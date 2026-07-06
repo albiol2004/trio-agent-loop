@@ -10,7 +10,7 @@ CLI has them:
    |---|---|
    | Claude Code | `claude -p "<prompt>" --permission-mode acceptEdits` |
    | OpenAI Codex CLI | `codex exec "<prompt>"` |
-   | Gemini CLI | `gemini -p "<prompt>"` |
+   | Gemini CLI / Antigravity | `gemini --approval-mode=yolo -p "<prompt>"` (native: `HARNESS=gemini`; also `agy`) |
    | OpenCode | `opencode run --auto "<prompt>"` (native support: `HARNESS=opencode`) |
    | Pi (pi.dev) | `pi -p "<prompt>"` (native support: `HARNESS=pi`) |
    | Hermes (Nous) | `hermes -z "<prompt>" --yolo` (native support: `HARNESS=hermes`) |

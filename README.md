@@ -106,11 +106,12 @@ The role prompts and mailbox protocol are harness-agnostic; `portable/`
 carries them as standalone files plus a Ralph-style bash driver:
 ```bash
 mkdir -p loop && cp portable/GOAL.template.md loop/GOAL.md   # edit it
-HARNESS=codex ./portable/driver.sh 10   # or cursor|opencode|pi|hermes|athen|claude|generic
+HARNESS=codex ./portable/driver.sh 10   # or cursor|opencode|pi|hermes|athen|gemini|agy|claude|generic
 ```
 Per-harness setup docs: `portable/SETUP-codex.md`, `SETUP-cursor.md`,
 `SETUP-opencode.md`, `SETUP-pi.md`, `SETUP-hermes.md`, `SETUP-athen.md`,
-`SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the GLM Coding Plan
+`SETUP-antigravity.md` (Antigravity IDE isn't scriptable; its `agy` CLI /
+Gemini CLI are), `SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the GLM Coding Plan
 endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. The driver
 parses only VERDICT.md's first line; exit codes 0=SHIP, 2=BLOCKED, 3=bad
@@ -127,5 +128,5 @@ loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md
 portable/                            # non-Claude-Code harnesses
   driver.sh prompts/{lead,evaluator}.md GOAL.template.md AGENTS.template.md
-  SETUP-{codex,cursor,opencode,pi,hermes,athen,zai,generic}.md
+  SETUP-{codex,cursor,opencode,pi,hermes,athen,antigravity,zai,generic}.md
 ```

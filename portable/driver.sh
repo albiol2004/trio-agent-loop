@@ -9,6 +9,8 @@
 #   HARNESS=cursor ./portable/driver.sh          # CURSOR_BIN=agent on newer installs
 #   HARNESS=opencode ./portable/driver.sh        # opts: OPENCODE_MODEL, OPENCODE_{LEAD,EVAL}_AGENT
 #   HARNESS=pi ./portable/driver.sh              # opts: PI_MODEL; run containerized!
+#   HARNESS=gemini ./portable/driver.sh          # opts: GEMINI_MODEL
+#   HARNESS=agy ./portable/driver.sh             # Antigravity CLI — verify flags with agy --help first
 #   HARNESS=hermes ./portable/driver.sh          # opts: HERMES_MODEL
 #   HARNESS=athen ./portable/driver.sh           # needs ATHEN_BASE_URL+ATHEN_MODEL; opts: ATHEN_BIN, ATHEN_{LEAD,EVAL}_PROFILE
 #   HARNESS=generic RUN_LEAD='mycli run --prompt-file' RUN_EVAL='mycli run --prompt-file' ./portable/driver.sh
@@ -44,6 +46,11 @@ run_role() {
                "$(cat "$prompt_file")" ;;
     pi)      # no permission system by design — run in a container/worktree; -p may hang, hence timeout
              timeout "${ROLE_TIMEOUT:-1200}" pi -p ${PI_MODEL:+--model "$PI_MODEL"} "$(cat "$prompt_file")" ;;
+    gemini)  # verified: -p one-shot; approval-mode=yolo per invocation (cannot be persisted)
+             timeout "${ROLE_TIMEOUT:-1200}" gemini --approval-mode=yolo \
+               ${GEMINI_MODEL:+-m "$GEMINI_MODEL"} -p "$(cat "$prompt_file")" ;;
+    agy)     # Antigravity CLI — flags UNVERIFIED from primary docs; confirm with agy --help (see SETUP-antigravity.md)
+             timeout "${ROLE_TIMEOUT:-1200}" agy --headless --approve all "$(cat "$prompt_file")" ;;
     hermes)  # --yolo required: non-interactive runs auto-DENY dangerous approvals without it
              timeout "${ROLE_TIMEOUT:-1200}" hermes -z "$(cat "$prompt_file")" --yolo --quiet \
                ${HERMES_MODEL:+-m "$HERMES_MODEL"} ;;
