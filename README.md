@@ -1,8 +1,16 @@
-# Trio agent loop — reusable Claude Code template
+# Trio agent loop
 
-A Karpathy/Ralph-style agent loop for Claude Code: two equal Opus "thinker"
-roles that prompt each other through markdown mailbox files, each fanning out
-cheap Sonnet workers, driven autonomously by `/loop`.
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Harnesses](https://img.shields.io/badge/harnesses-9%2B-brightgreen.svg)
+![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-d97757.svg)
+
+A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
+roles — a **Lead** that plans and implements, and an adversarial **Evaluator**
+that independently verifies — prompt each other through markdown mailbox
+files, fanning out cheap worker agents, iterating autonomously until the work
+ships or a human decision is needed. Native to Claude Code (`/loop /trio`),
+portable to Codex, Cursor, OpenCode, Pi, Hermes, Gemini/Antigravity and any
+CLI with a headless mode.
 
 ```
             ┌─────────────────────────────────────────────┐
@@ -130,3 +138,11 @@ portable/                            # non-Claude-Code harnesses
   driver.sh prompts/{lead,evaluator}.md GOAL.template.md AGENTS.template.md
   SETUP-{codex,cursor,opencode,pi,hermes,athen,antigravity,zai,generic}.md
 ```
+
+## Setting it up with an AI agent
+Point any Claude Code (or comparable) session at this repo and tell it to
+follow `SETUP-BY-CLAUDE.md` — it installs the template and explains usage.
+
+## License
+MIT — see [LICENSE](LICENSE). Issues and PRs welcome, especially new
+harness recipes for `portable/`.
