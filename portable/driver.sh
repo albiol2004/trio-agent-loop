@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Portable trio-loop driver: alternates Lead and Evaluator prompts through any
+# agentic CLI with a non-interactive mode, until VERDICT: SHIP/BLOCKED or the
+# iteration cap. State lives entirely in loop/ — safe to kill and re-run.
+#
+# Usage:
+#   HARNESS=codex ./portable/driver.sh [max_iterations]     # default harness: codex
+#   HARNESS=claude ./portable/driver.sh
+#   HARNESS=cursor ./portable/driver.sh          # CURSOR_BIN=agent on newer installs
+#   HARNESS=opencode ./portable/driver.sh        # opts: OPENCODE_MODEL, OPENCODE_{LEAD,EVAL}_AGENT
+#   HARNESS=pi ./portable/driver.sh              # opts: PI_MODEL; run containerized!
+#   HARNESS=hermes ./portable/driver.sh          # opts: HERMES_MODEL
+#   HARNESS=athen ./portable/driver.sh           # needs ATHEN_BASE_URL+ATHEN_MODEL; opts: ATHEN_BIN, ATHEN_{LEAD,EVAL}_PROFILE
+#   HARNESS=generic RUN_LEAD='mycli run --prompt-file' RUN_EVAL='mycli run --prompt-file' ./portable/driver.sh
+#
+# Prereq: loop/GOAL.md exists (copy portable/GOAL.template.md and fill it in).
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAX_ITER="${1:-10}"
+HARNESS="${HARNESS:-codex}"
+
+[[ -f loop/GOAL.md ]] || { echo "loop/GOAL.md missing — copy portable/GOAL.template.md to loop/GOAL.md and edit it." >&2; exit 1; }
+mkdir -p loop
+[[ -f loop/STATE.md ]] || printf 'iteration: 0\n\n## Approaches tried and rejected\n\n## Key decisions and rationale\n' > loop/STATE.md
+[[ -f loop/LOG.md   ]] || echo '# Trio loop log' > loop/LOG.md
+
+# run_role <prompt-file>  — one fresh-context invocation of the chosen harness
+run_role() {
+  local prompt_file="$1"
+  case "$HARNESS" in
+    codex)   # --full-auto is deprecated; sandbox must allow workspace writes.
+             # Per-role model/effort: set CODEX_LEAD_PROFILE / CODEX_EVAL_PROFILE
+             # (Codex >=0.134: profiles are separate ~/.codex/<name>.config.toml files).
+             local profile=""
+             [[ "$prompt_file" == *lead* ]] && profile="${CODEX_LEAD_PROFILE:-}" || profile="${CODEX_EVAL_PROFILE:-}"
+             codex exec --sandbox workspace-write ${profile:+--profile "$profile"} - < "$prompt_file" ;;
+    claude)  claude -p "$(cat "$prompt_file")" --permission-mode acceptEdits ;;
+    opencode) # "ask" permissions hang headless — see SETUP-opencode.md; exit codes unreliable, VERDICT.md is the truth
+             local agent_flag=""
+             [[ "$prompt_file" == *lead* ]] && agent_flag="${OPENCODE_LEAD_AGENT:-}" || agent_flag="${OPENCODE_EVAL_AGENT:-}"
+             timeout "${ROLE_TIMEOUT:-1200}" opencode run --auto \
+               ${OPENCODE_MODEL:+-m "$OPENCODE_MODEL"} ${agent_flag:+--agent "$agent_flag"} \
+               "$(cat "$prompt_file")" ;;
+    pi)      # no permission system by design — run in a container/worktree; -p may hang, hence timeout
+             timeout "${ROLE_TIMEOUT:-1200}" pi -p ${PI_MODEL:+--model "$PI_MODEL"} "$(cat "$prompt_file")" ;;
+    hermes)  # --yolo required: non-interactive runs auto-DENY dangerous approvals without it
+             timeout "${ROLE_TIMEOUT:-1200}" hermes -z "$(cat "$prompt_file")" --yolo --quiet \
+               ${HERMES_MODEL:+-m "$HERMES_MODEL"} ;;
+    athen)   # requires ATHEN_BASE_URL + ATHEN_MODEL in env (exit 2 otherwise) — see SETUP-athen.md
+             local ath_profile=""
+             [[ "$prompt_file" == *lead* ]] && ath_profile="${ATHEN_LEAD_PROFILE:-}" || ath_profile="${ATHEN_EVAL_PROFILE:-}"
+             ATHEN_WORKSPACE_DIR="$PWD" ATHEN_DISABLE_RISK_GATE=1 \
+               timeout "${ROLE_TIMEOUT:-2000}" \
+               "${ATHEN_BIN:-athen-cli}" \
+               ${ath_profile:+--profile "$ath_profile"} --prompt "$(cat "$prompt_file")" ;;
+    cursor)  "${CURSOR_BIN:-cursor-agent}" -p --force "$(cat "$prompt_file")" ;;  # without --force, -p only PROPOSES edits; newer installs: CURSOR_BIN=agent
+    generic) local cmd_var; [[ "$prompt_file" == *lead* ]] && cmd_var="${RUN_LEAD:?set RUN_LEAD}" || cmd_var="${RUN_EVAL:?set RUN_EVAL}"
+             $cmd_var "$prompt_file" ;;
+    *) echo "unknown HARNESS=$HARNESS" >&2; exit 1 ;;
+  esac
+}
+
+iter="$(awk -F': ' '/^iteration:/{print $2}' loop/STATE.md)"
+while (( iter < MAX_ITER )); do
+  iter=$((iter + 1))
+  sed -i "s/^iteration: .*/iteration: $iter/" loop/STATE.md
+  echo "=== iteration $iter/$MAX_ITER — lead ==="
+  run_role "$DIR/prompts/lead.md"
+
+  echo "=== iteration $iter/$MAX_ITER — evaluator ==="
+  run_role "$DIR/prompts/evaluator.md"
+
+  verdict="$(head -1 loop/VERDICT.md 2>/dev/null | tr -d '\r')"
+  echo "=== $verdict ==="
+  case "$verdict" in
+    "VERDICT: SHIP")    echo "Done — ready for human review (see loop/VERDICT.md)."; exit 0 ;;
+    "VERDICT: BLOCKED") echo "Loop blocked — human decision needed (see loop/VERDICT.md)."; exit 2 ;;
+    "VERDICT: ITERATE") ;;  # continue
+    *) echo "Unparseable or missing verdict — stopping to avoid a runaway loop." >&2; exit 3 ;;
+  esac
+done
+echo "Hit max iterations ($MAX_ITER) without SHIP — see loop/LOG.md and loop/VERDICT.md." >&2
+exit 4
