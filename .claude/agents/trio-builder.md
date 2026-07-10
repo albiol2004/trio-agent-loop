@@ -1,6 +1,6 @@
 ---
 name: trio-builder
-description: Sonnet implementation worker for the trio loop. Executes one well-specified mechanical task handed down by the Implementor — boilerplate, renames, applying a stated pattern across files, test scaffolding.
+description: Sonnet implementation worker for the trio loop. Executes one well-specified mechanical task handed down by the Opus Lead — boilerplate, renames, applying a stated pattern across files, test scaffolding.
 model: sonnet
 disallowedTools: Agent
 ---

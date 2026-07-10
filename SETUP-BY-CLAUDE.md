@@ -23,9 +23,10 @@ install the "trio" duo agent loop on the local machine. Do this:
    - `/loop /trio` → autonomous; iterates until the Evaluator's VERDICT.md
      first line reads SHIP or BLOCKED; Esc pauses; `max_iterations` in
      loop/STATE.md (default 10) is the budget cap.
-4. Do NOT modify the role files during install. Model tiers are set in the
-   agent frontmatter (`model: opus` for lead/evaluator, `sonnet` for
-   workers); the README's Tuning section explains when to change them.
+4. Do NOT modify the role files during install. The model contract is fixed in
+   the agent frontmatter: Lead and Evaluator are Opus agents; their explorers
+   (`trio-scout`) and implementors (`trio-builder`) are Sonnet agents. Keep
+   that split intact unless the human explicitly changes the architecture.
 
 Design rationale and research citations live in README.md — read it if the
 user asks why the loop is shaped this way.

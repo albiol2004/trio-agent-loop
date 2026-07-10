@@ -9,19 +9,23 @@ pattern). Fresh process per role per iteration; all state in `loop/`.
 2. Project context: Codex natively reads **AGENTS.md** (walks up from cwd to
    the `.git` root; also honors `AGENTS.override.md`). Add one describing the
    project — the role prompts themselves come from `portable/prompts/`.
-3. Optional per-role models/efforts — Codex ≥0.134 profiles are **separate
-   files** (the old `[profiles.x]` tables in config.toml no longer work):
+3. Pin the role tiers — Codex ≥0.134 profiles are **separate files** (the old
+   `[profiles.x]` tables in config.toml no longer work). The Codex contract is:
+   Lead and Evaluator use GPT-5.6 Terra at high reasoning; Scout and Builder
+   use GPT-5.6 Luna at high reasoning.
 
    ```toml
    # ~/.codex/lead.config.toml
-   model = "gpt-5.4"
-   model_reasoning_effort = "medium"
+   model = "gpt-5.6-terra"
+   model_reasoning_effort = "high"
    ```
    ```toml
    # ~/.codex/evaluator.config.toml
-   model = "gpt-5.4"
+   model = "gpt-5.6-terra"
    model_reasoning_effort = "high"    # judgment is the scarce resource
    ```
+   For Codex-native worker agents, set `trio-scout` and `trio-builder` to
+   `model = "gpt-5.6-luna"` with `model_reasoning_effort = "high"`.
    This is version-dependent and contentious upstream (openai/codex#4849) —
    check your installed version if profiles don't load.
 
