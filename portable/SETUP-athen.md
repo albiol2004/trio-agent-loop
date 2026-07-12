@@ -45,11 +45,19 @@ Athen wake-ups are daemon-only (`athen-app --headless`): clock-triggered
 sense events (OneShot/Cron/Interval) through the coordinator, with autonomy
 bands — pre-approved *capability*, not conditional "re-run until X". The CLI
 one-shot never constructs the scheduler, and v1 wake-ups can't gate on a
-condition like VERDICT.md's first line. So: bash driver for the loop.
-Future Athen feature idea if you want native looping: a wake-up-style
-`FollowUp` trigger that fires when the previous task exits, with a predicate
-on a file's first line — that would be Athen's equivalent of Claude Code's
-/loop and Cursor's stop-hook `followup_message` (see SETUP-cursor.md).
+condition like VERDICT.md's first line. So for the *CLI one-shot* path: bash driver.
+
+**Native Loop Mode exists in the Athen app** (implemented 2026-07-11 on the
+`feat/loop-mode` branch, commits 4936497 + 23183d7 — check whether your build
+includes it): a per-arc Lead→Evaluator loop inside the desktop/web app with
+the same mailbox file protocol, an enforced never-fixes Evaluator profile,
+start/stop/status from the arc UI (desktop and web, including headless +
+Remote Access) or `POST /api/arcs/{id}/loop`. If you are running the Athen
+app, prefer native Loop Mode — it gets model profiles, the vault, sub-agent
+fan-out, risk-gated autonomy, and notifications that this driver cannot
+reach. This driver remains the right tool for plain `athen-cli` setups,
+benchmarks, and containers without the app. Design + implementation map:
+Athen repo `docs/LOOP_MODE.md`.
 
 ## Caveats
 - Each invocation pays fresh provider init (no warm process) — fine at this

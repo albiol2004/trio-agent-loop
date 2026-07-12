@@ -2,13 +2,26 @@
 # Install the trio agent-loop template.
 #   ./install.sh --global          -> ~/.claude  (available in EVERY project; recommended)
 #   ./install.sh /path/to/project  -> <project>/.claude (committed with that repo)
+#   ./install.sh --portable [dir]  -> ~/.trio (default) — driver + prompts for
+#                                     non-Claude-Code harnesses (codex, athen, …)
 set -euo pipefail
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.claude"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$ROOT/.claude"
 
 case "${1:-}" in
   --global) DEST="$HOME/.claude" ;;
-  "") echo "usage: $0 --global | $0 /path/to/project" >&2; exit 1 ;;
+  --portable)
+    DEST="${2:-$HOME/.trio}"
+    mkdir -p "$DEST"
+    cp -rv "$ROOT/portable" "$DEST/"
+    echo
+    echo "Portable driver installed. From any project root:"
+    echo "  mkdir -p loop && cp $DEST/portable/GOAL.template.md loop/GOAL.md   # edit it"
+    echo "  HARNESS=codex $DEST/portable/driver.sh 10   # or athen|cursor|gemini|... "
+    echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
+    exit 0 ;;
+  "") echo "usage: $0 --global | $0 /path/to/project | $0 --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 

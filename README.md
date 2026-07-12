@@ -77,6 +77,12 @@ to pause it yourself; `/loop 10m /trio` forces a fixed cadence instead.
 ## Control knobs while it runs
 - `loop/GOAL.md` — edit anytime; next iteration obeys it.
 - `loop/STATE.md` → `max_iterations` (default 10) — hard budget cap.
+- **Concurrent loops: one mailbox dir per loop.** Second loop in the same
+  repo → `/trio-init dir=loop-<name> <goal>` then `/trio dir=loop-<name>`
+  (driver: `LOOP_DIR=loop-<name>`). The driver takes an atomic `.lock` on its
+  mailbox (exit 5 if another live driver owns it), and `/trio` halts if
+  STATE.md's `mission:` line stops matching GOAL.md — the signature of
+  another session repurposing the mailbox mid-loop.
 - `DECISION:` flags in PLAN.md — the Lead marks judgment calls it made;
   veto them by editing GOAL.md.
 - Two identical ITERATE verdicts in a row auto-escalate to BLOCKED, so a
@@ -123,7 +129,8 @@ Gemini CLI are), `SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the G
 endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. The driver
 parses only VERDICT.md's first line; exit codes 0=SHIP, 2=BLOCKED, 3=bad
-verdict, 4=iteration cap. Fresh process per role per iteration — the loop's
+verdict, 4=iteration cap, 5=mailbox locked by another driver
+(`LOOP_DIR=loop-<name>` runs concurrent loops). Fresh process per role per iteration — the loop's
 fresh-context property survives every harness; what you lose outside Claude
 Code is the Sonnet worker fan-out (single agent per invocation).
 
@@ -140,8 +147,13 @@ portable/                            # non-Claude-Code harnesses
 ```
 
 ## Setting it up with an AI agent
-Point any Claude Code (or comparable) session at this repo and tell it to
-follow `SETUP-BY-CLAUDE.md` — it installs the template and explains usage.
+Point an agent session at this repo and tell it to follow the setup doc for
+its harness — it installs the template and explains usage:
+- Claude Code: `SETUP-BY-CLAUDE.md` (native `/trio` install)
+- Codex CLI: `SETUP-BY-CODEX.md` (portable driver + `~/.codex` role profiles)
+- Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
+Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using
+its own harness's `portable/SETUP-*.md`.
 
 ## License
 MIT — see [LICENSE](LICENSE). Issues and PRs welcome, especially new
