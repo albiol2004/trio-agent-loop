@@ -9,7 +9,9 @@
 
 ## Agent-loop protocol (do not remove)
 This repo may be worked on by an automated Lead→Evaluator loop whose state
-lives in `loop/`:
+lives in a mailbox directory — `loop/` by default, `loop-*/` when several
+loops run concurrently (one mailbox per loop; never share or repurpose one
+that another session may own):
 - `loop/GOAL.md` is human-owned and immutable to agents.
 - `loop/PLAN.md`, `loop/REPORT.md` are written by the Lead role;
   `loop/VERDICT.md` by the Evaluator role (first line is machine-parsed:

@@ -6,8 +6,11 @@ disable-model-invocation: true
 
 You are the **orchestrator** of a two-agent loop. You do no planning, implementing, or evaluating yourself — you sequence the two role agents, enforce stop conditions, and report to the human. One invocation of /trio = exactly one iteration.
 
+**Mailbox directory**: default `loop/`. If invoked with `dir=<path>` (e.g. `/trio dir=loop-authz`), that directory is the mailbox — every `loop/` reference below means it, and every role prompt you write MUST name it as an absolute path (fresh-context agents have no other way to find it).
+
 ## 0. Preflight — decide whether to run at all
 1. Read `loop/STATE.md`. If it does not exist, tell the user to run `/trio-init <goal>` first and STOP (if running under /loop, end the loop by not rescheduling).
+   - **Collision check**: if STATE.md has a `mission:` line, verify it still matches GOAL.md's mission sentence, and verify LOG.md's tail is consistent with the iterations you've been orchestrating. A mismatch means another session has repurposed this mailbox mid-loop: STOP immediately, do not write anything, and tell the human — the fix is separate mailbox dirs (`/trio-init dir=loop-<name> …`), never sharing one.
 2. Read `loop/VERDICT.md` if it exists — its **first line** is machine-readable (`VERDICT: SHIP|ITERATE|BLOCKED`); trust that line, not your reading of the prose. Apply stop conditions **before** doing any work:
    - Last verdict `SHIP` → announce completion (quote the Evaluator's suggested commit message and follow-ups), end the loop.
    - Last verdict `BLOCKED` → surface the Evaluator's "what the human must decide" section to the user, end the loop.
