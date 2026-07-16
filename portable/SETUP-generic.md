@@ -9,14 +9,15 @@ CLI has them:
    | Harness | Invocation |
    |---|---|
    | Claude Code | `claude -p "<prompt>" --permission-mode acceptEdits` |
-   | OpenAI Codex CLI | `codex exec "<prompt>"` |
    | Gemini CLI / Antigravity | `gemini --approval-mode=yolo -p "<prompt>"` (native: `HARNESS=gemini`; also `agy`) |
    | OpenCode | `opencode run --auto "<prompt>"` (native support: `HARNESS=opencode`) |
-   | Pi (pi.dev) | `pi -p "<prompt>"` (native support: `HARNESS=pi`) |
    | Hermes (Nous) | `hermes -z "<prompt>" --yolo` (native support: `HARNESS=hermes`) |
    | Athen | `athen-cli --prompt "<prompt>"` (native support: `HARNESS=athen`) |
    | Aider | `aider --message "<prompt>"` |
    | GitHub Copilot CLI | `copilot -p "<prompt>"` |
+
+   Codex, ZCode, and Pi are intentionally excluded: use their native bundles
+   from `SETUP-BY-CODEX.md`, `SETUP-BY-ZCODE.md`, and `SETUP-BY-PI.md`.
 
 2. **Autonomy flags** so the invocation doesn't stall on approval prompts
    (each tool names this differently: `--full-auto`, `--force`,

@@ -1,52 +1,10 @@
-# Setup — OpenAI Codex CLI
+# Codex uses the native bundle
 
-Codex has no markdown-defined subagents or /loop, so the loop runs as the
-external bash driver alternating `codex exec` invocations (pure Ralph
-pattern). Fresh process per role per iteration; all state in `loop/`.
+Do not run Codex through this portable driver. Install the native Codex skill
+and custom agents instead:
 
-## One-time setup
-1. Install/auth Codex CLI (`codex login` or `OPENAI_API_KEY`).
-2. Project context: Codex natively reads **AGENTS.md** (walks up from cwd to
-   the `.git` root; also honors `AGENTS.override.md`). Add one describing the
-   project — the role prompts themselves come from `portable/prompts/`.
-3. Pin the role tiers — Codex ≥0.134 profiles are **separate files** (the old
-   `[profiles.x]` tables in config.toml no longer work). The Codex contract is:
-   Lead and Evaluator use GPT-5.6 Terra at high reasoning; Scout and Builder
-   use GPT-5.6 Luna at high reasoning.
-
-   ```toml
-   # ~/.codex/lead.config.toml
-   model = "gpt-5.6-terra"
-   model_reasoning_effort = "high"
-   ```
-   ```toml
-   # ~/.codex/evaluator.config.toml
-   model = "gpt-5.6-terra"
-   model_reasoning_effort = "high"    # judgment is the scarce resource
-   ```
-   For Codex-native worker agents, set `trio-scout` and `trio-builder` to
-   `model = "gpt-5.6-luna"` with `model_reasoning_effort = "high"`.
-   This is version-dependent and contentious upstream (openai/codex#4849) —
-   check your installed version if profiles don't load.
-
-## Run
 ```bash
-mkdir -p loop && cp portable/GOAL.template.md loop/GOAL.md   # edit it!
-HARNESS=codex CODEX_LEAD_PROFILE=lead CODEX_EVAL_PROFILE=evaluator \
-  ./portable/driver.sh 10
+./install.sh --codex
 ```
-(Profiles optional — omit the env vars to use your default config.)
 
-## Notes & caveats
-- The driver feeds prompts via stdin (`codex exec - < prompts/lead.md`) and
-  runs `--sandbox workspace-write`: writes allowed inside the repo, blocked
-  outside. Do NOT use `--dangerously-bypass-approvals-and-sandbox` unless the
-  whole thing runs in a disposable container/CI.
-- `~/.codex/prompts/*.md` custom prompts exist but are deprecated in favor of
-  Codex "skills" — irrelevant here anyway, since the driver passes full prompt
-  files directly.
-- `codex exec resume` exists if you ever want conversation continuity between
-  iterations — the loop deliberately does NOT use it (fresh context is the
-  design; continuity lives in loop/*.md).
-- `--json` emits machine-readable events if you later want tighter driver
-  integration than parsing VERDICT.md's first line.
+Then ask Codex to run a Trio loop. See `SETUP-BY-CODEX.md`.

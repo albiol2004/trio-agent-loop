@@ -8,9 +8,9 @@ A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
 roles — a **Lead** that plans and implements, and an adversarial **Evaluator**
 that independently verifies — prompt each other through markdown mailbox
 files, fanning out cheap worker agents, iterating autonomously until the work
-ships or a human decision is needed. Native to Claude Code (`/loop /trio`),
-portable to Codex, Cursor, OpenCode, Pi, Hermes, Gemini/Antigravity and any
-CLI with a headless mode.
+ships or a human decision is needed. Claude, Codex, ZCode, and Pi use their
+native orchestration surfaces; the shell driver remains for other headless
+harnesses.
 
 ```
             ┌─────────────────────────────────────────────┐
@@ -115,12 +115,12 @@ actor-critic literature (Reflexion, self-preference-bias papers):
   Budget roughly like two senior code reviews per iteration. `max_iterations`
   is your circuit breaker — keep it low until you trust a given GOAL.md.
 
-## Other harnesses (Codex, Cursor, Z.ai, anything with a headless mode)
+## Native bundles and other harnesses
 The role prompts and mailbox protocol are harness-agnostic; `portable/`
 carries them as standalone files plus a Ralph-style bash driver:
 ```bash
 mkdir -p loop && cp portable/GOAL.template.md loop/GOAL.md   # edit it
-HARNESS=codex ./portable/driver.sh 10   # or cursor|opencode|pi|hermes|athen|gemini|agy|claude|generic
+HARNESS=cursor ./portable/driver.sh 10   # or opencode|hermes|athen|gemini|agy|claude|generic
 ```
 Per-harness setup docs: `portable/SETUP-codex.md`, `SETUP-cursor.md`,
 `SETUP-opencode.md`, `SETUP-pi.md`, `SETUP-hermes.md`, `SETUP-athen.md`,
@@ -130,9 +130,9 @@ endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. The driver
 parses only VERDICT.md's first line; exit codes 0=SHIP, 2=BLOCKED, 3=bad
 verdict, 4=iteration cap, 5=mailbox locked by another driver
-(`LOOP_DIR=loop-<name>` runs concurrent loops). Fresh process per role per iteration — the loop's
-fresh-context property survives every harness; what you lose outside Claude
-Code is the Sonnet worker fan-out (single agent per invocation).
+(`LOOP_DIR=loop-<name>` runs concurrent loops). Codex uses native custom
+agents, ZCode uses native custom subagents and Goal Mode, and Pi uses
+in-process SDK AgentSessions. None of those three launches a child CLI.
 
 ## Files
 ```
@@ -150,7 +150,9 @@ portable/                            # non-Claude-Code harnesses
 Point an agent session at this repo and tell it to follow the setup doc for
 its harness — it installs the template and explains usage:
 - Claude Code: `SETUP-BY-CLAUDE.md` (native `/trio` install)
-- Codex CLI: `SETUP-BY-CODEX.md` (portable driver + `~/.codex` role profiles)
+- Codex: `SETUP-BY-CODEX.md` (native skill + custom agents + `/goal`)
+- ZCode: `SETUP-BY-ZCODE.md` (native skills + custom subagents + `/goal`)
+- Pi: `SETUP-BY-PI.md` (native in-process AgentSession extension)
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
 Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using
 its own harness's `portable/SETUP-*.md`.

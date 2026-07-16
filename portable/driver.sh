@@ -6,11 +6,9 @@
 # and re-run. Exit codes: 0 SHIP, 2 BLOCKED, 3 bad verdict, 4 cap, 5 mailbox locked.
 #
 # Usage:
-#   HARNESS=codex ./portable/driver.sh [max_iterations]     # default harness: codex
 #   HARNESS=claude ./portable/driver.sh
 #   HARNESS=cursor ./portable/driver.sh          # CURSOR_BIN=agent on newer installs
 #   HARNESS=opencode ./portable/driver.sh        # opts: OPENCODE_MODEL, OPENCODE_{LEAD,EVAL}_AGENT
-#   HARNESS=pi ./portable/driver.sh              # opts: PI_MODEL; run containerized!
 #   HARNESS=gemini ./portable/driver.sh          # opts: GEMINI_MODEL
 #   HARNESS=agy ./portable/driver.sh             # Antigravity CLI — verify flags with agy --help first
 #   HARNESS=hermes ./portable/driver.sh          # opts: HERMES_MODEL
@@ -24,7 +22,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_ITER="${1:-10}"
-HARNESS="${HARNESS:-codex}"
+HARNESS="${HARNESS:-generic}"
 LOOP_DIR="${LOOP_DIR:-loop}"
 
 [[ -f "$LOOP_DIR/GOAL.md" ]] || { echo "$LOOP_DIR/GOAL.md missing — copy portable/GOAL.template.md to $LOOP_DIR/GOAL.md and edit it." >&2; exit 1; }
@@ -58,12 +56,6 @@ build_prompt() {
 run_role() {
   local prompt_file="$1"
   case "$HARNESS" in
-    codex)   # --full-auto is deprecated; sandbox must allow workspace writes.
-             # Per-role model/effort: set CODEX_LEAD_PROFILE / CODEX_EVAL_PROFILE
-             # (Codex >=0.134: profiles are separate ~/.codex/<name>.config.toml files).
-             local profile=""
-             [[ "$prompt_file" == *lead* ]] && profile="${CODEX_LEAD_PROFILE:-}" || profile="${CODEX_EVAL_PROFILE:-}"
-             build_prompt "$prompt_file" | codex exec --sandbox workspace-write ${profile:+--profile "$profile"} - ;;
     claude)  claude -p "$(build_prompt "$prompt_file")" --permission-mode acceptEdits ;;
     opencode) # "ask" permissions hang headless — see SETUP-opencode.md; exit codes unreliable, VERDICT.md is the truth
              local agent_flag=""
@@ -71,8 +63,6 @@ run_role() {
              timeout "${ROLE_TIMEOUT:-1200}" opencode run --auto \
                ${OPENCODE_MODEL:+-m "$OPENCODE_MODEL"} ${agent_flag:+--agent "$agent_flag"} \
                "$(build_prompt "$prompt_file")" ;;
-    pi)      # no permission system by design — run in a container/worktree; -p may hang, hence timeout
-             timeout "${ROLE_TIMEOUT:-1200}" pi -p ${PI_MODEL:+--model "$PI_MODEL"} "$(build_prompt "$prompt_file")" ;;
     gemini)  # verified: -p one-shot; approval-mode=yolo per invocation (cannot be persisted)
              timeout "${ROLE_TIMEOUT:-1200}" gemini --approval-mode=yolo \
                ${GEMINI_MODEL:+-m "$GEMINI_MODEL"} -p "$(build_prompt "$prompt_file")" ;;
