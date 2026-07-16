@@ -8,9 +8,10 @@ A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
 roles — a **Lead** that plans and implements, and an adversarial **Evaluator**
 that independently verifies — prompt each other through markdown mailbox
 files, fanning out cheap worker agents, iterating autonomously until the work
-ships or a human decision is needed. Claude, Codex, ZCode, and Pi use their
-native orchestration surfaces; the shell driver remains for other headless
-harnesses.
+ships or a human decision is needed. Claude, ZCode, and Pi use their native
+orchestration surfaces. Codex prefers native custom agents and can fall back
+to isolated bundled Codex sessions when an app task does not expose native
+spawn controls. The shell driver remains for other headless harnesses.
 
 ```
             ┌─────────────────────────────────────────────┐
@@ -130,15 +131,20 @@ endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. The driver
 parses only VERDICT.md's first line; exit codes 0=SHIP, 2=BLOCKED, 3=bad
 verdict, 4=iteration cap, 5=mailbox locked by another driver
-(`LOOP_DIR=loop-<name>` runs concurrent loops). Codex uses native custom
-agents, ZCode uses native custom subagents and Goal Mode, and Pi uses
-in-process SDK AgentSessions. None of those three launches a child CLI.
+(`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
+agents and has a dedicated isolated-session fallback, ZCode uses native custom
+subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.
 
 ## Files
 ```
 .claude/agents/trio-{lead,evaluator,scout,builder}.md
 .claude/skills/trio/SKILL.md         # /trio  — one full iteration
 .claude/skills/trio-init/SKILL.md    # /trio-init — mailbox setup
+codex/                               # custom agents, skills, fallback runner
+  skills/trio/references/PROJECT-CONFIG.example.toml
+  skills/trio/references/TROUBLESHOOTING.md
+  skills/trio/scripts/run-role.sh
+  skills/trio/references/prompts/*.md
 loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md
 portable/                            # non-Claude-Code harnesses
@@ -150,7 +156,7 @@ portable/                            # non-Claude-Code harnesses
 Point an agent session at this repo and tell it to follow the setup doc for
 its harness — it installs the template and explains usage:
 - Claude Code: `SETUP-BY-CLAUDE.md` (native `/trio` install)
-- Codex: `SETUP-BY-CODEX.md` (native skill + custom agents + `/goal`)
+- Codex: `SETUP-BY-CODEX.md` (native-first skill + isolated fallback + `/goal`)
 - ZCode: `SETUP-BY-ZCODE.md` (native skills + custom subagents + `/goal`)
 - Pi: `SETUP-BY-PI.md` (native in-process AgentSession extension)
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)

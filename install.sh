@@ -2,7 +2,7 @@
 # Install the trio agent-loop template.
 #   ./install.sh --global          -> ~/.claude  (available in EVERY project; recommended)
 #   ./install.sh /path/to/project  -> <project>/.claude (committed with that repo)
-#   ./install.sh --codex           -> native Codex skills + custom agents
+#   ./install.sh --codex           -> Codex skills + custom agents + fallback
 #   ./install.sh --zcode           -> native ZCode skills
 #   ./install.sh --pi              -> native Pi AgentSession extension
 #   ./install.sh --portable [dir]  -> legacy driver for other harnesses
@@ -18,7 +18,9 @@ case "${1:-}" in
     cp -rv "$ROOT/codex/skills/trio" "$HOME/.agents/skills/"
     cp -rv "$ROOT/codex/skills/trio-init" "$HOME/.agents/skills/"
     cp -v "$ROOT"/codex/agents/trio-*.toml "$HOME/.codex/agents/"
-    echo "Installed native Codex Trio. Start a new task and ask to run a Trio loop."
+    chmod +x "$HOME/.agents/skills/trio/scripts/run-role.sh"
+    echo "Installed Codex Trio. Native agents are preferred; isolated Codex CLI sessions are the fallback."
+    echo "Next: follow SETUP-BY-CODEX.md to validate multi_agent and the target project's permission profile."
     exit 0 ;;
   --zcode)
     mkdir -p "$HOME/.zcode/skills"

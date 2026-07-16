@@ -1,0 +1,31 @@
+# Copy the relevant sections into a trusted target project's
+# .codex/config.toml. Replace the profile name if the project already has one.
+#
+# Keep this project-specific. Do not put private repository paths in the
+# public Trio repository or in a global user config.
+
+default_permissions = "trio-project"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+
+# The current project is already an effective workspace root. Add only sibling
+# repositories that Trio must read or modify.
+[permissions.trio-project.workspace_roots]
+"/absolute/path/to/sibling-repository" = true
+
+[permissions.trio-project.filesystem]
+glob_scan_max_depth = 5
+":minimal" = "read"
+"~/.agents/skills/trio" = "read"
+"~/.agents/skills/trio-init" = "read"
+"~/.codex/agents" = "read"
+
+[permissions.trio-project.filesystem.":workspace_roots"]
+"." = "write"
+"**/*.env" = "deny"
+
+# Keep command network access off by default. Enable it only when the project
+# genuinely needs dependency downloads, remote APIs, or Git network actions,
+# and prefer domain restrictions when supported.
+[permissions.trio-project.network]
+enabled = false
