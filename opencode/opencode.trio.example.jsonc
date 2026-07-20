@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Optional per-agent mappings. Run `opencode models` first, then replace
+  // each placeholder with an exact provider/model value from that output.
+  // Keep stronger selected models on the Orchestrator, Lead, and Evaluator;
+  // use lighter selected models for Scout and Builder. With no mappings,
+  // OpenCode's documented inheritance applies: the primary agent uses the
+  // configured global model, and subagents inherit their invoking primary's
+  // model.
+  "agent": {
+    // "trio-orchestrator": { "model": "<strong-provider/model-from-opencode-models>" },
+    // "trio-lead": { "model": "<strong-provider/model-from-opencode-models>" },
+    // "trio-evaluator": { "model": "<strong-provider/model-from-opencode-models>" },
+    // "trio-scout": { "model": "<lighter-provider/model-from-opencode-models>" },
+    // "trio-builder": { "model": "<lighter-provider/model-from-opencode-models>" }
+  }
+}

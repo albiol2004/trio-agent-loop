@@ -8,7 +8,7 @@
 # Usage:
 #   HARNESS=claude ./portable/driver.sh
 #   HARNESS=cursor ./portable/driver.sh          # CURSOR_BIN=agent on newer installs
-#   HARNESS=opencode ./portable/driver.sh        # opts: OPENCODE_MODEL, OPENCODE_{LEAD,EVAL}_AGENT
+#   HARNESS=opencode ./portable/driver.sh        # native opencode/ is preferred; this is the fallback
 #   HARNESS=gemini ./portable/driver.sh          # opts: GEMINI_MODEL
 #   HARNESS=agy ./portable/driver.sh             # Antigravity CLI — verify flags with agy --help first
 #   HARNESS=hermes ./portable/driver.sh          # opts: HERMES_MODEL
@@ -57,7 +57,7 @@ run_role() {
   local prompt_file="$1"
   case "$HARNESS" in
     claude)  claude -p "$(build_prompt "$prompt_file")" --permission-mode acceptEdits ;;
-    opencode) # "ask" permissions hang headless — see SETUP-opencode.md; exit codes unreliable, VERDICT.md is the truth
+    opencode) # Compatibility fallback; native named Task roles live in opencode/. See SETUP-opencode.md.
              local agent_flag=""
              [[ "$prompt_file" == *lead* ]] && agent_flag="${OPENCODE_LEAD_AGENT:-}" || agent_flag="${OPENCODE_EVAL_AGENT:-}"
              timeout "${ROLE_TIMEOUT:-1200}" opencode run --auto \

@@ -1,17 +1,19 @@
 # Trio agent loop
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Harnesses](https://img.shields.io/badge/harnesses-9%2B-brightgreen.svg)
+![Harnesses](https://img.shields.io/badge/harnesses-10%2B-brightgreen.svg)
 ![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-d97757.svg)
 
 A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
 roles — a **Lead** that plans, delegates, and reviews, and an adversarial **Evaluator**
 that independently verifies — prompt each other through markdown mailbox
 files, fanning out scoped worker agents, iterating autonomously until the work
-ships or a human decision is needed. Claude, ZCode, and Pi use their native
+ships or a human decision is needed. Claude, ZCode, Pi, and OpenCode use their native
 orchestration surfaces. Codex prefers native custom agents and can fall back
 to isolated bundled Codex sessions when an app task does not expose native
-spawn controls. The shell driver remains for other headless harnesses.
+spawn controls. Kimi Code has a first-class sequential CLI fallback: K3 handles
+Lead and Evaluator judgment, while Kimi for Coding handles Scout and Builder
+work. The shell driver remains for other headless harnesses.
 
 ```
             ┌─────────────────────────────────────────────┐
@@ -62,10 +64,21 @@ delegating the code-writing pass keeps its context focused without removing
 accountability. Native bundles enforce this provenance; portable single-agent
 harnesses cannot because they expose no subagent surface.
 
+Kimi Code preserves the same contract through fresh sequential print-mode
+processes. Its current public sub-agent documentation does not describe custom
+role names or per-role model pinning, so the integration treats those
+capabilities as unavailable. Its role aliases are `kimi-code/k3` (Kimi K3) for
+Lead/Evaluator and `kimi-code/kimi-for-coding` (Kimi K2.7 Code) for
+Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
+
 ## Install
 ```bash
 ./install.sh --global            # ~/.claude — every project on this machine
 ./install.sh ~/src/myproject     # or per-project, committed to the repo
+./install.sh --kimi              # Kimi Code skills + sequential role runner
+./install.sh --opencode \
+  --strong-model provider/strong --light-model provider/light
+                                # OpenCode native roles + user-selected models
 ```
 
 ## Use
@@ -140,6 +153,14 @@ verdict, 4=iteration cap, 5=mailbox locked by another driver
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
 agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.
+Kimi Code uses its documented print mode through a sequential role runner; see
+`SETUP-BY-KIMI.md` for installation and the K3/Kimi-for-Coding mapping.
+OpenCode's native bundle is primary; `portable/driver.sh` is the explicit
+fallback when a release lacks the documented named `Task` surface. See
+[SETUP-BY-OPENCODE.md](SETUP-BY-OPENCODE.md) for installation, model
+parameters/inheritance, permissions, and headless command routing. OpenCode
+maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
+light model to Scout/Builder; no provider is chosen by the repository.
 
 ## Files
 ```
@@ -156,6 +177,17 @@ loop/                                # created by /trio-init, per project
 portable/                            # non-Claude-Code harnesses
   driver.sh prompts/{lead,evaluator}.md GOAL.template.md AGENTS.template.md
   SETUP-{codex,cursor,opencode,pi,hermes,athen,antigravity,zai,generic}.md
+opencode/                             # native OpenCode agents + commands
+  agents/trio-{orchestrator,lead,scout,builder,evaluator}.md
+  commands/{trio,trio-init}.md
+  configure-models.sh             # applies user-supplied strong/light IDs
+  opencode.trio.example.jsonc         # optional; no model default
+kimi/                                # Kimi Code skills, prompts, and runner
+  skills/trio/SKILL.md
+  skills/trio-init/SKILL.md
+  skills/trio/scripts/run-role.sh
+  skills/trio/references/prompts/{lead,scout,builder,evaluator}.md
+  smoke-test.sh
 ```
 
 ## Setting it up with an AI agent
@@ -166,6 +198,8 @@ its harness — it installs the template and explains usage:
 - ZCode: `SETUP-BY-ZCODE.md` (native skills + custom subagents + `/goal`)
 - Pi: `SETUP-BY-PI.md` (native in-process AgentSession extension)
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
+- Kimi Code: `SETUP-BY-KIMI.md` (skills + sequential K3/Kimi-for-Coding runner)
+- OpenCode: `SETUP-BY-OPENCODE.md` (parameterized native roles + portable fallback)
 Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using
 its own harness's `portable/SETUP-*.md`.
 
