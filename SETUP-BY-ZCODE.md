@@ -45,20 +45,24 @@ Do this from the repository root:
    user-level feature. Keep existing definitions unless the human explicitly
    asks to replace them:
 
-   - `trio-lead`: Lead that plans and implements; all tools; use GLM-5.2 with
-     the highest available thought level.
+   - `trio-lead`: Lead that plans, delegates, reviews, and corrects; all tools;
+     use GLM-5.2 with the highest available thought level. Its initial pass
+     must not edit product code.
    - `trio-evaluator`: adversarial Evaluator; Read/Grep/Glob plus Bash for
      verification; no Edit or Write; use GLM-5.2 with the highest available
      thought level.
    - `trio-scout`: read-only explorer; Read/Grep/Glob only; use GLM-5.2 with
      the High thought level.
-   - `trio-builder`: mechanical implementation worker; Read/Edit/Write plus
-     Bash; use GLM-5.2 with the High thought level.
+   - `trio-builder`: primary implementation worker for substantive application
+     logic, tests, and integration within a Lead-defined brief; Read/Edit/Write
+     plus Bash; use GLM-5.2 with the High thought level.
 
-   The Lead and Evaluator remain the judgment roles. Scouts and Builders are
-   the lower-cost scoped workers. If the connected provider exposes different
-   model names or thought levels, preserve these role boundaries and report
-   the mapping instead of silently weakening the Evaluator.
+   Every code-changing increment starts with the Builder's main implementation
+   pass, followed by Lead review and any corrective edits. REPORT.md must state
+   that provenance. The Lead and Evaluator remain the judgment roles; Scouts
+   and Builders are scoped workers. If the connected provider exposes
+   different model names or thought levels, preserve these role boundaries and
+   report the mapping instead of silently weakening the Evaluator.
 
 5. Initialize and run in the open Workspace using only ZCode-native features:
 

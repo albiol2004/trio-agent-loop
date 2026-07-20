@@ -103,22 +103,50 @@ export default function trioExtension(pi: ExtensionAPI) {
             `Read loop/GOAL.md, STATE.md, the previous verdict, and relevant code. Brief the Lead for iteration ${iteration}.`,
             READ_TOOLS);
 
+          const initialLeadPrompt = "You are the Lead on the initial planning pass. Own architecture and PLAN.md, but do not edit product code. Every code-changing increment must set BUILDER_TASK.md to DELEGATE: YES with one well-specified main implementation task, approach, owned files, done-check, and forbidden scope. Use DELEGATE: NO with a reason only for SHIP/BLOCKED or a no-code increment. Never commit.";
           await writeFile(join(loop, "BUILDER_TASK.md"), "DELEGATE: NO\n");
           await runRole(ctx.cwd, ctx.model,
-            "You are the Lead. Own planning, judgment-heavy implementation, tests, PLAN.md and REPORT.md. Never commit. Write BUILDER_TASK.md as DELEGATE: NO or one bounded mechanical task.",
+            initialLeadPrompt,
             `Run iteration ${iteration} for loop/GOAL.md. Scout evidence:\n${scout}`,
             WRITE_TOOLS);
 
-          const builderTask = await readFile(join(loop, "BUILDER_TASK.md"), "utf8");
-          if (builderTask.startsWith("DELEGATE: YES")) {
+          let builderTask = await readFile(join(loop, "BUILDER_TASK.md"), "utf8");
+          let delegates = /^DELEGATE: YES\s*\n\S/m.test(builderTask);
+          let declines = /^DELEGATE: NO\s*\n\S/m.test(builderTask);
+          if (!delegates && !declines) {
+            await runRole(ctx.cwd, ctx.model,
+              initialLeadPrompt,
+              `Retry iteration ${iteration}: BUILDER_TASK.md was malformed or lacked a reason. Correct that role-contract breach without editing product code. Scout evidence:\n${scout}`,
+              WRITE_TOOLS);
+            builderTask = await readFile(join(loop, "BUILDER_TASK.md"), "utf8");
+            delegates = /^DELEGATE: YES\s*\n\S/m.test(builderTask);
+            declines = /^DELEGATE: NO\s*\n\S/m.test(builderTask);
+          }
+          if (!delegates && !declines) {
+            state = (await readFile(statePath, "utf8")).replace(/^status:.*$/m, "status: error");
+            await writeFile(statePath, state);
+            throw new Error("Lead twice wrote a malformed or unexplained BUILDER_TASK.md decision");
+          }
+          if (delegates) {
             const builder = await runRole(ctx.cwd, ctx.model,
-              "You are a mechanical Builder. Follow BUILDER_TASK.md exactly, touch only owned files, never edit loop/, and never make design decisions.",
+              "You are the primary Builder. Perform the main implementation pass in BUILDER_TASK.md, including substantive logic, tests, and integration work. Follow the Lead's approach and repository patterns, touch only owned files, never edit loop/, and stop if architectural intent is ambiguous.",
               builderTask,
               WRITE_TOOLS);
-            await runRole(ctx.cwd, ctx.model,
-              "You are the Lead returning for final review. Own and correct the Builder diff, rerun checks, and update REPORT.md. Never commit.",
-              `Review iteration ${iteration}. Builder report:\n${builder}`,
-              WRITE_TOOLS);
+            const reviewPrompt = "You are the Lead returning for final review. Inspect and own the complete Builder diff, make only necessary corrective edits, rerun checks, and update REPORT.md. Include an Implementation provenance section separating primary Builder work from Lead corrections. Do not replace the main Builder pass with a rewrite. Never commit.";
+            await runRole(ctx.cwd, ctx.model, reviewPrompt,
+              `Review iteration ${iteration}. Builder report:\n${builder}`, WRITE_TOOLS);
+            let report = await readFile(join(loop, "REPORT.md"), "utf8");
+            if (!/^## Implementation provenance\s*$/m.test(report)) {
+              await runRole(ctx.cwd, ctx.model, reviewPrompt,
+                `Retry the iteration ${iteration} review: REPORT.md omitted mandatory implementation provenance. Builder report:\n${builder}`,
+                WRITE_TOOLS);
+              report = await readFile(join(loop, "REPORT.md"), "utf8");
+            }
+            if (!/^## Implementation provenance\s*$/m.test(report)) {
+              state = (await readFile(statePath, "utf8")).replace(/^status:.*$/m, "status: error");
+              await writeFile(statePath, state);
+              throw new Error("Lead twice omitted mandatory Builder implementation provenance");
+            }
           }
 
           const evalScout = await runRole(ctx.cwd, ctx.model,

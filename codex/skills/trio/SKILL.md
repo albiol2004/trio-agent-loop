@@ -44,10 +44,12 @@ For each iteration, orchestrate these native agents synchronously:
 
 1. Spawn `trio-scout` (Luna High) for read-only reconnaissance. Keep its brief.
 2. Spawn `trio-lead` (Terra High), passing the goal, mailbox, iteration, and
-   scout brief. It plans, implements judgment-heavy work, writes REPORT.md,
-   and writes BUILDER_TASK.md as `DELEGATE: NO` or one bounded task.
-3. On `DELEGATE: YES`, spawn `trio-builder` (Luna High) for only that task,
-   then spawn `trio-lead` again for Terra review and final ownership.
+   scout brief. It plans the increment without editing product code and writes
+   BUILDER_TASK.md as `DELEGATE: YES` with the main implementation task, or
+   `DELEGATE: NO` only when no code change is required.
+3. On `DELEGATE: YES`, spawn `trio-builder` (Luna High) for that substantive
+   implementation pass, then spawn `trio-lead` again for Terra review,
+   corrective edits, verification, REPORT.md, and final ownership.
 4. Spawn `trio-scout` again for evaluator reconnaissance. It must inspect the
    goal, plan, and actual diff without reading REPORT.md or issuing a verdict.
 5. Spawn `trio-evaluator` (Terra High), passing that brief. It independently
@@ -56,6 +58,10 @@ For each iteration, orchestrate these native agents synchronously:
 Use the exact custom agent type on every spawn. Never use a generic agent,
 inherit the parent model, or override the custom agent's configured model.
 The main Codex task owns orchestration; workers must not spawn workers.
+A code-changing iteration is incomplete unless REPORT.md records a Luna
+Builder as primary implementor and distinguishes any Terra corrective edits.
+Retry the Lead once if the delegation contract or provenance is missing; on a
+second failure, stop with a role-contract error instead of silently continuing.
 
 ## CLI fallback mode
 

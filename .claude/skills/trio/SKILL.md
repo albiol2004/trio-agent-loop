@@ -18,8 +18,8 @@ You are the **orchestrator** of a two-agent loop. You do no planning, implementi
    - **Plateau check**: research shows iterate-loop gains flatten after ~3 iterations. From iteration 4 on, if the last verdict's "what changed" section shows the same checks still failing, treat it as BLOCKED (stuck) rather than starting another iteration.
 3. Otherwise increment `iteration` in STATE.md, set `status: running`, and proceed.
 
-## 1. Lead (plan + implement)
-Spawn the `trio-lead` agent synchronously (run_in_background: false). Prompt: the iteration number + instruction to update `loop/PLAN.md`, implement the increment, and write `loop/REPORT.md` per its role instructions; remind it to delegate scoped work to `trio-scout` / `trio-builder` subagents.
+## 1. Lead (plan + delegate implementation + review)
+Spawn the `trio-lead` agent synchronously (run_in_background: false). Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` Sonnet agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to use `trio-scout` for scoped exploration and that Opus must not replace the mandatory first implementation pass.
 
 After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
 
@@ -38,5 +38,6 @@ Then:
 ## Hard rules
 - Never edit the mailbox files yourself except STATE.md bookkeeping — content belongs to the roles.
 - Never fix code yourself, even for a trivial failure; that's the next iteration's job.
+- A code-changing Lead run is incomplete unless REPORT.md records at least one Sonnet builder as the primary implementor. Retry the Lead once if that provenance is missing; on a second failure, set `status: error`, report the role-contract breach, and end the loop.
 - The two roles run strictly sequentially — never in parallel; the Evaluator reads the Lead's output files.
 - If a role agent dies or returns without writing its file, retry it once with a note about what's missing; if it fails again, set `status: error` in STATE.md, report to the human, end the loop.

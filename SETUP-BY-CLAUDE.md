@@ -25,8 +25,11 @@ install the "trio" duo agent loop on the local machine. Do this:
      loop/STATE.md (default 10) is the budget cap.
 4. Do NOT modify the role files during install. The model contract is fixed in
    the agent frontmatter: Lead and Evaluator are Opus agents; their explorers
-   (`trio-scout`) and implementors (`trio-builder`) are Sonnet agents. Keep
-   that split intact unless the human explicitly changes the architecture.
+   (`trio-scout`) and primary implementors (`trio-builder`) are Sonnet agents.
+   Every code-changing increment starts with a Sonnet builder's main
+   implementation pass; the Opus Lead plans, reviews, and may make corrective
+   edits afterward. Keep that split intact unless the human explicitly changes
+   the architecture.
 
 Design rationale and research citations live in README.md — read it if the
 user asks why the loop is shaped this way.

@@ -52,8 +52,15 @@ For long work, `/goal Run a trio loop on <task> until SHIP or BLOCKED` keeps
 the outer task persistent. The Trio skill uses Codex's native multi-agent
 tools and exact named custom agents:
 
-- Terra High: `trio-lead`, post-Builder Lead review, `trio-evaluator`.
-- Luna High: `trio-scout`, `trio-builder`, evaluator reconnaissance.
+- Terra High: `trio-lead` planning and post-Builder review/correction,
+  `trio-evaluator`.
+- Luna High: `trio-scout`, the mandatory main implementation pass by
+  `trio-builder`, and evaluator reconnaissance.
+
+For every code-changing increment, Terra defines the approach but does not
+edit product code on its initial pass. Luna performs the primary implementation;
+Terra then reviews, verifies, and may make corrective edits. REPORT.md records
+that provenance. This role split is required, not an optional optimization.
 
 The main Codex task owns every spawn. Codex's default `agents.max_depth = 1`
 lets the main task spawn direct role agents while preventing those agents from

@@ -17,8 +17,11 @@ driver, or a subprocess-based subagent package.
    ```
 
 The installed `~/.pi/agent/extensions/trio.ts` command uses Pi's official
-`createAgentSession()` SDK with in-memory sessions for Scout, Lead, optional
-Builder, evaluator reconnaissance, and Evaluator. It never starts another
+`createAgentSession()` SDK with in-memory sessions for Scout, Lead, Builder,
+evaluator reconnaissance, and Evaluator. The Builder is skipped only when an
+increment requires no product-code change; otherwise it performs the main
+implementation pass before Lead review and corrective edits. REPORT.md records
+that provenance. The extension never starts another
 `pi` executable. Every role uses the model selected in the active Pi session
 at High thinking level; change the active model before `/trio` if needed.
 

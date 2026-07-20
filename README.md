@@ -5,9 +5,9 @@
 ![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-d97757.svg)
 
 A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
-roles — a **Lead** that plans and implements, and an adversarial **Evaluator**
+roles — a **Lead** that plans, delegates, and reviews, and an adversarial **Evaluator**
 that independently verifies — prompt each other through markdown mailbox
-files, fanning out cheap worker agents, iterating autonomously until the work
+files, fanning out scoped worker agents, iterating autonomously until the work
 ships or a human decision is needed. Claude, ZCode, and Pi use their native
 orchestration surfaces. Codex prefers native custom agents and can fall back
 to isolated bundled Codex sessions when an app task does not expose native
@@ -21,7 +21,7 @@ spawn controls. The shell driver remains for other headless harnesses.
                       ▼                       ▼
                   trio-lead              trio-evaluator
                 (Opus: plan +          (Opus: adversarial
-                 implement)             verify + API currency)
+                 review/fix)             verify + API currency)
                    │     │                │        │
              scout(s) builder(s)      scout(s)  WebSearch
              (Sonnet) (Sonnet)        (Sonnet)  (docs/CVEs)
@@ -43,18 +43,24 @@ spawn controls. The shell driver remains for other headless harnesses.
   `/trio` continues where it left off.
 
 ## The roles
+
+The model column shows the Claude reference bundle; other native integrations
+preserve the same judgment-tier/worker-tier boundary with their own models.
+
 | Role | Model | Reads | Writes | Job |
 |------|-------|-------|--------|-----|
-| trio-lead | Opus | GOAL, VERDICT, STATE | PLAN.md, REPORT.md + the code | plans AND implements the smallest verifiable increment; only role that edits product code; fans out Sonnet workers |
+| trio-lead | Opus | GOAL, VERDICT, STATE | PLAN.md, REPORT.md + corrective code edits | plans the increment, delegates its main implementation pass to the Builder tier, then reviews, verifies, and fixes as needed |
 | trio-evaluator | Opus | GOAL, PLAN, diff (REPORT last) | VERDICT.md | adversarial verification grounded in its own test runs + web checks that APIs used are current for the pinned versions; verdict SHIP / ITERATE / BLOCKED |
 | trio-scout | Sonnet | repo (read-only) | — | recon questions for either lead role |
-| trio-builder | Sonnet | repo | code | one well-specified mechanical task at a time (sequential on shared files) |
+| trio-builder | Sonnet | repo | code | primary implementor for one well-specified task, including substantive logic and tests (sequential on shared files) |
 
-Separation of powers is the point: the agent that wrote the code never grades
-it, and the agent that grades it is forbidden from fixing it. Merging the old
-Planner into the Lead follows the evidence (planning + implementing in one
-fresh context is fine); the independent grounded Evaluator is the one split
-the literature says you must never remove.
+Separation of powers is the point: the Builder tier performs the main
+implementation pass, the Lead owns the design and reviews or corrects that
+work, and the independent Evaluator is forbidden from fixing what it grades.
+Keeping planning and delivery ownership in the Lead follows the evidence;
+delegating the code-writing pass keeps its context focused without removing
+accountability. Native bundles enforce this provenance; portable single-agent
+harnesses cannot because they expose no subagent surface.
 
 ## Install
 ```bash
