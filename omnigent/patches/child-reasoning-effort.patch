@@ -1,0 +1,531 @@
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 3dc5ca7a..c453b76f 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -50,6 +50,7 @@ from omnigent.model_override import (
+     validate_model_override,
+ )
+ from omnigent.native_coding_agents import public_agent_name
++from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
+ from omnigent.runtime import pending_elicitations
+ from omnigent.session_lifecycle import (
+     CLOSED_LABEL_KEY,
+@@ -1007,6 +1008,18 @@ def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
+     return validate_model_override(raw_model)
+ 
+ 
++def _subagent_reasoning_effort_from_args(args: dict[str, Any]) -> str | None:
++    """Extract and validate a creation-only child reasoning effort."""
++    raw_message = args.get("args")
++    if not isinstance(raw_message, dict):
++        return None
++    return validate_effort(
++        raw_message.get("reasoning_effort"),
++        "session",
++        EFFORT_VALUES,
++    )
++
++
+ def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
+     """
+     Extract the optional ``file_ids`` from ``sys_session_send`` args.
+@@ -1469,6 +1482,11 @@ async def _execute_subagent_tool(
+     except ValueError as exc:
+         return f"Error: sys_session_send invalid 'model': {exc}"
+ 
++    try:
++        reasoning_effort = _subagent_reasoning_effort_from_args(args)
++    except ValueError as exc:
++        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
++
+     try:
+         file_ids = _subagent_file_ids_from_args(args)
+     except ValueError as exc:
+@@ -1503,6 +1521,13 @@ async def _execute_subagent_tool(
+                 "existing session. Re-send without 'model' to continue "
+                 f"session {target_session_id!r}."
+             )
++        if reasoning_effort is not None:
++            return (
++                "Error: sys_session_send 'reasoning_effort' applies only when a "
++                "sub-agent session is first created; it cannot change an existing "
++                "session. Re-send without 'reasoning_effort' to continue "
++                f"session {target_session_id!r}."
++            )
+         if file_ids:
+             return (
+                 "Error: sys_session_send 'file_ids' is supported only when "
+@@ -1587,6 +1612,15 @@ async def _execute_subagent_tool(
+                 "it, or sys_session_close it first to spawn a fresh "
+                 "session on the requested model."
+             )
++        if reasoning_effort is not None:
++            return (
++                f"Error: sys_session_send 'reasoning_effort' applies only when a "
++                f"sub-agent session is first created; {sub_agent_name!r} "
++                f"title {session_name!r} already exists as "
++                f"{child_session_id}. Re-send without 'reasoning_effort' to "
++                "continue it, or sys_session_close it first to spawn a fresh "
++                "session on the requested effort."
++            )
+         if file_ids:
+             return (
+                 f"Error: sys_session_send 'file_ids' applies only when a "
+@@ -1701,6 +1735,8 @@ async def _execute_subagent_tool(
+         }
+         if harness_override_canonical is not None:
+             create_body["harness_override"] = harness_override_canonical
++        if reasoning_effort is not None:
++            create_body["reasoning_effort"] = reasoning_effort
+         if model is not None:
+             # Reject up front when the child harness would silently
+             # ignore the persisted override — no silent drops.
+@@ -2063,6 +2099,7 @@ def _build_session_create_body(
+     title: Any,
+     message: Any,
+     model: Any = None,
++    reasoning_effort: Any = None,
+ ) -> dict[str, Any]:
+     """
+     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
+@@ -2091,6 +2128,9 @@ def _build_session_create_body(
+         body["title"] = title
+     if isinstance(model, str) and model:
+         body["model_override"] = model
++    effort = validate_effort(reasoning_effort, "session", EFFORT_VALUES)
++    if effort is not None:
++        body["reasoning_effort"] = effort
+     if isinstance(message, str) and message:
+         body["initial_items"] = [
+             {
+@@ -2235,13 +2275,17 @@ async def _execute_session_create(
+             agent_spec=agent_spec,
+             runner_workspace=runner_workspace,
+         )
+-    body = _build_session_create_body(
+-        str(agent_id),
+-        conversation_id,
+-        args.get("title"),
+-        args.get("message"),
+-        model=args.get("model"),
+-    )
++    try:
++        body = _build_session_create_body(
++            str(agent_id),
++            conversation_id,
++            args.get("title"),
++            args.get("message"),
++            model=args.get("model"),
++            reasoning_effort=args.get("reasoning_effort"),
++        )
++    except ValueError as exc:
++        return json.dumps({"error": f"invalid reasoning_effort: {exc}"})
+     try:
+         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+     except Exception as exc:  # noqa: BLE001
+@@ -2406,6 +2450,12 @@ async def _upload_config_bundle(
+     title = args.get("title")
+     if isinstance(title, str) and title:
+         metadata["title"] = title
++    try:
++        effort = validate_effort(args.get("reasoning_effort"), "session", EFFORT_VALUES)
++    except ValueError as exc:
++        return json.dumps({"error": f"invalid reasoning_effort: {exc}"})
++    if effort is not None:
++        metadata["reasoning_effort"] = effort
+     try:
+         resp = await server_client.post(
+             "/v1/sessions",
+diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
+index a01acc9c..a9e724bf 100644
+--- a/omnigent/tools/builtins/spawn.py
++++ b/omnigent/tools/builtins/spawn.py
+@@ -288,7 +288,7 @@ def _build_sys_session_send_schema(
+             "The user-input message to send to the sub-agent. The sub-agent "
+             "treats this as the first user turn in its conversation. Pass a "
+             "plain string for the normal contract, or pass "
+-            "{input, purpose, model, harness, cost_budget} when a spec-level "
++            "{input, purpose, model, reasoning_effort, harness, cost_budget} when a spec-level "
+             "policy requires explicit dispatch metadata, a per-dispatch model "
+             "override, an allowlisted harness override, or a per-subagent "
+             "cost budget."
+@@ -298,7 +298,7 @@ def _build_sys_session_send_schema(
+             "The user-input message to send to the sub-agent. The sub-agent "
+             "treats this as the first user turn in its conversation. Pass a "
+             "plain string for the normal contract, or pass "
+-            "{input, purpose, model, cost_budget} when a spec-level policy "
++            "{input, purpose, model, reasoning_effort, cost_budget} when a spec-level policy "
+             "requires explicit dispatch metadata, a per-dispatch model "
+             "override, or a per-subagent cost budget."
+         )
+@@ -357,6 +357,25 @@ def _build_sys_session_send_schema(
+                                             "omitted = the harness default."
+                                         ),
+                                     },
++                                    "reasoning_effort": {
++                                        "type": "string",
++                                        "enum": [
++                                            "none",
++                                            "minimal",
++                                            "low",
++                                            "medium",
++                                            "high",
++                                            "xhigh",
++                                            "max",
++                                        ],
++                                        "description": (
++                                            "Optional reasoning effort for the sub-agent "
++                                            "harness. Applies only when this send CREATES "
++                                            "the sub-agent session; omitted = the harness "
++                                            "or agent default. Provider-specific support is "
++                                            "validated when the child starts."
++                                        ),
++                                    },
+                                     "file_ids": {
+                                         "type": "array",
+                                         "items": {"type": "string", "minLength": 1},
+@@ -932,6 +951,23 @@ class SysSessionCreateTool(Tool):
+                                 "omit to use the agent's default."
+                             ),
+                         },
++                        "reasoning_effort": {
++                            "type": "string",
++                            "enum": [
++                                "none",
++                                "minimal",
++                                "low",
++                                "medium",
++                                "high",
++                                "xhigh",
++                                "max",
++                            ],
++                            "description": (
++                                "Optional reasoning effort for the child session. "
++                                "Sets the harness effort at session creation; omit "
++                                "to use the agent or harness default."
++                            ),
++                        },
+                     },
+                     # Only the always-optional fields are listed in
+                     # ``required`` (none): the agent_id-vs-config_path
+diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
+index c9373270..1e8c7dee 100644
+--- a/tests/runner/test_runner_dispatch.py
++++ b/tests/runner/test_runner_dispatch.py
+@@ -2945,6 +2945,55 @@ async def test_sys_session_send_model_lands_in_child_create_body(
+     assert create_bodies[0]["sub_agent_name"] == "worker"
+ 
+ 
++@pytest.mark.asyncio
++async def test_sys_session_send_reasoning_effort_lands_in_child_create_body(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A per-dispatch effort is persisted on the newly created child."""
++    from omnigent.runner import app as runner_app
++    from omnigent.runner.tool_dispatch import execute_tool
++
++    create_bodies: list[dict[str, Any]] = []
++    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
++    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
++    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
++
++    async def _server_handler(request: httpx.Request) -> httpx.Response:
++        if request.method == "GET":
++            return httpx.Response(200, json={"data": []})
++        if request.method == "POST" and request.url.path == "/v1/sessions":
++            create_bodies.append(json.loads(request.content))
++            return httpx.Response(201, json={"id": "conv_child_effort"})
++        if request.method == "POST" and request.url.path.endswith("/events"):
++            return httpx.Response(202, json={"queued": True})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(_server_handler), base_url="http://server"
++    ) as server_client:
++        try:
++            output = await execute_tool(
++                tool_name="sys_session_send",
++                arguments=json.dumps(
++                    {
++                        "agent": "worker",
++                        "title": "implement",
++                        "args": {"input": "build it", "reasoning_effort": "xhigh"},
++                    }
++                ),
++                server_client=server_client,
++                conversation_id="conv_parent_effort",
++                agent_spec=_spec_with_subagent_harness("codex-native"),
++                session_inbox=session_inbox,
++            )
++        finally:
++            runner_app.unregister_subagent_work("conv_child_effort")
++            runner_app._session_inboxes_ref.pop("conv_parent_effort", None)
++
++    assert json.loads(output)["status"] == "launching"
++    assert create_bodies[0]["reasoning_effort"] == "xhigh"
++
++
+ @pytest.mark.asyncio
+ async def test_sys_session_send_blocks_fresh_dispatch_when_harness_cli_missing(
+     monkeypatch: pytest.MonkeyPatch,
+@@ -6013,7 +6062,14 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
+     ) as server_client:
+         output = await execute_tool(
+             tool_name="sys_session_create",
+-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
++            arguments=json.dumps(
++                {
++                    "agent_id": "ag_x",
++                    "title": "auth",
++                    "message": "start",
++                    "reasoning_effort": "high",
++                }
++            ),
+             server_client=server_client,
+             conversation_id="conv_caller",
+         )
+@@ -6023,6 +6079,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
+     assert captured["parent_session_id"] == "conv_caller"
+     assert captured["agent_id"] == "ag_x"
+     assert captured["title"] == "auth"
++    assert captured["reasoning_effort"] == "high"
+     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+     handle = json.loads(output)
+     assert handle["conversation_id"] == "conv_child"
+diff --git a/tests/tools/builtins/test_spawn.py b/tests/tools/builtins/test_spawn.py
+index 78fc0d88..9334ad3e 100644
+--- a/tests/tools/builtins/test_spawn.py
++++ b/tests/tools/builtins/test_spawn.py
+@@ -58,6 +58,20 @@ def test_file_ids_present_and_optional() -> None:
+     assert branch["additionalProperties"] is False
+ 
+ 
++def test_reasoning_effort_present_and_optional() -> None:
++    branch = _object_branch()
++    assert branch["properties"]["reasoning_effort"]["enum"] == [
++        "none",
++        "minimal",
++        "low",
++        "medium",
++        "high",
++        "xhigh",
++        "max",
++    ]
++    assert "reasoning_effort" not in branch["required"]
++
++
+ def test_description_mentions_file_ids() -> None:
+     schema = _schema_with_subagent()
+     assert "file_ids" in schema["function"]["description"]
+diff --git a/omnigent/server/routes/sessions.py b/omnigent/server/routes/sessions.py
+index 9aa7b52c..d929870c 100644
+--- a/omnigent/server/routes/sessions.py
++++ b/omnigent/server/routes/sessions.py
+@@ -12623,6 +12623,38 @@ async def _remove_session_worktree_best_effort(
+         )
+ 
+ 
++def _resolve_agent_spec(
++    *,
++    agent: Agent,
++    agent_cache: AgentCache | None,
++) -> AgentSpec | None:
++    """
++    Load an already-registered agent's trusted root spec.
++
++    Registered-agent session creation binds by durable ``agent_id`` rather
++    than ``sub_agent_name``. Native launch wiring declared by that agent still
++    needs the same trusted-spec derivation used for bundled named children.
++
++    :param agent: The selected registered agent row.
++    :param agent_cache: Cache for loading the parsed agent bundle. ``None``
++        disables resolution.
++    :returns: The root :class:`AgentSpec`, or ``None`` when unavailable.
++    """
++    if agent_cache is None:
++        return None
++    try:
++        return agent_cache.load(
++            agent.id, agent.bundle_location, expand_env=agent.session_id is None
++        ).spec
++    except Exception:  # noqa: BLE001 -- launch derivation is best-effort.
++        _logger.warning(
++            "Could not load bundle for registered agent %s to derive launch config",
++            agent.id,
++            exc_info=True,
++        )
++        return None
++
++
+ def _resolve_subagent_spec(
+     *,
+     agent: Agent,
+@@ -12648,24 +12680,10 @@ def _resolve_subagent_spec(
+     :returns: The matching child :class:`AgentSpec`, or ``None`` when the
+         cache is absent, the bundle fails to load, or no sub-agent matches.
+     """
+-    if agent_cache is None:
+-        return None
+     from omnigent.runtime.workflow import _find_spec_by_name
+ 
+-    try:
+-        parent_spec = agent_cache.load(
+-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+-        ).spec
+-    except Exception:  # noqa: BLE001 -- create-time resolution is best-effort; never block create.
+-        # A bundle that fails to load here must not break session
+-        # creation; the session still works, just without the
+-        # derived labels / launch args.
+-        _logger.warning(
+-            "Could not load bundle for agent %s to resolve sub-agent %r spec",
+-            agent.id,
+-            sub_agent_name,
+-            exc_info=True,
+-        )
++    parent_spec = _resolve_agent_spec(agent=agent, agent_cache=agent_cache)
++    if parent_spec is None:
+         return None
+     return _find_spec_by_name(parent_spec, sub_agent_name)
+ 
+@@ -13132,6 +13150,7 @@ async def _create_session_from_existing_agent(
+     # flat-list shape plus this bounds check is the security boundary;
+     # mirrors the multipart create + PATCH paths.
+     sub_spec: AgentSpec | None = None
++    registered_agent_spec: AgentSpec | None = None
+     if body.sub_agent_name:
+         sub_spec = _resolve_subagent_spec(
+             agent=agent,
+@@ -13149,10 +13168,21 @@ async def _create_session_from_existing_agent(
+             ) from exc
+     else:
+         try:
+-            validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
++            if body.terminal_launch_args is not None:
++                validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
++            else:
++                registered_agent_spec = _resolve_agent_spec(
++                    agent=agent,
++                    agent_cache=agent_cache,
++                )
++                validated_launch_args = (
++                    _derive_terminal_launch_args_from_spec(registered_agent_spec)
++                    if registered_agent_spec is not None
++                    else None
++                )
+         except ValueError as exc:
+             raise OmnigentError(
+-                f"invalid terminal_launch_args: {exc}",
++                f"invalid terminal_launch_args in registered agent spec: {exc}",
+                 code=ErrorCode.INVALID_INPUT,
+             ) from exc
+ 
+@@ -13246,6 +13276,16 @@ async def _create_session_from_existing_agent(
+         _merged.update(_sa_labels)
+         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
+         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
++    elif registered_agent_spec is not None and (
++        _agent_labels := _native_subagent_wrapper_labels_from_spec(registered_agent_spec)
++    ):
++        # A session created from a durable registered agent id must preserve
++        # the native-terminal presentation declared by that agent's own spec,
++        # just like a bundled named sub-agent.
++        _merged = dict(body.labels) if body.labels else {}
++        _merged.update(_agent_labels)
++        await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
++        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+     elif body.labels:
+         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+ 
+diff --git a/tests/server/integration/test_sessions_child_sessions.py b/tests/server/integration/test_sessions_child_sessions.py
+index ce74dd39..e3d8f8d2 100644
+--- a/tests/server/integration/test_sessions_child_sessions.py
++++ b/tests/server/integration/test_sessions_child_sessions.py
+@@ -1215,6 +1215,88 @@ async def _create_parent_with_subagents(
+     return {"session_id": session_id, "agent_id": agent_resp.json()["id"]}
+ 
+ 
++def _bundle_with_native_root(
++    name: str,
++    harness: str,
++    config: dict[str, Any],
++) -> bytes:
++    """Build a registered agent whose root executor uses a native harness."""
++    root_config = {
++        "spec_version": 1,
++        "name": name,
++        "executor": {
++            "type": "omnigent",
++            "model": f"test-{name}",
++            "config": {"harness": harness, **config},
++        },
++        "prompt": "test native registered agent",
++    }
++    buf = io.BytesIO()
++    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
++        cfg = yaml.dump(root_config).encode()
++        info = tarfile.TarInfo(name="config.yaml")
++        info.size = len(cfg)
++        tf.addfile(info, io.BytesIO(cfg))
++    return buf.getvalue()
++
++
++@pytest.mark.parametrize(
++    "harness,root_config,expected_args",
++    [
++        (
++            "claude-native",
++            {"permission_mode": "bypassPermissions"},
++            ["--permission-mode", "bypassPermissions"],
++        ),
++        (
++            "codex-native",
++            {"yolo": True},
++            ["--dangerously-bypass-approvals-and-sandbox"],
++        ),
++    ],
++)
++async def test_registered_native_agent_create_derives_launch_args_from_root_spec(
++    client: httpx.AsyncClient,
++    harness: str,
++    root_config: dict[str, Any],
++    expected_args: list[str],
++) -> None:
++    """
++    Durable ``agent_id`` launches inherit native permission flags from YAML.
++
++    ``sys_session_create(agent_id=...)`` creates this JSON-path shape with no
++    ``sub_agent_name`` and no caller-supplied launch args. Dropping the root
++    spec here launches Claude/Codex in prompting mode even though the
++    registered role declares headless bypass.
++    """
++    bundle = _bundle_with_native_root(
++        name=f"registered-{harness}",
++        harness=harness,
++        config=root_config,
++    )
++    bootstrap = await client.post(
++        "/v1/sessions",
++        data={"metadata": json.dumps({})},
++        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
++    )
++    assert bootstrap.status_code == 201, bootstrap.text
++    bootstrap_id = bootstrap.json()["session_id"]
++    agent_resp = await client.get(f"/v1/sessions/{bootstrap_id}/agent")
++    assert agent_resp.status_code == 200, agent_resp.text
++
++    created = await client.post(
++        "/v1/sessions",
++        json={
++            "agent_id": agent_resp.json()["id"],
++            "parent_session_id": bootstrap_id,
++            "title": "registered native child",
++        },
++    )
++    assert created.status_code == 201, created.text
++    assert created.json()["terminal_launch_args"] == expected_args
++    assert created.json()["labels"]["omnigent.ui"] == "terminal"
++
++
+ @pytest.mark.parametrize(
+     "harness,expected_wrapper",
+     [

@@ -1,0 +1,40 @@
+spec_version: 1
+name: trio-omnigent-lead
+description: Opus Trio lead that plans, reviews the implementation pass, and corrects.
+spawn: true
+executor:
+  type: omnigent
+  model: claude-opus-4-8
+  config: {harness: claude-native, permission_mode: bypassPermissions}
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox: {type: none}
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments: {gate_pushes: false}
+prompt: |
+  You are the Trio Lead and own delegation for one complete iteration. Read
+  GOAL.md, VERDICT.md, STATE.md, then PLAN.md from the mailbox named in the
+  task. Maintain PLAN.md with the smallest verifiable increment and objective
+  acceptance criteria.
+
+  Resolve the exact trio-omnigent-builder and trio-omnigent-scout agent IDs
+  from ${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles/registry.json.
+  Decide whether reconnaissance is needed. Launch Scout only when useful and
+  launch the primary Builder yourself with sys_session_create, always passing
+  model gpt-5.6-luna and reasoning_effort xhigh. Use only those exact registered
+  Luna roles; never create another Lead, Evaluator, or coordinator. Child
+  creation is asynchronous: consume completion notifications instead of
+  polling, and continue an existing child without model or effort fields.
+
+  Give Builder a bounded task with objective, approach, owned files, done
+  criteria, and boundaries. After its result, inspect the actual diff, run
+  verification, correct integration or correctness issues yourself, and
+  overwrite REPORT.md. Never edit GOAL.md, commit, push, or touch another
+  mailbox.

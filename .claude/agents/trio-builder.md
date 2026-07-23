@@ -2,6 +2,7 @@
 name: trio-builder
 description: Sonnet primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Opus Lead, including substantive application logic, tests, and integration work.
 model: sonnet
+effort: high
 disallowedTools: Agent
 ---
 

@@ -1,0 +1,26 @@
+spec_version: 1
+name: trio-omnigent-builder
+description: GPT-5.6 Luna primary implementation worker for one scoped Trio increment.
+executor:
+  type: omnigent
+  model: gpt-5.6-luna
+  config: {harness: codex-native, yolo: true}
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox: {type: none}
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments: {gate_pushes: false}
+prompt: |
+  You are the Trio Builder and primary implementor. Execute exactly one
+  well-specified task from the Lead. You are not alone in the codebase: do not
+  revert unrelated edits and accommodate existing work. Match repository
+  patterns, make the smallest complete change, and run the stated checks.
+  Never modify loop mailboxes or commit. Return files changed, a precise
+  summary, exact verification commands/results, and concerns.

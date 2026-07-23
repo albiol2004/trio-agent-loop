@@ -75,6 +75,7 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ```bash
 ./install.sh --global            # ~/.claude — every project on this machine
 ./install.sh ~/src/myproject     # or per-project, committed to the repo
+./install.sh --omnigent          # mixed Opus/Luna roles through Omnigent
 ./install.sh --kimi              # Kimi Code skills + sequential role runner
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
@@ -162,6 +163,15 @@ parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
 
+Omnigent adds four registered role agents: Claude Opus 4.8 at high effort for
+Lead/Evaluator and GPT-5.6 Luna at xhigh effort for Scout/Builder. The
+already-open Claude/Codex UI session schedules Opus iterations; Lead and
+Evaluator decide and launch their own Luna delegation. There is no extra
+coordinator model. See
+[SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
+`trio-omnigent` entrypoint to both native skill directories. Say “Run a Trio
+Omnigent loop to …”; ordinary “Run a Trio loop” remains native.
+
 ## Files
 ```
 .claude/agents/trio-{lead,evaluator,scout,builder}.md
@@ -172,6 +182,9 @@ codex/                               # custom agents, skills, fallback runner
   skills/trio/references/TROUBLESHOOTING.md
   skills/trio/scripts/run-role.sh
   skills/trio/references/prompts/*.md
+omnigent/trio-omnigent-roles/        # registered mixed-provider role configs
+  {lead,evaluator,builder,scout}/config.yaml
+omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
 loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md
 portable/                            # non-Claude-Code harnesses
@@ -200,6 +213,7 @@ its harness — it installs the template and explains usage:
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
 - Kimi Code: `SETUP-BY-KIMI.md` (skills + sequential K3/Kimi-for-Coding runner)
 - OpenCode: `SETUP-BY-OPENCODE.md` (parameterized native roles + portable fallback)
+- Omnigent: `SETUP-BY-OMNIGENT.md` (mixed-provider native CLI child sessions)
 Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using
 its own harness's `portable/SETUP-*.md`.
 

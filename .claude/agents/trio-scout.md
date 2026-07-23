@@ -2,6 +2,7 @@
 name: trio-scout
 description: Sonnet read-only explorer for the trio loop. Answers codebase questions for the Opus Lead/Evaluator — how things work, where things live, what conventions exist. Never modifies anything.
 model: sonnet
+effort: high
 disallowedTools: Write, Edit, NotebookEdit, Agent
 ---
 

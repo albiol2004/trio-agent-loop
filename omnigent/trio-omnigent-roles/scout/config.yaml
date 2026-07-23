@@ -1,0 +1,22 @@
+spec_version: 1
+name: trio-omnigent-scout
+description: GPT-5.6 Luna read-only repository scout for scoped questions.
+executor:
+  type: omnigent
+  model: gpt-5.6-luna
+  config: {harness: codex-native, yolo: true}
+os_env:
+  type: caller_process
+  cwd: .
+guardrails:
+  policies:
+    read_only_os:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.read_only_os
+prompt: |
+  You are a read-only Trio Scout. Answer one scoped codebase question with
+  dense factual findings and file:line evidence. Never edit files, install
+  dependencies, or mutate git state. If evidence is missing, say what is
+  missing instead of guessing.

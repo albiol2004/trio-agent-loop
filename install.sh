@@ -3,6 +3,7 @@
 #   ./install.sh --global          -> ~/.claude  (available in EVERY project; recommended)
 #   ./install.sh /path/to/project  -> <project>/.claude (committed with that repo)
 #   ./install.sh --codex           -> Codex skills + custom agents + fallback
+#   ./install.sh --omnigent        -> isolated mixed Claude/Codex Omnigent agent
 #   ./install.sh --kimi            -> Kimi Code skills + sequential fallback
 #   ./install.sh --zcode           -> native ZCode skills
 #   ./install.sh --pi              -> native Pi AgentSession extension
@@ -24,6 +25,79 @@ case "${1:-}" in
     chmod +x "$HOME/.agents/skills/trio/scripts/run-role.sh"
     echo "Installed Codex Trio. Native agents are preferred; isolated Codex CLI sessions are the fallback."
     echo "Next: follow SETUP-BY-CODEX.md to validate multi_agent and the target project's permission profile."
+    exit 0 ;;
+  --omnigent)
+    if [[ -n "${OMNIGENT_SOURCE:-}" ]]; then
+      [[ -d "$OMNIGENT_SOURCE/.git" ]] || {
+        echo "OMNIGENT_SOURCE must point to an Omnigent git checkout." >&2
+        exit 2
+      }
+      OMNIGENT_PATCH="$ROOT/omnigent/patches/child-reasoning-effort.patch"
+      if git -C "$OMNIGENT_SOURCE" apply --reverse --check "$OMNIGENT_PATCH" >/dev/null 2>&1; then
+        echo "Omnigent child reasoning-effort patch is already applied."
+      elif git -C "$OMNIGENT_SOURCE" apply --check "$OMNIGENT_PATCH"; then
+        git -C "$OMNIGENT_SOURCE" apply "$OMNIGENT_PATCH"
+        echo "Applied Omnigent child reasoning-effort patch."
+      else
+        echo "The bundled Omnigent patch does not apply cleanly to $OMNIGENT_SOURCE." >&2
+        echo "Inspect its existing child reasoning-effort support before continuing." >&2
+        exit 1
+      fi
+      command -v uv >/dev/null 2>&1 || {
+        echo "uv is required to install the patched Omnigent checkout." >&2
+        exit 1
+      }
+      uv tool install --force --python 3.12 --editable "$OMNIGENT_SOURCE"
+    fi
+    command -v omnigent >/dev/null 2>&1 || {
+      echo "omnigent is not installed or is not on PATH." >&2
+      exit 1
+    }
+    OMNIGENT_BIN="$(command -v omnigent)"
+    OMNIGENT_TOOL_PYTHON="$(head -n 1 "$OMNIGENT_BIN" | sed 's/^#!//')"
+    if [[ ! -x "$OMNIGENT_TOOL_PYTHON" ]] || ! "$OMNIGENT_TOOL_PYTHON" -c '
+from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
+branches = _build_sys_session_send_schema({})["function"]["parameters"]["properties"]["args"]["anyOf"]
+props = next(branch["properties"] for branch in branches if branch.get("type") == "object")
+raise SystemExit(0 if "reasoning_effort" in props else 1)
+'; then
+      echo "The active Omnigent installation lacks sys_session_send.args.reasoning_effort." >&2
+      echo "Set OMNIGENT_SOURCE=/path/to/omnigent and rerun this installer." >&2
+      exit 1
+    fi
+    if ! "$OMNIGENT_TOOL_PYTHON" -c '
+from omnigent.tools.builtins.spawn import SysSessionCreateTool
+schema = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
+raise SystemExit(0 if "reasoning_effort" in schema else 1)
+'; then
+      echo "The active Omnigent installation lacks sys_session_create.reasoning_effort." >&2
+      echo "Set OMNIGENT_SOURCE=/path/to/omnigent and rerun this installer." >&2
+      exit 1
+    fi
+    if ! "$OMNIGENT_TOOL_PYTHON" -c '
+from omnigent.server.routes.sessions import _resolve_agent_spec
+raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
+'; then
+      echo "The active Omnigent installation drops native permission flags on registered-agent launches." >&2
+      echo "Set OMNIGENT_SOURCE=/path/to/omnigent and rerun this installer." >&2
+      exit 1
+    fi
+    OMNIGENT_ROLES_DEST="${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles"
+    mkdir -p "$OMNIGENT_ROLES_DEST"
+    for role in lead evaluator builder scout; do
+      rm -rf "$OMNIGENT_ROLES_DEST/$role"
+      cp -r "$ROOT/omnigent/trio-omnigent-roles/$role" "$OMNIGENT_ROLES_DEST/"
+    done
+    CLAUDE_OMNIGENT_SKILL="$HOME/.claude/skills/trio-omnigent"
+    CODEX_OMNIGENT_SKILL="$HOME/.agents/skills/trio-omnigent"
+    rm -rf "$CLAUDE_OMNIGENT_SKILL" "$CODEX_OMNIGENT_SKILL"
+    mkdir -p "$HOME/.claude/skills" "$HOME/.agents/skills"
+    cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CLAUDE_OMNIGENT_SKILL/"
+    cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CODEX_OMNIGENT_SKILL/"
+    echo "Installed Omnigent Trio role configs at $OMNIGENT_ROLES_DEST."
+    echo "Installed current-session trio-omnigent entrypoints for Claude Code and Codex."
+    echo "One-time user action: run 'claude --permission-mode bypassPermissions', accept option 2, then exit."
+    echo "Next: from this cloned repo, let the setup agent register all four roles with sys_session_create."
     exit 0 ;;
   --kimi)
     KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
@@ -118,7 +192,7 @@ case "${1:-}" in
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --codex | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 
