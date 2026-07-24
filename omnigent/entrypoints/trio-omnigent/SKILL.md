@@ -9,8 +9,8 @@ never launch a separate coordinator with `omnigent run`.
 Use Omnigent's `sys_session_*` tools to launch only the two Opus roles as
 direct children of this session:
 
-- `trio-omnigent-lead`: Claude Opus 4.8, effort `high`
-- `trio-omnigent-evaluator`: Claude Opus 4.8, effort `high`
+- `trio-omnigent-lead`: Claude Opus 5, effort `high`
+- `trio-omnigent-evaluator`: Claude Opus 5, effort `high`
 
 The Opus roles own delegation. Lead may launch the registered Builder and
 Scout; Evaluator may launch the registered Scout for verification. Every Luna
@@ -76,14 +76,14 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
 
 1. Read GOAL, STATE, and the previous verdict. Enforce the iteration cap.
 2. Create a fresh Lead child with `sys_session_create(agent_id=..., model=
-   "claude-opus-4-8", reasoning_effort="high", message=...)`. Give it the
+   "claude-opus-5", reasoning_effort="high", message=...)`. Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
    perform its own Luna delegation, review/correct, verify, and write REPORT.
    Use a title containing mailbox and iteration.
 3. Inspect the completed Lead session tree. Any Luna children must belong to
    that Lead and show `gpt-5.6-luna` / `xhigh`. A Luna child directly under
    this coordinator is a topology failure.
-4. Create a fresh Evaluator child with `claude-opus-4-8` / `high`. Require it
+4. Create a fresh Evaluator child with `claude-opus-5` / `high`. Require it
    to independently verify, decide whether it needs a Luna Scout, and write
    VERDICT.
 5. Inspect the completed Evaluator session tree. Any Luna verification child

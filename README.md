@@ -126,7 +126,7 @@ actor-critic literature (Reflexion, self-preference-bias papers):
   merging the Evaluator away is the one empirically bad move.
 
 ## Tuning
-- **Fable while it lasts**: change `model: opus` → `model: fable` in
+- **Fable alternative**: change `model: claude-opus-5` → `model: fable` in
   `trio-lead.md` and/or `trio-evaluator.md` — both roles are judgment-heavy;
   keep workers on Sonnet. Do NOT downgrade the Evaluator below the Lead's
   tier: a weak critic measurably hurts (91.4%→82.8% in one study).
@@ -163,7 +163,7 @@ parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
 
-Omnigent adds four registered role agents: Claude Opus 4.8 at high effort for
+Omnigent adds four registered role agents: Claude Opus 5 at high effort for
 Lead/Evaluator and GPT-5.6 Luna at xhigh effort for Scout/Builder. The
 already-open Claude/Codex UI session schedules Opus iterations; Lead and
 Evaluator decide and launch their own Luna delegation. There is no extra

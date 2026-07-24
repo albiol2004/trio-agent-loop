@@ -1,7 +1,7 @@
 ---
 name: trio-lead
 description: Opus lead of the duo loop — plans, delegates the main implementation pass to Sonnet builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.
-model: opus
+model: claude-opus-5
 effort: high
 ---
 

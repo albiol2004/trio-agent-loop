@@ -23,7 +23,7 @@ Driver support: `HARNESS=hermes`.
 ```bash
 mkdir -p loop && cp portable/GOAL.template.md loop/GOAL.md   # edit it!
 HARNESS=hermes ./portable/driver.sh 10
-# Optional: HERMES_MODEL=anthropic/claude-opus-4-8 (passed as -m)
+# Optional: HERMES_MODEL=anthropic/claude-opus-5 (passed as -m)
 ```
 
 The driver runs: `hermes -z "<prompt>" --yolo --quiet` (timeout-wrapped).

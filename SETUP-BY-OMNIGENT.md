@@ -14,8 +14,8 @@ Installing or removing one does not overwrite the others.
 
 | Role | Harness | Model | Effort |
 |---|---|---|---|
-| Lead | `claude-native` | `claude-opus-4-8` | `high` |
-| Evaluator | `claude-native` | `claude-opus-4-8` | `high` |
+| Lead | `claude-native` | `claude-opus-5` | `high` |
+| Evaluator | `claude-native` | `claude-opus-5` | `high` |
 | Builder | `codex-native` | `gpt-5.6-luna` | `xhigh` |
 | Scout | `codex-native` | `gpt-5.6-luna` | `xhigh` |
 

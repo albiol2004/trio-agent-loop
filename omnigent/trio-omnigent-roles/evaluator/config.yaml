@@ -4,7 +4,7 @@ description: Opus adversarial Trio evaluator that verifies independently and nev
 spawn: true
 executor:
   type: omnigent
-  model: claude-opus-4-8
+  model: claude-opus-5
   config: {harness: claude-native, permission_mode: bypassPermissions}
 os_env:
   type: caller_process

@@ -115,8 +115,8 @@ import pathlib, sys, yaml
 
 root = pathlib.Path(sys.argv[1])
 expected = {
-    "lead": ("trio-omnigent-lead", "claude-native", "claude-opus-4-8"),
-    "evaluator": ("trio-omnigent-evaluator", "claude-native", "claude-opus-4-8"),
+    "lead": ("trio-omnigent-lead", "claude-native", "claude-opus-5"),
+    "evaluator": ("trio-omnigent-evaluator", "claude-native", "claude-opus-5"),
     "builder": ("trio-omnigent-builder", "codex-native", "gpt-5.6-luna"),
     "scout": ("trio-omnigent-scout", "codex-native", "gpt-5.6-luna"),
 }

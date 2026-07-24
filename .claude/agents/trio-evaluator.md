@@ -1,7 +1,7 @@
 ---
 name: trio-evaluator
 description: Opus adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using Sonnet explorers for scoped reconnaissance and Sonnet implementors only when delegated verification support is needed. Writes VERDICT.md with SHIP / ITERATE / BLOCKED. Never fixes anything itself.
-model: opus
+model: claude-opus-5
 effort: high
 ---
 
