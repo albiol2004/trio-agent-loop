@@ -83,6 +83,8 @@ installer_replacement_contract() {
   local roles="$omnigent_home/agents/trio-omnigent-roles"
   local claude_skill="$home/.claude/skills/trio-omnigent"
   local codex_skill="$home/.agents/skills/trio-omnigent"
+  local trioctl="$home/.local/bin/trioctl"
+  local trioctl_config="$home/.config/trio-agent-loop/omnigent.toml"
   local snapshot="$TMP/install-snapshot"
   mkdir -p "$TMP/bin" "$home"
   make_probe pass
@@ -101,6 +103,9 @@ installer_replacement_contract() {
   [[ "$(<"$roles/registry.json")" == '{"preserve":true}' ]] || return 1
   [[ "$(find "$roles" -type f -name config.yaml | wc -l)" -eq 4 ]] || return 1
   [[ -f "$claude_skill/SKILL.md" && -f "$codex_skill/SKILL.md" ]] || return 1
+  [[ -x "$trioctl" && -f "$trioctl_config" ]] || return 1
+  assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
+    | grep -Fq '"model": "opus"'
   [[ -z "$(find "$claude_skill" "$codex_skill" -type d -name scripts -print)" ]] || return 1
   mkdir -p "$TMP/expected-roles"
   assert cp -a "$ROOT/omnigent/trio-omnigent-roles/." "$TMP/expected-roles/"
@@ -137,6 +142,7 @@ PY
 check 'A3 installer probes effort schemas and registered-agent native launch support' installer_probe_contract
 check 'A4 installer replaces owned trees and preserves registry' installer_replacement_contract
 check 'A6 role configs parse as YAML and match the documented role table' role_yaml_contract
+check 'A7 trioctl unit tests pass' python3 -m pytest -q "$ROOT/omnigent/tests/test_trioctl.py"
 
 if [[ -n "${OMNIGENT_SOURCE:-}" ]]; then
   if git -C "$OMNIGENT_SOURCE" apply --reverse --check \

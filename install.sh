@@ -90,12 +90,24 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     done
     CLAUDE_OMNIGENT_SKILL="$HOME/.claude/skills/trio-omnigent"
     CODEX_OMNIGENT_SKILL="$HOME/.agents/skills/trio-omnigent"
+    TRIOCTL_BIN_DIR="${TRIOCTL_BIN_DIR:-$HOME/.local/bin}"
+    TRIOCTL_CONFIG="${TRIOCTL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/trio-agent-loop/omnigent.toml}"
     rm -rf "$CLAUDE_OMNIGENT_SKILL" "$CODEX_OMNIGENT_SKILL"
-    mkdir -p "$HOME/.claude/skills" "$HOME/.agents/skills"
+    mkdir -p "$HOME/.claude/skills" "$HOME/.agents/skills" "$TRIOCTL_BIN_DIR"
     cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CLAUDE_OMNIGENT_SKILL/"
     cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CODEX_OMNIGENT_SKILL/"
+    cp "$ROOT/omnigent/trioctl" "$TRIOCTL_BIN_DIR/trioctl"
+    cp "$ROOT/omnigent/trioctl.example.toml" "$TRIOCTL_BIN_DIR/trioctl.example.toml"
+    chmod +x "$TRIOCTL_BIN_DIR/trioctl"
+    "$TRIOCTL_BIN_DIR/trioctl" omnigent configure --config "$TRIOCTL_CONFIG"
     echo "Installed Omnigent Trio role configs at $OMNIGENT_ROLES_DEST."
     echo "Installed current-session trio-omnigent entrypoints for Claude Code and Codex."
+    echo "Installed trioctl at $TRIOCTL_BIN_DIR/trioctl."
+    echo "Omnigent Trio profile: $TRIOCTL_CONFIG"
+    case ":$PATH:" in
+      *":$TRIOCTL_BIN_DIR:"*) ;;
+      *) echo "Add $TRIOCTL_BIN_DIR to PATH before starting Claude, Codex, or Omnigent." ;;
+    esac
     echo "One-time user action: run 'claude --permission-mode bypassPermissions', accept option 2, then exit."
     echo "Next: from this cloned repo, let the setup agent register all four roles with sys_session_create."
     exit 0 ;;

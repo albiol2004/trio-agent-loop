@@ -6,11 +6,12 @@ description: Run the mixed-provider Omnigent Trio loop from the current Claude/C
 You are the Trio coordinator. Stay in the current Claude Code or Codex session;
 never launch a separate coordinator with `omnigent run`.
 
-Use Omnigent's `sys_session_*` tools to launch only the two Opus roles as
-direct children of this session:
+Use `trioctl` to resolve the current profile, then Omnigent's
+`sys_session_*` tools to launch only the two Opus roles as direct children of
+this session:
 
-- `trio-omnigent-lead`: Claude Opus 5, effort `high`
-- `trio-omnigent-evaluator`: Claude Opus 5, effort `high`
+- `trio-omnigent-lead`: configured Claude Opus alias, normally `opus` / `high`
+- `trio-omnigent-evaluator`: configured Claude Opus alias, normally `opus` / `high`
 
 The Opus roles own delegation. Lead may launch the registered Builder and
 Scout; Evaluator may launch the registered Scout for verification. Every Luna
@@ -42,14 +43,21 @@ this coordinator.
    instructions. Never fall back to native Trio or another model.
 6. Confirm the registered Lead and Evaluator configs have `spawn: true`; this
    is what exposes Omnigent session tools so Opus can own Luna delegation.
-7. `sys_list_models` may only report the current generic UI agent because the
+7. Run `trioctl omnigent doctor`. Stop on any failed check. Then run
+   `trioctl omnigent resolve lead --json`,
+   `trioctl omnigent resolve evaluator --json`,
+   `trioctl omnigent resolve builder --json`, and
+   `trioctl omnigent resolve scout --json`. Use the returned `model` and
+   `reasoning_effort` values exactly. Never use `--allow-fallback` during a
+   loop: unavailable or unentitled models must fail loudly.
+8. `sys_list_models` may only report the current generic UI agent because the
    registered roles are not declared inline. Treat role-session creation and
    its persisted launch metadata as the authoritative model/effort preflight.
-8. Require registered-agent native launch propagation. Lead/Evaluator launch
+9. Require registered-agent native launch propagation. Lead/Evaluator launch
    metadata must contain `--permission-mode bypassPermissions`; Luna launch
    metadata must contain Codex's bypass-approvals-and-sandbox flag. Stop if
    either registered role launches with an empty native-argument list.
-9. Claude Code requires the user to acknowledge bypass mode once. If a role
+10. Claude Code requires the user to acknowledge bypass mode once. If a role
    fails readiness while showing `WARNING: Claude Code running in Bypass
    Permissions mode` and a `Yes, I accept` menu, do not retry or answer it.
    Ask the user to run `claude --permission-mode bypassPermissions` in a
@@ -75,19 +83,22 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
 ## One iteration
 
 1. Read GOAL, STATE, and the previous verdict. Enforce the iteration cap.
-2. Create a fresh Lead child with `sys_session_create(agent_id=..., model=
-   "claude-opus-5", reasoning_effort="high", message=...)`. Give it the
+2. Resolve Lead with `trioctl`, then create a fresh Lead child with
+   `sys_session_create(agent_id=..., model=<resolved model>,
+   reasoning_effort=<resolved effort>, message=...)`. Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
    perform its own Luna delegation, review/correct, verify, and write REPORT.
    Use a title containing mailbox and iteration.
 3. Inspect the completed Lead session tree. Any Luna children must belong to
-   that Lead and show `gpt-5.6-luna` / `xhigh`. A Luna child directly under
-   this coordinator is a topology failure.
-4. Create a fresh Evaluator child with `claude-opus-5` / `high`. Require it
-   to independently verify, decide whether it needs a Luna Scout, and write
-   VERDICT.
+   that Lead and show the Builder/Scout model and effort resolved during
+   preflight. A Luna child directly under this coordinator is a topology
+   failure.
+4. Resolve Evaluator with `trioctl`, then create a fresh Evaluator child with
+   its returned model and effort. Require it to independently verify, decide
+   whether it needs a Luna Scout, and write VERDICT.
 5. Inspect the completed Evaluator session tree. Any Luna verification child
-   must belong to that Evaluator and show `gpt-5.6-luna` / `xhigh`.
+   must belong to that Evaluator and show the Scout model and effort resolved
+   during preflight.
 6. Update STATE and LOG. Two materially identical ITERATE verdicts become
    BLOCKED.
 

@@ -1,0 +1,26 @@
+version = 1
+
+# Claude Code maintains "opus" as its moving alias for the latest Opus model.
+[roles.lead]
+provider = "claude"
+model = "opus"
+effort = "high"
+
+[roles.evaluator]
+provider = "claude"
+model = "opus"
+effort = "high"
+
+# Codex has no documented moving "luna" alias. trioctl resolves this family
+# against the authenticated CLI's live app-server model/list catalog.
+[roles.builder]
+provider = "codex"
+model_family = "luna"
+fallback_model = "gpt-5.6-luna"
+effort = "xhigh"
+
+[roles.scout]
+provider = "codex"
+model_family = "luna"
+fallback_model = "gpt-5.6-luna"
+effort = "xhigh"

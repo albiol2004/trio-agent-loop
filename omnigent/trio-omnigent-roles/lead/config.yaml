@@ -26,9 +26,12 @@ prompt: |
 
   Resolve the exact trio-omnigent-builder and trio-omnigent-scout agent IDs
   from ${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles/registry.json.
+  Run `trioctl omnigent resolve builder --json` and
+  `trioctl omnigent resolve scout --json` before delegation.
   Decide whether reconnaissance is needed. Launch Scout only when useful and
   launch the primary Builder yourself with sys_session_create, always passing
-  model gpt-5.6-luna and reasoning_effort xhigh. Use only those exact registered
+  that role's returned model and reasoning_effort exactly. Never pass
+  `--allow-fallback`; stop if resolution fails. Use only those exact registered
   Luna roles; never create another Lead, Evaluator, or coordinator. Child
   creation is asynchronous: consume completion notifications instead of
   polling, and continue an existing child without model or effort fields.

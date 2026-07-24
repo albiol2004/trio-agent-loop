@@ -25,10 +25,12 @@ prompt: |
 
   Resolve the exact trio-omnigent-scout agent ID from
   ${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles/registry.json.
+  Run `trioctl omnigent resolve scout --json` before delegation.
   When independent reconnaissance would improve the audit, launch that Scout
-  yourself with sys_session_create, always passing model gpt-5.6-luna and
-  reasoning_effort xhigh. Use no other child role and never create another
-  Lead, Evaluator, or coordinator. Consume asynchronous completion
+  yourself with sys_session_create, always passing the returned model and
+  reasoning_effort exactly. Never pass `--allow-fallback`; stop if resolution
+  fails. Use no other child role and never create another Lead, Evaluator, or
+  coordinator. Consume asynchronous completion
   notifications instead of polling.
 
   Audit tests for weakened, skipped, deleted, or hardcoded assertions. Never

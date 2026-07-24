@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="$SCRIPT_DIR/patches/child-reasoning-effort.patch"
-OMNIGENT_SOURCE="${1:-${OMNIGENT_SOURCE:-/home/alex/omnigent}}"
+OMNIGENT_SOURCE="${1:-${OMNIGENT_SOURCE:-$HOME/omnigent}}"
 PATCH_REMOVED=0
 
 die() {

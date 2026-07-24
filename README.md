@@ -163,9 +163,12 @@ parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
 
-Omnigent adds four registered role agents: Claude Opus 5 at high effort for
-Lead/Evaluator and GPT-5.6 Luna at xhigh effort for Scout/Builder. The
-already-open Claude/Codex UI session schedules Opus iterations; Lead and
+Omnigent adds four registered role agents: the current Claude `opus` alias at
+high effort for Lead/Evaluator and the newest entitled Codex Luna-family model
+at xhigh effort for Scout/Builder. The additive `trioctl` utility resolves this
+user-editable runtime profile from Claude's stable alias and Codex's live
+app-server model catalog, so provider slug updates do not require new role
+bundles. The already-open Claude/Codex UI session schedules Opus iterations; Lead and
 Evaluator decide and launch their own Luna delegation. There is no extra
 coordinator model. See
 [SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
@@ -185,6 +188,8 @@ codex/                               # custom agents, skills, fallback runner
 omnigent/trio-omnigent-roles/        # registered mixed-provider role configs
   {lead,evaluator,builder,scout}/config.yaml
 omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
+omnigent/trioctl                     # runtime profile/model resolver + doctor
+omnigent/trioctl.example.toml        # preserved user-profile default
 loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md
 portable/                            # non-Claude-Code harnesses

@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Manage and validate Trio's mixed-provider Omnigent model profile."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+ROLES = ("lead", "evaluator", "builder", "scout")
+DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
+
+
+class TrioctlError(RuntimeError):
+    """A user-actionable configuration or discovery failure."""
+
+
+def config_path(value: str | None = None) -> Path:
+    if value:
+        return Path(value).expanduser()
+    override = os.environ.get("TRIOCTL_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "trio-agent-loop" / "omnigent.toml"
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        data = tomllib.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise TrioctlError(
+            f"config not found: {path}; run 'trioctl omnigent configure'"
+        ) from exc
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise TrioctlError(f"cannot read config {path}: {exc}") from exc
+    if data.get("version") != 1:
+        raise TrioctlError(f"{path}: version must be 1")
+    roles = data.get("roles")
+    if not isinstance(roles, dict):
+        raise TrioctlError(f"{path}: missing [roles.*] tables")
+    missing = [role for role in ROLES if not isinstance(roles.get(role), dict)]
+    if missing:
+        raise TrioctlError(f"{path}: missing roles: {', '.join(missing)}")
+    return data
+
+
+def _send(proc: subprocess.Popen[str], payload: dict[str, Any]) -> None:
+    if proc.stdin is None:
+        raise TrioctlError("Codex app-server stdin is unavailable")
+    proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    proc.stdin.flush()
+
+
+def _wait_response(
+    proc: subprocess.Popen[str],
+    selector: selectors.BaseSelector,
+    request_id: int,
+    deadline: float,
+) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        events = selector.select(max(0.0, min(0.5, deadline - time.monotonic())))
+        if not events:
+            if proc.poll() is not None:
+                break
+            continue
+        if proc.stdout is None:
+            break
+        line = proc.stdout.readline()
+        if not line:
+            break
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") == request_id:
+            if "error" in message:
+                raise TrioctlError(f"Codex app-server error: {message['error']}")
+            return message
+    raise TrioctlError(f"Codex app-server timed out waiting for response {request_id}")
+
+
+def codex_models(timeout: float = 15.0) -> list[dict[str, Any]]:
+    codex = shutil.which("codex")
+    if not codex:
+        raise TrioctlError("codex is not on PATH")
+    try:
+        proc = subprocess.Popen(
+            [codex, "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise TrioctlError(f"could not start Codex app-server: {exc}") from exc
+
+    selector = selectors.DefaultSelector()
+    assert proc.stdout is not None
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    try:
+        _send(
+            proc,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "trioctl", "version": VERSION},
+                    "capabilities": {"experimentalApi": True},
+                },
+            },
+        )
+        _wait_response(proc, selector, 1, deadline)
+        _send(proc, {"method": "initialized"})
+
+        models: list[dict[str, Any]] = []
+        cursor: str | None = None
+        request_id = 2
+        while True:
+            params: dict[str, Any] = {"includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            _send(
+                proc,
+                {"id": request_id, "method": "model/list", "params": params},
+            )
+            envelope = _wait_response(proc, selector, request_id, deadline)
+            result = envelope.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise TrioctlError("Codex model/list returned an invalid response")
+            for item in result["data"]:
+                if isinstance(item, dict):
+                    models.append(item)
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return models
+            if not isinstance(cursor, str) or not cursor:
+                raise TrioctlError("Codex model/list returned an invalid cursor")
+            request_id += 1
+    finally:
+        selector.close()
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+
+
+def _efforts(model: dict[str, Any]) -> set[str]:
+    values = model.get("supportedReasoningEfforts", [])
+    if not isinstance(values, list):
+        return set()
+    return {
+        item["reasoningEffort"]
+        for item in values
+        if isinstance(item, dict) and isinstance(item.get("reasoningEffort"), str)
+    }
+
+
+def _model_rank(model: dict[str, Any]) -> tuple[int, ...]:
+    value = str(model.get("model") or model.get("id") or "")
+    match = re.search(r"gpt-(\d+)(?:\.(\d+))?(?:\.(\d+))?", value, re.I)
+    numbers = tuple(int(part or 0) for part in match.groups()) if match else (0, 0, 0)
+    return (*numbers, int(bool(model.get("isDefault"))))
+
+
+def _family_matches(model: dict[str, Any], family: str) -> bool:
+    values = " ".join(
+        str(model.get(key) or "") for key in ("id", "model", "displayName")
+    ).lower()
+    return family.lower() in re.split(r"[^a-z0-9]+", values)
+
+
+def resolve_role(
+    role: str,
+    config: dict[str, Any],
+    *,
+    models: list[dict[str, Any]] | None = None,
+    allow_fallback: bool = False,
+) -> dict[str, str]:
+    if role not in ROLES:
+        raise TrioctlError(f"unknown role: {role}")
+    spec = config["roles"][role]
+    provider = spec.get("provider")
+    effort = spec.get("effort")
+    if provider not in {"claude", "codex"} or not isinstance(effort, str):
+        raise TrioctlError(f"roles.{role}: provider/effort is invalid")
+
+    if provider == "claude":
+        model = spec.get("model")
+        if not isinstance(model, str) or not model:
+            raise TrioctlError(f"roles.{role}: Claude roles require model")
+        return {
+            "role": role,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "source": "configured-alias",
+        }
+
+    try:
+        catalog = models if models is not None else codex_models()
+        exact = spec.get("model")
+        family = spec.get("model_family")
+        if isinstance(exact, str) and exact:
+            matches = [
+                item for item in catalog if exact in {item.get("id"), item.get("model")}
+            ]
+        elif isinstance(family, str) and family:
+            matches = [item for item in catalog if _family_matches(item, family)]
+        else:
+            raise TrioctlError(
+                f"roles.{role}: Codex roles require model or model_family"
+            )
+        if not matches:
+            wanted = exact or f"family {family!r}"
+            raise TrioctlError(
+                f"roles.{role}: no available Codex model matches {wanted}"
+            )
+        selected = max(matches, key=_model_rank)
+        supported = _efforts(selected)
+        if supported and effort not in supported:
+            name = selected.get("model") or selected.get("id")
+            raise TrioctlError(
+                f"roles.{role}: {name} does not support effort {effort!r}; "
+                f"available: {', '.join(sorted(supported))}"
+            )
+        model = selected.get("model") or selected.get("id")
+        if not isinstance(model, str) or not model:
+            raise TrioctlError("selected Codex model has no usable identifier")
+        return {
+            "role": role,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "source": "codex-model-list",
+        }
+    except TrioctlError:
+        fallback = spec.get("fallback_model")
+        if not allow_fallback or not isinstance(fallback, str) or not fallback:
+            raise
+        return {
+            "role": role,
+            "provider": provider,
+            "model": fallback,
+            "reasoning_effort": effort,
+            "source": "explicit-fallback",
+        }
+
+
+def omnigent_contract() -> str:
+    """Verify the installed Omnigent package exposes Trio's required seams."""
+    executable = shutil.which("omnigent")
+    if not executable:
+        raise TrioctlError("omnigent is not on PATH")
+    try:
+        first_line = Path(executable).read_text().splitlines()[0]
+    except (OSError, IndexError) as exc:
+        raise TrioctlError(f"cannot inspect {executable}: {exc}") from exc
+    if not first_line.startswith("#!"):
+        raise TrioctlError(f"{executable} has no Python shebang")
+    interpreter = first_line[2:]
+    probe = """
+from omnigent.tools.builtins.spawn import (
+    SysSessionCreateTool,
+    _build_sys_session_send_schema,
+)
+from omnigent.server.routes.sessions import _resolve_agent_spec
+
+branches = _build_sys_session_send_schema({})["function"]["parameters"]["properties"]["args"]["anyOf"]
+send_props = next(branch["properties"] for branch in branches if branch.get("type") == "object")
+create_props = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
+assert "reasoning_effort" in send_props
+assert "reasoning_effort" in create_props
+assert callable(_resolve_agent_spec)
+"""
+    try:
+        result = subprocess.run(
+            [interpreter, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TrioctlError(f"Omnigent contract probe failed: {exc}") from exc
+    if result.returncode:
+        detail = result.stderr.strip().splitlines()
+        suffix = detail[-1] if detail else f"exit {result.returncode}"
+        raise TrioctlError(f"required session/launch support is missing: {suffix}")
+    return "reasoning effort and registered native launch propagation available"
+
+
+def command_configure(args: argparse.Namespace) -> int:
+    target = config_path(args.config)
+    if target.exists() and not args.force:
+        print(f"Preserving existing config: {target}")
+        return 0
+    source = DEFAULT_CONFIG
+    if not source.is_file():
+        raise TrioctlError(f"default config is missing: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    print(f"Wrote config: {target}")
+    return 0
+
+
+def command_models(args: argparse.Namespace) -> int:
+    models = codex_models(args.timeout)
+    if args.json:
+        print(json.dumps({"models": models}, indent=2, sort_keys=True))
+        return 0
+    for model in models:
+        name = model.get("model") or model.get("id") or "?"
+        efforts = ", ".join(sorted(_efforts(model))) or "unspecified"
+        default = " (default)" if model.get("isDefault") else ""
+        print(f"{name}{default}: {efforts}")
+    return 0
+
+
+def command_resolve(args: argparse.Namespace) -> int:
+    config = load_config(config_path(args.config))
+    result = resolve_role(args.role, config, allow_fallback=args.allow_fallback)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            f"{result['role']}: {result['model']} / "
+            f"{result['reasoning_effort']} ({result['source']})"
+        )
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    path = config_path(args.config)
+    checks: list[dict[str, Any]] = []
+    for command in ("omnigent", "claude", "codex"):
+        found = shutil.which(command)
+        checks.append(
+            {
+                "check": f"command:{command}",
+                "ok": found is not None,
+                "detail": found or "not on PATH",
+            }
+        )
+    try:
+        config = load_config(path)
+        checks.append({"check": "config", "ok": True, "detail": str(path)})
+    except TrioctlError as exc:
+        config = None
+        checks.append({"check": "config", "ok": False, "detail": str(exc)})
+
+    try:
+        detail = omnigent_contract()
+        checks.append(
+            {"check": "omnigent:session-contract", "ok": True, "detail": detail}
+        )
+    except TrioctlError as exc:
+        checks.append(
+            {
+                "check": "omnigent:session-contract",
+                "ok": False,
+                "detail": str(exc),
+            }
+        )
+
+    catalog: list[dict[str, Any]] | None = None
+    try:
+        catalog = codex_models(args.timeout)
+        checks.append(
+            {
+                "check": "codex:model/list",
+                "ok": True,
+                "detail": f"{len(catalog)} available models",
+            }
+        )
+    except TrioctlError as exc:
+        checks.append({"check": "codex:model/list", "ok": False, "detail": str(exc)})
+
+    if config is not None:
+        for role in ROLES:
+            try:
+                resolved = resolve_role(
+                    role,
+                    config,
+                    models=catalog if catalog is not None else [],
+                )
+                checks.append(
+                    {
+                        "check": f"role:{role}",
+                        "ok": True,
+                        "detail": (
+                            f"{resolved['model']} / {resolved['reasoning_effort']} "
+                            f"({resolved['source']})"
+                        ),
+                    }
+                )
+            except TrioctlError as exc:
+                checks.append(
+                    {"check": f"role:{role}", "ok": False, "detail": str(exc)}
+                )
+
+    registry = (
+        Path(os.environ.get("OMNIGENT_HOME", str(Path.home() / ".omnigent")))
+        / "agents"
+        / "trio-omnigent-roles"
+        / "registry.json"
+    )
+    try:
+        entries = json.loads(registry.read_text())
+        expected = {f"trio-omnigent-{role}" for role in ROLES}
+        missing = sorted(expected - set(entries))
+        if missing:
+            raise TrioctlError(f"missing: {', '.join(missing)}")
+        checks.append({"check": "registry", "ok": True, "detail": str(registry)})
+    except (OSError, json.JSONDecodeError, TypeError, TrioctlError) as exc:
+        checks.append({"check": "registry", "ok": False, "detail": str(exc)})
+
+    if args.json:
+        print(
+            json.dumps(
+                {"ok": all(item["ok"] for item in checks), "checks": checks}, indent=2
+            )
+        )
+    else:
+        for item in checks:
+            print(
+                f"{'PASS' if item['ok'] else 'FAIL'} {item['check']}: {item['detail']}"
+            )
+    return 0 if all(item["ok"] for item in checks) else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="trioctl")
+    root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    products = root.add_subparsers(dest="product", required=True)
+    omni = products.add_parser("omnigent", help="manage the Omnigent Trio profile")
+    commands = omni.add_subparsers(dest="command", required=True)
+
+    configure = commands.add_parser(
+        "configure", help="install the default user profile"
+    )
+    configure.add_argument("--config")
+    configure.add_argument("--force", action="store_true")
+    configure.set_defaults(func=command_configure)
+
+    models = commands.add_parser("models", help="query Codex's live model catalog")
+    models.add_argument("--json", action="store_true")
+    models.add_argument("--timeout", type=float, default=15.0)
+    models.set_defaults(func=command_models)
+
+    resolve = commands.add_parser("resolve", help="resolve one role's runtime model")
+    resolve.add_argument("role", choices=ROLES)
+    resolve.add_argument("--config")
+    resolve.add_argument("--json", action="store_true")
+    resolve.add_argument("--allow-fallback", action="store_true")
+    resolve.set_defaults(func=command_resolve)
+
+    doctor = commands.add_parser(
+        "doctor", help="validate commands, models, and registry"
+    )
+    doctor.add_argument("--config")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--timeout", type=float, default=15.0)
+    doctor.set_defaults(func=command_doctor)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.func(args)
+    except TrioctlError as exc:
+        print(f"trioctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
