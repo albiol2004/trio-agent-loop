@@ -67,6 +67,28 @@ tool schema, and installs the bundle plus both entrypoints. Without
 `OMNIGENT_SOURCE`, the installer leaves Omnigent itself untouched but still
 fails loudly if the active version lacks the required schema.
 
+## Update the Omnigent source checkout
+
+After the initial setup, update `/home/alex/omnigent` and reapply the Trio
+compatibility patch with:
+
+```bash
+./omnigent/update-omnigent.sh
+```
+
+Pass another checkout explicitly when needed:
+
+```bash
+./omnigent/update-omnigent.sh /path/to/omnigent
+```
+
+The updater reverses only the known Trio patch, runs `git pull --ff-only`, and
+then reapplies it. It leaves unrelated tracked changes and untracked files
+alone. If the pull fails, it attempts to restore the patch automatically. If a
+new upstream revision is incompatible with the bundled patch, it stops with a
+clear error instead of guessing. It does not reinstall Omnigent, restart a
+server, or modify role registrations.
+
 ## Set it up from an Omnigent UI session
 
 Open the cloned repository as the working directory of either an underlying
