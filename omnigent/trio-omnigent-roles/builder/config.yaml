@@ -1,10 +1,10 @@
 spec_version: 1
 name: trio-omnigent-builder
-description: GPT-5.6 Luna primary implementation worker for one scoped Trio increment.
+description: Cursor Grok 4.5 primary implementation worker for one scoped Trio increment.
 executor:
   type: omnigent
-  model: gpt-5.6-luna
-  config: {harness: codex-native, yolo: true}
+  model: cursor-grok-4.5-high
+  config: {harness: cursor-native, yolo: true}
 os_env:
   type: caller_process
   cwd: .

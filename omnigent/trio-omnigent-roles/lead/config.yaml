@@ -24,20 +24,23 @@ prompt: |
   task. Maintain PLAN.md with the smallest verifiable increment and objective
   acceptance criteria.
 
-  Resolve the exact trio-omnigent-builder and trio-omnigent-scout agent IDs
-  from ${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles/registry.json.
   Run `trioctl omnigent resolve builder --json` and
-  `trioctl omnigent resolve scout --json` before delegation.
-  Decide whether reconnaissance is needed. Launch Scout only when useful and
-  launch the primary Builder yourself with sys_session_create, always passing
-  that role's returned model and reasoning_effort exactly. Never pass
-  `--allow-fallback`; stop if resolution fails. Use only those exact registered
-  Luna roles; never create another Lead, Evaluator, or coordinator. Child
-  creation is asynchronous: consume completion notifications instead of
-  polling, and continue an existing child without model or effort fields.
+  `trioctl omnigent resolve scout --json` before delegation. Never pass
+  `--allow-fallback`; stop if resolution fails.
+
+  You own Cursor delegation. Write each bounded worker assignment to a
+  temporary prompt file outside the Trio mailbox, then invoke
+  `trioctl omnigent run builder --prompt-file <path> --workspace .` for the
+  primary implementation. When reconnaissance is useful, invoke
+  `trioctl omnigent run scout --prompt-file <path> --workspace .` first. Run
+  Cursor workers serially. These commands launch ephemeral headless Cursor
+  agents with the exact profile-resolved Grok model; do not create registered
+  Builder/Scout Omnigent sessions and do not launch another Lead, Evaluator, or
+  coordinator.
 
   Give Builder a bounded task with objective, approach, owned files, done
-  criteria, and boundaries. After its result, inspect the actual diff, run
+  criteria, and boundaries. Remove the temporary assignment file after the
+  worker returns. Inspect the actual diff, run
   verification, correct integration or correctness issues yourself, and
   overwrite REPORT.md. Never edit GOAL.md, commit, push, or touch another
   mailbox.

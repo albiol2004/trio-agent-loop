@@ -46,6 +46,11 @@ EOF
 #!$TMP/probe-interpreter
 EOF
   chmod +x "$TMP/bin/omnigent"
+  cat >"$TMP/bin/cursor-agent" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$TMP/bin/cursor-agent"
 }
 
 installer_probe_contract() {
@@ -122,8 +127,8 @@ root = pathlib.Path(sys.argv[1])
 expected = {
     "lead": ("trio-omnigent-lead", "claude-native", "claude-opus-5"),
     "evaluator": ("trio-omnigent-evaluator", "claude-native", "claude-opus-5"),
-    "builder": ("trio-omnigent-builder", "codex-native", "gpt-5.6-luna"),
-    "scout": ("trio-omnigent-scout", "codex-native", "gpt-5.6-luna"),
+    "builder": ("trio-omnigent-builder", "cursor-native", "cursor-grok-4.5-high"),
+    "scout": ("trio-omnigent-scout", "cursor-native", "cursor-grok-4.5-high"),
 }
 for role, (name, harness, model) in expected.items():
     data = yaml.safe_load((root / "omnigent/trio-omnigent-roles" / role / "config.yaml").read_text())

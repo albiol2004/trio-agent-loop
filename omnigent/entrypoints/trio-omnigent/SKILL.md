@@ -13,50 +13,50 @@ this session:
 - `trio-omnigent-lead`: configured Claude Opus alias, normally `opus` / `high`
 - `trio-omnigent-evaluator`: configured Claude Opus alias, normally `opus` / `high`
 
-The Opus roles own delegation. Lead may launch the registered Builder and
-Scout; Evaluator may launch the registered Scout for verification. Every Luna
-child must use GPT-5.6 Luna at effort `xhigh`. Never launch Luna directly from
-this coordinator.
+The Opus roles own delegation. They launch ephemeral headless Cursor workers
+through `trioctl`; every worker uses the profile-resolved Cursor Grok 4.5 model,
+normally `cursor-grok-4.5-high`. Never launch a Grok worker directly from this
+coordinator.
 
 ## Preflight and one-time registration
 
 1. Discover Omnigent's session tools if they are deferred.
-2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`. It maps the
-   four exact role names to their persisted `agent_id` values.
+2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
+   It maps the two exact Opus role names to persisted `agent_id` values.
 3. If the registry is missing and this is the cloned template repository,
    register
    them by calling `sys_session_create(config_path=...)` once for each:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-   - `omnigent/trio-omnigent-roles/builder`
-   - `omnigent/trio-omnigent-roles/scout`
    Create them idle and write each returned `agent_id` and
    `bootstrap_conversation_id` to the registry JSON, keyed by the exact role
    name. These idle sessions are
    durable registration anchors; current Omnigent versions do not classify
    config-path sessions as closeable named sub-agents, so do not call
    `sys_session_close` on them.
-4. Require all four exact names in the registry. Never choose by partial name.
+4. Require both exact names in the registry. Never choose by partial name.
    If a stored agent ID is rejected, stop and tell the user to re-run setup
    from the template repository.
 5. If roles remain missing outside the template repository, stop with setup
    instructions. Never fall back to native Trio or another model.
-6. Confirm the registered Lead and Evaluator configs have `spawn: true`; this
-   is what exposes Omnigent session tools so Opus can own Luna delegation.
+6. Confirm the registered Lead and Evaluator configs have shell access and
+   `spawn: true`. Opus owns Grok delegation by running `trioctl omnigent run`;
+   Builder and Scout must not be registered as persistent Omnigent agents.
 7. Run `trioctl omnigent doctor`. Stop on any failed check. Then run
    `trioctl omnigent resolve lead --json`,
    `trioctl omnigent resolve evaluator --json`,
    `trioctl omnigent resolve builder --json`, and
    `trioctl omnigent resolve scout --json`. Use the returned `model` and
-   `reasoning_effort` values exactly. Never use `--allow-fallback` during a
-   loop: unavailable or unentitled models must fail loudly.
+   `model` values exactly. Pass `reasoning_effort` only when it is non-null;
+   Cursor encodes worker effort in `model_effort` and the model ID. Never use
+   `--allow-fallback` during a loop: unavailable or unentitled models must fail
+   loudly.
 8. `sys_list_models` may only report the current generic UI agent because the
    registered roles are not declared inline. Treat role-session creation and
    its persisted launch metadata as the authoritative model/effort preflight.
 9. Require registered-agent native launch propagation. Lead/Evaluator launch
-   metadata must contain `--permission-mode bypassPermissions`; Luna launch
-   metadata must contain Codex's bypass-approvals-and-sandbox flag. Stop if
-   either registered role launches with an empty native-argument list.
+   metadata must contain `--permission-mode bypassPermissions`. Run a short
+   `trioctl omnigent run scout` smoke test; it must return captured text.
 10. Claude Code requires the user to acknowledge bypass mode once. If a role
    fails readiness while showing `WARNING: Claude Code running in Bypass
    Permissions mode` and a `Yes, I accept` menu, do not retry or answer it.
@@ -64,9 +64,9 @@ this coordinator.
    trusted workspace, select `2. Yes, I accept`, exit Claude, then start a
    fresh role session.
 
-Lead/Evaluator use `permission_mode: bypassPermissions`; Builder/Scout use
-`yolo: true`. A headless child under `auto` blocks on permission prompts and
-stalls the loop. Changing a role's `permission_mode`, `harness`, or `model`
+Lead/Evaluator use `permission_mode: bypassPermissions`. `trioctl` launches
+Builder with Cursor `--force --trust` and Scout with those flags plus read-only
+`--mode ask`. Changing an Opus role's permission mode, harness, or model
 requires re-registration because the stored `agent_id` was created from the
 config as it read at registration time.
 
@@ -87,18 +87,16 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    `sys_session_create(agent_id=..., model=<resolved model>,
    reasoning_effort=<resolved effort>, message=...)`. Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
-   perform its own Luna delegation, review/correct, verify, and write REPORT.
+   perform its own Grok delegation through `trioctl omnigent run`,
+   review/correct, verify, and write REPORT.
    Use a title containing mailbox and iteration.
-3. Inspect the completed Lead session tree. Any Luna children must belong to
-   that Lead and show the Builder/Scout model and effort resolved during
-   preflight. A Luna child directly under this coordinator is a topology
-   failure.
+3. Inspect the Lead result and actual diff. Its report must identify the
+   profile-resolved Grok worker and include the captured `trioctl` result.
 4. Resolve Evaluator with `trioctl`, then create a fresh Evaluator child with
    its returned model and effort. Require it to independently verify, decide
-   whether it needs a Luna Scout, and write VERDICT.
-5. Inspect the completed Evaluator session tree. Any Luna verification child
-   must belong to that Evaluator and show the Scout model and effort resolved
-   during preflight.
+   whether it needs a Grok Scout, and write VERDICT.
+5. Inspect the Evaluator result. Any delegated Scout evidence must come from
+   its own `trioctl omnigent run scout` invocation.
 6. Update STATE and LOG. Two materially identical ITERATE verdicts become
    BLOCKED.
 

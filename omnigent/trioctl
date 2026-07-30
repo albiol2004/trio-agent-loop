@@ -16,9 +16,27 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 ROLES = ("lead", "evaluator", "builder", "scout")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
+CURSOR_WORKER_ROLES = ("builder", "scout")
+CURSOR_ROLE_PROMPTS = {
+    "builder": (
+        "You are the Trio Builder and primary implementor. Execute exactly one "
+        "well-specified task from the Opus Lead. You are not alone in the "
+        "codebase: preserve unrelated edits and accommodate existing work. "
+        "Match repository patterns, make the smallest complete change, run the "
+        "stated checks, and never modify Trio mailbox files, commit, or push. "
+        "Return files changed, a precise summary, exact verification results, "
+        "and concerns."
+    ),
+    "scout": (
+        "You are the Trio Scout. Perform only the bounded read-only "
+        "reconnaissance requested by the Opus Lead or Evaluator. Do not edit "
+        "files, commit, push, or modify Trio mailbox files. Return concise, "
+        "evidence-backed findings with relevant file paths and commands."
+    ),
+}
 
 
 class TrioctlError(RuntimeError):
@@ -160,6 +178,40 @@ def codex_models(timeout: float = 15.0) -> list[dict[str, Any]]:
             proc.communicate()
 
 
+def cursor_models(timeout: float = 15.0) -> list[dict[str, Any]]:
+    """Return the authenticated Cursor CLI's live account model catalog."""
+    cursor = shutil.which("cursor-agent")
+    if not cursor:
+        raise TrioctlError("cursor-agent is not on PATH")
+    try:
+        result = subprocess.run(
+            [cursor, "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TrioctlError(f"could not query Cursor models: {exc}") from exc
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise TrioctlError(
+            f"Cursor model listing failed: {detail or result.returncode}"
+        )
+
+    models: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^(\S+)\s+-\s+(.+?)\s*$", line)
+        if match:
+            model_id, display_name = match.groups()
+            models.append(
+                {"id": model_id, "model": model_id, "displayName": display_name}
+            )
+    if not models:
+        raise TrioctlError("Cursor model listing returned no parseable models")
+    return models
+
+
 def _efforts(model: dict[str, Any]) -> set[str]:
     values = model.get("supportedReasoningEfforts", [])
     if not isinstance(values, list):
@@ -179,10 +231,12 @@ def _model_rank(model: dict[str, Any]) -> tuple[int, ...]:
 
 
 def _family_matches(model: dict[str, Any], family: str) -> bool:
-    values = " ".join(
-        str(model.get(key) or "") for key in ("id", "model", "displayName")
-    ).lower()
-    return family.lower() in re.split(r"[^a-z0-9]+", values)
+    needle = re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
+    values = (
+        re.sub(r"[^a-z0-9]+", "-", str(model.get(key) or "").lower()).strip("-")
+        for key in ("id", "model", "displayName")
+    )
+    return any(needle in value for value in values)
 
 
 def resolve_role(
@@ -191,13 +245,13 @@ def resolve_role(
     *,
     models: list[dict[str, Any]] | None = None,
     allow_fallback: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if role not in ROLES:
         raise TrioctlError(f"unknown role: {role}")
     spec = config["roles"][role]
     provider = spec.get("provider")
     effort = spec.get("effort")
-    if provider not in {"claude", "codex"} or not isinstance(effort, str):
+    if provider not in {"claude", "codex", "cursor"} or not isinstance(effort, str):
         raise TrioctlError(f"roles.{role}: provider/effort is invalid")
 
     if provider == "claude":
@@ -213,7 +267,11 @@ def resolve_role(
         }
 
     try:
-        catalog = models if models is not None else codex_models()
+        catalog = (
+            models
+            if models is not None
+            else (cursor_models() if provider == "cursor" else codex_models())
+        )
         exact = spec.get("model")
         family = spec.get("model_family")
         if isinstance(exact, str) and exact:
@@ -224,16 +282,26 @@ def resolve_role(
             matches = [item for item in catalog if _family_matches(item, family)]
         else:
             raise TrioctlError(
-                f"roles.{role}: Codex roles require model or model_family"
+                f"roles.{role}: {provider} roles require model or model_family"
             )
+        if provider == "cursor":
+            fast = spec.get("fast", False)
+            matches = [
+                item
+                for item in matches
+                if str(item.get("model") or item.get("id") or "").endswith(
+                    f"-{effort}" + ("-fast" if fast else "")
+                )
+            ]
         if not matches:
             wanted = exact or f"family {family!r}"
             raise TrioctlError(
-                f"roles.{role}: no available Codex model matches {wanted}"
+                f"roles.{role}: no available {provider} model matches {wanted} "
+                f"at effort {effort!r}"
             )
         selected = max(matches, key=_model_rank)
-        supported = _efforts(selected)
-        if supported and effort not in supported:
+        supported = _efforts(selected) if provider == "codex" else set()
+        if provider == "codex" and supported and effort not in supported:
             name = selected.get("model") or selected.get("id")
             raise TrioctlError(
                 f"roles.{role}: {name} does not support effort {effort!r}; "
@@ -246,8 +314,9 @@ def resolve_role(
             "role": role,
             "provider": provider,
             "model": model,
-            "reasoning_effort": effort,
-            "source": "codex-model-list",
+            "reasoning_effort": effort if provider == "codex" else None,
+            "model_effort": effort if provider == "cursor" else None,
+            "source": f"{provider}-model-list",
         }
     except TrioctlError:
         fallback = spec.get("fallback_model")
@@ -257,7 +326,8 @@ def resolve_role(
             "role": role,
             "provider": provider,
             "model": fallback,
-            "reasoning_effort": effort,
+            "reasoning_effort": effort if provider == "codex" else None,
+            "model_effort": effort if provider == "cursor" else None,
             "source": "explicit-fallback",
         }
 
@@ -320,15 +390,24 @@ def command_configure(args: argparse.Namespace) -> int:
 
 
 def command_models(args: argparse.Namespace) -> int:
-    models = codex_models(args.timeout)
+    catalogs = {}
+    if args.provider in {"codex", "all"}:
+        catalogs["codex"] = codex_models(args.timeout)
+    if args.provider in {"cursor", "all"}:
+        catalogs["cursor"] = cursor_models(args.timeout)
     if args.json:
-        print(json.dumps({"models": models}, indent=2, sort_keys=True))
+        print(json.dumps({"providers": catalogs}, indent=2, sort_keys=True))
         return 0
-    for model in models:
-        name = model.get("model") or model.get("id") or "?"
-        efforts = ", ".join(sorted(_efforts(model))) or "unspecified"
-        default = " (default)" if model.get("isDefault") else ""
-        print(f"{name}{default}: {efforts}")
+    for provider, models in catalogs.items():
+        print(f"{provider}:")
+        for model in models:
+            name = model.get("model") or model.get("id") or "?"
+            if provider == "codex":
+                detail = ", ".join(sorted(_efforts(model))) or "unspecified"
+            else:
+                detail = model.get("displayName") or "available"
+            default = " (default)" if model.get("isDefault") else ""
+            print(f"  {name}{default}: {detail}")
     return 0
 
 
@@ -338,17 +417,117 @@ def command_resolve(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(
-            f"{result['role']}: {result['model']} / "
-            f"{result['reasoning_effort']} ({result['source']})"
+        effort = result.get("reasoning_effort") or result.get("model_effort")
+        print(f"{result['role']}: {result['model']} / {effort} ({result['source']})")
+    return 0
+
+
+def run_cursor_worker(
+    role: str,
+    config: dict[str, Any],
+    *,
+    prompt: str,
+    workspace: Path,
+    models: list[dict[str, Any]] | None = None,
+    timeout: float | None = None,
+) -> str:
+    """Run one ephemeral Cursor worker with the live profile-resolved model."""
+    if role not in CURSOR_WORKER_ROLES:
+        raise TrioctlError(
+            f"Cursor worker role must be one of: {', '.join(CURSOR_WORKER_ROLES)}"
         )
+    if not prompt.strip():
+        raise TrioctlError("Cursor worker prompt is empty")
+    resolved = resolve_role(role, config, models=models)
+    if resolved["provider"] != "cursor":
+        raise TrioctlError(f"roles.{role}: provider must be cursor for worker dispatch")
+    cursor = shutil.which("cursor-agent")
+    if not cursor:
+        raise TrioctlError("cursor-agent is not on PATH")
+    command = [
+        cursor,
+        "-p",
+        "--output-format",
+        "text",
+        "--model",
+        resolved["model"],
+        "--force",
+        "--trust",
+        "--approve-mcps",
+        "--workspace",
+        str(workspace.resolve()),
+    ]
+    if role == "scout":
+        command.extend(["--mode", "ask"])
+    full_prompt = f"{CURSOR_ROLE_PROMPTS[role]}\n\nTASK FROM OPUS:\n{prompt.strip()}\n"
+    try:
+        result = subprocess.run(
+            command,
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TrioctlError(f"Cursor {role} failed to run: {exc}") from exc
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise TrioctlError(
+            f"Cursor {role} exited {result.returncode}: {detail or 'no output'}"
+        )
+    output = result.stdout.strip()
+    if not output:
+        raise TrioctlError(f"Cursor {role} completed without output")
+    return output
+
+
+def command_run(args: argparse.Namespace) -> int:
+    config = load_config(config_path(args.config))
+    if args.prompt_file == "-":
+        prompt = sys.stdin.read()
+    else:
+        try:
+            prompt = Path(args.prompt_file).read_text()
+        except OSError as exc:
+            raise TrioctlError(
+                f"cannot read prompt file {args.prompt_file}: {exc}"
+            ) from exc
+    output = run_cursor_worker(
+        args.role,
+        config,
+        prompt=prompt,
+        workspace=Path(args.workspace),
+        timeout=args.timeout,
+    )
+    print(output)
     return 0
 
 
 def command_doctor(args: argparse.Namespace) -> int:
     path = config_path(args.config)
     checks: list[dict[str, Any]] = []
-    for command in ("omnigent", "claude", "codex"):
+    try:
+        config = load_config(path)
+    except TrioctlError as exc:
+        config = None
+        checks.append({"check": "config", "ok": False, "detail": str(exc)})
+    else:
+        checks.append({"check": "config", "ok": True, "detail": str(path)})
+
+    providers = {
+        spec.get("provider")
+        for spec in (config or {}).get("roles", {}).values()
+        if isinstance(spec, dict)
+    }
+    required_commands = {"omnigent"}
+    required_commands.update(
+        {"claude" if provider == "claude" else provider for provider in providers}
+    )
+    if "cursor" in required_commands:
+        required_commands.remove("cursor")
+        required_commands.add("cursor-agent")
+    for command in sorted(required_commands):
         found = shutil.which(command)
         checks.append(
             {
@@ -357,13 +536,6 @@ def command_doctor(args: argparse.Namespace) -> int:
                 "detail": found or "not on PATH",
             }
         )
-    try:
-        config = load_config(path)
-        checks.append({"check": "config", "ok": True, "detail": str(path)})
-    except TrioctlError as exc:
-        config = None
-        checks.append({"check": "config", "ok": False, "detail": str(exc)})
-
     try:
         detail = omnigent_contract()
         checks.append(
@@ -378,18 +550,23 @@ def command_doctor(args: argparse.Namespace) -> int:
             }
         )
 
-    catalog: list[dict[str, Any]] | None = None
-    try:
-        catalog = codex_models(args.timeout)
-        checks.append(
-            {
-                "check": "codex:model/list",
-                "ok": True,
-                "detail": f"{len(catalog)} available models",
-            }
-        )
-    except TrioctlError as exc:
-        checks.append({"check": "codex:model/list", "ok": False, "detail": str(exc)})
+    catalogs: dict[str, list[dict[str, Any]]] = {}
+    for provider, loader in (("codex", codex_models), ("cursor", cursor_models)):
+        if provider not in providers:
+            continue
+        try:
+            catalogs[provider] = loader(args.timeout)
+            checks.append(
+                {
+                    "check": f"{provider}:model/list",
+                    "ok": True,
+                    "detail": f"{len(catalogs[provider])} available models",
+                }
+            )
+        except TrioctlError as exc:
+            checks.append(
+                {"check": f"{provider}:model/list", "ok": False, "detail": str(exc)}
+            )
 
     if config is not None:
         for role in ROLES:
@@ -397,15 +574,17 @@ def command_doctor(args: argparse.Namespace) -> int:
                 resolved = resolve_role(
                     role,
                     config,
-                    models=catalog if catalog is not None else [],
+                    models=catalogs.get(config["roles"][role].get("provider"), []),
+                )
+                effort = resolved.get("reasoning_effort") or resolved.get(
+                    "model_effort"
                 )
                 checks.append(
                     {
                         "check": f"role:{role}",
                         "ok": True,
                         "detail": (
-                            f"{resolved['model']} / {resolved['reasoning_effort']} "
-                            f"({resolved['source']})"
+                            f"{resolved['model']} / {effort} ({resolved['source']})"
                         ),
                     }
                 )
@@ -422,10 +601,21 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     try:
         entries = json.loads(registry.read_text())
-        expected = {f"trio-omnigent-{role}" for role in ROLES}
+        # Only Opus orchestration roles are durable Omnigent agents. Cursor
+        # workers are ephemeral headless CLI runs, avoiding cursor-native's
+        # one-chat-per-workspace transcript ownership collision.
+        expected = {"trio-omnigent-lead", "trio-omnigent-evaluator"}
         missing = sorted(expected - set(entries))
         if missing:
             raise TrioctlError(f"missing: {', '.join(missing)}")
+        obsolete = sorted(
+            {"trio-omnigent-builder", "trio-omnigent-scout"} & set(entries)
+        )
+        if obsolete:
+            raise TrioctlError(
+                "obsolete persistent Cursor roles: "
+                f"{', '.join(obsolete)}; remove them and restart Omnigent once"
+            )
         checks.append({"check": "registry", "ok": True, "detail": str(registry)})
     except (OSError, json.JSONDecodeError, TypeError, TrioctlError) as exc:
         checks.append({"check": "registry", "ok": False, "detail": str(exc)})
@@ -458,7 +648,12 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--force", action="store_true")
     configure.set_defaults(func=command_configure)
 
-    models = commands.add_parser("models", help="query Codex's live model catalog")
+    models = commands.add_parser(
+        "models", help="query provider CLI live model catalogs"
+    )
+    models.add_argument(
+        "--provider", choices=("all", "codex", "cursor"), default="cursor"
+    )
     models.add_argument("--json", action="store_true")
     models.add_argument("--timeout", type=float, default=15.0)
     models.set_defaults(func=command_models)
@@ -469,6 +664,20 @@ def parser() -> argparse.ArgumentParser:
     resolve.add_argument("--json", action="store_true")
     resolve.add_argument("--allow-fallback", action="store_true")
     resolve.set_defaults(func=command_resolve)
+
+    run = commands.add_parser(
+        "run", help="run one profile-resolved headless Cursor worker"
+    )
+    run.add_argument("role", choices=CURSOR_WORKER_ROLES)
+    run.add_argument("--config")
+    run.add_argument(
+        "--prompt-file",
+        default="-",
+        help="task prompt file, or - to read stdin (default)",
+    )
+    run.add_argument("--workspace", default=".")
+    run.add_argument("--timeout", type=float)
+    run.set_defaults(func=command_run)
 
     doctor = commands.add_parser(
         "doctor", help="validate commands, models, and registry"

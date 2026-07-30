@@ -75,7 +75,7 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ```bash
 ./install.sh --global            # ~/.claude — every project on this machine
 ./install.sh ~/src/myproject     # or per-project, committed to the repo
-./install.sh --omnigent          # mixed Opus/Luna roles through Omnigent
+./install.sh --omnigent          # mixed Opus/Cursor Grok roles through Omnigent
 ./install.sh --kimi              # Kimi Code skills + sequential role runner
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
@@ -163,14 +163,15 @@ parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
 
-Omnigent adds four registered role agents: the current Claude `opus` alias at
-high effort for Lead/Evaluator and the newest entitled Codex Luna-family model
-at xhigh effort for Scout/Builder. The additive `trioctl` utility resolves this
-user-editable runtime profile from Claude's stable alias and Codex's live
-app-server model catalog, so provider slug updates do not require new role
-bundles. The already-open Claude/Codex UI session schedules Opus iterations; Lead and
-Evaluator decide and launch their own Luna delegation. There is no extra
-coordinator model. See
+Omnigent adds two registered Opus agents for Lead/Evaluator. Their
+Scout/Builder delegation runs as ephemeral headless Cursor Grok 4.5 High agents
+through the additive `trioctl` utility. `trioctl` resolves the user-editable
+runtime profile from Claude's stable alias and Cursor's authenticated live
+model catalog, so model availability is checked before a loop starts. The
+already-open Claude/Codex UI session schedules Opus iterations; Lead and
+Evaluator decide and launch their own Grok delegation. There is no extra
+coordinator model and no persistent Cursor session competing for a workspace
+chat. See
 [SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
 `trio-omnigent` entrypoint to both native skill directories. Say “Run a Trio
 Omnigent loop to …”; ordinary “Run a Trio loop” remains native.
@@ -185,10 +186,10 @@ codex/                               # custom agents, skills, fallback runner
   skills/trio/references/TROUBLESHOOTING.md
   skills/trio/scripts/run-role.sh
   skills/trio/references/prompts/*.md
-omnigent/trio-omnigent-roles/        # registered mixed-provider role configs
+omnigent/trio-omnigent-roles/        # Opus agents + Cursor role references
   {lead,evaluator,builder,scout}/config.yaml
 omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
-omnigent/trioctl                     # runtime profile/model resolver + doctor
+omnigent/trioctl                     # resolver, doctor, headless Cursor runner
 omnigent/trioctl.example.toml        # preserved user-profile default
 loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md

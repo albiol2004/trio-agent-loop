@@ -3,7 +3,7 @@
 #   ./install.sh --global          -> ~/.claude  (available in EVERY project; recommended)
 #   ./install.sh /path/to/project  -> <project>/.claude (committed with that repo)
 #   ./install.sh --codex           -> Codex skills + custom agents + fallback
-#   ./install.sh --omnigent        -> isolated mixed Claude/Codex Omnigent agent
+#   ./install.sh --omnigent        -> isolated mixed Claude/Cursor Omnigent agent
 #   ./install.sh --kimi            -> Kimi Code skills + sequential fallback
 #   ./install.sh --zcode           -> native ZCode skills
 #   ./install.sh --pi              -> native Pi AgentSession extension
@@ -51,6 +51,10 @@ case "${1:-}" in
     fi
     command -v omnigent >/dev/null 2>&1 || {
       echo "omnigent is not installed or is not on PATH." >&2
+      exit 1
+    }
+    command -v cursor-agent >/dev/null 2>&1 || {
+      echo "cursor-agent is not installed or is not on PATH." >&2
       exit 1
     }
     OMNIGENT_BIN="$(command -v omnigent)"
@@ -109,7 +113,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
       *) echo "Add $TRIOCTL_BIN_DIR to PATH before starting Claude, Codex, or Omnigent." ;;
     esac
     echo "One-time user action: run 'claude --permission-mode bypassPermissions', accept option 2, then exit."
-    echo "Next: from this cloned repo, let the setup agent register all four roles with sys_session_create."
+    echo "Next: from this cloned repo, register only Lead and Evaluator with sys_session_create."
     exit 0 ;;
   --kimi)
     KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
