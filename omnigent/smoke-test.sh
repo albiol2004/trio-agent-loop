@@ -35,7 +35,6 @@ make_probe() {
 set -euo pipefail
 [[ "\${1:-}" == "-c" ]] || exit 1
 case "$mode" in
-  send-fail) [[ "\${2:-}" != *"_build_sys_session_send_schema"* ]] ;;
   create-fail) [[ "\${2:-}" != *"SysSessionCreateTool"* ]] ;;
   registered-launch-fail) [[ "\${2:-}" != *"_resolve_agent_spec"* ]] ;;
   pass) exit 0 ;;
@@ -59,13 +58,6 @@ installer_probe_contract() {
   make_probe pass
   assert env -u OMNIGENT_SOURCE PATH="$TMP/bin:$REAL_PATH" HOME="$TMP/home" OMNIGENT_HOME="$TMP/home/.omnigent" \
     "$ROOT/install.sh" --omnigent >/dev/null 2>"$TMP/probe-pass.err"
-
-  make_probe send-fail
-  stderr_file="$TMP/send-fail.err"
-  if env -u OMNIGENT_SOURCE PATH="$TMP/bin:$REAL_PATH" HOME="$TMP/home" OMNIGENT_HOME="$TMP/home/.omnigent" \
-    "$ROOT/install.sh" --omnigent >/dev/null 2>"$stderr_file"; then return 1; fi
-  grep -Fq 'sys_session_send.args.reasoning_effort' "$stderr_file" || return 1
-  grep -Fq 'OMNIGENT_SOURCE' "$stderr_file" || return 1
 
   make_probe create-fail
   stderr_file="$TMP/create-fail.err"
@@ -146,7 +138,7 @@ for role, (name, harness, model) in expected.items():
 PY
 }
 
-check 'A3 installer probes effort schemas and registered-agent native launch support' installer_probe_contract
+check 'A3 installer probes session-create effort and registered-agent launch support' installer_probe_contract
 check 'A4 installer replaces owned trees and preserves registry' installer_replacement_contract
 check 'A6 role configs parse as YAML and match the documented role table' role_yaml_contract
 check 'A7 trioctl unit tests pass' python3 -m pytest -q "$ROOT/omnigent/tests/test_trioctl.py"

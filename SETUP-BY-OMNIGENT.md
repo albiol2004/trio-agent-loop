@@ -42,7 +42,6 @@ do not require registration.
 ## Prerequisites
 
 1. Omnigent with child-effort dispatch support:
-   `sys_session_send.args.reasoning_effort` and
    `sys_session_create.reasoning_effort`, plus registered-agent native launch
    propagation so role YAML reaches Claude permission flags.
 2. `claude` and `cursor-agent` on `PATH`; `codex` is also required when the
@@ -149,8 +148,8 @@ The agent should:
 
 1. Verify that `omnigent`, `claude`, and `cursor-agent` are on `PATH`, and run
    `cursor-agent status`.
-2. Verify that the installed Omnigent exposes child `reasoning_effort` and
-   registered-agent native permission propagation.
+2. Verify that the installed Omnigent exposes session-create
+   `reasoning_effort` and registered-agent native permission propagation.
 3. Run `./install.sh --omnigent`.
 4. Run `trioctl omnigent models` and resolve all four roles. Stop if Grok or
    the configured effort is unavailable.
@@ -211,7 +210,7 @@ point two live runs at one mailbox.
 
 Omnigent already stored `reasoning_effort` on sessions and translated it to
 Claude's `--effort` or Codex reasoning configuration at launch. Previously,
-the child tools exposed `model` but not `reasoning_effort`, so an orchestrator
+the session-create tool exposed `model` but not `reasoning_effort`, so an orchestrator
 could not choose effort by Opus role. Registered `agent_id` launches also
 skipped the role's native launch configuration, dropping Claude
 `bypassPermissions`. The patch completes both existing paths.

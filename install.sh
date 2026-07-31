@@ -60,16 +60,6 @@ case "${1:-}" in
     OMNIGENT_BIN="$(command -v omnigent)"
     OMNIGENT_TOOL_PYTHON="$(head -n 1 "$OMNIGENT_BIN" | sed 's/^#!//')"
     if [[ ! -x "$OMNIGENT_TOOL_PYTHON" ]] || ! "$OMNIGENT_TOOL_PYTHON" -c '
-from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
-branches = _build_sys_session_send_schema({})["function"]["parameters"]["properties"]["args"]["anyOf"]
-props = next(branch["properties"] for branch in branches if branch.get("type") == "object")
-raise SystemExit(0 if "reasoning_effort" in props else 1)
-'; then
-      echo "The active Omnigent installation lacks sys_session_send.args.reasoning_effort." >&2
-      echo "Set OMNIGENT_SOURCE=/path/to/omnigent and rerun this installer." >&2
-      exit 1
-    fi
-    if ! "$OMNIGENT_TOOL_PYTHON" -c '
 from omnigent.tools.builtins.spawn import SysSessionCreateTool
 schema = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
 raise SystemExit(0 if "reasoning_effort" in schema else 1)

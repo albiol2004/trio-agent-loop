@@ -345,16 +345,10 @@ def omnigent_contract() -> str:
         raise TrioctlError(f"{executable} has no Python shebang")
     interpreter = first_line[2:]
     probe = """
-from omnigent.tools.builtins.spawn import (
-    SysSessionCreateTool,
-    _build_sys_session_send_schema,
-)
+from omnigent.tools.builtins.spawn import SysSessionCreateTool
 from omnigent.server.routes.sessions import _resolve_agent_spec
 
-branches = _build_sys_session_send_schema({})["function"]["parameters"]["properties"]["args"]["anyOf"]
-send_props = next(branch["properties"] for branch in branches if branch.get("type") == "object")
 create_props = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
-assert "reasoning_effort" in send_props
 assert "reasoning_effort" in create_props
 assert callable(_resolve_agent_spec)
 """
@@ -372,7 +366,7 @@ assert callable(_resolve_agent_spec)
         detail = result.stderr.strip().splitlines()
         suffix = detail[-1] if detail else f"exit {result.returncode}"
         raise TrioctlError(f"required session/launch support is missing: {suffix}")
-    return "reasoning effort and registered native launch propagation available"
+    return "session-create effort and registered native launch propagation available"
 
 
 def command_configure(args: argparse.Namespace) -> int:
