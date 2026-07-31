@@ -10,8 +10,8 @@ Use `trioctl` to resolve the current profile, then Omnigent's
 `sys_session_*` tools to launch only the two Opus roles as direct children of
 this session:
 
-- `trio-omnigent-lead`: configured Claude Opus alias, normally `opus` / `high`
-- `trio-omnigent-evaluator`: configured Claude Opus alias, normally `opus` / `high`
+- `trio-omnigent-lead`: configured Claude Opus alias, normally `opus` / `medium`
+- `trio-omnigent-evaluator`: configured Claude Opus alias, normally `opus` / `medium`
 
 The Opus roles own delegation. They launch ephemeral headless Cursor workers
 through `trioctl`; every worker uses the profile-resolved Cursor Grok 4.5 model,

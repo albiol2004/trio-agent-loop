@@ -4,12 +4,12 @@ version = 1
 [roles.lead]
 provider = "claude"
 model = "opus"
-effort = "high"
+effort = "medium"
 
 [roles.evaluator]
 provider = "claude"
 model = "opus"
-effort = "high"
+effort = "medium"
 
 # Cursor exposes account-entitled model IDs through `cursor-agent models`.
 # Effort is encoded in Cursor's model ID, so no separate reasoning override is

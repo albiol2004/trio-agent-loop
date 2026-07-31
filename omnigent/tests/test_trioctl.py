@@ -26,11 +26,11 @@ def profile(**builder):
     return {
         "version": 1,
         "roles": {
-            "lead": {"provider": "claude", "model": "opus", "effort": "high"},
+            "lead": {"provider": "claude", "model": "opus", "effort": "medium"},
             "evaluator": {
                 "provider": "claude",
                 "model": "opus",
-                "effort": "high",
+                "effort": "medium",
             },
             "builder": {
                 "provider": "cursor",
@@ -71,7 +71,7 @@ def test_claude_role_uses_configured_moving_alias():
         "role": "lead",
         "provider": "claude",
         "model": "opus",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
         "source": "configured-alias",
     }
 

@@ -111,6 +111,8 @@ installer_replacement_contract() {
   [[ -x "$trioctl" && -f "$trioctl_config" ]] || return 1
   assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
     | grep -Fq '"model": "opus"'
+  assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
+    | grep -Fq '"reasoning_effort": "medium"'
   [[ -z "$(find "$claude_skill" "$codex_skill" -type d -name scripts -print)" ]] || return 1
   mkdir -p "$TMP/expected-roles"
   assert cp -a "$ROOT/omnigent/trio-omnigent-roles/." "$TMP/expected-roles/"

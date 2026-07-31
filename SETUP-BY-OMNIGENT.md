@@ -14,13 +14,13 @@ Installing or removing one does not overwrite the others.
 
 | Role | Harness | Model | Effort |
 |---|---|---|---|
-| Lead | `claude-native` | Claude `opus` alias | `high` |
-| Evaluator | `claude-native` | Claude `opus` alias | `high` |
+| Lead | `claude-native` | Claude `opus` alias | `medium` |
+| Evaluator | `claude-native` | Claude `opus` alias | `medium` |
 | Builder | headless `cursor-agent` | `cursor-grok-4.5-high` | `high` in model ID |
 | Scout | headless `cursor-agent --mode ask` | `cursor-grok-4.5-high` | `high` in model ID |
 
 The Claude or Codex session already open in Omnigent schedules iterations. It
-creates only Lead and Evaluator as direct Opus/high children. Lead decides when
+creates only Lead and Evaluator as direct Opus/medium children. Lead decides when
 to run a Cursor Grok Builder or Scout through `trioctl`; Evaluator decides when
 it needs a read-only Grok Scout. There is no additional coordinator model, and
 the root session never delegates implementation directly to Grok.
@@ -244,11 +244,11 @@ python3 -m pytest -q omnigent/tests/test_trioctl.py
 ```
 
 Do a short real smoke run. Lead/Evaluator must show the profile-resolved
-Opus/high pair. Their captured `trioctl` output must identify the
+Opus/medium pair. Their captured `trioctl` output must identify the
 profile-resolved Cursor Grok 4.5 High worker.
 
 For a real smoke run, inspect the UI session tree: the current session must
-remain the root, with Lead/Evaluator as direct Opus/high children. Builder and
+remain the root, with Lead/Evaluator as direct Opus/medium children. Builder and
 Scout do not appear as persistent Omnigent children; the Opus role's command
 history and report must show its own `trioctl omnigent run` invocation. A
 root-launched Grok process or any Sonnet coordinator is a failure.

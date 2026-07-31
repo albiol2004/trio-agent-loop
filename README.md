@@ -163,7 +163,7 @@ parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
 
-Omnigent adds two registered Opus agents for Lead/Evaluator. Their
+Omnigent adds two registered Opus agents at medium effort for Lead/Evaluator. Their
 Scout/Builder delegation runs as ephemeral headless Cursor Grok 4.5 High agents
 through the additive `trioctl` utility. `trioctl` resolves the user-editable
 runtime profile from Claude's stable alias and Cursor's authenticated live
