@@ -117,6 +117,21 @@ the profile's exact fallback slug for diagnostics or recovery, but the
 
 ## Update the Omnigent source checkout
 
+The bundled compatibility patch is verified against the stable `v0.8.2`
+release as well as the contemporaneous development branch. For a stable
+installation, keep the Omnigent checkout on a local branch rooted at the
+release tag:
+
+```bash
+cd /path/to/omnigent
+git fetch origin --tags
+git switch -c trio-v0.8.2 v0.8.2
+```
+
+Do not run `git pull` on that pinned branch: release tags do not advance. Move
+to a new release deliberately, after preserving any local commits and checking
+that the bundled patch applies to the new tag.
+
 After the initial setup, update the default `$HOME/omnigent` checkout and reapply the Trio
 compatibility patch with:
 
@@ -130,7 +145,9 @@ Pass another checkout explicitly when needed:
 ./omnigent/update-omnigent.sh /path/to/omnigent
 ```
 
-The updater reverses only the known Trio patch, runs `git pull --ff-only`, and
+Use this updater only for an Omnigent branch that tracks an upstream branch
+(such as `main`), not for the pinned stable branch above. The updater reverses
+only the known Trio patch, runs `git pull --ff-only`, and
 then reapplies it. It leaves unrelated tracked changes and untracked files
 alone. If the pull fails, it attempts to restore the patch automatically. If a
 new upstream revision is incompatible with the bundled patch, it stops with a
