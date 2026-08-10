@@ -9,6 +9,8 @@
 #   ./install.sh --pi              -> native Pi AgentSession extension
 #   ./install.sh --opencode [--strong-model provider/model --light-model provider/model]
 #                                      -> native OpenCode agents + commands
+#   ./install.sh --omp [--strong-model provider/model --light-model provider/model]
+#                                      -> native Oh My Pi agents + commands
 #   ./install.sh --portable [dir]  -> legacy driver for other harnesses
 set -euo pipefail
 
@@ -188,6 +190,66 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     fi
     echo "Next: follow SETUP-BY-OPENCODE.md and validate the installed role mappings."
     exit 0 ;;
+  --omp)
+    shift
+    OMP_STRONG_MODEL=""
+    OMP_LIGHT_MODEL=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --strong-model)
+          [[ $# -gt 1 ]] || { echo "--strong-model requires provider/model" >&2; exit 2; }
+          OMP_STRONG_MODEL="$2"
+          shift 2 ;;
+        --light-model)
+          [[ $# -gt 1 ]] || { echo "--light-model requires provider/model" >&2; exit 2; }
+          OMP_LIGHT_MODEL="$2"
+          shift 2 ;;
+        *) echo "unknown --omp option: $1" >&2; exit 2 ;;
+      esac
+    done
+    if [[ -n "$OMP_STRONG_MODEL" || -n "$OMP_LIGHT_MODEL" ]]; then
+      [[ -n "$OMP_STRONG_MODEL" && -n "$OMP_LIGHT_MODEL" ]] || {
+        echo "Specify both --strong-model and --light-model, or neither to keep the bundled frontmatter model pins." >&2
+        exit 2
+      }
+    fi
+    if command -v omp >/dev/null 2>&1; then
+      OMP_DEST="$(omp config path)"
+    else
+      OMP_DEST="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+    fi
+    mkdir -p "$OMP_DEST/agents" "$OMP_DEST/commands"
+    for f in "$ROOT"/omp/agents/*.md; do
+      target="$OMP_DEST/agents/$(basename "$f")"
+      if [[ -e "$target" ]]; then
+        echo "Preserving existing $target"
+      else
+        cp -v "$f" "$target"
+      fi
+    done
+    for f in "$ROOT"/omp/commands/*.md; do
+      target="$OMP_DEST/commands/$(basename "$f")"
+      if [[ -e "$target" ]]; then
+        echo "Preserving existing $target"
+      else
+        cp -v "$f" "$target"
+      fi
+    done
+    if [[ -n "$OMP_STRONG_MODEL" ]]; then
+      bash "$ROOT/omp/configure-models.sh" \
+        --agent-dir "$OMP_DEST" \
+        --strong-model "$OMP_STRONG_MODEL" \
+        --light-model "$OMP_LIGHT_MODEL"
+    fi
+    echo "Installed native Oh My Pi Trio agents and commands under $OMP_DEST."
+    if [[ -n "$OMP_STRONG_MODEL" ]]; then
+      echo "Applied strong/light model overrides via task.agentModelOverrides."
+    else
+      echo "No overrides supplied; agents use their bundled frontmatter model pins."
+    fi
+    echo "Smoke-test script (repo-side): $ROOT/omp/smoke-test.sh"
+    echo "Next: follow SETUP-BY-OMP.md and validate the installed role mappings."
+    exit 0 ;;
   --portable)
     DEST="${2:-$HOME/.trio}"
     mkdir -p "$DEST"
@@ -198,7 +260,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 

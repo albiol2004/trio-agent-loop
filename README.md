@@ -8,7 +8,7 @@ A research-hardened, Karpathy/Ralph-style agent loop: two equal "thinker"
 roles — a **Lead** that plans, delegates, and reviews, and an adversarial **Evaluator**
 that independently verifies — prompt each other through markdown mailbox
 files, fanning out scoped worker agents, iterating autonomously until the work
-ships or a human decision is needed. Claude, ZCode, Pi, and OpenCode use their native
+ships or a human decision is needed. Claude, ZCode, Pi, OpenCode, and Omp use their native
 orchestration surfaces. Codex prefers native custom agents and can fall back
 to isolated bundled Codex sessions when an app task does not expose native
 spawn controls. Kimi Code has a first-class sequential CLI fallback: K3 handles
@@ -80,6 +80,9 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
                                 # OpenCode native roles + user-selected models
+./install.sh --omp \
+  --strong-model provider/strong --light-model provider/light
+                                # Omp native agents + optional model overrides
 ```
 
 ## Use
@@ -162,6 +165,11 @@ fallback when a release lacks the documented named `Task` surface. See
 parameters/inheritance, permissions, and headless command routing. OpenCode
 maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
 light model to Scout/Builder; no provider is chosen by the repository.
+Omp ships native agents and slash commands with a bundled default model
+contract: judgment-tier Lead/Evaluator and worker-tier Scout/Builder pins are
+set in frontmatter, with `--strong-model`/`--light-model` or the global
+`task.agentModelOverrides` config taking precedence over those pins, and it
+runs the loop in-session via `/trio auto` because Omp has no `/loop` command.
 
 Omnigent adds two registered Opus agents at medium effort for Lead/Evaluator. Their
 Scout/Builder delegation runs as ephemeral headless Cursor Grok 4.5 High agents
@@ -201,6 +209,11 @@ opencode/                             # native OpenCode agents + commands
   commands/{trio,trio-init}.md
   configure-models.sh             # applies user-supplied strong/light IDs
   opencode.trio.example.jsonc         # optional; no model default
+omp/                                  # native Oh My Pi agents + commands
+  agents/trio-{lead,evaluator,scout,builder}.md
+  commands/{trio,trio-init}.md
+  configure-models.sh             # overrides default frontmatter model pins
+  smoke-test.sh
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md
   skills/trio-init/SKILL.md
@@ -219,6 +232,7 @@ its harness — it installs the template and explains usage:
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
 - Kimi Code: `SETUP-BY-KIMI.md` (skills + sequential K3/Kimi-for-Coding runner)
 - OpenCode: `SETUP-BY-OPENCODE.md` (parameterized native roles + portable fallback)
+- Omp: `SETUP-BY-OMP.md` (native agents + `/trio` commands)
 - Omnigent: `SETUP-BY-OMNIGENT.md` (mixed-provider native CLI child sessions)
 Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using
 its own harness's `portable/SETUP-*.md`.
