@@ -69,6 +69,64 @@ model_value() {
   }'
 }
 
+# Validate that trio-evaluator.md has an output: field carrying parseable JSON Schema.
+validate_output_schema() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json, re, sys
+file = sys.argv[1]
+with open(file) as f:
+    text = f.read()
+if not text.startswith('---\n'):
+    sys.exit('no frontmatter')
+parts = text.split('\n---\n', 1)
+fm = parts[0][4:]
+lines = fm.splitlines()
+output = None
+i = 0
+while i < len(lines):
+    line = lines[i]
+    m = re.match(r'^([A-Za-z0-9_-]+)\s*:\s*(.*)$', line)
+    if m:
+        key, rest = m.group(1), m.group(2)
+        if key == 'output':
+            if rest and rest not in ('|', '>', '|-', '>-', '|+', '>+'):
+                output = rest
+                break
+            i += 1
+            block = []
+            while i < len(lines):
+                l = lines[i]
+                if l == '' or l.startswith(' ') or l.startswith('\t'):
+                    block.append(l)
+                    i += 1
+                elif re.match(r'^[A-Za-z0-9_-]+\s*:', l):
+                    break
+                else:
+                    block.append(l)
+                    i += 1
+            output = '\n'.join(block)
+            break
+    i += 1
+if output is None:
+    sys.exit('missing output field')
+out_lines = output.splitlines()
+nonblank = [l for l in out_lines if l.strip()]
+min_indent = min(len(l) - len(l.lstrip()) for l in nonblank) if nonblank else 0
+dedented = '\n'.join(l[min_indent:] for l in out_lines)
+first = dedented.lstrip().splitlines()[0] if dedented.strip() else ''
+if first in ('|', '>', '|-', '>-', '|+', '>+'):
+    dedented = '\n'.join(dedented.splitlines()[1:])
+schema = json.loads(dedented.strip())
+assert isinstance(schema, dict)
+assert schema.get('type') == 'object'
+assert 'verdict' in schema.get('required', [])
+assert 'summary' in schema.get('required', [])
+assert 'blocking_issues' in schema.get('properties', {})
+print('output schema OK')
+PY
+}
+
 # (b) Bundle source files exist.
 for role in trio-lead trio-evaluator trio-scout trio-builder; do
   [[ -f "$OMP/agents/$role.md" ]] || fail "missing agent source $OMP/agents/$role.md"
@@ -112,6 +170,10 @@ frontmatter "$OMP/agents/trio-scout.md" | grep -Eq '^read-summarize[[:space:]]*:
   || fail "trio-scout model: must be deepseek/deepseek-v4-flash"
 [[ "$(model_value "$OMP/agents/trio-builder.md")" == "deepseek/deepseek-v4-flash" ]] \
   || fail "trio-builder model: must be deepseek/deepseek-v4-flash"
+
+# Output schema in evaluator frontmatter.
+has_frontmatter "$OMP/agents/trio-evaluator.md" output || fail "trio-evaluator missing output:"
+validate_output_schema "$OMP/agents/trio-evaluator.md" || fail "trio-evaluator output schema is not valid JSON"
 
 # (d) Commands reference the mailbox protocol files.
 for cmd in trio trio-init; do

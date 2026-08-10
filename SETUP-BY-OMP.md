@@ -59,6 +59,12 @@ omp config set task.agentModelOverrides '{"trio-lead":"provider/strong-model","t
 `task.agentModelOverrides` has precedence over frontmatter `model:` fields, so
 changing the override record is the supported way to retarget the loop.
 
+Frontmatter `model:` accepts a prioritized list whose later entries are
+per-spawn fallbacks (for example
+`model: [kimi-code/kimi-for-coding, kimi-code/kimi]`). The bundle ships
+single pins by default — adding fallbacks is a supported local edit, unlike
+the fixed role-prompt contract.
+
 ## 3. Verify the installation
 
 Confirm the files exist under the resolved Omp agent directory:
@@ -105,9 +111,35 @@ From any project:
 - Concurrent loops: use a distinct mailbox directory with
   `/trio-init dir=loop-<name> <goal>` then `/trio dir=loop-<name>`.
 - `max_iterations` in `loop/STATE.md` (default 10) is the hard budget cap.
+- `/pause` parks the main agent AND all role subagents at safe boundaries —
+  the clean way to pause a `/trio auto` run mid-iteration (Esc/interrupt also
+  works).
+- Cost knobs: `task.maxEffort` ceilings subagent effort and
+  `thinkingBudgets.*` sizes thinking levels without touching the bundle.
 - You can steer role agents live through the Agent Hub (Alt+A).
 
-## 5. Do NOT modify the role files
+## 5. Headless / CI runs
+
+For non-interactive or CI runs, start the loop headless:
+
+```text
+omp -p "/trio auto"
+```
+
+Use an overlay `--config` YAML to make the run repeatable and cheaper:
+
+```yaml
+tools:
+  approvalMode: yolo
+task:
+  maxEffort: med
+```
+
+`tools.approvalMode: yolo` auto-approves tool calls, so run CI in a
+disposable checkout. `max_iterations` in `loop/STATE.md` still caps the
+budget.
+
+## 6. Do NOT modify the role files
 
 The role contract is fixed in the agent frontmatter and prompt bodies:
 `trio-lead` plans, delegates, and reviews; `trio-builder` performs the primary
@@ -119,7 +151,7 @@ Lead-plans/Builder-implements/Evaluator-verifies separation of powers is the
 core contract. If you need different models, use the `task.agentModelOverrides`
 config path described above instead of editing frontmatter.
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 - **Unknown agent errors** in a running session usually mean the agents were
   installed after the session started. Restart the Omp session.

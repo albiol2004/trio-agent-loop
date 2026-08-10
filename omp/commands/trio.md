@@ -25,9 +25,12 @@ After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation
 
 ## 2. Evaluate
 Dispatch the `trio-evaluator` agent with the task tool (`agent: "trio-evaluator"`) and wait for its result. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
+- The task result carries a structured output object with `verdict` (SHIP/ITERATE/BLOCKED), `summary`, and optional `blocking_issues`. This structured `verdict` is the **authoritative** verdict for the iteration.
+- If the structured `verdict` is missing or cannot be parsed, fall back to reading the first line of `loop/VERDICT.md`.
+- If the structured `verdict` differs from `loop/VERDICT.md`'s first-line word, the Evaluator breached the mirror contract: retry the Evaluator once with a note about the mismatch. If the mismatch persists, set `status: error` in STATE.md, report the role-contract breach, and end the loop.
 
 ## 3. Report and schedule
-Read `loop/VERDICT.md`, update `loop/STATE.md` (`status: <verdict>`, `last_run: <date from bash>`), then give the human a compact iteration digest:
+Use the authoritative verdict from step 2. Read `loop/VERDICT.md` for the human-facing detail (suggested commit message, follow-ups, blocking details), update `loop/STATE.md` (`status: <verdict>`, `last_run: <date from bash>`), then give the human a compact iteration digest:
 - Iteration N, verdict, one line each for what was planned / done / found.
 - Any `DECISION:` flags the Lead recorded (the human may want to veto).
 

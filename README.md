@@ -170,6 +170,11 @@ contract: judgment-tier Lead/Evaluator and worker-tier Scout/Builder pins are
 set in frontmatter, with `--strong-model`/`--light-model` or the global
 `task.agentModelOverrides` config taking precedence over those pins, and it
 runs the loop in-session via `/trio auto` because Omp has no `/loop` command.
+The Omp Evaluator also returns a structured verdict (an `output` schema in its
+frontmatter: `verdict`/`summary`/`blocking_issues`), so the orchestrator reads
+a typed result and treats VERDICT.md's first line as the audit fallback — a
+channel the other native bundles don't expose. `omp -p "/trio auto"` runs the
+loop headless for CI.
 
 Omnigent adds two registered Opus agents at medium effort for Lead/Evaluator. Their
 Scout/Builder delegation runs as ephemeral headless Cursor Grok 4.5 High agents
