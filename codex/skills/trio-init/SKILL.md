@@ -13,7 +13,7 @@ Write:
 - `GOAL.md`: `profile: software|data`, mission, objective definition of done,
   and constraints. Data goals must name ground truth, reconciliation tolerance,
   key uniqueness, and rerun/idempotence expectations.
-- `STATE.md`: iteration 0, max_iterations 10, ready status, mission fingerprint,
+- `STATE.md`: `schema: 1`, iteration 0, max_iterations 10, ready status, mission fingerprint,
   rejected approaches, and key decisions.
 - `LOG.md`: `# Trio loop log`.
 - Empty `PLAN.md`, `REPORT.md`, and `VERDICT.md`.

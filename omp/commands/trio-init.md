@@ -23,6 +23,7 @@ For `profile: data`, the Definition of done MUST include data ground truth, so i
 
 `loop/STATE.md` (the `mission:` line is the first sentence of GOAL.md's mission, verbatim — the `/trio` orchestrator halts if it ever stops matching GOAL.md, which catches another session repurposing the mailbox):
 ```markdown
+schema: 1
 iteration: 0
 max_iterations: 10
 status: ready

@@ -6,7 +6,9 @@ subtask: true
 
 Initialize or validate the existing Trio mailbox for this project. Create only
 the standard `loop/` files required by the repository's established protocol,
-preserve any existing user mailbox, and do not implement product code. Record
+with the `schema: 1` version marker as the first line of `loop/STATE.md`
+(per MAILBOX-SCHEMA.md), preserve any existing user mailbox, and do not
+implement product code. Record
 the supplied goal in `loop/GOAL.md` only when the mailbox is new or the user
 explicitly asks to replace it. Then explain how to run `/trio`.
 

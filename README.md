@@ -223,6 +223,8 @@ omp/                                  # native Oh My Pi agents + commands
 metrics/                            # cross-harness loop analytics
   trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
                                   #   normalization across template generations
+  trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
+MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md
   skills/trio-init/SKILL.md
