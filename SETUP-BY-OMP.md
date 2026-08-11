@@ -74,12 +74,17 @@ ls "$(omp config path)/agents"/trio-{lead,evaluator,scout,builder}.md
 ls "$(omp config path)/commands"/{trio,trio-init}.md
 ```
 
-Check that `trio-lead.md` and `trio-evaluator.md` contain `blocking: true` in
-their frontmatter, and that the default model pins match the contract above:
+Check that the default model pins match the contract above, and that the lead
+and evaluator frontmatter carry `spawns:` (roles are dispatched as background
+jobs — they must NOT set `blocking:`, which would freeze the orchestrator's
+turn):
 
 ```bash
-grep -E '^model:' "$(omp config path)/agents"/trio-{lead,evaluator,scout,builder}.md
+grep -E '^(model|spawns):' "$(omp config path)/agents"/trio-{lead,evaluator,scout,builder}.md
 ```
+
+Roles run as async background jobs whose results auto-deliver to the
+orchestrator; watch or steer them live via the Agent Hub (Alt+A).
 
 Optionally run the repo-side smoke test:
 

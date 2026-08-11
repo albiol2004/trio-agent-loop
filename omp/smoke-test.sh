@@ -160,10 +160,16 @@ has_frontmatter "$OMP/agents/trio-evaluator.md" spawns || fail "trio-evaluator m
 eval_spawns="$(spawns_value "$OMP/agents/trio-evaluator.md")"
 [[ "$eval_spawns" == *trio-scout* ]] || fail "trio-evaluator spawns: must include trio-scout"
 
-frontmatter "$OMP/agents/trio-lead.md" | grep -Eq '^blocking[[:space:]]*:[[:space:]]*true$' \
-  || fail "trio-lead must set blocking: true"
-frontmatter "$OMP/agents/trio-evaluator.md" | grep -Eq '^blocking[[:space:]]*:[[:space:]]*true$' \
-  || fail "trio-evaluator must set blocking: true"
+# Roles must NOT pin blocking: true — the loop dispatches them as background
+# jobs with auto-delivery; blocking would freeze the orchestrator's turn.
+frontmatter "$OMP/agents/trio-lead.md" | grep -Eq '^blocking[[:space:]]*:' \
+  && fail "trio-lead must not set blocking: (async dispatch)"
+frontmatter "$OMP/agents/trio-evaluator.md" | grep -Eq '^blocking[[:space:]]*:' \
+  && fail "trio-evaluator must not set blocking: (async dispatch)"
+grep -q 'background job' "$OMP/commands/trio.md" \
+  || fail "trio.md must instruct background-job dispatch"
+grep -q 'auto-delivers' "$OMP/commands/trio.md" \
+  || fail "trio.md must document auto-delivery semantics"
 frontmatter "$OMP/agents/trio-scout.md" | grep -Eq '^read-summarize[[:space:]]*:[[:space:]]*false$' \
   || fail "trio-scout must set read-summarize: false"
 

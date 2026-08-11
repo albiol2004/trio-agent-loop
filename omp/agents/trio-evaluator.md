@@ -2,7 +2,6 @@
 name: trio-evaluator
 description: Independent adversarial Trio evaluator; verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using scouts for scoped reconnaissance. Writes VERDICT.md with SHIP / ITERATE / BLOCKED. Never fixes anything itself.
 model: kimi-code/kimi-for-coding
-blocking: true
 spawns: trio-scout
 output: |
   {

@@ -19,14 +19,16 @@ If you are coming from the Claude bundle, `/trio auto` replaces the old `/loop /
 3. Otherwise increment `iteration` in STATE.md, set `status: running`, and proceed.
 
 ## 1. Lead (plan + delegate implementation + review)
-Dispatch the `trio-lead` agent with the task tool (`agent: "trio-lead"`) and wait for its result — its frontmatter sets `blocking: true`. Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to dispatch `trio-scout` for scoped exploration and that the Lead must not replace the mandatory first implementation pass.
+Dispatch the `trio-lead` agent as a **background job** with the task tool. The tasks item MUST carry the `agent` field: `{"agent": "trio-lead", "task": "..."}`. Immediately check the spawn confirmation: if it shows a generated label instead of `trio-lead` (e.g. a random animal name), the `agent` field was dropped — cancel that job and redispatch. Never let a generic agent play a role.
 
-Before dispatching the Lead, capture the wall-clock start time with bash:
+Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to dispatch `trio-scout` for scoped exploration and that the Lead must not replace the mandatory first implementation pass.
+
+The job result **auto-delivers** when the Lead finishes — do not busy-poll and do not block your turn waiting; end the turn or continue other work, and resume when the result arrives. Before dispatching the Lead, capture the wall-clock start time with bash:
 ```bash
 date -u +%Y-%m-%dT%H:%M:%SZ
 ```
 
-After the Lead returns, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
+After the Lead's result arrives, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
 
 ### 1a. Append the orchestrator's Lead timing line to LOG.md
 The Lead role also appends its own human-readable line to `loop/LOG.md`. You must append a second, **authoritative** Format-A line that carries per-role timing fields. Capture the end time, compute wall-clock seconds, and append:
@@ -38,7 +40,9 @@ The Lead role also appends its own human-readable line to `loop/LOG.md`. You mus
 Use a one-line summary of what the Lead did (keep it ≤ 12 words, no `|` characters). You may either run `bash` with `printf '%s\n' "..." >> loop/LOG.md` or, when the repo-side helper is present, run `bash omp/scripts/trio-log-usage.sh -d loop -i N -r lead -s "..." started_at:... ended_at:... duration_sec:...`.
 
 ## 2. Evaluate
-Dispatch the `trio-evaluator` agent with the task tool (`agent: "trio-evaluator"`) and wait for its result. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
+Dispatch the `trio-evaluator` agent as a **background job** with the task tool — same rules as the Lead dispatch: the tasks item MUST carry `{"agent": "trio-evaluator", ...}`, verify the spawn confirmation names `trio-evaluator`, and NEVER dispatch it before the Lead's result has arrived (the Evaluator reads the Lead's output files). Its result auto-delivers; do not busy-poll.
+
+Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
 - The task result carries a structured output object with `verdict` (SHIP/ITERATE/BLOCKED), `summary`, and optional `blocking_issues`. This structured `verdict` is the **authoritative** verdict for the iteration.
 - If the structured `verdict` is missing or cannot be parsed, fall back to reading the first line of `loop/VERDICT.md`.
 - If the structured `verdict` differs from `loop/VERDICT.md`'s first-line word, the Evaluator breached the mirror contract: retry the Evaluator once with a note about the mismatch. If the mismatch persists, set `status: error` in STATE.md, report the role-contract breach, and end the loop.
@@ -71,5 +75,5 @@ Then:
 - Never edit the mailbox files yourself except `loop/STATE.md` bookkeeping and the orchestrator usage-log lines in `loop/LOG.md` described above — content belongs to the roles.
 - Never fix code yourself, even for a trivial failure; that's the next iteration's job.
 - A code-changing Lead run is incomplete unless REPORT.md records at least one `trio-builder` as the primary implementor. Retry the Lead once if that provenance is missing; on a second failure, set `status: error`, report the role-contract breach, and end the loop.
-- The two roles run strictly sequentially — never in parallel; the Evaluator reads the Lead's output files.
+- The two roles run strictly sequentially — never in parallel. Async dispatch does not change this: the Evaluator job is dispatched only after the Lead job's result has been delivered and reviewed; the Evaluator reads the Lead's output files.
 - If a role agent dies or returns without writing its file, retry it once with a note about what's missing; if it fails again, set `status: error` in STATE.md, report to the human, end the loop.
