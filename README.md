@@ -199,6 +199,10 @@ codex/                               # custom agents, skills, fallback runner
   skills/trio/references/TROUBLESHOOTING.md
   skills/trio/scripts/run-role.sh
   skills/trio/references/prompts/*.md
+bridge/                              # cross-harness trio-bridge suggestion skill
+  skills/trio-bridge/SKILL.md        # /trio-bridge — scan for background work
+  commands/trio-bridge.md            # Omp native command source
+  README.md                          # proposal card contract
 omnigent/trio-omnigent-roles/        # Opus agents + Cursor role references
   {lead,evaluator,builder,scout}/config.yaml
 omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
@@ -224,6 +228,10 @@ metrics/                            # cross-harness loop analytics
   trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
                                   #   normalization across template generations
   trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
+dashboard/                          # read-only web dashboard (stdlib-only server)
+  serve.py                        # board/sessions/SSE-transcript API server
+  index.html app.css app.js       # self-contained dark-theme frontend (no CDN)
+  README.md                       # usage, CLI flags, and tailscale access notes
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md

@@ -11,6 +11,7 @@
 #                                      -> native OpenCode agents + commands
 #   ./install.sh --omp [--strong-model provider/model --light-model provider/model]
 #                                      -> native Oh My Pi agents + commands
+#   ./install.sh --bridge              -> install the trio-bridge suggestion skill for Claude, Codex, and Omp
 #   ./install.sh --portable [dir]  -> legacy driver for other harnesses
 set -euo pipefail
 
@@ -250,6 +251,56 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "Smoke-test script (repo-side): $ROOT/omp/smoke-test.sh"
     echo "Next: follow SETUP-BY-OMP.md and validate the installed role mappings."
     exit 0 ;;
+  --bridge)
+    shift
+    BRIDGE_STRONG_MODEL=""
+    BRIDGE_LIGHT_MODEL=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --strong-model)
+          [[ $# -gt 1 ]] || { echo "--strong-model requires provider/model" >&2; exit 2; }
+          BRIDGE_STRONG_MODEL="$2"
+          shift 2 ;;
+        --light-model)
+          [[ $# -gt 1 ]] || { echo "--light-model requires provider/model" >&2; exit 2; }
+          BRIDGE_LIGHT_MODEL="$2"
+          shift 2 ;;
+        *) echo "unknown --bridge option: $1" >&2; exit 2 ;;
+      esac
+    done
+    if [[ -n "$BRIDGE_STRONG_MODEL" || -n "$BRIDGE_LIGHT_MODEL" ]]; then
+      echo "note: --strong-model/--light-model are unused for the prompt-only trio-bridge skill."
+    fi
+    # trio-bridge is a prompt-only suggestion skill; copy it to each harness
+    # tree, preserving any existing copy. Claude and Omnigent share ~/.claude,
+    # Codex uses ~/.agents, and Omp gets the native command form.
+    if [[ -e "$HOME/.claude/skills/trio-bridge" ]]; then
+      echo "Preserving existing $HOME/.claude/skills/trio-bridge"
+    else
+      mkdir -p "$HOME/.claude/skills"
+      cp -rv "$ROOT/bridge/skills/trio-bridge" "$HOME/.claude/skills/"
+    fi
+    if [[ -e "$HOME/.agents/skills/trio-bridge" ]]; then
+      echo "Preserving existing $HOME/.agents/skills/trio-bridge"
+    else
+      mkdir -p "$HOME/.agents/skills"
+      cp -rv "$ROOT/bridge/skills/trio-bridge" "$HOME/.agents/skills/"
+    fi
+    if command -v omp >/dev/null 2>&1; then
+      OMP_DEST="$(omp config path)"
+    else
+      OMP_DEST="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+    fi
+    mkdir -p "$OMP_DEST/commands"
+    target="$OMP_DEST/commands/trio-bridge.md"
+    if [[ -e "$target" ]]; then
+      echo "Preserving existing $target"
+    else
+      cp -v "$ROOT/bridge/commands/trio-bridge.md" "$target"
+    fi
+    echo "Installed trio-bridge suggestion skill for Claude, Codex, and Omp."
+    echo "Next: run /trio-bridge in a project to scan for background work."
+    exit 0 ;;
   --portable)
     DEST="${2:-$HOME/.trio}"
     mkdir -p "$DEST"
@@ -260,7 +311,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 
