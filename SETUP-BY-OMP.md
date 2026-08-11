@@ -117,6 +117,16 @@ From any project:
 - Cost knobs: `task.maxEffort` ceilings subagent effort and
   `thinkingBudgets.*` sizes thinking levels without touching the bundle.
 - You can steer role agents live through the Agent Hub (Alt+A).
+- **Per-iteration usage / timing logging**: The `/trio` orchestrator appends
+  one authoritative Format-A line per role to `loop/LOG.md` after each role
+  returns. The line carries wall-clock timing (`started_at`, `ended_at`,
+  `duration_sec`) as trailing `| key: value` fields. Token usage is visible
+  live in the Agent Hub (Alt+A), but it is **not yet machine-readable from the
+  loop** — the task tool result surfaced to the orchestrator does not include
+  per-agent token counts, the `agent.db` usage tables are not populated with
+  per-agent records, and the session-JSONL usage objects are not exposed
+  through a stable API. Timing fields are the supported proxy until OMP exposes
+  programmatic per-agent token usage.
 
 ## 5. Headless / CI runs
 

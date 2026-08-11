@@ -138,6 +138,12 @@ done
 [[ -x "$OMP/configure-models.sh" ]] || fail "$OMP/configure-models.sh is not executable"
 [[ -x "$OMP/smoke-test.sh" ]] || fail "$OMP/smoke-test.sh is not executable"
 
+# (b2) Optional helper script.
+if [[ -f "$OMP/scripts/trio-log-usage.sh" ]]; then
+  bash -n "$OMP/scripts/trio-log-usage.sh" || fail "trio-log-usage.sh has syntax errors"
+  [[ -x "$OMP/scripts/trio-log-usage.sh" ]] || fail "trio-log-usage.sh is not executable"
+fi
+
 # (c) Frontmatter contract.
 for role in trio-lead trio-evaluator trio-scout trio-builder; do
   file="$OMP/agents/$role.md"

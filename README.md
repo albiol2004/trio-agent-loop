@@ -218,7 +218,11 @@ omp/                                  # native Oh My Pi agents + commands
   agents/trio-{lead,evaluator,scout,builder}.md
   commands/{trio,trio-init}.md
   configure-models.sh             # overrides default frontmatter model pins
+  scripts/trio-log-usage.sh       # appends per-role timing lines to LOG.md
   smoke-test.sh
+metrics/                            # cross-harness loop analytics
+  trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
+                                  #   normalization across template generations
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md
   skills/trio-init/SKILL.md

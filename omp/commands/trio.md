@@ -21,7 +21,21 @@ If you are coming from the Claude bundle, `/trio auto` replaces the old `/loop /
 ## 1. Lead (plan + delegate implementation + review)
 Dispatch the `trio-lead` agent with the task tool (`agent: "trio-lead"`) and wait for its result — its frontmatter sets `blocking: true`. Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to dispatch `trio-scout` for scoped exploration and that the Lead must not replace the mandatory first implementation pass.
 
-After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
+Before dispatching the Lead, capture the wall-clock start time with bash:
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+```
+
+After the Lead returns, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
+
+### 1a. Append the orchestrator's Lead timing line to LOG.md
+The Lead role also appends its own human-readable line to `loop/LOG.md`. You must append a second, **authoritative** Format-A line that carries per-role timing fields. Capture the end time, compute wall-clock seconds, and append:
+
+```text
+- iter N | lead | <one-line summary> | started_at: <ISO-8601> | ended_at: <ISO-8601> | duration_sec: <seconds>
+```
+
+Use a one-line summary of what the Lead did (keep it ≤ 12 words, no `|` characters). You may either run `bash` with `printf '%s\n' "..." >> loop/LOG.md` or, when the repo-side helper is present, run `bash omp/scripts/trio-log-usage.sh -d loop -i N -r lead -s "..." started_at:... ended_at:... duration_sec:...`.
 
 ## 2. Evaluate
 Dispatch the `trio-evaluator` agent with the task tool (`agent: "trio-evaluator"`) and wait for its result. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
@@ -29,17 +43,32 @@ Dispatch the `trio-evaluator` agent with the task tool (`agent: "trio-evaluator"
 - If the structured `verdict` is missing or cannot be parsed, fall back to reading the first line of `loop/VERDICT.md`.
 - If the structured `verdict` differs from `loop/VERDICT.md`'s first-line word, the Evaluator breached the mirror contract: retry the Evaluator once with a note about the mismatch. If the mismatch persists, set `status: error` in STATE.md, report the role-contract breach, and end the loop.
 
+Before dispatching the Evaluator, capture the wall-clock start time with bash:
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+```
+
+### 2a. Append the orchestrator's Evaluator timing line to LOG.md
+The Evaluator role also appends its own human-readable line to `loop/LOG.md`. You must append a second, **authoritative** Format-A line that carries the authoritative verdict and timing fields. After the Evaluator returns, capture the end time and append:
+
+```text
+- iter N | evaluator | VERDICT: SHIP — <one-line summary> | started_at: <ISO-8601> | ended_at: <ISO-8601> | duration_sec: <seconds>
+```
+
+Use the authoritative `verdict` from the structured output, and a one-line summary from `loop/VERDICT.md` (≤ 12 words, no `|` characters). Use `bash` with `printf` or the repo-side helper `bash omp/scripts/trio-log-usage.sh -d loop -i N -r evaluator -v <SHIP|ITERATE|BLOCKED> -s "..." started_at:... ended_at:... duration_sec:...`.
+
 ## 3. Report and schedule
 Use the authoritative verdict from step 2. Read `loop/VERDICT.md` for the human-facing detail (suggested commit message, follow-ups, blocking details), update `loop/STATE.md` (`status: <verdict>`, `last_run: <date from bash>`), then give the human a compact iteration digest:
 - Iteration N, verdict, one line each for what was planned / done / found.
 - Any `DECISION:` flags the Lead recorded (the human may want to veto).
+- The per-role timing fields you just recorded in `loop/LOG.md` (started_at, ended_at, duration_sec).
 
 Then:
 - **ITERATE** → if you are in `/trio auto` mode, promptly start the next iteration in the same turn; otherwise tell the user to run `/trio` again or start `/trio auto`.
 - **SHIP / BLOCKED** → end the loop (do not start another iteration) and tell the user why.
 
 ## Hard rules
-- Never edit the mailbox files yourself except STATE.md bookkeeping — content belongs to the roles.
+- Never edit the mailbox files yourself except `loop/STATE.md` bookkeeping and the orchestrator usage-log lines in `loop/LOG.md` described above — content belongs to the roles.
 - Never fix code yourself, even for a trivial failure; that's the next iteration's job.
 - A code-changing Lead run is incomplete unless REPORT.md records at least one `trio-builder` as the primary implementor. Retry the Lead once if that provenance is missing; on a second failure, set `status: error`, report the role-contract breach, and end the loop.
 - The two roles run strictly sequentially — never in parallel; the Evaluator reads the Lead's output files.
