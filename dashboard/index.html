@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Trio Loop Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230d1117'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='%23388bfd'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="topbar-title">
+      <h1>Trio Loop Dashboard</h1>
+      <p class="topbar-sub">Live status and session transcripts for trio loops</p>
+    </div>
+    <div class="topbar-meta">
+      <span id="updated-at" class="updated-at" title="">Updated &mdash;</span>
+      <span id="board-status" class="board-status status-idle"><span class="dot"></span><span id="board-status-text">connecting&hellip;</span></span>
+    </div>
+  </header>
+
+  <div id="layout" class="layout">
+    <main id="board" class="board" aria-label="Loop board">
+      <div id="board-error" class="board-error" hidden></div>
+      <div id="card-grid" class="card-grid"></div>
+    </main>
+
+    <aside id="transcript-pane" class="transcript-pane" hidden aria-label="Transcript viewer">
+      <header class="pane-header">
+        <div class="pane-heading">
+          <h2 id="pane-loop-name" class="pane-loop-name">Transcript</h2>
+          <span id="pane-status" class="pane-status status-idle"><span class="dot"></span><span id="pane-status-text">idle</span></span>
+        </div>
+        <button id="pane-close" class="icon-btn" type="button" title="Close transcript pane" aria-label="Close transcript pane">&times;</button>
+      </header>
+
+      <div class="pane-sessions">
+        <div id="session-list" class="session-list"></div>
+      </div>
+
+      <div class="pane-transcript">
+        <div id="transcript-view" class="transcript-view" role="log" aria-label="Session transcript" tabindex="0"></div>
+        <div id="transcript-notice" class="transcript-notice" hidden></div>
+      </div>
+
+      <footer class="pane-footer">
+        <button id="follow-btn" class="follow-btn" type="button" aria-pressed="true">Pause follow</button>
+        <span id="offset-hint" class="offset-hint">offset 0</span>
+      </footer>
+    </aside>
+  </div>
+
+  <noscript>This dashboard requires JavaScript.</noscript>
+</div>
+</body>
+</html>
