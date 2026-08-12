@@ -6,7 +6,10 @@ live status board and tails omp agent session transcripts over SSE. It is
 strictly read-only: no endpoint mutates loops, sessions, or the repo.
 
 Usage:
-    python3 dashboard/serve.py [--host 127.0.0.1] [--port 8420] [--root <dir>]
+    python3 dashboard/serve.py [--host 127.0.0.1] [--port <port>] [--root <dir>]
+
+With no --port, the first free port in the range 9470-9479 is used
+(override the range with the TRIO_DASH_PORTS env var, e.g. "9500-9509").
 
 `--root` defaults to the current working directory and is scanned top-level
 for `loop*/` mailbox directories. Parsing logic for mailboxes is reused from
@@ -56,6 +59,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import sys
 import time
@@ -665,7 +669,8 @@ def main(argv: list[str] | None = None) -> int:
                     "transcript viewer for trio loop mailboxes."
     )
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8420, help="bind port (default: 8420)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="bind port (default: first free port in the TRIO_DASH_PORTS range, 9470-9479)")
     parser.add_argument("--root", default=".", help="project root scanned for loop*/ dirs (default: cwd)")
     args = parser.parse_args(argv)
 
@@ -674,16 +679,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --root {args.root} is not a directory", file=sys.stderr)
         return 2
 
+    port_range = os.environ.get("TRIO_DASH_PORTS", "9470-9479")
     try:
-        server = DashboardServer((args.host, args.port), root)
-    except OSError as exc:
-        print(f"error: cannot bind {args.host}:{args.port} — {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"error: failed to load metrics module: {exc}", file=sys.stderr)
+        range_start, range_end = (int(p) for p in port_range.split("-", 1))
+    except ValueError:
+        print(f"error: invalid TRIO_DASH_PORTS range {port_range!r} (expected START-END)", file=sys.stderr)
+        return 2
+    candidate_ports = [args.port] if args.port is not None else list(range(range_start, range_end + 1))
+
+    server = None
+    for port in candidate_ports:
+        try:
+            server = DashboardServer((args.host, port), root)
+            break
+        except OSError as exc:
+            if args.port is not None:
+                print(f"error: cannot bind {args.host}:{port} — {exc}", file=sys.stderr)
+                return 1
+            continue  # range scan: port busy, try the next one
+        except Exception as exc:
+            print(f"error: failed to load metrics module: {exc}", file=sys.stderr)
+            return 1
+    if server is None:
+        print(f"error: no free port in range {port_range} on {args.host}", file=sys.stderr)
         return 1
 
-    print(f"Trio Loop Dashboard listening on http://{args.host}:{args.port} (root: {root})", flush=True)
+    print(f"Trio Loop Dashboard listening on http://{args.host}:{port} (root: {root})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

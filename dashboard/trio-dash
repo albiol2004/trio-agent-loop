@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# trio-dash — serve the trio loop dashboard for the current project.
+# Installed by install.sh --dashboard; run from any project root:
+#   trio-dash                 # board + live transcripts for ./loop*
+#   trio-dash --port 9999     # explicit port (bypasses 9470-9479 range scan)
+# Env:
+#   TRIO_DASH_HOME   install dir (default ~/.local/share/trio-agent-loop/dashboard)
+#   TRIO_DASH_HOST   bind address (default 0.0.0.0 so tailscale can reach it)
+#   TRIO_DASH_PORTS  port range (default 9470-9479)
+set -euo pipefail
+
+SHARE="${TRIO_DASH_HOME:-$HOME/.local/share/trio-agent-loop/dashboard}"
+if [[ ! -f "$SHARE/serve.py" ]]; then
+  echo "trio-dash: dashboard not installed at $SHARE" >&2
+  echo "Run install.sh --dashboard from the trio-agent-loop repo first." >&2
+  exit 1
+fi
+
+exec python3 "$SHARE/serve.py" \
+  --root "$PWD" \
+  --host "${TRIO_DASH_HOST:-0.0.0.0}" \
+  "$@"

@@ -2,34 +2,45 @@
 
 A production-quality, read-only web dashboard for trio agent loops. It runs on Python 3 stdlib only (no pip installs, no build step) and serves a live status board plus live transcript tailing for loop mailboxes.
 
-## Start
+## Install and start (per project)
 
-From the repo root:
-
-```bash
-python3 dashboard/serve.py
-```
-
-Defaults:
-- host: `127.0.0.1`
-- port: `8420`
-- root: current working directory (scanned top-level for `loop*/` mailbox dirs)
-
-Override any default:
+Install once:
 
 ```bash
-python3 dashboard/serve.py --host 0.0.0.0 --port 8420 --root /path/to/project
+./install.sh --dashboard
 ```
+
+Then from any project root — terminal or agent session:
+
+```bash
+trio-dash
+```
+
+This serves that project's `loop*/` mailboxes. Defaults:
+- host: `0.0.0.0` (reachable over tailscale; override with `TRIO_DASH_HOST` or `--host`)
+- port: first free port in `9470-9479` (override the range with `TRIO_DASH_PORTS`, or pass `--port` to bypass the range scan)
+- root: `$PWD` (override with `--root`)
+- install dir: `~/.local/share/trio-agent-loop/dashboard` (override with `TRIO_DASH_HOME`)
+
+The printed `listening on http://...` line names the actual bound port.
 
 ## Remote / Tailscale access
 
-Use `--host 0.0.0.0` to listen on all interfaces so the dashboard is reachable over your tailnet:
+`trio-dash` binds `0.0.0.0` by default, so the dashboard is reachable over your tailnet at `http://<machine-tailscale-ip>:<port>`. If the machine's firewall filters the tailscale interface, allow the range once (needs sudo):
 
 ```bash
-python3 dashboard/serve.py --host 0.0.0.0 --port 8420
+sudo firewall-cmd --permanent --zone=trusted --add-port=9470-9479/tcp && sudo firewall-cmd --reload
 ```
 
+Adjust the zone to the one holding `tailscale0`; no rule is needed if that interface is already in a trusted zone.
+
 There is no authentication in v1 — the tailnet ACL is the access boundary. Do not expose `--host 0.0.0.0` on untrusted networks without an auth layer.
+
+## Running from the repo checkout (development)
+
+```bash
+python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, root=cwd
+```
 
 ## What it shows
 

@@ -12,6 +12,7 @@
 #   ./install.sh --omp [--strong-model provider/model --light-model provider/model]
 #                                      -> native Oh My Pi agents + commands
 #   ./install.sh --bridge              -> install the trio-bridge suggestion skill for Claude, Codex, and Omp
+#   ./install.sh --dashboard           -> trio-dash per-project loop dashboard (ports 9470-9479, tailscale-ready)
 #   ./install.sh --portable [dir]  -> legacy driver for other harnesses
 set -euo pipefail
 
@@ -301,6 +302,27 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "Installed trio-bridge suggestion skill for Claude, Codex, and Omp."
     echo "Next: run /trio-bridge in a project to scan for background work."
     exit 0 ;;
+  --dashboard)
+    DASH_SHARE="${TRIO_DASH_HOME:-$HOME/.local/share/trio-agent-loop/dashboard}"
+    DASH_BIN="$HOME/.local/bin"
+    mkdir -p "$DASH_SHARE" "$DASH_BIN" "$(dirname "$DASH_SHARE")/metrics"
+    # Shipped code: overwrite our own files on reinstall (not user config).
+    cp -v "$ROOT/dashboard/serve.py" "$ROOT/dashboard/app.css" \
+          "$ROOT/dashboard/app.js" "$ROOT/dashboard/index.html" \
+          "$ROOT/dashboard/README.md" "$DASH_SHARE/"
+    cp -v "$ROOT/metrics/trio-metrics.py" "$(dirname "$DASH_SHARE")/metrics/"
+    cp -v "$ROOT/dashboard/trio-dash" "$DASH_BIN/trio-dash"
+    chmod +x "$DASH_BIN/trio-dash"
+    echo "Installed trio-dash. From any project root (terminal or agent): trio-dash"
+    echo "Binds ${TRIO_DASH_HOST:-0.0.0.0}, first free port in ${TRIO_DASH_PORTS:-9470-9479}."
+    case ":$PATH:" in
+      *":$DASH_BIN:"*) ;;
+      *) echo "Add $DASH_BIN to PATH." ;;
+    esac
+    echo "Tailscale (one-time, needs sudo): allow the range on the tailnet interface, e.g."
+    echo "  sudo firewall-cmd --permanent --zone=trusted --add-port=9470-9479/tcp && sudo firewall-cmd --reload"
+    echo "  (adjust the zone to the one holding tailscale0; no rule needed if tailscale0 is already trusted)"
+    exit 0 ;;
   --portable)
     DEST="${2:-$HOME/.trio}"
     mkdir -p "$DEST"
@@ -311,7 +333,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | --dashboard | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 
