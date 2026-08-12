@@ -8,10 +8,11 @@ const state = {
   boardTimer: null,
   loops: [],
   updatedAt: null,
+  tab: "all",
 
   /* drawer */
-  activeLoop: null,    /* loop whose drawer is open */
-  detail: null,        /* last /api/loop payload */
+  activeLoop: null,
+  detail: null,
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -25,6 +26,7 @@ const state = {
 };
 
 const BOARD_POLL_MS = 5000;
+const TABS = ["all", "running", "shipped", "blocked", "idle"];
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -112,11 +114,11 @@ function fmtDuration(sec) {
   return hrs + "h " + (mins % 60) + "m";
 }
 
-/* Map arbitrary STATE.md status text onto badge buckets. */
+/* Map arbitrary STATE.md status text onto buckets. */
 function normStatus(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return "unknown";
-  if (/(running|active|iterat|in progress|working|pending|queued)/.test(s)) {
+  if (/(running|active|iterat|in progress|working|pending|queued|awaiting)/.test(s)) {
     return "running";
   }
   if (/(complet|done|finish|ship|passed|succeed|closed)/.test(s)) {
@@ -152,33 +154,46 @@ const STATE_LABEL = {
   idle: "IDLE",
 };
 
-/* Verdict tiles from segments' verdict sequences, e.g. "IS" → [I, S]. */
-function verdictTiles(loop) {
+/* Verdict sequence from segments, e.g. ["iterate", "ship"]. */
+function verdictSeq(loop) {
   const seq = (loop.segments || [])
     .map((s) => s.verdict_sequence || "")
     .join("");
-  const tiles = [];
+  const out = [];
   for (const ch of seq) {
-    if (ch === "S") tiles.push("ship");
-    else if (ch === "I") tiles.push("iterate");
-    else if (ch === "B") tiles.push("blocked");
-    else tiles.push("none");
+    if (ch === "S") out.push("ship");
+    else if (ch === "I") out.push("iterate");
+    else if (ch === "B") out.push("blocked");
   }
-  return tiles;
+  return out;
 }
 
-function stripEl(tiles, large) {
-  const strip = document.createElement("div");
-  strip.className = "strip" + (large ? " strip-large" : "");
-  if (!tiles.length) {
-    strip.appendChild(span("strip-tile tile-none", "·"));
-    return strip;
+/* Segmented verdict bar: one hairline segment per verdict. */
+function segbarEl(seq, large) {
+  const bar = document.createElement("div");
+  bar.className = "segbar" + (large ? " segbar-large" : "");
+  if (!seq.length) {
+    const empty = document.createElement("div");
+    empty.className = "segbar-empty";
+    bar.appendChild(empty);
+    return bar;
   }
-  const letter = { ship: "S", iterate: "I", blocked: "B", none: "?" };
-  for (const t of tiles) {
-    strip.appendChild(span("strip-tile tile-" + t, letter[t]));
+  for (const v of seq) {
+    bar.appendChild(span("seg seg-" + v, ""));
   }
-  return strip;
+  return bar;
+}
+
+/* Mono sequence legend: S→I→S with per-verdict coloring. */
+function seqLegendEl(seq) {
+  const legend = document.createElement("span");
+  legend.className = "seg-seq";
+  const letter = { ship: "S", iterate: "I", blocked: "B" };
+  seq.forEach((v, i) => {
+    if (i > 0) legend.appendChild(document.createTextNode("→"));
+    legend.appendChild(span("seq-" + v, letter[v]));
+  });
+  return legend;
 }
 
 /* ------------------------------ board ------------------------------ */
@@ -192,6 +207,7 @@ async function refreshBoard() {
     state.updatedAt = data.updated_at || null;
     setBoardStatus("live", "live");
     hideBoardError();
+    renderTabs();
     renderBoard();
     if (state.activeLoop) refreshDetail({ quiet: true });
   } catch (err) {
@@ -220,11 +236,46 @@ function updateAggregates() {
   const total = state.loops.length;
   const active = state.loops.filter((l) => loopState(l) === "running").length;
   el("agg-loops").textContent = total + (total === 1 ? " loop" : " loops");
-  const activeChip = el("agg-active");
-  activeChip.textContent = active + " active";
-  activeChip.classList.toggle("is-active", active > 0);
+  el("agg-active").textContent = active + " active";
+  el("agg-active").classList.toggle("is-active", active > 0);
   const at = state.updatedAt ? fmtClock(state.updatedAt) : null;
   el("updated-at").textContent = "updated " + (at || "—");
+}
+
+function renderTabs() {
+  const nav = el("tabs");
+  nav.textContent = "";
+  for (const tab of TABS) {
+    const count = tab === "all"
+      ? state.loops.length
+      : state.loops.filter((l) => loopState(l) === tab).length;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tab";
+    if (state.tab === tab) btn.classList.add("active");
+    if (count === 0) btn.classList.add("tab-empty");
+    btn.textContent = tab;
+    btn.appendChild(span("tab-count", String(count)));
+    btn.setAttribute("aria-pressed", String(state.tab === tab));
+    btn.addEventListener("click", () => {
+      state.tab = tab;
+      history.replaceState(null, "", tab === "all" ? "#" : "#" + tab);
+      renderTabs();
+      renderBoard();
+    });
+    nav.appendChild(btn);
+  }
+}
+
+function visibleLoops() {
+  const rank = { running: 0, blocked: 1, idle: 2, shipped: 3 };
+  return state.loops
+    .filter((l) => state.tab === "all" || loopState(l) === state.tab)
+    .sort((a, b) => {
+      const r = rank[loopState(a)] - rank[loopState(b)];
+      if (r !== 0) return r;
+      return String(b.last_activity || "").localeCompare(String(a.last_activity || ""));
+    });
 }
 
 function renderBoard() {
@@ -238,13 +289,15 @@ function renderBoard() {
     grid.appendChild(empty);
     return;
   }
-  const rank = { running: 0, blocked: 1, idle: 2, shipped: 3 };
-  const sorted = [...state.loops].sort((a, b) => {
-    const r = rank[loopState(a)] - rank[loopState(b)];
-    if (r !== 0) return r;
-    return String(b.last_activity || "").localeCompare(String(a.last_activity || ""));
-  });
-  sorted.forEach((loop, i) => {
+  const loops = visibleLoops();
+  if (!loops.length) {
+    const empty = document.createElement("div");
+    empty.className = "board-empty";
+    empty.textContent = "No " + state.tab + " loops.";
+    grid.appendChild(empty);
+    return;
+  }
+  loops.forEach((loop, i) => {
     const card = cardEl(loop);
     card.style.animationDelay = Math.min(i * 40, 320) + "ms";
     grid.appendChild(card);
@@ -262,7 +315,7 @@ function cardEl(loop) {
 
   const top = document.createElement("div");
   top.className = "card-top";
-  top.appendChild(span("badge badge-" + display, STATE_LABEL[display]));
+  top.appendChild(span("status-label status-" + display, STATE_LABEL[display]));
   const iter = document.createElement("span");
   iter.className = "card-iter";
   const cur = loop.iteration != null ? loop.iteration : "–";
@@ -286,7 +339,7 @@ function cardEl(loop) {
 
   const bottom = document.createElement("div");
   bottom.className = "card-bottom";
-  bottom.appendChild(stripEl(verdictTiles(loop), false));
+  bottom.appendChild(segbarEl(verdictSeq(loop), false));
   bottom.appendChild(span("card-activity", relTime(loop.last_activity)));
   card.appendChild(bottom);
 
@@ -311,7 +364,7 @@ async function openDrawer(name) {
   state.activePath = null;
 
   el("drawer-name").textContent = name;
-  el("drawer-badge").className = "badge badge-idle";
+  el("drawer-badge").className = "status-label status-idle";
   el("drawer-badge").textContent = "LOADING";
   el("drawer-mission").textContent = "";
   el("fact-iter").textContent = "—";
@@ -352,7 +405,7 @@ async function refreshDetail({ quiet }) {
       cache: "no-store",
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    if (state.activeLoop !== name) return; /* drawer switched mid-flight */
+    if (state.activeLoop !== name) return;
     const detail = await res.json();
     state.detail = detail;
     state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
@@ -369,7 +422,7 @@ async function refreshDetail({ quiet }) {
 function renderDetail(detail) {
   const display = loopState(detail);
   const badge = el("drawer-badge");
-  badge.className = "badge badge-" + display;
+  badge.className = "status-label status-" + display;
   badge.textContent = STATE_LABEL[display];
 
   el("drawer-mission").textContent = detail.mission || "No mission recorded.";
@@ -388,12 +441,11 @@ function renderDetail(detail) {
 
   const strip = el("drawer-strip");
   strip.textContent = "";
-  const tiles = verdictTiles(detail);
-  strip.appendChild(stripEl(tiles, true));
-  const seqLabel = tiles.length
-    ? tiles.length + (tiles.length === 1 ? " verdict" : " verdicts")
-    : "no verdicts yet";
-  strip.appendChild(span("strip-label", seqLabel));
+  const seq = verdictSeq(detail);
+  strip.appendChild(segbarEl(seq, true));
+  strip.appendChild(
+    seq.length ? seqLegendEl(seq) : span("seg-seq", "no verdicts yet")
+  );
 
   renderTimeline(detail.timeline || []);
 
@@ -442,7 +494,7 @@ function renderTimeline(entries) {
   }
 }
 
-/* --------------------------- sessions & transcript --------------------- */
+/* --------------------------- sessions --------------------- */
 
 function renderSessionList() {
   const list = el("session-list");
@@ -456,8 +508,6 @@ function renderSessionList() {
     return;
   }
 
-  /* Grouped rendering: parents are group headers; subagents nest under
-   * the session whose path matches their parent_path (recursively). */
   const byPath = new Map(state.sessions.map((s) => [s.path, s]));
   const childrenOf = new Map();
   const roots = [];
@@ -605,6 +655,8 @@ function closeStream() {
   }
 }
 
+/* --------------------------- transcript trace --------------------------- */
+
 function queueLine(record) {
   state.pendingLines.push(record);
   if (!state.rafPending) {
@@ -619,71 +671,195 @@ function flushLines() {
   state.pendingLines = [];
   if (!lines.length) return;
   const view = el("transcript-view");
-  for (const rec of lines) appendLine(view, rec);
+  for (const rec of lines) appendRecord(view, rec);
   if (state.follow) view.scrollTop = view.scrollHeight;
 }
 
-function appendLine(view, rec) {
-  hideTranscriptNotice();
-  const line = document.createElement("div");
-  line.className = "tr-line";
-
-  const time = fmtClock(rec && rec.timestamp);
-  if (time) line.appendChild(span("tr-time", time));
-
-  const type = rec && typeof rec.type === "string" ? rec.type : "?";
-  line.appendChild(span("tr-type tr-type-" + cssClass(type), type));
-
-  const preview = recordPreview(rec);
-  if (preview.role) {
-    line.appendChild(
-      span("tr-role tr-role-" + cssClass(preview.role), preview.role)
-    );
-  }
-  const text = span("tr-text", preview.text);
-  if (preview.text.length > 40) text.title = preview.text;
-  line.appendChild(text);
-
-  view.appendChild(line);
+function timeEl(rec) {
+  const t = fmtClock(rec && rec.timestamp);
+  return t ? span("tr-time", t) : null;
 }
 
-function recordPreview(rec) {
-  if (!rec || typeof rec !== "object") {
-    return { role: null, text: "?" };
-  }
-  switch (rec.type) {
-    case "message": {
-      const msg = rec.message || {};
-      const role = msg.role || "?";
-      const parts = Array.isArray(msg.content) ? msg.content : [];
-      const textPart = parts.find(
-        (p) => p && p.type === "text" && typeof p.text === "string" && p.text.trim()
-      );
-      if (textPart) return { role, text: oneLine(textPart.text) };
-      const toolUse = parts.find((p) => p && p.type === "tool_use");
-      if (toolUse) {
-        return { role, text: oneLine("tool_use " + (toolUse.name || "")) };
-      }
-      const other = parts.find((p) => p && typeof p.type === "string");
-      if (other) return { role, text: "<" + other.type + ">" };
-      return { role, text: "(empty)" };
+function textOf(parts) {
+  return (Array.isArray(parts) ? parts : [])
+    .filter((p) => p && p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n")
+    .trim();
+}
+
+/* Dispatch one JSONL record into trace blocks. */
+function appendRecord(view, rec) {
+  if (!rec || typeof rec !== "object") return;
+  hideTranscriptNotice();
+
+  if (rec.type === "message") {
+    const msg = rec.message || {};
+    const role = msg.role;
+    const parts = Array.isArray(msg.content) ? msg.content : [];
+
+    if (role === "user") {
+      const text = textOf(parts);
+      if (text) view.appendChild(msgBlock(rec, "user", "user", text));
+      return;
     }
-    case "custom":
-      return { role: null, text: oneLine(rec.customType || "custom") };
-    case "tool": {
-      const name =
-        (rec.tool && (rec.tool.name || rec.name)) || rec.name || "";
-      return { role: null, text: oneLine("tool " + name).trim() };
-    }
-    default: {
-      for (const key of ["title", "name", "model", "subtype"]) {
-        if (rec[key] != null && rec[key] !== "") {
-          return { role: null, text: oneLine(String(rec[key])) };
+
+    if (role === "assistant") {
+      for (const part of parts) {
+        if (!part || typeof part !== "object") continue;
+        if (part.type === "text" && part.text && part.text.trim()) {
+          view.appendChild(msgBlock(rec, "assistant", "assistant", part.text.trim()));
+        } else if (part.type === "thinking" && part.thinking) {
+          view.appendChild(thinkingBlock(rec, part.thinking));
+        } else if (part.type === "toolCall") {
+          view.appendChild(toolCallBlock(rec, part));
         }
       }
-      return { role: null, text: rec.type || "?" };
+      return;
     }
+
+    if (role === "toolResult") {
+      view.appendChild(toolResultBlock(rec, msg));
+      return;
+    }
+
+    metaRow(view, rec, role || "message");
+    return;
   }
+
+  if (rec.type === "custom") {
+    /* tool_execution_start duplicates the assistant's toolCall block. */
+    if (rec.customType === "tool_execution_start") return;
+    metaRow(view, rec, String(rec.customType || "custom"));
+    return;
+  }
+
+  if (rec.type === "custom_message") {
+    const text = typeof rec.content === "string" ? oneLine(rec.content, 200) : "";
+    metaRow(view, rec, String(rec.customType || "note"), text);
+    return;
+  }
+
+  if (rec.type === "session") {
+    metaRow(view, rec, "session", rec.title || rec.cwd || "");
+    return;
+  }
+  if (rec.type === "title" || rec.type === "title_change") {
+    metaRow(view, rec, "title", rec.title || "");
+    return;
+  }
+  if (rec.type === "model_change") {
+    metaRow(view, rec, "model", rec.model || "");
+    return;
+  }
+  if (rec.type === "thinking_level_change") {
+    metaRow(view, rec, "thinking level", rec.thinkingLevel || "");
+    return;
+  }
+  if (rec.type === "compaction") {
+    metaRow(view, rec, "compacted", oneLine(rec.summary || "", 120));
+    return;
+  }
+
+  metaRow(view, rec, String(rec.type || "record"));
+}
+
+/* user / assistant text block */
+function msgBlock(rec, cls, tag, text) {
+  const block = document.createElement("div");
+  block.className = "tr-msg tr-" + cls;
+
+  const head = document.createElement("div");
+  head.className = "tr-msg-head";
+  head.appendChild(span("tr-tag", tag));
+  const t = timeEl(rec);
+  if (t) head.appendChild(t);
+  block.appendChild(head);
+
+  const body = document.createElement("p");
+  body.className = "tr-msg-body";
+  body.textContent = text;
+  block.appendChild(body);
+  return block;
+}
+
+/* thinking: collapsed details with one-line preview */
+function thinkingBlock(rec, text) {
+  const block = document.createElement("details");
+  block.className = "tr-thinking";
+
+  const summary = document.createElement("summary");
+  summary.appendChild(span("tr-tag", "thinking"));
+  summary.appendChild(span("tr-preview", oneLine(text, 90)));
+  const t = timeEl(rec);
+  if (t) summary.appendChild(t);
+  block.appendChild(summary);
+
+  const body = document.createElement("p");
+  body.className = "tr-thinking-body";
+  body.textContent = text;
+  block.appendChild(body);
+  return block;
+}
+
+/* tool call: name + intent, arguments behind the fold */
+function toolCallBlock(rec, part) {
+  const block = document.createElement("details");
+  block.className = "tr-tool";
+
+  const summary = document.createElement("summary");
+  summary.appendChild(span("tr-tool-name", String(part.name || "tool")));
+  if (part.intent) summary.appendChild(span("tr-tool-intent", oneLine(part.intent, 90)));
+  const t = timeEl(rec);
+  if (t) summary.appendChild(t);
+  block.appendChild(summary);
+
+  if (part.arguments && Object.keys(part.arguments).length) {
+    const body = document.createElement("pre");
+    body.className = "tr-tool-body";
+    body.textContent = JSON.stringify(part.arguments, null, 2);
+    block.appendChild(body);
+  }
+  return block;
+}
+
+/* tool result: indented under its call, errors in red */
+function toolResultBlock(rec, msg) {
+  const block = document.createElement("details");
+  block.className = "tr-result" + (msg.isError ? " is-error" : "");
+
+  const summary = document.createElement("summary");
+  summary.appendChild(
+    span("tr-tool-name", (msg.isError ? "error · " : "result · ") + String(msg.toolName || "tool"))
+  );
+  const text = textOf(msg.content);
+  if (text) summary.appendChild(span("tr-tool-intent", oneLine(text, 90)));
+  const hasImage = (Array.isArray(msg.content) ? msg.content : []).some(
+    (p) => p && p.type === "image"
+  );
+  if (hasImage) summary.appendChild(span("tr-tool-intent", "[image]"));
+  const t = timeEl(rec);
+  if (t) summary.appendChild(t);
+  block.appendChild(summary);
+
+  if (text) {
+    const body = document.createElement("pre");
+    body.className = "tr-tool-body";
+    body.textContent = text;
+    block.appendChild(body);
+  }
+  return block;
+}
+
+/* quiet single-line meta row for session markers */
+function metaRow(view, rec, label, text) {
+  const row = document.createElement("div");
+  row.className = "tr-meta";
+  row.appendChild(span("tr-tag", label));
+  if (text) row.appendChild(span("tr-meta-text", String(text)));
+  const t = timeEl(rec);
+  if (t) row.appendChild(t);
+  view.appendChild(row);
 }
 
 function renderTranscript() {
@@ -701,7 +877,7 @@ function hideTranscriptNotice() {
 }
 
 function setPaneStatus(key, text) {
-  el("pane-status").className = "pane-status status-" + key;
+  el("pane-status").className = "stream-status status-" + key;
   el("pane-status-text").textContent = text;
 }
 
@@ -724,6 +900,9 @@ function setOffsetHint() {
 /* ------------------------------- boot ------------------------------- */
 
 function init() {
+  const hash = location.hash.replace(/^#/, "");
+  if (TABS.includes(hash)) state.tab = hash;
+
   el("drawer-close").addEventListener("click", closeDrawer);
   el("drawer-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (ev) => {

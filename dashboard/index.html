@@ -14,20 +14,18 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true"><span class="brand-tile tile-ship">S</span><span class="brand-tile tile-iterate">I</span></span>
-      <div class="brand-text">
-        <h1>Trio Loops</h1>
-        <p class="brand-sub">mission control for agent loops</p>
-      </div>
+      <h1>Trio Loops</h1>
+      <p class="brand-sub">mission control for agent loops</p>
     </div>
     <div class="topbar-meta">
-      <span id="agg-loops" class="agg-chip" title="Loop mailboxes in this project">&mdash; loops</span>
-      <span id="agg-active" class="agg-chip" title="Loops currently running">&mdash; active</span>
-      <span class="agg-divider" aria-hidden="true"></span>
-      <span id="updated-at" class="updated-at" title="">updated &mdash;</span>
-      <span id="board-status" class="board-status status-idle"><span class="dot"></span><span id="board-status-text">connecting&hellip;</span></span>
+      <span id="agg-loops" class="agg">&mdash; loops</span>
+      <span id="agg-active" class="agg">&mdash; active</span>
+      <span id="updated-at" class="updated-at">updated &mdash;</span>
+      <span id="board-status" class="board-status status-idle"><span id="board-status-text">connecting&hellip;</span></span>
     </div>
   </header>
+
+  <nav id="tabs" class="tabs" aria-label="Filter loops by state"></nav>
 
   <main class="board" aria-label="Loop board">
     <div id="board-error" class="board-error" hidden></div>
@@ -38,7 +36,7 @@
   <aside id="drawer" class="drawer" hidden aria-label="Loop detail">
     <header class="drawer-header">
       <div class="drawer-heading">
-        <span id="drawer-badge" class="badge badge-idle">IDLE</span>
+        <span id="drawer-badge" class="status-label status-idle">IDLE</span>
         <h2 id="drawer-name" class="drawer-name">&mdash;</h2>
       </div>
       <button id="drawer-close" class="icon-btn" type="button" title="Close detail (Esc)" aria-label="Close detail">&times;</button>
@@ -67,7 +65,7 @@
       <details id="sessions-details" class="drawer-section sessions">
         <summary>
           <h3 class="section-label">Sessions &amp; transcripts</h3>
-          <span id="pane-status" class="pane-status status-idle"><span class="dot"></span><span id="pane-status-text">idle</span></span>
+          <span id="pane-status" class="stream-status status-idle"><span id="pane-status-text">idle</span></span>
         </summary>
         <div class="sessions-inner">
           <div id="session-list" class="session-list"></div>
