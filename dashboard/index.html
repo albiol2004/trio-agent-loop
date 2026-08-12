@@ -4,54 +4,85 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Trio Loop Dashboard</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230d1117'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='%23388bfd'/%3E%3C/svg%3E">
+<title>Trio Loops</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230B1214'/%3E%3Crect%20x='3' y='6' width='4' height='4' rx='1' fill='%233FBF8F'/%3E%3Crect%20x='9' y='6' width='4' height='4' rx='1' fill='%23E8A33D'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
 </head>
 <body>
 <div id="app">
+
   <header class="topbar">
-    <div class="topbar-title">
-      <h1>Trio Loop Dashboard</h1>
-      <p class="topbar-sub">Live status and session transcripts for trio loops</p>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><span class="brand-tile tile-ship">S</span><span class="brand-tile tile-iterate">I</span></span>
+      <div class="brand-text">
+        <h1>Trio Loops</h1>
+        <p class="brand-sub">mission control for agent loops</p>
+      </div>
     </div>
     <div class="topbar-meta">
-      <span id="updated-at" class="updated-at" title="">Updated &mdash;</span>
+      <span id="agg-loops" class="agg-chip" title="Loop mailboxes in this project">&mdash; loops</span>
+      <span id="agg-active" class="agg-chip" title="Loops currently running">&mdash; active</span>
+      <span class="agg-divider" aria-hidden="true"></span>
+      <span id="updated-at" class="updated-at" title="">updated &mdash;</span>
       <span id="board-status" class="board-status status-idle"><span class="dot"></span><span id="board-status-text">connecting&hellip;</span></span>
     </div>
   </header>
 
-  <div id="layout" class="layout">
-    <main id="board" class="board" aria-label="Loop board">
-      <div id="board-error" class="board-error" hidden></div>
-      <div id="card-grid" class="card-grid"></div>
-    </main>
+  <main class="board" aria-label="Loop board">
+    <div id="board-error" class="board-error" hidden></div>
+    <div id="card-grid" class="card-grid"></div>
+  </main>
 
-    <aside id="transcript-pane" class="transcript-pane" hidden aria-label="Transcript viewer">
-      <header class="pane-header">
-        <div class="pane-heading">
-          <h2 id="pane-loop-name" class="pane-loop-name">Transcript</h2>
+  <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-label="Loop detail">
+    <header class="drawer-header">
+      <div class="drawer-heading">
+        <span id="drawer-badge" class="badge badge-idle">IDLE</span>
+        <h2 id="drawer-name" class="drawer-name">&mdash;</h2>
+      </div>
+      <button id="drawer-close" class="icon-btn" type="button" title="Close detail (Esc)" aria-label="Close detail">&times;</button>
+    </header>
+
+    <div class="drawer-body">
+      <p id="drawer-mission" class="drawer-mission"></p>
+
+      <dl class="facts" aria-label="Loop facts">
+        <div class="fact"><dt>Iteration</dt><dd id="fact-iter" class="mono">&mdash;</dd></div>
+        <div class="fact"><dt>Verdict</dt><dd id="fact-verdict">&mdash;</dd></div>
+        <div class="fact"><dt>Last activity</dt><dd id="fact-activity">&mdash;</dd></div>
+        <div class="fact"><dt>Sessions</dt><dd id="fact-sessions" class="mono">&mdash;</dd></div>
+      </dl>
+
+      <section class="drawer-section" aria-label="Verdict history">
+        <h3 class="section-label">Verdict history</h3>
+        <div id="drawer-strip" class="strip strip-large"></div>
+      </section>
+
+      <section class="drawer-section" aria-label="Activity timeline">
+        <h3 class="section-label">Activity</h3>
+        <div id="drawer-timeline" class="timeline"></div>
+      </section>
+
+      <details id="sessions-details" class="drawer-section sessions">
+        <summary>
+          <h3 class="section-label">Sessions &amp; transcripts</h3>
           <span id="pane-status" class="pane-status status-idle"><span class="dot"></span><span id="pane-status-text">idle</span></span>
+        </summary>
+        <div class="sessions-inner">
+          <div id="session-list" class="session-list"></div>
+          <div class="pane-transcript">
+            <div id="transcript-view" class="transcript-view" role="log" aria-label="Session transcript" tabindex="0"></div>
+            <div id="transcript-notice" class="transcript-notice" hidden></div>
+          </div>
+          <div class="pane-footer">
+            <button id="follow-btn" class="follow-btn" type="button" aria-pressed="true">Pause follow</button>
+            <span id="offset-hint" class="offset-hint mono">offset 0</span>
+          </div>
         </div>
-        <button id="pane-close" class="icon-btn" type="button" title="Close transcript pane" aria-label="Close transcript pane">&times;</button>
-      </header>
-
-      <div class="pane-sessions">
-        <div id="session-list" class="session-list"></div>
-      </div>
-
-      <div class="pane-transcript">
-        <div id="transcript-view" class="transcript-view" role="log" aria-label="Session transcript" tabindex="0"></div>
-        <div id="transcript-notice" class="transcript-notice" hidden></div>
-      </div>
-
-      <footer class="pane-footer">
-        <button id="follow-btn" class="follow-btn" type="button" aria-pressed="true">Pause follow</button>
-        <span id="offset-hint" class="offset-hint">offset 0</span>
-      </footer>
-    </aside>
-  </div>
+      </details>
+    </div>
+  </aside>
 
   <noscript>This dashboard requires JavaScript.</noscript>
 </div>

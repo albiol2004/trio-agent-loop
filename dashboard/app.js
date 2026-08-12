@@ -2,19 +2,21 @@
 
 /* Trio Loop Dashboard — read-only frontend.
  * No build step, no external dependencies. Talks to the backend at
- * /api/board, /api/sessions and /api/transcript (SSE). */
+ * /api/board, /api/loop and /api/transcript (SSE). */
 
-/* All state lives in module scope. */
 const state = {
   boardTimer: null,
   loops: [],
   updatedAt: null,
 
-  /* transcript pane */
-  activeLoop: null,   /* loop whose pane is open */
+  /* drawer */
+  activeLoop: null,    /* loop whose drawer is open */
+  detail: null,        /* last /api/loop payload */
+
+  /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
-  activePath: null,   /* session file currently being streamed */
-  es: null,           /* active EventSource */
+  activePath: null,
+  es: null,
   offset: 0,
   size: null,
   follow: true,
@@ -40,6 +42,10 @@ function esc(value) {
   }[c]));
 }
 
+function escAttr(value) {
+  return esc(value).replace(/`/g, "&#96;");
+}
+
 function cssClass(value) {
   return String(value).replace(/[^a-z0-9]+/gi, "-").toLowerCase();
 }
@@ -53,7 +59,7 @@ function span(cls, text) {
 
 function oneLine(text, max = 160) {
   const s = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (s.length > max) return s.slice(0, max - 1).trimEnd() + "\u2026";
+  if (s.length > max) return s.slice(0, max - 1).trimEnd() + "…";
   return s;
 }
 
@@ -95,7 +101,18 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(1) + "MB";
 }
 
-/* Map arbitrary STATE.md status text onto the four badge buckets. */
+function fmtDuration(sec) {
+  if (sec == null) return "—";
+  sec = Number(sec);
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  if (sec < 60) return Math.round(sec) + "s";
+  const mins = Math.floor(sec / 60);
+  if (mins < 60) return mins + "m";
+  const hrs = Math.floor(mins / 60);
+  return hrs + "h " + (mins % 60) + "m";
+}
+
+/* Map arbitrary STATE.md status text onto badge buckets. */
 function normStatus(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return "unknown";
@@ -109,7 +126,6 @@ function normStatus(raw) {
   return "unknown";
 }
 
-/* Map a VERDICT.md verdict onto SHIP/ITERATE/BLOCKED/none. */
 function normVerdict(raw) {
   if (!raw) return "none";
   const v = String(raw).trim().toUpperCase();
@@ -117,6 +133,52 @@ function normVerdict(raw) {
   if (v === "ITERATE") return "iterate";
   if (v === "BLOCKED") return "blocked";
   return "none";
+}
+
+/* Single display state for a loop: running beats verdict, verdict beats rest. */
+function loopState(loop) {
+  const status = normStatus(loop.status);
+  const verdict = normVerdict(loop.final_verdict);
+  if (status === "running") return "running";
+  if (status === "blocked" || verdict === "blocked") return "blocked";
+  if (verdict === "ship") return "shipped";
+  return "idle";
+}
+
+const STATE_LABEL = {
+  running: "RUNNING",
+  shipped: "SHIPPED",
+  blocked: "BLOCKED",
+  idle: "IDLE",
+};
+
+/* Verdict tiles from segments' verdict sequences, e.g. "IS" → [I, S]. */
+function verdictTiles(loop) {
+  const seq = (loop.segments || [])
+    .map((s) => s.verdict_sequence || "")
+    .join("");
+  const tiles = [];
+  for (const ch of seq) {
+    if (ch === "S") tiles.push("ship");
+    else if (ch === "I") tiles.push("iterate");
+    else if (ch === "B") tiles.push("blocked");
+    else tiles.push("none");
+  }
+  return tiles;
+}
+
+function stripEl(tiles, large) {
+  const strip = document.createElement("div");
+  strip.className = "strip" + (large ? " strip-large" : "");
+  if (!tiles.length) {
+    strip.appendChild(span("strip-tile tile-none", "·"));
+    return strip;
+  }
+  const letter = { ship: "S", iterate: "I", blocked: "B", none: "?" };
+  for (const t of tiles) {
+    strip.appendChild(span("strip-tile tile-" + t, letter[t]));
+  }
+  return strip;
 }
 
 /* ------------------------------ board ------------------------------ */
@@ -131,20 +193,16 @@ async function refreshBoard() {
     setBoardStatus("live", "live");
     hideBoardError();
     renderBoard();
-    updateUpdatedAt();
+    if (state.activeLoop) refreshDetail({ quiet: true });
   } catch (err) {
-    setBoardStatus("offline", "offline");
-    showBoardError(
-      "Cannot reach /api/board (" + err.message + "). Retrying every " +
-      BOARD_POLL_MS / 1000 + "s."
-    );
-  } finally {
-    state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
+    setBoardStatus("error", "offline");
+    showBoardError("Cannot reach the dashboard server: " + err.message);
   }
+  state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
 }
 
 function setBoardStatus(cls, text) {
-  el("board-status").className = "board-status " + cls;
+  el("board-status").className = "board-status status-" + cls;
   el("board-status-text").textContent = text;
 }
 
@@ -158,91 +216,82 @@ function hideBoardError() {
   el("board-error").hidden = true;
 }
 
-function updateUpdatedAt() {
-  const node = el("updated-at");
-  if (!state.updatedAt) {
-    node.textContent = "Updated \u2014";
-    node.title = "";
-    return;
-  }
-  node.textContent =
-    "Updated " + fmtClock(state.updatedAt) + " (" + relTime(state.updatedAt) + ")";
-  node.title = new Date(state.updatedAt).toLocaleString();
+function updateAggregates() {
+  const total = state.loops.length;
+  const active = state.loops.filter((l) => loopState(l) === "running").length;
+  el("agg-loops").textContent = total + (total === 1 ? " loop" : " loops");
+  const activeChip = el("agg-active");
+  activeChip.textContent = active + " active";
+  activeChip.classList.toggle("is-active", active > 0);
+  const at = state.updatedAt ? fmtClock(state.updatedAt) : null;
+  el("updated-at").textContent = "updated " + (at || "—");
 }
 
 function renderBoard() {
+  updateAggregates();
   const grid = el("card-grid");
   grid.textContent = "";
   if (!state.loops.length) {
     const empty = document.createElement("div");
     empty.className = "board-empty";
-    empty.textContent = "No loops found.";
+    empty.textContent = "No loop mailboxes found. Start one with /trio-init in this project.";
     grid.appendChild(empty);
     return;
   }
-  const frag = document.createDocumentFragment();
-  for (const loop of state.loops) frag.appendChild(cardEl(loop));
-  grid.appendChild(frag);
+  const rank = { running: 0, blocked: 1, idle: 2, shipped: 3 };
+  const sorted = [...state.loops].sort((a, b) => {
+    const r = rank[loopState(a)] - rank[loopState(b)];
+    if (r !== 0) return r;
+    return String(b.last_activity || "").localeCompare(String(a.last_activity || ""));
+  });
+  sorted.forEach((loop, i) => {
+    const card = cardEl(loop);
+    card.style.animationDelay = Math.min(i * 40, 320) + "ms";
+    grid.appendChild(card);
+  });
 }
 
 function cardEl(loop) {
-  const card = document.createElement("article");
+  const display = loopState(loop);
+  const card = document.createElement("button");
+  card.type = "button";
   card.className = "loop-card";
-  card.tabIndex = 0;
-  card.setAttribute("role", "button");
   card.dataset.loop = loop.name;
   if (state.activeLoop === loop.name) card.classList.add("active");
+  card.setAttribute("aria-label", "Open detail for " + loop.name);
 
-  const status = normStatus(loop.status);
-  const statusText = loop.status ? String(loop.status) : "unknown";
-  const verdict = normVerdict(loop.final_verdict);
-  const verdictText = loop.final_verdict
-    ? String(loop.final_verdict).toUpperCase()
-    : "none";
-  const mission = loop.mission ? String(loop.mission) : "";
-  const iter = loop.iteration ?? "?";
-  const maxIt = loop.max_iterations ?? "?";
-  const summary = loop.last_entry_summary
-    ? String(loop.last_entry_summary)
-    : "no activity";
-  const activityAbs = loop.last_activity
-    ? new Date(loop.last_activity).toLocaleString()
-    : "";
+  const top = document.createElement("div");
+  top.className = "card-top";
+  top.appendChild(span("badge badge-" + display, STATE_LABEL[display]));
+  const iter = document.createElement("span");
+  iter.className = "card-iter";
+  const cur = loop.iteration != null ? loop.iteration : "–";
+  const max = loop.max_iterations != null ? loop.max_iterations : "–";
+  iter.innerHTML = "<strong>" + esc(cur) + "</strong> / " + esc(max) + " iter";
+  top.appendChild(iter);
+  card.appendChild(top);
 
-  card.innerHTML =
-    '<div class="card-top">' +
-      '<h3 class="card-name">' + esc(loop.name) + "</h3>" +
-      '<span class="badge status-' + status + '" title="Status: ' +
-        esc(statusText) + '">' + esc(statusText) + "</span>" +
-    "</div>" +
-    '<p class="card-mission" title="' + escAttr(mission) + '">' +
-      (mission ? esc(mission) : "\u2014") +
-    "</p>" +
-    '<div class="card-meta">' +
-      '<span class="badge verdict-badge verdict-' + verdict + '">' +
-        esc(verdictText) + "</span>" +
-      '<span class="card-iter">iter ' + esc(iter) + " / " + esc(maxIt) + "</span>" +
-    "</div>" +
-    '<div class="card-foot">' +
-      '<span class="card-activity"' +
-        (activityAbs ? ' title="' + escAttr(activityAbs) + '"' : "") + ">" +
-        relTime(loop.last_activity) + "</span>" +
-      '<span class="card-summary" title="' + escAttr(summary) + '">' +
-        esc(summary) + "</span>" +
-    "</div>";
+  const name = document.createElement("h3");
+  name.className = "card-name";
+  name.textContent = loop.name;
+  card.appendChild(name);
 
-  card.addEventListener("click", () => openTranscript(loop.name));
-  card.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      openTranscript(loop.name);
-    }
-  });
+  if (loop.mission) {
+    const mission = document.createElement("p");
+    mission.className = "card-mission";
+    mission.textContent = loop.mission;
+    mission.title = loop.mission;
+    card.appendChild(mission);
+  }
+
+  const bottom = document.createElement("div");
+  bottom.className = "card-bottom";
+  bottom.appendChild(stripEl(verdictTiles(loop), false));
+  bottom.appendChild(span("card-activity", relTime(loop.last_activity)));
+  card.appendChild(bottom);
+
+  card.addEventListener("click", () => openDrawer(loop.name));
   return card;
-}
-
-function escAttr(value) {
-  return esc(value).replace(/`/g, "&#96;");
 }
 
 function markActiveCard() {
@@ -251,71 +300,155 @@ function markActiveCard() {
   }
 }
 
-/* --------------------------- transcript pane --------------------------- */
+/* ------------------------------ drawer ------------------------------ */
 
-async function openTranscript(name) {
-  /* Already showing this loop — leave the stream alone. */
-  if (!el("transcript-pane").hidden && state.activeLoop === name) return;
-
+async function openDrawer(name) {
+  if (!el("drawer").hidden && state.activeLoop === name) return;
   closeStream();
   state.activeLoop = name;
+  state.detail = null;
   state.sessions = [];
   state.activePath = null;
-  state.offset = 0;
-  state.size = null;
-  state.follow = true;
-  updateFollowBtn();
 
-  el("pane-loop-name").textContent = name;
-  el("layout").classList.add("with-pane");
-  el("transcript-pane").hidden = false;
-  setPaneStatus("idle", "loading sessions\u2026");
-  showTranscriptNotice("Loading sessions\u2026");
+  el("drawer-name").textContent = name;
+  el("drawer-badge").className = "badge badge-idle";
+  el("drawer-badge").textContent = "LOADING";
+  el("drawer-mission").textContent = "";
+  el("fact-iter").textContent = "—";
+  el("fact-verdict").textContent = "—";
+  el("fact-verdict").className = "";
+  el("fact-activity").textContent = "—";
+  el("fact-sessions").textContent = "—";
+  el("drawer-strip").textContent = "";
+  el("drawer-timeline").innerHTML = '<div class="timeline-empty">Loading…</div>';
+  el("session-list").textContent = "";
+  el("sessions-details").open = false;
+  setPaneStatus("idle", "loading…");
   renderTranscript();
-  renderSessionList();
-  markActiveCard();
 
+  el("drawer").hidden = false;
+  el("drawer-scrim").hidden = false;
+  markActiveCard();
+  await refreshDetail({ quiet: false });
+}
+
+function closeDrawer() {
+  closeStream();
+  state.activeLoop = null;
+  state.detail = null;
+  state.sessions = [];
+  state.activePath = null;
+  state.pendingLines = [];
+  el("drawer").hidden = true;
+  el("drawer-scrim").hidden = true;
+  markActiveCard();
+}
+
+async function refreshDetail({ quiet }) {
+  const name = state.activeLoop;
+  if (!name) return;
   try {
-    const res = await fetch("/api/sessions?loop=" + encodeURIComponent(name), {
+    const res = await fetch("/api/loop?name=" + encodeURIComponent(name), {
       cache: "no-store",
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const sessions = await res.json();
-    state.sessions = Array.isArray(sessions) ? sessions : [];
-    renderSessionList();
-    if (state.sessions.length) {
-      showTranscriptNotice("Select a session to stream its transcript.");
-      setPaneStatus(
-        "idle",
-        state.sessions.length + " session" + (state.sessions.length === 1 ? "" : "s")
-      );
-    } else {
-      showTranscriptNotice("No matching session found.");
-      setPaneStatus("idle", "no sessions");
-    }
+    if (state.activeLoop !== name) return; /* drawer switched mid-flight */
+    const detail = await res.json();
+    state.detail = detail;
+    state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
+    renderDetail(detail);
+    if (!quiet) renderSessionList();
   } catch (err) {
-    showTranscriptNotice("Failed to load sessions: " + err.message);
-    setPaneStatus("error", "load failed");
+    if (!quiet) {
+      el("drawer-timeline").innerHTML =
+        '<div class="timeline-empty">Failed to load detail: ' + esc(err.message) + "</div>";
+    }
   }
 }
 
-function closeTranscript() {
-  closeStream();
-  state.activeLoop = null;
-  state.activePath = null;
-  state.sessions = [];
-  state.pendingLines = [];
-  el("transcript-pane").hidden = true;
-  el("layout").classList.remove("with-pane");
-  markActiveCard();
+function renderDetail(detail) {
+  const display = loopState(detail);
+  const badge = el("drawer-badge");
+  badge.className = "badge badge-" + display;
+  badge.textContent = STATE_LABEL[display];
+
+  el("drawer-mission").textContent = detail.mission || "No mission recorded.";
+
+  const cur = detail.iteration != null ? detail.iteration : "–";
+  const max = detail.max_iterations != null ? detail.max_iterations : "–";
+  el("fact-iter").textContent = cur + " of " + max;
+
+  const verdict = detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "—";
+  const fv = el("fact-verdict");
+  fv.textContent = verdict;
+  fv.className = detail.final_verdict ? "verdict-" + normVerdict(detail.final_verdict) : "";
+
+  el("fact-activity").textContent = relTime(detail.last_activity);
+  el("fact-sessions").textContent = String(state.sessions.length);
+
+  const strip = el("drawer-strip");
+  strip.textContent = "";
+  const tiles = verdictTiles(detail);
+  strip.appendChild(stripEl(tiles, true));
+  const seqLabel = tiles.length
+    ? tiles.length + (tiles.length === 1 ? " verdict" : " verdicts")
+    : "no verdicts yet";
+  strip.appendChild(span("strip-label", seqLabel));
+
+  renderTimeline(detail.timeline || []);
+
+  if (!state.activePath) {
+    setPaneStatus(
+      "idle",
+      state.sessions.length
+        ? state.sessions.length + (state.sessions.length === 1 ? " session" : " sessions")
+        : "no sessions"
+    );
+  }
 }
+
+function renderTimeline(entries) {
+  const view = el("drawer-timeline");
+  view.textContent = "";
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "timeline-empty";
+    empty.textContent = "No log entries yet.";
+    view.appendChild(empty);
+    return;
+  }
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "timeline-row";
+
+    row.appendChild(span("role-chip role-" + cssClass(entry.role), entry.role || "?"));
+    row.appendChild(span("timeline-dur", fmtDuration(entry.duration_sec)));
+
+    const text = document.createElement("div");
+    text.className = "timeline-text";
+    let summary = entry.summary || "";
+    if (entry.verdict) {
+      text.appendChild(
+        span("verdict-word verdict-" + entry.verdict.toLowerCase(), entry.verdict)
+      );
+      text.appendChild(document.createTextNode(" "));
+      summary = summary.replace(/^VERDICT:\s*(SHIP|ITERATE|BLOCKED)\s*[—–-]\s*/i, "");
+    }
+    text.appendChild(span("timeline-dur timeline-iter-inline", "iter " + entry.iteration + " · "));
+    text.appendChild(document.createTextNode(summary));
+    row.appendChild(text);
+
+    view.appendChild(row);
+  }
+}
+
+/* --------------------------- sessions & transcript --------------------- */
 
 function renderSessionList() {
   const list = el("session-list");
   list.textContent = "";
   if (!state.sessions.length) return;
 
-  /* No subagents — keep the flat top-level-only rendering. */
   if (!state.sessions.some((s) => s.kind === "subagent")) {
     const frag = document.createDocumentFragment();
     for (const s of state.sessions) frag.appendChild(sessionItem(s));
@@ -343,7 +476,7 @@ function renderSessionList() {
       }
       kids.push(s);
     } else {
-      roots.push(s); /* orphan — no matching parent session in the list */
+      roots.push(s);
     }
   }
 
@@ -391,13 +524,13 @@ function sessionItem(s, depth = 0, subCount = 0) {
   item.innerHTML =
     '<span class="session-label" title="' + escAttr(s.label ?? "") + '">' +
       esc(label) + "</span>" +
-    '<span class="session-meta">' + meta.join(" \u00b7 ") + "</span>";
+    '<span class="session-meta">' + meta.join(" · ") + "</span>";
   item.addEventListener("click", () => openSession(s.path));
   return item;
 }
 
 function openSession(path) {
-  if (state.activePath === path && state.es) return; /* already streaming */
+  if (state.activePath === path && state.es) return;
 
   closeStream();
   state.activePath = path;
@@ -408,8 +541,8 @@ function openSession(path) {
   setOffsetHint();
   renderTranscript();
   renderSessionList();
-  setPaneStatus("connecting", "connecting\u2026");
-  showTranscriptNotice("Waiting for stream\u2026");
+  setPaneStatus("connecting", "connecting…");
+  showTranscriptNotice("Waiting for stream…");
 
   const es = new EventSource(
     "/api/transcript?path=" + encodeURIComponent(path) + "&offset=0"
@@ -435,7 +568,7 @@ function openSession(path) {
     let data;
     try {
       data = JSON.parse(ev.data);
-    } catch { /* malformed line — skip */ return; }
+    } catch { return; }
     state.offset = Number(data.offset) || state.offset;
     if (data.record) {
       queueLine(data.record);
@@ -446,7 +579,6 @@ function openSession(path) {
   es.addEventListener("error", (ev) => {
     if (state.es !== es) return;
     if (typeof ev.data === "string" && ev.data) {
-      /* Backend-sent `event: error` payload. */
       let msg = "stream error";
       try {
         msg = JSON.parse(ev.data).error || msg;
@@ -457,12 +589,11 @@ function openSession(path) {
       if (state.es === es) state.es = null;
       return;
     }
-    /* Network-level failure; EventSource auto-reconnects. */
     if (es.readyState === EventSource.CLOSED) {
       setPaneStatus("disconnected", "disconnected");
       if (state.es === es) state.es = null;
     } else {
-      setPaneStatus("connecting", "reconnecting\u2026");
+      setPaneStatus("connecting", "reconnecting…");
     }
   });
 }
@@ -473,8 +604,6 @@ function closeStream() {
     state.es = null;
   }
 }
-
-/* --------------------------- transcript render --------------------------- */
 
 function queueLine(record) {
   state.pendingLines.push(record);
@@ -518,7 +647,6 @@ function appendLine(view, rec) {
   view.appendChild(line);
 }
 
-/* Human preview for a transcript record. */
 function recordPreview(rec) {
   if (!rec || typeof rec !== "object") {
     return { role: null, text: "?" };
@@ -541,10 +669,7 @@ function recordPreview(rec) {
       return { role, text: "(empty)" };
     }
     case "custom":
-      return {
-        role: null,
-        text: oneLine(rec.customType || "custom"),
-      };
+      return { role: null, text: oneLine(rec.customType || "custom") };
     case "tool": {
       const name =
         (rec.tool && (rec.tool.name || rec.name)) || rec.name || "";
@@ -593,20 +718,24 @@ function updateFollowBtn() {
 function setOffsetHint() {
   const parts = ["offset " + state.offset];
   if (state.size != null) parts.push("size " + fmtSize(state.size));
-  el("offset-hint").textContent = parts.join(" \u00b7 ");
+  el("offset-hint").textContent = parts.join(" · ");
 }
 
 /* ------------------------------- boot ------------------------------- */
 
 function init() {
-  el("pane-close").addEventListener("click", closeTranscript);
+  el("drawer-close").addEventListener("click", closeDrawer);
+  el("drawer-scrim").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
+  });
   el("follow-btn").addEventListener("click", () => {
     state.follow = !state.follow;
     updateFollowBtn();
   });
 
   el("card-grid").innerHTML =
-    '<div class="board-empty">Loading loops\u2026</div>';
+    '<div class="board-empty">Loading loops…</div>';
   refreshBoard();
 }
 

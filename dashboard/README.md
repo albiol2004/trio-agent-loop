@@ -44,8 +44,9 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## What it shows
 
-- **Status board** — one card per `loop*/` mailbox, showing mission, iteration/status, last verdict, and last activity. Refreshes automatically every 5 seconds.
-- **Live transcripts** — click a loop card, pick a matched omp session, and the dashboard tails `~/.omp/agent/sessions/<cwd-slug>/*.jsonl` via SSE. Auto-follows new lines; pause/resume with the button.
+- **Status board** — one card per `loop*/` mailbox: state badge (RUNNING / SHIPPED / BLOCKED / IDLE), iteration counter, mission, a verdict-history strip (S/I/B tiles — the loop's fingerprint), and last activity. Refreshes every 5 seconds; running loops sort first.
+- **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
+- **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
 ## Implementation notes
 

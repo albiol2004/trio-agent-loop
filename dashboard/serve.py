@@ -229,6 +229,54 @@ def _last_entry_summary(entries: list[dict]) -> str:
     return " | ".join(parts)
 
 
+_LOG_LINE_RE = re.compile(r"^-\s*iter(?:ation)?\s+(\d+)\s*\|\s*([^|]+?)\s*\|\s*(.*)$")
+_LOG_FIELD_RE = re.compile(r"\b(started_at|ended_at|duration_sec):\s*([^\s|]+)")
+_VERDICT_RE = re.compile(r"\bVERDICT:\s*(SHIP|ITERATE|BLOCKED)\b", re.IGNORECASE)
+
+
+def _loop_timeline(log_path: Path) -> list[dict]:
+    """Parse LOG.md into a merged per-(iter, role) activity timeline.
+
+    Roles append two lines per action (a summary line and a Format-A timing
+    line that repeats the summary); merge them, preferring the timed variant.
+    """
+    if not log_path.is_file():
+        return []
+    by_key: dict[tuple[int, str], dict] = {}
+    order: list[tuple[int, str]] = []
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for raw in lines:
+        match = _LOG_LINE_RE.match(raw.strip())
+        if not match:
+            continue
+        iteration, role, rest = match.groups()
+        role = role.strip().lower()
+        fields = dict((k, v) for k, v in _LOG_FIELD_RE.findall(rest))
+        summary = _LOG_FIELD_RE.sub("", rest)
+        summary = re.sub(r"\s*\|\s*$", "", summary).strip(" |")
+        verdict_match = _VERDICT_RE.search(summary)
+        entry = {
+            "iteration": int(iteration),
+            "role": role,
+            "summary": summary,
+            "verdict": verdict_match.group(1).upper() if verdict_match else None,
+            "started_at": fields.get("started_at"),
+            "ended_at": fields.get("ended_at"),
+            "duration_sec": _to_int(fields.get("duration_sec")),
+        }
+        key = (entry["iteration"], role)
+        prev = by_key.get(key)
+        if prev is None:
+            order.append(key)
+            by_key[key] = entry
+        elif entry["duration_sec"] is not None or prev["duration_sec"] is None:
+            by_key[key] = entry
+    return [by_key[key] for key in order]
+
+
 # --------------------------------------------------------------------------
 # Session discovery
 # --------------------------------------------------------------------------
@@ -452,17 +500,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- /api/sessions -----------------------------------------------------
 
-    def _handle_sessions(self, query: dict) -> None:
-        name = (query.get("loop") or [None])[0]
-        if not name:
-            return self._send_json(400, {"error": "missing 'loop' parameter"})
-        metrics = self.server.metrics
-        loop_dir = next(
-            (p for p in metrics.discover_loops(self.server.root) if p.name == name),
-            None,
-        )
-        if loop_dir is None:
-            return self._send_json(400, {"error": f"unknown loop: {name}"})
+    def _session_list(self, loop_dir: Path) -> list[dict]:
+        """Parents first (newest first), then subagents, for one loop."""
         sessions = []
         for desc in _session_files_for_loop(loop_dir, self.server.root):
             try:
@@ -473,13 +512,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
             session["parent_id"] = desc["parent_id"]
             session["parent_path"] = desc["parent_path"]
             sessions.append(session)
-        # Parents first (newest first — unchanged), then subagents, so the
-        # frontend can render parent-first groups.
         parents = [s for s in sessions if s["kind"] == "parent"]
         subagents = [s for s in sessions if s["kind"] != "parent"]
         parents.sort(key=lambda s: (s["timestamp"], s["label"]), reverse=True)
         subagents.sort(key=lambda s: (s["timestamp"], s["label"]), reverse=True)
-        self._send_json(200, parents + subagents)
+        return parents + subagents
+
+    def _find_loop_dir(self, name: str) -> Path | None:
+        metrics = self.server.metrics
+        return next(
+            (p for p in metrics.discover_loops(self.server.root) if p.name == name),
+            None,
+        )
+
+    def _handle_sessions(self, query: dict) -> None:
+        name = (query.get("loop") or [None])[0]
+        if not name:
+            return self._send_json(400, {"error": "missing 'loop' parameter"})
+        loop_dir = self._find_loop_dir(name)
+        if loop_dir is None:
+            return self._send_json(400, {"error": f"unknown loop: {name}"})
+        self._send_json(200, self._session_list(loop_dir))
+
+    # -- /api/loop (detail) --------------------------------------------------
+
+    def _handle_loop_detail(self, query: dict) -> None:
+        name = (query.get("name") or [None])[0]
+        if not name:
+            return self._send_json(400, {"error": "missing 'name' parameter"})
+        loop_dir = self._find_loop_dir(name)
+        if loop_dir is None:
+            return self._send_json(400, {"error": f"unknown loop: {name}"})
+        card = self._loop_card(loop_dir, self.server.metrics)
+        card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
+        card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
+        card["sessions"] = self._session_list(loop_dir)
+        self._send_json(200, card)
 
     # -- /api/transcript (SSE) ---------------------------------------------
 
@@ -637,6 +705,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._serve_static(name, ctype)
         if path == "/api/board":
             return self._api(self._handle_board)
+        if path == "/api/loop":
+            return self._api(lambda: self._handle_loop_detail(query))
         if path == "/api/sessions":
             return self._api(lambda: self._handle_sessions(query))
         if path == "/api/transcript":
