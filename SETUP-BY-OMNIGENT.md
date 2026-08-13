@@ -117,15 +117,14 @@ the profile's exact fallback slug for diagnostics or recovery, but the
 
 ## Update the Omnigent source checkout
 
-The bundled compatibility patch is verified against the stable `v0.8.2`
-release as well as the contemporaneous development branch. For a stable
-installation, keep the Omnigent checkout on a local branch rooted at the
-release tag:
+The bundled compatibility patch is verified against the stable `v0.9.0`
+release. For a stable installation, keep the Omnigent checkout on a local
+branch rooted at the release tag:
 
 ```bash
 cd /path/to/omnigent
 git fetch origin --tags
-git switch -c trio-v0.8.2 v0.8.2
+git switch -c trio-v0.9.0 v0.9.0
 ```
 
 Do not run `git pull` on that pinned branch: release tags do not advance. Move
