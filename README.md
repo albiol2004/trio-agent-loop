@@ -237,11 +237,13 @@ metrics/                            # cross-harness loop analytics
   trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
                                   #   normalization across template generations
   trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
+  trio-shadow.py                  # shadow checker, declared-vs-actual slice writes
 dashboard/                          # read-only web dashboard (stdlib-only server)
   serve.py                        # board/sessions/SSE-transcript API server
   index.html app.css app.js       # self-contained dark-theme frontend (no CDN)
   README.md                       # usage, CLI flags, and tailscale access notes
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
+PIPELINE.md                         # experimental speculative-pipeline execution spec — slice contracts, frozen interfaces, shadow measurement
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md
   skills/trio-init/SKILL.md
