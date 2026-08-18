@@ -1,7 +1,7 @@
 ---
 name: trio-lead
 description: Trio lead — plans, delegates the main implementation pass to builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.
-model: kimi-code/kimi-for-coding
+model: cursor/cursor-grok-4.6-high
 spawns: trio-builder, trio-scout
 ---
 

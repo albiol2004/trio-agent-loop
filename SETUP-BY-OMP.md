@@ -34,8 +34,13 @@ unrelated harness directories are created.
 
 The bundle ships with a default model contract set in role frontmatter:
 
-- **Judgment tier** (`trio-lead`, `trio-evaluator`): `kimi-code/kimi-for-coding`
+- **Judgment tier** (`trio-lead`, `trio-evaluator`): `cursor/cursor-grok-4.6-high`
 - **Worker tier** (`trio-scout`, `trio-builder`): `deepseek/deepseek-v4-flash`
+
+The judgment tier runs on the Cursor provider (OAuth login via `/login` →
+cursor; Grok 4.6 draws from Cursor's first-party model pool, not the
+third-party usage pool). The worker tier runs on the DeepSeek API
+(`DEEPSEEK_API_KEY` or `/login` → deepseek).
 
 Keep those defaults unless the user asks for different models. Only then
 install with explicit overrides — both flags together, never just one:
@@ -61,7 +66,7 @@ changing the override record is the supported way to retarget the loop.
 
 Frontmatter `model:` accepts a prioritized list whose later entries are
 per-spawn fallbacks (for example
-`model: [kimi-code/kimi-for-coding, kimi-code/kimi]`). The bundle ships
+`model: [cursor/cursor-grok-4.6-high, cursor/cursor-grok-4.6-medium]`). The bundle ships
 single pins by default — adding fallbacks is a supported local edit, unlike
 the fixed role-prompt contract.
 

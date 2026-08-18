@@ -174,10 +174,10 @@ frontmatter "$OMP/agents/trio-scout.md" | grep -Eq '^read-summarize[[:space:]]*:
   || fail "trio-scout must set read-summarize: false"
 
 # Model pins in checked-in frontmatter.
-[[ "$(model_value "$OMP/agents/trio-lead.md")" == "kimi-code/kimi-for-coding" ]] \
-  || fail "trio-lead model: must be kimi-code/kimi-for-coding"
-[[ "$(model_value "$OMP/agents/trio-evaluator.md")" == "kimi-code/kimi-for-coding" ]] \
-  || fail "trio-evaluator model: must be kimi-code/kimi-for-coding"
+[[ "$(model_value "$OMP/agents/trio-lead.md")" == "cursor/cursor-grok-4.6-high" ]] \
+  || fail "trio-lead model: must be cursor/cursor-grok-4.6-high"
+[[ "$(model_value "$OMP/agents/trio-evaluator.md")" == "cursor/cursor-grok-4.6-high" ]] \
+  || fail "trio-evaluator model: must be cursor/cursor-grok-4.6-high"
 [[ "$(model_value "$OMP/agents/trio-scout.md")" == "deepseek/deepseek-v4-flash" ]] \
   || fail "trio-scout model: must be deepseek/deepseek-v4-flash"
 [[ "$(model_value "$OMP/agents/trio-builder.md")" == "deepseek/deepseek-v4-flash" ]] \
