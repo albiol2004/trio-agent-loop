@@ -14,51 +14,41 @@ Installing or removing one does not overwrite the others.
 
 | Role | Harness | Model | Effort |
 |---|---|---|---|
-| Lead | `claude-native` | Claude `opus` alias | `medium` |
-| Evaluator | `claude-native` | Claude `opus` alias | `medium` |
-| Builder | headless `cursor-agent` | `cursor-grok-4.5-high` | `high` in model ID |
-| Scout | headless `cursor-agent --mode ask` | `cursor-grok-4.5-high` | `high` in model ID |
+| Lead | `cursor-native` | `cursor-grok-4.6-medium` | `medium` in model ID |
+| Evaluator | `cursor-native` | `cursor-grok-4.6-medium` | `medium` in model ID |
+| Builder | headless `cursor-agent` | `gpt-5.6-luna-max` | `max` in model ID |
+| Scout | headless `cursor-agent --mode ask` | `gpt-5.6-luna-max` | `max` in model ID |
 
 The Claude or Codex session already open in Omnigent schedules iterations. It
-creates only Lead and Evaluator as direct Opus/medium children. Lead decides when
-to run a Cursor Grok Builder or Scout through `trioctl`; Evaluator decides when
-it needs a read-only Grok Scout. There is no additional coordinator model, and
-the root session never delegates implementation directly to Grok.
+creates only Lead and Evaluator as direct Grok 4.6 Medium children. Lead decides
+when to run a Cursor GPT-5.6 Luna Max Builder or Scout through `trioctl`;
+Evaluator decides when it needs a read-only Luna Scout. There is no additional
+coordinator model, and the root session never delegates implementation directly
+to Luna.
 
-`trioctl` owns this runtime mapping. Claude Code documents `opus` as a moving
-alias. Cursor exposes account-entitled model IDs through `cursor-agent models`,
-so `trioctl` requires the non-fast Grok 4.5 High variant before launching.
+`trioctl` owns this runtime mapping. Cursor exposes account-entitled model IDs
+through `cursor-agent models`, so `trioctl` requires the non-fast Grok 4.6
+Medium and GPT-5.6 Luna Max variants before launching.
 Cursor encodes effort in the model ID. `trioctl` invokes Cursor's supported
-headless print mode and captures the worker result for Opus. It never silently
+headless print mode and captures the worker result for Grok. It never silently
 substitutes Auto, Composer, another provider, or native Trio.
 
-Lead/Evaluator run with `permission_mode: bypassPermissions`. `trioctl` invokes
+Lead/Evaluator run through `cursor-native` with `yolo: true`. `trioctl` invokes
 Builder with Cursor `--force --trust` and invokes Scout with those flags plus
-read-only `--mode ask`. Changing an Opus role's `permission_mode` or harness
+read-only `--mode ask`. Changing a registered role's model, `yolo`, or harness
 requires re-registration because its stored `agent_id` was created from the
-config as read at registration time. Cursor model and effort profile changes
-do not require registration.
+config as read at registration time. Builder/Scout model and effort profile
+changes do not require registration because those workers are ephemeral.
 
 ## Prerequisites
 
 1. Omnigent with child-effort dispatch support:
    `sys_session_create.reasoning_effort`, plus registered-agent native launch
-   propagation so role YAML reaches Claude permission flags.
-2. `claude` and `cursor-agent` on `PATH`; `codex` is also required when the
-   current Omnigent coordinator session uses Codex.
-3. Claude configured for Omnigent and `cursor-agent status` logged in.
+   propagation so role YAML reaches Cursor's `--yolo` launch flag.
+2. `cursor-agent` on `PATH`; `claude` or `codex` is also required only for the
+   corresponding current Omnigent coordinator session.
+3. `cursor-agent status` logged in.
 4. The four model/effort combinations above available to those accounts.
-5. Claude Code's one-time bypass-permissions acknowledgement completed by the
-   user in a trusted workspace:
-
-   ```bash
-   claude --permission-mode bypassPermissions
-   ```
-
-   Select `2. Yes, I accept`, then exit Claude. This consent must not be
-   automated. Without it, a headless Opus role times out before its input is
-   delivered while Claude displays `WARNING: Claude Code running in Bypass
-   Permissions mode`.
 
 When using a patched source checkout, make the normal `omnigent` command use
 that checkout before installing the bundle:
@@ -97,8 +87,8 @@ Edit the TOML profile to change a role's alias, model family, exact model, or
 effort. The next child uses the new values; role re-registration is unnecessary
 for model-only changes.
 
-To migrate a profile created by the older Luna default to Cursor Grok, replace
-it with the repository default and review the resulting TOML:
+To migrate an existing profile to Grok 4.6 Medium and Luna Max, replace it with
+the repository default and review the resulting TOML:
 
 ```bash
 trioctl omnigent configure --force
@@ -106,12 +96,12 @@ trioctl omnigent configure --force
 
 If an earlier Cursor-native Trio build registered persistent Builder or Scout
 anchors, remove those two entries from `registry.json` and restart Omnigent
-once. The restart terminates their old Cursor TUI processes; future Grok
+once. The restart terminates their old Cursor TUI processes; future Luna
 workers are ephemeral headless commands and need no registration or restart.
 `trioctl omnigent doctor` fails while either obsolete entry remains.
 
-Resolution is intentionally strict. A missing Cursor catalog, missing Grok 4.5
-High entitlement, or unsupported selection exits non-zero. `--allow-fallback` opts into
+Resolution is intentionally strict. A missing Cursor catalog, missing Grok 4.6
+Medium or Luna Max entitlement, or unsupported selection exits non-zero. `--allow-fallback` opts into
 the profile's exact fallback slug for diagnostics or recovery, but the
 `trio-omnigent` skill never uses it automatically.
 
@@ -162,32 +152,33 @@ Claude Code or Codex session and say:
 
 The agent should:
 
-1. Verify that `omnigent`, `claude`, and `cursor-agent` are on `PATH`, and run
+1. Verify that `omnigent` and `cursor-agent` are on `PATH`, and run
    `cursor-agent status`.
 2. Verify that the installed Omnigent exposes session-create
    `reasoning_effort` and registered-agent native permission propagation.
 3. Run `./install.sh --omnigent`.
-4. Run `trioctl omnigent models` and resolve all four roles. Stop if Grok or
-   the configured effort is unavailable.
+4. Run `trioctl omnigent models` and resolve all four roles. Stop if Grok 4.6
+   Medium, Luna Max, or a configured effort is unavailable.
 5. Discover Omnigent's deferred `sys_session_create`, `sys_session_close`, and
    `sys_agent_list` tools.
-6. Register only the two Opus roles by creating an idle child from:
+6. Back up a registry whose `_profile` is not
+   `cursor-grok-4.6-medium+luna-max-v1`, then register only the two judgment
+   roles by creating an idle child from:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-7. Write the exact returned `agent_id` and `bootstrap_conversation_id` values to
+7. Write `_profile: cursor-grok-4.6-medium+luna-max-v1` plus the exact returned
+   `agent_id` and `bootstrap_conversation_id` values to
    `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`, keyed by
    `trio-omnigent-{lead,evaluator}`. Leave the idle bootstrap
    sessions in place as registration anchors; `sys_session_close` currently
    rejects config-path-created sessions as `session_not_a_sub_agent`.
 8. Verify both exact names and IDs are present in the registry. Remove legacy
    Builder/Scout entries; they are no longer registration anchors.
-9. Ask the user to complete Claude Code's one-time bypass-permissions
-   acknowledgement shown under Prerequisites. Do not select the consent answer
-   for them.
-10. Verify Lead and Evaluator have `spawn: true`, then run a short
+9. Verify Lead and Evaluator use `cursor-native`, `yolo: true`, and
+   `spawn: true`, then run a short
     `trioctl omnigent run scout` smoke test and confirm its text is captured.
-11. Run `trioctl omnigent doctor`; all checks must pass.
-12. Tell you to start a new underlying Claude/Codex session so its skill catalog
+10. Run `trioctl omnigent doctor`; all checks must pass.
+11. Tell you to start a new underlying Claude/Codex session so its skill catalog
    includes the installed entrypoint.
 
 The setup operation must not launch a billable Trio loop unless you separately
@@ -205,9 +196,9 @@ now say:
 > Run a Trio Omnigent loop to add config-driven rate limiting to the public API.
 
 The `trio-omnigent` skill keeps that already-open session as the iteration
-scheduler. It resolves the profile at runtime and launches Opus Lead and
-Evaluator; those Opus roles independently resolve and run ephemeral headless
-Cursor Grok 4.5 High workers. It runs until
+scheduler. It resolves the profile at runtime and launches Grok 4.6 Medium Lead
+and Evaluator; those roles independently resolve and run ephemeral headless
+Cursor GPT-5.6 Luna Max workers. It runs until
 SHIP/BLOCKED by default. Say “one supervised iteration” to stop after one
 verdict.
 
@@ -217,7 +208,8 @@ fall back to native Trio.
 
 `OMNIGENT_HOME=/custom/path ./install.sh --omnigent` selects another Omnigent
 home. Re-running the installer updates only the Trio-owned role sources and
-entrypoint skills. Re-register the Opus roles after changing their configs.
+entrypoint skills. Re-register the Lead/Evaluator roles after changing their
+configs.
 
 Use a different mailbox such as `loop-auth` for a concurrent mission. Never
 point two live runs at one mailbox.
@@ -225,11 +217,12 @@ point two live runs at one mailbox.
 ## Why the Omnigent patch is required
 
 Omnigent already stored `reasoning_effort` on sessions and translated it to
-Claude's `--effort` or Codex reasoning configuration at launch. Previously,
-the session-create tool exposed `model` but not `reasoning_effort`, so an orchestrator
-could not choose effort by Opus role. Registered `agent_id` launches also
-skipped the role's native launch configuration, dropping Claude
-`bypassPermissions`. The patch completes both existing paths.
+native harness configuration at launch. Previously, the session-create tool
+exposed `model` but not `reasoning_effort`. Registered `agent_id` launches also
+skipped the role's native launch configuration, dropping Cursor's `--yolo`.
+The patch completes both existing paths. The current all-Cursor profile encodes
+effort in exact model IDs, while retaining the general effort seam for custom
+profiles.
 Effort is creation-only and cannot change on a continued child.
 
 The compatibility patch remains additive while released Omnigent builds lack
@@ -258,19 +251,15 @@ For CLI unit tests:
 python3 -m pytest -q omnigent/tests/test_trioctl.py
 ```
 
-Do a short real smoke run. Lead/Evaluator must show the profile-resolved
-Opus/medium pair. Their captured `trioctl` output must identify the
-profile-resolved Cursor Grok 4.5 High worker.
+Do a short real smoke run. Lead/Evaluator must show the profile-resolved Cursor
+Grok 4.6 Medium pair. Their captured `trioctl` output must identify the
+profile-resolved Cursor GPT-5.6 Luna Max worker.
 
 For a real smoke run, inspect the UI session tree: the current session must
-remain the root, with Lead/Evaluator as direct Opus/medium children. Builder and
-Scout do not appear as persistent Omnigent children; the Opus role's command
+remain the root, with Lead/Evaluator as direct Grok 4.6 Medium children. Builder
+and Scout do not appear as persistent Omnigent children; the Grok role's command
 history and report must show its own `trioctl omnigent run` invocation. A
-root-launched Grok process or any Sonnet coordinator is a failure.
-
-If an Opus child fails readiness with the bypass-permissions warning and a
-`Yes, I accept` menu, stop retrying. Complete the one-time Claude command in
-Prerequisites manually, then launch a fresh Trio iteration.
+root-launched Luna process or any extra coordinator is a failure.
 
 ## Remove
 

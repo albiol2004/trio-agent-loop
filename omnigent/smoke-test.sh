@@ -47,6 +47,10 @@ EOF
   chmod +x "$TMP/bin/omnigent"
   cat >"$TMP/bin/cursor-agent" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "models" ]]; then
+  echo 'cursor-grok-4.6-medium - Cursor Grok 4.6 Medium'
+  echo 'gpt-5.6-luna-max - GPT-5.6 Luna 1M Max'
+fi
 exit 0
 EOF
   chmod +x "$TMP/bin/cursor-agent"
@@ -102,9 +106,9 @@ installer_replacement_contract() {
   [[ -f "$claude_skill/SKILL.md" && -f "$codex_skill/SKILL.md" ]] || return 1
   [[ -x "$trioctl" && -f "$trioctl_config" ]] || return 1
   assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
-    | grep -Fq '"model": "opus"'
+    | grep -Fq '"model": "cursor-grok-4.6-medium"'
   assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
-    | grep -Fq '"reasoning_effort": "medium"'
+    | grep -Fq '"model_effort": "medium"'
   [[ -z "$(find "$claude_skill" "$codex_skill" -type d -name scripts -print)" ]] || return 1
   mkdir -p "$TMP/expected-roles"
   assert cp -a "$ROOT/omnigent/trio-omnigent-roles/." "$TMP/expected-roles/"
@@ -119,10 +123,10 @@ import pathlib, sys, yaml
 
 root = pathlib.Path(sys.argv[1])
 expected = {
-    "lead": ("trio-omnigent-lead", "claude-native", "claude-opus-5"),
-    "evaluator": ("trio-omnigent-evaluator", "claude-native", "claude-opus-5"),
-    "builder": ("trio-omnigent-builder", "cursor-native", "cursor-grok-4.5-high"),
-    "scout": ("trio-omnigent-scout", "cursor-native", "cursor-grok-4.5-high"),
+    "lead": ("trio-omnigent-lead", "cursor-native", "cursor-grok-4.6-medium"),
+    "evaluator": ("trio-omnigent-evaluator", "cursor-native", "cursor-grok-4.6-medium"),
+    "builder": ("trio-omnigent-builder", "cursor-native", "gpt-5.6-luna-max"),
+    "scout": ("trio-omnigent-scout", "cursor-native", "gpt-5.6-luna-max"),
 }
 for role, (name, harness, model) in expected.items():
     data = yaml.safe_load((root / "omnigent/trio-omnigent-roles" / role / "config.yaml").read_text())
@@ -131,7 +135,7 @@ for role, (name, harness, model) in expected.items():
     assert (data["name"], config["harness"], executor["model"]) == (name, harness, model)
     if role in {"lead", "evaluator"}:
         assert data["spawn"] is True
-        assert config["permission_mode"] == "bypassPermissions"
+        assert config["yolo"] is True
     else:
         assert not data.get("spawn", False)
         assert config["yolo"] is True

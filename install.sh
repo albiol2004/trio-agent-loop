@@ -106,8 +106,8 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
       *":$TRIOCTL_BIN_DIR:"*) ;;
       *) echo "Add $TRIOCTL_BIN_DIR to PATH before starting Claude, Codex, or Omnigent." ;;
     esac
-    echo "One-time user action: run 'claude --permission-mode bypassPermissions', accept option 2, then exit."
-    echo "Next: from this cloned repo, register only Lead and Evaluator with sys_session_create."
+    echo "Lead/Evaluator now use Cursor Grok 4.6 Medium; old Claude registration IDs must not be reused."
+    echo "When migrating, run 'trioctl omnigent configure --force', then register only Lead and Evaluator."
     exit 0 ;;
   --kimi)
     KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"

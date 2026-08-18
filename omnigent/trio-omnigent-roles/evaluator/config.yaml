@@ -1,11 +1,11 @@
 spec_version: 1
 name: trio-omnigent-evaluator
-description: Opus adversarial Trio evaluator that verifies independently and never fixes.
+description: Cursor Grok 4.6 adversarial Trio evaluator that verifies independently and never fixes.
 spawn: true
 executor:
   type: omnigent
-  model: claude-opus-5
-  config: {harness: claude-native, permission_mode: bypassPermissions}
+  model: cursor-grok-4.6-medium
+  config: {harness: cursor-native, yolo: true}
 os_env:
   type: caller_process
   cwd: .
@@ -27,7 +27,7 @@ prompt: |
   When independent reconnaissance would improve the audit, write a bounded
   read-only assignment to a temporary file outside the Trio mailbox and invoke
   `trioctl omnigent run scout --prompt-file <path> --workspace .`. Remove the
-  temporary file afterward. This launches an ephemeral headless Cursor Grok
+  temporary file afterward. This launches an ephemeral headless Cursor Luna
   Scout in read-only ask mode. Never pass `--allow-fallback`, create a
   registered Builder/Scout Omnigent session, or create another Lead, Evaluator,
   or coordinator.

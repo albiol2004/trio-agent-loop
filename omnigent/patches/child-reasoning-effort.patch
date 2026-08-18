@@ -268,7 +268,7 @@ diff --git a/tests/server/integration/test_sessions_child_sessions.py b/tests/se
 index 8dcc39fe..92e70f95 100644
 --- a/tests/server/integration/test_sessions_child_sessions.py
 +++ b/tests/server/integration/test_sessions_child_sessions.py
-@@ -1216,6 +1216,81 @@ async def _create_parent_with_subagents(
+@@ -1216,6 +1216,86 @@ async def _create_parent_with_subagents(
      return {"session_id": session_id, "agent_id": agent_resp.json()["id"]}
  
  
@@ -309,6 +309,11 @@ index 8dcc39fe..92e70f95 100644
 +            "codex-native",
 +            {"yolo": True},
 +            ["--dangerously-bypass-approvals-and-sandbox"],
++        ),
++        (
++            "cursor-native",
++            {"yolo": True},
++            ["--yolo"],
 +        ),
 +    ],
 +)

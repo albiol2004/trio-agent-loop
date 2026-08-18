@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage and validate Trio's mixed-provider Omnigent model profile."""
+"""Manage and validate Trio's Omnigent model profile."""
 
 from __future__ import annotations
 
@@ -16,14 +16,15 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ROLES = ("lead", "evaluator", "builder", "scout")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
 CURSOR_WORKER_ROLES = ("builder", "scout")
+REGISTRY_PROFILE = "cursor-grok-4.6-medium+luna-max-v1"
 CURSOR_ROLE_PROMPTS = {
     "builder": (
         "You are the Trio Builder and primary implementor. Execute exactly one "
-        "well-specified task from the Opus Lead. You are not alone in the "
+        "well-specified task from the Trio Lead. You are not alone in the "
         "codebase: preserve unrelated edits and accommodate existing work. "
         "Match repository patterns, make the smallest complete change, run the "
         "stated checks, and never modify Trio mailbox files, commit, or push. "
@@ -32,7 +33,7 @@ CURSOR_ROLE_PROMPTS = {
     ),
     "scout": (
         "You are the Trio Scout. Perform only the bounded read-only "
-        "reconnaissance requested by the Opus Lead or Evaluator. Do not edit "
+        "reconnaissance requested by the Trio Lead or Evaluator. Do not edit "
         "files, commit, push, or modify Trio mailbox files. Return concise, "
         "evidence-backed findings with relevant file paths and commands."
     ),
@@ -453,7 +454,7 @@ def run_cursor_worker(
     ]
     if role == "scout":
         command.extend(["--mode", "ask"])
-    full_prompt = f"{CURSOR_ROLE_PROMPTS[role]}\n\nTASK FROM OPUS:\n{prompt.strip()}\n"
+    full_prompt = f"{CURSOR_ROLE_PROMPTS[role]}\n\nTASK FROM LEAD:\n{prompt.strip()}\n"
     try:
         result = subprocess.run(
             command,
@@ -595,7 +596,12 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     try:
         entries = json.loads(registry.read_text())
-        # Only Opus orchestration roles are durable Omnigent agents. Cursor
+        if entries.get("_profile") != REGISTRY_PROFILE:
+            raise TrioctlError(
+                "registered role profile is stale; back up registry.json and "
+                "re-register Lead/Evaluator from the current role configs"
+            )
+        # Only the two orchestration roles are durable Omnigent agents. Cursor
         # workers are ephemeral headless CLI runs, avoiding cursor-native's
         # one-chat-per-workspace transcript ownership collision.
         expected = {"trio-omnigent-lead", "trio-omnigent-evaluator"}

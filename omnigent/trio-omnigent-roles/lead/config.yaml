@@ -1,11 +1,11 @@
 spec_version: 1
 name: trio-omnigent-lead
-description: Opus Trio lead that plans, reviews the implementation pass, and corrects.
+description: Cursor Grok 4.6 Trio lead that plans, reviews the implementation pass, and corrects.
 spawn: true
 executor:
   type: omnigent
-  model: claude-opus-5
-  config: {harness: claude-native, permission_mode: bypassPermissions}
+  model: cursor-grok-4.6-medium
+  config: {harness: cursor-native, yolo: true}
 os_env:
   type: caller_process
   cwd: .
@@ -28,13 +28,13 @@ prompt: |
   `trioctl omnigent resolve scout --json` before delegation. Never pass
   `--allow-fallback`; stop if resolution fails.
 
-  You own Cursor delegation. Write each bounded worker assignment to a
+  You own Luna delegation. Write each bounded worker assignment to a
   temporary prompt file outside the Trio mailbox, then invoke
   `trioctl omnigent run builder --prompt-file <path> --workspace .` for the
   primary implementation. When reconnaissance is useful, invoke
   `trioctl omnigent run scout --prompt-file <path> --workspace .` first. Run
   Cursor workers serially. These commands launch ephemeral headless Cursor
-  agents with the exact profile-resolved Grok model; do not create registered
+  agents with the exact profile-resolved Luna model; do not create registered
   Builder/Scout Omnigent sessions and do not launch another Lead, Evaluator, or
   coordinator.
 

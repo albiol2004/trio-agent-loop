@@ -26,25 +26,33 @@ def profile(**builder):
     return {
         "version": 1,
         "roles": {
-            "lead": {"provider": "claude", "model": "opus", "effort": "medium"},
-            "evaluator": {
-                "provider": "claude",
-                "model": "opus",
+            "lead": {
+                "provider": "cursor",
+                "model_family": "grok-4.6",
+                "fallback_model": "cursor-grok-4.6-medium",
                 "effort": "medium",
+                "fast": False,
+            },
+            "evaluator": {
+                "provider": "cursor",
+                "model_family": "grok-4.6",
+                "fallback_model": "cursor-grok-4.6-medium",
+                "effort": "medium",
+                "fast": False,
             },
             "builder": {
                 "provider": "cursor",
-                "model_family": "grok-4.5",
-                "fallback_model": "cursor-grok-4.5-high",
-                "effort": "high",
+                "model_family": "gpt-5.6-luna",
+                "fallback_model": "gpt-5.6-luna-max",
+                "effort": "max",
                 "fast": False,
                 **builder,
             },
             "scout": {
                 "provider": "cursor",
-                "model_family": "grok-4.5",
-                "fallback_model": "cursor-grok-4.5-high",
-                "effort": "high",
+                "model_family": "gpt-5.6-luna",
+                "fallback_model": "gpt-5.6-luna-max",
+                "effort": "max",
                 "fast": False,
             },
         },
@@ -62,17 +70,22 @@ def model(name: str, *efforts: str):
     }
 
 
-def test_claude_role_uses_configured_moving_alias():
+def test_cursor_lead_resolves_grok_medium():
     trioctl = load_trioctl()
 
-    result = trioctl.resolve_role("lead", profile())
+    result = trioctl.resolve_role(
+        "lead",
+        profile(),
+        models=[model("cursor-grok-4.6-medium"), model("cursor-grok-4.6-medium-fast")],
+    )
 
     assert result == {
         "role": "lead",
-        "provider": "claude",
-        "model": "opus",
-        "reasoning_effort": "medium",
-        "source": "configured-alias",
+        "provider": "cursor",
+        "model": "cursor-grok-4.6-medium",
+        "reasoning_effort": None,
+        "model_effort": "medium",
+        "source": "cursor-model-list",
     }
 
 
@@ -131,10 +144,10 @@ def test_codex_fallback_requires_explicit_opt_in():
         allow_fallback=True,
     )
 
-    assert result["model"] == "cursor-grok-4.5-high"
+    assert result["model"] == "gpt-5.6-luna-max"
     assert result["source"] == "explicit-fallback"
     assert result["reasoning_effort"] is None
-    assert result["model_effort"] == "high"
+    assert result["model_effort"] == "max"
 
 
 def test_load_config_requires_every_role(tmp_path: Path):
@@ -190,9 +203,9 @@ def test_codex_models_completes_handshake_and_paginates(
 def test_cursor_family_selects_non_fast_effort_variant():
     trioctl = load_trioctl()
     models = [
-        model("cursor-grok-4.5-medium"),
-        model("cursor-grok-4.5-high"),
-        model("cursor-grok-4.5-high-fast"),
+        model("gpt-5.6-luna-high"),
+        model("gpt-5.6-luna-max"),
+        model("gpt-5.6-luna-max-fast"),
         model("composer-2.5"),
     ]
 
@@ -201,9 +214,9 @@ def test_cursor_family_selects_non_fast_effort_variant():
     assert result == {
         "role": "builder",
         "provider": "cursor",
-        "model": "cursor-grok-4.5-high",
+        "model": "gpt-5.6-luna-max",
         "reasoning_effort": None,
-        "model_effort": "high",
+        "model_effort": "max",
         "source": "cursor-model-list",
     }
 
@@ -220,7 +233,7 @@ def test_cursor_models_parses_authenticated_cli_listing(
             print("Available models")
             print()
             print("auto - Auto (default)")
-            print("cursor-grok-4.5-high - Cursor Grok 4.5")
+            print("gpt-5.6-luna-max - GPT-5.6 Luna 1M Max")
             """
         )
     )
@@ -230,9 +243,9 @@ def test_cursor_models_parses_authenticated_cli_listing(
     assert trioctl.cursor_models(timeout=2) == [
         {"id": "auto", "model": "auto", "displayName": "Auto (default)"},
         {
-            "id": "cursor-grok-4.5-high",
-            "model": "cursor-grok-4.5-high",
-            "displayName": "Cursor Grok 4.5",
+            "id": "gpt-5.6-luna-max",
+            "model": "gpt-5.6-luna-max",
+            "displayName": "GPT-5.6 Luna 1M Max",
         },
     ]
 
@@ -256,7 +269,7 @@ def test_cursor_builder_runs_headless_with_resolved_model(
         profile(),
         prompt="Implement the bounded change.",
         workspace=tmp_path,
-        models=[model("cursor-grok-4.5-high")],
+        models=[model("gpt-5.6-luna-max")],
     )
 
     assert output == "WORKER_OK"
@@ -266,14 +279,14 @@ def test_cursor_builder_runs_headless_with_resolved_model(
         "--output-format",
         "text",
         "--model",
-        "cursor-grok-4.5-high",
+        "gpt-5.6-luna-max",
         "--force",
         "--trust",
         "--approve-mcps",
         "--workspace",
         str(tmp_path.resolve()),
     ]
-    assert "TASK FROM OPUS:\nImplement the bounded change." in seen["kwargs"]["input"]
+    assert "TASK FROM LEAD:\nImplement the bounded change." in seen["kwargs"]["input"]
 
 
 def test_cursor_scout_is_forced_read_only(
@@ -294,7 +307,7 @@ def test_cursor_scout_is_forced_read_only(
         profile(),
         prompt="Inspect the module.",
         workspace=tmp_path,
-        models=[model("cursor-grok-4.5-high")],
+        models=[model("gpt-5.6-luna-max")],
     )
 
     assert seen["command"][-2:] == ["--mode", "ask"]

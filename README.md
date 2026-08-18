@@ -75,7 +75,7 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ```bash
 ./install.sh --global            # ~/.claude — every project on this machine
 ./install.sh ~/src/myproject     # or per-project, committed to the repo
-./install.sh --omnigent          # mixed Opus/Cursor Grok roles through Omnigent
+./install.sh --omnigent          # Cursor Grok/Luna roles through Omnigent
 ./install.sh --kimi              # Kimi Code skills + sequential role runner
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
@@ -176,13 +176,13 @@ a typed result and treats VERDICT.md's first line as the audit fallback — a
 channel the other native bundles don't expose. `omp -p "/trio auto"` runs the
 loop headless for CI.
 
-Omnigent adds two registered Opus agents at medium effort for Lead/Evaluator. Their
-Scout/Builder delegation runs as ephemeral headless Cursor Grok 4.5 High agents
-through the additive `trioctl` utility. `trioctl` resolves the user-editable
-runtime profile from Claude's stable alias and Cursor's authenticated live
-model catalog, so model availability is checked before a loop starts. The
-already-open Claude/Codex UI session schedules Opus iterations; Lead and
-Evaluator decide and launch their own Grok delegation. There is no extra
+Omnigent adds two registered Cursor Grok 4.6 Medium agents for Lead/Evaluator.
+Their Scout/Builder delegation runs as ephemeral headless Cursor GPT-5.6 Luna
+Max agents through the additive `trioctl` utility. `trioctl` resolves the
+user-editable runtime profile from Cursor's authenticated live model catalog,
+so model availability is checked before a loop starts. The already-open
+Claude/Codex UI session schedules Grok iterations; Lead and Evaluator decide
+and launch their own Luna delegation. There is no extra
 coordinator model and no persistent Cursor session competing for a workspace
 chat. See
 [SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
@@ -203,7 +203,7 @@ bridge/                              # cross-harness trio-bridge suggestion skil
   skills/trio-bridge/SKILL.md        # /trio-bridge — scan for background work
   commands/trio-bridge.md            # Omp native command source
   README.md                          # proposal card contract
-omnigent/trio-omnigent-roles/        # Opus agents + Cursor role references
+omnigent/trio-omnigent-roles/        # registered Grok agents + Luna role references
   {lead,evaluator,builder,scout}/config.yaml
 omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
 omnigent/trioctl                     # resolver, doctor, headless Cursor runner
