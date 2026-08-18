@@ -48,8 +48,8 @@ Start a new Codex task and say:
 Run a trio loop on <task>.
 ```
 
-For long work, `/goal Run a trio loop on <task> until SHIP or BLOCKED` keeps
-the outer task persistent. The Trio skill uses Codex's native multi-agent
+For long work, `/goal Run a trio loop on <task> until SHIP, BLOCKED, or
+NEEDS_HUMAN` keeps the outer task persistent. The Trio skill uses Codex's native multi-agent
 tools and exact named custom agents:
 
 - Terra High: `trio-lead` planning and post-Builder review/correction,
@@ -79,3 +79,11 @@ uses separate ephemeral `codex exec` sessions for the same roles. These runs:
 
 See `codex/skills/trio/references/TROUBLESHOOTING.md` for capability and
 permission diagnostics. The loop never commits.
+
+## Orchestration policy
+
+`./install.sh --codex` also upserts the marked block from
+`portable/ORCHESTRATION.md` into `~/.codex/AGENTS.md`, Codex's user-global
+instruction file, so every Codex session loads the same cross-harness routing
+workstyle. Only the marked region is ever replaced: re-running the installer
+is byte-idempotent, and any other content in your AGENTS.md is preserved.

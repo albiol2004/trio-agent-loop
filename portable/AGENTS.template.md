@@ -15,8 +15,10 @@ that another session may own):
 - `loop/GOAL.md` is human-owned and immutable to agents.
 - `loop/PLAN.md`, `loop/REPORT.md` are written by the Lead role;
   `loop/VERDICT.md` by the Evaluator role (first line is machine-parsed:
-  `VERDICT: SHIP|ITERATE|BLOCKED`); `loop/STATE.md` and `loop/LOG.md` are
-  shared bookkeeping.
+  `VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED`, with an optional
+  `scope=design` or `scope=local:<paths>` suffix on ITERATE); `loop/STATE.md`
+  and `loop/LOG.md` are shared bookkeeping; `loop/.repairs` is a
+  driver-internal counter.
 - If you are invoked with one of the role prompts from `portable/prompts/`,
   follow that prompt exactly. If you are a human-driven session, don't edit
   `loop/` files casually — the loop depends on them.

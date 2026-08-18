@@ -231,7 +231,7 @@ def _last_entry_summary(entries: list[dict]) -> str:
 
 _LOG_LINE_RE = re.compile(r"^-\s*iter(?:ation)?\s+(\d+)\s*\|\s*([^|]+?)\s*\|\s*(.*)$")
 _LOG_FIELD_RE = re.compile(r"\b(started_at|ended_at|duration_sec):\s*([^\s|]+)")
-_VERDICT_RE = re.compile(r"\bVERDICT:\s*(SHIP|ITERATE|BLOCKED)\b", re.IGNORECASE)
+_VERDICT_RE = re.compile(r"\bVERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\b", re.IGNORECASE)
 
 
 def _loop_timeline(log_path: Path) -> list[dict]:

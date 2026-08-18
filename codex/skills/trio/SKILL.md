@@ -53,7 +53,16 @@ For each iteration, orchestrate these native agents synchronously:
 4. Spawn `trio-scout` again for evaluator reconnaissance. It must inspect the
    goal, plan, and actual diff without reading REPORT.md or issuing a verdict.
 5. Spawn `trio-evaluator` (Terra High), passing that brief. It independently
-   verifies before reading REPORT.md and writes VERDICT.md.
+   verifies before reading REPORT.md and writes VERDICT.md with one of
+   `SHIP`, `ITERATE` (optionally `scope=design` or `scope=local:<paths>`),
+   `NEEDS_HUMAN`, or `BLOCKED` on the first line.
+6. On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2 consecutive
+   repairs, spawn `trio-repair` (Luna High) instead of `trio-lead`: it fixes
+   exactly the listed paths with no re-planning. Track the consecutive count
+   in `loop/.repairs` (driver-internal; start at 1, cap at 2, reset to 0 after
+   any full Lead pass). On the 3rd consecutive scoped verdict, or for any
+   other ITERATE, spawn `trio-lead` as usual. On `VERDICT: NEEDS_HUMAN`, stop
+   and surface the mandatory `## Human check` section from VERDICT.md.
 
 Use the exact custom agent type on every spawn. Never use a generic agent,
 inherit the parent model, or override the custom agent's configured model.
@@ -76,7 +85,9 @@ For each role invocation:
    <trio-skill-dir>/scripts/run-role.sh <role> <context-file> <result-file> <project-root>
    ```
 
-   Roles are `scout`, `lead`, `builder`, and `evaluator`.
+   Roles are `scout`, `lead`, `builder`, `evaluator`, and `repair` (run for
+   `VERDICT: ITERATE scope=local:<paths>` instead of a full Lead pass, capped
+   at 2 consecutive repairs — see native mode step 6).
 3. Read the result file and verify the role also wrote its required mailbox
    artifacts. Treat a failed or malformed child run as a Trio blocking issue,
    not as permission to impersonate the role in the parent.
@@ -90,5 +101,14 @@ It uses `codex exec --ephemeral`, inherits the project's active Codex
 configuration and permission profile, and never bypasses the sandbox. Child
 runs are sequential. The parent remains the only orchestrator.
 
-Continue on ITERATE until SHIP, BLOCKED, the iteration cap, or the active Goal
-budget stops the task. Never commit automatically.
+Continue on ITERATE until SHIP, BLOCKED, NEEDS_HUMAN, the iteration cap, or
+the active Goal budget stops the task. Never commit automatically.
+
+<!-- trio-protocol:start -->
+## Trio protocol essentials
+
+- Verdict grammar — the first non-empty line of `VERDICT.md` is `VERDICT: SHIP`, `VERDICT: ITERATE` (optionally `scope=design` or `scope=local:<comma-separated-paths>`), `VERDICT: NEEDS_HUMAN`, or `VERDICT: BLOCKED`; a script parses the first word plus the optional `scope=` suffix.
+- `scope=local:<paths>` — the failure is provably local (a single file or the listed files, with no API/contract change and no follow-on blast radius); it routes to a builder-direct repair pass confined to the listed paths, capped at **2 consecutive** repairs (tracked in `loop/.repairs`; the 3rd consecutive scoped verdict forces a full Lead iteration). `scope=design` or plain ITERATE runs a full Lead iteration.
+- `NEEDS_HUMAN` — every agent-verifiable criterion passes but `PLAN.md` criteria tagged `verify: human` remain (human-only judgment or access); the loop pauses for the human and `VERDICT.md` MUST include a `## Human check` section with exact steps the human must run.
+- Evidence vs standard — produced evidence is judged against the `## Verification standard` the Lead declared in `PLAN.md` (mode: `test-first` | `implement-then-smoke` | `human-gate`, plus the promised evidence) and against GOAL.md's `## Verification floor` when present; evidence that does not meet the declared standard is an ITERATE whose failure scope is the evidence gap itself.
+<!-- trio-protocol:end -->

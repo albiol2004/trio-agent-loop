@@ -19,14 +19,99 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$ROOT/.claude"
 
+# install_role_file <src> <dest-dir> — install a repo-owned generated role
+# file with manifest tracking (<dest-dir>/.trio-hashes lines "<sha256>  <base>"):
+#   target missing                    -> install, record hash
+#   target untouched since we installed it (hash matches manifest) -> update, record
+#   manifest entry but on-disk content differs -> hand-edited: preserve + warn
+#   no manifest entry, identical content -> adopt into manifest
+#   no manifest entry, differing content -> foreign file: preserve + warn
+# This replaces blanket no-clobber: role prompts must track the repo (they are
+# generated from prompts/canonical), while genuine user files stay protected.
+install_role_file() {
+  local src="$1" dir="$2"
+  local base target manifest hash_on_disk hash_src
+  base="$(basename "$src")"
+  target="$dir/$base"
+  manifest="$dir/.trio-hashes"
+  mkdir -p "$dir"
+  hash_src="$(sha256sum "$src" | cut -d' ' -f1)"
+  if [[ ! -e "$target" ]]; then
+    cp -v "$src" "$target"
+    { [[ -f "$manifest" ]] && grep -v "  $base\$" "$manifest" || true; echo "$hash_src  $base"; } > "$manifest.new"
+    mv "$manifest.new" "$manifest"
+    return
+  fi
+  hash_on_disk="$(sha256sum "$target" | cut -d' ' -f1)"
+  if [[ -f "$manifest" ]] && grep -q "^$hash_on_disk  $base\$" "$manifest"; then
+    [[ "$hash_on_disk" == "$hash_src" ]] || cp -v "$src" "$target"
+    { grep -v "  $base\$" "$manifest" || true; echo "$hash_src  $base"; } > "$manifest.new"
+    mv "$manifest.new" "$manifest"
+  elif [[ -f "$manifest" ]] && grep -q "  $base\$" "$manifest"; then
+    echo "WARNING: preserving hand-edited $target — repo has a different generated version; diff and re-install manually to update" >&2
+  elif [[ "$hash_on_disk" == "$hash_src" ]]; then
+    echo "$hash_src  $base" >> "$manifest"  # adopt identical foreign file
+  else
+    echo "Preserving existing $target (not trio-installed; move it aside to receive repo updates)" >&2
+  fi
+}
+
+# inject_orchestration <target> — upsert the marked block from
+# portable/ORCHESTRATION.md into the harness's user-global instruction file.
+# Idempotent: a second run yields a byte-identical target.
+inject_orchestration() {
+
+  local target="$1"
+  local blockfile tmpfile
+  blockfile="$(mktemp)"
+  tmpfile="$(mktemp)"
+  trap 'rm -f "$blockfile" "$tmpfile"' RETURN
+  # Markers are standalone lines; the doc prose mentions them inside backticks,
+  # so match only lines that are exactly the marker.
+  sed -n '/^<!-- orchestration:start -->$/,/^<!-- orchestration:end -->$/p' \
+    "$ROOT/portable/ORCHESTRATION.md" > "$blockfile"
+  mkdir -p "$(dirname "$target")"
+  if [[ ! -e "$target" ]]; then
+    # Fresh file: it contains exactly the block.
+    cp "$blockfile" "$target"
+  elif grep -q -- '^<!-- orchestration:start -->$' "$target"; then
+    # Marked block present: replace the region between the markers
+    # (inclusive) with the fresh block; keep everything outside it.
+    awk -v blockfile="$blockfile" '
+      /^<!-- orchestration:start -->$/ {
+        while ((getline line < blockfile) > 0) print line
+        close(blockfile)
+        skipping = 1
+        next
+      }
+      skipping && /^<!-- orchestration:end -->$/ { skipping = 0; next }
+      !skipping
+    ' "$target" > "$tmpfile"
+    mv "$tmpfile" "$target"
+  else
+    # No block yet: append a blank line plus the block.
+    {
+      cat "$target"
+      echo
+      cat "$blockfile"
+    } > "$tmpfile"
+    mv "$tmpfile" "$target"
+  fi
+  echo "Injected orchestration policy into $target"
+}
+
 case "${1:-}" in
-  --global) DEST="$HOME/.claude" ;;
+  --global)
+    DEST="$HOME/.claude"
+    INJECT_ORCHESTRATION_TARGET="$DEST/CLAUDE.md"
+    ;;
   --codex)
     mkdir -p "$HOME/.agents/skills" "$HOME/.codex/agents"
     cp -rv "$ROOT/codex/skills/trio" "$HOME/.agents/skills/"
     cp -rv "$ROOT/codex/skills/trio-init" "$HOME/.agents/skills/"
     cp -v "$ROOT"/codex/agents/trio-*.toml "$HOME/.codex/agents/"
     chmod +x "$HOME/.agents/skills/trio/scripts/run-role.sh"
+    inject_orchestration "$HOME/.codex/AGENTS.md"
     echo "Installed Codex Trio. Native agents are preferred; isolated Codex CLI sessions are the fallback."
     echo "Next: follow SETUP-BY-CODEX.md to validate multi_agent and the target project's permission profile."
     exit 0 ;;
@@ -115,6 +200,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     cp -rv "$ROOT/kimi/skills/trio" "$KIMI_HOME/skills/"
     cp -rv "$ROOT/kimi/skills/trio-init" "$KIMI_HOME/skills/"
     chmod +x "$KIMI_HOME/skills/trio/scripts/run-role.sh"
+    inject_orchestration "$KIMI_HOME/AGENTS.md"
     echo "Installed Kimi Code Trio skills and sequential role runner."
     echo "Next: follow SETUP-BY-KIMI.md to validate Kimi Code and initialize a mailbox."
     exit 0 ;;
@@ -152,25 +238,17 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
         exit 2
       }
     fi
-    # OpenCode's global project-independent tree. Copy only Trio-owned files;
-    # an existing user config or same-named file is never overwritten.
+    # OpenCode's global project-independent tree. Role files are repo-owned
+    # generated artifacts: always updated in place (model overrides live in
+    # the jsonc config, not in these files, so nothing user-side is lost).
+    # Genuine config files below are never overwritten.
     OPENCODE_DEST="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
     mkdir -p "$OPENCODE_DEST/agents" "$OPENCODE_DEST/commands"
     for f in "$ROOT"/opencode/agents/*.md; do
-      target="$OPENCODE_DEST/agents/$(basename "$f")"
-      if [[ -e "$target" ]]; then
-        echo "Preserving existing $target"
-      else
-        cp -v "$f" "$target"
-      fi
+      install_role_file "$f" "$OPENCODE_DEST/agents"
     done
     for f in "$ROOT"/opencode/commands/*.md; do
-      target="$OPENCODE_DEST/commands/$(basename "$f")"
-      if [[ -e "$target" ]]; then
-        echo "Preserving existing $target"
-      else
-        cp -v "$f" "$target"
-      fi
+      install_role_file "$f" "$OPENCODE_DEST/commands"
     done
     target="$OPENCODE_DEST/opencode.trio.example.jsonc"
     if [[ -e "$target" ]]; then
@@ -184,6 +262,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
         --strong-model "$OPENCODE_STRONG_MODEL" \
         --light-model "$OPENCODE_LIGHT_MODEL"
     fi
+    inject_orchestration "$OPENCODE_DEST/AGENTS.md"
     echo "Installed native OpenCode Trio agents, commands, and an optional model example."
     if [[ -n "$OPENCODE_STRONG_MODEL" ]]; then
       echo "Applied the user-selected strong/light model mapping."
@@ -221,21 +300,14 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
       OMP_DEST="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
     fi
     mkdir -p "$OMP_DEST/agents" "$OMP_DEST/commands"
+    # Role files are repo-owned generated artifacts: always update in place.
+    # Model overrides live in config.yml via configure-models.sh below, so
+    # overwriting these files loses no user configuration.
     for f in "$ROOT"/omp/agents/*.md; do
-      target="$OMP_DEST/agents/$(basename "$f")"
-      if [[ -e "$target" ]]; then
-        echo "Preserving existing $target"
-      else
-        cp -v "$f" "$target"
-      fi
+      install_role_file "$f" "$OMP_DEST/agents"
     done
     for f in "$ROOT"/omp/commands/*.md; do
-      target="$OMP_DEST/commands/$(basename "$f")"
-      if [[ -e "$target" ]]; then
-        echo "Preserving existing $target"
-      else
-        cp -v "$f" "$target"
-      fi
+      install_role_file "$f" "$OMP_DEST/commands"
     done
     if [[ -n "$OMP_STRONG_MODEL" ]]; then
       bash "$ROOT/omp/configure-models.sh" \
@@ -243,6 +315,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
         --strong-model "$OMP_STRONG_MODEL" \
         --light-model "$OMP_LIGHT_MODEL"
     fi
+    inject_orchestration "$OMP_DEST/AGENTS.md"
     echo "Installed native Oh My Pi Trio agents and commands under $OMP_DEST."
     if [[ -n "$OMP_STRONG_MODEL" ]]; then
       echo "Applied strong/light model overrides via task.agentModelOverrides."
@@ -346,8 +419,12 @@ for d in "$SRC"/skills/trio "$SRC"/skills/trio-init; do
   cp -rv "$d" "$DEST/skills/"
 done
 
+if [[ -n "${INJECT_ORCHESTRATION_TARGET:-}" ]]; then
+  inject_orchestration "$INJECT_ORCHESTRATION_TARGET"
+fi
+
 echo
 echo "Installed. In any project (new Claude Code session):"
 echo "  /trio-init <your goal>    # creates loop/ mailbox + GOAL.md"
 echo "  /trio                     # one supervised iteration"
-echo "  /loop /trio               # autonomous until SHIP/BLOCKED (Esc to stop)"
+echo "  /loop /trio               # autonomous until SHIP/BLOCKED/NEEDS_HUMAN (Esc to stop)"

@@ -38,7 +38,8 @@ Cursor hooks (`cursor.com/docs/hooks`, config in `.cursor/hooks.json`) include
 a **`stop` hook whose JSON response can return `followup_message`**, which
 auto-triggers the next turn, gated by `loop_limit` (default 5, `null` =
 unlimited). A stop-hook script that reads `loop/VERDICT.md` and returns the
-next role prompt as `followup_message` (empty on SHIP/BLOCKED) reproduces the
+next role prompt as `followup_message` (empty on SHIP/BLOCKED/NEEDS_HUMAN)
+reproduces the
 loop natively — same trick as Anthropic's ralph-wiggum plugin. Caveat: this
 runs Lead and Evaluator in ONE session (weaker context isolation than the
 driver's fresh process per role); headless hook coverage is also partial

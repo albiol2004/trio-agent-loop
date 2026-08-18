@@ -70,6 +70,17 @@ per-spawn fallbacks (for example
 single pins by default — adding fallbacks is a supported local edit, unlike
 the fixed role-prompt contract.
 
+## Orchestration policy
+
+The installer also upserts the marked block from `portable/ORCHESTRATION.md`
+into the resolved agent directory's user-global context file
+(`<resolved agent dir>/AGENTS.md`, default `~/.omp/agent/AGENTS.md`). Omp
+loads that native provider user file in every session, and it shadows other
+tools' user files inside omp — harmless here, because the same block lands in
+every harness's user file. Only the marked region is ever replaced: re-running
+the installer is byte-idempotent, and any other content in that AGENTS.md is
+preserved.
+
 ## 3. Verify the installation
 
 Confirm the files exist under the resolved Omp agent directory:
@@ -107,7 +118,7 @@ From any project:
 ```text
 /trio-init add rate limiting to the public API, config-driven, no new deps
 /trio          # run ONE iteration supervised — sanity-check the loop first
-/trio auto     # autonomous; iterates until VERDICT.md first line is SHIP or BLOCKED
+/trio auto     # autonomous; iterates until VERDICT.md first line is SHIP, BLOCKED, or NEEDS_HUMAN
 ```
 
 - `/trio-init <goal>` creates the `loop/` mailbox (`GOAL.md`, `STATE.md`,
@@ -116,8 +127,8 @@ From any project:
   data-ground-truth checks (reconciliation, integrity, reproducibility).
 - `/trio` runs one supervised iteration.
 - `/trio auto` runs iterations in the same turn until the Evaluator's
-  `loop/VERDICT.md` first line reads `SHIP` or `BLOCKED`. Press **Esc** or
-  interrupt to pause it yourself.
+  `loop/VERDICT.md` first line reads `SHIP`, `BLOCKED`, or `NEEDS_HUMAN`.
+  Press **Esc** or interrupt to pause it yourself.
 - Concurrent loops: use a distinct mailbox directory with
   `/trio-init dir=loop-<name> <goal>` then `/trio dir=loop-<name>`.
 - `max_iterations` in `loop/STATE.md` (default 10) is the hard budget cap.

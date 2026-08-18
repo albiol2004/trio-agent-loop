@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+loop/
+loop-*/
+.cursor/
+.claude/launch.json

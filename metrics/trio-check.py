@@ -13,7 +13,9 @@ and reuses its STATE.md / VERDICT.md parsing, then classifies each mailbox:
 v1 mailboxes are validated against MAILBOX-SCHEMA.md: required files, required
 STATE.md fields, the VERDICT.md first-line contract, and a non-empty LOG.md.
 Legacy and unknown mailboxes are reported for information and never fail the
-run.
+run. When the scanned root contains prompts/generate.py, the checker also
+runs its `--check` mode so drift in the single-sourced role prompts fails
+conformance (disable with `--no-prompt-sync`).
 
 Exit code: 0 when no v1 mailbox has violations, 1 when at least one does.
 """
@@ -23,6 +25,7 @@ import argparse
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,7 +38,12 @@ REQUIRED_FILES = (
     "LOG.md",
 )
 REQUIRED_STATE_KEYS = ("iteration", "max_iterations", "status", "mission")
-VALID_VERDICTS = ("SHIP", "ITERATE", "BLOCKED")
+VALID_VERDICTS = ("SHIP", "ITERATE", "BLOCKED", "NEEDS_HUMAN")
+
+# Optional scope= suffix, allowed only on ITERATE: scope=design for an
+# explicit full Lead iteration, or scope=local:<comma-separated-paths> for a
+# builder-direct repair pass.
+SCOPE_RE = re.compile(r"^scope=(design|local:[^\s]+)$", re.IGNORECASE)
 
 # Mirrors the STATE.md key-line format of trio-metrics.STATE_RE
 # (^\s*(?:-\s+)?<key>\s*:\s*(.*)$, case-insensitive), extended with the
@@ -110,9 +118,26 @@ def check_verdict(loop_dir: Path, tm) -> list[str]:
     m = tm.VERDICT_RE.match(first)
     if not m or m.group(1).upper() not in VALID_VERDICTS:
         return [
-            "VERDICT.md first non-empty line must be `VERDICT: SHIP|ITERATE|BLOCKED` "
-            f"(case-insensitive, optional `# ` prefix); got: {first!r}"
+            "VERDICT.md first non-empty line must be `VERDICT: SHIP|ITERATE|BLOCKED|NEEDS_HUMAN` "
+            "(case-insensitive, optional `# ` prefix; ITERATE may carry a "
+            "`scope=design` or `scope=local:<paths>` suffix); "
+            f"got: {first!r}"
         ]
+    # Optional scope= suffix: validate its syntax and that it only rides on
+    # ITERATE. Trailing prose after the verdict word stays tolerated.
+    rest = first[m.end():].strip()
+    if rest.startswith("scope="):
+        if m.group(1).upper() != "ITERATE":
+            return [
+                "scope= suffix is only valid on `VERDICT: ITERATE` "
+                f"(scope=design or scope=local:<paths>); got: {first!r}"
+            ]
+        if not SCOPE_RE.match(rest):
+            return [
+                "invalid scope= suffix on VERDICT.md first line; expected "
+                "`scope=design` or `scope=local:<comma-separated-paths>`; "
+                f"got: {rest!r}"
+            ]
     return []
 
 
@@ -128,6 +153,37 @@ def check_log(loop_dir: Path) -> list[str]:
     if not any(line.strip() for line in text.splitlines()):
         return ["LOG.md is empty — expected at least a `# Trio loop log` header"]
     return []
+
+
+def check_prompt_sync(root: Path) -> tuple[bool, list[str]]:
+    """Run prompts/generate.py --check when the scanned root has a generator.
+
+    The Trio role prompts are single-sourced (prompts/canonical + overlays);
+    generated flavor files that drift from the tree fail conformance. Roots
+    without prompts/generate.py (e.g. plain loop mailboxes) skip the check.
+    Returns (ok, error_lines).
+    """
+    gen = root / "prompts" / "generate.py"
+    if not gen.is_file():
+        return True, []
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(gen), "--check"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, [f"prompt-sync check could not run: {exc}"]
+    if proc.returncode == 0:
+        return True, []
+    detail = (proc.stdout + proc.stderr).strip().splitlines()
+    return False, [
+        "generated Trio prompt files are out of sync with "
+        "prompts/canonical+overlays (run `python3 prompts/generate.py`):",
+        *[f"    {line}" for line in detail[:12]],
+    ]
 
 
 def check_v1(loop_dir: Path, tm) -> list[str]:
@@ -203,6 +259,10 @@ def render(loops: list[dict], root: Path, summary: dict) -> str:
             )
             for note in loop["info"]:
                 lines.append(f"    - {note}")
+    if summary["prompt_sync_lines"]:
+        lines.append("Prompt sync:")
+        for line in summary["prompt_sync_lines"]:
+            lines.append(f"  {line}")
     lines.append(
         f"Summary: {summary['total']} loop(s): {summary['v1']} v1, "
         f"{summary['legacy']} legacy, {summary['unknown']} unknown; "
@@ -225,12 +285,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json", action="store_true", help="Emit a machine-readable JSON report"
     )
+    parser.add_argument(
+        "--no-prompt-sync",
+        action="store_true",
+        help="Skip the prompts/generate.py --check drift check (runs automatically "
+        "when the scanned root contains prompts/generate.py)",
+    )
     args = parser.parse_args(argv)
 
     tm = load_trio_metrics()
     root = Path(args.path).expanduser().resolve()
     loops = [inspect_loop(p, tm) for p in tm.discover_loops(root)]
     summary = summarize(loops)
+
+    prompt_ok, prompt_lines = (True, []) if args.no_prompt_sync else check_prompt_sync(root)
+    summary["prompt_sync_lines"] = prompt_lines
+    if not prompt_ok:
+        summary["ok"] = False
 
     if args.json:
         json.dump({"path": str(root), "loops": loops, "summary": summary}, sys.stdout, indent=2)

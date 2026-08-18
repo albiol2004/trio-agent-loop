@@ -44,14 +44,20 @@ path. If your CLI wants the prompt as text instead of a file path, wrap it:
 - Fresh context per role per iteration (each invocation is a new process);
   ALL state lives in `loop/` markdown files.
 - Control flow parses only the first line of `loop/VERDICT.md`
-  (`VERDICT: SHIP|ITERATE|BLOCKED`); an unparseable verdict stops the loop
-  rather than running away.
+  (`VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED`, plus an optional
+  `scope=design`/`scope=local:<paths>` suffix on ITERATE that routes to a
+  builder-direct repair pass, capped at 2 consecutive repairs via the
+  driver-internal `loop/.repairs` counter); an unparseable verdict stops the
+  loop rather than running away.
 - Iteration cap (arg 1, default 10); exit codes: 0 SHIP, 2 BLOCKED,
-  3 bad verdict, 4 cap hit.
+  3 bad verdict, 4 cap hit, 5 NEEDS_HUMAN (or mailbox locked by another
+  driver).
 
 ## Checklist for a new harness
 - [ ] One-shot mode confirmed writing files without interactive approval
 - [ ] Role prompts reachable (the driver passes `portable/prompts/*.md`)
 - [ ] Context file present (`AGENTS.md` or the tool's equivalent)
+- [ ] User-level context file receives the orchestration block (the marked
+      block from `portable/ORCHESTRATION.md` is upserted there by `install.sh`)
 - [ ] Dry run: one manual lead invocation, inspect `loop/PLAN.md` + `REPORT.md`
 - [ ] Then hand it to `driver.sh`

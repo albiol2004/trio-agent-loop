@@ -25,6 +25,8 @@ the two are documented together here. Driver support: `HARNESS=gemini`
    Simplest cross-surface setup: keep AGENTS.md as the source of truth and
    symlink `GEMINI.md → AGENTS.md`. (Heads-up: Antigravity and Gemini CLI
    both read `~/.gemini/GEMINI.md` globally — keep global context minimal.)
+   The trio installer injects the cross-harness orchestration block into
+   `~/.gemini/GEMINI.md` (see `portable/ORCHESTRATION.md`).
 3. Permissions for unattended runs: full YOLO deliberately cannot be
    persisted in settings.json — the driver passes it per invocation. A
    safer persistent middle ground is

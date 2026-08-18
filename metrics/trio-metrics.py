@@ -60,7 +60,7 @@ def _parse_b_verdict(text: str) -> str | None:
             if not m:
                 continue
             candidate = m.group(1).upper()
-        if candidate in {"SHIP", "ITERATE", "BLOCKED"}:
+        if candidate in {"SHIP", "ITERATE", "BLOCKED", "NEEDS_HUMAN"}:
             return candidate
     return None
 
@@ -190,7 +190,12 @@ def parse_verdict(verdict_path: Path) -> str | None:
 
 
 def verdict_letter(verdict: str) -> str:
-    return {"SHIP": "S", "ITERATE": "I", "BLOCKED": "B"}.get(verdict, "?")
+    return {
+        "SHIP": "S",
+        "ITERATE": "I",
+        "BLOCKED": "B",
+        "NEEDS_HUMAN": "H",
+    }.get(verdict, "?")
 
 
 def dominant_format(entries: list[dict]) -> str:

@@ -10,6 +10,14 @@ This integration is separate from the native Claude Code and Codex installs:
 
 Installing or removing one does not overwrite the others.
 
+## Orchestration policy
+
+There is no separate Omnigent injection target: the coordinator is the
+already-open Claude Code or Codex session, which inherits the marked
+orchestration block from `~/.claude/CLAUDE.md` (via `./install.sh --global`)
+or `~/.codex/AGENTS.md` (via `./install.sh --codex`). `./install.sh
+--omnigent` therefore never writes its own copy of the block.
+
 ## Role mapping
 
 | Role | Harness | Model | Effort |
@@ -199,8 +207,8 @@ The `trio-omnigent` skill keeps that already-open session as the iteration
 scheduler. It resolves the profile at runtime and launches Grok 4.6 Medium Lead
 and Evaluator; those roles independently resolve and run ephemeral headless
 Cursor GPT-5.6 Luna Max workers. It runs until
-SHIP/BLOCKED by default. Say “one supervised iteration” to stop after one
-verdict.
+SHIP/BLOCKED/NEEDS_HUMAN by default. Say “one supervised iteration” to stop
+after one verdict.
 
 Ordinary “run a Trio loop” remains native Claude/Codex Trio. The word
 “Omnigent” is the explicit routing signal; the entrypoint must never silently

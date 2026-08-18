@@ -91,11 +91,29 @@ export default function trioExtension(pi: ExtensionAPI) {
         let iteration = Number(state.match(/^iteration:\s*(\d+)/m)?.[1] ?? 0);
         const max = Number(state.match(/^max_iterations:\s*(\d+)/m)?.[1] ?? 10);
 
+        // Consecutive builder-direct repair counter (driver-internal; mirrors
+        // portable/driver.sh's .repairs file so a resume never exceeds the
+        // 2-repair cap; reset to 0 on every full Lead pass).
+        let repairCount = 0;
+        try {
+          repairCount = Number((await readFile(join(loop, ".repairs"), "utf8")).trim()) || 0;
+        } catch { /* fresh mailbox */ }
+        let repairPending = false;  // next iteration's lead slot runs a repair pass
+
         while (iteration < max) {
           iteration += 1;
           state = state.replace(/^iteration:.*$/m, `iteration: ${iteration}`)
             .replace(/^status:.*$/m, "status: running");
           await writeFile(statePath, state);
+          if (repairPending) {
+            // Builder-direct repair pass for VERDICT: ITERATE scope=local:<paths>.
+            ctx.ui.notify(`Trio iteration ${iteration}: repair`, "info");
+            await runRole(ctx.cwd, ctx.model,
+              "You are the Repair pass for a scoped ITERATE verdict. Read loop/VERDICT.md and fix exactly the failure scope it names (the scope=local paths) with the smallest correct diff: no re-planning, no refactoring, no scope expansion. Do not touch loop/ files except appending one line to loop/LOG.md. Never commit.",
+              `Repair iteration ${iteration}: apply the scoped fix from loop/VERDICT.md (scope=local:<paths>).`,
+              WRITE_TOOLS);
+            repairPending = false;
+          } else {
           ctx.ui.notify(`Trio iteration ${iteration}: scout`, "info");
 
           const scout = await runRole(ctx.cwd, ctx.model,
@@ -103,7 +121,7 @@ export default function trioExtension(pi: ExtensionAPI) {
             `Read loop/GOAL.md, STATE.md, the previous verdict, and relevant code. Brief the Lead for iteration ${iteration}.`,
             READ_TOOLS);
 
-          const initialLeadPrompt = "You are the Lead on the initial planning pass. Own architecture and PLAN.md, but do not edit product code. Every code-changing increment must set BUILDER_TASK.md to DELEGATE: YES with one well-specified main implementation task, approach, owned files, done-check, and forbidden scope. Use DELEGATE: NO with a reason only for SHIP/BLOCKED or a no-code increment. Never commit.";
+          const initialLeadPrompt = "You are the Lead on the initial planning pass. Own architecture and PLAN.md, but do not edit product code. Before implementation, declare the iteration's `## Verification standard` in PLAN.md: the per-criterion evidence that will count as verified, plus the mode (test-first | implement-then-smoke | human-gate), folding in GOAL.md's verification floor if present. Every code-changing increment must set BUILDER_TASK.md to DELEGATE: YES with one well-specified main implementation task, approach, owned files, done-check, and forbidden scope. Use DELEGATE: NO with a reason only for SHIP/BLOCKED or a no-code increment. Never commit.";
           await writeFile(join(loop, "BUILDER_TASK.md"), "DELEGATE: NO\n");
           await runRole(ctx.cwd, ctx.model,
             initialLeadPrompt,
@@ -148,24 +166,50 @@ export default function trioExtension(pi: ExtensionAPI) {
               throw new Error("Lead twice omitted mandatory Builder implementation provenance");
             }
           }
+          }  // end full Lead pass (else of repairPending)
 
           const evalScout = await runRole(ctx.cwd, ctx.model,
             "You are a read-only evaluator Scout. Inspect GOAL.md, PLAN.md and the diff. Do not read REPORT.md and do not issue a verdict.",
             `Find blast radius, test-integrity risks, edge cases, and API/version concerns for iteration ${iteration}.`,
             READ_TOOLS);
           await runRole(ctx.cwd, ctx.model,
-            "You are the independent Evaluator. Never fix code. Verify the goal and PLAN.md yourself before reading REPORT.md. Write VERDICT.md with SHIP, ITERATE, or BLOCKED on line one.",
+            "You are the independent Evaluator. Never fix code. Verify the goal and PLAN.md yourself before reading REPORT.md. The first line of VERDICT.md must be VERDICT: SHIP, VERDICT: ITERATE (optionally with scope=design or scope=local:<comma-separated-paths>), VERDICT: NEEDS_HUMAN, or VERDICT: BLOCKED. Emit scope=local ONLY when the failure is provably local (single file or listed files, no API/contract change); use plain ITERATE or scope=design otherwise. Emit NEEDS_HUMAN when every agent-verifiable criterion passes but PLAN.md criteria tagged `verify: human` remain — then the `## Human check` section with exact steps is mandatory. Check the produced evidence against the `## Verification standard` declared in PLAN.md; insufficient evidence is an ITERATE with the evidence gap as the failure scope.",
             `Evaluate iteration ${iteration}. Scout evidence to verify:\n${evalScout}`,
             WRITE_TOOLS);
 
-          const verdict = (await readFile(join(loop, "VERDICT.md"), "utf8")).split(/\r?\n/, 1)[0];
-          state = (await readFile(statePath, "utf8")).replace(/^status:.*$/m, `status: ${verdict.replace("VERDICT: ", "").toLowerCase()}`);
+          const verdictLine = (await readFile(join(loop, "VERDICT.md"), "utf8")).split(/\r?\n/, 1)[0];
+          if (!/^VERDICT:\s/.test(verdictLine)) throw new Error(`Malformed verdict: ${verdictLine}`);
+          // Split the first line into the verdict word and an optional scope=
+          // suffix so scoped ITERATE and NEEDS_HUMAN route like portable/driver.sh.
+          const verdictRest = verdictLine.replace(/^VERDICT:\s*/, "");
+          const verdictWord = verdictRest.split(/\s+/, 1)[0];
+          const scope = verdictRest.slice(verdictWord.length).trim();
+          state = (await readFile(statePath, "utf8")).replace(/^status:.*$/m, `status: ${verdictWord.toLowerCase()}`);
           await writeFile(statePath, state);
-          if (verdict === "VERDICT: SHIP" || verdict === "VERDICT: BLOCKED") {
-            ctx.ui.notify(verdict, verdict.endsWith("SHIP") ? "info" : "warning");
+          if (verdictWord === "SHIP" || verdictWord === "BLOCKED" || verdictWord === "NEEDS_HUMAN") {
+            ctx.ui.notify(verdictLine, verdictWord === "SHIP" ? "info" : "warning");
             return;
           }
-          if (verdict !== "VERDICT: ITERATE") throw new Error(`Malformed verdict: ${verdict}`);
+          if (verdictWord !== "ITERATE") throw new Error(`Malformed verdict: ${verdictLine}`);
+          if (scope === "" || scope === "scope=design") {
+            // Full Lead iteration (implicit or explicit): repair streak resets.
+            repairCount = 0;
+            repairPending = false;
+            await writeFile(join(loop, ".repairs"), "0\n");
+          } else if (scope.startsWith("scope=local:")) {
+            if (repairCount < 2) {
+              repairCount += 1;
+              await writeFile(join(loop, ".repairs"), `${repairCount}\n`);
+              repairPending = true;
+            } else {
+              // Repair cap hit: force a full Lead iteration and reset.
+              repairCount = 0;
+              repairPending = false;
+              await writeFile(join(loop, ".repairs"), "0\n");
+            }
+          } else {
+            throw new Error(`Malformed verdict: ${verdictLine}`);
+          }
         }
         ctx.ui.notify(`Trio reached max_iterations (${max}).`, "warning");
       } finally {
@@ -177,3 +221,12 @@ export default function trioExtension(pi: ExtensionAPI) {
     },
   });
 }
+
+// trio-protocol:start
+// ## Trio protocol essentials
+// 
+// - Verdict grammar — the first non-empty line of `VERDICT.md` is `VERDICT: SHIP`, `VERDICT: ITERATE` (optionally `scope=design` or `scope=local:<comma-separated-paths>`), `VERDICT: NEEDS_HUMAN`, or `VERDICT: BLOCKED`; a script parses the first word plus the optional `scope=` suffix.
+// - `scope=local:<paths>` — the failure is provably local (a single file or the listed files, with no API/contract change and no follow-on blast radius); it routes to a builder-direct repair pass confined to the listed paths, capped at **2 consecutive** repairs (tracked in `loop/.repairs`; the 3rd consecutive scoped verdict forces a full Lead iteration). `scope=design` or plain ITERATE runs a full Lead iteration.
+// - `NEEDS_HUMAN` — every agent-verifiable criterion passes but `PLAN.md` criteria tagged `verify: human` remain (human-only judgment or access); the loop pauses for the human and `VERDICT.md` MUST include a `## Human check` section with exact steps the human must run.
+// - Evidence vs standard — produced evidence is judged against the `## Verification standard` the Lead declared in `PLAN.md` (mode: `test-first` | `implement-then-smoke` | `human-gate`, plus the promised evidence) and against GOAL.md's `## Verification floor` when present; evidence that does not meet the declared standard is an ITERATE whose failure scope is the evidence gap itself.
+// trio-protocol:end

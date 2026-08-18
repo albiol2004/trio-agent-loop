@@ -228,6 +228,7 @@ html, body {
 .status-label.status-shipped { color: var(--green); }
 .status-label.status-running { color: var(--amber); }
 .status-label.status-blocked { color: var(--red); }
+.status-label.status-needs_human { color: var(--violet); }
 .status-label.status-idle    { color: var(--slate); }
 
 .card-iter {
@@ -293,6 +294,7 @@ html, body {
 .seg.seg-ship    { background: var(--green); }
 .seg.seg-iterate { background: var(--amber); }
 .seg.seg-blocked { background: var(--red); }
+.seg.seg-needs_human { background: var(--violet); }
 
 .segbar-large { max-width: none; }
 .segbar-large .seg { height: 4px; }
@@ -313,6 +315,7 @@ html, body {
 .seg-seq .seq-ship    { color: var(--green); }
 .seg-seq .seq-iterate { color: var(--amber); }
 .seg-seq .seq-blocked { color: var(--red); }
+.seg-seq .seq-needs_human { color: var(--violet); }
 
 /* -------------------------------- drawer -------------------------------- */
 
@@ -469,6 +472,7 @@ html, body {
 .timeline-text .verdict-ship    { color: var(--green); }
 .timeline-text .verdict-iterate { color: var(--amber); }
 .timeline-text .verdict-blocked { color: var(--red); }
+.timeline-text .verdict-needs_human { color: var(--violet); }
 
 .timeline-empty { font-size: 13px; color: var(--faint); }
 

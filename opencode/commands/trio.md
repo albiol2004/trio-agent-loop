@@ -7,7 +7,7 @@ subtask: true
 Run one native Trio iteration for the goal below. Preserve the fixed Scout →
 Lead → mandatory primary Builder → Lead review/correction → Evaluator Scout →
 independent Evaluator sequence described by `trio-orchestrator`. Use the
-existing `loop/` mailbox and stop on SHIP or BLOCKED.
+existing `loop/` mailbox and stop on SHIP, BLOCKED, or NEEDS_HUMAN.
 
 Goal or operator guidance:
 $ARGUMENTS

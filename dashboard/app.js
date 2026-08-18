@@ -134,6 +134,7 @@ function normVerdict(raw) {
   if (v === "SHIP") return "ship";
   if (v === "ITERATE") return "iterate";
   if (v === "BLOCKED") return "blocked";
+  if (v === "NEEDS_HUMAN") return "needs_human";
   return "none";
 }
 
@@ -144,6 +145,7 @@ function loopState(loop) {
   if (status === "running") return "running";
   if (status === "blocked" || verdict === "blocked") return "blocked";
   if (verdict === "ship") return "shipped";
+  if (verdict === "needs_human" || status === "needs_human") return "needs_human";
   return "idle";
 }
 
@@ -151,6 +153,7 @@ const STATE_LABEL = {
   running: "RUNNING",
   shipped: "SHIPPED",
   blocked: "BLOCKED",
+  needs_human: "NEEDS HUMAN",
   idle: "IDLE",
 };
 
@@ -164,6 +167,7 @@ function verdictSeq(loop) {
     if (ch === "S") out.push("ship");
     else if (ch === "I") out.push("iterate");
     else if (ch === "B") out.push("blocked");
+    else if (ch === "H") out.push("needs_human");
   }
   return out;
 }
@@ -484,7 +488,7 @@ function renderTimeline(entries) {
         span("verdict-word verdict-" + entry.verdict.toLowerCase(), entry.verdict)
       );
       text.appendChild(document.createTextNode(" "));
-      summary = summary.replace(/^VERDICT:\s*(SHIP|ITERATE|BLOCKED)\s*[—–-]\s*/i, "");
+      summary = summary.replace(/^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i, "");
     }
     text.appendChild(span("timeline-dur timeline-iter-inline", "iter " + entry.iteration + " · "));
     text.appendChild(document.createTextNode(summary));

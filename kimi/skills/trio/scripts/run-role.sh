@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 scout|lead|builder|evaluator CONTEXT_FILE RESULT_FILE [PROJECT_ROOT]" >&2
+  echo "usage: $0 scout|lead|builder|evaluator|repair CONTEXT_FILE RESULT_FILE [PROJECT_ROOT]" >&2
   exit 2
 }
 
@@ -29,7 +29,7 @@ command -v "$KIMI_BIN" >/dev/null 2>&1 || {
 }
 
 case "$ROLE" in
-  scout|builder)
+  scout|builder|repair)
     MODEL="kimi-code/kimi-for-coding"
     ;;
   lead|evaluator)

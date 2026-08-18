@@ -52,7 +52,7 @@ preserve the same judgment-tier/worker-tier boundary with their own models.
 | Role | Model | Reads | Writes | Job |
 |------|-------|-------|--------|-----|
 | trio-lead | Opus | GOAL, VERDICT, STATE | PLAN.md, REPORT.md + corrective code edits | plans the increment, delegates its main implementation pass to the Builder tier, then reviews, verifies, and fixes as needed |
-| trio-evaluator | Opus | GOAL, PLAN, diff (REPORT last) | VERDICT.md | adversarial verification grounded in its own test runs + web checks that APIs used are current for the pinned versions; verdict SHIP / ITERATE / BLOCKED |
+| trio-evaluator | Opus | GOAL, PLAN, diff (REPORT last) | VERDICT.md | adversarial verification grounded in its own test runs + web checks that APIs used are current for the pinned versions; verdict SHIP / ITERATE (optionally scoped) / NEEDS_HUMAN / BLOCKED |
 | trio-scout | Sonnet | repo (read-only) | — | recon questions for either lead role |
 | trio-builder | Sonnet | repo | code | primary implementor for one well-specified task, including substantive logic and tests (sequential on shared files) |
 
@@ -84,6 +84,11 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
   --strong-model provider/strong --light-model provider/light
                                 # Omp native agents + optional model overrides
 ```
+Every harness install also upserts the marked block from
+`portable/ORCHESTRATION.md` into that harness's user-global instruction file
+(`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.kimi-code/AGENTS.md`,
+`~/.omp/agent/AGENTS.md`, or `~/.config/opencode/AGENTS.md`), replacing only
+the marked region so re-runs are safe and byte-idempotent.
 
 ## Use
 ```bash
@@ -92,10 +97,11 @@ cd ~/src/myproject && claude
 ```
 /trio-init add rate limiting to the public API, config-driven, no new deps
 /trio          # run ONE iteration supervised — sanity-check the loop first
-/loop /trio    # then let it run: iterates until SHIP or BLOCKED
+/loop /trio    # then let it run: iterates until SHIP, BLOCKED, or NEEDS_HUMAN
 ```
 `/loop /trio` uses dynamic mode: the orchestrator reschedules itself after an
-ITERATE verdict and simply stops rescheduling on SHIP/BLOCKED. Press **Esc**
+ITERATE verdict and simply stops rescheduling on SHIP/BLOCKED/NEEDS_HUMAN.
+Press **Esc**
 to pause it yourself; `/loop 10m /trio` forces a fixed cadence instead.
 
 ## Control knobs while it runs
@@ -152,8 +158,10 @@ Per-harness setup docs: `portable/SETUP-codex.md`, `SETUP-cursor.md`,
 Gemini CLI are), `SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the GLM Coding Plan
 endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. The driver
-parses only VERDICT.md's first line; exit codes 0=SHIP, 2=BLOCKED, 3=bad
-verdict, 4=iteration cap, 5=mailbox locked by another driver
+parses only VERDICT.md's first line (verdict word plus optional `scope=`
+suffix — `scope=local:<paths>` routes to a builder-direct repair pass capped
+at 2 consecutive repairs); exit codes 0=SHIP, 2=BLOCKED, 3=bad verdict,
+4=iteration cap, 5=NEEDS_HUMAN (or mailbox locked by another driver)
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
 agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.
@@ -212,6 +220,7 @@ loop/                                # created by /trio-init, per project
   GOAL.md STATE.md PLAN.md REPORT.md VERDICT.md LOG.md
 portable/                            # non-Claude-Code harnesses
   driver.sh prompts/{lead,evaluator}.md GOAL.template.md AGENTS.template.md
+  ORCHESTRATION.md               # cross-harness workstyle policy (marked block)
   SETUP-{codex,cursor,opencode,pi,hermes,athen,antigravity,zai,generic}.md
 opencode/                             # native OpenCode agents + commands
   agents/trio-{orchestrator,lead,scout,builder,evaluator}.md

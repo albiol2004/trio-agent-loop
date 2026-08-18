@@ -79,7 +79,8 @@ shell/file actions below — that is expected. Do this:
    `shell_spawn` with
    `bash -c 'cd <project> && source ~/.trio/athen.env && HARNESS=athen ~/.trio/portable/driver.sh 10'`
    — then check on it via `shell_logs` and the first line of
-   `loop/VERDICT.md`, and report SHIP/ITERATE/BLOCKED to the human. (In the
+   `loop/VERDICT.md`, and report SHIP/ITERATE/NEEDS_HUMAN/BLOCKED to the
+   human. (In the
    daemon, a recurring wake-up checking that first line is a good monitor.)
    The role invocations are fresh `athen-cli` processes — they do not share
    your conversation, which is by design.

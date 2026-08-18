@@ -30,6 +30,12 @@ roles or overlap this sequence.
 3. Run the roles in this order, waiting for each result before starting the
    next: `scout`, initial `lead`, `builder` when the Lead writes
    `DELEGATE: YES`, post-Builder `lead`, evaluator `scout`, then `evaluator`.
+   On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2 consecutive
+   repairs, run `repair` instead of the next full Lead pass (it fixes exactly
+   the listed paths with no re-planning). Track the consecutive count in
+   `loop/.repairs` (driver-internal; start at 1, cap at 2, reset to 0 after
+   any full Lead pass); on the 3rd consecutive scoped verdict, or for any
+   other ITERATE, run the full `lead` pass as usual.
    Example:
 
    ```sh
@@ -40,10 +46,20 @@ roles or overlap this sequence.
 4. Verify that the roles wrote their required mailbox artifacts. The Lead owns
    `PLAN.md`, `BUILDER_TASK.md`, and `REPORT.md`; the Evaluator owns
    `VERDICT.md`; append their required lines to `LOG.md`.
-5. Continue only on `VERDICT: ITERATE`; stop on `SHIP`, `BLOCKED`, an iteration
-   cap, or a missing/failed child result. Never commit automatically.
+5. Continue only on `VERDICT: ITERATE`; stop on `SHIP`, `BLOCKED`,
+   `NEEDS_HUMAN` (surface the `## Human check` section from VERDICT.md), an
+   iteration cap, or a missing/failed child result. Never commit automatically.
 
 Scout is read-only. The initial Lead plans and delegates without editing
 product code. Builder performs the substantive implementation in its named
 scope. The post-Builder Lead reviews and may correct the implementation. The
 Evaluator independently runs checks and grades the diff without fixing it.
+
+<!-- trio-protocol:start -->
+## Trio protocol essentials
+
+- Verdict grammar — the first non-empty line of `VERDICT.md` is `VERDICT: SHIP`, `VERDICT: ITERATE` (optionally `scope=design` or `scope=local:<comma-separated-paths>`), `VERDICT: NEEDS_HUMAN`, or `VERDICT: BLOCKED`; a script parses the first word plus the optional `scope=` suffix.
+- `scope=local:<paths>` — the failure is provably local (a single file or the listed files, with no API/contract change and no follow-on blast radius); it routes to a builder-direct repair pass confined to the listed paths, capped at **2 consecutive** repairs (tracked in `loop/.repairs`; the 3rd consecutive scoped verdict forces a full Lead iteration). `scope=design` or plain ITERATE runs a full Lead iteration.
+- `NEEDS_HUMAN` — every agent-verifiable criterion passes but `PLAN.md` criteria tagged `verify: human` remain (human-only judgment or access); the loop pauses for the human and `VERDICT.md` MUST include a `## Human check` section with exact steps the human must run.
+- Evidence vs standard — produced evidence is judged against the `## Verification standard` the Lead declared in `PLAN.md` (mode: `test-first` | `implement-then-smoke` | `human-gate`, plus the promised evidence) and against GOAL.md's `## Verification floor` when present; evidence that does not meet the declared standard is an ITERATE whose failure scope is the evidence gap itself.
+<!-- trio-protocol:end -->

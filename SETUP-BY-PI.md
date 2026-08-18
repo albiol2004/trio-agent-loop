@@ -25,8 +25,8 @@ that provenance. The extension never starts another
 `pi` executable. Every role uses the model selected in the active Pi session
 at High thinking level; change the active model before `/trio` if needed.
 
-The extension creates/resumes `loop/`, stops on SHIP/BLOCKED or the mailbox
-iteration cap, and never commits.
+The extension creates/resumes `loop/`, stops on SHIP/BLOCKED/NEEDS_HUMAN or
+the mailbox iteration cap, and never commits.
 
 References: https://pi.dev/docs/latest/sdk and
 https://pi.dev/docs/latest/extensions

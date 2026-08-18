@@ -24,7 +24,7 @@ install the "trio" duo agent loop on the local machine. Do this:
      data ground truth (reconciliation, integrity, reproducibility).
    - `/trio` → ONE supervised iteration (recommended first run).
    - `/loop /trio` → autonomous; iterates until the Evaluator's VERDICT.md
-     first line reads SHIP or BLOCKED; Esc pauses; `max_iterations` in
+     first line reads SHIP, BLOCKED, or NEEDS_HUMAN; Esc pauses; `max_iterations` in
      loop/STATE.md (default 10) is the budget cap.
 4. Do NOT modify the role files during install. The model contract is fixed in
    the agent frontmatter: Lead and Evaluator use Claude Opus 5 at high effort;
@@ -34,6 +34,16 @@ install the "trio" duo agent loop on the local machine. Do this:
    implementation pass; the Opus Lead plans, reviews, and may make corrective
    edits afterward. Keep that split intact unless the human explicitly changes
    the architecture.
+
+## Orchestration policy
+
+`./install.sh --global` also upserts the marked block from
+`portable/ORCHESTRATION.md` into `~/.claude/CLAUDE.md`, Claude Code's
+user-global instruction file, so every project session loads the same
+cross-harness routing workstyle (SCOUT/BUILDER/LEAD/EVALUATOR vocabulary and
+delegation defaults). Only the marked region is ever replaced: re-running the
+installer is byte-idempotent, and any other content in your CLAUDE.md is
+preserved.
 
 Design rationale and research citations live in README.md — read it if the
 user asks why the loop is shaped this way.

@@ -53,6 +53,16 @@ To keep Kimi's data and skills in a separate location, set
 `KIMI_CODE_HOME=/path/to/kimi-code` before running the installer. This variable
 is documented in the [Kimi data-locations guide](https://moonshotai.github.io/kimi-code/en/configuration/data-locations.html).
 
+## Orchestration policy
+
+The installer also defines a user-global context surface for Kimi Code: it
+upserts the marked block from `portable/ORCHESTRATION.md` into
+`~/.kimi-code/AGENTS.md` (honoring `KIMI_CODE_HOME`). That path is a chosen
+convention — Kimi Code does not document a user-global AGENTS.md, so the file
+is harmless if the tool ignores it and ready if a future release reads it.
+Only the marked region is ever replaced: re-running the installer is
+byte-idempotent, and any other content in that AGENTS.md is preserved.
+
 ## 3. Initialize and run a mailbox
 
 In the project root, start Kimi and initialize a mailbox:
@@ -93,7 +103,8 @@ Role/model mapping is fixed to source-documented aliases:
 
 The runner is deliberately sequential and portable. It does not claim native
 custom-role orchestration or an autonomous Trio loop; continue iterations only
-after inspecting `VERDICT.md`, and stop on `SHIP` or `BLOCKED`.
+after inspecting `VERDICT.md`, and stop on `SHIP`, `BLOCKED`, or
+`NEEDS_HUMAN` (surfacing the `## Human check` steps).
 
 > Safety: Kimi's documented `-p` mode runs regular tool calls under its `auto`
 > permission policy. The Builder and post-Builder Lead can therefore modify the

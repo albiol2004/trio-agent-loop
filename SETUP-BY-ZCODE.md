@@ -74,7 +74,7 @@ Do this from the repository root:
    `trio-init` creates the mailbox and `trio` uses ZCode's Agent tool with the
    configured custom subagents. For autonomous continuation, start `/goal`
    with the same mission and instruct it to run the native Trio protocol until
-   SHIP or BLOCKED. Never use the portable driver.
+   SHIP, BLOCKED, or NEEDS_HUMAN. Never use the portable driver.
 
 6. There is no documented ZCode equivalent of Claude Code's `/loop`. For
    repeated trio iterations, invoke `$trio` again after an `ITERATE` verdict,
@@ -84,8 +84,9 @@ Do this from the repository root:
 
 7. Verify that `loop/GOAL.md`, `loop/STATE.md`, and `loop/LOG.md` exist, that
    `STATE.md` contains the mission fingerprint, and that the first line of
-   `VERDICT.md` is `VERDICT: SHIP`, `ITERATE`, or `BLOCKED` when an iteration
-   has completed. The loop never commits automatically.
+   `VERDICT.md` is `VERDICT: SHIP`, `ITERATE` (optionally `scope=design` or
+   `scope=local:<paths>`), `NEEDS_HUMAN`, or `BLOCKED` when an iteration has
+   completed. The loop never commits automatically.
 
 ZCode references:
 
