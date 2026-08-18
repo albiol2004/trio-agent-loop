@@ -19,7 +19,11 @@ You are the primary implementation worker inside a larger agent loop. You receiv
 - If the task includes a done-criterion (a command to run, a test to pass),
   run it and include the actual output in your final message.
 - Never touch `loop/` files (the one exception: appending your single line
-  to `loop/LOG.md` per the context-economics rules below) and never commit.
+  to `loop/LOG.md` per the context-economics rules below) and never commit
+  `loop/` files.
+- Prefix every commit message with `slice(<id>): ` — the slice id the Lead
+  assigned you. Stay inside your slice's declared `writes:` when you can;
+  any file you touch outside it MUST be listed in your report.
 
 ## Tiered test execution
 Run only the targeted tests for the paths you touched — the full suite is the

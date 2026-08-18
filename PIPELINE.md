@@ -51,11 +51,15 @@ PLAN.md with machine-readable fields:
 
 ```yaml
 - id: provider-config
+  repo: .                         # target repo relative to mailbox; default .
   writes: [omp/smoke-test.sh, "api:ProviderConfig"]
   reads:  []                      # dispatchable immediately
+  gate: false
 - id: omp-cursor-models
+  repo: .
   writes: [omp/configure-models.sh]
   reads:  ["api:ProviderConfig"]  # dispatchable once that interface freezes
+  gate: false
 ```
 
 **Frozen interface** — an API signature, schema, or file contract marked
@@ -83,11 +87,27 @@ the interlocks exist for.
 A slice enters build when every entry in `reads:` is frozen. Plain
 dependency, no barrier on verification.
 
+**Freeze governance**: the Lead freezes. It already reviews every builder
+increment, so freezing adds no machinery. The watcher is the wrong tier to
+hold governance authority; the Evaluator stays out of the dispatch path
+(it would re-serialize the pipeline). Freeze = Lead verifies the
+interface-only commit matches the declared contract, then appends
+`frozen: <interface> @<sha>` to STATE.md. The watcher may later check
+conformance mechanically; authority stays with the Lead.
+
 ### Execution: worktrees as register renaming
 
 Each slice builds in its own git worktree — writes are private until
 retirement, so WAW/WAR hazards become merge decisions at the reorder
 buffer (the merge queue), not corruption in a shared tree.
+
+**Mailbox placement standard**: `loop/` lives in the orchestrator
+session's cwd (the coordination repo) — always singular, never inside a
+worktree. Multi-repo projects (a main repo referencing frontend/backend
+siblings) are handled by the slice schema: each slice declares `repo:` —
+the repo it writes to, defaulting to the coordination repo. Worktrees are
+created as siblings of the *target* repo (`<repo>.worktrees/<slice-id>/`),
+and the driver passes absolute paths to roles.
 
 ### Runtime hazards: three tiers
 
@@ -150,12 +170,13 @@ Already shipped (protocol v2): async evaluator (speculation), scoped
 verdicts (fault descriptors), repair role + cap (handler + tripwire),
 per-iteration commits (precise state), NEEDS_HUMAN (external refill),
 verification standards (retirement criteria), steering channels (hub,
-session_send).
+session_send). Also shipped in shadow mode: machine-readable slice
+contracts in PLAN.md plus the shadow checker measuring declared-vs-actual
+writes — informational only, nothing gates on it yet.
 
-New here: machine-readable slice contracts in PLAN.md, the interlock
-script, the watcher role bound to the light model tier, worktree-per-slice
-renaming, the in-order merge queue, the rolling-SHIP predictor, `gate: true`
-slice declarations.
+New here: interlock enforcement of the slice contracts, the watcher role
+bound to the light model tier, worktree-per-slice renaming, the in-order
+merge queue, the rolling-SHIP predictor, `gate: true` slice declarations.
 
 ## Cost model
 

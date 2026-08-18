@@ -1,10 +1,11 @@
 # Trio Mailbox Schema — version 1
 
 This document defines version 1 of the trio-agent-loop mailbox protocol: the
-set of files every mailbox must contain, the required `STATE.md` fields, and
-the first-line contract of `VERDICT.md`. Mailboxes are versioned so that
-tooling (metrics, conformance checks, drivers) can distinguish current
-mailboxes from pre-versioning ones and treat them accordingly.
+set of files every mailbox must contain, the required `STATE.md` fields, the
+first-line contract of `VERDICT.md`, the PLAN.md slice contracts, and the
+mailbox placement standard. Mailboxes are versioned so that tooling
+(metrics, conformance checks, drivers) can distinguish current mailboxes
+from pre-versioning ones and treat them accordingly.
 
 The conformance checker for this schema is `metrics/trio-check.py`
 (`python3 metrics/trio-check.py [path]`).
@@ -139,6 +140,82 @@ result, confirm a policy decision, check a credential-scoped behavior). When
 every agent-verifiable criterion passes but `verify: human` criteria remain,
 the Evaluator writes `VERDICT: NEEDS_HUMAN` with a `## Human check` section
 naming each such criterion and the exact steps for the human to confirm it.
+
+## PLAN.md slice contracts (shadow mode)
+
+When a plan has more than one increment (or one increment with delegable
+sub-parts), PLAN.md carries a machine-readable slice block so pipeline
+tooling can measure declared-vs-actual writes. The block is a fenced
+```yaml
+code block whose top-level key is `slices:`:
+
+```yaml
+slices:
+  - id: provider-config
+    repo: .                         # target repo relative to the mailbox root; default .
+    writes: [omp/configure-models.sh, "api:ProviderConfig"]
+    reads:  []                      # dispatchable immediately
+    gate: false                     # optional; default false
+```
+
+One list entry per slice. The restricted shape is exactly:
+
+| Field | Required | Type | Meaning |
+|---|---|---|---|
+| `id` | yes | kebab-case string | slice identifier; also prefixes the slice's commit messages |
+| `repo` | no (default `.`) | path | target repo, relative to the mailbox root — `.` is the coordination repo; other repos are siblings it references |
+| `writes` | yes | list of paths and/or `api:<Name>` | files (or directories) the slice may touch; `api:` entries name interfaces, not paths |
+| `reads` | yes (may be `[]`) | list of paths and/or `api:<Name>` | inputs the slice needs frozen before it may be dispatched |
+| `gate` | no (default `false`) | bool | foundation slice: never speculated, regardless of predictor state |
+
+Paths may be approximate (a directory entry covers everything beneath it);
+`api:` names are exact. The block is optional in v1 — a mailbox without it
+remains conformant, and `trio-check.py` does not validate it. The shadow
+checker `metrics/trio-shadow.py` (`--mailbox <dir> [--json]`) parses the
+block with a stdlib line-based parser and compares declared `writes:`
+against the files actually touched by the slice's commits. `api:` entries
+are excluded from git matching. Undeclared writes are reported, never
+enforced — shadow/instrumentation mode; enforcement is a later pipeline
+stage.
+
+## STATE.md `frozen:` lines
+
+Interface freezes are recorded as plain STATE.md lines, appended by the
+Lead only, when a builder's interface-only commit lands and matches the
+declared contract:
+
+```markdown
+frozen: api:ProviderConfig @a1b2c3d
+```
+
+The value is the interface or path being frozen, a space, then `@` plus the
+short sha of the commit that froze it. Once an interface is frozen, slices
+whose `reads:` list it may be delegated. STATE.md is the hot summary roles
+read every iteration, so frozen lines stay short — one line per interface.
+
+## Slice commit convention
+
+Every commit that belongs to a slice is prefixed with the slice id so
+tooling can attribute touched files:
+
+```text
+slice(provider-config): add configure-models.sh
+```
+
+The prefix is exactly `slice(<id>): ` — the kebab-case slice id, a colon,
+a space — followed by a normal commit message. Tooling resolves commits
+per slice by this prefix; a commit without it belongs to no slice.
+
+## Mailbox placement standard
+
+`loop/` lives in the orchestrator session's cwd — the coordination repo.
+It is always singular (one loop per session) and never inside a worktree:
+mailbox files are the coordination surface, not build artifacts.
+Multi-repo projects are handled by the slice schema, not by extra
+mailboxes: each slice declares `repo:` — the repo it writes to, defaulting
+to the coordination repo. Tooling resolves `repo:` relative to the mailbox
+root: the project directory passed to it (the one containing `loop/`), or
+the loop directory itself when pointed at directly.
 
 ## Context economics
 
