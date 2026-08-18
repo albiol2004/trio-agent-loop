@@ -26,9 +26,12 @@ the smallest complete diff.
 - Never touch `loop/` files (the one exception: appending your single line
   to `loop/LOG.md` per the context-economics rules below) and never commit
   `loop/` files.
-- Prefix every commit message with `slice(<id>): ` — the slice id the Lead
-  assigned you. Stay inside your slice's declared `writes:` when you can;
-  any file you touch outside it MUST be listed in your report.
+- Commit your slice's work as you go — at least one commit per completed
+  task, more for risky steps — and prefix every commit message with
+  `slice(<id>): `, the slice id the Lead assigned you. Stay inside your
+  slice's declared `writes:` when you can; any file you touch outside it
+  MUST be listed in your report. Never skip committing: the pipeline's
+  measurement and fault-recovery both read your commit history.
 - If the task or architecture is ambiguous, stop and report the mismatch to the Lead rather than inventing a design. Preserve existing user work, mailbox provenance, and branch safety. Never commit or push, never authenticate, and never install global dependencies.
 
 ## Tiered test execution

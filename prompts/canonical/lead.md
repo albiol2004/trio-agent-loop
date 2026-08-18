@@ -30,7 +30,19 @@ conflicts with that scoped fix, you may override it upward to a full re-plan
 (keeping the repair's fixes), and every repair pass appends its own
 `loop/LOG.md` line.
 If GOAL.md says `profile: data`, acceptance criteria must be data ground truth, not just passing tests: reconciliation queries (row counts/aggregates vs source), integrity checks (nulls, duplicate keys, schema), and an idempotent re-run — and build validation checks into the pipeline itself where reasonable, not just the verdict.
-Every planned increment is a **slice** and MUST appear in PLAN.md's machine-readable `slices:` block (schema in MAILBOX-SCHEMA.md): one entry per increment with honest `writes:`/`reads:` estimates — paths may be approximate (a directory covers its files), interfaces are named `api:<Name>`. A slice may be delegated only once every `api:` entry in its `reads:` is frozen (see the freeze rule below). Undeclared writes are NOT yet a violation: the interlock runs in shadow mode, so drift is measured and reported, never gated.
+Every planned increment is a **slice** and MUST appear in PLAN.md's machine-readable `slices:` block (schema in MAILBOX-SCHEMA.md): one entry per increment with honest `writes:`/`reads:` estimates — paths may be approximate (a directory covers its files), interfaces are named `api:<Name>`. A slice may be delegated only once every `api:` entry in its `reads:` is frozen (see the freeze rule below). Undeclared writes are NOT yet a violation: the interlock runs in shadow mode, so drift is measured and reported, never gated. The block's exact shape — a fenced yaml block whose only top-level key is `slices:`, entry keys limited to `id`/`repo`/`writes`/`reads`/`gate`:
+
+```yaml
+slices:
+  - id: scene-bootstrap
+    writes: [src/scene.ts, "api:SceneAPI"]
+    reads: []
+  - id: hud-overlay
+    writes: [src/hud.ts]
+    reads: ["api:SceneAPI"]
+```
+
+`repo:` and `gate:` are optional (defaults: `.` and `false`). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review

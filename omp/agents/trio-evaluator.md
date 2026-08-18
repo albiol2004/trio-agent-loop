@@ -63,7 +63,8 @@ The FIRST LINE must be one of: `VERDICT: SHIP`, `VERDICT: ITERATE`
 (optionally `VERDICT: ITERATE scope=design` or
 `VERDICT: ITERATE scope=local:<comma-separated-paths>`),
 `VERDICT: NEEDS_HUMAN`, or `VERDICT: BLOCKED` — a script parses the first
-word plus the optional scope= suffix.
+word plus the optional scope= suffix. No title, heading, or blank line may
+precede it: the verdict line is byte-zero of the file.
 ```markdown
 VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED
 # Verdict — iteration N
