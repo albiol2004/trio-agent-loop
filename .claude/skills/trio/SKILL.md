@@ -30,7 +30,7 @@ After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation
 Spawn `trio-evaluator` synchronously. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
 
 ## 3. Report and schedule
-Read `loop/VERDICT.md`, update `loop/STATE.md` (`status: <verdict>`, `last_run: <date from Bash>`), then give the human a compact iteration digest:
+Read `loop/VERDICT.md`, update `loop/STATE.md` (`status: <verdict>`, `verdict: <outcome>`, `eval: <one-line compressed evidence>`, `last_run: <date from Bash>`), then give the human a compact iteration digest:
 - Iteration N, verdict, one line each for what was planned / done / found.
 - Any `DECISION:` flags the Lead recorded (the human may want to veto).
 

@@ -51,6 +51,23 @@ In addition to `schema: 1`, a v1 STATE.md must define these top-level fields
 Other keys (e.g. `mission_fingerprint`) are allowed. `schema: 1` is required
 to appear as a top-level key with value `1`.
 
+### STATE.md `verdict:` and `eval:` hot-summary lines
+
+The hot summary may carry two optional one-line fields recording the latest
+iteration's outcome, written by the driver that runs the role sequence when
+it updates STATE.md after a verdict:
+
+- `verdict: <SHIP|ITERATE|NEEDS_HUMAN|BLOCKED|pending>` — the latest
+  verdict's outcome word, or `pending` while an iteration is in flight
+  (evaluator has not returned yet).
+- `eval: <one-line compressed evidence pointer>` — key metrics and/or the
+  evidence directory path (`loop/evidence/iterN/`), compressed to one line:
+  numbers and paths, never prose paragraphs.
+
+Both are plain `key: value` lines like every other STATE.md field, one line
+each; they are absent until the first verdict lands. `eval:` is a pointer
+for machines and humans to re-check the outcome, not a report.
+
 ## LOG.md
 
 `LOG.md` is the append-only flight recorder. This repository accepts a few
@@ -156,7 +173,17 @@ slices:
     writes: [omp/configure-models.sh, "api:ProviderConfig"]
     reads:  []                      # dispatchable immediately
     gate: false                     # optional; default false
+    status: in_progress             # optional; default in_progress
+    iteration: 1                    # optional; int
 ```
+
+The block is **cumulative** across the loop's life — it is the single
+machine-readable slice history. Completed slices are never removed from it:
+when a new iteration starts, entries from earlier iterations stay, marked
+`status: complete` with their `iteration: N`, and the new iteration's
+slices are appended. Prose per-iteration sections (e.g. `## Iteration N`
+headings) may still exist for humans, but scripts read only the fenced
+block — tooling resolves every entry in it, completed or not.
 
 One list entry per slice. The restricted shape is exactly:
 
@@ -167,16 +194,18 @@ One list entry per slice. The restricted shape is exactly:
 | `writes` | yes | list of paths and/or `api:<Name>` | files (or directories) the slice may touch; `api:` entries name interfaces, not paths |
 | `reads` | yes (may be `[]`) | list of paths and/or `api:<Name>` | inputs the slice needs frozen before it may be dispatched |
 | `gate` | no (default `false`) | bool | foundation slice: never speculated, regardless of predictor state |
+| `status` | no (default `in_progress`) | `planned` \| `in_progress` \| `complete` | lifecycle state; `complete` marks a finished slice that stays in the cumulative history |
+| `iteration` | no | int | the iteration the slice belongs to; required in practice for completed entries, recommended for all |
 
 Paths may be approximate (a directory entry covers everything beneath it);
 `api:` names are exact. The block is optional in v1 — a mailbox without it
 remains conformant, and `trio-check.py` does not validate it. The shadow
 checker `metrics/trio-shadow.py` (`--mailbox <dir> [--json]`) parses the
 block with a stdlib line-based parser and compares declared `writes:`
-against the files actually touched by the slice's commits. `api:` entries
-are excluded from git matching. Undeclared writes are reported, never
-enforced — shadow/instrumentation mode; enforcement is a later pipeline
-stage.
+against the files actually touched by the slice's commits — for every slice
+in the block, regardless of `status:`. `api:` entries are excluded from git
+matching. Undeclared writes are reported, never enforced —
+shadow/instrumentation mode; enforcement is a later pipeline stage.
 
 ## STATE.md `frozen:` lines
 

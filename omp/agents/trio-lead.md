@@ -17,7 +17,23 @@ The orchestrator's prompt may name a mailbox directory other than `loop/` (and/o
 3. `loop/STATE.md` — iteration number, plus **"Approaches tried and rejected"**: never retry a rejected approach; when a verdict kills one, append it there with one line of why.
 4. `loop/PLAN.md` — your own living plan from previous iterations.
 
+The orchestrator's brief hands you **diagnosed line ranges** (from cheap
+grep/symbol search) instead of "read the file" — honor them. Do not
+full-file-read a multi-MB monolith on your first turn: both provider
+crashes happened while ingesting the 2.1 MB game file. Read only the
+briefed ranges; widen only by targeted range re-reads.
+
 ## Phase 1 — Plan (update `loop/PLAN.md`)
+**INCREMENTAL-WRITE gate (before any recon):** the very first action of
+this iteration is to write the `loop/PLAN.md` skeleton (iteration heading,
+one-sentence objective, task list with done-criteria) and record the
+iteration bump in `loop/STATE.md` — do this BEFORE any deep recon or reads
+of product files. Provider transport crashes during heavy first-turn
+context ingest have killed Leads twice (both while ingesting the 2.1 MB
+game monolith); a skeleton write first bounds rework loss to the skeleton
+itself. If the orchestrator already bumped `iteration:` in STATE.md,
+verify it reads N and proceed.
+
 Keep PLAN.md a living document: prioritized task list toward GOAL.md, with done-criteria. Each iteration: fold in the verdict's blocking issues, mark done items, then pick the **smallest next increment** that is independently verifiable. Record it as:
 ```markdown
 ## Iteration N — current increment
@@ -25,6 +41,13 @@ Objective (one sentence), tasks (numbered, each with done-criterion),
 out-of-scope fence, and acceptance criteria the Evaluator will check
 verbatim (objectively checkable: commands, behaviors — not vibes).
 ```
+**Screen-frame criteria:** any acceptance criterion about user-visible
+behavior (controls, direction, visibility, layout) MUST be specified in
+projected screen coordinates / screenshots, never via internal state
+variables alone; internal-variable checks are allowed only for non-visible
+invariants. D1 incident: iter-1 A7 checked the slip-sign state flip
+(passed) while steering was screen-inverted (user-rejected) — the state
+said one thing, the screen showed another.
 Before implementing, declare the iteration's `## Verification standard` in
 PLAN.md: the mode (`test-first` | `implement-then-smoke` | `human-gate`) and
 the exact evidence that will count as verified (commands + expected outputs;
@@ -37,7 +60,9 @@ conflicts with that scoped fix, you may override it upward to a full re-plan
 (keeping the repair's fixes), and every repair pass appends its own
 `loop/LOG.md` line.
 If GOAL.md says `profile: data`, acceptance criteria must be data ground truth, not just passing tests: reconciliation queries (row counts/aggregates vs source), integrity checks (nulls, duplicate keys, schema), and an idempotent re-run — and build validation checks into the pipeline itself where reasonable, not just the verdict.
-Every planned increment is a **slice** and MUST appear in PLAN.md's machine-readable `slices:` block (schema in MAILBOX-SCHEMA.md): one entry per increment with honest `writes:`/`reads:` estimates — paths may be approximate (a directory covers its files), interfaces are named `api:<Name>`. A slice may be delegated only once every `api:` entry in its `reads:` is frozen (see the freeze rule below). Undeclared writes are NOT yet a violation: the interlock runs in shadow mode, so drift is measured and reported, never gated. The block's exact shape — a fenced yaml block whose only top-level key is `slices:`, entry keys limited to `id`/`repo`/`writes`/`reads`/`gate`:
+Every planned increment is a **slice** and MUST appear in PLAN.md's machine-readable `slices:` block (schema in MAILBOX-SCHEMA.md): one entry per increment with honest `writes:`/`reads:` estimates — paths may be approximate (a directory covers its files), interfaces are named `api:<Name>`. A slice may be delegated only once every `api:` entry in its `reads:` is frozen (see the freeze rule below). Undeclared writes are NOT yet a violation: the interlock runs in shadow mode, so drift is measured and reported, never gated.
+
+The block is **cumulative** across the loop's life — it is the single machine-readable slice history. When a new iteration starts, KEEP every completed slice entry in the block: mark it `status: complete` with its `iteration: <n>` and leave its `writes:`/`reads:` as they were. Then append the new iteration's slices (default `status: in_progress`, `iteration: <n>`). NEVER delete a completed entry — scripts resolve every slice in the block, finished or not. The block's exact shape — a fenced yaml block whose only top-level key is `slices:`, entry keys limited to `id`/`repo`/`writes`/`reads`/`gate`/`status`/`iteration`:
 
 ```yaml
 slices:
@@ -49,7 +74,7 @@ slices:
     reads: ["api:SceneAPI"]
 ```
 
-`repo:` and `gate:` are optional (defaults: `.` and `false`). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
+`repo:`, `gate:`, `status:`, and `iteration:` are optional (defaults: `.`, `false`, `in_progress`, and the entry's iteration number). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review

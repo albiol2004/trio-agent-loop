@@ -88,7 +88,10 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
    perform its own Luna delegation through `trioctl omnigent run`,
-   review/correct, verify, and write REPORT.
+   review/correct, verify, and write REPORT. Hand it **diagnosed line
+   ranges** (from cheap grep/symbol search) for every product file it must
+   touch — never "read the file" for a large file; first-turn full-file
+   ingest of the 2.1 MB monolith crashed the provider transport twice.
    Use a title containing mailbox and iteration.
 3. Inspect the Lead result and actual diff. Its report must identify the
    profile-resolved Luna worker and include the captured `trioctl` result.
@@ -96,10 +99,17 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    its returned model and effort. Require it to independently verify, decide
    whether it needs a Luna Scout, and write VERDICT with one of SHIP, ITERATE
    (optionally `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or
-   BLOCKED on the first line.
+   BLOCKED on the first line. Before spawning it, verify `loop/LOG.md`
+   contains the Lead's `- iter N | lead | ...` entry for this iteration
+   (the LOG.md gate) — the Evaluator cannot SHIP without it; if the append
+   is missing, have the Lead add it first.
 5. Inspect the Evaluator result. Any delegated Scout evidence must come from
    its own `trioctl omnigent run scout` invocation.
-6. Update STATE and LOG. Two materially identical ITERATE verdicts become
+6. Update STATE and LOG. After the verdict, set `loop/STATE.md` bookkeeping:
+   `status: <verdict>`, `verdict: <outcome>`, `eval: <one-line compressed
+   evidence>` (key metrics + evidence dir path, e.g.
+   `loop/evidence/iter<N>/`; schema: MAILBOX-SCHEMA.md), and `last_run:
+   <date>`. Two materially identical ITERATE verdicts become
    BLOCKED. On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2
    consecutive repairs, run a scoped repair pass instead of the next full
    Lead pass: invoke `trioctl omnigent run builder --prompt-file <repair
@@ -115,6 +125,13 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
 `sys_session_create` is asynchronous. Use inbox/session history tools and end
 the turn while a role is running; Omnigent wakes this session on completion.
 Do not busy-poll.
+
+If a role session's result is `failed (exit N)` and the broker log shows a
+provider transport error — the observed triggers are `resource_exhausted`,
+`NGHTTP2_INTERNAL_ERROR`, or `stream refused` — auto-wake the named session
+ONCE via `hub send` with the message `continue` before surfacing any failure
+to the user. A second failure, or no live session to wake, is a real
+failure: surface it.
 
 Default to repeated iterations until SHIP/BLOCKED/NEEDS_HUMAN. If the user
 explicitly asks for one supervised iteration, stop after one verdict.

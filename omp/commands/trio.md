@@ -24,7 +24,7 @@ If the last verdict was `VERDICT: ITERATE scope=local:<paths>` and fewer than 2 
 
 Dispatch the `trio-lead` agent as a **background job** with the task tool. The tasks item MUST carry the `agent` field: `{"agent": "trio-lead", "task": "..."}`. Immediately check the spawn confirmation: if it shows a generated label instead of `trio-lead` (e.g. a random animal name), the `agent` field was dropped — cancel that job and redispatch. Never let a generic agent play a role.
 
-Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to dispatch `trio-scout` for scoped exploration and that the Lead must not replace the mandatory first implementation pass.
+Prompt: the iteration number + instruction to update `loop/PLAN.md`, have one or more `trio-builder` agents perform the main implementation pass for every code-changing increment, review and correct their work as needed, and write `loop/REPORT.md` per its role instructions. Remind it to dispatch `trio-scout` for scoped exploration and that the Lead must not replace the mandatory first implementation pass. Hand it **diagnosed line ranges** (from cheap grep/symbol search) for every product file it must touch — never "read the file" for a large file: first-turn full-file ingest of the 2.1 MB monolith crashed the provider transport twice.
 
 The job result **auto-delivers** when the Lead finishes — do not busy-poll and do not block your turn waiting; end the turn or continue other work, and resume when the result arrives. Before dispatching the Lead, capture the wall-clock start time with bash:
 ```bash
@@ -44,6 +44,8 @@ Use a one-line summary of what the Lead did (keep it ≤ 12 words, no `|` charac
 
 ## 2. Evaluate
 Dispatch the `trio-evaluator` agent as a **background job** with the task tool — same rules as the Lead dispatch: the tasks item MUST carry `{"agent": "trio-evaluator", ...}`, verify the spawn confirmation names `trio-evaluator`, and NEVER dispatch it before the Lead's result has arrived (the Evaluator reads the Lead's output files). Its result auto-delivers; do not busy-poll.
+
+Before dispatching the Evaluator, verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` append for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without it. If the append is missing, have the Lead add it before spawning the Evaluator.
 
 Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
 - The task result carries a structured output object with `verdict` (SHIP/ITERATE/NEEDS_HUMAN/BLOCKED), `summary`, and optional `blocking_issues`. This structured `verdict` is the **authoritative** verdict for the iteration.
@@ -65,7 +67,9 @@ The Evaluator role also appends its own human-readable line to `loop/LOG.md`. Yo
 Use the authoritative `verdict` from the structured output, and a one-line summary from `loop/VERDICT.md` (≤ 12 words, no `|` characters). Use `bash` with `printf` or the repo-side helper `bash omp/scripts/trio-log-usage.sh -d loop -i N -r evaluator -v <SHIP|ITERATE|NEEDS_HUMAN|BLOCKED> -s "..." started_at:... ended_at:... duration_sec:...`.
 
 ## 3. Report and schedule
-Use the authoritative verdict from step 2. Read `loop/VERDICT.md` for the human-facing detail (suggested commit message, follow-ups, blocking details), update `loop/STATE.md` (`status: <verdict>`, `last_run: <date from bash>`), then give the human a compact iteration digest:
+Use the authoritative verdict from step 2. Read `loop/VERDICT.md` for the human-facing detail (suggested commit message, follow-ups, blocking details), update `loop/STATE.md` (`status: <verdict>`, `verdict: <outcome>`, `eval: <one-line compressed evidence>`, `last_run: <date from bash>`), then give the human a compact iteration digest:
+
+`verdict:` is the outcome word (`SHIP|ITERATE|NEEDS_HUMAN|BLOCKED`); `eval:` is ONE compressed line — the key metrics and the evidence directory path (e.g. `loop/evidence/iter<N>/`), never prose paragraphs (schema: MAILBOX-SCHEMA.md).
 - Iteration N, verdict, one line each for what was planned / done / found.
 - Any `DECISION:` flags the Lead recorded (the human may want to veto).
 - The per-role timing fields you just recorded in `loop/LOG.md` (started_at, ended_at, duration_sec).
@@ -80,3 +84,4 @@ Then:
 - A code-changing Lead run is incomplete unless REPORT.md records at least one `trio-builder` as the primary implementor. Retry the Lead once if that provenance is missing; on a second failure, set `status: error`, report the role-contract breach, and end the loop.
 - The two roles run strictly sequentially — never in parallel. Async dispatch does not change this: the Evaluator job is dispatched only after the Lead job's result has been delivered and reviewed; the Evaluator reads the Lead's output files.
 - If a role agent dies or returns without writing its file, retry it once with a note about what's missing; if it fails again, set `status: error` in STATE.md, report to the human, end the loop.
+- **Auto-resume on provider transport failure:** when a role job's result is `failed (exit N)` and the broker log for that session shows a provider transport error — the observed triggers are `resource_exhausted`, `NGHTTP2_INTERNAL_ERROR`, or `stream refused` — auto-wake the named subagent session ONCE via `hub send` with the message `continue` before surfacing any failure to the user. If the wake is not applicable (job dispatch without a live session) or the session fails again, fall through to the retry rule above.

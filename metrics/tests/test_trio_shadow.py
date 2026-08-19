@@ -67,6 +67,27 @@ slices:
 ```
 """
 
+PLAN_CUMULATIVE = """\
+# Iteration 2 — current increment
+
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    reads: []
+    status: complete
+    iteration: 1
+  - id: fresh
+    writes: [fresh.py]
+    reads: []
+    status: in_progress
+    iteration: 2
+```
+
+## Verification standard
+implement-then-smoke
+"""
+
 GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
@@ -240,6 +261,9 @@ def test_mailbox_may_be_the_loop_dir_itself(git_repo: Path) -> None:
         ("bad-writes", "```yaml\nslices:\n  - id: alpha\n    writes: nope\n```\n", "bracketed list"),
         ("bad-id", "```yaml\nslices:\n  - id: Bad ID\n    writes: []\n```\n", "not kebab-case"),
         ("bad-gate", "```yaml\nslices:\n  - id: alpha\n    writes: []\n    gate: maybe\n```\n", "must be true or false"),
+        ("bad-status", "```yaml\nslices:\n  - id: alpha\n    writes: []\n    status: done\n```\n", "must be one of planned, in_progress, complete"),
+        ("bad-iteration", "```yaml\nslices:\n  - id: alpha\n    writes: []\n    iteration: 2.5\n```\n", "must be an integer"),
+        ("unknown-key-with-valid-status", "```yaml\nslices:\n  - id: alpha\n    writes: []\n    status: complete\n    bogus: 1\n```\n", "unknown slice key 'bogus'"),
         ("content-outside-slice", "```yaml\nslices:\n  - id: alpha\n    writes: []\n  - id: beta\n    writes: []\nrandom: line\n```\n", "unknown slice key 'random'"),
     ],
 )
@@ -259,3 +283,58 @@ def test_missing_plan_exits_2(tmp_path: Path) -> None:
     result = run_checker(mailbox)
     assert result.returncode == 2
     assert "PLAN.md not found" in result.stderr
+
+
+def test_status_and_iteration_keys_parse_and_analyze(git_repo: Path) -> None:
+    """Slices carrying the optional status/iteration keys parse and analyze
+    exactly like plain slices; commit matching is unaffected."""
+    plan = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    reads: []
+    status: complete
+    iteration: 1
+```
+"""
+    write_plan(git_repo, plan)
+    commit(git_repo, {"loop/PLAN.md": plan}, "plan: declare slice")
+    sha = commit(git_repo, {"a.py": "A\n"}, "slice(alpha): add module a")
+
+    result = run_checker(git_repo, "--json")
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    alpha = report["slices"][0]
+    assert alpha["id"] == "alpha"
+    assert alpha["repo_status"] == "ok"
+    assert alpha["commits"] == [sha]
+    assert alpha["actual_touched"] == ["a.py"]
+    assert alpha["undeclared_touches"] == []
+    assert report["summary"]["total_slices"] == 1
+
+
+def test_cumulative_history_covers_completed_and_new_slices(git_repo: Path) -> None:
+    """A cumulative slices block keeps old completed entries next to the new
+    iteration's: both are resolved and reported; a completed slice with
+    commits still matches, and only the commit-less new slice counts in
+    slices_without_commits."""
+    write_plan(git_repo, PLAN_CUMULATIVE)
+    commit(git_repo, {"loop/PLAN.md": PLAN_CUMULATIVE}, "plan: declare slices")
+    commit(git_repo, {"a.py": "A\n"}, "slice(alpha): add module a")
+
+    result = run_checker(git_repo, "--json")
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    by_id = {s["id"]: s for s in report["slices"]}
+    assert set(by_id) == {"alpha", "fresh"}
+    assert by_id["alpha"]["commits"]  # completed slice still resolved
+    assert by_id["fresh"]["commits"] == []
+    summary = report["summary"]
+    assert summary["total_slices"] == 2
+    assert summary["slices_without_commits"] == 1
+
+    human = run_checker(git_repo)
+    assert human.returncode == 0
+    assert "alpha" in human.stdout and "fresh" in human.stdout
+    assert "no slice-prefixed commits" in human.stdout

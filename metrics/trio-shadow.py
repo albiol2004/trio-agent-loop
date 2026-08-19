@@ -41,7 +41,8 @@ ENTRY_RE = re.compile(r"^\s*- id:\s*(.+?)\s*$")
 KEY_RE = re.compile(r"^([a-z]+):\s*(.*)$")
 FLOW_LIST_RE = re.compile(r"^\[(.*)\]$")
 ITEM_RE = re.compile(r"^\s*- (.+)$")
-SLICE_KEYS = ("id", "repo", "writes", "reads", "gate")
+SLICE_KEYS = ("id", "repo", "writes", "reads", "gate", "status", "iteration")
+STATUS_VALUES = ("planned", "in_progress", "complete")
 
 
 class SliceParseError(Exception):
@@ -107,10 +108,11 @@ def parse_slices(lines: list[str]) -> list[dict]:
     """Parse the restricted slices shape into a list of slice dicts.
 
     Accepts exactly: a top-level `slices:` key, then one `- id: <kebab-case>`
-    entry per slice with keys id/repo/writes/reads/gate. `writes:`/`reads:`
-    are flow-style `[a, "b"]` lists or block-style `- item` lists. `repo`
-    defaults to `.`, `gate` to `false`. Anything else raises SliceParseError
-    with the offending line number.
+    entry per slice with keys id/repo/writes/reads/gate/status/iteration.
+    `writes:`/`reads:` are flow-style `[a, "b"]` lists or block-style
+    `- item` lists. `repo` defaults to `.`, `gate` to `false`, `status` to
+    `in_progress`; `iteration` is optional (validated as int when present).
+    Anything else raises SliceParseError with the offending line number.
     """
     slices: list[dict] = []
     cur: dict | None = None
@@ -152,6 +154,7 @@ def parse_slices(lines: list[str]) -> list[dict]:
                 "writes": [],
                 "reads": [],
                 "gate": False,
+                "status": "in_progress",
             }
             list_key = None
             continue
@@ -191,6 +194,22 @@ def parse_slices(lines: list[str]) -> list[dict]:
                         f"line {i}: `gate:` must be true or false, got {value!r}"
                     )
                 cur["gate"] = value == "true"
+                list_key = None
+            elif key == "status":
+                if value not in STATUS_VALUES:
+                    raise SliceParseError(
+                        f"line {i}: `status:` must be one of "
+                        f"{', '.join(STATUS_VALUES)}, got {value!r}"
+                    )
+                cur["status"] = value
+                list_key = None
+            elif key == "iteration":
+                try:
+                    cur["iteration"] = int(value)
+                except ValueError:
+                    raise SliceParseError(
+                        f"line {i}: `iteration:` must be an integer, got {value!r}"
+                    ) from None
                 list_key = None
             continue
 
