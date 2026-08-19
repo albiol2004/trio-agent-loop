@@ -52,10 +52,17 @@ For each iteration, orchestrate these native agents synchronously:
    corrective edits, verification, REPORT.md, and final ownership.
 4. Spawn `trio-scout` again for evaluator reconnaissance. It must inspect the
    goal, plan, and actual diff without reading REPORT.md or issuing a verdict.
-5. Spawn `trio-evaluator` (Terra High), passing that brief. It independently
-   verifies before reading REPORT.md and writes VERDICT.md with one of
-   `SHIP`, `ITERATE` (optionally `scope=design` or `scope=local:<paths>`),
-   `NEEDS_HUMAN`, or `BLOCKED` on the first line.
+5. Before spawning the Evaluator — in either mode — run the **commit gate**
+   (active interlock): `trio-shadow.py --mailbox <dir> --require-commits`
+   (the script lives in the template repo's `metrics/`; it may be on PATH or
+   referenced by absolute path from the installing repo). Exit 0 → proceed.
+   Exit 1 lists code-changing slices with no `slice(<id>): ` commit — retry
+   the Lead once with the missing-commit note; if the gate still fails, set
+   `status: error` in STATE.md, record the breach in LOG.md, and end the
+   loop. Then spawn `trio-evaluator` (Terra High), passing that brief. It
+   independently verifies before reading REPORT.md and writes VERDICT.md
+   with one of `SHIP`, `ITERATE` (optionally `scope=design` or
+   `scope=local:<paths>`), `NEEDS_HUMAN`, or `BLOCKED` on the first line.
 6. On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2 consecutive
    repairs, spawn `trio-repair` (Luna High) instead of `trio-lead`: it fixes
    exactly the listed paths with no re-planning. Track the consecutive count
@@ -101,8 +108,13 @@ It uses `codex exec --ephemeral`, inherits the project's active Codex
 configuration and permission profile, and never bypasses the sandbox. Child
 runs are sequential. The parent remains the only orchestrator.
 
-Continue on ITERATE until SHIP, BLOCKED, NEEDS_HUMAN, the iteration cap, or
-the active Goal budget stops the task. Never commit automatically.
+When the user asks to run/start/continue the trio loop in any phrasing,
+chain iterations end-to-end by default with no per-iteration checkpoint
+between Lead completion, the commit gate, Evaluator dispatch, and the
+verdict-driven next iteration — continue on ITERATE (repair path for
+`scope=local`) until SHIP, BLOCKED, NEEDS_HUMAN, the iteration cap, or the
+active Goal budget stops the task; a bare supervised step remains available
+for deliberate single-iteration runs. Never commit automatically.
 
 <!-- trio-protocol:start -->
 ## Trio protocol essentials

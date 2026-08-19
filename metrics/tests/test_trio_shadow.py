@@ -338,3 +338,116 @@ def test_cumulative_history_covers_completed_and_new_slices(git_repo: Path) -> N
     assert human.returncode == 0
     assert "alpha" in human.stdout and "fresh" in human.stdout
     assert "no slice-prefixed commits" in human.stdout
+
+
+PLAN_GATE_COMMITTED = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    reads: []
+```
+"""
+
+PLAN_GATE_UNCOMMITTED = """\
+```yaml
+slices:
+  - id: solo
+    writes: [a.py, "api:SoloConfig"]
+    reads: []
+```
+"""
+
+PLAN_GATE_LOOP_ONLY = """\
+```yaml
+slices:
+  - id: mailbox-chores
+    writes: [loop/PLAN.md, "api:ChoreAPI"]
+    reads: []
+```
+"""
+
+PLAN_GATE_MIXED = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    reads: []
+  - id: beta
+    writes: [loop/PLAN.md]
+    reads: []
+```
+"""
+
+
+def test_require_commits_code_changing_slice_with_commits_exits_0(
+    git_repo: Path,
+) -> None:
+    """--require-commits: a code-changing slice with a slice(<id>): commit
+    passes the gate (exit 0)."""
+    write_plan(git_repo, PLAN_GATE_COMMITTED)
+    commit(git_repo, {"loop/PLAN.md": PLAN_GATE_COMMITTED}, "plan: declare slice")
+    commit(git_repo, {"a.py": "A\n"}, "slice(alpha): add module a")
+
+    result = run_checker(git_repo, "--require-commits")
+    assert result.returncode == 0, result.stdout
+    assert "commit gate: PASS" in result.stdout
+    assert "slice(<id>): commit" in result.stdout
+
+
+def test_require_commits_code_changing_slice_without_commits_exits_1(
+    git_repo: Path,
+) -> None:
+    """--require-commits: a code-changing slice (writes outside loop/, not
+    api:) with no slice(<id>): commit fails the gate (exit 1), naming the
+    slice; the shadow report and JSON output are still emitted."""
+    write_plan(git_repo, PLAN_GATE_UNCOMMITTED)
+    commit(git_repo, {"loop/PLAN.md": PLAN_GATE_UNCOMMITTED}, "plan: declare slice")
+    commit(git_repo, {"a.py": "A\n"}, "feat: add a")  # no slice prefix
+
+    result = run_checker(git_repo, "--require-commits")
+    assert result.returncode == 1, result.stdout
+    assert "commit gate: FAIL" in result.stdout
+    assert "solo" in result.stdout
+    assert "slice(solo): commit" in result.stdout
+    assert "a.py" in result.stdout  # the offending code-changing write
+
+    as_json = run_checker(git_repo, "--require-commits", "--json")
+    assert as_json.returncode == 1, as_json.stdout
+    # The JSON document is printed first; the gate verdict lines follow it.
+    doc = as_json.stdout[: as_json.stdout.index("commit gate:")]
+    report = json.loads(doc)
+    assert report["slices"][0]["id"] == "solo"
+    assert "commit gate: FAIL" in as_json.stdout
+
+
+def test_require_commits_loop_only_slice_without_commits_exits_0(
+    git_repo: Path,
+) -> None:
+    """--require-commits: a slice writing only loop/ paths and api: names is
+    exempt — no commits, gate still passes (exit 0)."""
+    write_plan(git_repo, PLAN_GATE_LOOP_ONLY)
+    commit(git_repo, {"loop/PLAN.md": PLAN_GATE_LOOP_ONLY}, "plan: declare slice")
+
+    result = run_checker(git_repo, "--require-commits")
+    assert result.returncode == 0, result.stdout
+    assert "commit gate: PASS" in result.stdout
+
+
+def test_require_commits_mixed_committed_code_and_uncommitted_loop_only_exits_0(
+    git_repo: Path,
+) -> None:
+    """--require-commits: one committed code-changing slice plus one
+    commit-less loop/-only slice — the loop/-only slice is exempt, so the
+    gate passes (exit 0) and never names it."""
+    write_plan(git_repo, PLAN_GATE_MIXED)
+    commit(git_repo, {"loop/PLAN.md": PLAN_GATE_MIXED}, "plan: declare slices")
+    commit(git_repo, {"a.py": "A\n"}, "slice(alpha): add module a")
+
+    result = run_checker(git_repo, "--require-commits")
+    assert result.returncode == 0, result.stdout
+    assert "commit gate: PASS" in result.stdout
+    # beta is exempt: it must appear in the shadow report listing, but never
+    # as a gate offender.
+    assert "commit gate: FAIL" not in result.stdout
+    assert "slice(beta): commit" not in result.stdout

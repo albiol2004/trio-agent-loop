@@ -60,7 +60,7 @@ this repo.
 
 ## The policy (maintainer notes)
 
-The block encodes four decisions:
+The block encodes five decisions:
 
 - **Main session routes, rarely implements.** It builds only trivial
   one-breath edits; everything else goes to a subagent matched by the
@@ -84,6 +84,11 @@ The block encodes four decisions:
 - **The routing table is the whole router.** Intake classification —
   question → SCOUT, slice → BUILDER, fuzzy/multi-slice → LEAD+EVALUATOR
   loop, trivial → self — is the complete decision procedure.
+- **Trio loops run end-to-end by default.** No per-iteration checkpoints:
+  any run/start/continue request chains LEAD → commit gate → EVALUATOR →
+  verdict dispatch until a terminal verdict. The commit gate is the one
+  mechanical interlock that is active, not speculative: slice-commit
+  presence is enforced before Evaluator dispatch.
 
 ## The distributable block
 
@@ -117,4 +122,14 @@ You are the session router. Optimize for delegation, not direct work.
 - After a verified/merged change, queue exactly one coalesced background
   documentation task (cheap model) with the change summary and rationale.
   Never document unverified decisions.
+
+### Trio loops — end-to-end by default
+- When the user asks to run/start/continue a trio loop (any phrasing), run
+  the full chain with no per-iteration checkpoints: LEAD → commit gate →
+  EVALUATOR → verdict dispatch (ITERATE → next iteration; scoped ITERATE →
+  repair path; SHIP/BLOCKED/NEEDS_HUMAN → stop and surface). A bare
+  supervised-step command remains available for deliberate step-through.
+- Before dispatching the EVALUATOR, run the commit gate
+  (`trio-shadow.py --require-commits`); on failure retry the LEAD once,
+  then stop with `status: error`.
 <!-- orchestration:end -->

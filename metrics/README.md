@@ -43,4 +43,7 @@ python3 metrics/trio-shadow.py --mailbox <project-or-loop-dir> --json
 directory directly; it defaults to the current directory. Shadow mode is
 informational only — the script always exits 0 on a successful analysis and
 never gates the pipeline. Exit 2 means `PLAN.md` was missing or its `slices`
-block did not match the restricted shape.
+block did not match the restricted shape. With `--require-commits` the
+script becomes the active commit gate: exit 1 when any code-changing slice
+(a `writes:` entry neither `api:` nor under `loop/`) lacks a
+`slice(<id>): ` commit.

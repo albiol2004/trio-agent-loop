@@ -204,8 +204,34 @@ checker `metrics/trio-shadow.py` (`--mailbox <dir> [--json]`) parses the
 block with a stdlib line-based parser and compares declared `writes:`
 against the files actually touched by the slice's commits — for every slice
 in the block, regardless of `status:`. `api:` entries are excluded from git
-matching. Undeclared writes are reported, never enforced —
-shadow/instrumentation mode; enforcement is a later pipeline stage.
+matching. Undeclared-write drift is reported, never enforced —
+shadow/instrumentation mode; commit presence, by contrast, is enforced by
+the active gate below (the first ACTIVE interlock).
+
+### Slice commit gate (active interlock)
+
+The commit-presence check is the first **active** interlock: drivers run it
+**post-Lead, pre-Evaluator** — before dispatching the Evaluator, so a
+code-changing iteration that never committed its slices cannot be graded as
+shipped work.
+
+- **What it checks**: every slice in the `slices:` block that is
+  *code-changing* — at least one `writes:` entry that is neither an
+  `api:<Name>` pseudo-entry nor a path inside `loop/` — must have at least
+  one commit whose message starts with `slice(<id>): `. Slices that write
+  only `loop/` files or `api:` names are exempt.
+- **Command**: `python3 metrics/trio-shadow.py --mailbox <dir>
+  --require-commits` (the script may be on PATH or referenced by absolute
+  path from the installing repo's `metrics/`).
+- **Exit semantics**: 0 = pass (every code-changing slice has commits, or
+  there are none); 1 = fail, listing the offending slice ids; 2 = the
+  `slices:` block is missing or malformed (a driver error, not a gate
+  verdict). Without `--require-commits` the script stays in shadow mode and
+  always exits 0 on a successful analysis.
+- **Retry semantics**: on exit 1 the orchestrator retries the Lead once
+  with the missing-commit note (reusing the retry-once pattern); if the
+  gate still fails, the driver sets `status: error` in STATE.md, records
+  the breach in LOG.md, and ends the loop.
 
 ## STATE.md `frozen:` lines
 

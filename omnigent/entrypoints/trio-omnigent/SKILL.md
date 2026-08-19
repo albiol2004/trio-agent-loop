@@ -99,10 +99,17 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    its returned model and effort. Require it to independently verify, decide
    whether it needs a Luna Scout, and write VERDICT with one of SHIP, ITERATE
    (optionally `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or
-   BLOCKED on the first line. Before spawning it, verify `loop/LOG.md`
-   contains the Lead's `- iter N | lead | ...` entry for this iteration
-   (the LOG.md gate) — the Evaluator cannot SHIP without it; if the append
-   is missing, have the Lead add it first.
+   BLOCKED on the first line. Before spawning it, run the **commit gate**
+   (active interlock) via your shell tools:
+   `trio-shadow.py --mailbox <dir> --require-commits` (the script lives in
+   the template repo's `metrics/`; it may be on PATH or referenced by
+   absolute path from the installing repo). Exit 0 → proceed. Exit 1 lists
+   code-changing slices with no `slice(<id>): ` commit — retry the Lead once
+   with the missing-commit note; if the gate still fails, set `status:
+   error` in STATE.md, record the breach in LOG.md, and end the loop. Then
+   verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` entry
+   for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without
+   it; if the append is missing, have the Lead add it first.
 5. Inspect the Evaluator result. Any delegated Scout evidence must come from
    its own `trioctl omnigent run scout` invocation.
 6. Update STATE and LOG. After the verdict, set `loop/STATE.md` bookkeeping:
@@ -133,8 +140,12 @@ ONCE via `hub send` with the message `continue` before surfacing any failure
 to the user. A second failure, or no live session to wake, is a real
 failure: surface it.
 
-Default to repeated iterations until SHIP/BLOCKED/NEEDS_HUMAN. If the user
-explicitly asks for one supervised iteration, stop after one verdict.
+Default to repeated iterations until SHIP/BLOCKED/NEEDS_HUMAN, with NO user
+checkpoint between Lead completion, Evaluator dispatch, and the
+verdict-driven next iteration — only a terminal verdict stops the chain
+(the compact per-iteration digest is still posted after each verdict).
+If the user explicitly asks for one supervised iteration, stop after one
+verdict.
 
 <!-- trio-protocol:start -->
 ## Trio protocol essentials

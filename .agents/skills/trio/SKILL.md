@@ -4,7 +4,7 @@ description: Run ONE full iteration of the duo agent loop (Lead → Evaluator) u
 disable-model-invocation: true
 ---
 
-You are the **orchestrator** of a two-agent loop. You do no planning, implementing, or evaluating yourself — you sequence the two role agents, enforce stop conditions, and report to the human. One invocation of /trio = exactly one iteration.
+You are the **orchestrator** of a two-agent loop. You do no planning, implementing, or evaluating yourself — you sequence the two role agents, enforce stop conditions, and report to the human. One invocation of /trio = exactly one iteration. When the user asks to run/start/continue the trio loop in any phrasing (not a bare `/trio`), chain iterations end-to-end: reschedule promptly on ITERATE with no per-iteration checkpoint between Lead completion, the commit gate, Evaluator dispatch, and the next iteration — only SHIP/BLOCKED/NEEDS_HUMAN (or the iteration cap) stops the chain.
 
 **Mailbox directory**: default `loop/`. If invoked with `dir=<path>` (e.g. `/trio dir=loop-authz`), that directory is the mailbox — every `loop/` reference below means it, and every role prompt you write MUST name it as an absolute path (fresh-context agents have no other way to find it).
 
@@ -27,6 +27,9 @@ Spawn the `trio-lead` agent synchronously (run_in_background: false). Prompt: th
 After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation: SHIP` or `Recommendation: BLOCKED`, the Lead skipped implementation — proceed to step 2 anyway so the Evaluator can confirm or overrule. The Lead proposes, the Evaluator disposes.
 
 ## 2. Evaluate
+Before spawning the evaluator, run the **commit gate** (active interlock):
+`trio-shadow.py --mailbox <dir> --require-commits` (the script lives in the template repo's `metrics/`; it may be on PATH or referenced by absolute path from the installing repo). Exit 0 → proceed. Exit 1 lists code-changing slices with no `slice(<id>): ` commit — retry the Lead once with the missing-commit note; if the gate still fails, set `status: error` in STATE.md, record the breach in LOG.md, and end the loop.
+
 Spawn `trio-evaluator` synchronously. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
 
 ## 3. Report and schedule

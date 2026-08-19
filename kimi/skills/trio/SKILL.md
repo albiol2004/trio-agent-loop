@@ -29,7 +29,15 @@ roles or overlap this sequence.
    task, repository scope, and any prior brief needed by the next role.
 3. Run the roles in this order, waiting for each result before starting the
    next: `scout`, initial `lead`, `builder` when the Lead writes
-   `DELEGATE: YES`, post-Builder `lead`, evaluator `scout`, then `evaluator`.
+   `DELEGATE: YES`, post-Builder `lead`, evaluator `scout`, then the
+   **commit gate**, then `evaluator`. The gate (active interlock) is
+   `trio-shadow.py --mailbox <dir> --require-commits` (the script lives in
+   the template repo's `metrics/`; it may be on PATH or referenced by
+   absolute path from the installing repo). Exit 0 → proceed. Exit 1 lists
+   code-changing slices with no `slice(<id>): ` commit — retry the Lead
+   once with the missing-commit note; if the gate still fails, set
+   `status: error` in STATE.md, record the breach in LOG.md, and end the
+   loop.
    On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2 consecutive
    repairs, run `repair` instead of the next full Lead pass (it fixes exactly
    the listed paths with no re-planning). Track the consecutive count in
@@ -46,9 +54,16 @@ roles or overlap this sequence.
 4. Verify that the roles wrote their required mailbox artifacts. The Lead owns
    `PLAN.md`, `BUILDER_TASK.md`, and `REPORT.md`; the Evaluator owns
    `VERDICT.md`; append their required lines to `LOG.md`.
-5. Continue only on `VERDICT: ITERATE`; stop on `SHIP`, `BLOCKED`,
+5. When the user asks to run/start/continue the loop in any phrasing, chain
+   iterations end-to-end by default: continue only on `VERDICT: ITERATE`
+   (repair path for `scope=local`) and stop on `SHIP`, `BLOCKED`,
    `NEEDS_HUMAN` (surface the `## Human check` section from VERDICT.md), an
-   iteration cap, or a missing/failed child result. Never commit automatically.
+   iteration cap, or a missing/failed child result. Honest limitation of
+   this flavor: every role is a blocking `run-role.sh` CLI process, so an
+   iteration is a strictly sequential sequence — chaining means re-running
+   the full sequence per iteration in one session, never overlapping roles.
+   A bare supervised single-iteration invocation remains available. Never
+   commit automatically.
 
 Scout is read-only. The initial Lead plans and delegates without editing
 product code. Builder performs the substantive implementation in its named

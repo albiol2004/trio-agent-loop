@@ -60,7 +60,26 @@ boundaries visible in the messages and in `loop/LOG.md`:
    never repairs product code. Before spawning it, verify `loop/LOG.md`
    contains the Lead's `- iter N | lead | ...` entry for this iteration
    (the LOG.md gate); if the append is missing, have the Lead append it
-   first.
+   first. Then run the **commit gate** (active interlock) before dispatching
+   the Evaluator: `trio-shadow.py --mailbox <loop-dir> --require-commits`
+   (the script lives in the template repo's `metrics/`; it may be on PATH or
+   referenced by absolute path from the installing repo). Exit 1 lists
+   code-changing slices — any slice with a `writes:` entry that is neither
+   `api:` nor under `loop/` — that have no `slice(<id>): ` commit: retry the
+   Lead once with the missing-commit note; if the gate still fails, set
+   `status: error` in STATE.md, record the breach in LOG.md, and end the
+   loop.
+
+## Auto-chain default
+When the user asks to run, start, or continue a trio loop in any phrasing
+(run the loop, keep going, next iteration, etc.), run the chain end-to-end
+with **no per-iteration checkpoints**: Lead → commit gate → Evaluator →
+verdict dispatch (ITERATE → next iteration; scoped ITERATE → repair path;
+SHIP/BLOCKED/NEEDS_HUMAN → stop and surface). Only a terminal verdict or
+the iteration cap ends the chain; a bare supervised-step command remains
+available for deliberate step-through. The orchestrator still posts the
+compact per-iteration digest after each verdict — checkpoint-free does not
+mean silent.
 
 ## Stop conditions and repair routing
 Stop on `VERDICT: SHIP`, `VERDICT: BLOCKED`, or `VERDICT: NEEDS_HUMAN`

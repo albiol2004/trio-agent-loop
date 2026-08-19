@@ -21,7 +21,21 @@ Shadow mode: the report is observability only — undeclared writes are
 measured, never enforced. The exit code is 0 whenever the analysis itself
 succeeds, including missing/non-git repos and slices with no prefixed
 commits; 2 means the PLAN.md slices block is missing or malformed; 1 is a
-usage error. This script never gates anything.
+usage error.
+
+Active mode (the commit gate):
+
+  python3 metrics/trio-shadow.py --mailbox <dir> --require-commits
+
+With --require-commits, a slice that is code-changing — at least one
+declared ``writes:`` entry that is neither an ``api:`` pseudo-entry nor a
+path inside ``loop/`` — must have at least one matching
+``slice(<id>): `` commit, or the script exits 1 listing the offenders.
+Exit 0 means every code-changing slice has commits (slices that write only
+``loop/`` files or ``api:`` names are exempt). A missing or malformed
+slices block still exits 2, and a parseable block with no code-changing
+slices never fails the gate. This is the first active interlock: drivers
+run it post-Lead, pre-Evaluator, and retry the Lead once on exit 1.
 
 Stdlib only — the restricted YAML shape is parsed line-based; there is no
 PyYAML dependency.
@@ -275,6 +289,32 @@ def _normalize(path: str) -> str:
     return path
 
 
+def _is_loop_path(path: str) -> bool:
+    norm = _normalize(path)
+    return norm == "loop" or norm.startswith("loop/")
+
+
+def code_changing_writes(declared: list[str]) -> list[str]:
+    """Declared writes that make a slice code-changing: not an ``api:``
+    pseudo-entry and not a path inside ``loop/``."""
+    return [
+        w for w in declared
+        if not w.startswith("api:") and not _is_loop_path(w)
+    ]
+
+
+def commit_gate_offenders(report: dict) -> list[dict]:
+    """Slices that are code-changing but have zero ``slice(<id>): `` commits.
+
+    The commit gate fails on exactly these; loop/-only and api:-only slices
+    are exempt even without commits.
+    """
+    return [
+        e for e in report["slices"]
+        if code_changing_writes(e["declared_writes"]) and not e["commits"]
+    ]
+
+
 def covers(declared: str, actual: str) -> bool:
     """Whether a declared write covers an actual file: exact path match, or
     the declared path is a directory prefix of it."""
@@ -366,7 +406,7 @@ def _join(items: list[str]) -> str:
     return ", ".join(items) if items else "(none)"
 
 
-def render(report: dict) -> str:
+def render(report: dict, require_commits: bool = False) -> str:
     lines = [
         f"Checked: {report['mailbox']}",
         f"Slice contracts: {report['plan']}",
@@ -400,14 +440,20 @@ def render(report: dict) -> str:
             f"  ({s['repos_missing_or_not_git']} slice(s) with a missing or "
             "non-git repo)"
         )
-    lines.append("Result: shadow mode — informational only, never gates (exit 0)")
+    if require_commits:
+        lines.append(
+            "Result: commit gate active — slice commits enforced (exit 0)"
+        )
+    else:
+        lines.append("Result: shadow mode — informational only, never gates (exit 0)")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Measure declared-vs-actual writes for PLAN.md slices "
-        "(shadow mode: observability only, never gates).",
+        "(shadow mode: observability only; --require-commits turns on the "
+        "active commit gate).",
     )
     parser.add_argument(
         "--mailbox",
@@ -416,6 +462,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--json", action="store_true", help="Emit a machine-readable JSON report"
+    )
+    parser.add_argument(
+        "--require-commits",
+        action="store_true",
+        help="ACTIVE interlock: exit 1 when any code-changing slice (a writes "
+        "entry that is neither api: nor under loop/) has no slice(<id>): "
+        "commit; exit 0 when every code-changing slice has commits. "
+        "Missing/malformed slices block still exits 2.",
     )
     args = parser.parse_args(argv)
 
@@ -429,7 +483,26 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(report, sys.stdout, indent=2)
         print()
     else:
-        print(render(report))
+        print(render(report, require_commits=args.require_commits))
+
+    if args.require_commits:
+        offenders = commit_gate_offenders(report)
+        if offenders:
+            for e in offenders:
+                why = ""
+                if e["repo_status"] != "ok":
+                    why = f" (repo: {e['repo_status']})"
+                cc = ", ".join(code_changing_writes(e["declared_writes"]))
+                print(
+                    f"commit gate: slice {e['id']!r} is code-changing "
+                    f"(writes: {cc}) but has no slice({e['id']}): commit{why}"
+                )
+            print(
+                f"commit gate: FAIL — {len(offenders)} code-changing slice(s) "
+                "missing slice-prefixed commits; fix before Evaluator dispatch"
+            )
+            return 1
+        print("commit gate: PASS — every code-changing slice has a slice(<id>): commit")
     return 0
 
 

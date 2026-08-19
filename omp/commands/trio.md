@@ -9,6 +9,8 @@ You are the **orchestrator** of the Trio two-agent loop. You do no planning, imp
 If you are coming from the Claude bundle, `/trio auto` replaces the old `/loop /trio` autonomous invocation.
 
 ## 0. Preflight — decide whether to run at all
+> **Default mode**: a natural-language run-the-loop request ("run the trio loop", "start it", "continue", "keep iterating") follows `/trio auto` semantics — full chain, no per-iteration checkpoints, until SHIP/BLOCKED/NEEDS_HUMAN. Bare `/trio` stays supervised (exactly one iteration).
+
 1. Read `loop/STATE.md`. If it does not exist, tell the user to run `/trio-init <goal>` first and STOP.
    - **Collision check**: if STATE.md has a `mission:` line, verify it still matches GOAL.md's mission sentence, and verify LOG.md's tail is consistent with the iterations you've been orchestrating. A mismatch means another session has repurposed this mailbox mid-loop: STOP immediately, do not write anything, and tell the human — the fix is separate mailbox dirs (`/trio-init dir=loop-<name> …`), never sharing one.
 2. Read `loop/VERDICT.md` if it exists — its **first line** is machine-readable (`VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED`, with an optional `scope=design` or `scope=local:<paths>` suffix on ITERATE); trust that line, not your reading of the prose. Apply stop conditions **before** doing any work:
@@ -45,7 +47,13 @@ Use a one-line summary of what the Lead did (keep it ≤ 12 words, no `|` charac
 ## 2. Evaluate
 Dispatch the `trio-evaluator` agent as a **background job** with the task tool — same rules as the Lead dispatch: the tasks item MUST carry `{"agent": "trio-evaluator", ...}`, verify the spawn confirmation names `trio-evaluator`, and NEVER dispatch it before the Lead's result has arrived (the Evaluator reads the Lead's output files). Its result auto-delivers; do not busy-poll.
 
-Before dispatching the Evaluator, verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` append for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without it. If the append is missing, have the Lead add it before spawning the Evaluator.
+Before anything else in this step, run the **commit gate** (active interlock) as the first check:
+```bash
+trio-shadow.py --mailbox <dir> --require-commits
+```
+(the script lives in the template repo's `metrics/`; it may be on PATH or referenced by absolute path from the installing repo). Exit 0 → proceed. Exit 1 lists code-changing slices with no `slice(<id>): ` commit — retry the Lead once with the missing-commit note (reusing the retry-once pattern from the hard rules); if the gate still fails, set `status: error` in STATE.md, record the breach in LOG.md, and end the loop.
+
+Then verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` append for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without it. If the append is missing, have the Lead add it before spawning the Evaluator.
 
 Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
 - The task result carries a structured output object with `verdict` (SHIP/ITERATE/NEEDS_HUMAN/BLOCKED), `summary`, and optional `blocking_issues`. This structured `verdict` is the **authoritative** verdict for the iteration.

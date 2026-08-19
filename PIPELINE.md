@@ -174,9 +174,15 @@ session_send). Also shipped in shadow mode: machine-readable slice
 contracts in PLAN.md plus the shadow checker measuring declared-vs-actual
 writes — informational only, nothing gates on it yet.
 
-New here: interlock enforcement of the slice contracts, the watcher role
-bound to the light model tier, worktree-per-slice renaming, the in-order
-merge queue, the rolling-SHIP predictor, `gate: true` slice declarations.
+**Promoted to active:** the slice commit-presence check. `trio-shadow.py
+--require-commits` now gates Evaluator dispatch (post-Lead, pre-Evaluator;
+retry the Lead once, then `status: error`). Shadow measurement continues
+for undeclared-write drift; commit presence is now enforced.
+
+New here: enforcement of the declared-write (path-set) slice contracts, the
+watcher role bound to the light model tier, worktree-per-slice renaming,
+the in-order merge queue, the rolling-SHIP predictor, `gate: true` slice
+declarations.
 
 ## Cost model
 
