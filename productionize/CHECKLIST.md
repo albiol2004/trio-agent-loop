@@ -53,11 +53,26 @@ These items describe the same control from different angles — the glossary ass
 
 Estimated post-merge registry: **~340 nodes**.
 
+## Status
+
+- **Wave 1 (research)**: done — `research/*.md`, 406 items across 11 domains.
+- **Wave 2 (glossary)**: done — `glossary/*.md`, 406/406 expanded entries
+  (definition/implementation/probe/failure_modes/severity/applies_if/sources),
+  86 merges_into markers for the 16 canonical dedupe clusters.
+- **Graph v1**: done — `graph/SCHEMA.md` + `driver/validate_graph.py`; pilot
+  domain `graph/reliability.json` (37 nodes, 17 depends_on edges, validator
+  clean). Node = one glossary entry; dedupe via `cluster` field, not merging.
+- **Driver**: done — `driver/run.py` (plan / record / status; profile pruning,
+  topo order, executor hints, JSONL verdict state). Smoke-tested.
+- **Command**: done — `/trio-productionize` in `omp/commands/` and
+  `opencode/commands/`.
+
 ## Next steps
 
-1. **Glossary deep-dive (wave 2)**: per-item expanded entry — full definition, implementation guidance, probe pseudocode, failure stories, source links. One builder per domain against these files.
-2. **Node schema v1**: promote items to `productionize/graph/nodes/*.yaml` with `depends_on` edges (e.g. restore-drill depends on backup-rpo-retention; canary-analysis depends on release-observability + slo-error-budget).
-3. **Driver**: mechanical runner that walks the pruned graph (applies_if vs project profile), executes probes, escalates judgment items to the model tier from the profile, and records verdicts.
+1. Promote the remaining 10 domains to `graph/<domain>.json` (same recipe as
+   the reliability pilot — one builder per domain, batches of 3).
+2. Dogfood `/trio-productionize` on a real repo; tune probe recipes and
+   batch sizes from the run's evidence quality.
 
 ## Provenance
 
