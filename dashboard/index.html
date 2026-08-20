@@ -29,11 +29,15 @@
 
   <main class="board" aria-label="Loop board">
     <div id="board-error" class="board-error" hidden></div>
+    <section id="inbox" class="inbox" hidden aria-label="Attention inbox">
+      <h2 class="inbox-title">Needs attention <span id="inbox-count" class="inbox-count"></span></h2>
+      <div id="inbox-list" class="inbox-list"></div>
+    </section>
     <div id="card-grid" class="card-grid"></div>
   </main>
 
   <div id="drawer-scrim" class="drawer-scrim" hidden></div>
-  <aside id="drawer" class="drawer" hidden aria-label="Loop detail">
+  <div id="drawer" class="drawer modal" hidden role="dialog" aria-modal="true" aria-label="Loop detail">
     <header class="drawer-header">
       <div class="drawer-heading">
         <span id="drawer-badge" class="status-label status-idle">IDLE</span>
@@ -42,43 +46,59 @@
       <button id="drawer-close" class="icon-btn" type="button" title="Close detail (Esc)" aria-label="Close detail">&times;</button>
     </header>
 
+    <nav id="drawer-tabs" class="drawer-tabs" aria-label="Loop detail views"></nav>
+
     <div class="drawer-body">
-      <p id="drawer-mission" class="drawer-mission"></p>
+      <div id="view-overview" class="drawer-view">
+        <p id="drawer-mission" class="drawer-mission"></p>
 
-      <dl class="facts" aria-label="Loop facts">
-        <div class="fact"><dt>Iteration</dt><dd id="fact-iter" class="mono">&mdash;</dd></div>
-        <div class="fact"><dt>Verdict</dt><dd id="fact-verdict">&mdash;</dd></div>
-        <div class="fact"><dt>Last activity</dt><dd id="fact-activity">&mdash;</dd></div>
-        <div class="fact"><dt>Sessions</dt><dd id="fact-sessions" class="mono">&mdash;</dd></div>
-      </dl>
+        <dl class="facts" aria-label="Loop facts">
+          <div class="fact"><dt>Iteration</dt><dd id="fact-iter" class="mono">&mdash;</dd></div>
+          <div class="fact"><dt>Verdict</dt><dd id="fact-verdict">&mdash;</dd></div>
+          <div class="fact"><dt>Last activity</dt><dd id="fact-activity">&mdash;</dd></div>
+          <div class="fact"><dt>Sessions</dt><dd id="fact-sessions" class="mono">&mdash;</dd></div>
+        </dl>
 
-      <section class="drawer-section" aria-label="Verdict history">
-        <h3 class="section-label">Verdict history</h3>
-        <div id="drawer-strip" class="strip strip-large"></div>
-      </section>
+        <section class="drawer-section" aria-label="Verdict history">
+          <h3 class="section-label">Verdict history</h3>
+          <div id="drawer-strip" class="strip strip-large"></div>
+        </section>
 
-      <section class="drawer-section" aria-label="Activity timeline">
-        <h3 class="section-label">Activity</h3>
-        <div id="drawer-timeline" class="timeline"></div>
-      </section>
+        <section id="commits-section" class="drawer-section" aria-label="Commits" hidden>
+          <h3 class="section-label">Commits</h3>
+          <div id="commit-list" class="commit-list"></div>
+        </section>
 
-      <details id="sessions-details" class="drawer-section sessions">
-        <summary>
-          <h3 class="section-label">Sessions &amp; transcripts</h3>
-          <span id="pane-status" class="stream-status status-idle"><span id="pane-status-text">idle</span></span>
-        </summary>
-        <div class="sessions-inner">
-          <div id="session-list" class="session-list"></div>
-          <div class="pane-transcript">
-            <div id="transcript-view" class="transcript-view" role="log" aria-label="Session transcript" tabindex="0"></div>
+        <section class="drawer-section" aria-label="Activity timeline">
+          <h3 class="section-label">Activity</h3>
+          <div id="drawer-timeline" class="timeline"></div>
+        </section>
+
+
+      </div>
+
+      <div id="view-timeline" class="drawer-view" hidden></div>
+      <div id="view-files" class="drawer-view" hidden></div>
+      <div id="view-graph" class="drawer-view" hidden></div>
+      <div id="view-transcripts" class="drawer-view drawer-view-fill" hidden>
+        <div class="chat-layout">
+          <aside class="chat-sessions" aria-label="Sessions">
+            <div class="chat-sessions-head">
+              <h3 class="section-label">Sessions</h3>
+              <span id="pane-status" class="stream-status status-idle"><span id="pane-status-text">idle</span></span>
+            </div>
+            <div id="session-list" class="session-list"></div>
+          </aside>
+          <div class="chat-main">
+            <div id="transcript-view" class="transcript-view transcript-chat" role="log" aria-label="Session transcript" tabindex="0"></div>
             <div id="transcript-notice" class="transcript-notice" hidden></div>
-          </div>
-          <div class="pane-footer">
-            <button id="follow-btn" class="follow-btn" type="button" aria-pressed="true">Pause follow</button>
-            <span id="offset-hint" class="offset-hint mono">offset 0</span>
+            <div class="pane-footer">
+              <button id="follow-btn" class="follow-btn" type="button" aria-pressed="true">Pause follow</button>
+              <span id="offset-hint" class="offset-hint mono">offset 0</span>
+            </div>
           </div>
         </div>
-      </details>
+      </div>
     </div>
   </aside>
 

@@ -13,6 +13,9 @@ const state = {
   /* drawer */
   activeLoop: null,
   detail: null,
+  drawerTab: "overview",
+  graphSel: null,
+  compare: [],
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -27,6 +30,7 @@ const state = {
 
 const BOARD_POLL_MS = 5000;
 const TABS = ["all", "running", "shipped", "blocked", "idle"];
+const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -118,7 +122,7 @@ function fmtDuration(sec) {
 function normStatus(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
   if (!s) return "unknown";
-  if (/(running|active|iterat|in progress|working|pending|queued|awaiting)/.test(s)) {
+  if (/(running|active|iterating|in progress|working)/.test(s)) {
     return "running";
   }
   if (/(complet|done|finish|ship|passed|succeed|closed)/.test(s)) {
@@ -142,10 +146,24 @@ function normVerdict(raw) {
 function loopState(loop) {
   const status = normStatus(loop.status);
   const verdict = normVerdict(loop.final_verdict);
-  if (status === "running") return "running";
-  if (status === "blocked" || verdict === "blocked") return "blocked";
+  // A terminal verdict always wins over a stale status word. Fall back to
+  // the latest logged segment verdict when VERDICT.md is not yet written.
+  const seg = verdictSeq(loop);
+  const lastSeg = seg.length ? seg[seg.length - 1] : "none";
+  const eff = verdict !== "none" ? verdict : lastSeg;
+  if (eff === "ship") return "shipped";
+  if (eff === "blocked") return "blocked";
+  if (eff === "needs_human") return "needs_human";
   if (verdict === "ship") return "shipped";
-  if (verdict === "needs_human" || status === "needs_human") return "needs_human";
+  if (verdict === "blocked") return "blocked";
+  if (verdict === "needs_human") return "needs_human";
+  if (status === "blocked") return "blocked";
+  // "running" only when the mailbox is actively moving (fresh activity).
+  if (status === "running") {
+    const last = loop.last_activity ? new Date(loop.last_activity).getTime() : NaN;
+    if (Number.isFinite(last) && Date.now() - last < 2 * 60 * 1000) return "running";
+    return "idle";
+  }
   return "idle";
 }
 
@@ -202,12 +220,44 @@ function seqLegendEl(seq) {
 
 /* ------------------------------ board ------------------------------ */
 
+function renderInbox(inbox) {
+  const section = el("inbox");
+  const list = el("inbox-list");
+  list.textContent = "";
+  const items = Array.isArray(inbox) ? inbox : [];
+  section.hidden = items.length === 0;
+  if (!items.length) return;
+  el("inbox-count").textContent = String(items.length);
+  for (const item of items) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "inbox-item inbox-" + cssClass(item.severity || "low");
+    row.appendChild(span("inbox-sev", (item.severity || "").toUpperCase()));
+    const main = document.createElement("span");
+    main.className = "inbox-main";
+    const head = document.createElement("span");
+    head.className = "inbox-headline";
+    head.appendChild(span("inbox-loop", item.loop || "?"));
+    head.appendChild(document.createTextNode(item.headline || ""));
+    main.appendChild(head);
+    if (item.detail) {
+      const det = span("inbox-detail", item.detail);
+      det.title = item.detail;
+      main.appendChild(det);
+    }
+    row.appendChild(main);
+    row.addEventListener("click", () => openDrawer(item.loop));
+    list.appendChild(row);
+  }
+}
+
 async function refreshBoard() {
   try {
     const res = await fetch("/api/board", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     state.loops = Array.isArray(data.loops) ? data.loops : [];
+  renderInbox(data.inbox);
     state.updatedAt = data.updated_at || null;
     setBoardStatus("live", "live");
     hideBoardError();
@@ -364,8 +414,11 @@ async function openDrawer(name) {
   closeStream();
   state.activeLoop = name;
   state.detail = null;
+  state.compare = [];
   state.sessions = [];
   state.activePath = null;
+  state.drawerTab = "overview";
+  state.graphSel = null;
 
   el("drawer-name").textContent = name;
   el("drawer-badge").className = "status-label status-idle";
@@ -379,13 +432,14 @@ async function openDrawer(name) {
   el("drawer-strip").textContent = "";
   el("drawer-timeline").innerHTML = '<div class="timeline-empty">Loading…</div>';
   el("session-list").textContent = "";
-  el("sessions-details").open = false;
   setPaneStatus("idle", "loading…");
   renderTranscript();
 
   el("drawer").hidden = false;
   el("drawer-scrim").hidden = false;
   markActiveCard();
+  renderDrawerTabs();
+  showDrawerTab();
   await refreshDetail({ quiet: false });
 }
 
@@ -393,9 +447,12 @@ function closeDrawer() {
   closeStream();
   state.activeLoop = null;
   state.detail = null;
+  state.compare = [];
   state.sessions = [];
   state.activePath = null;
   state.pendingLines = [];
+  state.drawerTab = "overview";
+  state.graphSel = null;
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
   markActiveCard();
@@ -423,13 +480,68 @@ async function refreshDetail({ quiet }) {
   }
 }
 
+/* --------------------- iteration lifecycle + compare --------------------- */
+
+const LIFECYCLES = ["planned", "in_flight", "pending_eval", "shipped", "abandoned"];
+
+function iterMeta(n) {
+  const its =
+    state.detail && Array.isArray(state.detail.iterations)
+      ? state.detail.iterations
+      : [];
+  for (const it of its) {
+    if (it && Number(it.n) === Number(n)) return it;
+  }
+  return null;
+}
+
+/* Lifecycle comes from the backend (detail.iterations). When the field is
+ * absent (older server), fall back to timeline verdicts so badges still
+ * render: last verdict wins, else presence of entries means in_flight. */
+function iterLifecycle(n) {
+  const meta = iterMeta(n);
+  if (meta && LIFECYCLES.includes(meta.lifecycle)) return meta.lifecycle;
+  const entries =
+    state.detail && Array.isArray(state.detail.timeline) ? state.detail.timeline : [];
+  let lastVerdict = null;
+  let count = 0;
+  for (const e of entries) {
+    if (e.iteration == null || Number(e.iteration) !== Number(n)) continue;
+    count++;
+    if (e.verdict) lastVerdict = String(e.verdict).toUpperCase();
+  }
+  if (lastVerdict === "SHIP") return "shipped";
+  if (lastVerdict === "ITERATE" || lastVerdict === "BLOCKED") return "abandoned";
+  if (lastVerdict === "NEEDS_HUMAN") return "pending_eval";
+  return count ? "in_flight" : "planned";
+}
+
+function lifecycleChip(n) {
+  const st = iterLifecycle(n);
+  return span("lifecycle-chip lifecycle-" + st, st.replace("_", " "));
+}
+
+function toggleCompare(n) {
+  if (n == null) return;
+  const i = state.compare.indexOf(n);
+  if (i >= 0) {
+    state.compare.splice(i, 1);
+  } else {
+    state.compare.push(n);
+    if (state.compare.length > 2) state.compare.shift();
+  }
+  renderTimelineView();
+}
+
 function renderDetail(detail) {
   const display = loopState(detail);
   const badge = el("drawer-badge");
   badge.className = "status-label status-" + display;
   badge.textContent = STATE_LABEL[display];
 
-  el("drawer-mission").textContent = detail.mission || "No mission recorded.";
+  const missionEl = el("drawer-mission");
+  missionEl.textContent = detail.mission || "No mission recorded.";
+  missionEl.title = detail.mission || "";
 
   const cur = detail.iteration != null ? detail.iteration : "–";
   const max = detail.max_iterations != null ? detail.max_iterations : "–";
@@ -451,7 +563,28 @@ function renderDetail(detail) {
     seq.length ? seqLegendEl(seq) : span("seg-seq", "no verdicts yet")
   );
 
+  const commits = Array.isArray(detail.commits) ? detail.commits : [];
+  const csec = el("commits-section");
+  const clist = el("commit-list");
+  clist.textContent = "";
+  csec.hidden = commits.length === 0;
+  for (const c of commits) {
+    const row = document.createElement("div");
+    row.className = "commit-row";
+    const sha = span("commit-sha", c.short || (c.sha || "").slice(0, 7));
+    sha.title = c.sha || "";
+    row.appendChild(sha);
+    if (c.slice) row.appendChild(span("meta-chip slice-chip", c.slice));
+    const subj = span("commit-subject", c.subject || "");
+    subj.title = c.subject || "";
+    row.appendChild(subj);
+    clist.appendChild(row);
+  }
+
   renderTimeline(detail.timeline || []);
+  renderTimelineView();
+  renderFilesView();
+  renderGraphView();
 
   if (!state.activePath) {
     setPaneStatus(
@@ -473,13 +606,32 @@ function renderTimeline(entries) {
     view.appendChild(empty);
     return;
   }
+  /* Every entry is shown, grouped under per-iteration headers — the loop's
+   * full narrative, not a per-(iteration, role) digest. Parallel
+   * iterations interleave in file order, so group strictly by iteration
+   * (file order preserved within each group). */
+  const groups = new Map();
   for (const entry of entries) {
+    const key = entry.iteration ?? null;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  }
+  const order = [...groups.keys()].sort(
+    (x, y) => (x == null ? 1e9 : x) - (y == null ? 1e9 : y)
+  );
+  for (const iter of order) {
+    const hdr = document.createElement("div");
+    hdr.className = "iter-header";
+    hdr.appendChild(
+      span("iter-header-label", iter == null ? "unattributed" : "Iteration " + iter)
+    );
+    if (iter != null) hdr.appendChild(lifecycleChip(iter));
+    view.appendChild(hdr);
+    for (const entry of groups.get(iter)) {
     const row = document.createElement("div");
     row.className = "timeline-row";
-
     row.appendChild(span("role-chip role-" + cssClass(entry.role), entry.role || "?"));
     row.appendChild(span("timeline-dur", fmtDuration(entry.duration_sec)));
-
     const text = document.createElement("div");
     text.className = "timeline-text";
     let summary = entry.summary || "";
@@ -488,14 +640,894 @@ function renderTimeline(entries) {
         span("verdict-word verdict-" + entry.verdict.toLowerCase(), entry.verdict)
       );
       text.appendChild(document.createTextNode(" "));
-      summary = summary.replace(/^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i, "");
+      summary = summary.replace(
+        /^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i,
+        ""
+      );
     }
-    text.appendChild(span("timeline-dur timeline-iter-inline", "iter " + entry.iteration + " · "));
+    if (entry.scope) {
+      text.appendChild(span("meta-chip scope-chip", String(entry.scope)));
+      text.appendChild(document.createTextNode(" "));
+    }
+    if (entry.slice) {
+      text.appendChild(span("meta-chip slice-chip", String(entry.slice)));
+      text.appendChild(document.createTextNode(" "));
+    }
     text.appendChild(document.createTextNode(summary));
+    text.title = summary;
     row.appendChild(text);
-
     view.appendChild(row);
+    }
   }
+}
+
+/* ------------------------------ drawer views ------------------------------ */
+
+function renderDrawerTabs() {
+  const nav = el("drawer-tabs");
+  nav.textContent = "";
+  for (const tab of DRAWER_TABS) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "drawer-tab" + (state.drawerTab === tab ? " active" : "");
+    btn.textContent = tab;
+    btn.setAttribute("aria-pressed", String(state.drawerTab === tab));
+    btn.addEventListener("click", () => {
+      state.drawerTab = tab;
+      renderDrawerTabs();
+      showDrawerTab();
+    });
+    nav.appendChild(btn);
+  }
+}
+
+/* Toggle the active view without refetching: content is re-rendered from
+ * the cached state.detail (renders are cheap, and data arrival re-renders
+ * the visible view via renderDetail). */
+function showDrawerTab() {
+  for (const tab of DRAWER_TABS) {
+    el("view-" + tab).hidden = state.drawerTab !== tab;
+  }
+  renderTimelineView();
+  renderFilesView();
+  renderGraphView();
+}
+
+function appendEmpty(view, msg) {
+  const empty = document.createElement("div");
+  empty.className = "view-empty";
+  empty.textContent = msg;
+  view.appendChild(empty);
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const key in attrs || {}) node.setAttribute(key, attrs[key]);
+  return node;
+}
+
+function entryTitle(entry) {
+  let t =
+    "iter " + (entry.iteration ?? "?") + " · " + (entry.role || "?");
+  if (entry.slice) t += " · " + entry.slice;
+  t += " — " + oneLine(entry.summary, 200);
+  if (entry.duration_sec != null) t += " · " + fmtDuration(entry.duration_sec);
+  if (entry.scope) t += " · scope " + String(entry.scope);
+  return t;
+}
+
+function fmtHm(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+function parseMs(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/* Wall-clock span for one entry; null when it has no usable timing. */
+function tlSpan(entry) {
+  const s = parseMs(entry.started_at);
+  const e = parseMs(entry.ended_at);
+  const d =
+    entry.duration_sec != null && Number.isFinite(Number(entry.duration_sec))
+      ? Number(entry.duration_sec) * 1000
+      : null;
+  if (s != null && e != null) return { start: s, end: e };
+  if (s != null && d != null) return { start: s, end: s + d };
+  if (e != null && d != null) return { start: e - d, end: e };
+  if (e != null) return { start: e, end: e };
+  if (s != null) return { start: s, end: s };
+  return null;
+}
+
+function tlRole(entry) {
+  return String(entry.role || "?").toLowerCase();
+}
+
+function tickStep(rangeMs, plotW) {
+  const steps = [
+    30e3, 60e3, 120e3, 300e3, 600e3, 900e3, 1800e3, 3600e3, 7200e3,
+    10800e3, 21600e3, 43200e3, 86400e3,
+  ];
+  for (const s of steps) {
+    if (s / Math.max(1, rangeMs) * plotW >= 80) return s;
+  }
+  return steps[steps.length - 1];
+}
+
+function scopeLabel(scope) {
+  const s = String(scope);
+  if (s.startsWith("local:")) {
+    const paths = s.slice(6).split(",").filter(Boolean);
+    const one = paths[0] || "";
+    const tail = one.length > 14 ? one.slice(0, 13) + "…" : one;
+    const more = paths.length > 1 ? " +" + (paths.length - 1) : "";
+    return "local:" + tail + more;
+  }
+  return s.length > 18 ? s.slice(0, 17) + "…" : s;
+}
+
+function shortSlice(id) {
+  const s = String(id);
+  return s.length > 16 ? s.slice(0, 15) + "…" : s;
+}
+
+function fitText(text, px) {
+  const max = Math.max(1, Math.floor(px / 5.6));
+  const s = String(text);
+  return s.length > max ? s.slice(0, Math.max(1, max - 1)) + "…" : s;
+}
+
+/* --------------------------- Timeline view --------------------------- */
+
+/* Iteration-centric swimlane: one row per iteration, entries in seq order
+ * as role-colored blocks (wall-clock positioned when timings exist), the
+ * row's last verdict at the right edge, and PLAN.md slice pills beneath. */
+function renderTimelineView() {
+  const view = el("view-timeline");
+  if (view.hidden) return;
+  view.textContent = "";
+  if (!state.detail) {
+    appendEmpty(view, "Loading…");
+    return;
+  }
+  const entries = Array.isArray(state.detail.timeline) ? state.detail.timeline : [];
+  if (!entries.length) {
+    appendEmpty(view, "No log entries yet.");
+    return;
+  }
+  const slices = Array.isArray(state.detail.slices) ? state.detail.slices : [];
+
+  const iters = [];
+  const seenIter = new Set();
+  for (const e of entries) {
+    const k = e.iteration == null ? null : Number(e.iteration);
+    if (!seenIter.has(k)) {
+      seenIter.add(k);
+      iters.push(k);
+    }
+  }
+  iters.sort((x, y) => (x == null ? 1e9 : x) - (y == null ? 1e9 : y));
+
+  const timed = entries.some((e) => tlSpan(e));
+  const W = Math.max(360, view.clientWidth - 2);
+  const ML = 148;
+  const MR = 100;
+  const MT = 8;
+  const MB = timed ? 24 : 10;
+  const BLOCK_H = 22;
+  const PILL_H = 12;
+  const ROW_GAP = 12;
+  const plotW = W - ML - MR;
+
+  let minT = Infinity;
+  let maxT = -Infinity;
+  if (timed) {
+    for (const e of entries) {
+      const sp = tlSpan(e);
+      if (sp) {
+        minT = Math.min(minT, sp.start);
+        maxT = Math.max(maxT, sp.end);
+      }
+    }
+    if (!(maxT > minT)) {
+      minT = 0;
+      maxT = 1;
+    }
+  }
+  const xTime = (t) => ML + ((t - minT) / (maxT - minT)) * plotW;
+
+  const rows = iters.map((it) => ({
+    it,
+    entries: entries.filter(
+      (e) => (e.iteration == null ? null : Number(e.iteration)) === it
+    ),
+    slices: slices.filter(
+      (sl) => sl && sl.iteration != null && Number(sl.iteration) === it
+    ),
+  }));
+  const maxCount = Math.max(1, ...rows.map((r) => r.entries.length));
+  const seqW = Math.max(28, Math.min(110, plotW / maxCount - 6));
+
+  let totalH = 0;
+  const yOf = rows.map((r) => {
+    const y = totalH;
+    totalH += BLOCK_H + (r.slices.length ? PILL_H + 5 : 0) + ROW_GAP;
+    return y;
+  });
+  const H = MT + totalH + MB;
+  const svg = svgEl("svg", {
+    class: "tl-svg",
+    viewBox: "0 0 " + W + " " + H,
+    width: W,
+    height: H,
+    role: "img",
+    "aria-label": "Loop timeline",
+  });
+
+  rows.forEach((row, ri) => {
+    const y = MT + yOf[ri];
+    if (ri > 0) {
+      svg.appendChild(
+        svgEl("line", {
+          class: "tl-rowline",
+          x1: 0, x2: W, y1: y - ROW_GAP / 2, y2: y - ROW_GAP / 2,
+        })
+      );
+    }
+    if (row.it == null) {
+      const lab = svgEl("text", {
+        class: "tl-lane",
+        x: ML - 8,
+        y: y + BLOCK_H / 2 + 3.5,
+        "text-anchor": "end",
+      });
+      lab.textContent = "—";
+      svg.appendChild(lab);
+    } else {
+      const fo = svgEl("foreignObject", {
+        x: 0, y: y, width: ML - 8, height: BLOCK_H,
+      });
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "tl-lanebtn" +
+        (state.compare.includes(row.it) ? " selected" : "");
+      btn.setAttribute("aria-pressed", String(state.compare.includes(row.it)));
+      btn.title = "Click to compare iteration " + row.it;
+      btn.appendChild(span("tl-lanebtn-label", "iter " + row.it));
+      btn.appendChild(lifecycleChip(row.it));
+      btn.addEventListener("click", () => toggleCompare(row.it));
+      fo.appendChild(btn);
+      svg.appendChild(fo);
+    }
+
+    let untimedN = 0;
+    row.entries.forEach((entry, i) => {
+      const role = tlRole(entry);
+      const sp = timed ? tlSpan(entry) : null;
+      if (timed && !sp) {
+        /* Untimed entries in a timed chart: gutter markers right of the plot. */
+        const mx = ML + plotW + 6 + untimedN * 8;
+        untimedN++;
+        const m = svgEl("rect", {
+          class: "tl-untimed",
+          x: mx, y: y + BLOCK_H / 2 - 3, width: 6, height: 6,
+        });
+        const tip = svgEl("title", {});
+        tip.textContent = entryTitle(entry) + " · no timestamps";
+        m.appendChild(tip);
+        svg.appendChild(m);
+        return;
+      }
+      let bx;
+      let bw;
+      if (timed) {
+        bx = xTime(sp.start);
+        bw = Math.max(3, xTime(sp.end) - bx);
+      } else {
+        bx = ML + i * (seqW + 6);
+        bw = seqW;
+      }
+      const g = svgEl("g", {});
+      const seg = svgEl("rect", {
+        class: "tl-seg tl-role-" + cssClass(role),
+        x: bx, y: y, width: bw, height: BLOCK_H, rx: 4,
+      });
+      const tip = svgEl("title", {});
+      tip.textContent = entryTitle(entry);
+      seg.appendChild(tip);
+      g.appendChild(seg);
+      if (bw >= 44) {
+        const t = svgEl("text", {
+          class: "tl-block-label",
+          x: bx + 5,
+          y: y + BLOCK_H / 2 + 3.5,
+        });
+        t.textContent = fitText(entry.slice ? "bld " + shortSlice(entry.slice) : role, bw - 10);
+        g.appendChild(t);
+        if (entry.duration_sec != null && bw >= 92) {
+          const d = svgEl("text", {
+            class: "tl-block-dur",
+            x: bx + bw - 5,
+            y: y + BLOCK_H / 2 + 3.5,
+            "text-anchor": "end",
+          });
+          d.textContent = fmtDuration(entry.duration_sec);
+          g.appendChild(d);
+        }
+      }
+      if (entry.scope) {
+        const sc = svgEl("text", {
+          class: "tl-scope",
+          x: bx + bw + 5,
+          y: y + BLOCK_H / 2 + 3.5,
+        });
+        sc.textContent = scopeLabel(entry.scope);
+        const stip = svgEl("title", {});
+        stip.textContent = String(entry.scope);
+        sc.appendChild(stip);
+        g.appendChild(sc);
+      }
+      svg.appendChild(g);
+    });
+
+    /* Last verdict of the iteration at the right edge. */
+    const vEntry = [...row.entries].reverse().find((e) => e.verdict);
+    if (vEntry) {
+      const vc = normVerdict(vEntry.verdict);
+      const v = svgEl("text", {
+        class: "tl-verdict tl-verdict-" + vc,
+        x: W - 4,
+        y: y + BLOCK_H / 2 + 3.5,
+        "text-anchor": "end",
+      });
+      v.textContent = String(vEntry.verdict).toUpperCase();
+      const vtip = svgEl("title", {});
+      vtip.textContent = entryTitle(vEntry);
+      v.appendChild(vtip);
+      svg.appendChild(v);
+    }
+
+    /* Slice pills beneath the row; click jumps to the graph node. */
+    if (row.slices.length) {
+      let px = ML;
+      const py = y + BLOCK_H + 5;
+      for (const sl of row.slices) {
+        const id = String(sl.id ?? "");
+        const st = normSliceStatus(sl.status);
+        const wpx = Math.min(190, Math.max(44, id.length * 5.6 + 14));
+        if (px + wpx > ML + plotW + 30) break;
+        const pill = svgEl("g", { class: "tl-pill", cursor: "pointer" });
+        pill.appendChild(
+          svgEl("rect", {
+            class: "tl-pill-rect tl-pill-" + st,
+            x: px, y: py, width: wpx, height: PILL_H, rx: 6,
+          })
+        );
+        const pt = svgEl("text", {
+          class: "tl-pill-label",
+          x: px + 7,
+          y: py + PILL_H / 2 + 3,
+        });
+        pt.textContent = fitText(id, wpx - 12);
+        pill.appendChild(pt);
+        const ptip = svgEl("title", {});
+        ptip.textContent =
+          id + " · " + st.replace("_", " ") +
+          " · writes: " + (Array.isArray(sl.writes) ? sl.writes.length : 0) +
+          " · reads: " + (Array.isArray(sl.reads) ? sl.reads.length : 0);
+        pill.appendChild(ptip);
+        pill.addEventListener("click", () => {
+          state.graphSel = id;
+          state.drawerTab = "graph";
+          renderDrawerTabs();
+          showDrawerTab();
+        });
+        svg.appendChild(pill);
+        px += wpx + 6;
+      }
+    }
+  });
+
+  if (timed) {
+    const step = tickStep(maxT - minT, plotW);
+    for (let t = Math.floor(minT / step) * step; t <= maxT; t += step) {
+      const gx = xTime(t);
+      svg.appendChild(
+        svgEl("line", { class: "tl-grid", x1: gx, y1: MT, x2: gx, y2: MT + totalH })
+      );
+      const lab = svgEl("text", {
+        class: "tl-axis-label",
+        x: gx,
+        y: MT + totalH + 14,
+        "text-anchor": "middle",
+      });
+      lab.textContent = fmtHm(t);
+      svg.appendChild(lab);
+    }
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "tl-wrap";
+  wrap.appendChild(svg);
+
+  const overlaps =
+    state.detail && Array.isArray(state.detail.overlaps) ? state.detail.overlaps : [];
+  if (overlaps.length) {
+    const bar = document.createElement("div");
+    bar.className = "overlap-notice";
+    for (const ov of overlaps) {
+      const line = document.createElement("div");
+      line.className = "overlap-line";
+      line.appendChild(
+        span("overlap-head",
+             "Iterations " + ov.a + " and " + ov.b + " overlap (" +
+             String(ov.relation || "").replace("-", "/") + ")")
+      );
+      const paths = (ov.paths || []).join(", ");
+      const det = span("overlap-paths", paths);
+      det.title = paths;
+      line.appendChild(det);
+      bar.appendChild(line);
+    }
+    view.appendChild(bar);
+  }
+
+  if (state.compare.length) {
+    view.appendChild(comparePanel());
+  }
+
+  view.appendChild(wrap);
+}
+
+/* Side-by-side compare of up to two selected iterations. */
+function comparePanel() {
+  const panel = document.createElement("div");
+  panel.className = "compare-panel";
+
+  const head = document.createElement("div");
+  head.className = "compare-head";
+  head.appendChild(span("section-label", "Compare iterations"));
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.className = "follow-btn";
+  clear.textContent = "Clear selection";
+  clear.addEventListener("click", () => {
+    state.compare = [];
+    renderTimelineView();
+  });
+  head.appendChild(clear);
+  panel.appendChild(head);
+
+  const grid = document.createElement("div");
+  grid.className = "compare-grid";
+
+  const cols = state.compare.map((n) => {
+    const meta = iterMeta(n) || {};
+    const files = Array.isArray(meta.files) ? meta.files : [];
+    const criteria = Array.isArray(meta.criteria) ? meta.criteria : [];
+    return { n, meta, files, criteria };
+  });
+  const shared =
+    cols.length === 2 ? new Set(cols[0].files.filter((f) => cols[1].files.includes(f))) : new Set();
+
+  for (const col of cols) {
+    const card = document.createElement("div");
+    card.className = "compare-col";
+
+    const title = document.createElement("div");
+    title.className = "compare-title";
+    title.appendChild(span("compare-iter", "Iteration " + col.n));
+    title.appendChild(lifecycleChip(col.n));
+    card.appendChild(title);
+
+    const facts = document.createElement("dl");
+    facts.className = "compare-facts";
+    const addFact = (label, value) => {
+      const dt = document.createElement("dt");
+      dt.textContent = label;
+      const dd = document.createElement("dd");
+      dd.textContent = value == null || value === "" ? "—" : String(value);
+      facts.appendChild(dt);
+      facts.appendChild(dd);
+    };
+    addFact("Verdict", col.meta.verdict || "—");
+    addFact("Duration", col.meta.duration_sec != null ? fmtDuration(col.meta.duration_sec) : "—");
+    addFact("Started", col.meta.started || "—");
+    addFact("Ended", col.meta.ended || "—");
+    card.appendChild(facts);
+
+    if (col.criteria.length) {
+      const cl = document.createElement("div");
+      cl.className = "compare-criteria";
+      for (const c of col.criteria) {
+        const row = document.createElement("div");
+        row.className = "compare-crit";
+        row.appendChild(span("crit-outcome crit-" + String(c.outcome || "").toLowerCase(), c.outcome || "?"));
+        row.appendChild(span("crit-id", c.id || ""));
+        const t = span("crit-title", c.title || "");
+        t.title = c.title || "";
+        row.appendChild(t);
+        cl.appendChild(row);
+      }
+      card.appendChild(cl);
+    }
+
+    const fl = document.createElement("div");
+    fl.className = "compare-files";
+    if (!col.files.length) {
+      fl.appendChild(span("crit-title", "No attributed files"));
+    }
+    for (const f of col.files) {
+      const chip = span("compare-file" + (shared.has(f) ? " shared" : ""), f);
+      chip.title = shared.has(f) ? f + " — also written by the other iteration" : f;
+      fl.appendChild(chip);
+    }
+    card.appendChild(fl);
+
+    grid.appendChild(card);
+  }
+
+  panel.appendChild(grid);
+  return panel;
+}
+
+/* --------------------------- Files view --------------------------- */
+
+function renderFilesView() {
+  const view = el("view-files");
+  if (view.hidden) return;
+  view.textContent = "";
+  if (!state.detail) {
+    appendEmpty(view, "Loading…");
+    return;
+  }
+  const slices = Array.isArray(state.detail.slices) ? state.detail.slices : null;
+  if (!slices || !slices.length) {
+    appendEmpty(view, "PLAN.md has no slices block.");
+    return;
+  }
+  const shadow = new Map();
+  for (const s of (state.detail.slice_activity &&
+    state.detail.slice_activity.slices) || []) {
+    if (s && s.id != null) {
+      shadow.set(String(s.id), new Set((s.undeclared || []).map(String)));
+    }
+  }
+  const rows = new Map();
+  const iters = new Set();
+  const MAIL = "@mailbox";
+  const bump = (rows, key, iterKey, id, drift) => {
+    let row = rows.get(key);
+    if (!row) {
+      row = { label: key, cells: new Map() };
+      rows.set(key, row);
+    }
+    let c = row.cells.get(iterKey);
+    if (!c) {
+      c = { count: 0, ids: [], drift: false };
+      row.cells.set(iterKey, c);
+    }
+    c.count += 1;
+    if (!c.ids.includes(id)) c.ids.push(id);
+    if (drift) c.drift = true;
+  };
+  for (const s of slices) {
+    const id = String(s.id ?? "");
+    const iterKey = s.iteration == null ? "—" : String(s.iteration);
+    iters.add(iterKey);
+    for (const w of Array.isArray(s.writes) ? s.writes : []) {
+      if (typeof w !== "string" || !w) continue;
+      if (w.startsWith("api:")) continue; // interface names are not files
+      const key = w.startsWith("loop/") ? MAIL : w;
+      bump(rows, key, iterKey, id, false);
+    }
+    const und = shadow.get(id);
+    if (und) {
+      for (const u of und) {
+        const key = u.startsWith("loop/") ? MAIL : u;
+        bump(rows, key, iterKey, id, true);
+      }
+    }
+  }
+  const rowKeys = [...rows.keys()].filter((k) => k !== MAIL).sort();
+  if (rows.has(MAIL)) rowKeys.push(MAIL);
+  const iterCols = [...iters].sort((a, b) =>
+    a === "—" ? 1 : b === "—" ? -1 : Number(a) - Number(b)
+  );
+  if (!rowKeys.length) {
+    appendEmpty(view, "No file writes recorded in PLAN.md slices.");
+    return;
+  }
+  let maxCount = 1;
+  for (const k of rowKeys) {
+    for (const c of rows.get(k).cells.values()) {
+      maxCount = Math.max(maxCount, c.count);
+    }
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "heat-wrap";
+  const grid = document.createElement("div");
+  grid.className = "heat-grid";
+  grid.setAttribute("role", "table");
+  grid.setAttribute("aria-label", "Slice file writes per iteration");
+  grid.style.gridTemplateColumns =
+    "minmax(110px, 1fr) repeat(" + iterCols.length + ", 34px)";
+
+  const head = document.createElement("div");
+  head.className = "heat-file heat-hdr";
+  head.setAttribute("role", "columnheader");
+  head.textContent = "file";
+  grid.appendChild(head);
+  for (const it of iterCols) {
+    const h = document.createElement("div");
+    h.className = "heat-hdr";
+    h.textContent = it;
+    h.setAttribute("role", "columnheader");
+    grid.appendChild(h);
+  }
+
+  for (const key of rowKeys) {
+    const row = rows.get(key);
+    const label = key === MAIL ? "loop/ (mailbox)" : key;
+    const lf = document.createElement("div");
+    lf.className = "heat-file heat-rowfile";
+    lf.textContent = label;
+    lf.setAttribute("role", "rowheader");
+    lf.title = key === MAIL ? "loop/ mailbox paths" : label;
+    grid.appendChild(lf);
+    for (const it of iterCols) {
+      const c = row.cells.get(it);
+      const cell = document.createElement("div");
+      cell.className = "heat-cell" + (c ? " hot" : " empty") +
+        (c && c.drift ? " drift" : "");
+      if (c) {
+        const a = 0.1 + 0.65 * (c.count / maxCount);
+        cell.style.background = "rgba(232, 163, 61, " + a.toFixed(3) + ")";
+        cell.title = label + (it === "—" ? " · unplanned" : " · iter " + it) +
+          " — " + c.ids.join(", ") +
+          (c.drift ? " (undeclared)" : "");
+      } else {
+        cell.title = label + (it === "—" ? " · unplanned" : " · iter " + it) +
+          " — no writes";
+      }
+      grid.appendChild(cell);
+    }
+  }
+  wrap.appendChild(grid);
+  view.appendChild(wrap);
+}
+
+/* --------------------------- Graph view --------------------------- */
+
+function graphNodeW(id) {
+  return Math.min(168, Math.max(64, Math.round(id.length * 6.4 + 20)));
+}
+
+function normSliceStatus(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "complete" || s === "completed" || s === "done") return "complete";
+  if (
+    s === "in_progress" || s === "in-progress" ||
+    s === "running" || s === "active"
+  ) return "in_progress";
+  return "planned";
+}
+
+function renderGraphView() {
+  const view = el("view-graph");
+  if (view.hidden) return;
+  view.textContent = "";
+  if (!state.detail) {
+    appendEmpty(view, "Loading…");
+    return;
+  }
+  const slices = Array.isArray(state.detail.slices) ? state.detail.slices : null;
+  if (!slices || !slices.length) {
+    appendEmpty(view, "PLAN.md has no slices block.");
+    return;
+  }
+  const NODE_H = 26;
+  const V_GAP = 16;
+  const L_GAP = 56;
+
+  /* Layers: numbered iterations ascending; slices without an iteration get
+   * their own layer at the end, in declaration order. */
+  const numbered = slices
+    .map((s, i) => ({ s, i }))
+    .filter((x) => x.s.iteration != null)
+    .sort((a, b) => a.s.iteration - b.s.iteration || a.i - b.i);
+  const layers = [];
+  for (const x of numbered) {
+    const last = layers[layers.length - 1];
+    if (last && last[0].s.iteration === x.s.iteration) last.push(x);
+    else layers.push([x]);
+  }
+  for (const x of slices
+    .map((s, i) => ({ s, i }))
+    .filter((x) => x.s.iteration == null)) {
+    layers.push([x]);
+  }
+
+  const widths = layers.map((layer) =>
+    Math.max(...layer.map((x) => graphNodeW(String(x.s.id ?? x.i))))
+  );
+  const W =
+    20 + widths.reduce((a, b) => a + b, 0) +
+    Math.max(0, layers.length - 1) * L_GAP + 20;
+  const xs = [];
+  let cx = 20;
+  for (const w of widths) {
+    xs.push(cx);
+    cx += w + L_GAP;
+  }
+  const maxNodes = Math.max(...layers.map((l) => l.length));
+  const H = 24 + maxNodes * (NODE_H + V_GAP) + 24;
+  const pos = new Map();
+  for (let li = 0; li < layers.length; li++) {
+    const total = layers[li].length * (NODE_H + V_GAP);
+    let y = (H - total) / 2;
+    for (const x of layers[li]) {
+      pos.set(x.i, { x: xs[li], y, w: widths[li] });
+      y += NODE_H + V_GAP;
+    }
+  }
+
+  /* Edges A→B when B reads something A writes (string equality, api: names
+   * included). Dashed when the coupling is api:-only. */
+  const edges = [];
+  for (let bi = 0; bi < slices.length; bi++) {
+    const B = slices[bi];
+    const reads = new Set((Array.isArray(B.reads) ? B.reads : []).map(String));
+    for (let ai = 0; ai < slices.length; ai++) {
+      if (ai === bi) continue;
+      const A = slices[ai];
+      const matched = (Array.isArray(A.writes) ? A.writes : [])
+        .map(String)
+        .filter((w) => reads.has(w) && !w.startsWith("loop/"));
+      if (matched.length) edges.push({ from: ai, to: bi, matched });
+    }
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "graph-wrap";
+  const svg = svgEl("svg", {
+    class: "g-svg",
+    viewBox: "0 0 " + W + " " + H,
+    width: W,
+    height: H,
+    role: "img",
+    "aria-label": "Slice dependency graph",
+  });
+  const defs = svgEl("defs", {});
+  const mk = svgEl("marker", {
+    id: "g-arrow",
+    viewBox: "0 0 10 10",
+    refX: 9,
+    refY: 5,
+    markerWidth: 6.5,
+    markerHeight: 6.5,
+    orient: "auto-start-reverse",
+  });
+  mk.appendChild(svgEl("path", { d: "M0,0 L10,5 L0,10 z", class: "g-arrow-path" }));
+  defs.appendChild(mk);
+  const mks = svgEl("marker", {
+    id: "g-arrow-sel",
+    viewBox: "0 0 10 10",
+    refX: 9,
+    refY: 5,
+    markerWidth: 7,
+    markerHeight: 7,
+    orient: "auto-start-reverse",
+  });
+  mks.appendChild(svgEl("path", { d: "M0,0 L10,5 L0,10 z", class: "g-arrow-sel-path" }));
+  defs.appendChild(mks);
+  svg.appendChild(defs);
+
+  const sel = state.graphSel;
+  const hasSel = sel != null && slices.some((s) => String(s.id ?? "") === sel);
+  if (!hasSel) state.graphSel = null;
+
+  for (const e of edges) {
+    const A = pos.get(e.from);
+    const B = pos.get(e.to);
+    const ax = A.x + A.w;
+    const ay = A.y + NODE_H / 2;
+    const sameLayer = B.x === A.x;
+    let d;
+    if (sameLayer) {
+      /* Route around the right side of the layer so the arrow enters B's
+       * right edge pointing left (source and target share a column). */
+      const bx = B.x + B.w;
+      const by = B.y + NODE_H / 2;
+      d = "M " + ax + " " + ay +
+        " C " + (ax + 40) + " " + ay +
+        ", " + (bx + 40) + " " + by +
+        ", " + bx + " " + by;
+    } else {
+      const bx = B.x;
+      const by = B.y + NODE_H / 2;
+      d = "M " + ax + " " + ay + " L " + bx + " " + by;
+    }
+    const apiOnly = e.matched.every((m) => m.startsWith("api:"));
+    const isSel =
+      hasSel &&
+      (String(slices[e.from].id ?? "") === sel ||
+        String(slices[e.to].id ?? "") === sel);
+    const cls =
+      "g-edge" + (apiOnly ? " g-edge-api" : "") +
+      (isSel ? " g-edge-sel" : hasSel ? " g-edge-dim" : "");
+    const line = svgEl("path", { class: cls, d });
+    line.setAttribute("marker-end", isSel ? "url(#g-arrow-sel)" : "url(#g-arrow)");
+    const tip = svgEl("title", {});
+    tip.textContent =
+      String(slices[e.from].id ?? e.from) + " → " +
+      String(slices[e.to].id ?? e.to) + ": " + e.matched.join(", ");
+    line.appendChild(tip);
+    svg.appendChild(line);
+  }
+
+  for (let i = 0; i < slices.length; i++) {
+    const s = slices[i];
+    const id = String(s.id ?? i);
+    const p = pos.get(i);
+    const status = normSliceStatus(s.status);
+    const g = svgEl("g", {
+      class:
+        "g-node g-node-" + status +
+        (id === state.graphSel ? " g-node-sel" : ""),
+      transform: "translate(" + p.x + ", " + p.y + ")",
+      "data-id": id,
+      tabindex: "0",
+      role: "button",
+    });
+    g.appendChild(
+      svgEl("rect", { class: "g-node-bg", width: p.w, height: NODE_H, rx: 6 })
+    );
+    const maxChars = Math.max(4, Math.floor((p.w - 16) / 6.1));
+    const label = svgEl("text", {
+      class: "g-node-label",
+      x: 8,
+      y: NODE_H / 2 + 3.5,
+    });
+    label.textContent =
+      id.length > maxChars ? id.slice(0, maxChars - 1) + "…" : id;
+    g.appendChild(label);
+    const tip = svgEl("title", {});
+    tip.textContent =
+      id + " · " + status +
+      (s.iteration != null ? " · iter " + s.iteration : "");
+    g.appendChild(tip);
+    g.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      state.graphSel = state.graphSel === id ? null : id;
+      renderGraphView();
+    });
+    g.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        state.graphSel = state.graphSel === id ? null : id;
+        renderGraphView();
+      }
+    });
+    svg.appendChild(g);
+  }
+  svg.addEventListener("click", (ev) => {
+    if (ev.target === svg) {
+      state.graphSel = null;
+      renderGraphView();
+    }
+  });
+
+  wrap.appendChild(svg);
+  view.appendChild(wrap);
 }
 
 /* --------------------------- sessions --------------------- */
