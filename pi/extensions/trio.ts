@@ -1,5 +1,6 @@
 import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -9,6 +10,20 @@ import {
 
 const READ_TOOLS = ["read", "grep", "find", "ls"];
 const WRITE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+// trio-productionize-dispatch:start
+const PI_PRODUCTIONIZE_DISPATCH = `## Pi dispatch
+
+- \`scout\` (probe batches): use this extension's existing \`runRole\`
+  agent-session mechanism with the read-only Scout role and \`READ_TOOLS\`.
+- \`assessor:<tier>\` (judgment batches): use the same \`runRole\`
+  mechanism with the Lead-equivalent assessor role at the requested tier.
+- \`user\` nodes: ask the user directly through the Pi UI before recording
+  the decision as evidence.
+- Delivery first: every agent writes
+  \`pz-run/results/<batch-stem>.json\` before replying; the orchestrator
+  records verdicts from that file.
+`;
+// trio-productionize-dispatch:end
 
 async function exists(path: string): Promise<boolean> {
   try { await readFile(path); return true; } catch { return false; }
@@ -218,6 +233,27 @@ export default function trioExtension(pi: ExtensionAPI) {
         }
         await rm(lock, { force: true });
       }
+    },
+  });
+  pi.registerCommand("trio-productionize", {
+    description: "Run the production-readiness audit",
+    handler: async (args, ctx) => {
+      const pzHome = process.env.TRIO_PZ_HOME
+        || join(homedir(), ".local/share/trio-agent-loop/productionize");
+      const commandPath = join(pzHome, "command.md");
+      if (!(await exists(commandPath))) {
+        ctx.ui.notify(
+          "Productionize assets are not installed. From the agent-trio-template repo run: ./install.sh --productionize (or any harness install flag, which also installs them).",
+          "error",
+        );
+        return;
+      }
+
+      const command = await readFile(commandPath, "utf8");
+      const argumentsSection = args.trim()
+        ? `\n\n## User arguments\n\n${args.trim()}\n`
+        : "";
+      pi.sendUserMessage(`${command.trim()}\n\n${PI_PRODUCTIONIZE_DISPATCH}${argumentsSection}`);
     },
   });
 }

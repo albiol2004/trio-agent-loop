@@ -3,6 +3,7 @@
 #   ./install.sh --global          -> ~/.claude  (available in EVERY project; recommended)
 #   ./install.sh /path/to/project  -> <project>/.claude (committed with that repo)
 #   ./install.sh --codex           -> Codex skills + custom agents + fallback
+#   ./install.sh --productionize   -> shared graph/driver/glossary audit assets only
 #   ./install.sh --omnigent        -> isolated mixed Claude/Cursor Omnigent agent
 #   ./install.sh --kimi            -> Kimi Code skills + sequential fallback
 #   ./install.sh --zcode           -> native ZCode skills
@@ -55,6 +56,32 @@ install_role_file() {
     echo "Preserving existing $target (not trio-installed; move it aside to receive repo updates)" >&2
   fi
 }
+# install_role_dir <src-dir> <dest-dir> — recursively install repo-owned
+# generated assets while preserving hand edits, with one manifest per tree.
+install_role_dir() {
+  local src_dir="$1" dest_dir="$2" entry
+  mkdir -p "$dest_dir"
+  for entry in "$src_dir"/*; do
+    [[ -e "$entry" ]] || continue
+    if [[ -d "$entry" ]]; then
+      install_role_dir "$entry" "$dest_dir/$(basename "$entry")"
+    else
+      install_role_file "$entry" "$dest_dir"
+    fi
+  done
+}
+
+# install_productionize_assets — install the audit graph, driver, glossary,
+# and canonical command outside any harness-specific surface.
+install_productionize_assets() {
+  local pz_home="${TRIO_PZ_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/trio-agent-loop/productionize}"
+  install_role_file "$ROOT/productionize/command.md" "$pz_home"
+  for dir in graph driver glossary; do
+    install_role_dir "$ROOT/productionize/$dir" "$pz_home/$dir"
+  done
+  echo "Installed productionize audit assets under $pz_home."
+}
+
 
 # inject_orchestration <target> — upsert the marked block from
 # portable/ORCHESTRATION.md into the harness's user-global instruction file.
@@ -109,6 +136,9 @@ case "${1:-}" in
     mkdir -p "$HOME/.agents/skills" "$HOME/.codex/agents"
     cp -rv "$ROOT/codex/skills/trio" "$HOME/.agents/skills/"
     cp -rv "$ROOT/codex/skills/trio-init" "$HOME/.agents/skills/"
+    cp -rv "$ROOT/codex/skills/trio-productionize" "$HOME/.agents/skills/"
+    cp -rv "$ROOT/codex/skills/trio-ship" "$HOME/.agents/skills/"
+    install_productionize_assets
     cp -v "$ROOT"/codex/agents/trio-*.toml "$HOME/.codex/agents/"
     chmod +x "$HOME/.agents/skills/trio/scripts/run-role.sh"
     inject_orchestration "$HOME/.codex/AGENTS.md"
@@ -179,6 +209,12 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     mkdir -p "$HOME/.claude/skills" "$HOME/.agents/skills" "$TRIOCTL_BIN_DIR"
     cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CLAUDE_OMNIGENT_SKILL/"
     cp -r "$ROOT/omnigent/entrypoints/trio-omnigent/." "$CODEX_OMNIGENT_SKILL/"
+    CLAUDE_OMNIGENT_PZ_SKILL="$HOME/.claude/skills/trio-productionize-omnigent"
+    CODEX_OMNIGENT_PZ_SKILL="$HOME/.agents/skills/trio-productionize-omnigent"
+    mkdir -p "$CLAUDE_OMNIGENT_PZ_SKILL" "$CODEX_OMNIGENT_PZ_SKILL"
+    cp -r "$ROOT/omnigent/entrypoints/trio-productionize-omnigent/." "$CLAUDE_OMNIGENT_PZ_SKILL/"
+    cp -r "$ROOT/omnigent/entrypoints/trio-productionize-omnigent/." "$CODEX_OMNIGENT_PZ_SKILL/"
+    install_productionize_assets
     cp "$ROOT/omnigent/trioctl" "$TRIOCTL_BIN_DIR/trioctl"
     cp "$ROOT/omnigent/trioctl.example.toml" "$TRIOCTL_BIN_DIR/trioctl.example.toml"
     chmod +x "$TRIOCTL_BIN_DIR/trioctl"
@@ -199,7 +235,10 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     mkdir -p "$KIMI_HOME/skills"
     cp -rv "$ROOT/kimi/skills/trio" "$KIMI_HOME/skills/"
     cp -rv "$ROOT/kimi/skills/trio-init" "$KIMI_HOME/skills/"
+    cp -rv "$ROOT/kimi/skills/trio-productionize" "$KIMI_HOME/skills/"
+    cp -rv "$ROOT/kimi/skills/trio-ship" "$KIMI_HOME/skills/"
     chmod +x "$KIMI_HOME/skills/trio/scripts/run-role.sh"
+    install_productionize_assets
     inject_orchestration "$KIMI_HOME/AGENTS.md"
     echo "Installed Kimi Code Trio skills and sequential role runner."
     echo "Next: follow SETUP-BY-KIMI.md to validate Kimi Code and initialize a mailbox."
@@ -208,11 +247,16 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     mkdir -p "$HOME/.zcode/skills"
     cp -rv "$ROOT/zcode/skills/trio" "$HOME/.zcode/skills/"
     cp -rv "$ROOT/zcode/skills/trio-init" "$HOME/.zcode/skills/"
+    cp -rv "$ROOT/zcode/skills/trio-productionize" "$HOME/.zcode/skills/"
+    install_productionize_assets
+    echo "Orchestration policy injection is N/A for ZCode; no global instructions file convention found."
     echo "Installed native ZCode Trio skills. Refresh Settings -> Skills."
     exit 0 ;;
   --pi)
+    install_productionize_assets
     mkdir -p "$HOME/.pi/agent/extensions"
     cp -v "$ROOT/pi/extensions/trio.ts" "$HOME/.pi/agent/extensions/trio.ts"
+    inject_orchestration "$HOME/.pi/agent/AGENTS.md"
     echo "Installed native Pi Trio extension. Run /reload, then /trio <goal>."
     exit 0 ;;
   --opencode)
@@ -250,6 +294,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     for f in "$ROOT"/opencode/commands/*.md; do
       install_role_file "$f" "$OPENCODE_DEST/commands"
     done
+    install_productionize_assets
     target="$OPENCODE_DEST/opencode.trio.example.jsonc"
     if [[ -e "$target" ]]; then
       echo "Preserving existing $target"
@@ -309,6 +354,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     for f in "$ROOT"/omp/commands/*.md; do
       install_role_file "$f" "$OMP_DEST/commands"
     done
+    install_productionize_assets
     if [[ -n "$OMP_STRONG_MODEL" ]]; then
       bash "$ROOT/omp/configure-models.sh" \
         --agent-dir "$OMP_DEST" \
@@ -324,6 +370,10 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     fi
     echo "Smoke-test script (repo-side): $ROOT/omp/smoke-test.sh"
     echo "Next: follow SETUP-BY-OMP.md and validate the installed role mappings."
+    exit 0 ;;
+  --productionize)
+    install_productionize_assets
+    echo "Productionize assets only; harness surfaces are added by --global, --codex, --omnigent, --kimi, --zcode, --pi, --opencode, and --omp."
     exit 0 ;;
   --bridge)
     shift
@@ -406,7 +456,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | --dashboard | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --productionize | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | --dashboard | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 
@@ -415,9 +465,11 @@ mkdir -p "$DEST/agents" "$DEST/skills"
 for f in "$SRC"/agents/trio-*.md; do
   cp -v "$f" "$DEST/agents/"
 done
-for d in "$SRC"/skills/trio "$SRC"/skills/trio-init; do
+for d in "$SRC"/skills/trio "$SRC"/skills/trio-init \
+         "$SRC"/skills/trio-productionize "$SRC"/skills/trio-ship; do
   cp -rv "$d" "$DEST/skills/"
 done
+install_productionize_assets
 
 if [[ -n "${INJECT_ORCHESTRATION_TARGET:-}" ]]; then
   inject_orchestration "$INJECT_ORCHESTRATION_TARGET"
