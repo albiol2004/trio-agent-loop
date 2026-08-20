@@ -30,3 +30,9 @@ the mailbox iteration cap, and never commits.
 
 References: https://pi.dev/docs/latest/sdk and
 https://pi.dev/docs/latest/extensions
+
+
+## Productionize audit
+
+Pi exposes `/trio-productionize` in the extension; it reads `command.md` at
+runtime. `--productionize` (or the Pi install flag) installs the shared assets.

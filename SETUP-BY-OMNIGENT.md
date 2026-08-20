@@ -275,3 +275,8 @@ Remove `~/.omnigent/agents/trio-omnigent-roles`,
 `~/.claude/skills/trio-omnigent`, and
 `~/.agents/skills/trio-omnigent`. The native Claude and Codex Trio
 installations remain intact.
+
+## Productionize audit
+
+Omnigent exposes the `trio-productionize-omnigent` entrypoint skill. `--productionize`
+(or the Omnigent install flag) installs the shared assets.

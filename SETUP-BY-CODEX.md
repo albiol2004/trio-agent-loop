@@ -87,3 +87,9 @@ permission diagnostics. The loop never commits.
 instruction file, so every Codex session loads the same cross-harness routing
 workstyle. Only the marked region is ever replaced: re-running the installer
 is byte-idempotent, and any other content in your AGENTS.md is preserved.
+
+
+## Productionize audit
+
+Codex exposes `/trio-productionize` as a skill. `--productionize` (or the
+Codex install flag) installs the shared assets.

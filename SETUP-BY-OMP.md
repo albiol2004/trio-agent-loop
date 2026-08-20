@@ -192,3 +192,9 @@ config path described above instead of editing frontmatter.
 - **Model not used as expected**: check `omp config get task.agentModelOverrides
   --json`. If it is set, it overrides frontmatter. Clear or update it with
   `omp config set`.
+
+
+## Productionize audit
+
+Omp exposes `/trio-productionize` as a command. `--productionize` (or the Omp
+install flag) installs the shared assets.

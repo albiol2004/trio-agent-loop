@@ -120,3 +120,9 @@ after inspecting `VERDICT.md`, and stop on `SHIP`, `BLOCKED`, or
 - [Model aliases and configuration](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html)
 - [Agent Skills and discovery](https://moonshotai.github.io/kimi-code/en/customization/skills)
 - [Built-in agents and sub-agents](https://moonshotai.github.io/kimi-code/en/customization/agents)
+
+
+## Productionize audit
+
+Kimi exposes `/trio-productionize` as a skill. `--productionize` (or the Kimi
+install flag) installs the shared assets.

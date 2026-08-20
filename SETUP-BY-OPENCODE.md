@@ -207,3 +207,9 @@ That fallback preserves the mailbox and verdict semantics but runs the Lead
 and Evaluator sequentially through the CLI; it cannot enforce native named
 subagent separation. See [portable/SETUP-opencode.md](portable/SETUP-opencode.md)
 for its deliberately narrower contract.
+
+
+## Productionize audit
+
+OpenCode exposes `/trio-productionize` as a command. `--productionize` (or the
+OpenCode install flag) installs the shared assets.

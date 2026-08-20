@@ -99,3 +99,9 @@ Athen-specific details and caveats (risk gate, workspace dir, timeouts,
 inert `--max-steps`) live in `portable/SETUP-athen.md`; design rationale and
 research citations in `README.md` — read them if the user asks why the loop
 is shaped this way.
+
+
+## Productionize audit
+
+Athen exposes `/trio-productionize` through its installed skill surface.
+`--productionize` (or the Athen install flag) installs the shared assets.

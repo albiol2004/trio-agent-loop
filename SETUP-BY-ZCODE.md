@@ -95,3 +95,10 @@ ZCode references:
 - https://zcode.z.ai/en/docs/goal
 - https://zcode.z.ai/en/docs/subagents
 - https://zcode.z.ai/en/docs/skill
+
+
+## Productionize audit
+
+ZCode exposes `/trio-productionize` as a skill. `--productionize` (or the ZCode
+install flag) installs the shared assets. ZCode is a no-commit harness and has
+no `/trio-ship`.

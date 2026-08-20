@@ -47,3 +47,9 @@ preserved.
 
 Design rationale and research citations live in README.md — read it if the
 user asks why the loop is shaped this way.
+
+
+## Productionize audit
+
+Claude exposes `/trio-productionize` as a skill. `--productionize` (or the
+Claude install flag) installs the shared assets.

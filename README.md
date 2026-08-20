@@ -84,6 +84,16 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
   --strong-model provider/strong --light-model provider/light
                                 # Omp native agents + optional model overrides
 ```
+
+`./install.sh --productionize` installs the shared audit assets only.
+
+The productionize audit (`/trio-productionize`) is available on every harness
+after install. Its assets live at
+`${TRIO_PZ_HOME:-~/.local/share/trio-agent-loop/productionize}`; it runs the
+404-node production-readiness graph against a project, triages failures with
+the user (fix/defer/accept-risk/dispute), and seeds fix-triaged items into the
+Trio loop. `/trio-ship` is now available on Claude, Codex, Kimi, and OpenCode;
+ZCode and Pi are no-commit harnesses, so they do not provide `/trio-ship`.
 Every harness install also upserts the marked block from
 `portable/ORCHESTRATION.md` into that harness's user-global instruction file
 (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.kimi-code/AGENTS.md`,
