@@ -46,6 +46,45 @@ EMBEDDED = [
     ("omnigent/entrypoints/trio-omnigent/SKILL.md", "md"),
 ]
 
+# Generated standalone documents: one canonical body in prompts/documents/,
+# fanned out to per-harness command/skill surfaces with per-dest frontmatter.
+# (source, [(dest, frontmatter-lines), ...])
+DOCUMENTS = [
+    ("trio-ship", [
+        ("omp/commands/trio-ship.md",
+         ["---",
+          "description: Manually recover an orphaned SHIP verdict — performs the Evaluator's retirement commit (product + mailbox) for a SHIP whose commit: lines are missing. No subagent, no model config.",
+          "---"]),
+        ("opencode/commands/trio-ship.md",
+         ["---",
+          "description: Manually recover an orphaned SHIP verdict — perform the Evaluator's retirement commit for a SHIP whose commit: lines are missing.",
+          "agent: trio-orchestrator",
+          "---"]),
+        (".claude/skills/trio-ship/SKILL.md",
+         ["---",
+          "name: trio-ship",
+          "description: Recover an orphaned SHIP verdict — perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config.",
+          "---"]),
+        ("codex/skills/trio-ship/SKILL.md",
+         ["---",
+          "name: trio-ship",
+          "description: Recover an orphaned SHIP verdict — perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config.",
+          "---"]),
+        ("kimi/skills/trio-ship/SKILL.md",
+         ["---",
+          "name: trio-ship",
+          "description: Recover an orphaned SHIP verdict — perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config.",
+          "---"]),
+    ]),
+]
+DOCUMENTS_DIR = ROOT / "prompts" / "documents"
+
+
+def render_document(source: str, frontmatter: list[str]) -> str:
+    body = (DOCUMENTS_DIR / f"{source}.md").read_text(encoding="utf-8")
+    return "\n".join(frontmatter) + "\n\n" + body.lstrip("\n")
+
+
 SLOT_REF = re.compile(r"{{\s*(\w+)\.([A-Z][A-Z0-9_]*)\s*}}")
 TARGET_RE = re.compile(r"^([\w.]+)(?:@([\w.]+))?\s*:\s*(\S+)\s*$")
 SLOT_LINE_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:\s*(.*)$")
@@ -247,6 +286,9 @@ def all_outputs() -> dict[Path, str]:
         path = ROOT / relpath
         if path.is_file():
             outputs[path] = upsert_embedded(path, style)
+    for source, dests in DOCUMENTS:
+        for relpath, frontmatter in dests:
+            outputs[ROOT / relpath] = render_document(source, frontmatter)
     return outputs
 
 

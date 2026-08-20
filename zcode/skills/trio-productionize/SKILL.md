@@ -1,7 +1,6 @@
 ---
-description: Run the production-readiness graph against this project — batched probe scouts, tiered judgment assessors, user triage — then report failures ordered by severity and hand fix-triaged items to the trio loop.
-agent: trio-orchestrator
-subtask: true
+name: trio-productionize
+description: Run a production-readiness audit of the current project against the production-readiness graph — batched probe scouts, tiered judgment assessors, user triage, then hand fix-triaged failures to the trio loop. Use when the user invokes /trio-productionize or asks to productionize the project.
 ---
 
 Run a production-readiness audit of the current project: the
@@ -18,11 +17,13 @@ and close-out. If `$PZ_HOME/command.md` is missing, stop and tell the user
 to install the assets (`install.sh --productionize` from the
 agent-trio-template repo).
 
-## Dispatch (opencode)
+## Dispatch (this harness)
 
-- `scout` (probe batches) → subtask with the **trio-scout** agent, one per
-  batch file in `pz-run/batches/`.
-- `assessor:<tier>` (judgment batches) → subtask with **trio-orchestrator**.
+Use ZCode's native custom subagents (same agents the trio skill uses):
+- `scout` (probe batches) → **trio-scout** subagent, one per batch file in
+  `pz-run/batches/`.
+- `assessor:<tier>` (judgment batches) → **trio-lead** (standard) /
+  **trio-evaluator** (high) subagent.
 - `user` nodes → ask the user in-session; record the decision verbatim.
 
 ## Delivery (binding on every dispatched agent)
