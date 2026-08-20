@@ -1,0 +1,710 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "health-contract",
+      "domain": "reliability",
+      "title": "Health Contract",
+      "summary": "Expose separate, cheap liveness, readiness, and startup health contracts with documented status semantics and bounded latency. Conflated or slow probes can restart healthy processes, route traffic to broken instances, or amplify an outage.",
+      "check": "probe",
+      "probe": "Parse route registrations and deployment manifests for `/livez`, `/readyz`, and `/startupz` (or documented equivalents), curl each during normal operation and an injected dependency failure, and assert bounded latency plus the expected status transition.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#health-contract",
+      "sources": [
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring"
+      ],
+      "cluster": "health-check-contracts"
+    },
+    {
+      "id": "liveness-process-only",
+      "domain": "reliability",
+      "title": "Liveness Process Only",
+      "summary": "Keep liveness checks limited to whether the local process can make progress, leaving dependency and traffic eligibility checks to readiness. A dependency outage that makes every instance fail liveness causes restart storms and removes the capacity needed for recovery.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the liveness handler and its call graph for dependency, DNS, storage, or broker calls; inspect probe configuration and failure thresholds; and verify the runbook explains why each dependency is readiness-only.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#liveness-process-only",
+      "sources": [
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+        "https://sre.google/sre-book/addressing-cascading-failures/"
+      ],
+      "depends_on": [
+        "health-contract"
+      ],
+      "cluster": "health-check-contracts",
+      "min_tier": "standard"
+    },
+    {
+      "id": "readiness-dependency-gating",
+      "domain": "reliability",
+      "title": "Readiness Dependency Gating",
+      "summary": "Make readiness fail for dependencies that are required for correct requests while keeping optional dependencies out of the readiness gate. Serving traffic from an instance that cannot execute its critical path turns a partial dependency outage into widespread user errors.",
+      "check": "probe",
+      "probe": "Start the service with a required database or broker unreachable, curl readiness and liveness, and assert readiness fails, liveness remains successful, and the orchestrator or load balancer excludes the instance.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#readiness-dependency-gating",
+      "sources": [
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring"
+      ],
+      "depends_on": [
+        "health-contract"
+      ],
+      "cluster": "health-check-contracts"
+    },
+    {
+      "id": "startup-probe",
+      "domain": "reliability",
+      "title": "Startup Probe",
+      "summary": "Configure a startup-specific failure budget so slow initialization completes before liveness and readiness enforcement begins. Cold starts, migrations, or model loading can be mistaken for a dead process and repeatedly killed before becoming useful.",
+      "check": "probe",
+      "probe": "Parse workload manifests for a startup probe with explicit period, timeout, and failure threshold, run a deliberately slow initialization fixture, and assert it is not killed before the startup budget expires.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#startup-probe",
+      "sources": [
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+      ],
+      "depends_on": [
+        "health-contract"
+      ],
+      "cluster": "health-check-contracts"
+    },
+    {
+      "id": "health-check-budget",
+      "domain": "reliability",
+      "title": "Health Check Budget",
+      "summary": "Keep health handlers bounded and low-cost, avoid dependency fan-out, and give probe traffic its own rate and resource budget. Probe storms or recursive health checks can consume the capacity required to serve users and recover from the original fault.",
+      "check": "judgment",
+      "probe": "The assessor must inspect health handler call graphs, dependency fan-out, timeout and caching behavior, probe ingress limits, and resource reservations; evidence must show probe volume cannot starve ordinary requests during a dependency incident.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#health-check-budget",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring",
+        "https://sre.google/sre-book/handling-overload/"
+      ],
+      "depends_on": [
+        "health-contract"
+      ],
+      "cluster": "health-check-contracts",
+      "min_tier": "standard"
+    },
+    {
+      "id": "sigterm-shutdown",
+      "domain": "reliability",
+      "title": "Sigterm Shutdown",
+      "summary": "Handle SIGTERM by stopping admission of new work, canceling or completing in-flight work according to policy, closing resources, and exiting within the termination grace period. Abrupt termination drops requests, corrupts work, and causes duplicate processing during deploys, evictions, or node loss.",
+      "check": "probe",
+      "probe": "Parse signal handlers and termination-grace configuration, launch with an in-flight request, send SIGTERM, and assert new work is refused, in-flight work follows the documented policy, and the process exits before the grace deadline.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#sigterm-shutdown",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
+        "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html"
+      ],
+      "cluster": "graceful-lifecycle"
+    },
+    {
+      "id": "connection-draining",
+      "domain": "reliability",
+      "title": "Connection Draining",
+      "summary": "Coordinate endpoint deregistration, connection draining, keep-alive limits, and termination grace so existing connections finish without admitting new traffic. Killing a serving instance while clients hold connections produces avoidable resets, partial responses, and retry bursts.",
+      "check": "probe",
+      "probe": "Parse load-balancer deregistration and server keep-alive settings, hold a long-lived request and keep-alive connection across termination, and assert existing work completes or is canceled cleanly while new connections are not routed there.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#connection-draining",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
+        "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html"
+      ],
+      "depends_on": [
+        "sigterm-shutdown"
+      ],
+      "cluster": "graceful-lifecycle"
+    },
+    {
+      "id": "cancellation-propagation",
+      "domain": "reliability",
+      "title": "Cancellation Propagation",
+      "summary": "Propagate request, job, and shutdown cancellation through handlers, workers, and every downstream operation. Work that continues after its caller has gone away consumes scarce capacity and can outlive shutdown, creating cascading overload.",
+      "check": "judgment",
+      "probe": "The assessor must trace cancellation from ingress and shutdown through handler, worker, and downstream APIs; inspect whether every blocking operation accepts the context; and review tests or traces showing canceled work releases resources promptly.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#cancellation-propagation",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://sre.google/sre-book/addressing-cascading-failures/"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "outbound-deadlines",
+      "domain": "reliability",
+      "title": "Outbound Deadlines",
+      "summary": "Set finite connect, handshake, operation, and total deadlines on every outbound HTTP, RPC, database, queue, DNS, and subprocess call. One unbounded dependency call can pin threads or workers indefinitely and exhaust the service under a slow or partitioned dependency.",
+      "check": "probe",
+      "probe": "Enumerate outbound client constructors and call sites with a language-aware scanner, assert finite connect and operation deadlines, and run a blackhole or delayed-server fixture to verify calls return within the configured bound.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#outbound-deadlines",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://grpc.io/docs/guides/deadlines/"
+      ]
+    },
+    {
+      "id": "deadline-budget",
+      "domain": "reliability",
+      "title": "Deadline Budget",
+      "summary": "Propagate one end-to-end deadline and reserve explicit budget for downstream work, retries, and response handling instead of stacking full per-hop timeouts. Independent hop timeouts multiply latency and allow retries to continue after the caller's useful deadline, causing tail-latency and retry cascades.",
+      "check": "judgment",
+      "probe": "The assessor must inspect deadline propagation across each service boundary, retry calculations, queue and response reservations, and traces showing remaining time decreases monotonically rather than resetting at each hop.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#deadline-budget",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://grpc.io/docs/guides/deadlines/"
+      ],
+      "depends_on": [
+        "outbound-deadlines"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "retry-classification",
+      "domain": "reliability",
+      "title": "Retry Classification",
+      "summary": "Retry only transient failures and operations that are idempotent or protected by an idempotency key, never blindly retrying validation, authorization, or permanent errors. Retrying permanent failures wastes capacity, while retrying non-idempotent mutations can duplicate charges, writes, or jobs.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the error taxonomy and retry middleware for explicit permanent/transient classification, verify non-idempotent operations require deduplication, and review cases for timeout-after-commit handling.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#retry-classification",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/retry"
+      ],
+      "cluster": "retry-backoff-breakers",
+      "min_tier": "standard"
+    },
+    {
+      "id": "retry-exponential-jitter",
+      "domain": "reliability",
+      "title": "Retry Exponential Jitter",
+      "summary": "Use capped exponential backoff with randomized jitter and respect server retry hints when retrying eligible calls. Fixed or immediate retries synchronize clients into retry storms precisely while a dependency is recovering.",
+      "check": "probe",
+      "probe": "Parse retry policies for exponential growth, a maximum delay, and jitter; run a failed-call harness with multiple clients; and assert bounded increasing delays with non-identical schedules.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#retry-exponential-jitter",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/retry"
+      ],
+      "depends_on": [
+        "retry-classification"
+      ],
+      "cluster": "retry-backoff-breakers"
+    },
+    {
+      "id": "retry-budget",
+      "domain": "reliability",
+      "title": "Retry Budget",
+      "summary": "Bound retries by attempts, elapsed deadline, and an aggregate retry budget so failure traffic cannot exceed a configured fraction of normal traffic. Unbounded retries amplify a small dependency failure into a system-wide overload and prevent recovery.",
+      "check": "probe",
+      "probe": "Parse retry and deadline configuration, inject a dependency that fails for a fixed interval, and assert per-request attempts and aggregate retry calls remain below declared caps.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#retry-budget",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://sre.google/sre-book/addressing-cascading-failures/"
+      ],
+      "depends_on": [
+        "retry-classification",
+        "deadline-budget"
+      ],
+      "cluster": "retry-backoff-breakers"
+    },
+    {
+      "id": "idempotent-retries",
+      "domain": "reliability",
+      "title": "Idempotent Retries",
+      "summary": "Make retried mutations deduplicable with idempotency keys, request identities, or transactional outboxes and define key retention long enough for the retry window. Timeouts after a successful commit make clients retry, creating duplicate orders, payments, messages, or state transitions.",
+      "check": "probe",
+      "probe": "Submit the same mutating request twice with the same idempotency identity and once with a new identity, then assert exactly one effect for the replay and one additional effect for the new request.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#idempotent-retries",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc9110.html",
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+      ],
+      "depends_on": [
+        "retry-classification"
+      ],
+      "cluster": "retry-backoff-breakers"
+    },
+    {
+      "id": "circuit-breaker",
+      "domain": "reliability",
+      "title": "Circuit Breaker",
+      "summary": "Configure per-dependency circuit breakers with explicit closed, open, and half-open behavior, bounded recovery probes, and reset thresholds. Continuing to call a failing dependency consumes local resources and spreads its outage through the caller graph.",
+      "check": "probe",
+      "probe": "Inject consecutive dependency failures, assert the breaker opens and suppresses calls after its threshold, restore the dependency, and assert only bounded half-open probes precede closure.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#circuit-breaker",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+        "https://sre.google/sre-book/addressing-cascading-failures/"
+      ],
+      "cluster": "retry-backoff-breakers"
+    },
+    {
+      "id": "bulkhead-isolation",
+      "domain": "reliability",
+      "title": "Bulkhead Isolation",
+      "summary": "Isolate tenants, dependency pools, and workload classes with independent concurrency, connection, and queue limits. A slow or noisy tenant/dependency otherwise consumes shared workers and makes unrelated traffic fail.",
+      "check": "probe",
+      "probe": "Saturate one tenant or dependency pool with delayed work and assert an independent tenant or pool continues within its own latency and capacity limits.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#bulkhead-isolation",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead",
+        "https://sre.google/sre-book/handling-overload/"
+      ]
+    },
+    {
+      "id": "self-rate-limiting",
+      "domain": "reliability",
+      "title": "Self Rate Limiting",
+      "summary": "Enforce local outbound QPS and in-flight budgets per dependency and workload, even when upstream callers are within their quotas. A healthy caller can overwhelm a fragile dependency or itself through fan-out, causing a self-created cascade.",
+      "check": "probe",
+      "probe": "Inject a slow dependency and run concurrent outbound traffic, asserting the client stays below configured per-dependency QPS and in-flight limits while unrelated dependencies remain usable.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#self-rate-limiting",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/throttling",
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+      ]
+    },
+    {
+      "id": "client-rate-limiting",
+      "domain": "reliability",
+      "title": "Client Rate Limiting",
+      "summary": "Enforce explicit per-client or per-tenant quotas with a global emergency limit and a machine-readable over-limit response. A single abusive or accidentally hot client can starve other clients and turn overload into an availability incident.",
+      "check": "probe",
+      "probe": "Send concurrent requests from several clients above configured quotas and assert over-limit clients receive 429 with the documented retry signal while an in-quota client succeeds.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#client-rate-limiting",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc6585.html",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/throttling"
+      ]
+    },
+    {
+      "id": "admission-control",
+      "domain": "reliability",
+      "title": "Admission Control",
+      "summary": "Bound server concurrency and waiting-room size, rejecting or canceling excess work before it consumes unbounded memory or worker time. Accepting unlimited concurrent work creates queue collapse, out-of-memory termination, and extreme tail latency.",
+      "check": "probe",
+      "probe": "Drive load above configured in-flight and queue limits and assert memory and wait time stay bounded while excess requests receive deterministic rejection or cancellation.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#admission-control",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/"
+      ]
+    },
+    {
+      "id": "priority-load-shedding",
+      "domain": "reliability",
+      "title": "Priority Load Shedding",
+      "summary": "Shed low-priority and optional work before critical traffic when saturation signals cross a defined threshold. Treating every request equally lets background or cosmetic work consume capacity needed for core user operations.",
+      "check": "probe",
+      "probe": "Run mixed critical and low-priority load until saturation and assert low-priority work is rejected or degraded first while critical traffic remains within its latency and error policy.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#priority-load-shedding",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/"
+      ],
+      "depends_on": [
+        "admission-control"
+      ]
+    },
+    {
+      "id": "backpressure",
+      "domain": "reliability",
+      "title": "Backpressure",
+      "summary": "Propagate bounded demand from consumers to producers and pause or slow intake when downstream capacity is exhausted. Ignoring downstream saturation turns a temporary slowdown into unbounded buffers, memory exhaustion, and lost work.",
+      "check": "probe",
+      "probe": "Attach a deliberately slow consumer or sink, then assert producer throughput falls or pauses and memory plus queue depth remain within configured bounds.",
+      "applies_if": [
+        "data-pipeline"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#backpressure",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling"
+      ]
+    },
+    {
+      "id": "queue-load-leveling",
+      "domain": "reliability",
+      "title": "Queue Load Leveling",
+      "summary": "Use durable queues to absorb bursts, with explicit maximum depth or age, visibility timeout, retention, and consumer scaling policies. Synchronous burst handling overloads workers and dependencies even when average throughput is sufficient.",
+      "check": "probe",
+      "probe": "Parse queue and consumer configuration for bounded depth or age, visibility, retention, and scaling; inject a burst; and assert producers remain bounded and consumers drain it without violating message-loss policy.",
+      "applies_if": [
+        "data-pipeline"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#queue-load-leveling",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/competing-consumers"
+      ]
+    },
+    {
+      "id": "bounded-queue-overflow",
+      "domain": "reliability",
+      "title": "Bounded Queue Overflow",
+      "summary": "Make every in-memory and durable queue capacity and overflow action explicit—reject, shed, spill, or dead-letter—instead of allowing unbounded buffering. An unbounded queue converts overload into out-of-memory failure and hides the point at which work was lost or refused.",
+      "check": "probe",
+      "probe": "Parse queue capacities and overflow policies, fill each queue beyond capacity in a harness, and assert the documented action occurs without process termination or silent loss.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#bounded-queue-overflow",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling"
+      ]
+    },
+    {
+      "id": "poison-message-dlq",
+      "domain": "reliability",
+      "title": "Poison Message Dlq",
+      "summary": "Cap delivery attempts for permanently failing messages, move them to a durable dead-letter queue with failure context, and provide controlled replay. Poison messages that are retried forever starve healthy work and can keep a queue permanently unhealthy.",
+      "check": "probe",
+      "probe": "Publish a deliberately invalid message and assert it reaches the DLQ after the configured attempt cap with reason and original identity preserved; verify replay can be invoked without bypassing the cap.",
+      "applies_if": [
+        "data-pipeline"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#poison-message-dlq",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/competing-consumers",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling"
+      ],
+      "depends_on": [
+        "queue-load-leveling"
+      ]
+    },
+    {
+      "id": "graceful-degradation",
+      "domain": "reliability",
+      "title": "Graceful Degradation",
+      "summary": "Define and test stale-cache, partial-response, or feature-off fallbacks for optional dependencies while preserving correctness for critical paths. An optional recommendation, enrichment, or analytics outage should not become a total outage for the core operation.",
+      "check": "user-decision",
+      "probe": "Present the exact question: “When this optional dependency is unavailable, which behavior is acceptable?” Options: “serve bounded stale data,” “serve a labeled partial response,” “disable the feature,” or “fail the whole request.” Require an owner, maximum staleness, and correctness rationale for the selected option.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#graceful-degradation",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html"
+      ]
+    },
+    {
+      "id": "fallback-correctness",
+      "domain": "reliability",
+      "title": "Fallback Correctness",
+      "summary": "Ensure every fallback is bounded, explicitly labeled where users can observe staleness, and never presents an unknown or default value as authoritative. A graceful-looking but incorrect fallback can silently corrupt business decisions and be more damaging than an explicit error.",
+      "check": "judgment",
+      "probe": "The assessor must inspect fallback code paths, data provenance/freshness labels, business-critical fail-open decisions, maximum staleness enforcement, and tests or incident evidence showing fallback exit after dependency recovery.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#fallback-correctness",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html"
+      ],
+      "depends_on": [
+        "graceful-degradation"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "spof-inventory",
+      "domain": "reliability",
+      "title": "Spof Inventory",
+      "summary": "Inventory every critical-path component and operator dependency, then eliminate or explicitly accept each single point of failure with an owner and mitigation. Redundant application replicas do not help when one DNS zone, credential store, queue, control plane, or operator is the real SPOF.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the dependency graph and SPOF register for critical-path and operator dependencies, confirm each has an owner and mitigation or signed acceptance, and verify mitigations are exercised rather than merely documented.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#spof-inventory",
+      "sources": [
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html",
+        "https://csrc.nist.gov/publications/detail/sp/800-34/rev-1/final"
+      ],
+      "min_tier": "frontier"
+    },
+    {
+      "id": "failure-domain-spread",
+      "domain": "reliability",
+      "title": "Failure Domain Spread",
+      "summary": "Spread capacity and stateful dependencies across independent hosts or zones with topology-aware routing, anti-affinity, and quorum-aware placement. A host or zone failure otherwise removes all replicas or a quorum at once.",
+      "check": "probe",
+      "probe": "Parse scheduling, topology-spread, anti-affinity, and service-routing configuration, simulate or cordon one failure domain, and assert capacity and quorum remain above policy.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#failure-domain-spread",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html"
+      ]
+    },
+    {
+      "id": "regional-failover",
+      "domain": "reliability",
+      "title": "Regional Failover",
+      "summary": "For region-sensitive services, define automated or rehearsed traffic cutover, replication mode, write-conflict or split-brain protection, and failback procedure. A regional outage can otherwise become prolonged downtime or divergent writes despite having a nominal second region.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the regional topology, replication and write-authority configuration, fencing mechanism, traffic-cutover automation, and failback runbook; evidence must include a rehearsal showing no conflicting writers and measured recovery/data-loss times.",
+      "applies_if": [
+        "web-api"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#regional-failover",
+      "sources": [
+        "https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/plan-for-recovery.html"
+      ],
+      "depends_on": [
+        "rto-rpo"
+      ],
+      "cluster": "backup-dr",
+      "min_tier": "frontier"
+    },
+    {
+      "id": "rto-rpo",
+      "domain": "reliability",
+      "title": "Rto Rpo",
+      "summary": "Set service-specific RTO and RPO targets with business-owner sign-off, including degraded-mode behavior and dependency assumptions. An unowned target lets a technically successful recovery still violate acceptable downtime or data loss.",
+      "check": "user-decision",
+      "probe": "Present the exact question: “For this service and data set, what maximum downtime and data loss are acceptable?” Options: “RTO ≤15 minutes / RPO ≤1 minute,” “RTO ≤1 hour / RPO ≤15 minutes,” “RTO ≤4 hours / RPO ≤1 hour,” or “custom targets.” Require degraded-mode behavior, dependency assumptions, and business-owner approval.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#rto-rpo",
+      "sources": [
+        "https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html",
+        "https://csrc.nist.gov/publications/detail/sp/800-34/rev-1/final"
+      ],
+      "cluster": "backup-dr"
+    },
+    {
+      "id": "backup-restore-drill",
+      "domain": "reliability",
+      "title": "Backup Restore Drill",
+      "summary": "Automate versioned backups and periodically restore them into an isolated environment while measuring integrity, actual RTO, and actual RPO. Unrestored, stale, or corrupt backups fail exactly when a disaster makes the primary unavailable.",
+      "check": "probe",
+      "probe": "Parse backup schedules, retention, and restore configuration, execute the latest isolated restore drill, and assert integrity plus measured recovery time and data loss meet declared objectives.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#backup-restore-drill",
+      "sources": [
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-reliability.html",
+        "https://csrc.nist.gov/publications/detail/sp/800-34/rev-1/final"
+      ],
+      "depends_on": [
+        "rto-rpo"
+      ],
+      "cluster": "backup-dr"
+    },
+    {
+      "id": "chaos-hypothesis-guardrails",
+      "domain": "reliability",
+      "title": "Chaos Hypothesis Guardrails",
+      "summary": "Run scoped fault-injection experiments with a stated steady-state hypothesis, bounded blast radius, abort conditions, and rollback. Uncontrolled experiments can cause the outage they are meant to prevent, while unmeasured experiments teach nothing actionable.",
+      "check": "judgment",
+      "probe": "The assessor must inspect experiment plans for a falsifiable steady-state hypothesis, scoped target, blast-radius limit, abort thresholds, rollback steps, approval, and recorded outcome; reject experiments that only state “kill something” without measurable expectations.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#chaos-hypothesis-guardrails",
+      "sources": [
+        "https://principlesofchaos.org/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-reliability.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "partial-failure-chaos",
+      "domain": "reliability",
+      "title": "Partial Failure Chaos",
+      "summary": "Exercise slow, refused, malformed, throttled, partitioned, resource-exhausted, clock-skewed, and process-kill faults rather than testing crashes alone. Distributed systems usually fail through hangs, partial responses, and resource starvation that a simple process-kill test does not expose.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the fault matrix and experiment records for slow, refusal, malformed, throttled, partition, resource, clock, and kill scenarios; verify each has expected behavior and measured recovery evidence.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#partial-failure-chaos",
+      "sources": [
+        "https://principlesofchaos.org/",
+        "https://sre.google/sre-book/addressing-cascading-failures/"
+      ],
+      "min_tier": "frontier"
+    },
+    {
+      "id": "recovery-rehearsal",
+      "domain": "reliability",
+      "title": "Recovery Rehearsal",
+      "summary": "Rehearse failover and restoration on a defined cadence and record detection, mitigation, recovery, and data-loss times with owned follow-up actions. A paper runbook and unpracticed operators routinely miss real RTO/RPO targets during incidents.",
+      "check": "judgment",
+      "probe": "The assessor must inspect rehearsal cadence, scope, runbooks, participant ownership, measured detection/mitigation/recovery/data-loss times, and closed follow-up actions; require evidence of a recent completed exercise.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#recovery-rehearsal",
+      "sources": [
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-reliability.html",
+        "https://csrc.nist.gov/publications/detail/sp/800-34/rev-1/final"
+      ],
+      "depends_on": [
+        "backup-restore-drill"
+      ],
+      "cluster": "backup-dr",
+      "min_tier": "standard"
+    },
+    {
+      "id": "dependency-failure-matrix",
+      "domain": "reliability",
+      "title": "Dependency Failure Matrix",
+      "summary": "Document and test each outbound dependency's behavior for timeout, refusal, throttling, malformed response, partial success, and stale data. An unmodeled failure mode becomes a hang, retry storm, silent corruption, or accidental all-or-nothing outage.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the matrix for every outbound dependency and operation, confirm all listed fault classes have explicit timeout/retry/fallback/correctness behavior, and review evidence that representative fixtures or drills exercise the rows.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#dependency-failure-matrix",
+      "sources": [
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker"
+      ],
+      "depends_on": [
+        "outbound-deadlines"
+      ],
+      "min_tier": "frontier"
+    },
+    {
+      "id": "lease-recovery-idempotence",
+      "domain": "reliability",
+      "title": "Lease Recovery Idempotence",
+      "summary": "Make worker leases and heartbeats expire safely and resume processing idempotently after crashes, partitions, or consumer replacement. Abandoned leases create permanent backlog while duplicate delivery can lose or corrupt work without deduplication.",
+      "check": "probe",
+      "probe": "Kill workers at each processing phase and assert leases expire, items are eventually retried or deduplicated, and every item has exactly-once effect or a documented at-least-once outcome.",
+      "applies_if": [
+        "data-pipeline"
+      ],
+      "severity": "critical",
+      "glossary_ref": "glossary/reliability.md#lease-recovery-idempotence",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/competing-consumers",
+        "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+      ]
+    },
+    {
+      "id": "capacity-failure-headroom",
+      "domain": "reliability",
+      "title": "Capacity Failure Headroom",
+      "summary": "Validate peak capacity and failure headroom with load tests that include dependency latency, retry traffic, queue saturation, and loss of a failure domain. Average happy-path capacity hides tail amplification and leaves no margin when a replica, zone, or dependency is degraded.",
+      "check": "probe",
+      "probe": "Run the documented peak-load scenario with injected dependency delay and one capacity unit removed, then assert latency, error, queue, and recovery measures remain within declared limits.",
+      "applies_if": [
+        "all"
+      ],
+      "severity": "important",
+      "glossary_ref": "glossary/reliability.md#capacity-failure-headroom",
+      "sources": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-reliability.html"
+      ]
+    }
+  ]
+}
