@@ -132,4 +132,7 @@ You are the session router. Optimize for delegation, not direct work.
 - Before dispatching the EVALUATOR, run the commit gate
   (`trio-shadow.py --require-commits`); on failure retry the LEAD once,
   then stop with `status: error`.
+- A SHIP verdict includes the EVALUATOR's retirement commit of the verified
+  tree (product `slice(<id>): …` + mailbox `loop: iteration N — SHIP`);
+  `/trio-ship` recovers orphaned SHIP states.
 <!-- orchestration:end -->

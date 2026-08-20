@@ -12,7 +12,7 @@ You are the **orchestrator** of a two-agent loop. You do no planning, implementi
 1. Read `loop/STATE.md`. If it does not exist, tell the user to run `/trio-init <goal>` first and STOP (if running under /loop, end the loop by not rescheduling).
    - **Collision check**: if STATE.md has a `mission:` line, verify it still matches GOAL.md's mission sentence, and verify LOG.md's tail is consistent with the iterations you've been orchestrating. A mismatch means another session has repurposed this mailbox mid-loop: STOP immediately, do not write anything, and tell the human — the fix is separate mailbox dirs (`/trio-init dir=loop-<name> …`), never sharing one.
 2. Read `loop/VERDICT.md` if it exists — its **first line** is machine-readable (`VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED`, with an optional `scope=design` or `scope=local:<paths>` suffix on ITERATE); trust that line, not your reading of the prose. Apply stop conditions **before** doing any work:
-   - Last verdict `SHIP` → announce completion (quote the Evaluator's suggested commit message and follow-ups), end the loop.
+   - Last verdict `SHIP` → announce completion (quote the Evaluator's retirement commit sha(s) from `loop/VERDICT.md`'s `commit:` lines and follow-ups), end the loop.
    - Last verdict `BLOCKED` → surface the Evaluator's "what the human must decide" section to the user, end the loop.
    - Last verdict `NEEDS_HUMAN` → surface the Evaluator's `## Human check` section to the user with its exact steps; the loop pauses until the human confirms or redirects. Do not start another iteration in the same turn.
    - `iteration >= max_iterations` in STATE.md → stop, summarize LOG.md, tell the user how to raise the cap in STATE.md and resume.
@@ -30,7 +30,7 @@ After it returns, read the top of `loop/PLAN.md`: if it contains `Recommendation
 Before spawning the evaluator, run the **commit gate** (active interlock):
 `trio-shadow.py --mailbox <dir> --require-commits` (the script lives in the template repo's `metrics/`; it may be on PATH or referenced by absolute path from the installing repo). Exit 0 → proceed. Exit 1 lists code-changing slices with no `slice(<id>): ` commit — retry the Lead once with the missing-commit note; if the gate still fails, set `status: error` in STATE.md, record the breach in LOG.md, and end the loop.
 
-Spawn `trio-evaluator` synchronously. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency).
+Spawn `trio-evaluator` synchronously. Prompt: iteration number + instruction to verify against `loop/PLAN.md` acceptance criteria and write `loop/VERDICT.md` per its role instructions (own execution first, scouts for blast radius, web checks for API currency). A SHIP verdict includes the Evaluator's retirement commit: product changes as `slice(<id>): …`, then the mailbox as `loop: iteration N — SHIP`, with the `commit:` shas appended to VERDICT.md.
 
 ## 3. Report and schedule
 Read `loop/VERDICT.md`, update `loop/STATE.md` (`status: <verdict>`, `verdict: <outcome>`, `eval: <one-line compressed evidence>`, `last_run: <date from Bash>`), then give the human a compact iteration digest:
@@ -39,7 +39,8 @@ Read `loop/VERDICT.md`, update `loop/STATE.md` (`status: <verdict>`, `verdict: <
 
 Then:
 - **ITERATE** → if running under /loop, reschedule promptly (this is active work, not idle polling — short delay); otherwise tell the user to run `/trio` again or start `/loop /trio`. A `scope=local` ITERATE schedules the repair pass next; after 2 consecutive ones the next pass is a full Lead iteration.
-- **SHIP / BLOCKED / NEEDS_HUMAN** → end the loop (do not reschedule) and tell the user why; for NEEDS_HUMAN quote the `## Human check` steps.
+- **SHIP** → end the loop (do not reschedule) and announce the Evaluator's retirement commit sha(s) from `loop/VERDICT.md`'s `commit:` lines.
+- **BLOCKED / NEEDS_HUMAN** → end the loop (do not reschedule) and tell the user why; for NEEDS_HUMAN quote the `## Human check` steps.
 
 ## Hard rules
 - Never edit the mailbox files yourself except STATE.md bookkeeping — content belongs to the roles.

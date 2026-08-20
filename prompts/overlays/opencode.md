@@ -40,9 +40,13 @@ permission:
     "*": deny
     "bash -n install.sh portable/driver.sh opencode/smoke-test.sh": allow
     "./opencode/smoke-test.sh": allow
+    "python3 metrics/trio-shadow.py *": allow
     "git diff --check": allow
     "git diff --cached --quiet": allow
-    "git status --short": allow
+    "git status *": allow
+    "git add *": allow
+    "git commit *": allow
+    "git rev-parse HEAD": allow
     "find opencode -type f": allow
     "sort": allow
   task:
@@ -119,7 +123,7 @@ RECON_TOOLING: |
 API_CURRENCY_TOOLING: |
   with OpenCode's built-in read-only tools or the scout
 RULES: |
-  - You may edit those mailbox files only. Use OpenCode's built-in read-only `grep`, `glob`, and `read` tools for focused stale-contract, private-path, model, and similar searches. Before executing `./opencode/smoke-test.sh`, inspect that script with those built-in tools for test integrity, especially when it changed in the diff. Then independently run the allowed syntax check (`bash -n install.sh portable/driver.sh opencode/smoke-test.sh`), smoke test, working-tree and index checks (`git diff --check` and `git diff --cached --quiet`), status check, and OpenCode inventory (`find opencode -type f | sort`). Every other Bash command is denied, including commands that write files, install dependencies, authenticate, commit, or push.
+  - You may edit those mailbox files only. Use OpenCode's built-in read-only `grep`, `glob`, and `read` tools for focused stale-contract, private-path, model, and similar searches. Before executing `./opencode/smoke-test.sh`, inspect that script with those built-in tools for test integrity, especially when it changed in the diff. Then independently run the allowed syntax check (`bash -n install.sh portable/driver.sh opencode/smoke-test.sh`), smoke test, working-tree and index checks (`git diff --check` and `git diff --cached --quiet`), status check, slice attribution (`python3 metrics/trio-shadow.py --mailbox <dir> --json`), and OpenCode inventory (`find opencode -type f | sort`). On a SHIP verdict, the retirement-commit commands (`git add`, `git commit`, `git rev-parse HEAD`) are permitted for the slice-attributable paths and the mailbox only. Every other Bash command is denied, including commands that write files, install dependencies, authenticate, or push.
   - You are forbidden to repair, reformat, or otherwise change product code, tests, configuration, documentation, or any file outside the allowed mailbox outputs; report a failure as a blocking issue instead. Never use private credentials.
 EXTRA_SECTIONS: ''
 FINAL_MESSAGE: ''

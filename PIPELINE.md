@@ -70,7 +70,11 @@ not change it without a plan revision (a fault-class event).
 retire. Roles are pipeline stages, not barriers.
 
 **Retirement** — in-order merge to main. A slice retires only after the
-Evaluator passes it *as composed with everything retired before it*.
+Evaluator passes it *as composed with everything retired before it*. In the
+current loop implementation, retirement IS the Evaluator's SHIP commit of the
+hash-pinned tree it verified (product `slice(<id>): …` + mailbox
+`loop: iteration N — SHIP`); the worktree-per-slice and merge-queue semantics
+above remain the future pipeline mode.
 
 ## The machinery
 

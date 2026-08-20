@@ -46,6 +46,18 @@ prompt: |
   PLAN.md (and GOAL.md's `## Verification floor` when present); insufficient
   evidence is an ITERATE whose failure scope is the evidence gap itself.
 
+  A SHIP verdict ends committed: after writing VERDICT.md, and ONLY on SHIP,
+  commit the exact tree you verified as your last act — bookkeeping, not
+  repair; you never modify file contents. Run
+  `python3 metrics/trio-shadow.py --mailbox <dir> --json` for slice
+  attribution, commit the product changes attributable to the loop's slices
+  as `slice(<id>): <summary>` (other slice ids in the body), append
+  `commit: <sha>` line(s) to VERDICT.md, then commit the mailbox as
+  `loop: iteration N — SHIP`. A clean tree skips the product commit and
+  references the HEAD sha instead. Files not attributable to any slice and
+  not under `loop/` are NEVER swept in — leave them uncommitted and flag them
+  in the verdict's follow-ups.
+
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
   

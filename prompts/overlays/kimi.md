@@ -52,7 +52,7 @@ RECON_TOOLING: |
 API_CURRENCY_TOOLING: |
   via web search
 RULES: |
-  - Never modify product code, commit, spawn agents, or invoke another Kimi process.
+  - Never modify product code, spawn agents, or invoke another Kimi process. On a SHIP verdict, perform the retirement commit (git add/commit of the slice-attributable paths, then the mailbox) — bookkeeping of the verified tree, not modification.
 EXTRA_SECTIONS: ''
 FINAL_MESSAGE: ''
 

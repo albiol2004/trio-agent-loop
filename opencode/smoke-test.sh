@@ -79,12 +79,16 @@ bash_contract_valid() {
       expected[1] = "\"*\": deny"
       expected[2] = "\"bash -n install.sh portable/driver.sh opencode/smoke-test.sh\": allow"
       expected[3] = "\"./opencode/smoke-test.sh\": allow"
-      expected[4] = "\"git diff --check\": allow"
-      expected[5] = "\"git diff --cached --quiet\": allow"
-      expected[6] = "\"git status --short\": allow"
-      expected[7] = "\"find opencode -type f\": allow"
-      expected[8] = "\"sort\": allow"
-      expected_count = 8
+      expected[4] = "\"python3 metrics/trio-shadow.py *\": allow"
+      expected[5] = "\"git diff --check\": allow"
+      expected[6] = "\"git diff --cached --quiet\": allow"
+      expected[7] = "\"git status *\": allow"
+      expected[8] = "\"git add *\": allow"
+      expected[9] = "\"git commit *\": allow"
+      expected[10] = "\"git rev-parse HEAD\": allow"
+      expected[11] = "\"find opencode -type f\": allow"
+      expected[12] = "\"sort\": allow"
+      expected_count = 12
     }
     NR == 1 && /^---$/ { in_frontmatter = 1; next }
     in_frontmatter && /^---$/ { in_frontmatter = 0; next }
@@ -109,7 +113,7 @@ bash_contract_valid() {
         sub(/: allow$/, "", allow_key)
         sub(/^"/, "", allow_key)
         sub(/"$/, "", allow_key)
-        if (allow_key ~ /[*?]/) wildcard_allow = 1
+        if (allow_key == "*") wildcard_allow = 1
       }
     }
     END {
@@ -182,8 +186,8 @@ if bash_contract_valid "$tmp_contract/missing-rule.md"; then
   fail "Evaluator Bash parser accepted a missing required allow rule"
 fi
 awk '
-  $0 == "    \"git status --short\": allow" {
-    print "    \"git status *\": allow"
+  $0 == "    \"git status *\": allow" {
+    print "    \"git status --short\": allow"
     next
   }
   { print }

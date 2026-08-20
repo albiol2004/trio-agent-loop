@@ -53,7 +53,11 @@ roles or overlap this sequence.
    Use the same pattern for the other roles and inspect each result file.
 4. Verify that the roles wrote their required mailbox artifacts. The Lead owns
    `PLAN.md`, `BUILDER_TASK.md`, and `REPORT.md`; the Evaluator owns
-   `VERDICT.md`; append their required lines to `LOG.md`.
+   `VERDICT.md`; append their required lines to `LOG.md`. On a
+   `VERDICT: SHIP`, the evaluator step performs the retirement commit:
+   product changes as `slice(<id>): <summary>`, then the mailbox as
+   `loop: iteration N — SHIP`, appending the `commit:` shas to VERDICT.md
+   before the mailbox commit.
 5. When the user asks to run/start/continue the loop in any phrasing, chain
    iterations end-to-end by default: continue only on `VERDICT: ITERATE`
    (repair path for `scope=local`) and stop on `SHIP`, `BLOCKED`,
@@ -62,8 +66,9 @@ roles or overlap this sequence.
    this flavor: every role is a blocking `run-role.sh` CLI process, so an
    iteration is a strictly sequential sequence — chaining means re-running
    the full sequence per iteration in one session, never overlapping roles.
-   A bare supervised single-iteration invocation remains available. Never
-   commit automatically.
+   A bare supervised single-iteration invocation remains available. The
+   orchestrator never commits automatically — the SHIP retirement commit is
+   the evaluator step's job.
 
 Scout is read-only. The initial Lead plans and delegates without editing
 product code. Builder performs the substantive implementation in its named

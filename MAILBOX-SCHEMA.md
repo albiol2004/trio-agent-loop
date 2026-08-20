@@ -261,6 +261,34 @@ The prefix is exactly `slice(<id>): ` — the kebab-case slice id, a colon,
 a space — followed by a normal commit message. Tooling resolves commits
 per slice by this prefix; a commit without it belongs to no slice.
 
+## SHIP retirement commit convention
+
+A `VERDICT: SHIP` ends the loop with the Evaluator's **retirement commit**: as
+its last act the Evaluator commits the exact tree it verified (SHIP only —
+never on ITERATE/NEEDS_HUMAN/BLOCKED). The pattern is exactly two commits:
+
+- **Product commit** — the working-tree changes attributable to the loop's
+  slices, in one commit: `slice(<primary-id>): <summary>` (the summary from
+  the verdict's suggested commit message; additional slice ids go in the
+  body). A clean tree skips it; the verdict references the existing HEAD sha
+  instead.
+- **Mailbox commit** — the mailbox files (`loop/`):
+  `loop: iteration N — SHIP`.
+
+The Evaluator appends a `commit: <full sha>` line per product commit to
+`VERDICT.md` before the mailbox commit, so the verdict records what was
+committed. **Foreign-path rule**: a modified file that is not attributable to
+any slice (per `trio-shadow.py --mailbox <dir> --json`) and not under `loop/`
+is NEVER included — it stays uncommitted and is flagged in the verdict's
+follow-ups. The retirement commit is bookkeeping of the verified tree; it does
+not change the Evaluator's read-only status (contents never change, and a
+failed `--require-commits` gate is covered by the retirement commit on SHIP,
+recorded as a protocol breach in the verdict). An orphaned SHIP verdict — a
+machine-readable `VERDICT: SHIP` first line with no `commit:` lines (legacy or
+interrupted run) — is recovered manually with the `/trio-ship` command (omp),
+which performs the same two-commit pattern from the verdict's suggested commit
+message.
+
 ## Mailbox placement standard
 
 `loop/` lives in the orchestrator session's cwd — the coordination repo.

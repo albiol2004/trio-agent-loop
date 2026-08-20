@@ -99,7 +99,11 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    its returned model and effort. Require it to independently verify, decide
    whether it needs a Luna Scout, and write VERDICT with one of SHIP, ITERATE
    (optionally `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or
-   BLOCKED on the first line. Before spawning it, run the **commit gate**
+   BLOCKED on the first line. On a SHIP verdict, the Evaluator child performs
+   the retirement commit as part of writing it: product changes as
+   `slice(<id>): …`, then the mailbox as `loop: iteration N — SHIP`, with
+   the `commit:` shas appended to VERDICT.md before the mailbox commit.
+   Before spawning it, run the **commit gate**
    (active interlock) via your shell tools:
    `trio-shadow.py --mailbox <dir> --require-commits` (the script lives in
    the template repo's `metrics/`; it may be on PATH or referenced by

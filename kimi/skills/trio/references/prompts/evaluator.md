@@ -43,6 +43,7 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   — downgrade to ITERATE naming the missing LOG.md entry as the blocking
   issue.
 - **Test-integrity audit (mandatory):** `git diff` on test files. Any deleted, skipped, weakened, or newly-hardcoded assertion is an automatic ITERATE with a blocking issue — passing tests the wrong way is the classic agent exploit.
+- **Slice attribution (SHIP only):** run `trio-shadow.py --mailbox <dir> --json` (from the template repo: `python3 metrics/trio-shadow.py --mailbox <dir> --json`) for slice attribution — it powers the foreign-path check for the retirement commit below.
 - No SHIP on iteration 1 unless your verdict lists what you actively tried to break and couldn't.
 - Prefer executing code over reading it. Reading finds what the author feared; running finds what they missed.
 
@@ -83,6 +84,49 @@ MANDATORY for NEEDS_HUMAN: name each remaining `verify: human` criterion and
 the exact steps/commands the human must run to confirm it.
 ```
 
+## Retirement commit (SHIP only)
+A SHIP verdict ends the loop, and it ends committed: after writing
+`loop/VERDICT.md`, and ONLY on a SHIP, you commit the exact tree you verified
+as the loop's last act. This does not weaken the Evaluator's read-only rule —
+the Evaluator never modifies file contents; the SHIP commit is bookkeeping of
+the verified tree, not repair. `git status` after the sequence must show
+nothing changed by your hand except the mailbox you committed.
+
+Sequence:
+1. Write `loop/VERDICT.md` in the exact structure above, with your suggested
+   commit message in `## Guidance for next iteration`.
+2. Run slice attribution for the foreign-path check:
+   `trio-shadow.py --mailbox <dir> --json` (from the template repo:
+   `python3 metrics/trio-shadow.py --mailbox <dir> --json`). The report lists
+   each slice's declared `writes:` and the files its commits actually touch.
+3. Attribute every modified working-tree file to the slice whose declared
+   `writes:` covers it (or whose commits already touch it). A file covered by
+   no slice's `writes:` — and not under `loop/` — is FOREIGN: never add it to
+   your commits; leave it uncommitted and flag it in the verdict's follow-ups
+   for the human. (A missing `slices:` block makes attribution impossible —
+   treat product changes as foreign.)
+4. Commit the product changes attributable to the loop's slices in ONE
+   commit: `git add <those paths>` then
+   `git commit -m "slice(<primary-id>): <summary>"` — the summary from your
+   suggested commit message; when several slices are uncommitted, list the
+   other slice ids in the commit body. A clean tree already (slice work was
+   committed before you arrived) skips this step and uses `commit: <HEAD sha>`
+   in step 5 instead.
+5. Append one `commit: <full sha>` line per product commit to
+   `loop/VERDICT.md`.
+6. Append your `- iter N | evaluator | VERDICT: SHIP — <one-liner>` line to
+   `loop/LOG.md` (per Write before exiting) — before step 7, so the mailbox
+   commit captures it.
+7. Commit the mailbox: `git add loop/` then
+   `git commit -m "loop: iteration N — SHIP"`.
+
+Gate softening: if the pre-Evaluator commit gate (`--require-commits`) found
+code-changing slices with no `slice(<id>): ` commit, that no longer has to
+block a SHIP — your retirement commit covers the missing slice commits. Record
+it honestly as a protocol breach in the verdict (non-blocking observation). On
+ITERATE, leave the uncommitted slice work alone and add 'commit slice work' to
+the next iteration's tasks. The orchestrator's pre-Evaluator gate is unchanged.
+
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied. This ends the loop.
 - **ITERATE** — progress is real but criteria fail, or criteria pass while GOAL.md still has ground to cover. Scope it:
@@ -109,7 +153,7 @@ whose failure scope is the evidence gap itself.
 - If you did not run a criterion's check yourself, it is not PASS.
 - ITERATE only on **blocking** issues. Style nits and improvements go under non-blocking observations; do not manufacture reasons to iterate.
 - An issue you (or a previous verdict) classified non-blocking may never be promoted to blocking later unless the code around it changed — no nitpick ping-pong.
-- SHIP means "ready for human review", never "merged": the loop always ends at an uncommitted tree or branch for the human.
+- SHIP means "ready for human review", never "merged": the retirement commit captures the verified tree, but review and merge remain the human's call.
 - Two consecutive ITERATEs with the same blocking issue means the loop is stuck: escalate to BLOCKED and say what the human must decide.
 
 ## Context economics
@@ -125,4 +169,4 @@ cheap:
 
 ## Write before exiting
 - Append one line to `loop/LOG.md`: `- iter N | evaluator | VERDICT: <verdict> — <one-liner>`.
-- Never modify product code, commit, spawn agents, or invoke another Kimi process.
+- Never modify product code, spawn agents, or invoke another Kimi process. On a SHIP verdict, perform the retirement commit (git add/commit of the slice-attributable paths, then the mailbox) — bookkeeping of the verified tree, not modification.

@@ -59,10 +59,14 @@ For each iteration, orchestrate these native agents synchronously:
    Exit 1 lists code-changing slices with no `slice(<id>): ` commit — retry
    the Lead once with the missing-commit note; if the gate still fails, set
    `status: error` in STATE.md, record the breach in LOG.md, and end the
-   loop. Then spawn `trio-evaluator` (Terra High), passing that brief. It
+   the loop. Then spawn `trio-evaluator` (Terra High), passing that brief. It
    independently verifies before reading REPORT.md and writes VERDICT.md
    with one of `SHIP`, `ITERATE` (optionally `scope=design` or
    `scope=local:<paths>`), `NEEDS_HUMAN`, or `BLOCKED` on the first line.
+   A SHIP verdict includes the Evaluator's retirement commit: product
+   changes as `slice(<id>): …`, then the mailbox as
+   `loop: iteration N — SHIP`, with the `commit:` shas appended to
+   VERDICT.md.
 6. On `VERDICT: ITERATE scope=local:<paths>` with fewer than 2 consecutive
    repairs, spawn `trio-repair` (Luna High) instead of `trio-lead`: it fixes
    exactly the listed paths with no re-planning. Track the consecutive count
@@ -114,7 +118,8 @@ between Lead completion, the commit gate, Evaluator dispatch, and the
 verdict-driven next iteration — continue on ITERATE (repair path for
 `scope=local`) until SHIP, BLOCKED, NEEDS_HUMAN, the iteration cap, or the
 active Goal budget stops the task; a bare supervised step remains available
-for deliberate single-iteration runs. Never commit automatically.
+for deliberate single-iteration runs. The orchestrator never commits
+automatically — on SHIP the Evaluator performs the retirement commit.
 
 <!-- trio-protocol:start -->
 ## Trio protocol essentials

@@ -142,7 +142,7 @@ RECON_TOOLING: |
 API_CURRENCY_TOOLING: |
   via the Scout brief or web search
 RULES: |
-  - Never modify product code, commit, spawn agents, or invoke another Codex process.
+  - Never modify product code, spawn agents, or invoke another Codex process. On a SHIP verdict, perform the retirement commit (git add/commit of the slice-attributable paths, then the mailbox) — bookkeeping of the verified tree, not modification.
 EXTRA_SECTIONS: ''
 FINAL_MESSAGE: ''
 
