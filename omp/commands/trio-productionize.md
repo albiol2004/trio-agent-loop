@@ -36,6 +36,11 @@ message per node verdict. Respect the graph:
 - **cluster**: all nodes sharing a cluster go in ONE agent task — they are
   the same concern viewed from different domains. Still record one verdict
   per node id.
+- **Batch briefing rule** (dogfood-proven): NEVER point agents at the raw
+  plan.json — it poisons their context on large plans. Extract each batch's
+  node ids + probe recipes mechanically from plan.json and inline them in the
+  agent prompt; also name large vendored/generated files the agent must not
+  open. Never guess node ids from the glossary — read them from the plan.
 - **Executor dispatch**:
   - `scout` (probe nodes) → light-tier scout agents. The probe field is the
     recipe: run the commands/queries against the repo (and live system, if
