@@ -174,6 +174,155 @@ def cmd_status(args):
             print(f"  {nid}" + (f" — {ev[:120]}" if ev else ""))
 
 
+
+def _chunk(seq, size):
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
+def cmd_batches(args):
+    """Write per-domain batch briefing files from a plan.
+
+    Probes land in <out>/, judgment nodes in a sibling jbatches/ directory
+    (same convention both dogfood runs converged on). Each file carries the
+    node id, severity, executor, and the probe/assessment recipe verbatim —
+    agents NEVER read plan.json (context poisoning on large plans).
+    """
+    plan = json.loads(Path(require(args, "--plan")).read_text())
+    out = Path(require(args, "--out"))
+    chunk = int(opt(args, "--chunk", "7"))
+    out.mkdir(parents=True, exist_ok=True)
+    jdir = out.parent / "jbatches"  # dogfood convention
+    jdir.mkdir(parents=True, exist_ok=True)
+
+    probes, judgments = {}, {}
+    for n in plan["nodes"]:
+        if n["check"] == "user-decision":
+            continue  # asked to the user directly, never batched to agents
+        sink = probes if n["check"] == "probe" else judgments
+        sink.setdefault(n["domain"], []).append(n)
+
+    index = []
+    for base_dir, grouped, is_judge in ((out, probes, False), (jdir, judgments, True)):
+        for domain in sorted(grouped):
+            for i, chunk_nodes in enumerate(_chunk(grouped[domain], chunk), 1):
+                fname = base_dir / f"{domain}-{i}.md"
+                with fname.open("w") as fh:
+                    for n in chunk_nodes:
+                        label = "Assessment" if is_judge else "Probe"
+                        fh.write(f"## {n['id']} [{n['severity']}] executor={n['executor']}\n")
+                        fh.write(f"{label}: {n['probe']}\n\n")
+                index.append({"file": str(fname), "check": "judgment" if is_judge else "probe",
+                              "ids": [n["id"] for n in chunk_nodes]})
+    (out / "index.json").write_text(json.dumps(index, indent=1) + "\n")
+    print(f"wrote {len(index)} batch files: "
+          f"{sum(len(b['ids']) for b in index if b['check'] == 'probe')} probe nodes, "
+          f"{sum(len(b['ids']) for b in index if b['check'] == 'judgment')} judgment nodes")
+
+
+def cmd_record_batch(args):
+    """Bulk-record verdicts from a JSON array on stdin or --file.
+
+    Dogfood-proven: agents return one array per batch; recording it in one
+    call is atomic, validates every id against the plan (catches typos and
+    ids the agent invented), and reports skipped unknowns instead of
+    silently accepting them.
+    """
+    state_path = Path(require(args, "--state"))
+    plan = json.loads(Path(require(args, "--plan")).read_text())
+    valid_ids = {n["id"] for n in plan["nodes"]}
+    src = opt(args, "--file")
+    text = Path(src).read_text() if src else sys.stdin.read()
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        # agents sometimes wrap the array in prose; extract the first [...] block
+        start, end = text.find("["), text.rfind("]")
+        if start < 0 or end <= start:
+            die("no JSON array found in input")
+        rows = json.loads(text[start:end + 1])
+    if not isinstance(rows, list):
+        die("expected a JSON array of {node, verdict, evidence}")
+    recorded, skipped = 0, []
+    with state_path.open("a") as fh:
+        for row in rows:
+            node, verdict = row.get("node"), row.get("verdict")
+            if node not in valid_ids:
+                skipped.append(node)
+                continue
+            if verdict not in VERDICTS:
+                skipped.append(f"{node}(bad verdict {verdict!r})")
+                continue
+            rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "node": node, "verdict": verdict,
+                   "evidence": row.get("evidence", "")}
+            fh.write(json.dumps(rec) + "\n")
+            recorded += 1
+    print(f"recorded {recorded}, skipped {len(skipped)}")
+    for s in skipped:
+        print(f"  skipped: {s}")
+
+
+def cmd_report(args):
+    """Generate REPORT.md from plan + verdicts (mechanical close-out)."""
+    plan = json.loads(Path(require(args, "--plan")).read_text())
+    latest = latest_verdicts(Path(require(args, "--state")))
+    nodes = {n["id"]: n for n in plan["nodes"]}
+    lines = ["# Production-Readiness Audit — Report", ""]
+    profile = plan.get("profile", {})
+    lines.append(f"Profile: `{profile.get('name', '?')}` "
+                 f"({', '.join(profile.get('tags', []))}). "
+                 f"{plan['node_count']} nodes planned; {len(latest)} decided.")
+    counts = {v: 0 for v in sorted(VERDICTS)}
+    for rec in latest.values():
+        counts[rec["verdict"]] = counts.get(rec["verdict"], 0) + 1
+    sev_fails = {}
+    for nid, rec in latest.items():
+        if rec["verdict"] == "fail":
+            sev = nodes.get(nid, {}).get("severity", "?")
+            sev_fails[sev] = sev_fails.get(sev, 0) + 1
+    lines += ["", "## Verdict distribution",
+              f"- pass: {counts['pass']}  |  fail: {counts['fail']} "
+              f"({', '.join(f'{v} {k}' for k, v in sorted(sev_fails.items()))})  |  "
+              f"na: {counts['na']}  |  blocked: {counts['blocked']}"]
+
+    def section(title, pred):
+        lines.extend(["", f"## {title}"])
+        for nid, rec in latest.items():
+            if pred(nid, rec):
+                n = nodes.get(nid, {})
+                lines.append(f"- **{nid}** [{n.get('severity', '?')}] "
+                             f"({n.get('domain', '?')}): {rec.get('evidence', '')}")
+
+    section("Passes", lambda _i, r: r["verdict"] == "pass")
+    section("Blocked (need a live environment to conclude)",
+            lambda _i, r: r["verdict"] == "blocked")
+    lines += ["", "## Critical failures by domain"]
+    by_dom = {}
+    for nid, rec in latest.items():
+        n = nodes.get(nid, {})
+        if rec["verdict"] == "fail" and n.get("severity") == "critical":
+            by_dom.setdefault(n.get("domain", "?"), []).append((nid, rec))
+    for dom in sorted(by_dom):
+        lines.append(f"### {dom} ({len(by_dom[dom])} critical fails)")
+        for nid, rec in by_dom[dom]:
+            lines.append(f"- **{nid}**: {rec.get('evidence', '')}")
+    open_decisions = [n for n in plan["nodes"]
+                      if n["check"] == "user-decision" and n["id"] not in latest]
+    if open_decisions:
+        lines += ["", f"## Open user decisions ({len(open_decisions)})",
+                  "Policy choices only the user can make; each links to its "
+                  "glossary entry for option trade-offs.", ""]
+        for n in open_decisions:
+            q = n["probe"].replace("\n", " ")
+            lines.append(f"- [{n['severity']}] **{n['id']}** ({n['domain']}): {q[:200]}")
+    out = opt(args, "--out")
+    text = "\n".join(lines) + "\n"
+    if out:
+        Path(out).write_text(text)
+        print(f"wrote {out}: {len(lines)} lines")
+    else:
+        sys.stdout.write(text)
+
 def opt(args, flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 
@@ -191,11 +340,16 @@ def die(msg):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("plan", "record", "status"):
-        die("usage: run.py plan|record|status ...")
+    cmds = {"plan": cmd_plan, "record": cmd_record, "record-batch": cmd_record_batch,
+            "batches": cmd_batches, "status": cmd_status, "report": cmd_report}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        die(f"usage: run.py {"|".join(cmds)} ...")
     cmd, args = sys.argv[1], sys.argv[2:]
-    {"plan": cmd_plan, "record": cmd_record, "status": cmd_status}[cmd](args)
+    cmds[cmd](args)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)  # downstream closed the pipe (e.g. `| head`) — not an error
