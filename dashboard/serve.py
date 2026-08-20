@@ -61,6 +61,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -78,6 +79,9 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 
 METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
 """Parsing module, resolved relative to this file (NOT cwd)."""
+
+SHADOW_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-shadow.py"
+"""Slice shadow module (slice-commit/git attribution), resolved like METRICS_PATH."""
 
 SESSIONS_ROOT = Path.home() / ".omp" / "agent" / "sessions"
 """Root under which omp session JSONL files live."""
@@ -110,22 +114,62 @@ HEARTBEAT_SECONDS = 15.0
 # --------------------------------------------------------------------------
 
 
+_METRICS_MODULE = None
+"""Cached metrics module; loaded once and shared by the server and helpers."""
+
+
 def load_metrics_module():
     """Load metrics/trio-metrics.py via importlib and return the module.
 
     The hyphenated filename cannot be imported normally, so it is loaded
     by file location relative to this file. Only public functions are used
-    (discover_loops, analyze_loop, parse_log); no parsing regex is copied.
+    (discover_loops, analyze_loop, parse_log, parse_timeline,
+    parse_slices_block); no parsing regex is copied. The module is loaded
+    once and cached.
     """
+    global _METRICS_MODULE
+    if _METRICS_MODULE is not None:
+        return _METRICS_MODULE
     spec = importlib.util.spec_from_file_location("trio_metrics", METRICS_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load metrics module: {METRICS_PATH}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    for fn in ("discover_loops", "analyze_loop", "parse_log"):
+    for fn in ("discover_loops", "analyze_loop", "parse_log", "parse_timeline",
+               "parse_slices_block"):
         if not hasattr(module, fn):
             raise RuntimeError(f"metrics module missing required function: {fn}")
+    _METRICS_MODULE = module
+    return module
+
+
+_SHADOW_MODULE = None
+"""Cached shadow module; loaded once, None when unavailable (slice_activity
+degrades to null in that case)."""
+
+
+def load_shadow_module():
+    """Load metrics/trio-shadow.py via importlib and return the module.
+
+    Same by-path loading as ``load_metrics_module``. The dashboard reuses
+    its slice-commit/git-attribution functions (find_slices_block,
+    parse_slices, analyze_slice) instead of duplicating them. Any load
+    failure raises; callers degrade gracefully.
+    """
+    global _SHADOW_MODULE
+    if _SHADOW_MODULE is not None:
+        return _SHADOW_MODULE
+    spec = importlib.util.spec_from_file_location("trio_shadow", SHADOW_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load shadow module: {SHADOW_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in ("find_slices_block", "parse_slices", "analyze_slice"):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"shadow module missing required function: {fn}")
+    _SHADOW_MODULE = module
     return module
 
 
@@ -229,52 +273,235 @@ def _last_entry_summary(entries: list[dict]) -> str:
     return " | ".join(parts)
 
 
-_LOG_LINE_RE = re.compile(r"^-\s*iter(?:ation)?\s+(\d+)\s*\|\s*([^|]+?)\s*\|\s*(.*)$")
-_LOG_FIELD_RE = re.compile(r"\b(started_at|ended_at|duration_sec):\s*([^\s|]+)")
-_VERDICT_RE = re.compile(r"\bVERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\b", re.IGNORECASE)
-
-
 def _loop_timeline(log_path: Path) -> list[dict]:
-    """Parse LOG.md into a merged per-(iter, role) activity timeline.
+    """Parse LOG.md into the full ordered list of parsed entries.
 
-    Roles append two lines per action (a summary line and a Format-A timing
-    line that repeats the summary); merge them, preferring the timed variant.
+    Every parsed entry is returned in file order (no per-(iter, role)
+    merging — the drawer groups and dedups frontend-side). Delegates to
+    metrics.parse_timeline so all LOG parsing stays in trio-metrics.py.
     """
-    if not log_path.is_file():
-        return []
-    by_key: dict[tuple[int, str], dict] = {}
-    order: list[tuple[int, str]] = []
+    return load_metrics_module().parse_timeline(log_path)
+
+
+def _loop_slices(loop_dir: Path) -> list[dict] | None:
+    """The parsed PLAN.md ```yaml slices: block, or None when absent/unparseable.
+
+    Uses metrics.parse_slices_block (the lenient wrapper): a missing PLAN.md
+    or a missing/malformed slices block yields None, never an error.
+    """
+    plan_path = loop_dir / "PLAN.md"
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        text = plan_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        return None
+    return load_metrics_module().parse_slices_block(text)
+
+
+def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
+    """Shadow drift for a loop's slices, or None when not applicable.
+
+    Reuses metrics/trio-shadow.py's slice-commit/git attribution (loaded by
+    path via importlib, same as the metrics module) and shapes the result
+    per the API contract: {"slices": [{"id", "declared_writes",
+    "actual_writes", "undeclared", "commits"}]}. Slice repos resolve
+    relative to the mailbox root — the project root the dashboard scans.
+    Any failure (no PLAN.md, no slices block, a missing/non-git repo, or a
+    shadow-script load error) yields None, never a 500.
+    """
+    try:
+        shadow = load_shadow_module()
+        text = (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+        slices = shadow.parse_slices(shadow.find_slices_block(text))
+    except Exception:
+        return None
+    entries = []
+    for sl in slices:
+        entry = shadow.analyze_slice(sl, root)
+        if entry["repo_status"] != "ok":
+            return None  # cannot attribute commits -> no meaningful drift data
+        entries.append({
+            "id": entry["id"],
+            "declared_writes": entry["declared_writes"],
+            "actual_writes": entry["actual_touched"],
+            "undeclared": entry["undeclared_touches"],
+            "commits": entry["commits"],
+        })
+    return {"slices": entries}
+
+
+def _loop_iterations(loop_dir: Path, root: Path) -> tuple[list[dict], list[dict]]:
+    """Per-iteration lifecycle + overlaps for a loop.
+
+    All parsing lives in metrics/trio-metrics.py (derive_iterations /
+    iteration_path_sets / iteration_overlaps); this helper only loads the
+    mailbox inputs. Any failure yields ([], []), never a 500.
+    """
+    try:
+        metrics = load_metrics_module()
+        state = metrics.parse_state(loop_dir / "STATE.md")
+        timeline = metrics.parse_timeline(loop_dir / "LOG.md")
+        slices = _loop_slices(loop_dir) or []
+        try:
+            verdict_text = (loop_dir / "VERDICT.md").read_text(
+                encoding="utf-8", errors="replace")
+        except OSError:
+            verdict_text = ""
+        try:
+            report_text = (loop_dir / "REPORT.md").read_text(
+                encoding="utf-8", errors="replace")
+        except OSError:
+            report_text = ""
+        activity = _loop_slice_activity(loop_dir, root)
+        iterations = metrics.derive_iterations(
+            state, timeline, slices,
+            verdict_text=verdict_text, report_text=report_text,
+            slice_activity=activity)
+        overlaps = metrics.iteration_overlaps(
+            iterations, metrics.iteration_path_sets(slices))
+        return iterations, overlaps
+    except Exception:
+        traceback.print_exc()
+        return [], []
+
+
+_SLICE_COMMIT_RE = re.compile(r"^slice\(([^)]+)\):\s*(.*)$")
+"""Conventional slice commit subject: ``slice(<id>): <subject>``."""
+
+STALE_MINUTES = 45
+"""An active-looking loop with no activity for this long is flagged stale."""
+
+_ACTIVE_STATUS_WORDS = ("running", "pending", "in_progress", "planning", "building")
+
+
+def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
+    """Git metadata for a loop: slice-attributed commits newest first.
+
+    Reads ``git log`` of the coordination repo (the mailbox's parent root)
+    and keeps subjects matching the conventional ``slice(<id>): `` prefix
+    (MAILBOX-SCHEMA.md). Not a git repo / git missing / any failure -> [].
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "log", "--format=%H%x09%h%x09%s", "-n", "200"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return []
-    for raw in lines:
-        match = _LOG_LINE_RE.match(raw.strip())
-        if not match:
+    if out.returncode != 0:
+        return []
+    commits = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
             continue
-        iteration, role, rest = match.groups()
-        role = role.strip().lower()
-        fields = dict((k, v) for k, v in _LOG_FIELD_RE.findall(rest))
-        summary = _LOG_FIELD_RE.sub("", rest)
-        summary = re.sub(r"\s*\|\s*$", "", summary).strip(" |")
-        verdict_match = _VERDICT_RE.search(summary)
-        entry = {
-            "iteration": int(iteration),
-            "role": role,
-            "summary": summary,
-            "verdict": verdict_match.group(1).upper() if verdict_match else None,
-            "started_at": fields.get("started_at"),
-            "ended_at": fields.get("ended_at"),
-            "duration_sec": _to_int(fields.get("duration_sec")),
-        }
-        key = (entry["iteration"], role)
-        prev = by_key.get(key)
-        if prev is None:
-            order.append(key)
-            by_key[key] = entry
-        elif entry["duration_sec"] is not None or prev["duration_sec"] is None:
-            by_key[key] = entry
-    return [by_key[key] for key in order]
+        sha, short, subject = parts
+        m = _SLICE_COMMIT_RE.match(subject)
+        if not m:
+            continue
+        commits.append({
+            "sha": sha,
+            "short": short,
+            "slice": m.group(1),
+            "subject": m.group(2),
+        })
+    return commits
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
+    """Attention signals for one loop, highest severity first.
+
+    Kinds: needs_human / blocked (high), stale / drift (medium),
+    repair (low). Anything that cannot be determined is simply absent —
+    the inbox never guesses.
+    """
+    items = []
+
+    def add(severity, kind, headline, detail):
+        items.append({
+            "loop": card["name"],
+            "kind": kind,
+            "severity": severity,
+            "headline": headline,
+            "detail": detail,
+        })
+
+    verdict = (card.get("final_verdict") or "").upper()
+    if verdict == "NEEDS_HUMAN":
+        add("high", "needs_human", "Human verification pending",
+            "Agent-verifiable criteria pass; verify: human criteria remain.")
+    elif verdict == "BLOCKED":
+        add("high", "blocked", "Loop blocked",
+            card.get("last_entry_summary") or "")
+
+    status = (card.get("status") or "").lower()
+    if any(w in status for w in _ACTIVE_STATUS_WORDS):
+        last = _parse_iso(card.get("last_activity"))
+        if last is not None:
+            idle = (datetime.now(timezone.utc) - last).total_seconds() / 60
+            if idle >= STALE_MINUTES:
+                hours = idle / 60
+                span = f"{int(hours)}h" if hours >= 1 else f"{int(idle)}m"
+                add("medium", "stale", f"No activity for {span}",
+                    f"Status is '{card['status']}' but the mailbox has not moved.")
+
+    plan = loop_dir / "PLAN.md"
+    try:
+        has_slices = "slices:" in plan.read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        has_slices = False
+    if has_slices:
+        activity = _loop_slice_activity(loop_dir, root)
+        if activity:
+            drift_files = set()
+            drift_slices = 0
+            for sl in activity["slices"]:
+                if sl["undeclared"]:
+                    drift_slices += 1
+                    drift_files.update(sl["undeclared"])
+            if drift_files:
+                add("medium", "drift",
+                    f"{len(drift_files)} undeclared write"
+                    f"{'s' if len(drift_files) != 1 else ''}",
+                    f"Across {drift_slices} slice"
+                    f"{'s' if drift_slices != 1 else ''}: "
+                    + ", ".join(sorted(drift_files)[:4])
+                    + ("…" if len(drift_files) > 4 else ""))
+
+    try:
+        _, overlaps = _loop_iterations(loop_dir, root)
+        for ov in overlaps:
+            paths = ov["paths"]
+            shown = ", ".join(paths[:6]) + ("\u2026" if len(paths) > 6 else "")
+            verb = ("share write paths" if ov["relation"] == "write-write"
+                    else "overlap read/write paths" if ov["relation"] == "write-read"
+                    else "share write paths and read/write paths")
+            add("medium", "overlap",
+                f"Iterations {ov['a']} and {ov['b']} {verb}", shown)
+    except Exception:
+        traceback.print_exc()
+
+    try:
+        repairs = int((loop_dir / ".repairs").read_text().strip())
+    except (OSError, ValueError):
+        repairs = 0
+    if repairs >= 1:
+        add("low", "repair", f"{repairs} consecutive scoped repair"
+             f"{'s' if repairs != 1 else ''}",
+            "Repair-only loop risk: a full Lead pass is forced at 2.")
+
+    order = {"high": 0, "medium": 1, "low": 2}
+    items.sort(key=lambda i: order[i["severity"]])
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -493,8 +720,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "last_entry_summary": "unreadable mailbox",
                     "segments": [],
                 })
+        inbox = []
+        for loop_dir, card in zip(
+            list(metrics.discover_loops(self.server.root)), loops
+        ):
+            try:
+                inbox.extend(_inbox_items(loop_dir, card, self.server.root))
+            except Exception:
+                traceback.print_exc()
+        order = {"high": 0, "medium": 1, "low": 2}
+        inbox.sort(key=lambda i: (order[i["severity"]], i["loop"]))
         self._send_json(200, {
             "loops": loops,
+            "inbox": inbox,
             "updated_at": _utc_iso(datetime.now(timezone.utc)),
         })
 
@@ -546,6 +784,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         card = self._loop_card(loop_dir, self.server.metrics)
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
+        card["commits"] = _loop_commits(loop_dir, self.server.root)
+        card["slices"] = _loop_slices(loop_dir)
+        card["slice_activity"] = _loop_slice_activity(loop_dir, self.server.root)
+        card["iterations"], card["overlaps"] = _loop_iterations(
+            loop_dir, self.server.root)
         card["sessions"] = self._session_list(loop_dir)
         self._send_json(200, card)
 

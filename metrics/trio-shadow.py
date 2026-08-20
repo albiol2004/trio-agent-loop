@@ -38,218 +38,41 @@ slices never fails the gate. This is the first active interlock: drivers
 run it post-Lead, pre-Evaluator, and retry the Lead once on exit 1.
 
 Stdlib only — the restricted YAML shape is parsed line-based; there is no
-PyYAML dependency.
+PyYAML dependency. The block parser itself (``find_slices_block`` /
+``parse_slices`` / ``SliceParseError``) is shared from trio-metrics.py, the
+single source of truth for the format, and loaded here by file location.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-SLICE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SLICES_KEY_RE = re.compile(r"^\s*slices\s*:\s*(.*)$")
-ENTRY_RE = re.compile(r"^\s*- id:\s*(.+?)\s*$")
-KEY_RE = re.compile(r"^([a-z]+):\s*(.*)$")
-FLOW_LIST_RE = re.compile(r"^\[(.*)\]$")
-ITEM_RE = re.compile(r"^\s*- (.+)$")
-SLICE_KEYS = ("id", "repo", "writes", "reads", "gate", "status", "iteration")
-STATUS_VALUES = ("planned", "in_progress", "complete")
+def _load_metrics_module():
+    """Load metrics/trio-metrics.py via importlib by path.
 
-
-class SliceParseError(Exception):
-    """The PLAN.md slices block is missing or does not match the restricted shape."""
-
-
-def find_slices_block(plan_text: str) -> list[str]:
-    """Return the lines of the first ```yaml fence with a top-level `slices:` key.
-
-    Only yaml-marked fences (```yaml / ```yml) are candidates, matching the
-    documented PLAN.md format. Raises SliceParseError when no such block
-    exists.
+    The hyphenated filename cannot be imported normally, so the slice
+    block parser is shared from trio-metrics.py and loaded here by file
+    location (same pattern as trio-check.py and dashboard/serve.py). This
+    keeps one source of truth for the PLAN.md ``slices:`` format.
     """
-    in_fence = False
-    yaml_fence = False
-    buf: list[str] = []
-    for raw in plan_text.splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("```"):
-            if in_fence:
-                if yaml_fence and _has_slices_key(buf):
-                    return buf
-                in_fence = False
-                yaml_fence = False
-                buf = []
-            else:
-                in_fence = True
-                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
-                buf = []
-            continue
-        if in_fence and yaml_fence:
-            buf.append(raw)
-    if in_fence and yaml_fence and _has_slices_key(buf):
-        return buf
-    raise SliceParseError(
-        "no ```yaml slices block found in PLAN.md "
-        "(expected a fenced yaml block whose top-level key is `slices:`)"
-    )
+    path = Path(__file__).resolve().parent / "trio-metrics.py"
+    spec = importlib.util.spec_from_file_location("trio_metrics", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load trio-metrics.py from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def _has_slices_key(lines: list[str]) -> bool:
-    return any(SLICES_KEY_RE.match(ln) for ln in lines)
-
-
-def _unquote(item: str) -> str:
-    item = item.strip()
-    if len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
-        return item[1:-1]
-    return item
-
-
-def _parse_flow_list(value: str, line: int) -> list[str]:
-    m = FLOW_LIST_RE.match(value)
-    if not m:
-        raise SliceParseError(
-            f"line {line}: `writes:`/`reads:` must be a bracketed list like "
-            f'[path.py, "api:Name"], got {value!r}'
-        )
-    return [_unquote(part) for part in m.group(1).split(",") if part.strip()]
-
-
-def parse_slices(lines: list[str]) -> list[dict]:
-    """Parse the restricted slices shape into a list of slice dicts.
-
-    Accepts exactly: a top-level `slices:` key, then one `- id: <kebab-case>`
-    entry per slice with keys id/repo/writes/reads/gate/status/iteration.
-    `writes:`/`reads:` are flow-style `[a, "b"]` lists or block-style
-    `- item` lists. `repo` defaults to `.`, `gate` to `false`, `status` to
-    `in_progress`; `iteration` is optional (validated as int when present).
-    Anything else raises SliceParseError with the offending line number.
-    """
-    slices: list[dict] = []
-    cur: dict | None = None
-    list_key: str | None = None
-    saw_slices = False
-
-    for i, raw in enumerate(lines, 1):
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        m = SLICES_KEY_RE.match(stripped)
-        if m:
-            if cur is not None:
-                raise SliceParseError(
-                    f"line {i}: duplicate `slices:` key inside a slice entry"
-                )
-            if m.group(1).strip():
-                raise SliceParseError(
-                    f"line {i}: expected `slices:` with an empty value followed "
-                    "by `- id:` entries"
-                )
-            saw_slices = True
-            continue
-
-        m = ENTRY_RE.match(stripped)
-        if m:
-            if cur is not None:
-                slices.append(cur)
-            slice_id = m.group(1).strip()
-            if not SLICE_ID_RE.match(slice_id):
-                raise SliceParseError(
-                    f"line {i}: slice id {slice_id!r} is not kebab-case "
-                    "(lowercase letters, digits, hyphens)"
-                )
-            cur = {
-                "id": slice_id,
-                "repo": ".",
-                "writes": [],
-                "reads": [],
-                "gate": False,
-                "status": "in_progress",
-            }
-            list_key = None
-            continue
-
-        if cur is None:
-            raise SliceParseError(
-                f"line {i}: unexpected content before any slice entry: {stripped!r}"
-            )
-
-        m = KEY_RE.match(stripped)
-        if m:
-            key, value = m.group(1), m.group(2).strip()
-            if key not in SLICE_KEYS:
-                raise SliceParseError(
-                    f"line {i}: unknown slice key {key!r} "
-                    f"(expected one of {', '.join(SLICE_KEYS)})"
-                )
-            if key == "id":
-                raise SliceParseError(
-                    f"line {i}: `id` is set by the `- id:` entry; remove this line"
-                )
-            if key == "repo":
-                if not value:
-                    raise SliceParseError(f"line {i}: `repo:` needs a path value")
-                cur["repo"] = value
-                list_key = None
-            elif key in ("writes", "reads"):
-                if value:
-                    cur[key] = _parse_flow_list(value, i)
-                    list_key = None
-                else:
-                    cur[key] = []
-                    list_key = key
-            elif key == "gate":
-                if value not in ("true", "false"):
-                    raise SliceParseError(
-                        f"line {i}: `gate:` must be true or false, got {value!r}"
-                    )
-                cur["gate"] = value == "true"
-                list_key = None
-            elif key == "status":
-                if value not in STATUS_VALUES:
-                    raise SliceParseError(
-                        f"line {i}: `status:` must be one of "
-                        f"{', '.join(STATUS_VALUES)}, got {value!r}"
-                    )
-                cur["status"] = value
-                list_key = None
-            elif key == "iteration":
-                try:
-                    cur["iteration"] = int(value)
-                except ValueError:
-                    raise SliceParseError(
-                        f"line {i}: `iteration:` must be an integer, got {value!r}"
-                    ) from None
-                list_key = None
-            continue
-
-        # Block-style list item under the current writes:/reads: key.
-        if list_key is not None:
-            m = ITEM_RE.match(stripped)
-            if not m:
-                raise SliceParseError(
-                    f"line {i}: expected a `- item` list entry under "
-                    f"`{list_key}:`, got {stripped!r}"
-                )
-            cur[list_key].append(_unquote(m.group(1).strip()))
-            continue
-
-        raise SliceParseError(
-            f"line {i}: unexpected content in slice {cur['id']!r}: {stripped!r}"
-        )
-
-    if cur is not None:
-        slices.append(cur)
-    if not saw_slices:
-        raise SliceParseError(
-            "the yaml block has no top-level `slices:` key "
-            "(expected `slices:` followed by `- id:` entries)"
-        )
-    return slices
+_METRICS = _load_metrics_module()
+SliceParseError = _METRICS.SliceParseError
+find_slices_block = _METRICS.find_slices_block
+parse_slices = _METRICS.parse_slices
 
 
 def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
