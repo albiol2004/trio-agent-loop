@@ -1,0 +1,586 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "ci-stage-gates",
+      "domain": "deployment",
+      "title": "CI Stage Gates",
+      "summary": "A deployment pipeline is an ordered set of deterministic build, test, security, packaging, and deploy-validation stages. Production promotion is possible only when every required predecessor reports success, and a failed or skipped gate blocks the dependent release.",
+      "check": "probe",
+      "probe": "Parse every CI workflow's production deployment jobs, recursively resolve `needs`, and assert paths include required test, security, package, and validation jobs. Verify a simulated non-zero predecessor result prevents deployment, for example by dispatching a staging workflow with a deliberately failing gate and asserting no deploy event is emitted.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "glossary_ref": "glossary/deployment.md#ci-stage-gates",
+      "sources": [
+        "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions",
+        "https://slsa.dev/spec/v1.0/requirements"
+      ]
+    },
+    {
+      "id": "ci-feedback-budget",
+      "domain": "deployment",
+      "title": "CI Feedback Budget",
+      "summary": "CI spends its feedback budget by running cheap deterministic checks before expensive integration and end-to-end work, while independent jobs execute concurrently. Dependency caches are keyed by the lockfile and relevant toolchain so speed does not conceal input drift.",
+      "check": "probe",
+      "probe": "Parse workflow `needs`, matrices, timeout, and cache-key fields; construct the dependency graph and flag independent jobs with unnecessary edges. Assert cache keys contain the relevant lockfile or toolchain hash and run two jobs with changed lockfiles to confirm they do not reuse the prior cache.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "glossary_ref": "glossary/deployment.md#ci-feedback-budget",
+      "sources": [
+        "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows",
+        "https://docs.gitlab.com/ci/pipelines/"
+      ]
+    },
+    {
+      "id": "ci-reproducible-inputs",
+      "domain": "deployment",
+      "title": "CI Reproducible Inputs",
+      "summary": "CI builds from a clean checkout with pinned runners, toolchains, actions, base images, and lockfile-resolved dependencies. Mutable network inputs such as floating tags or unconstrained package ranges are not allowed to change the result of a rebuild.",
+      "check": "probe",
+      "probe": "Parse manifests, lockfiles, Dockerfiles, and workflow setup steps. Fail on missing supported lockfiles, floating action or base-image tags, unpinned toolchain setup, or install commands that ignore lockfiles; rebuild the same revision twice in clean workers and compare artifact digests.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "glossary_ref": "glossary/deployment.md#ci-reproducible-inputs",
+      "sources": [
+        "https://slsa.dev/spec/v1.0/requirements",
+        "https://reproducible-builds.org/docs/definition/"
+      ]
+    },
+    {
+      "id": "ci-production-protection",
+      "domain": "deployment",
+      "title": "CI Production Protection",
+      "summary": "Production deployment is reachable only from protected branches or tags after required status checks, reviewed changes, and an authenticated environment gate. The policy applies to every production path, including manual and emergency workflows.",
+      "check": "probe",
+      "probe": "Query repository protection and deployment-environment settings; enumerate all workflows and jobs that can target production and assert required checks, reviews, ref restrictions, and approvals on each path. Attempt an unreviewed or unprotected ref in a staging policy test and confirm authorization is denied.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["ci-stage-gates"],
+      "glossary_ref": "glossary/deployment.md#ci-production-protection",
+      "sources": [
+        "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches",
+        "https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment"
+      ]
+    },
+    {
+      "id": "artifact-build-once",
+      "domain": "deployment",
+      "title": "Artifact Build Once",
+      "summary": "CI produces one tested, immutable artifact identified by a digest or content hash and promotes that exact identifier through environments. Promotion changes references and configuration only; it never rebuilds or resolves a mutable tag.",
+      "check": "probe",
+      "probe": "Inspect pipeline steps, artifact publication, and deployment manifests. Assert publication occurs once per revision and every environment consumes the same digest; deploy a test release and compare registry, release-record, and runtime digests.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["ci-stage-gates", "ci-reproducible-inputs"],
+      "glossary_ref": "glossary/deployment.md#artifact-build-once",
+      "sources": [
+        "https://slsa.dev/spec/v1.0/requirements",
+        "https://github.com/opencontainers/image-spec/blob/main/descriptor.md"
+      ]
+    },
+    {
+      "id": "artifact-provenance",
+      "domain": "deployment",
+      "title": "Artifact Provenance",
+      "summary": "Each release artifact has verifiable signed provenance and an SBOM that link it to its source revision, builder, inputs, and build steps. The attestations are addressable by the artifact digest and are checked before promotion.",
+      "check": "probe",
+      "probe": "For a release digest, run `cosign verify-attestation --type slsaprovenance <image>` with the expected identity and issuer, then retrieve and parse its SBOM. Fail if either is absent, does not match the digest, or cannot be cryptographically verified.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["artifact-build-once"],
+      "cluster": "sbom-provenance",
+      "glossary_ref": "glossary/deployment.md#artifact-provenance",
+      "sources": [
+        "https://slsa.dev/spec/v1.0/requirements",
+        "https://docs.sigstore.dev/cosign/verifying/verify-attestation/"
+      ]
+    },
+    {
+      "id": "artifact-retention",
+      "domain": "deployment",
+      "title": "Artifact Retention",
+      "summary": "The registry retains immutable release digests and their metadata for at least the documented rollback and forensic window. Production references use digests, while mutable production tags are rejected or cannot overwrite an existing release.",
+      "check": "probe",
+      "probe": "Query registry retention, immutability, and deletion policies and list deployment references. Assert every production reference is a retained digest beyond the rollback window; attempt tag overwrite or deletion in a non-production registry and expect denial.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["artifact-build-once"],
+      "glossary_ref": "glossary/deployment.md#artifact-retention",
+      "sources": [
+        "https://github.com/opencontainers/image-spec/blob/main/descriptor.md",
+        "https://kubernetes.io/docs/concepts/containers/images/"
+      ]
+    },
+    {
+      "id": "trunk-short-lived",
+      "domain": "deployment",
+      "title": "Trunk Short-Lived",
+      "summary": "The production-bound branch remains continuously releasable, with small changes merged quickly and incomplete work hidden behind controlled flags. Integration happens frequently rather than through long-lived divergence.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: branch-age and merge-frequency reports, recent pull requests, release history, flag usage, and documented exceptions. Verify the default branch is releasable and any branch exceeding the stated lifetime has a recorded reason and owner.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#trunk-short-lived",
+      "sources": ["https://trunkbaseddevelopment.com/"]
+    },
+    {
+      "id": "branch-policy",
+      "domain": "deployment",
+      "title": "Branch Policy",
+      "summary": "Every long-lived release branch has a documented purpose and lifecycle rather than becoming an accidental second mainline. Its owner, cut criteria, backport rules, and end-of-life date make differences from the production-bound branch intentional and reviewable.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: all branches with age beyond the short-lived threshold, policy records, owners, backport pull requests, and end-of-life status. For each long-lived branch, confirm a documented purpose, owner, cut policy, backport rule, and date.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#branch-policy",
+      "sources": [
+        "https://trunkbaseddevelopment.com/",
+        "https://docs.github.com/en/get-started/using-github/github-flow"
+      ]
+    },
+    {
+      "id": "rolling-safety",
+      "domain": "deployment",
+      "title": "Rolling Safety",
+      "summary": "A rolling release replaces instances while readiness gates and bounded surge/unavailable settings preserve service capacity. Revision history and disruption budgets provide a known rollback path and prevent voluntary disruption from removing too much capacity.",
+      "check": "probe",
+      "probe": "Parse rollout manifests and assert startup/readiness probes, bounded `maxUnavailable`, `maxSurge`, revision history, and disruption-budget settings. In staging, roll a revision under representative load and verify capacity and traffic remain within the stated bounds.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["readiness-drain"],
+      "glossary_ref": "glossary/deployment.md#rolling-safety",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/",
+        "https://kubernetes.io/docs/tasks/run-application/configure-pdb/"
+      ]
+    },
+    {
+      "id": "blue-green-switch",
+      "domain": "deployment",
+      "title": "Blue-Green Switch",
+      "summary": "Blue-green deployment keeps the known-good (blue) and candidate (green) versions independently runnable and validates green before one controlled traffic switch. Blue remains available for immediate reversal until compatibility and stability are established.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: routing configuration, two live deployment revisions, validation results, switch authorization, and rollback procedure. Confirm the traffic switch is atomic or bounded, green was tested before production routing, and blue remains runnable after the switch.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "min_tier": "standard",
+      "depends_on": ["artifact-build-once"],
+      "glossary_ref": "glossary/deployment.md#blue-green-switch",
+      "sources": ["https://martinfowler.com/bliki/BlueGreenDeployment.html"]
+    },
+    {
+      "id": "canary-analysis",
+      "domain": "deployment",
+      "title": "Canary Analysis",
+      "summary": "Canary analysis exposes a candidate to bounded traffic steps and evaluates version-scoped reliability, latency, saturation, and business metrics for a minimum observation window. Promotion occurs only when thresholds pass; a breach aborts or rolls back automatically.",
+      "check": "probe",
+      "probe": "Parse rollout and analysis configuration for traffic steps, hold duration, metric queries, thresholds, sample windows, and abort action. In a non-production environment, inject a controlled candidate error or latency regression and assert analysis fails before full promotion.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["release-observability"],
+      "glossary_ref": "glossary/deployment.md#canary-analysis",
+      "sources": ["https://sre.google/workbook/canarying-releases/"]
+    },
+    {
+      "id": "release-observability",
+      "domain": "deployment",
+      "title": "Release Observability",
+      "summary": "Release telemetry attributes logs, metrics, traces, and alerts to both the old and new version during rollout. Version identity is present before traffic shifts so analysis and responders can compare candidate behavior rather than mixed aggregates.",
+      "check": "probe",
+      "probe": "Send a uniquely identifiable request through a staging rollout and query logs, metrics, and traces by release identifier. Assert old/new labels and source revision or digest appear consistently and that alerts can isolate candidate traffic.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "cluster": "release-telemetry-attribution",
+      "glossary_ref": "glossary/deployment.md#release-observability",
+      "sources": [
+        "https://sre.google/workbook/canarying-releases/",
+        "https://opentelemetry.io/docs/specs/semconv/"
+      ]
+    },
+    {
+      "id": "automated-rollback",
+      "domain": "deployment",
+      "title": "Automated Rollback",
+      "summary": "A release controller halts promotion and restores the last known-good artifact when health, analysis, or SLO gates breach. Rollback is based on the immutable prior identifier and leaves an auditable outcome rather than merely stopping new instances.",
+      "check": "probe",
+      "probe": "Parse rollout-controller policy and run a staging rollout with a controlled failing candidate. Assert promotion aborts, traffic returns to the prior revision and digest, health recovers, and the release event records the reason.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["canary-analysis", "artifact-retention"],
+      "glossary_ref": "glossary/deployment.md#automated-rollback",
+      "sources": [
+        "https://sre.google/workbook/canarying-releases/",
+        "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-back-a-deployment"
+      ]
+    },
+    {
+      "id": "rollback-blockers",
+      "domain": "deployment",
+      "title": "Rollback Blockers",
+      "summary": "Rollback policy names conditions in which returning to the prior release is unsafe, including irreversible schema changes, unavailable artifacts, insufficient capacity, and incompatible dependencies. For each blocker it defines a safe stop, forward-fix, or recovery action and an owner.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: rollback runbooks, migration compatibility annotations, artifact retention, dependency support matrix, capacity calculations, and a recent drill. Verify each listed blocker has a detection signal and an executable safe response rather than an unconditional rollback command.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["artifact-retention", "migration-expand-contract"],
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#rollback-blockers",
+      "sources": [
+        "https://martinfowler.com/articles/evodb.html",
+        "https://sre.google/sre-book/release-engineering/"
+      ]
+    },
+    {
+      "id": "feature-flag-contract",
+      "domain": "deployment",
+      "title": "Feature Flag Contract",
+      "summary": "Every release flag has explicit metadata describing its owner, purpose, type, default, target scope, and expiry or removal issue. The contract makes flag behavior and lifecycle reviewable instead of leaving semantics in scattered conditionals.",
+      "check": "probe",
+      "probe": "Scan the flag registry or configuration and source annotations; assert required metadata, valid ownership, type consistency, and an expiry or removal reference for every flag. Fail on source references to unregistered flags.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "glossary_ref": "glossary/deployment.md#feature-flag-contract",
+      "sources": ["https://martinfowler.com/articles/feature-toggles.html"]
+    },
+    {
+      "id": "feature-flag-cleanup",
+      "domain": "deployment",
+      "title": "Feature Flag Cleanup",
+      "summary": "Temporary flags have an enforced expiry and cleanup path, and expired entries produce a blocking CI failure or an owned debt action. Removing a flag deletes its configuration and both obsolete code paths rather than merely turning it off.",
+      "check": "probe",
+      "probe": "Compare flag registry entries with source references and expiry dates; inject an expired test flag and assert CI fails or creates the documented owner action. Verify a cleanup change removes its branches and configuration references.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "depends_on": ["feature-flag-contract"],
+      "glossary_ref": "glossary/deployment.md#feature-flag-cleanup",
+      "sources": ["https://martinfowler.com/articles/feature-toggles.html"]
+    },
+    {
+      "id": "feature-flag-fail-safe",
+      "domain": "deployment",
+      "title": "Feature Flag Fail Safe",
+      "summary": "A kill switch has a documented safe default, authorized change boundary, audit trail, and explicit behavior when the flag service is unavailable. Failure of flag evaluation must not silently enable risky functionality or weaken authorization.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: flag definitions, outage behavior tests, authorization code, access policy, audit events, and operator runbook. Confirm a service outage selects the documented safe default and that a flag cannot grant privilege by itself.",
+      "applies_if": ["spa"],
+      "severity": "critical",
+      "depends_on": ["feature-flag-contract"],
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#feature-flag-fail-safe",
+      "sources": [
+        "https://martinfowler.com/articles/feature-toggles.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "id": "environment-parity",
+      "domain": "deployment",
+      "title": "Environment Parity",
+      "summary": "Environments deploy the same immutable artifact and versioned runtime/infrastructure definitions, with differences limited to an explicit configuration, scale, and isolated-data allowlist. Parity concerns execution semantics, not identical capacity or credentials.",
+      "check": "probe",
+      "probe": "Resolve each environment's manifests and IaC overlays and compare artifact digest, runtime versions, base images, and module versions. Fail on differences outside the approved variable, scale, and data allowlist.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["artifact-build-once"],
+      "glossary_ref": "glossary/deployment.md#environment-parity",
+      "sources": [
+        "https://12factor.net/config",
+        "https://slsa.dev/spec/v1.0/requirements"
+      ]
+    },
+    {
+      "id": "environment-data-isolation",
+      "domain": "deployment",
+      "title": "Environment Data Isolation",
+      "summary": "Non-production environments use synthetic or scrubbed data and separately scoped services, credentials, domains, and quotas. Network and identity policy prevents staging or preview code from reading production data or mutating production systems.",
+      "check": "probe",
+      "probe": "Scan environment manifests, secret references, endpoint configuration, and network policies for production references. From a non-production workload, attempt connections to production endpoints and assert deny; inspect dataset labels to confirm synthetic or scrubbed origin.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "cluster": "nonprod-data-isolation",
+      "glossary_ref": "glossary/deployment.md#environment-data-isolation",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/security/secrets-good-practices/",
+        "https://kubernetes.io/docs/concepts/services-networking/network-policies/"
+      ]
+    },
+    {
+      "id": "iac-review-plan",
+      "domain": "deployment",
+      "title": "IaC Review Plan",
+      "summary": "Infrastructure and deployment changes are version-controlled, reviewed, policy-checked, and applied only from a saved plan generated from the reviewed commit. The apply input is therefore the same intended change that reviewers examined.",
+      "check": "probe",
+      "probe": "Inspect IaC CI configuration and assert pull-request plan and policy checks, approval gates, and apply steps consume the same commit or saved plan. Change the reviewed commit after plan generation in a staging test and verify apply rejects the stale plan.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "glossary_ref": "glossary/deployment.md#iac-review-plan",
+      "sources": [
+        "https://developer.hashicorp.com/terraform/tutorials/automation/automate-terraform",
+        "https://developer.hashicorp.com/terraform/cloud-docs/workspaces/run"
+      ]
+    },
+    {
+      "id": "iac-drift",
+      "domain": "deployment",
+      "title": "IaC Drift",
+      "summary": "A scheduled read-only plan detects infrastructure changed outside version control and routes non-zero drift to an owner. Reconciliation or an exception is explicit, approved, and expires rather than silently accepting live state.",
+      "check": "probe",
+      "probe": "Inspect scheduler, read-only identity, plan command, exit-code handling, notifications, owner routing, and exception expiry. Introduce a harmless out-of-band change in a test workspace and assert drift is detected and routed without applying it.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["iac-review-plan"],
+      "glossary_ref": "glossary/deployment.md#iac-drift",
+      "sources": [
+        "https://developer.hashicorp.com/terraform/tutorials/cloud/drift-detection",
+        "https://developer.hashicorp.com/terraform/cli/commands/plan#detailed-exitcode"
+      ]
+    },
+    {
+      "id": "iac-state-safety",
+      "domain": "deployment",
+      "title": "IaC State Safety",
+      "summary": "IaC state is stored remotely with encryption, least-privilege access, concurrency locking, versioning/backups, and deliberate handling of sensitive values. State recovery and access are tested because losing or exposing it can affect the entire estate.",
+      "check": "probe",
+      "probe": "Parse backend and policy configuration and assert remote encryption, locking, backup or versioning, least-privilege roles, and audit logging. Run concurrent plan/apply and restore a prior state version in a test workspace, confirming safe failure and recovery.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["iac-review-plan"],
+      "glossary_ref": "glossary/deployment.md#iac-state-safety",
+      "sources": [
+        "https://developer.hashicorp.com/terraform/language/state/locking",
+        "https://developer.hashicorp.com/terraform/language/state/sensitive-data"
+      ]
+    },
+    {
+      "id": "gitops-reconciliation",
+      "domain": "deployment",
+      "title": "GitOps Reconciliation",
+      "summary": "A GitOps controller continuously reconciles each environment to an auditable desired-state commit and reports divergence. CI publishes or approves the desired state; it does not require unrestricted imperative mutation of the live cluster.",
+      "check": "probe",
+      "probe": "Inspect controller application configuration and CI steps; assert pull-based sync, commit revision tracking, health reporting, and no unrestricted `kubectl apply` or equivalent in production. Introduce test drift and confirm the controller reports or reconciles it according to policy.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["iac-review-plan"],
+      "glossary_ref": "glossary/deployment.md#gitops-reconciliation",
+      "sources": [
+        "https://opengitops.dev/#principles",
+        "https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/"
+      ]
+    },
+    {
+      "id": "gitops-break-glass",
+      "domain": "deployment",
+      "title": "GitOps Break Glass",
+      "summary": "Emergency out-of-band changes are time-bound, authorized, and fully audited, with a required follow-up commit restoring Git as the source of truth. Break-glass is a controlled exception, not a second deployment process.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: break-glass role policy, access logs, recent emergency changes, incident links, and follow-up commits. Verify each exception has time-bounded authorization and that live state was reconciled to Git.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["gitops-reconciliation"],
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#gitops-break-glass",
+      "sources": [
+        "https://opengitops.dev/#principles",
+        "https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/"
+      ]
+    },
+    {
+      "id": "secret-injection",
+      "domain": "deployment",
+      "title": "Secret Injection",
+      "summary": "Deployments obtain secrets from a managed store at release or runtime using workload identity, never embedding values in source, image layers, rendered manifests, or logs. Secret references and access policies are environment-scoped and auditable.",
+      "check": "probe",
+      "probe": "Scan repository history, image layers, rendered manifests, and deployment logs for secret literals. Resolve deployment references and assert they point to external providers with identity-based access; use a canary secret to verify no value appears in logs or artifacts.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "cluster": "secrets-management",
+      "glossary_ref": "glossary/deployment.md#secret-injection",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/security/secrets-good-practices/",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "id": "secret-rotation",
+      "domain": "deployment",
+      "title": "Secret Rotation",
+      "summary": "Secret rotation has a named owner, defined cadence, revocation path, and compatibility plan for consumers. Where simultaneous keys are required, a bounded dual-key overlap and deployment smoke test prevent rotation from causing an outage or leaving old credentials trusted indefinitely.",
+      "check": "judgment",
+      "probe": "Evidence to inspect: secret inventory, rotation schedules, owner assignments, vault audit events, revocation runbooks, and a recent rotation drill. Confirm the consumer smoke test fails safely on invalid values and that the prior key is revoked at the documented deadline.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["secret-injection"],
+      "cluster": "secrets-management",
+      "min_tier": "standard",
+      "glossary_ref": "glossary/deployment.md#secret-rotation",
+      "sources": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+        "https://kubernetes.io/docs/concepts/security/secrets-good-practices/"
+      ]
+    },
+    {
+      "id": "readiness-drain",
+      "domain": "deployment",
+      "title": "Readiness Drain",
+      "summary": "A service distinguishes startup, readiness, and liveness, and removes itself from traffic before termination. Grace periods, connection timeouts, and idempotent retry behavior let in-flight work finish or be safely retried during replacement.",
+      "check": "probe",
+      "probe": "Parse workload and service manifests for distinct probes, deregistration or `preStop`, termination grace, and timeout/retry policies. Exercise a rolling restart with active requests and assert new traffic stops before termination, in-flight requests complete or retry safely, and no forced drops exceed the policy.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["health-contract"],
+      "cluster": "health-check-contracts",
+      "glossary_ref": "glossary/deployment.md#readiness-drain",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"
+      ]
+    },
+    {
+      "id": "migration-expand-contract",
+      "domain": "deployment",
+      "title": "Migration Expand Contract",
+      "summary": "Schema changes are released in expand, migrate, and contract phases so old and new application versions remain mutually compatible during rollout and rollback. Destructive removal waits until all readers and writers and backfill validation have completed.",
+      "check": "probe",
+      "probe": "Parse migration files, application release ordering, and compatibility annotations; flag destructive DDL, non-null required columns, or renamed fields before the compatibility window or backfill. In a staging clone, run old and new versions concurrently and verify reads and writes during each phase.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["artifact-build-once"],
+      "cluster": "db-migrations",
+      "glossary_ref": "glossary/deployment.md#migration-expand-contract",
+      "sources": [
+        "https://martinfowler.com/articles/evodb.html",
+        "https://docs.gitlab.com/development/database/avoiding_downtime_in_migrations/"
+      ]
+    },
+    {
+      "id": "migration-backup-restore",
+      "domain": "deployment",
+      "title": "Migration Backup Restore",
+      "summary": "Before irreversible data changes, an automated backup and tested restore path are current, observable, and within agreed recovery point and recovery time objectives. A code rollback is not treated as data recovery.",
+      "check": "probe",
+      "probe": "Inspect migration pipeline gates and backup job records; assert a successful backup, restore validation result, recovered timestamp, and restore duration fall within documented RPO and RTO. Run a test restore from the selected backup and verify row and integrity checks.",
+      "applies_if": ["data-pipeline"],
+      "severity": "critical",
+      "depends_on": ["migration-expand-contract", "backup-integrity-check", "backup-rpo-retention"],
+      "cluster": "db-migrations",
+      "glossary_ref": "glossary/deployment.md#migration-backup-restore",
+      "sources": [
+        "https://martinfowler.com/articles/evodb.html",
+        "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-recovery-procedures.html"
+      ]
+    },
+    {
+      "id": "capacity-surge-budget",
+      "domain": "deployment",
+      "title": "Capacity Surge Budget",
+      "summary": "Rollout policy reserves enough capacity for candidate and incumbent replicas together while respecting disruption budgets, autoscaling limits, and platform quota. Replacement concurrency is bounded by a calculated worst-case surge rather than an optimistic average.",
+      "check": "probe",
+      "probe": "Parse resource requests and limits, autoscaling, disruption budgets, quotas, and rollout parameters; compute worst-case candidate-plus-incumbent demand and assert it fits available or autoscalable capacity. Run a staging rollout at peak configured replicas and observe no unschedulable surge pods.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["rolling-safety"],
+      "glossary_ref": "glossary/deployment.md#capacity-surge-budget",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/",
+        "https://kubernetes.io/docs/tasks/run-application/configure-pdb/"
+      ]
+    },
+    {
+      "id": "preview-environments",
+      "domain": "deployment",
+      "title": "Preview Environments",
+      "summary": "Each pull request can deploy its tested immutable artifact to an isolated, discoverable preview with a stable URL, smoke checks, owner metadata, and automatic expiry. Preview lifecycle is tied to the pull request so abandoned environments do not persist indefinitely.",
+      "check": "probe",
+      "probe": "Parse CI and environment configuration and assert pull-request trigger, artifact digest pinning, URL reporting, smoke-job execution, owner metadata, and TTL teardown. Open a test pull request, verify URL and smoke status, then close it and assert resources are removed after the configured grace period.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "depends_on": ["artifact-build-once", "ci-stage-gates"],
+      "cluster": "preview-environments",
+      "glossary_ref": "glossary/deployment.md#preview-environments",
+      "sources": ["https://docs.gitlab.com/ci/review_apps/"]
+    },
+    {
+      "id": "preview-data-safety",
+      "domain": "deployment",
+      "title": "Preview Data Safety",
+      "summary": "Preview environments treat pull-request code as untrusted and prevent access to production data or privileged services. They use synthetic or scrubbed fixtures and short-lived, narrowly scoped credentials with network deny rules.",
+      "check": "probe",
+      "probe": "Inspect preview namespace, network, identity, and secret policies; assert deny rules for production endpoints and absence of production secret references. From preview code, attempt production DNS or network and secret access and verify denial, then inspect fixture provenance and teardown.",
+      "applies_if": ["spa"],
+      "severity": "critical",
+      "depends_on": ["preview-environments", "environment-data-isolation"],
+      "cluster": "nonprod-data-isolation",
+      "glossary_ref": "glossary/deployment.md#preview-data-safety",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/services-networking/network-policies/",
+        "https://kubernetes.io/docs/concepts/security/secrets-good-practices/"
+      ]
+    },
+    {
+      "id": "dora-four-keys",
+      "domain": "deployment",
+      "title": "DORA Four Keys",
+      "summary": "The four DORA delivery metrics measure deployment frequency, lead time for changes, change fail rate, and time to restore service from consistent deployment, commit, and incident events. Each metric has a defined population and time window so speed is evaluated alongside reliability.",
+      "check": "probe",
+      "probe": "Inspect event schemas and dashboard queries, select a fixed reporting period, and recompute all four metrics from deployment, commit, and incident identifiers. Compare the independently computed values with dashboard output and document any excluded events.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["dora-event-integrity", "deployment-audit-trail"],
+      "glossary_ref": "glossary/deployment.md#dora-four-keys",
+      "sources": [
+        "https://dora.dev/guides/dora-metrics-four-keys/",
+        "https://cloud.google.com/blog/products/devops-sre/using-the-four-keys-to-measure-your-devops-performance"
+      ]
+    },
+    {
+      "id": "dora-event-integrity",
+      "domain": "deployment",
+      "title": "DORA Event Integrity",
+      "summary": "Delivery metric events use a consistent timezone, stable commit-to-deployment association, explicit inclusion and exclusion rules, and versioned definitions across services. Recomputing a known sample produces the same result regardless of dashboard or service implementation.",
+      "check": "probe",
+      "probe": "Query event storage and metric code; assert required IDs and timestamps, timezone normalization, documented filters, and version identifiers. Recompute metrics for a known fixture containing retries, rollbacks, and late events and verify deterministic results.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["deployment-audit-trail"],
+      "glossary_ref": "glossary/deployment.md#dora-event-integrity",
+      "sources": [
+        "https://dora.dev/guides/dora-metrics-four-keys/",
+        "https://cloud.google.com/blog/products/devops-sre/using-the-four-keys-to-measure-your-devops-performance"
+      ]
+    },
+    {
+      "id": "deployment-audit-trail",
+      "domain": "deployment",
+      "title": "Deployment Audit Trail",
+      "summary": "A searchable release record links approver, source revision, artifact digest and provenance, IaC plan, target environment, rollout outcome, and rollback reason. It provides a chain of custody from reviewed change to running bits during incidents and audits.",
+      "check": "probe",
+      "probe": "Inspect deployment event schema and query a recent release by ID; assert all listed fields are emitted, searchable, immutable, and linked to the deployed digest and outcome. Compare the record with controller and registry facts.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["artifact-provenance", "iac-review-plan"],
+      "glossary_ref": "glossary/deployment.md#deployment-audit-trail",
+      "sources": [
+        "https://slsa.dev/spec/v1.0/requirements",
+        "https://opengitops.dev/#principles"
+      ]
+    },
+    {
+      "id": "release-approval-boundary",
+      "domain": "deployment",
+      "title": "Release Approval Boundary",
+      "summary": "The team explicitly decides which environments auto-promote and which require human approval, tying approvals to release evidence rather than blanket ceremony. The boundary is documented, enforced by the deployment system, and reviewed when risk changes.",
+      "check": "user-decision",
+      "probe": "User decision: Which environments should auto-promote, and which require human approval? Present options: (A) auto-promote dev/preview and staging, require approval for production; (B) auto-promote through canary, require approval before full production; (C) require approval for every environment; (D) another named boundary with approver groups and evidence requirements. After selection, inspect policy to confirm it is enforced rather than only documented.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["deployment-audit-trail", "ci-production-protection"],
+      "glossary_ref": "glossary/deployment.md#release-approval-boundary",
+      "sources": [
+        "https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment",
+        "https://sre.google/sre-book/release-engineering/"
+      ]
+    }
+  ]
+}

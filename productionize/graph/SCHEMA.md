@@ -9,6 +9,9 @@ The graph is the executable form of the glossary. One JSON file per domain:
 - **Cross-domain duplicates are NOT merged away.** Nodes carry `cluster: <canonical-id>`; the driver
   collapses a cluster to one verdict per run (first failing node in the cluster fails the cluster).
   Supersedes the "merge into one node" sketch in `../CHECKLIST.md` — same canonical IDs.
+- **An id MAY appear in more than one domain file** when it is the same concern seen from
+  two domains (e.g. `backup-restore-drill` in data and reliability). Every instance MUST carry
+  the same `cluster` value; the driver collapses duplicates at plan time (first domain file wins).
 - **`depends_on` may reference any glossary id**, including ids not yet promoted to nodes
   (validated against the glossary heading universe). Cycles among *present* nodes are an error.
 

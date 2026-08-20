@@ -1,0 +1,654 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "billable-unit-definition",
+      "domain": "ops-economics",
+      "title": "Billable Unit Definition",
+      "summary": "Define a versioned contract for what customers pay for across requests, users, tenants, jobs, retries, storage, egress, and third-party calls. Explicit aggregation, rounding, retry treatment, allowances, and effective dates make invoices reproducible and disputes resolvable.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the versioned meter catalog, pricing history, immutable usage-event schema, invoice reconciliation, and examples showing retries and fan-out counted consistently. Evidence must identify an owner and a customer-visible explanation for every billable unit.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#billable-unit-definition",
+      "sources": [
+        "https://www.finops.org/framework/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "unit-cost-measurement",
+      "domain": "ops-economics",
+      "title": "Unit Cost Measurement",
+      "summary": "Allocate fixed and marginal provider, compute, storage, network, and vendor spend to successful requests, users, tenants, or other defined units. Endpoint and cohort distributions expose tail costs that aggregate averages hide.",
+      "check": "judgment",
+      "probe": "The assessor must inspect a recent cost dashboard or query, its allocation formula, endpoint and cohort breakdowns, fixed-versus-marginal assumptions, and reconciliation against provider invoices. They should verify failed requests and retries follow the billable-unit contract.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["billable-unit-definition"],
+      "glossary_ref": "glossary/ops-economics.md#unit-cost-measurement",
+      "sources": [
+        "https://www.finops.org/framework/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "cost-attribution-tags",
+      "domain": "ops-economics",
+      "title": "Cost Attribution Tags",
+      "summary": "Attach stable service, environment, operation, release, and approved tenant or plan dimensions to cost-bearing events and traces. Bounded metric dimensions preserve usable observability while detailed billing records retain accountable attribution.",
+      "check": "probe",
+      "probe": "Parse metric schemas, trace resource attributes, cloud cost tags, and billing-event producers; fail if cost-bearing records lack `service`, `environment`, `operation`, and an approved tenant or plan dimension. Check that metric dimensions have an explicit cardinality policy and an owned `unknown` bucket.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["billable-unit-definition"],
+      "glossary_ref": "glossary/ops-economics.md#cost-attribution-tags",
+      "sources": [
+        "https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html",
+        "https://opentelemetry.io/docs/specs/semconv/general/"
+      ]
+    },
+    {
+      "id": "cost-alert-policy",
+      "domain": "ops-economics",
+      "title": "Cost Alert Policy",
+      "summary": "Set owner-backed thresholds for absolute spend, spend rate, forecasted spend, and cost per request or user. Warning, paging, escalation, suppression, and permitted response actions prevent runaway work from continuing without accountability.",
+      "check": "user-decision",
+      "probe": "Question: Which thresholds and actions should govern spend alerts? Options: (A) absolute budget only, (B) budget plus rate/forecast, (C) budget plus rate/forecast and unit-cost paging, or (D) custom values with named owners. Record thresholds, escalation targets, exemptions, and whether an alert may pause expensive work.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["unit-cost-measurement"],
+      "glossary_ref": "glossary/ops-economics.md#cost-alert-policy",
+      "sources": [
+        "https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html",
+        "https://docs.aws.amazon.com/cost-management/latest/userguide/getting-started-ad.html"
+      ]
+    },
+    {
+      "id": "cost-alert-delivery",
+      "domain": "ops-economics",
+      "title": "Cost Alert Delivery",
+      "summary": "Deliver spend and unit-cost alerts to a monitored on-call destination with enough context to act. Each alert identifies the affected service, owner, scope, and response runbook, and delivery is auditable.",
+      "check": "probe",
+      "probe": "Parse alert rules and notification routes, then fire a staging alert and assert that the received event contains `service`, `owner`, and `runbook_url`; also verify tenant or plan context for scoped alerts and a current on-call recipient at the destination.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["cost-alert-policy"],
+      "glossary_ref": "glossary/ops-economics.md#cost-alert-delivery",
+      "sources": [
+        "https://docs.aws.amazon.com/cost-management/latest/userguide/getting-started-ad.html",
+        "https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html"
+      ]
+    },
+    {
+      "id": "cost-to-serve-benchmark",
+      "domain": "ops-economics",
+      "title": "Cost To Serve Benchmark",
+      "summary": "Benchmark representative workloads at target and surge load, capturing latency, throughput, capacity, and marginal cost including tail behavior and saturation. The resulting artifact records workload, build, region, data shape, and infrastructure assumptions.",
+      "check": "judgment",
+      "probe": "The assessor must inspect recent benchmark runs and confirm representative workloads, target and surge scenarios, p50/p95 metrics, marginal-cost calculation, saturation point, and comparison to capacity and SLO limits. They should verify the test build and infrastructure are identified.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["unit-cost-measurement"],
+      "glossary_ref": "glossary/ops-economics.md#cost-to-serve-benchmark",
+      "sources": [
+        "https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html",
+        "https://cloud.google.com/architecture/framework/cost-optimization"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "ephemeral-environment-ttl",
+      "domain": "ops-economics",
+      "title": "Ephemeral Environment TTL",
+      "summary": "Give every preview, test, and temporary environment an owner, creation timestamp, explicit expiry, and automated teardown of its complete resource graph. This limits recurring charges, retained secrets, and lingering public endpoints.",
+      "check": "probe",
+      "probe": "Parse IaC and CI configuration; fail when an ephemeral environment lacks `owner`, `created_at`, or `expires_at`, or lacks an automatic destroy path. Create a fixture environment, simulate expiry, and assert attached databases, IPs, secrets, and other dependent resources are selected for teardown.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "cluster": "preview-environments",
+      "glossary_ref": "glossary/ops-economics.md#ephemeral-environment-ttl",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/workloads/controllers/ttlafterfinished/",
+        "https://developer.hashicorp.com/terraform/cli/commands/destroy"
+      ]
+    },
+    {
+      "id": "scheduled-resource-cleanup",
+      "domain": "ops-economics",
+      "title": "Scheduled Resource Cleanup",
+      "summary": "Run recurring, least-privilege inventory and deletion for expired or unowned resources outside the normal environment workflow. Protected dependencies are retained and reported with an accountable owner rather than silently skipped.",
+      "check": "probe",
+      "probe": "Parse scheduler configuration for a cleanup job and run its dry-run against fixtures containing an expired environment and a protected dependency. Assert the expired resource is selected, the protected dependency is retained, and an owner and actionable error are emitted.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["ephemeral-environment-ttl"],
+      "glossary_ref": "glossary/ops-economics.md#scheduled-resource-cleanup",
+      "sources": [
+        "https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html",
+        "https://developer.hashicorp.com/terraform/cli/commands/destroy"
+      ]
+    },
+    {
+      "id": "teardown-guardrails",
+      "domain": "ops-economics",
+      "title": "Teardown Guardrails",
+      "summary": "Make destructive cleanup deny-by-default for production and shared infrastructure, requiring classification, dependency, backup, retention, and approval checks. Explicit resource IDs, dry-run plans, and append-only audit records make deletion safe and reviewable.",
+      "check": "judgment",
+      "probe": "The assessor must inspect deletion IAM policies, environment classification, Terraform or controller plans, backup and retention checks, approval rules, and audit records. They should confirm a production-target fixture is rejected before any delete call.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["ephemeral-environment-ttl"],
+      "glossary_ref": "glossary/ops-economics.md#teardown-guardrails",
+      "sources": [
+        "https://developer.hashicorp.com/terraform/cli/commands/destroy",
+        "https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "authenticated-tenant-context",
+      "domain": "ops-economics",
+      "title": "Authenticated Tenant Context",
+      "summary": "Derive tenant identity from server-validated credentials and propagate immutable tenant context through authorization, storage, jobs, logs, and caches. Client-supplied tenant identifiers remain untrusted selectors and cannot authorize access.",
+      "check": "probe",
+      "probe": "Trace request and job context code and fail paths where a repository, cache, or queue call accepts a tenant identifier not sourced from authenticated context. Inspect tests or runtime traces showing forged client IDs are rejected across synchronous, asynchronous, retry, and cache paths.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#authenticated-tenant-context",
+      "sources": [
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html",
+        "https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/considerations"
+      ]
+    },
+    {
+      "id": "tenant-keyed-schema",
+      "domain": "ops-economics",
+      "title": "Tenant Keyed Schema",
+      "summary": "Make tenant identity part of partitioning, foreign-key relationships, uniqueness constraints, and every tenant-owned query boundary. The database model thereby makes accidental cross-tenant joins and mutations structurally difficult.",
+      "check": "probe",
+      "probe": "Parse migrations, schema metadata, and query builders; fail tenant-owned tables or update/delete statements that lack a tenant key or composite constraint. Inspect representative joins, foreign keys, and uniqueness constraints for cross-tenant safety.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "glossary_ref": "glossary/ops-economics.md#tenant-keyed-schema",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/considerations",
+        "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+      ]
+    },
+    {
+      "id": "database-row-isolation",
+      "domain": "ops-economics",
+      "title": "Database Row Isolation",
+      "summary": "Enforce deny-by-default tenant policies at the database layer independently of ORM filters. Application, worker, reporting, and administrative roles receive only narrowly audited access appropriate to their tenant context.",
+      "check": "probe",
+      "probe": "Parse database migrations and role grants; require RLS and policies or a documented equivalent on tenant tables and deny table access to roles that bypass them. Execute representative queries with absent, alternate, and stale tenant contexts and assert no unauthorized rows are returned.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["tenant-keyed-schema"],
+      "glossary_ref": "glossary/ops-economics.md#database-row-isolation",
+      "sources": [
+        "https://www.postgresql.org/docs/current/ddl-rowsecurity.html",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"
+      ]
+    },
+    {
+      "id": "tenant-scoped-secrets-and-logs",
+      "domain": "ops-economics",
+      "title": "Tenant Scoped Secrets And Logs",
+      "summary": "Isolate keys, object prefixes, caches, backups, and operational records by tenant while minimizing sensitive tenant data in shared channels. Access and retention remain auditable across live and archived copies.",
+      "check": "judgment",
+      "probe": "The assessor must inspect key policies, object-store paths, cache naming, backup access, log redaction rules, support-role permissions, and retention controls. Evidence should include a cross-tenant access-denial test and confirmation that archived copies follow tenant retention policy.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "glossary_ref": "glossary/ops-economics.md#tenant-scoped-secrets-and-logs",
+      "sources": [
+        "https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final",
+        "https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "noisy-neighbor-controls",
+      "domain": "ops-economics",
+      "title": "Noisy Neighbor Controls",
+      "summary": "Cap each tenant's resource consumption and schedule shared-pool work fairly across request rate, concurrency, CPU, memory, queues, storage, and backpressure. This prevents one tenant from exhausting capacity needed by others.",
+      "check": "probe",
+      "probe": "Parse gateway, queue, and runtime policy; require tenant-keyed rate and concurrency limits plus a bounded queue or fair-share scheduler. Run a load fixture for one tenant and assert other tenants retain admission and SLO capacity.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "cluster": "quota-policy",
+      "glossary_ref": "glossary/ops-economics.md#noisy-neighbor-controls",
+      "sources": [
+        "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
+        "https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/considerations"
+      ]
+    },
+    {
+      "id": "tenant-quota-policy",
+      "domain": "ops-economics",
+      "title": "Tenant Quota Policy",
+      "summary": "Publish and enforce limits by tenant, plan, operation, and time window with predictable overage, throttling, and rejection semantics. Structured `429`, `Retry-After`, reset timing, and upgrade or appeal paths make quota exhaustion actionable.",
+      "check": "user-decision",
+      "probe": "Question: For each tenant and operation, what should happen at quota exhaustion? Options: (A) reject with `429` and `Retry-After`, (B) queue until reset, (C) allow metered overage, (D) degrade to a cheaper mode, or (E) custom hybrid. Record limits, burst, reset window, customer notice, and escalation owner.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "cluster": "quota-policy",
+      "glossary_ref": "glossary/ops-economics.md#tenant-quota-policy",
+      "sources": [
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "https://kubernetes.io/docs/concepts/policy/resource-quotas/"
+      ]
+    },
+    {
+      "id": "authenticated-user-quota",
+      "domain": "ops-economics",
+      "title": "Authenticated User Quota",
+      "summary": "Impose a second allowance within each tenant so one authenticated credential cannot consume all shared capacity. Quota keys combine trusted tenant and user identities with operation-specific limits for expensive work.",
+      "check": "probe",
+      "probe": "Parse quota keys and enforcement middleware; require the key tuple to include authenticated `user_id` and `tenant_id` for expensive operations. Exercise two users in one tenant and assert one user's burst cannot consume the other's reserved allowance.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "depends_on": ["tenant-quota-policy", "authenticated-tenant-context"],
+      "cluster": "quota-policy",
+      "glossary_ref": "glossary/ops-economics.md#authenticated-user-quota",
+      "sources": [
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "https://kubernetes.io/docs/concepts/policy/resource-quotas/"
+      ]
+    },
+    {
+      "id": "quota-reservation-atomicity",
+      "domain": "ops-economics",
+      "title": "Quota Reservation Atomicity",
+      "summary": "Atomically reserve quota before expensive work and release or settle it when work succeeds or fails. Idempotent reservation keys prevent concurrent oversubscription, duplicate charging, and permanently consumed allowance after failure.",
+      "check": "probe",
+      "probe": "Inspect quota-store operations and job admission; require an atomic conditional increment or reservation before enqueue or external spend and a compensating release on failure. Run concurrent admission and retry fixtures and assert total reserved capacity never exceeds the limit and duplicate keys create one reservation.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["tenant-quota-policy", "authenticated-user-quota"],
+      "cluster": "quota-policy",
+      "glossary_ref": "glossary/ops-economics.md#quota-reservation-atomicity",
+      "sources": [
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "https://docs.stripe.com/api/idempotent_requests"
+      ]
+    },
+    {
+      "id": "wcag-22-aa-target",
+      "domain": "ops-economics",
+      "title": "WCAG 2.2 AA Target",
+      "summary": "Set WCAG 2.2 Level AA as the product accessibility baseline for keyboard, screen-reader, visual, cognitive, and input interactions. Exceptions carry affected criteria, user impact, an owner, and a bounded remediation date.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the accessibility policy, journey-to-criterion mapping, exception register, owners, and recent release evidence. They should verify exceptions have bounded remediation dates and compensating support rather than blanket waivers.",
+      "applies_if": ["spa"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#wcag-22-aa-target",
+      "sources": [
+        "https://www.w3.org/TR/WCAG22/",
+        "https://www.w3.org/WAI/test-evaluate/"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "automated-a11y-gates",
+      "domain": "ops-economics",
+      "title": "Automated Accessibility Gates",
+      "summary": "Scan representative authenticated and unauthenticated routes and critical states in CI with axe-core or an equivalent pinned ruleset. Reports, thresholds, and reviewed suppressions provide fast regression detection without replacing manual validation.",
+      "check": "probe",
+      "probe": "Parse CI workflows and test dependencies; require an accessibility job invoking `axe-core` or an equivalent scanner against authenticated and unauthenticated critical routes. Verify it fails on a seeded missing-label fixture and suppressions reference the exception register.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "depends_on": ["wcag-22-aa-target"],
+      "glossary_ref": "glossary/ops-economics.md#automated-a11y-gates",
+      "sources": [
+        "https://github.com/dequelabs/axe-core",
+        "https://www.w3.org/WAI/test-evaluate/"
+      ]
+    },
+    {
+      "id": "manual-a11y-journeys",
+      "domain": "ops-economics",
+      "title": "Manual Accessibility Journeys",
+      "summary": "Validate high-value and destructive flows with keyboard, screen reader, zoom, reflow, visible focus, and error recovery. Manual evidence covers task meaning and interaction behavior automated rules cannot establish.",
+      "check": "judgment",
+      "probe": "The assessor must inspect dated manual test recordings or reports for sign-in, purchase, and destructive flows, including keyboard path, visible focus, screen-reader output, zoom/reflow, and error recovery. They should verify unresolved failures are tracked to the accessibility target.",
+      "applies_if": ["spa"],
+      "severity": "critical",
+      "depends_on": ["wcag-22-aa-target"],
+      "glossary_ref": "glossary/ops-economics.md#manual-a11y-journeys",
+      "sources": [
+        "https://www.w3.org/TR/WCAG22/",
+        "https://www.w3.org/WAI/ARIA/apg/"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "i18n-string-catalogs",
+      "domain": "ops-economics",
+      "title": "I18n String Catalogs",
+      "summary": "Externalize every user-visible string, plural and select rule, validation message, and accessibility label into versioned locale catalogs. Stable keys, observable missing-key behavior, and default-locale completeness prevent locale-unsafe literals.",
+      "check": "probe",
+      "probe": "Parse UI source and fail user-facing literal assignments outside approved locale catalogs or translation APIs, then verify every default-locale key has a catalog entry. Include plural and accessibility-label fixtures in the scan.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "glossary_ref": "glossary/ops-economics.md#i18n-string-catalogs",
+      "sources": [
+        "https://cldr.unicode.org/",
+        "https://www.w3.org/International/"
+      ]
+    },
+    {
+      "id": "locale-aware-formatting",
+      "domain": "ops-economics",
+      "title": "Locale Aware Formatting",
+      "summary": "Use ICU or `Intl` with explicit locale, time zone, currency, and unit rules for displayed dates, numbers, names, and prices. Centralized wrappers and locale fixtures prevent implicit server-local assumptions and misleading charges.",
+      "check": "probe",
+      "probe": "Static-scan UI and presentation code for locale-unsafe date and number formatting and require locale and zone arguments or approved ICU wrappers for displayed values. Render representative values in at least two locales and time zones and compare expected output.",
+      "applies_if": ["spa"],
+      "severity": "critical",
+      "depends_on": ["i18n-string-catalogs"],
+      "glossary_ref": "glossary/ops-economics.md#locale-aware-formatting",
+      "sources": [
+        "https://cldr.unicode.org/",
+        "https://www.w3.org/International/"
+      ]
+    },
+    {
+      "id": "rtl-and-expansion-locales",
+      "domain": "ops-economics",
+      "title": "RTL And Expansion Locales",
+      "summary": "Test long translations, plural variants, bidirectional scripts, RTL layout, Unicode normalization, and locale fallback under real text expansion. Critical controls must remain reachable and text must not be clipped or reordered incorrectly.",
+      "check": "probe",
+      "probe": "Parse supported-locale configuration and DOM or screenshot fixtures; require at least one RTL and one expansion locale plus fallback and normalization cases. Assert critical controls remain reachable and text is not clipped or reordered incorrectly.",
+      "applies_if": ["spa"],
+      "severity": "important",
+      "depends_on": ["i18n-string-catalogs", "locale-aware-formatting"],
+      "glossary_ref": "glossary/ops-economics.md#rtl-and-expansion-locales",
+      "sources": [
+        "https://www.unicode.org/reports/tr9/",
+        "https://www.unicode.org/reports/tr15/"
+      ]
+    },
+    {
+      "id": "deterministic-locale-negotiation",
+      "domain": "ops-economics",
+      "title": "Deterministic Locale Negotiation",
+      "summary": "Select an allowlisted locale from explicit user or request settings using a stable fallback order. Localized response caches include the selected locale and relevant format variants so users cannot receive another locale's response.",
+      "check": "probe",
+      "probe": "Parse locale middleware and cache-key construction; require allowlisted BCP 47 locales, deterministic fallback, and locale inclusion in every localized response cache key. Send conflicting locale requests through a shared-cache fixture and assert each receives the correct variant.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "depends_on": ["i18n-string-catalogs"],
+      "glossary_ref": "glossary/ops-economics.md#deterministic-locale-negotiation",
+      "sources": [
+        "https://www.w3.org/International/questions/qa-html-language-declarations",
+        "https://cldr.unicode.org/"
+      ]
+    },
+    {
+      "id": "api-deprecation-policy",
+      "domain": "ops-economics",
+      "title": "API Deprecation Policy",
+      "summary": "Publish a versioned API deprecation contract defining notice period, support window, owner, migration guidance, and exceptions. A tracked consumer register and removal evidence make breaking change timing predictable.",
+      "check": "user-decision",
+      "probe": "Question: What deprecation contract should customers receive? Options: (A) documented notice plus fixed support window, (B) notice plus support window and migration assistance, (C) indefinite compatibility for selected clients, or (D) custom policy. Record notice length, owner, exception process, and removal evidence required.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#api-deprecation-policy",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc9745",
+        "https://www.rfc-editor.org/rfc/rfc8594"
+      ]
+    },
+    {
+      "id": "deprecation-sunset-signals",
+      "domain": "ops-economics",
+      "title": "Deprecation Sunset Signals",
+      "summary": "Expose machine-readable `Deprecation` and `Sunset` headers on deprecated responses, linked to migration guidance and a documented removal date. Headers are generated from the versioned registry and monitored for drift.",
+      "check": "probe",
+      "probe": "Curl each deprecated endpoint or version and assert valid `Deprecation` and `Sunset` headers, a migration link, and a documented removal date. Compare header dates and links to the deprecation registry and docs.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["api-deprecation-policy"],
+      "glossary_ref": "glossary/ops-economics.md#deprecation-sunset-signals",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc9745",
+        "https://www.rfc-editor.org/rfc/rfc8594"
+      ]
+    },
+    {
+      "id": "sunset-consumer-inventory",
+      "domain": "ops-economics",
+      "title": "Sunset Consumer Inventory",
+      "summary": "Identify active clients, versions, tenants, and request volume before removal and map each consumer to an accountable owner and notification record. Repeated snapshots turn unknown API dependence into auditable migration evidence.",
+      "check": "probe",
+      "probe": "Parse access-log and telemetry schemas and the deprecation runbook; require client, version, and tenant fields plus a report query covering the proposed sunset window. Verify the report has owner mapping and notification evidence for every active consumer.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "depends_on": ["api-deprecation-policy", "deprecation-sunset-signals"],
+      "glossary_ref": "glossary/ops-economics.md#sunset-consumer-inventory",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc8594",
+        "https://spec.openapis.org/oas/latest.html"
+      ]
+    },
+    {
+      "id": "sunset-removal-response",
+      "domain": "ops-economics",
+      "title": "Sunset Removal Response",
+      "summary": "Remove a sunset endpoint only after the announced date, migration evidence, and exception decisions are recorded. The final response returns documented `410 Gone` or an equivalent status pointing remaining clients to the supported replacement.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the announced sunset date, migration evidence, exception approvals, deployment gate, and production response for a removed endpoint. They should verify the response is `410 Gone` or a documented equivalent and directs consumers to the replacement.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "depends_on": ["api-deprecation-policy", "sunset-consumer-inventory"],
+      "glossary_ref": "glossary/ops-economics.md#sunset-removal-response",
+      "sources": [
+        "https://www.rfc-editor.org/rfc/rfc9110#name-410-gone",
+        "https://www.rfc-editor.org/rfc/rfc8594"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "expensive-operation-friction",
+      "domain": "ops-economics",
+      "title": "Expensive Operation Friction",
+      "summary": "Apply progressive trust checks before anonymous or low-trust operations that incur substantial compute, messaging, inference, scraping, or vendor cost. Risk-based escalation preserves an accessible and explainable path for legitimate users.",
+      "check": "user-decision",
+      "probe": "Question: What friction should precede each expensive low-trust operation? Options: (A) CAPTCHA, (B) proof-of-work, (C) verified identity or step-up authentication, (D) manual review, (E) layered escalation, or (F) no friction with an explicitly accepted cost limit. Record accessibility fallback, trigger threshold, and owner.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "cluster": "abuse-friction",
+      "glossary_ref": "glossary/ops-economics.md#expensive-operation-friction",
+      "sources": [
+        "https://owasp.org/www-project-automated-threats-to-web-applications/",
+        "https://cloud.google.com/recaptcha/docs"
+      ]
+    },
+    {
+      "id": "expensive-operation-caps",
+      "domain": "ops-economics",
+      "title": "Expensive Operation Caps",
+      "summary": "Place finite limits on payload bytes, fan-out, recursion, execution time, concurrency, retries, and third-party spend before expensive work begins. Remaining budgets propagate through nested calls and exhausted work stops with structured errors.",
+      "check": "probe",
+      "probe": "Parse route schemas and job definitions; require finite maximums for bytes, items, depth, duration, retries, concurrency, and external-call budget on expensive operations. Run boundary and over-limit fixtures and assert rejection occurs before external spend.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "glossary_ref": "glossary/ops-economics.md#expensive-operation-caps",
+      "sources": [
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html"
+      ]
+    },
+    {
+      "id": "idempotent-chargeable-operations",
+      "domain": "ops-economics",
+      "title": "Idempotent Chargeable Operations",
+      "summary": "Require a durable client or operation idempotency key before chargeable mutations and external side effects execute. Identical retries and queue redeliveries reuse the original outcome, while conflicting payloads are rejected.",
+      "check": "probe",
+      "probe": "Parse API schemas, routes, and worker admission code; require `Idempotency-Key` or equivalent persisted deduplication before executing each chargeable operation. Replay identical requests and queue deliveries and assert one side effect and a stable response; submit a conflicting payload and assert rejection.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "depends_on": ["authenticated-tenant-context"],
+      "cluster": "idempotency-keys",
+      "glossary_ref": "glossary/ops-economics.md#idempotent-chargeable-operations",
+      "sources": [
+        "https://docs.stripe.com/api/idempotent_requests",
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+      ]
+    },
+    {
+      "id": "abuse-cost-kill-switch",
+      "domain": "ops-economics",
+      "title": "Abuse Cost Kill Switch",
+      "summary": "Stop new expensive work for a precisely attributed tenant, operation, or actor while allowing safe completion or cancellation of in-flight state. Activation, scope, approval, expiry, and release are auditable and reversible.",
+      "check": "probe",
+      "probe": "Parse incident controls and job admission code; require an operator or API kill switch keyed by tenant and operation plus a traceable audit event. Activate it in staging and assert new work is rejected while an in-flight fixture reaches a defined safe state.",
+      "applies_if": ["web-api"],
+      "severity": "important",
+      "depends_on": ["cost-attribution-tags"],
+      "glossary_ref": "glossary/ops-economics.md#abuse-cost-kill-switch",
+      "sources": [
+        "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "https://docs.aws.amazon.com/cost-management/latest/userguide/getting-started-ad.html"
+      ]
+    },
+    {
+      "id": "sbom-per-shipped-artifact",
+      "domain": "ops-economics",
+      "title": "SBOM Per Shipped Artifact",
+      "summary": "Attach a machine-readable SPDX or CycloneDX SBOM to every shipped image, binary, package, and installer, covering direct and transitive components and license identifiers. Binding the SBOM to the exact artifact digest makes affected releases discoverable.",
+      "check": "probe",
+      "probe": "Parse the release workflow and inspect a sample artifact; require a machine-readable SPDX or CycloneDX SBOM whose component digest matches the shipped artifact. Verify transitive dependencies and license identifiers are present and the SBOM is retrievable by release digest.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "cluster": "sbom-provenance",
+      "glossary_ref": "glossary/ops-economics.md#sbom-per-shipped-artifact",
+      "sources": [
+        "https://spdx.dev/specifications/",
+        "https://cyclonedx.org/specification/"
+      ]
+    },
+    {
+      "id": "shipped-license-policy",
+      "domain": "ops-economics",
+      "title": "Shipped License Policy",
+      "summary": "Define approved, restricted, and prohibited dependency licenses and ship required notices, attribution, and source offers with every distributable artifact. Policy exceptions and dual-license obligations have an accountable legal owner.",
+      "check": "judgment",
+      "probe": "The assessor must inspect the license policy, direct and transitive dependency scan, exception approvals, generated notices, and a sample distributable artifact. They should verify notice contents match the exact shipped dependency set and source obligations are accessible.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["sbom-per-shipped-artifact"],
+      "glossary_ref": "glossary/ops-economics.md#shipped-license-policy",
+      "sources": [
+        "https://spdx.org/licenses/",
+        "https://spdx.dev/specifications/"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "build-provenance-reproducibility",
+      "domain": "ops-economics",
+      "title": "Build Provenance Reproducibility",
+      "summary": "Record verifiable claims about source, builder, dependencies, parameters, and artifact digest while retaining inputs needed to rebuild or explain a release. Signed provenance and matching SBOM evidence distinguish authorized artifacts from compromised or divergent rebuilds.",
+      "check": "probe",
+      "probe": "Parse release metadata and verify a sample artifact has a signature or provenance attestation, immutable source revision, lockfile digest, and matching SBOM digest. Attempt verification with the published identity and assert tampered metadata or artifact bytes fail.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["sbom-per-shipped-artifact"],
+      "cluster": "sbom-provenance",
+      "glossary_ref": "glossary/ops-economics.md#build-provenance-reproducibility",
+      "sources": [
+        "https://slsa.dev/spec/v1.0/",
+        "https://spdx.dev/specifications/"
+      ]
+    },
+    {
+      "id": "dependency-eol-register",
+      "domain": "ops-economics",
+      "title": "Dependency EOL Register",
+      "summary": "Track support end dates and owners for runtimes, operating systems, base images, frameworks, and direct or transitive dependencies. Each component has an upgrade target, remediation issue, and time-bounded exception where needed.",
+      "check": "probe",
+      "probe": "Parse lockfiles, container manifests, runtime version files, and an EOL catalog; fail entries without a support end date, owner, or upgrade issue. Verify a transitive dependency and base image are both represented and stale entries alert before EOL.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#dependency-eol-register",
+      "sources": [
+        "https://endoflife.date/",
+        "https://google.github.io/osv-scanner/"
+      ]
+    },
+    {
+      "id": "dependency-update-deadlines",
+      "domain": "ops-economics",
+      "title": "Dependency Update Deadlines",
+      "summary": "Set maximum age and severity-based remediation windows for security and maintenance updates. Escalation, release-blocking policy, and expiring exceptions keep known-risk versions from remaining indefinitely in tracking systems.",
+      "check": "user-decision",
+      "probe": "Question: What maximum age and remediation deadline should apply to dependencies? Options: (A) fixed age for all updates, (B) severity-based windows, (C) severity-based windows plus release blocking, or (D) custom deadlines with named exception owner. Record values, escalation, release-blocking, and expiry behavior.",
+      "applies_if": ["all"],
+      "severity": "important",
+      "depends_on": ["dependency-eol-register"],
+      "glossary_ref": "glossary/ops-economics.md#dependency-update-deadlines",
+      "sources": [
+        "https://google.github.io/osv-scanner/",
+        "https://scorecard.dev/"
+      ]
+    },
+    {
+      "id": "service-decommission-runbook",
+      "domain": "ops-economics",
+      "title": "Service Decommission Runbook",
+      "summary": "Maintain a versioned, owner-backed procedure for retiring compute and every connected dependency, including traffic, queues, schedules, data retention/export, backups, DNS, secrets, IAM, vendors, and billing. Staged drain and rollback points make retirement complete and reversible where required.",
+      "check": "judgment",
+      "probe": "The assessor must inspect a versioned runbook and a completed decommission record covering owner, dependency graph, traffic drain, queues, data, backups, DNS, secrets, IAM, vendors, and billing. They should verify rollback and retention decisions are explicit.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["tenant-retention-erasure"],
+      "glossary_ref": "glossary/ops-economics.md#service-decommission-runbook",
+      "sources": [
+        "https://sre.google/sre-book/decommissioning/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html"
+      ],
+      "min_tier": "standard"
+    },
+    {
+      "id": "decommission-exit-evidence",
+      "domain": "ops-economics",
+      "title": "Decommission Exit Evidence",
+      "summary": "Prove that traffic and jobs are gone, queues and schedules are disabled, access is removed, data decisions are complete, and billing has stopped. Timestamped evidence is scoped to the service and dependency graph rather than relying on operator assertion.",
+      "check": "probe",
+      "probe": "Parse the runbook checklist and inventory queries; require timestamped checks for request volume, queue depth, schedulers, DNS, IAM, secrets, storage, and billing. Run the checks against a decommission fixture and assert missing or nonzero evidence blocks closure.",
+      "applies_if": ["all"],
+      "severity": "critical",
+      "depends_on": ["service-decommission-runbook"],
+      "glossary_ref": "glossary/ops-economics.md#decommission-exit-evidence",
+      "sources": [
+        "https://sre.google/sre-book/decommissioning/",
+        "https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html"
+      ]
+    },
+    {
+      "id": "tenant-retention-erasure",
+      "domain": "ops-economics",
+      "title": "Tenant Retention Erasure",
+      "summary": "Define tenant offboarding export, deletion, backup expiry, legal-hold, and audit behavior across live, derived, logged, and vendor-held data. Authenticated idempotent workflows produce completion records listing datasets, residual retention, failures, and owners.",
+      "check": "user-decision",
+      "probe": "Question: What should happen to a tenant's data at offboarding? Options: (A) export then delete on a fixed schedule, (B) retain for a defined contractual period, (C) preserve only legal holds, or (D) custom per-data-class policy. Record retention durations, backup expiry, export format, legal-hold authority, and completion evidence.",
+      "applies_if": ["web-api"],
+      "severity": "critical",
+      "glossary_ref": "glossary/ops-economics.md#tenant-retention-erasure",
+      "sources": [
+        "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+        "https://sre.google/sre-book/decommissioning/"
+      ]
+    }
+  ]
+}

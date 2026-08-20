@@ -32,7 +32,9 @@ def load_nodes(graph_dir):
             continue
         doc = json.loads(f.read_text())
         for n in doc.get("nodes", []):
-            nodes[n["id"]] = n
+            # Cross-domain duplicates (same id + cluster) collapse: first
+            # domain file wins (sorted order), they describe one concern.
+            nodes.setdefault(n["id"], n)
     return nodes
 
 

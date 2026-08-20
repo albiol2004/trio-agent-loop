@@ -71,9 +71,14 @@ def main():
             if not nid or not isinstance(nid, str) or not KEBAB.match(nid):
                 err(f"{loc}: id missing or not kebab-case")
             elif nid in all_nodes:
-                err(f"{loc}: duplicate id (also in {all_nodes[nid]})")
+                # Cross-domain duplicate: legal only when every instance carries
+                # the same non-null cluster (same concern, deduped at runtime).
+                prev = all_nodes[nid]
+                if not n.get("cluster") or n.get("cluster") != prev[1]:
+                    err(f"{loc}: duplicate id (also in {prev[0]}); duplicates "
+                        f"must share one cluster on every instance")
             else:
-                all_nodes[nid] = f.name
+                all_nodes[nid] = (f.name, n.get("cluster"))
                 if nid not in known:
                     err(f"{loc}: id not found as a glossary heading")
             if n.get("domain") != domain:
