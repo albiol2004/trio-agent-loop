@@ -442,7 +442,7 @@ def render(report: dict, require_commits: bool = False) -> str:
         )
     if require_commits:
         lines.append(
-            "Result: commit gate active — slice commits enforced (exit 0)"
+            "Result: commit gate active — slice commits enforced (exit 0 if the gate passes, 1 otherwise)"
         )
     else:
         lines.append("Result: shadow mode — informational only, never gates (exit 0)")
