@@ -84,8 +84,22 @@ Respect the graph:
 1. `python3 productionize/driver/run.py status --state pz-run/verdicts.jsonl --plan pz-run/plan.json`
    — only user-decision nodes may remain pending while waiting on the user.
 2. `python3 productionize/driver/run.py report --state pz-run/verdicts.jsonl --plan pz-run/plan.json --out pz-run/REPORT.md`.
-3. Commit the `pz-run/` artifacts.
-4. Present the report and propose the fix path: critical failures become
-   the GOAL for `/trio-init` + `/trio` (fixes dispatch per the
-   orchestration policy — cheapest tier whose verifier can prove the fix).
-   Do not start fixing in this loop.
+3. **Triage with the user** — never seed fixes from an untriaged report.
+   Walk the failures and record one decision per item:
+   `python3 productionize/driver/run.py triage --state pz-run/verdicts.jsonl --plan pz-run/plan.json`
+   (bulk JSON array on stdin: `[{"node": ..., "action": ..., "note": ...}]`).
+   Actions: `fix` (goes into the fix GOAL), `defer` (stays open),
+   `accept-risk` (documented acceptance), `dispute` (user rejects the
+   verdict — this re-records it as `na` with the user's rationale as
+   evidence; latest-wins keeps the audit honest). Only fails are triageable.
+   `status` reports untriaged-failure count; loop until the user has
+   decided everything they care about (remaining items may be bulk-deferred).
+4. Commit the `pz-run/` artifacts (verdicts, triage, report).
+5. Seed the fix path from `fix`-triaged items ONLY: they become the GOAL
+   for `/trio-init` + `/trio` (fixes dispatch per the orchestration
+   policy — cheapest tier whose verifier can prove the fix). Do not start
+   fixing in this loop.
+6. **After fixes ship, re-verify**: `pz-run/batches/index.json` maps every
+   node to its batch file — re-dispatch only the batches containing fixed
+   nodes and record fresh verdicts (latest-wins flips them). The audit is
+   a regression suite, not a one-shot.

@@ -139,7 +139,8 @@ def latest_verdicts(state_path):
 
 def cmd_status(args):
     plan = json.loads(Path(require(args, "--plan")).read_text())
-    latest = latest_verdicts(Path(require(args, "--state")))
+    state_path = Path(require(args, "--state"))
+    latest = latest_verdicts(state_path)
     counts = {v: 0 for v in sorted(VERDICTS)}
     counts["pending"] = 0
     failed, blocked = [], []
@@ -172,6 +173,11 @@ def cmd_status(args):
         print("\nblocked:")
         for nid, ev in blocked:
             print(f"  {nid}" + (f" — {ev[:120]}" if ev else ""))
+    triaged = load_triage(state_path)
+    untriaged = [nid for _sev, nid, _ev in failed if nid not in triaged]
+    if untriaged:
+        print(f"\nuntriaged failures: {len(untriaged)} — "
+              f"run triage before seeding the fix loop")
 
 
 
@@ -323,6 +329,81 @@ def cmd_report(args):
     else:
         sys.stdout.write(text)
 
+
+TRIAGE_ACTIONS = {"fix", "defer", "dispute", "accept-risk"}
+
+
+def _triage_path(state_path):
+    return state_path.with_name("triage.jsonl")
+
+
+def cmd_triage(args):
+    """Record user triage decisions over failed nodes.
+
+    Triage is separate from verdicts: the verdict is what the audit found,
+    the triage decision is what the user wants done about it. Bulk input
+    matches record-batch (JSON array on stdin or --file); single decisions
+    use --node/--action/--note. `dispute` also re-records the verdict as
+    `na` with the user's rationale — latest-wins keeps the audit honest.
+    """
+    state_path = Path(require(args, "--state"))
+    plan = json.loads(Path(require(args, "--plan")).read_text())
+    valid = {n["id"]: n for n in plan["nodes"]}
+    latest = latest_verdicts(state_path)
+    src_file = opt(args, "--file")
+    if opt(args, "--node"):
+        rows = None  # single-decision mode; --node wins over stdin
+    elif src_file or not sys.stdin.isatty():
+        text = Path(src_file).read_text() if src_file else sys.stdin.read()
+        try:
+            rows = json.loads(text)
+        except json.JSONDecodeError:
+            start, end = text.find("["), text.rfind("]")
+            if start < 0 or end <= start:
+                die("no JSON array found in triage input")
+            rows = json.loads(text[start:end + 1])
+    if rows is None:
+        rows = [{"node": require(args, "--node"),
+                 "action": require(args, "--action"),
+                 "note": opt(args, "--note", "")}]
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    recorded, skipped = 0, []
+    with _triage_path(state_path).open("a") as fh, state_path.open("a") as vs:
+        for row in rows:
+            node, action = row.get("node"), row.get("action")
+            note = row.get("note", "")
+            if node not in valid:
+                skipped.append(node)
+                continue
+            if action not in TRIAGE_ACTIONS:
+                skipped.append(f"{node}(bad action {action!r})")
+                continue
+            if latest.get(node, {}).get("verdict") != "fail":
+                skipped.append(f"{node}(not a fail; triage applies to failures)")
+                continue
+            fh.write(json.dumps({"ts": ts, "node": node, "action": action,
+                                 "note": note}) + "\n")
+            if action == "dispute":
+                vs.write(json.dumps({"ts": ts, "node": node, "verdict": "na",
+                                     "evidence": f"user disputed: {note}"}) + "\n")
+            recorded += 1
+    print(f"triaged {recorded}, skipped {len(skipped)}")
+    for s in skipped:
+        print(f"  skipped: {s}")
+
+
+def load_triage(state_path):
+    """Latest triage action per node."""
+    path = _triage_path(state_path)
+    latest = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                latest[rec["node"]] = rec
+    return latest
+
+
 def opt(args, flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 
@@ -341,7 +422,8 @@ def die(msg):
 
 def main():
     cmds = {"plan": cmd_plan, "record": cmd_record, "record-batch": cmd_record_batch,
-            "batches": cmd_batches, "status": cmd_status, "report": cmd_report}
+            "batches": cmd_batches, "status": cmd_status, "report": cmd_report,
+            "triage": cmd_triage}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         die(f"usage: run.py {"|".join(cmds)} ...")
     cmd, args = sys.argv[1], sys.argv[2:]
