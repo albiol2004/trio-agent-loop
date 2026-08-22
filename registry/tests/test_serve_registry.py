@@ -279,17 +279,61 @@ class SerializeValidationTests(DashboardServerTestCase):
         refields, _ = registry.parse_frontmatter(payload["content"])
         self.assertEqual(refields["permission"], {"*": "deny", "read": "allow"})
 
-    def test_malformed_yaml_wrapper_returns_400_naming_key(self):
-        # The hand-rolled YAML-subset parser is deliberately lenient (never
-        # raises on ordinary bad syntax so a single misformatted harness
-        # file can't kill a scan); the one input shape that reliably raises
-        # is unbounded nested flow-collection recursion (RecursionError).
-        pathological = "x: " + "[" * 4000
+    def test_malformed_yaml_wrapper_mis_indented_nested_line_returns_400(self):
+        # A realistic slip: mis-indenting one line of a nested permission
+        # block by two spaces. The lenient scan.py parser silently drops the
+        # "rm -rf *" rule and returns {} for that branch (see VERDICT.md
+        # iteration 1); the serialize endpoint must reject it instead of
+        # writing a file with a rule silently missing.
+        malformed = '"*": deny\nbash:\n    "git status *": allow\n  "rm -rf *": deny\n'
         status, payload = _http_json(
             "POST", f"{self.base}/api/registry/serialize",
             {
                 "format": "yaml",
-                "frontmatter": {"permission": {"$yaml": pathological}},
+                "frontmatter": {"permission": {"$yaml": malformed}},
+                "body": "body\n",
+            })
+        self.assertEqual(status, 400, payload)
+        self.assertIn("permission", payload["error"])
+
+    def test_malformed_yaml_wrapper_tab_indentation_returns_400(self):
+        # A tab-indented nested line: scan.py's indent tracking only counts
+        # spaces, so a tab is silently treated as indent 0 and the value is
+        # re-nested at the wrong level instead of raising.
+        malformed = "a:\n\tb: 1\n"
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml",
+                "frontmatter": {"permission": {"$yaml": malformed}},
+                "body": "body\n",
+            })
+        self.assertEqual(status, 400, payload)
+        self.assertIn("permission", payload["error"])
+
+    def test_malformed_yaml_wrapper_duplicate_key_returns_400(self):
+        # A duplicate key at the same nesting level: the lenient parser just
+        # lets the later value silently overwrite the earlier one.
+        malformed = '"*": deny\nread: allow\nread: deny\n'
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml",
+                "frontmatter": {"permission": {"$yaml": malformed}},
+                "body": "body\n",
+            })
+        self.assertEqual(status, 400, payload)
+        self.assertIn("permission", payload["error"])
+
+    def test_malformed_yaml_wrapper_unclosed_flow_returns_400(self):
+        # An unclosed flow list/map: the lenient parser coerces this into a
+        # partial list rather than raising.
+        malformed = "bad: [unclosed\n"
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml",
+                "frontmatter": {"permission": {"$yaml": malformed}},
                 "body": "body\n",
             })
         self.assertEqual(status, 400, payload)

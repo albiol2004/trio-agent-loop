@@ -308,6 +308,58 @@ class Frontmatter(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Strict YAML (opt-in validation path for the serialize endpoint's raw-$yaml
+# sub-editor; the lenient parse_yaml default must stay unchanged)
+# --------------------------------------------------------------------------
+
+
+class StrictYaml(unittest.TestCase):
+    def test_default_lenient_mode_is_unaffected(self):
+        # Same malformed input the strict-mode tests below reject: lenient
+        # parse_yaml() must keep coercing it, never raise, for scan_* safety.
+        text = 'a:\n    b: 1\n  c: 2\n'
+        self.assertEqual(scan.parse_yaml(text), {"a": {"b": 1}})
+        self.assertEqual(scan.parse_yaml(text, strict=False), {"a": {"b": 1}})
+
+    def test_strict_valid_input_parses_normally(self):
+        fields = scan.parse_yaml(OPENCODE_EVALUATOR, strict=True)
+        self.assertEqual(fields["mode"], "subagent")
+        self.assertEqual(fields["permission"]["bash"]["git status *"], "allow")
+
+    def test_strict_rejects_mis_indented_nested_line(self):
+        # One line under "a:" indented two rather than four spaces: lenient
+        # mode silently drops "c" (see VERDICT.md iteration 1).
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('a:\n    b: 1\n  c: 2\n', strict=True)
+
+    def test_strict_rejects_top_level_sequence(self):
+        # Lenient mode returns {} (drops everything) for a document whose
+        # top level is a sequence, not a mapping.
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('- a\nb: 1\n', strict=True)
+
+    def test_strict_rejects_non_key_value_line(self):
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('a: 1\nthis is not yaml\n', strict=True)
+
+    def test_strict_rejects_tab_indentation(self):
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('a:\n\tb: 1\n', strict=True)
+
+    def test_strict_rejects_duplicate_key(self):
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('read: allow\nread: deny\n', strict=True)
+
+    def test_strict_rejects_unclosed_flow_collection(self):
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('bad: [unclosed\n', strict=True)
+
+    def test_strict_rejects_unterminated_quote(self):
+        with self.assertRaises(ValueError):
+            scan.parse_yaml('a: "unterminated\n', strict=True)
+
+
+# --------------------------------------------------------------------------
 # TOML
 # --------------------------------------------------------------------------
 

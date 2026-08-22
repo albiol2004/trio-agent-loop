@@ -74,8 +74,10 @@ Registry (format-aware):
     Response: 200 {"content", "warnings": [<str>]} or 400 {"error"}
         Pure serialization + validation; never writes to disk. A frontmatter
         value shaped {"$yaml": "<text>"} is parsed as YAML server-side (the
-        raw sub-editor escape hatch); a parse failure is a 400 naming the
-        key. Warnings are non-blocking: unknown key, `name` mismatching the
+        raw sub-editor escape hatch) using the *strict* parser (rejects
+        malformed/mis-indented input instead of scan.py's lenient on-disk
+        behaviour); a parse failure is a 400 naming the key. Warnings are
+        non-blocking: unknown key, `name` mismatching the
         target filename/dirname (suppressed for omnigent), or a format that
         disagrees with the harness/surface's canonical format.
 """
@@ -1136,7 +1138,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     and isinstance(value.get("$yaml"), str)):
                 raw = value["$yaml"]
                 try:
-                    parsed = registry.parse_yaml(raw)
+                    # Strict: the scanner's parser is deliberately lenient
+                    # for on-disk files (a bad file must not kill a scan),
+                    # but user-submitted raw-YAML must be rejected rather
+                    # than silently coerced/data-dropped on save.
+                    parsed = registry.parse_yaml(raw, strict=True)
                 except Exception as exc:
                     return self._send_json(
                         400, {"error": f"invalid YAML for key '{key}': {exc}"})

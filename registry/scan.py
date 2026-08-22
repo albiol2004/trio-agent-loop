@@ -160,6 +160,32 @@ def _split_key(line: str) -> tuple[str | None, str]:
     return key.strip(), rest.strip()
 
 
+def _flow_balanced(text: str) -> bool:
+    """Whether the flow collection at ``text[0]`` (``[`` / ``{``) is closed.
+
+    Quote-aware bracket count over the (single-line) flow text; used only by
+    the strict parser to reject ``bad: [unclosed`` instead of returning a
+    partial/garbage collection.
+    """
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            end = _quoted_end(text, i)
+            if end is None:
+                return False
+            i = end + 1
+            continue
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        i += 1
+    return depth == 0
+
+
 def _parse_flow(text: str, pos: int = 0):
     """Parse a flow collection (``[a, b]`` / ``{a: b}``) starting at ``pos``."""
     def skip_ws(i):
@@ -210,15 +236,31 @@ def _parse_flow(text: str, pos: int = 0):
 
 
 class _YamlReader:
-    """Indentation-driven reader for the YAML subset the harnesses use."""
+    """Indentation-driven reader for the YAML subset the harnesses use.
 
-    def __init__(self, text: str):
+    ``strict`` is opt-in and used only by the serialize endpoint's raw-$yaml
+    sub-editor validation: it turns the constructs the lenient reader
+    silently discards (see module docstring on ``parse_yaml``) into a
+    ``ValueError`` naming the offending line instead. The default (lenient)
+    behaviour that ``entry_record``/``scan_*`` depend on is unchanged.
+    """
+
+    def __init__(self, text: str, *, strict: bool = False):
         self.lines = text.split("\n")
         if self.lines and self.lines[-1] == "":
             # Artifact of a trailing newline, not a blank line: counting it
             # would add a newline to every keep-chomped (``|+``) block.
             self.lines.pop()
         self.i = 0
+        self.strict = strict
+        if strict:
+            for idx, line in enumerate(self.lines):
+                content = line.lstrip(" \t")
+                leading = line[:len(line) - len(content)]
+                if "\t" in leading:
+                    raise ValueError(
+                        f"line {idx + 1}: tab indentation is not supported: "
+                        f"{line!r}")
 
     # -- helpers -----------------------------------------------------------
 
@@ -243,7 +285,11 @@ class _YamlReader:
         if self._at_end():
             return {}
         node = self.parse_node(self._indent(self.lines[self.i]))
-        return node if isinstance(node, dict) else {}
+        if isinstance(node, dict):
+            return node
+        if self.strict:
+            raise ValueError("top-level YAML value is not a mapping")
+        return {}
 
     def parse_node(self, indent: int):
         self._skip_blank()
@@ -269,14 +315,25 @@ class _YamlReader:
                 break
             stripped = line.strip()
             if cur > indent:          # stray deeper line: ignore, stay resilient
+                if self.strict:
+                    raise ValueError(
+                        f"line {self.i + 1}: unexpected indentation: "
+                        f"{stripped!r}")
                 self.i += 1
                 continue
             if stripped.startswith("- ") or stripped == "-":
                 break                 # a sibling sequence belongs to our parent
             key, rest = _split_key(stripped)
             if key is None:
+                if self.strict:
+                    raise ValueError(
+                        f"line {self.i + 1}: expected 'key: value': "
+                        f"{stripped!r}")
                 self.i += 1
                 continue
+            if self.strict and key in result:
+                raise ValueError(
+                    f"line {self.i + 1}: duplicate key {key!r}")
             self.i += 1
             result[key] = self.parse_value(rest, indent)
         return result
@@ -315,9 +372,16 @@ class _YamlReader:
         if rest[:1] in ("|", ">"):
             return self.parse_block_scalar(rest, key_indent)
         if rest[:1] == "[" or rest[:1] == "{":
+            if self.strict and not _flow_balanced(rest):
+                raise ValueError(
+                    f"line {self.i}: unclosed flow collection: {rest!r}")
             value, _ = _parse_flow(rest, 0)
             return value
         if rest != "":
+            if (self.strict and rest[:1] in ("'", '"')
+                    and _quoted_end(rest, 0) is None):
+                raise ValueError(
+                    f"line {self.i}: unterminated quote: {rest!r}")
             return _scalar(rest)
         # Empty value: a nested block, a sibling-indent sequence, or null.
         mark = self.i
@@ -421,11 +485,26 @@ def _fold(text: str) -> str:
     return "".join(pieces) + "\n"
 
 
-def parse_yaml(text: str) -> dict:
-    """Parse a YAML-subset document (no ``---`` fences) into a dict."""
+def parse_yaml(text: str, *, strict: bool = False) -> dict:
+    """Parse a YAML-subset document (no ``---`` fences) into a dict.
+
+    Default (lenient) behaviour is unchanged: malformed input is coerced as
+    best-effort rather than raising, because a bad file in a harness's
+    on-disk config must never kill a scan (``entry_record``/``scan_*``
+    depend on this).
+
+    ``strict=True`` is an opt-in path for validating user-submitted text
+    (the dashboard's raw-$yaml sub-editor, via the serialize endpoint) where
+    silent data loss is the wrong behaviour. It raises ``ValueError`` naming
+    the offending line for: tab indentation, an indentation level matching
+    no open block, a line that is neither a comment/``key: value``/``- item``
+    nor a block-scalar continuation, a duplicate key, an unterminated quote,
+    an unclosed flow collection, or a document whose top level is not a
+    mapping.
+    """
     if not text.strip():
         return {}
-    return _YamlReader(text).parse_document()
+    return _YamlReader(text, strict=strict).parse_document()
 
 
 # --------------------------------------------------------------------------
