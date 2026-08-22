@@ -17,6 +17,24 @@ hand-written YAML-subset parser/serializer (no PyYAML - stdlib only) and a
 ``parse(dump(parse(text))) == parse(text)``, with key insertion order
 preserved (never sorted).
 
+``generated_paths()`` loads ``prompts/generate.py`` by file path and asks it
+for the absolute paths of every file it generates (the trio role prompts and
+generated documents); ``entry_record`` marks a scanned file ``managed`` when
+its caller passes ``managed=True`` (the Cursor builtin-skill cache) *or* the
+file's resolved path is in that set, so the dashboard can render it read-only
+instead of letting an edit be silently overwritten by the next generate.py
+run. Loading is best-effort and memoized - any failure yields an empty set
+rather than breaking a scan.
+
+``build_index`` groups ``skill``/``command``/``agent`` entries by name into
+the canonical-vs-installation drift view described above. It also accepts an
+optional ``canonical_agents`` list (records from
+``registry/agents.py:agent_index_records()``, not imported here to avoid a
+circular dependency) and, when given, cross-references each record's
+per-harness rendered ``body_hash`` against the matching installed ``agent``
+entry to produce ``agent_matrix``: one row per canonical agent with an
+in-sync/stale/missing/unsupported cell per harness.
+
 Usage: python3 registry/scan.py [--out registry/registry.json] [--project DIR]
 Stdlib only. Requires Python 3.11+ (tomllib).
 """
@@ -25,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import sys
@@ -829,6 +848,48 @@ def default_template(harness: str, surface: str, name: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# generate.py-owned paths
+# --------------------------------------------------------------------------
+
+_generated_paths_cache: frozenset[str] | None = None
+
+
+def generated_paths() -> frozenset[str]:
+    """Absolute paths of every file ``prompts/generate.py`` generates.
+
+    Loads ``prompts/generate.py`` by file path (no import-time dependency
+    from scan.py to generate.py) and calls its ``all_outputs()``, which
+    returns ``dict[Path, str]`` keyed by absolute output paths. The result is
+    memoized (see :func:`reset_generated_paths_cache`) since ``all_outputs``
+    re-renders every overlay/document on each call.
+
+    Never raises: any failure to load or run the module - a missing file, a
+    bad overlay, an exception inside generate.py itself - is swallowed and
+    reported as "nothing is generated" (an empty frozenset), so a scan is
+    never blocked by this lookup.
+    """
+    global _generated_paths_cache
+    if _generated_paths_cache is not None:
+        return _generated_paths_cache
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "trio_prompts_generate", REPO / "prompts" / "generate.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        outputs = module.all_outputs()
+        _generated_paths_cache = frozenset(str(p.resolve()) for p in outputs)
+    except Exception:
+        _generated_paths_cache = frozenset()
+    return _generated_paths_cache
+
+
+def reset_generated_paths_cache() -> None:
+    """Test hook: clear the memoized :func:`generated_paths` result."""
+    global _generated_paths_cache
+    _generated_paths_cache = None
+
+
+# --------------------------------------------------------------------------
 # Scanning
 # --------------------------------------------------------------------------
 
@@ -848,6 +909,7 @@ def entry_record(path: Path, harness: str, surface: str, scope: str,
         name = fields.get("name") or path.parent.name
     else:
         name = fields.get("name") or path.stem
+    managed = managed or str(path.resolve()) in generated_paths()
     return {
         "name": name,
         "path": str(path),
@@ -1011,11 +1073,64 @@ def collect(project: Path | None) -> list[dict]:
     return entries
 
 
-def build_index(entries: list[dict]) -> dict:
-    """Group skill/command entries by logical name; verdict vs canonical."""
+def _build_agent_matrix(entries: list[dict], canonical_agents: list[dict]) -> list[dict]:
+    """Cross-reference ``canonical_agents`` render hashes against installed agents.
+
+    ``entries`` order is preserved when picking the candidate installed entry
+    for a (harness, name) pair, per the documented "first in entries order"
+    tie-break.
+    """
+    if not canonical_agents:
+        return []
+    global_agents = [e for e in entries
+                     if e["surface"] == "agent" and e["scope"] == "global"]
+    matrix = []
+    for rec in sorted(canonical_agents, key=lambda r: r["name"]):
+        renders = rec.get("renders", {}) or {}
+        unsupported = rec.get("unsupported", {}) or {}
+        cells = []
+        for harness, render in renders.items():
+            candidate = next((e for e in global_agents
+                              if e["harness"] == harness and e["name"] == rec["name"]),
+                             None)
+            filename = render.get("filename")
+            if candidate is None:
+                cells.append({"harness": harness, "status": "missing",
+                              "path": None, "filename": filename, "reason": None})
+            elif candidate["body_hash"] == render.get("body_hash"):
+                cells.append({"harness": harness, "status": "in-sync",
+                              "path": candidate["path"], "filename": filename,
+                              "reason": None})
+            else:
+                cells.append({"harness": harness, "status": "stale",
+                              "path": candidate["path"], "filename": filename,
+                              "reason": None})
+        for harness, reason in unsupported.items():
+            cells.append({"harness": harness, "status": "unsupported",
+                          "path": None, "filename": None, "reason": reason})
+        matrix.append({
+            "name": rec["name"],
+            "path": rec.get("path"),
+            "description": rec.get("description"),
+            "model_tier": rec.get("model_tier"),
+            "tool_policy": rec.get("tool_policy"),
+            "harnesses": list(renders) + list(unsupported),
+            "cells": cells,
+        })
+    return matrix
+
+
+def build_index(entries: list[dict], canonical_agents: list[dict] | None = None) -> dict:
+    """Group skill/command/agent entries by logical name; verdict vs canonical.
+
+    ``canonical_agents``, when given, feeds the separate ``agent_matrix``
+    comparison (see module docstring); omitted or empty, ``agent_matrix`` is
+    ``[]`` rather than absent, so callers can rely on the key always being
+    present.
+    """
     by_name: dict[str, list[dict]] = {}
     for e in entries:
-        if e["surface"] in ("skill", "command"):
+        if e["surface"] in ("skill", "command", "agent"):
             by_name.setdefault(e["name"], []).append(e)
 
     groups = []
@@ -1053,6 +1168,7 @@ def build_index(entries: list[dict]) -> dict:
         "entries": entries,
         "groups": groups,
         "stale": sorted(stale),
+        "agent_matrix": _build_agent_matrix(entries, canonical_agents or []),
     }
 
 
