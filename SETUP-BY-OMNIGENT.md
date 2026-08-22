@@ -282,3 +282,6 @@ Omnigent exposes the `trio-productionize-omnigent` entrypoint skill. `--producti
 (or the Omnigent install flag) installs the shared assets. Productionize uses
 the same registered Grok judgment roles and ephemeral Luna probe workers as
 Trio; the canonical productionize driver remains the source of batch state.
+Invoke it from the current Claude or Codex session with the explicit phrase
+“Productionize Omnigent” or `/trio-productionize-omnigent`. The ordinary
+`/trio-productionize` skill remains the native-harness audit.

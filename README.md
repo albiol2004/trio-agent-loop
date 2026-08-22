@@ -204,8 +204,11 @@ and launch their own Luna delegation. There is no extra
 coordinator model and no persistent Cursor session competing for a workspace
 chat. See
 [SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
-`trio-omnigent` entrypoint to both native skill directories. Say “Run a Trio
-Omnigent loop to …”; ordinary “Run a Trio loop” remains native.
+`trio-omnigent` and `trio-productionize-omnigent` entrypoints to both native
+skill directories. Say “Run a Trio Omnigent loop to …” for the loop, or
+“Productionize Omnigent” / `/trio-productionize-omnigent` for the
+Cursor-backed production-readiness audit; ordinary “Run a Trio loop” and
+`/trio-productionize` remain native.
 
 ## Files
 ```
