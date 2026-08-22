@@ -1,4 +1,3 @@
-
 A SHIP verdict normally ends with the Evaluator's retirement commit: one
 product commit `slice(<id>): <summary>` plus one mailbox commit
 `loop: iteration N — SHIP`, recorded as `commit:` lines in `loop/VERDICT.md`.

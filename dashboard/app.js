@@ -28,6 +28,17 @@ const state = {
   rafPending: false,
 };
 
+let currentRoot = "";
+function withRoot(url) {
+  if (!currentRoot) return url;
+  return url + (url.includes("?") ? "&" : "?") + "root=" + encodeURIComponent(currentRoot);
+}
+window.addEventListener("trio:workspace", (event) => {
+  currentRoot = event.detail && event.detail.path ? event.detail.path : "";
+  clearTimeout(state.boardTimer);
+  refreshBoard();
+});
+
 const BOARD_POLL_MS = 5000;
 const TABS = ["all", "running", "shipped", "blocked", "idle"];
 const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
@@ -253,7 +264,7 @@ function renderInbox(inbox) {
 
 async function refreshBoard() {
   try {
-    const res = await fetch("/api/board", { cache: "no-store" });
+    const res = await fetch(withRoot("/api/board"), { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     state.loops = Array.isArray(data.loops) ? data.loops : [];
@@ -462,7 +473,7 @@ async function refreshDetail({ quiet }) {
   const name = state.activeLoop;
   if (!name) return;
   try {
-    const res = await fetch("/api/loop?name=" + encodeURIComponent(name), {
+    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(name)), {
       cache: "no-store",
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -1631,7 +1642,7 @@ function openSession(path) {
   showTranscriptNotice("Waiting for stream…");
 
   const es = new EventSource(
-    "/api/transcript?path=" + encodeURIComponent(path) + "&offset=0"
+    withRoot("/api/transcript?path=" + encodeURIComponent(path) + "&offset=0")
   );
   state.es = es;
 

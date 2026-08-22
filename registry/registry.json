@@ -1,0 +1,3677 @@
+{
+  "version": 1,
+  "generated_by": "registry/scan.py",
+  "entry_count": 144,
+  "entries": [
+    {
+      "name": "design-canvas",
+      "path": "/home/alex/.claude/skills/design-canvas/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "design-canvas",
+        "description": "Submit HTML design variants to the local Open Design canvas (http://127.0.0.1:7456) so the human can browse them. Use when generating design mockups, UI variants, or HTML prototypes the user should review visually."
+      },
+      "frontmatter_hash": "7471808fc5998cc7",
+      "body_hash": "b952103187a61850",
+      "is_symlink": false,
+      "size": 2781
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.claude/skills/trio/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run ONE full iteration of the duo agent loop (Lead \u2192 Evaluator) using the loop/ mailbox files. Designed to be driven by \"/loop /trio\".",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "cae0892b28feec1e",
+      "body_hash": "d9d10157f0d0813d",
+      "is_symlink": false,
+      "size": 8451
+    },
+    {
+      "name": "trio-bridge",
+      "path": "/home/alex/.claude/skills/trio-bridge/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-bridge",
+        "description": "Suggest background Trio work by scanning a project and writing deduplicated proposal cards into proposals/.",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "aabfefe13621b9d7",
+      "body_hash": "1a934963ef001260",
+      "is_symlink": false,
+      "size": 5094
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.claude/skills/trio-init/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize the trio agent loop in the current project \u2014 creates the loop/ mailbox directory and GOAL.md from the given goal text.",
+        "argument-hint": "<goal description>",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "ac4dffdf01b38c0f",
+      "body_hash": "c3556133452cede6",
+      "is_symlink": false,
+      "size": 3284
+    },
+    {
+      "name": "trio-omnigent",
+      "path": "/home/alex/.claude/skills/trio-omnigent/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-omnigent",
+        "description": "Run the Cursor-backed Omnigent Trio loop from the current Claude/Codex UI session when the user explicitly says \u201cTrio Omnigent\u201d, \u201cOmnigent Trio\u201d, or invokes /trio-omnigent. Do not use for an ordinary native Trio request."
+      },
+      "frontmatter_hash": "a0783bf8ef8db6ef",
+      "body_hash": "60d2fa1aa161f42c",
+      "is_symlink": false,
+      "size": 10559
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.claude/skills/trio-productionize/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "fe19a944f6c903fe",
+      "is_symlink": false,
+      "size": 1144
+    },
+    {
+      "name": "trio-productionize-omnigent",
+      "path": "/home/alex/.claude/skills/trio-productionize-omnigent/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize-omnigent",
+        "description": "Run a Cursor-backed Omnigent production-readiness audit from the current Claude/Codex UI session when the user explicitly says \"Productionize Omnigent\", \"Omnigent Productionize\", or invokes /trio-productionize-omnigent. Do not use for an ordinary native productionize run."
+      },
+      "frontmatter_hash": "9bad2cc5eda1ba4f",
+      "body_hash": "ae70a51e29c60e0a",
+      "is_symlink": false,
+      "size": 3398
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/.claude/skills/trio-ship/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "use-railway",
+      "path": "/home/alex/.claude/skills/use-railway/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "use-railway",
+        "description": ">",
+        "Operate Railway infrastructure": "sign up for or sign in to a Railway account,",
+        "onboarded to Railway": "do not refuse \u2014 drive them through the unauthed",
+        "allowed-tools": "Bash(railway:*), Bash(which:*), Bash(command:*), Bash(npm:*), Bash(npx:*), Bash(curl:*), Bash(python3:*)"
+      },
+      "frontmatter_hash": "8381b6ec08ae41e0",
+      "body_hash": "8ed8efa10617b2d4",
+      "is_symlink": false,
+      "size": 28726
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/.claude/agents/trio-builder.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "description": "Sonnet primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Opus Lead, including substantive application logic, tests, and integration work.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "07d76cefd54ac529",
+      "body_hash": "d37ec00b5744fdc2",
+      "is_symlink": false,
+      "size": 2626
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/.claude/agents/trio-evaluator.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "description": "Opus adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using Sonnet explorers for scoped reconnaissance and Sonnet implementors only when delegated verification support is needed. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "6a17b31c13be1dd5",
+      "body_hash": "3c2e294d2136f126",
+      "is_symlink": false,
+      "size": 12884
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/.claude/agents/trio-lead.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "description": "Opus lead of the duo loop \u2014 plans, delegates the main implementation pass to Sonnet builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "a23c012835f7ec84",
+      "body_hash": "ed07c45f5eeb27df",
+      "is_symlink": false,
+      "size": 10943
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/.claude/agents/trio-repair.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "description": "Sonnet scoped-repair worker for the trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "0ce266be13d9c2c3",
+      "body_hash": "9fa7d3605f8b54de",
+      "is_symlink": false,
+      "size": 2837
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/.claude/agents/trio-scout.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "description": "Sonnet read-only explorer for the trio loop. Answers codebase questions for the Opus Lead/Evaluator \u2014 how things work, where things live, what conventions exist. Never modifies anything.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Write, Edit, NotebookEdit, Agent"
+      },
+      "frontmatter_hash": "64f15b9c54d85685",
+      "body_hash": "03bde409afee3135",
+      "is_symlink": false,
+      "size": 997
+    },
+    {
+      "name": "CLAUDE",
+      "path": "/home/alex/.claude/CLAUDE.md",
+      "harness": "claude",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "design-canvas",
+      "path": "/home/alex/.agents/skills/design-canvas/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "design-canvas",
+        "description": "Submit HTML design variants to the local Open Design canvas (http://127.0.0.1:7456) so the human can browse them. Use when generating design mockups, UI variants, or HTML prototypes the user should review visually."
+      },
+      "frontmatter_hash": "7471808fc5998cc7",
+      "body_hash": "b952103187a61850",
+      "is_symlink": false,
+      "size": 2781
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.agents/skills/trio/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run Trio through native Codex custom agents when available, with isolated bundled Codex CLI sessions as an explicit fallback when a task does not expose native spawn controls."
+      },
+      "frontmatter_hash": "77497ef220d15902",
+      "body_hash": "0139811fe4a79f2c",
+      "is_symlink": false,
+      "size": 7861
+    },
+    {
+      "name": "trio-bridge",
+      "path": "/home/alex/.agents/skills/trio-bridge/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-bridge",
+        "description": "Suggest background Trio work by scanning a project and writing deduplicated proposal cards into proposals/.",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "aabfefe13621b9d7",
+      "body_hash": "1a934963ef001260",
+      "is_symlink": false,
+      "size": 5094
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.agents/skills/trio-init/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Codex Trio mailbox from the user's goal. Use when the user explicitly asks to initialize Trio or when the Trio skill needs a new mailbox."
+      },
+      "frontmatter_hash": "496d2b38311aea97",
+      "body_hash": "99d9b798451a0c36",
+      "is_symlink": false,
+      "size": 1003
+    },
+    {
+      "name": "trio-omnigent",
+      "path": "/home/alex/.agents/skills/trio-omnigent/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-omnigent",
+        "description": "Run the Cursor-backed Omnigent Trio loop from the current Claude/Codex UI session when the user explicitly says \u201cTrio Omnigent\u201d, \u201cOmnigent Trio\u201d, or invokes /trio-omnigent. Do not use for an ordinary native Trio request."
+      },
+      "frontmatter_hash": "a0783bf8ef8db6ef",
+      "body_hash": "60d2fa1aa161f42c",
+      "is_symlink": false,
+      "size": 10559
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.agents/skills/trio-productionize/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "8a498a567cc55d8f",
+      "is_symlink": false,
+      "size": 1365
+    },
+    {
+      "name": "trio-productionize-omnigent",
+      "path": "/home/alex/.agents/skills/trio-productionize-omnigent/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize-omnigent",
+        "description": "Run a Cursor-backed Omnigent production-readiness audit from the current Claude/Codex UI session when the user explicitly says \"Productionize Omnigent\", \"Omnigent Productionize\", or invokes /trio-productionize-omnigent. Do not use for an ordinary native productionize run."
+      },
+      "frontmatter_hash": "9bad2cc5eda1ba4f",
+      "body_hash": "ae70a51e29c60e0a",
+      "is_symlink": false,
+      "size": 3398
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/.agents/skills/trio-ship/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "use-railway",
+      "path": "/home/alex/.agents/skills/use-railway/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "use-railway",
+        "description": ">",
+        "Operate Railway infrastructure": "sign up for or sign in to a Railway account,",
+        "onboarded to Railway": "do not refuse \u2014 drive them through the unauthed",
+        "allowed-tools": "Bash(railway:*), Bash(which:*), Bash(command:*), Bash(npm:*), Bash(npx:*), Bash(curl:*), Bash(python3:*)"
+      },
+      "frontmatter_hash": "8381b6ec08ae41e0",
+      "body_hash": "8ed8efa10617b2d4",
+      "is_symlink": false,
+      "size": 28726
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/.codex/agents/trio-builder.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Luna High primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Terra Lead, including substantive application logic, tests, and integration work.",
+        "developer_instructions": ""
+      },
+      "frontmatter_hash": "18780242b2254429",
+      "body_hash": "f0464bbe7cbd60ef",
+      "is_symlink": false,
+      "size": 2675
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/.codex/agents/trio-evaluator.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "model": "gpt-5.6-terra",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Terra High adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using GPT-5.6 Luna High explorers for scoped reconnaissance. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "developer_instructions": "",
+        "- For `scope": "local` verdicts you issued, re-verify the listed paths' behavior",
+        "(optionally `VERDICT: ITERATE scope": "design` or",
+        "`VERDICT: ITERATE scope": "local:<comma-separated-paths>`),",
+        "word plus the optional scope": "suffix. No title, heading, or blank line may",
+        "- `scope": "design` or plain `VERDICT: ITERATE` otherwise (plain ITERATE ="
+      },
+      "frontmatter_hash": "a525e7e76bf0e65e",
+      "body_hash": "87cce43b8dc853e6",
+      "is_symlink": false,
+      "size": 12550
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/.codex/agents/trio-lead.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "model": "gpt-5.6-terra",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Terra High lead of the duo loop \u2014 plans, delegates the main implementation pass to GPT-5.6 Luna High builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "developer_instructions": "",
+        "scope": "local:<paths>` was a builder-direct repair pass: if in-flight work",
+        "**Commit presence is a completion criterion.** An iteration with code-changing slices is not complete until `git log` shows at least one `slice(<id>): ` commit per such slice (code-changing": "any `writes:` entry that is neither `api:` nor under `loop/`). Verify this yourself \u2014 e.g. `git log --grep=\"^slice(<id>):\"` \u2014 before writing REPORT.md; if a slice is missing its commit, commit it (or instruct the builder to) and re-verify. The orchestrator re-checks mechanically before the Evaluator runs."
+      },
+      "frontmatter_hash": "ece1f16c6b5d45af",
+      "body_hash": "592d76c9297db777",
+      "is_symlink": false,
+      "size": 10442
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/.codex/agents/trio-repair.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Luna High scoped-repair worker for the trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "developer_instructions": "",
+        "You are the Repair pass in a two-agent loop, invoked because the Evaluator wrote `VERDICT: ITERATE scope": "local:<paths>`. You receive ONE scoped fix and perform its code-writing pass.",
+        "1. Read `loop/VERDICT.md` first: the failure scope is the `scope": "local:<paths>`"
+      },
+      "frontmatter_hash": "a70125cdac72a913",
+      "body_hash": "d606372ad0b124bc",
+      "is_symlink": false,
+      "size": 2885
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/.codex/agents/trio-scout.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "sandbox_mode": "read-only",
+        "description": "GPT-5.6 Luna High read-only explorer for the trio loop. Answers codebase questions for the Terra Lead/Evaluator \u2014 how things work, where things live, what conventions exist. Never modifies anything.",
+        "developer_instructions": ""
+      },
+      "frontmatter_hash": "e129935fb9d1454a",
+      "body_hash": "48b56670d22b4199",
+      "is_symlink": false,
+      "size": 1043
+    },
+    {
+      "name": "AGENTS",
+      "path": "/home/alex/.codex/AGENTS.md",
+      "harness": "codex",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "builder",
+      "path": "/home/alex/.omnigent/agents/trio-omnigent-roles/builder/config.yaml",
+      "harness": "omnigent",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "54317d1c395e87b0",
+      "is_symlink": false,
+      "size": 2404
+    },
+    {
+      "name": "evaluator",
+      "path": "/home/alex/.omnigent/agents/trio-omnigent-roles/evaluator/config.yaml",
+      "harness": "omnigent",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "5aa5bf7f0cef5d57",
+      "is_symlink": false,
+      "size": 4439
+    },
+    {
+      "name": "lead",
+      "path": "/home/alex/.omnigent/agents/trio-omnigent-roles/lead/config.yaml",
+      "harness": "omnigent",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "b42bf2e9dad3947d",
+      "is_symlink": false,
+      "size": 4018
+    },
+    {
+      "name": "scout",
+      "path": "/home/alex/.omnigent/agents/trio-omnigent-roles/scout/config.yaml",
+      "harness": "omnigent",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "b7e7ec82b4e7b291",
+      "is_symlink": false,
+      "size": 2147
+    },
+    {
+      "name": "config",
+      "path": "/home/alex/.omnigent/config.yaml",
+      "harness": "omnigent",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "25a38b8f8340597e",
+      "is_symlink": false,
+      "size": 498
+    },
+    {
+      "name": "trio-bridge",
+      "path": "/home/alex/.omp/agent/commands/trio-bridge.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Scan the current project in the background and write deduplicated Trio proposal cards into proposals/."
+      },
+      "frontmatter_hash": "fdcbb23611d57572",
+      "body_hash": "1959e1f39b8e4c3f",
+      "is_symlink": false,
+      "size": 5064
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.omp/agent/commands/trio-init.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Initialize the Trio loop in the current project \u2014 creates the loop/ mailbox directory and GOAL.md from the given goal text."
+      },
+      "frontmatter_hash": "035975b6f5145316",
+      "body_hash": "90a3acad91e1f45c",
+      "is_symlink": false,
+      "size": 3195
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.omp/agent/commands/trio-productionize.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "9a40430d719db49e",
+      "body_hash": "1aa3c3e787e1e41b",
+      "is_symlink": false,
+      "size": 1151
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/.omp/agent/commands/trio-ship.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Manually recover an orphaned SHIP verdict \u2014 performs the Evaluator's retirement commit (product + mailbox) for a SHIP whose commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "1c959bb87e8341a0",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1819
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.omp/agent/commands/trio.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run one or more iterations of the Trio agent loop using the loop/ mailbox files. /trio = one supervised iteration; /trio auto = keep iterating in-session until SHIP, BLOCKED, or NEEDS_HUMAN."
+      },
+      "frontmatter_hash": "806ce19fd17cc36d",
+      "body_hash": "ef4abe7ae86d4ac2",
+      "is_symlink": false,
+      "size": 12261
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/.omp/agent/agents/trio-builder.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "description": "Primary implementation worker for the Trio loop. Executes one well-specified increment handed down by the Lead, including substantive application logic, tests, and integration work.",
+        "model": "deepseek/deepseek-v4-flash"
+      },
+      "frontmatter_hash": "dac9291a2fbf59a4",
+      "body_hash": "d37ec00b5744fdc2",
+      "is_symlink": false,
+      "size": 2598
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/.omp/agent/agents/trio-evaluator.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "description": "Independent adversarial Trio evaluator; verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using scouts for scoped reconnaissance. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "model": "cursor/cursor-grok-4.6-high",
+        "spawns": "trio-scout",
+        "output": "|",
+        "\"type\"": "object\",",
+        "\"required\"": "[\"verdict\", \"summary\"],",
+        "\"properties\"": "{",
+        "\"verdict\"": "{ \"enum\": [\"SHIP\", \"ITERATE\", \"NEEDS_HUMAN\", \"BLOCKED\"] },",
+        "\"summary\"": "{ \"type\": \"string\", \"description\": \"<=3 sentences\" },",
+        "\"blocking_issues\"": "{ \"type\": \"array\", \"items\": { \"type\": \"string\" } }"
+      },
+      "frontmatter_hash": "7c9c4895808911ff",
+      "body_hash": "401177d6dbd0195a",
+      "is_symlink": false,
+      "size": 13533
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/.omp/agent/agents/trio-lead.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "description": "Trio lead \u2014 plans, delegates the main implementation pass to builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "model": "cursor/cursor-grok-4.6-high",
+        "spawns": "trio-builder, trio-scout"
+      },
+      "frontmatter_hash": "f1a28088c16b6c40",
+      "body_hash": "9296ae47ef53cda7",
+      "is_symlink": false,
+      "size": 10989
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/.omp/agent/agents/trio-repair.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "description": "Scoped-repair worker for the Trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "model": "deepseek/deepseek-v4-flash"
+      },
+      "frontmatter_hash": "9758ecea2f3b8386",
+      "body_hash": "9fa7d3605f8b54de",
+      "is_symlink": false,
+      "size": 2814
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/.omp/agent/agents/trio-scout.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "description": "Read-only reconnaissance worker for the Trio loop. Answers scoped codebase and API questions for the Lead/Evaluator. Never modifies anything.",
+        "model": "deepseek/deepseek-v4-flash",
+        "tools": "read, grep, glob, web_search",
+        "read-summarize": "false"
+      },
+      "frontmatter_hash": "72692183c5c848b7",
+      "body_hash": "4807aba88ce59ea7",
+      "is_symlink": false,
+      "size": 1134
+    },
+    {
+      "name": "AGENTS",
+      "path": "/home/alex/.omp/agent/AGENTS.md",
+      "harness": "omp",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.config/opencode/commands/trio-init.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Initialize a Trio mailbox for a new goal, then report the next command.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "bd491d3ecb34ed8e",
+      "body_hash": "b812b497b32f516f",
+      "is_symlink": false,
+      "size": 625
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.config/opencode/commands/trio-productionize.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "9492ffb12c5b99b2",
+      "body_hash": "c6a54a3e3023aee0",
+      "is_symlink": false,
+      "size": 1108
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/.config/opencode/commands/trio-ship.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Manually recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit for a SHIP whose commit: lines are missing.",
+        "agent": "trio-orchestrator"
+      },
+      "frontmatter_hash": "d4763c61b14ddaf0",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1793
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.config/opencode/commands/trio.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run one supervised native Trio iteration.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "9be22fcca2011ba7",
+      "body_hash": "1fecbd7c50345c9d",
+      "is_symlink": false,
+      "size": 448
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/.config/opencode/agents/trio-builder.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Mandatory primary Trio implementation worker for one well-specified increment.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "deny"
+      },
+      "frontmatter_hash": "82af3655ce265469",
+      "body_hash": "552f877cacbec785",
+      "is_symlink": false,
+      "size": 2707
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/.config/opencode/agents/trio-evaluator.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Independent adversarial Trio evaluator; verifies and never repairs product code.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "\"*\"": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "edit": "",
+        "\"loop/VERDICT.md\"": "allow",
+        "\"loop/LOG.md\"": "allow",
+        "bash": "",
+        "\"bash -n install.sh portable/driver.sh opencode/smoke-test.sh\"": "allow",
+        "\"./opencode/smoke-test.sh\"": "allow",
+        "\"python3 metrics/trio-shadow.py *\"": "allow",
+        "\"git diff --check\"": "allow",
+        "\"git diff --cached --quiet\"": "allow",
+        "\"git status *\"": "allow",
+        "\"git add *\"": "allow",
+        "\"git commit *\"": "allow",
+        "\"git rev-parse HEAD\"": "allow",
+        "\"find opencode -type f\"": "allow",
+        "\"sort\"": "allow",
+        "task": "",
+        "trio-scout": "allow"
+      },
+      "frontmatter_hash": "87db19e7bb98ccbb",
+      "body_hash": "28222e43b177c09a",
+      "is_symlink": false,
+      "size": 13807
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/.config/opencode/agents/trio-lead.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Trio Lead that plans, delegates the mandatory Builder pass, reviews, and reports.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "",
+        "\"*\"": "deny",
+        "trio-builder": "allow"
+      },
+      "frontmatter_hash": "948dbdca0d621033",
+      "body_hash": "5cd3ea3c9d09bea5",
+      "is_symlink": false,
+      "size": 10007
+    },
+    {
+      "name": "trio-orchestrator",
+      "path": "/home/alex/.config/opencode/agents/trio-orchestrator.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Native Trio coordinator that runs the fixed Scout, Lead, Builder, review, and Evaluator protocol.",
+        "mode": "primary",
+        "permission": "",
+        "edit": "",
+        "\"*\"": "deny",
+        "\"loop/*.md\"": "allow",
+        "bash": "deny",
+        "task": "",
+        "trio-scout": "allow",
+        "trio-lead": "allow",
+        "trio-repair": "allow",
+        "trio-evaluator": "allow"
+      },
+      "frontmatter_hash": "dcf07b8bfc9d2732",
+      "body_hash": "e8438289ea9dabed",
+      "is_symlink": false,
+      "size": 5523
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/.config/opencode/agents/trio-repair.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Scoped-repair worker for the Trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "deny"
+      },
+      "frontmatter_hash": "3d89b46626b34b94",
+      "body_hash": "7fc04d9d902f2d91",
+      "is_symlink": false,
+      "size": 2757
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/.config/opencode/agents/trio-scout.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "description": "Read-only Trio reconnaissance worker for scoped repository and API questions.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "\"*\"": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "webfetch": "allow",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny"
+      },
+      "frontmatter_hash": "8136ab43b43a7797",
+      "body_hash": "d312658b5f31dc8f",
+      "is_symlink": false,
+      "size": 767
+    },
+    {
+      "name": "AGENTS",
+      "path": "/home/alex/.config/opencode/AGENTS.md",
+      "harness": "opencode",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.kimi-code/skills/trio/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run one supervised Trio iteration with Kimi Code's sequential role runner.",
+        "type": "prompt",
+        "whenToUse": "When the user asks to initialize, run, resume, or inspect a Trio mailbox with Kimi Code"
+      },
+      "frontmatter_hash": "1bad9cd372a8aace",
+      "body_hash": "d2af549e67db1a04",
+      "is_symlink": false,
+      "size": 5725
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.kimi-code/skills/trio-init/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Trio mailbox for a Kimi Code session.",
+        "type": "prompt",
+        "whenToUse": "When the user asks Kimi Code to start a new Trio loop or create its mailbox",
+        "arguments": ""
+      },
+      "frontmatter_hash": "ad2d8a24d8d050ea",
+      "body_hash": "49129409d476dd48",
+      "is_symlink": false,
+      "size": 1079
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.kimi-code/skills/trio-productionize/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure.",
+        "type": "prompt",
+        "whenToUse": "When the user asks Kimi Code to audit production readiness with Trio"
+      },
+      "frontmatter_hash": "06934dacd95ecbd7",
+      "body_hash": "8b36f110f185ed98",
+      "is_symlink": false,
+      "size": 1386
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/.kimi-code/skills/trio-ship/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "AGENTS",
+      "path": "/home/alex/.kimi-code/AGENTS.md",
+      "harness": "kimi",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.zcode/skills/trio/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run the Trio workflow with ZCode Agent's native custom subagents and Goal Mode. Never uses a headless CLI or portable driver."
+      },
+      "frontmatter_hash": "1c4189aebff9d5c8",
+      "body_hash": "debe74a4a16bebd8",
+      "is_symlink": false,
+      "size": 3913
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/.zcode/skills/trio-init/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Trio mailbox for a ZCode-native Goal and subagent workflow."
+      },
+      "frontmatter_hash": "3ac602b7cd35e5fe",
+      "body_hash": "4e05c79e33bede3b",
+      "is_symlink": false,
+      "size": 430
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/.zcode/skills/trio-productionize/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "ed19e2b8347f7a0d",
+      "is_symlink": false,
+      "size": 1163
+    },
+    {
+      "name": "AGENTS",
+      "path": "/home/alex/.zcode/AGENTS.md",
+      "harness": "zcode",
+      "surface": "instructions",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "fc5874ef18b7b983",
+      "is_symlink": false,
+      "size": 2308
+    },
+    {
+      "name": "babysit",
+      "path": "/home/alex/.cursor/skills-cursor/babysit/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "babysit",
+        "description": ">-"
+      },
+      "frontmatter_hash": "689b72a4aeb7f32c",
+      "body_hash": "5e25bb16d3f993b9",
+      "is_symlink": false,
+      "size": 1436
+    },
+    {
+      "name": "canvas",
+      "path": "/home/alex/.cursor/skills-cursor/canvas/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "canvas",
+        "description": "",
+        "metadata": "",
+        "surfaces": "",
+        "environments": ""
+      },
+      "frontmatter_hash": "58a5f6f11e4176d3",
+      "body_hash": "f7b05c6547c88226",
+      "is_symlink": false,
+      "size": 8342
+    },
+    {
+      "name": "create-hook",
+      "path": "/home/alex/.cursor/skills-cursor/create-hook/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "create-hook",
+        "description": ">-"
+      },
+      "frontmatter_hash": "a7b3f26c48057ec7",
+      "body_hash": "b4d48024ac9bdd7a",
+      "is_symlink": false,
+      "size": 9192
+    },
+    {
+      "name": "create-rule",
+      "path": "/home/alex/.cursor/skills-cursor/create-rule/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "create-rule",
+        "description": ">-"
+      },
+      "frontmatter_hash": "65bd18a11ff66def",
+      "body_hash": "e832287b61b7c359",
+      "is_symlink": false,
+      "size": 3636
+    },
+    {
+      "name": "create-skill",
+      "path": "/home/alex/.cursor/skills-cursor/create-skill/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "create-skill",
+        "description": ">-"
+      },
+      "frontmatter_hash": "bc47943478a521ad",
+      "body_hash": "9ec5dfce2f8af829",
+      "is_symlink": false,
+      "size": 14412
+    },
+    {
+      "name": "create-subagent",
+      "path": "/home/alex/.cursor/skills-cursor/create-subagent/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "create-subagent",
+        "description": ">-",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "c36444c4a7d26e35",
+      "body_hash": "6421a0b603d6476d",
+      "is_symlink": false,
+      "size": 6454
+    },
+    {
+      "name": "goal",
+      "path": "/home/alex/.cursor/skills-cursor/goal/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "goal",
+        "description": "Set a goal that Cursor will pursue to completion.",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "e1c01e1317e4f00d",
+      "body_hash": "737af9acc4cb70a5",
+      "is_symlink": false,
+      "size": 5017
+    },
+    {
+      "name": "loop",
+      "path": "/home/alex/.cursor/skills-cursor/loop/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "loop",
+        "description": ">-"
+      },
+      "frontmatter_hash": "5568d291a5fda952",
+      "body_hash": "07328c34e3438dac",
+      "is_symlink": false,
+      "size": 7602
+    },
+    {
+      "name": "migrate-to-skills",
+      "path": "/home/alex/.cursor/skills-cursor/migrate-to-skills/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "migrate-to-skills",
+        "description": ">-",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "2d9d5dd7bc7d038c",
+      "body_hash": "8fe27a6a906d8766",
+      "is_symlink": false,
+      "size": 6439
+    },
+    {
+      "name": "new-repo",
+      "path": "/home/alex/.cursor/skills-cursor/new-repo/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "new-repo",
+        "description": ">-",
+        "disabled-environments": ""
+      },
+      "frontmatter_hash": "7145fcfc6b7180a0",
+      "body_hash": "f9f425a4c2ca9272",
+      "is_symlink": false,
+      "size": 2825
+    },
+    {
+      "name": "origin",
+      "path": "/home/alex/.cursor/skills-cursor/origin/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "origin",
+        "description": ">-",
+        "disabled-environments": ""
+      },
+      "frontmatter_hash": "494f7c50b2336788",
+      "body_hash": "acf414d13dcfdbbe",
+      "is_symlink": false,
+      "size": 3890
+    },
+    {
+      "name": "rename-chat",
+      "path": "/home/alex/.cursor/skills-cursor/rename-chat/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "rename-chat",
+        "description": ">-",
+        "disable-model-invocation": "true",
+        "environments": ""
+      },
+      "frontmatter_hash": "2d5eeddb02749f4b",
+      "body_hash": "07ef94b9d854bfd6",
+      "is_symlink": false,
+      "size": 793
+    },
+    {
+      "name": "review",
+      "path": "/home/alex/.cursor/skills-cursor/review/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "review",
+        "description": "Review code changes with the Bugbot or Security Review subagent.",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "152e9cdaa4f14de8",
+      "body_hash": "7cda7b3548c85fc4",
+      "is_symlink": false,
+      "size": 587
+    },
+    {
+      "name": "review-bugbot",
+      "path": "/home/alex/.cursor/skills-cursor/review-bugbot/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "review-bugbot",
+        "description": "Review code changes with Bugbot subagent."
+      },
+      "frontmatter_hash": "f170e04e7630f12e",
+      "body_hash": "a9d078ab26f202dc",
+      "is_symlink": false,
+      "size": 3695
+    },
+    {
+      "name": "review-security",
+      "path": "/home/alex/.cursor/skills-cursor/review-security/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "review-security",
+        "description": "Review code changes with Security Review subagent."
+      },
+      "frontmatter_hash": "6b812eb4e318b197",
+      "body_hash": "6d9b27f8722c6c1a",
+      "is_symlink": false,
+      "size": 3757
+    },
+    {
+      "name": "sdk",
+      "path": "/home/alex/.cursor/skills-cursor/sdk/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "sdk",
+        "description": ">-"
+      },
+      "frontmatter_hash": "4bb3cd0da1651500",
+      "body_hash": "bd6cccc45737bac9",
+      "is_symlink": false,
+      "size": 19586
+    },
+    {
+      "name": "share",
+      "path": "/home/alex/.cursor/skills-cursor/share/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "share",
+        "description": ">-",
+        "disabled-environments": ""
+      },
+      "frontmatter_hash": "1a9432b98bd64ab8",
+      "body_hash": "dee15a424670676b",
+      "is_symlink": false,
+      "size": 3740
+    },
+    {
+      "name": "shell",
+      "path": "/home/alex/.cursor/skills-cursor/shell/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "shell",
+        "description": ">-",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "180f4a61fd3e8e7c",
+      "body_hash": "9d7a969460b2f3c0",
+      "is_symlink": false,
+      "size": 867
+    },
+    {
+      "name": "split-to-prs",
+      "path": "/home/alex/.cursor/skills-cursor/split-to-prs/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "split-to-prs",
+        "description": ">-"
+      },
+      "frontmatter_hash": "6523a2d0a14655de",
+      "body_hash": "651bd66176c7b35d",
+      "is_symlink": false,
+      "size": 2261
+    },
+    {
+      "name": "statusline",
+      "path": "/home/alex/.cursor/skills-cursor/statusline/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "statusline",
+        "description": ">-"
+      },
+      "frontmatter_hash": "f3249722b4ea7f7d",
+      "body_hash": "7c431c4960cc3f71",
+      "is_symlink": false,
+      "size": 7200
+    },
+    {
+      "name": "update-cli-config",
+      "path": "/home/alex/.cursor/skills-cursor/update-cli-config/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "update-cli-config",
+        "description": ">-",
+        "metadata": "",
+        "surfaces": ""
+      },
+      "frontmatter_hash": "4cb098685b0abfbc",
+      "body_hash": "edafb16b7c78b455",
+      "is_symlink": false,
+      "size": 4682
+    },
+    {
+      "name": "update-cursor-settings",
+      "path": "/home/alex/.cursor/skills-cursor/update-cursor-settings/SKILL.md",
+      "harness": "cursor",
+      "surface": "skill",
+      "scope": "global",
+      "managed": true,
+      "frontmatter": {
+        "name": "update-cursor-settings",
+        "description": ">-",
+        "metadata": "",
+        "surfaces": ""
+      },
+      "frontmatter_hash": "81a79f3edc33e1f4",
+      "body_hash": "4b421b4d3d068122",
+      "is_symlink": false,
+      "size": 4296
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/.pi/agent/extensions/trio.ts",
+      "harness": "pi",
+      "surface": "extension",
+      "scope": "global",
+      "managed": false,
+      "frontmatter": {},
+      "frontmatter_hash": "44136fa355b3678a",
+      "body_hash": "9ea0bbefac438f48",
+      "is_symlink": false,
+      "size": 15189
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run ONE full iteration of the duo agent loop (Lead \u2192 Evaluator) using the loop/ mailbox files. Designed to be driven by \"/loop /trio\".",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "cae0892b28feec1e",
+      "body_hash": "d9d10157f0d0813d",
+      "is_symlink": false,
+      "size": 8451
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-init/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize the trio agent loop in the current project \u2014 creates the loop/ mailbox directory and GOAL.md from the given goal text.",
+        "argument-hint": "<goal description>",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "ac4dffdf01b38c0f",
+      "body_hash": "c3556133452cede6",
+      "is_symlink": false,
+      "size": 3284
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-productionize/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "fe19a944f6c903fe",
+      "is_symlink": false,
+      "size": 1144
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-ship/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-builder.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "description": "Sonnet primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Opus Lead, including substantive application logic, tests, and integration work.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "07d76cefd54ac529",
+      "body_hash": "d37ec00b5744fdc2",
+      "is_symlink": false,
+      "size": 2626
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-evaluator.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "description": "Opus adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using Sonnet explorers for scoped reconnaissance and Sonnet implementors only when delegated verification support is needed. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "6a17b31c13be1dd5",
+      "body_hash": "3c2e294d2136f126",
+      "is_symlink": false,
+      "size": 12884
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-lead.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "description": "Opus lead of the duo loop \u2014 plans, delegates the main implementation pass to Sonnet builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "a23c012835f7ec84",
+      "body_hash": "ed07c45f5eeb27df",
+      "is_symlink": false,
+      "size": 10943
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-repair.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "description": "Sonnet scoped-repair worker for the trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "0ce266be13d9c2c3",
+      "body_hash": "9fa7d3605f8b54de",
+      "is_symlink": false,
+      "size": 2837
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-scout.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "project",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "description": "Sonnet read-only explorer for the trio loop. Answers codebase questions for the Opus Lead/Evaluator \u2014 how things work, where things live, what conventions exist. Never modifies anything.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Write, Edit, NotebookEdit, Agent"
+      },
+      "frontmatter_hash": "64f15b9c54d85685",
+      "body_hash": "03bde409afee3135",
+      "is_symlink": false,
+      "size": 997
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run ONE full iteration of the duo agent loop (Lead \u2192 Evaluator) using the loop/ mailbox files. Designed to be driven by \"/loop /trio\".",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "cae0892b28feec1e",
+      "body_hash": "d9d10157f0d0813d",
+      "is_symlink": false,
+      "size": 8451
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-init/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize the trio agent loop in the current project \u2014 creates the loop/ mailbox directory and GOAL.md from the given goal text.",
+        "argument-hint": "<goal description>",
+        "disable-model-invocation": "true"
+      },
+      "frontmatter_hash": "ac4dffdf01b38c0f",
+      "body_hash": "c3556133452cede6",
+      "is_symlink": false,
+      "size": 3284
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-productionize/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "fe19a944f6c903fe",
+      "is_symlink": false,
+      "size": 1144
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-ship/SKILL.md",
+      "harness": "claude",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-builder.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "description": "Sonnet primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Opus Lead, including substantive application logic, tests, and integration work.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "07d76cefd54ac529",
+      "body_hash": "d37ec00b5744fdc2",
+      "is_symlink": false,
+      "size": 2626
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-evaluator.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "description": "Opus adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using Sonnet explorers for scoped reconnaissance and Sonnet implementors only when delegated verification support is needed. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "6a17b31c13be1dd5",
+      "body_hash": "3c2e294d2136f126",
+      "is_symlink": false,
+      "size": 12884
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-lead.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "description": "Opus lead of the duo loop \u2014 plans, delegates the main implementation pass to Sonnet builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "model": "claude-opus-5",
+        "effort": "high"
+      },
+      "frontmatter_hash": "a23c012835f7ec84",
+      "body_hash": "ed07c45f5eeb27df",
+      "is_symlink": false,
+      "size": 10943
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-repair.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "description": "Sonnet scoped-repair worker for the trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Agent"
+      },
+      "frontmatter_hash": "0ce266be13d9c2c3",
+      "body_hash": "9fa7d3605f8b54de",
+      "is_symlink": false,
+      "size": 2837
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/pruebas/agent-trio-template/.claude/agents/trio-scout.md",
+      "harness": "claude",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "description": "Sonnet read-only explorer for the trio loop. Answers codebase questions for the Opus Lead/Evaluator \u2014 how things work, where things live, what conventions exist. Never modifies anything.",
+        "model": "sonnet",
+        "effort": "high",
+        "disallowedTools": "Write, Edit, NotebookEdit, Agent"
+      },
+      "frontmatter_hash": "64f15b9c54d85685",
+      "body_hash": "03bde409afee3135",
+      "is_symlink": false,
+      "size": 997
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run Trio through native Codex custom agents when available, with isolated bundled Codex CLI sessions as an explicit fallback when a task does not expose native spawn controls."
+      },
+      "frontmatter_hash": "77497ef220d15902",
+      "body_hash": "0139811fe4a79f2c",
+      "is_symlink": false,
+      "size": 7861
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-init/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Codex Trio mailbox from the user's goal. Use when the user explicitly asks to initialize Trio or when the Trio skill needs a new mailbox."
+      },
+      "frontmatter_hash": "496d2b38311aea97",
+      "body_hash": "99d9b798451a0c36",
+      "is_symlink": false,
+      "size": 1003
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-productionize/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "8a498a567cc55d8f",
+      "is_symlink": false,
+      "size": 1365
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-ship/SKILL.md",
+      "harness": "codex",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/agents/trio-builder.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Luna High primary implementation worker for the trio loop. Executes one well-specified increment handed down by the Terra Lead, including substantive application logic, tests, and integration work.",
+        "developer_instructions": ""
+      },
+      "frontmatter_hash": "18780242b2254429",
+      "body_hash": "f0464bbe7cbd60ef",
+      "is_symlink": false,
+      "size": 2675
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/agents/trio-evaluator.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "model": "gpt-5.6-terra",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Terra High adversarial evaluator of the duo loop. Verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using GPT-5.6 Luna High explorers for scoped reconnaissance. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "developer_instructions": "",
+        "- For `scope": "local` verdicts you issued, re-verify the listed paths' behavior",
+        "(optionally `VERDICT: ITERATE scope": "design` or",
+        "`VERDICT: ITERATE scope": "local:<comma-separated-paths>`),",
+        "word plus the optional scope": "suffix. No title, heading, or blank line may",
+        "- `scope": "design` or plain `VERDICT: ITERATE` otherwise (plain ITERATE ="
+      },
+      "frontmatter_hash": "a525e7e76bf0e65e",
+      "body_hash": "87cce43b8dc853e6",
+      "is_symlink": false,
+      "size": 12550
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/agents/trio-lead.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "model": "gpt-5.6-terra",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Terra High lead of the duo loop \u2014 plans, delegates the main implementation pass to GPT-5.6 Luna High builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "developer_instructions": "",
+        "scope": "local:<paths>` was a builder-direct repair pass: if in-flight work",
+        "**Commit presence is a completion criterion.** An iteration with code-changing slices is not complete until `git log` shows at least one `slice(<id>): ` commit per such slice (code-changing": "any `writes:` entry that is neither `api:` nor under `loop/`). Verify this yourself \u2014 e.g. `git log --grep=\"^slice(<id>):\"` \u2014 before writing REPORT.md; if a slice is missing its commit, commit it (or instruct the builder to) and re-verify. The orchestrator re-checks mechanically before the Evaluator runs."
+      },
+      "frontmatter_hash": "ece1f16c6b5d45af",
+      "body_hash": "592d76c9297db777",
+      "is_symlink": false,
+      "size": 10442
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/agents/trio-repair.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "description": "GPT-5.6 Luna High scoped-repair worker for the trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "developer_instructions": "",
+        "You are the Repair pass in a two-agent loop, invoked because the Evaluator wrote `VERDICT: ITERATE scope": "local:<paths>`. You receive ONE scoped fix and perform its code-writing pass.",
+        "1. Read `loop/VERDICT.md` first: the failure scope is the `scope": "local:<paths>`"
+      },
+      "frontmatter_hash": "a70125cdac72a913",
+      "body_hash": "d606372ad0b124bc",
+      "is_symlink": false,
+      "size": 2885
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/pruebas/agent-trio-template/codex/agents/trio-scout.toml",
+      "harness": "codex",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "model": "gpt-5.6-luna",
+        "model_reasoning_effort": "high",
+        "sandbox_mode": "read-only",
+        "description": "GPT-5.6 Luna High read-only explorer for the trio loop. Answers codebase questions for the Terra Lead/Evaluator \u2014 how things work, where things live, what conventions exist. Never modifies anything.",
+        "developer_instructions": ""
+      },
+      "frontmatter_hash": "e129935fb9d1454a",
+      "body_hash": "48b56670d22b4199",
+      "is_symlink": false,
+      "size": 1043
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run one supervised Trio iteration with Kimi Code's sequential role runner.",
+        "type": "prompt",
+        "whenToUse": "When the user asks to initialize, run, resume, or inspect a Trio mailbox with Kimi Code"
+      },
+      "frontmatter_hash": "1bad9cd372a8aace",
+      "body_hash": "d2af549e67db1a04",
+      "is_symlink": false,
+      "size": 5725
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-init/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Trio mailbox for a Kimi Code session.",
+        "type": "prompt",
+        "whenToUse": "When the user asks Kimi Code to start a new Trio loop or create its mailbox",
+        "arguments": ""
+      },
+      "frontmatter_hash": "ad2d8a24d8d050ea",
+      "body_hash": "49129409d476dd48",
+      "is_symlink": false,
+      "size": 1079
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-productionize/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure.",
+        "type": "prompt",
+        "whenToUse": "When the user asks Kimi Code to audit production readiness with Trio"
+      },
+      "frontmatter_hash": "06934dacd95ecbd7",
+      "body_hash": "8b36f110f185ed98",
+      "is_symlink": false,
+      "size": 1386
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-ship/SKILL.md",
+      "harness": "kimi",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-ship",
+        "description": "Recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit (product + mailbox) when a SHIP's commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "e0429c997d17353a",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1822
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio",
+        "description": "Run the Trio workflow with ZCode Agent's native custom subagents and Goal Mode. Never uses a headless CLI or portable driver."
+      },
+      "frontmatter_hash": "1c4189aebff9d5c8",
+      "body_hash": "debe74a4a16bebd8",
+      "is_symlink": false,
+      "size": 3913
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio-init/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-init",
+        "description": "Initialize a Trio mailbox for a ZCode-native Goal and subagent workflow."
+      },
+      "frontmatter_hash": "3ac602b7cd35e5fe",
+      "body_hash": "4e05c79e33bede3b",
+      "is_symlink": false,
+      "size": 430
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio-productionize/SKILL.md",
+      "harness": "zcode",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize",
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "4eb18e06ed09d7ff",
+      "body_hash": "ed19e2b8347f7a0d",
+      "is_symlink": false,
+      "size": 1163
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-init.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Initialize a Trio mailbox for a new goal, then report the next command.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "bd491d3ecb34ed8e",
+      "body_hash": "b812b497b32f516f",
+      "is_symlink": false,
+      "size": 625
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-productionize.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "9492ffb12c5b99b2",
+      "body_hash": "c6a54a3e3023aee0",
+      "is_symlink": false,
+      "size": 1108
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-ship.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Manually recover an orphaned SHIP verdict \u2014 perform the Evaluator's retirement commit for a SHIP whose commit: lines are missing.",
+        "agent": "trio-orchestrator"
+      },
+      "frontmatter_hash": "d4763c61b14ddaf0",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1793
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio.md",
+      "harness": "opencode",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run one supervised native Trio iteration.",
+        "agent": "trio-orchestrator",
+        "subtask": "true"
+      },
+      "frontmatter_hash": "9be22fcca2011ba7",
+      "body_hash": "1fecbd7c50345c9d",
+      "is_symlink": false,
+      "size": 448
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-builder.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Mandatory primary Trio implementation worker for one well-specified increment.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "deny"
+      },
+      "frontmatter_hash": "82af3655ce265469",
+      "body_hash": "552f877cacbec785",
+      "is_symlink": false,
+      "size": 2707
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-evaluator.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Independent adversarial Trio evaluator; verifies and never repairs product code.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "\"*\"": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "edit": "",
+        "\"loop/VERDICT.md\"": "allow",
+        "\"loop/LOG.md\"": "allow",
+        "bash": "",
+        "\"bash -n install.sh portable/driver.sh opencode/smoke-test.sh\"": "allow",
+        "\"./opencode/smoke-test.sh\"": "allow",
+        "\"python3 metrics/trio-shadow.py *\"": "allow",
+        "\"git diff --check\"": "allow",
+        "\"git diff --cached --quiet\"": "allow",
+        "\"git status *\"": "allow",
+        "\"git add *\"": "allow",
+        "\"git commit *\"": "allow",
+        "\"git rev-parse HEAD\"": "allow",
+        "\"find opencode -type f\"": "allow",
+        "\"sort\"": "allow",
+        "task": "",
+        "trio-scout": "allow"
+      },
+      "frontmatter_hash": "87db19e7bb98ccbb",
+      "body_hash": "28222e43b177c09a",
+      "is_symlink": false,
+      "size": 13807
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-lead.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Trio Lead that plans, delegates the mandatory Builder pass, reviews, and reports.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "",
+        "\"*\"": "deny",
+        "trio-builder": "allow"
+      },
+      "frontmatter_hash": "948dbdca0d621033",
+      "body_hash": "5cd3ea3c9d09bea5",
+      "is_symlink": false,
+      "size": 10007
+    },
+    {
+      "name": "trio-orchestrator",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-orchestrator.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Native Trio coordinator that runs the fixed Scout, Lead, Builder, review, and Evaluator protocol.",
+        "mode": "primary",
+        "permission": "",
+        "edit": "",
+        "\"*\"": "deny",
+        "\"loop/*.md\"": "allow",
+        "bash": "deny",
+        "task": "",
+        "trio-scout": "allow",
+        "trio-lead": "allow",
+        "trio-repair": "allow",
+        "trio-evaluator": "allow"
+      },
+      "frontmatter_hash": "dcf07b8bfc9d2732",
+      "body_hash": "e8438289ea9dabed",
+      "is_symlink": false,
+      "size": 5523
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-repair.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Scoped-repair worker for the Trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "task": "deny"
+      },
+      "frontmatter_hash": "3d89b46626b34b94",
+      "body_hash": "7fc04d9d902f2d91",
+      "is_symlink": false,
+      "size": 2757
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/pruebas/agent-trio-template/opencode/agents/trio-scout.md",
+      "harness": "opencode",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Read-only Trio reconnaissance worker for scoped repository and API questions.",
+        "mode": "subagent",
+        "hidden": "true",
+        "permission": "",
+        "\"*\"": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "webfetch": "allow",
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny"
+      },
+      "frontmatter_hash": "8136ab43b43a7797",
+      "body_hash": "d312658b5f31dc8f",
+      "is_symlink": false,
+      "size": 767
+    },
+    {
+      "name": "trio-init",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-init.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Initialize the Trio loop in the current project \u2014 creates the loop/ mailbox directory and GOAL.md from the given goal text."
+      },
+      "frontmatter_hash": "035975b6f5145316",
+      "body_hash": "90a3acad91e1f45c",
+      "is_symlink": false,
+      "size": 3195
+    },
+    {
+      "name": "trio-productionize",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-productionize.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run the production-readiness graph through the shared Trio productionize procedure."
+      },
+      "frontmatter_hash": "9a40430d719db49e",
+      "body_hash": "1aa3c3e787e1e41b",
+      "is_symlink": false,
+      "size": 1151
+    },
+    {
+      "name": "trio-ship",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-ship.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Manually recover an orphaned SHIP verdict \u2014 performs the Evaluator's retirement commit (product + mailbox) for a SHIP whose commit: lines are missing. No subagent, no model config."
+      },
+      "frontmatter_hash": "1c959bb87e8341a0",
+      "body_hash": "435fd642f510ebea",
+      "is_symlink": false,
+      "size": 1819
+    },
+    {
+      "name": "trio",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio.md",
+      "harness": "omp",
+      "surface": "command",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "description": "Run one or more iterations of the Trio agent loop using the loop/ mailbox files. /trio = one supervised iteration; /trio auto = keep iterating in-session until SHIP, BLOCKED, or NEEDS_HUMAN."
+      },
+      "frontmatter_hash": "806ce19fd17cc36d",
+      "body_hash": "ef4abe7ae86d4ac2",
+      "is_symlink": false,
+      "size": 12261
+    },
+    {
+      "name": "trio-builder",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/agents/trio-builder.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-builder",
+        "description": "Primary implementation worker for the Trio loop. Executes one well-specified increment handed down by the Lead, including substantive application logic, tests, and integration work.",
+        "model": "deepseek/deepseek-v4-flash"
+      },
+      "frontmatter_hash": "dac9291a2fbf59a4",
+      "body_hash": "d37ec00b5744fdc2",
+      "is_symlink": false,
+      "size": 2598
+    },
+    {
+      "name": "trio-evaluator",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/agents/trio-evaluator.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-evaluator",
+        "description": "Independent adversarial Trio evaluator; verifies the Lead's iteration against PLAN.md's acceptance criteria by actually exercising the code, using scouts for scoped reconnaissance. Writes VERDICT.md with SHIP / ITERATE (optionally scope=local) / NEEDS_HUMAN / BLOCKED. Never fixes anything itself.",
+        "model": "cursor/cursor-grok-4.6-high",
+        "spawns": "trio-scout",
+        "output": "|",
+        "\"type\"": "object\",",
+        "\"required\"": "[\"verdict\", \"summary\"],",
+        "\"properties\"": "{",
+        "\"verdict\"": "{ \"enum\": [\"SHIP\", \"ITERATE\", \"NEEDS_HUMAN\", \"BLOCKED\"] },",
+        "\"summary\"": "{ \"type\": \"string\", \"description\": \"<=3 sentences\" },",
+        "\"blocking_issues\"": "{ \"type\": \"array\", \"items\": { \"type\": \"string\" } }"
+      },
+      "frontmatter_hash": "7c9c4895808911ff",
+      "body_hash": "401177d6dbd0195a",
+      "is_symlink": false,
+      "size": 13533
+    },
+    {
+      "name": "trio-lead",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/agents/trio-lead.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-lead",
+        "description": "Trio lead \u2014 plans, delegates the main implementation pass to builders, then reviews and corrects their work. Maintains PLAN.md and REPORT.md and owns the final result.",
+        "model": "cursor/cursor-grok-4.6-high",
+        "spawns": "trio-builder, trio-scout"
+      },
+      "frontmatter_hash": "f1a28088c16b6c40",
+      "body_hash": "9296ae47ef53cda7",
+      "is_symlink": false,
+      "size": 10989
+    },
+    {
+      "name": "trio-repair",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/agents/trio-repair.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-repair",
+        "description": "Scoped-repair worker for the Trio loop. Invoked on VERDICT: ITERATE scope=local:<paths> \u2014 fixes exactly the listed failure scope with no re-planning, refactoring, or scope expansion.",
+        "model": "deepseek/deepseek-v4-flash"
+      },
+      "frontmatter_hash": "9758ecea2f3b8386",
+      "body_hash": "9fa7d3605f8b54de",
+      "is_symlink": false,
+      "size": 2814
+    },
+    {
+      "name": "trio-scout",
+      "path": "/home/alex/pruebas/agent-trio-template/omp/agents/trio-scout.md",
+      "harness": "omp",
+      "surface": "agent",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-scout",
+        "description": "Read-only reconnaissance worker for the Trio loop. Answers scoped codebase and API questions for the Lead/Evaluator. Never modifies anything.",
+        "model": "deepseek/deepseek-v4-flash",
+        "tools": "read, grep, glob, web_search",
+        "read-summarize": "false"
+      },
+      "frontmatter_hash": "72692183c5c848b7",
+      "body_hash": "4807aba88ce59ea7",
+      "is_symlink": false,
+      "size": 1134
+    },
+    {
+      "name": "trio-omnigent",
+      "path": "/home/alex/pruebas/agent-trio-template/omnigent/entrypoints/trio-omnigent/SKILL.md",
+      "harness": "omnigent",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-omnigent",
+        "description": "Run the Cursor-backed Omnigent Trio loop from the current Claude/Codex UI session when the user explicitly says \u201cTrio Omnigent\u201d, \u201cOmnigent Trio\u201d, or invokes /trio-omnigent. Do not use for an ordinary native Trio request."
+      },
+      "frontmatter_hash": "a0783bf8ef8db6ef",
+      "body_hash": "60d2fa1aa161f42c",
+      "is_symlink": false,
+      "size": 10559
+    },
+    {
+      "name": "trio-productionize-omnigent",
+      "path": "/home/alex/pruebas/agent-trio-template/omnigent/entrypoints/trio-productionize-omnigent/SKILL.md",
+      "harness": "omnigent",
+      "surface": "skill",
+      "scope": "canonical",
+      "managed": false,
+      "frontmatter": {
+        "name": "trio-productionize-omnigent",
+        "description": "Run a Cursor-backed Omnigent production-readiness audit from the current Claude/Codex UI session when the user explicitly says \"Productionize Omnigent\", \"Omnigent Productionize\", or invokes /trio-productionize-omnigent. Do not use for an ordinary native productionize run."
+      },
+      "frontmatter_hash": "9bad2cc5eda1ba4f",
+      "body_hash": "ae70a51e29c60e0a",
+      "is_symlink": false,
+      "size": 3398
+    }
+  ],
+  "groups": [
+    {
+      "name": "babysit",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/babysit/SKILL.md",
+          "body_hash": "5e25bb16d3f993b9",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "canvas",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/canvas/SKILL.md",
+          "body_hash": "f7b05c6547c88226",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "create-hook",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/create-hook/SKILL.md",
+          "body_hash": "b4d48024ac9bdd7a",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "create-rule",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/create-rule/SKILL.md",
+          "body_hash": "e832287b61b7c359",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "create-skill",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/create-skill/SKILL.md",
+          "body_hash": "9ec5dfce2f8af829",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "create-subagent",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/create-subagent/SKILL.md",
+          "body_hash": "6421a0b603d6476d",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "design-canvas",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/design-canvas/SKILL.md",
+          "body_hash": "b952103187a61850",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/design-canvas/SKILL.md",
+          "body_hash": "b952103187a61850",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex"
+      ]
+    },
+    {
+      "name": "goal",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/goal/SKILL.md",
+          "body_hash": "737af9acc4cb70a5",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "loop",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/loop/SKILL.md",
+          "body_hash": "07328c34e3438dac",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "migrate-to-skills",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/migrate-to-skills/SKILL.md",
+          "body_hash": "8fe27a6a906d8766",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "new-repo",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/new-repo/SKILL.md",
+          "body_hash": "f9f425a4c2ca9272",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "origin",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/origin/SKILL.md",
+          "body_hash": "acf414d13dcfdbbe",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "rename-chat",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/rename-chat/SKILL.md",
+          "body_hash": "07ef94b9d854bfd6",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "review",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/review/SKILL.md",
+          "body_hash": "7cda7b3548c85fc4",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "review-bugbot",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/review-bugbot/SKILL.md",
+          "body_hash": "a9d078ab26f202dc",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "review-security",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/review-security/SKILL.md",
+          "body_hash": "6d9b27f8722c6c1a",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "sdk",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/sdk/SKILL.md",
+          "body_hash": "bd6cccc45737bac9",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "share",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/share/SKILL.md",
+          "body_hash": "dee15a424670676b",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "shell",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/shell/SKILL.md",
+          "body_hash": "9d7a969460b2f3c0",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "split-to-prs",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/split-to-prs/SKILL.md",
+          "body_hash": "651bd66176c7b35d",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "statusline",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/statusline/SKILL.md",
+          "body_hash": "7c431c4960cc3f71",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "trio",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio/SKILL.md",
+          "body_hash": "d9d10157f0d0813d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio/SKILL.md",
+          "body_hash": "0139811fe4a79f2c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.omp/agent/commands/trio.md",
+          "body_hash": "ef4abe7ae86d4ac2",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.config/opencode/commands/trio.md",
+          "body_hash": "1fecbd7c50345c9d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.kimi-code/skills/trio/SKILL.md",
+          "body_hash": "d2af549e67db1a04",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.zcode/skills/trio/SKILL.md",
+          "body_hash": "debe74a4a16bebd8",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "project",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio/SKILL.md",
+          "body_hash": "d9d10157f0d0813d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio/SKILL.md",
+          "body_hash": "d9d10157f0d0813d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio/SKILL.md",
+          "body_hash": "0139811fe4a79f2c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio/SKILL.md",
+          "body_hash": "d2af549e67db1a04",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio/SKILL.md",
+          "body_hash": "debe74a4a16bebd8",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio.md",
+          "body_hash": "1fecbd7c50345c9d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio.md",
+          "body_hash": "ef4abe7ae86d4ac2",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "kimi",
+        "omp",
+        "opencode",
+        "zcode"
+      ]
+    },
+    {
+      "name": "trio-bridge",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-bridge/SKILL.md",
+          "body_hash": "1a934963ef001260",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-bridge/SKILL.md",
+          "body_hash": "1a934963ef001260",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.omp/agent/commands/trio-bridge.md",
+          "body_hash": "1959e1f39b8e4c3f",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "omp"
+      ]
+    },
+    {
+      "name": "trio-init",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-init/SKILL.md",
+          "body_hash": "c3556133452cede6",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-init/SKILL.md",
+          "body_hash": "99d9b798451a0c36",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.omp/agent/commands/trio-init.md",
+          "body_hash": "90a3acad91e1f45c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.config/opencode/commands/trio-init.md",
+          "body_hash": "b812b497b32f516f",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.kimi-code/skills/trio-init/SKILL.md",
+          "body_hash": "49129409d476dd48",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.zcode/skills/trio-init/SKILL.md",
+          "body_hash": "4e05c79e33bede3b",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "project",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-init/SKILL.md",
+          "body_hash": "c3556133452cede6",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-init/SKILL.md",
+          "body_hash": "c3556133452cede6",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-init/SKILL.md",
+          "body_hash": "99d9b798451a0c36",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-init/SKILL.md",
+          "body_hash": "49129409d476dd48",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio-init/SKILL.md",
+          "body_hash": "4e05c79e33bede3b",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-init.md",
+          "body_hash": "b812b497b32f516f",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-init.md",
+          "body_hash": "90a3acad91e1f45c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "kimi",
+        "omp",
+        "opencode",
+        "zcode"
+      ]
+    },
+    {
+      "name": "trio-omnigent",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-omnigent/SKILL.md",
+          "body_hash": "60d2fa1aa161f42c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-omnigent/SKILL.md",
+          "body_hash": "60d2fa1aa161f42c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "omnigent",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omnigent/entrypoints/trio-omnigent/SKILL.md",
+          "body_hash": "60d2fa1aa161f42c",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "omnigent"
+      ]
+    },
+    {
+      "name": "trio-productionize",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-productionize/SKILL.md",
+          "body_hash": "fe19a944f6c903fe",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-productionize/SKILL.md",
+          "body_hash": "8a498a567cc55d8f",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.omp/agent/commands/trio-productionize.md",
+          "body_hash": "1aa3c3e787e1e41b",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.config/opencode/commands/trio-productionize.md",
+          "body_hash": "c6a54a3e3023aee0",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.kimi-code/skills/trio-productionize/SKILL.md",
+          "body_hash": "8b36f110f185ed98",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.zcode/skills/trio-productionize/SKILL.md",
+          "body_hash": "ed19e2b8347f7a0d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "project",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-productionize/SKILL.md",
+          "body_hash": "fe19a944f6c903fe",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-productionize/SKILL.md",
+          "body_hash": "fe19a944f6c903fe",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-productionize/SKILL.md",
+          "body_hash": "8a498a567cc55d8f",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-productionize/SKILL.md",
+          "body_hash": "8b36f110f185ed98",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "zcode",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/zcode/skills/trio-productionize/SKILL.md",
+          "body_hash": "ed19e2b8347f7a0d",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-productionize.md",
+          "body_hash": "c6a54a3e3023aee0",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-productionize.md",
+          "body_hash": "1aa3c3e787e1e41b",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "kimi",
+        "omp",
+        "opencode",
+        "zcode"
+      ]
+    },
+    {
+      "name": "trio-productionize-omnigent",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-productionize-omnigent/SKILL.md",
+          "body_hash": "ae70a51e29c60e0a",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-productionize-omnigent/SKILL.md",
+          "body_hash": "ae70a51e29c60e0a",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "omnigent",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omnigent/entrypoints/trio-productionize-omnigent/SKILL.md",
+          "body_hash": "ae70a51e29c60e0a",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "omnigent"
+      ]
+    },
+    {
+      "name": "trio-ship",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.omp/agent/commands/trio-ship.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "global",
+          "path": "/home/alex/.config/opencode/commands/trio-ship.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.kimi-code/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "project",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "in-sync"
+        },
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/.claude/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/codex/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "kimi",
+          "surface": "skill",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/kimi/skills/trio-ship/SKILL.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "opencode",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/opencode/commands/trio-ship.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        },
+        {
+          "harness": "omp",
+          "surface": "command",
+          "scope": "canonical",
+          "path": "/home/alex/pruebas/agent-trio-template/omp/commands/trio-ship.md",
+          "body_hash": "435fd642f510ebea",
+          "is_symlink": false,
+          "managed": false,
+          "status": "canonical"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex",
+        "kimi",
+        "omp",
+        "opencode"
+      ]
+    },
+    {
+      "name": "update-cli-config",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/update-cli-config/SKILL.md",
+          "body_hash": "edafb16b7c78b455",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "update-cursor-settings",
+      "installations": [
+        {
+          "harness": "cursor",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.cursor/skills-cursor/update-cursor-settings/SKILL.md",
+          "body_hash": "4b421b4d3d068122",
+          "is_symlink": false,
+          "managed": true,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "cursor"
+      ]
+    },
+    {
+      "name": "use-railway",
+      "installations": [
+        {
+          "harness": "claude",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.claude/skills/use-railway/SKILL.md",
+          "body_hash": "8ed8efa10617b2d4",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        },
+        {
+          "harness": "codex",
+          "surface": "skill",
+          "scope": "global",
+          "path": "/home/alex/.agents/skills/use-railway/SKILL.md",
+          "body_hash": "8ed8efa10617b2d4",
+          "is_symlink": false,
+          "managed": false,
+          "status": "unknown"
+        }
+      ],
+      "harnesses": [
+        "claude",
+        "codex"
+      ]
+    }
+  ],
+  "stale": []
+}

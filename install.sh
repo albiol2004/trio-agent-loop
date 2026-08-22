@@ -249,14 +249,14 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     cp -rv "$ROOT/zcode/skills/trio-init" "$HOME/.zcode/skills/"
     cp -rv "$ROOT/zcode/skills/trio-productionize" "$HOME/.zcode/skills/"
     install_productionize_assets
-    echo "Orchestration policy injection is N/A for ZCode; no global instructions file convention found."
+    inject_orchestration "$HOME/.zcode/AGENTS.md"
     echo "Installed native ZCode Trio skills. Refresh Settings -> Skills."
     exit 0 ;;
   --pi)
     install_productionize_assets
     mkdir -p "$HOME/.pi/agent/extensions"
     cp -v "$ROOT/pi/extensions/trio.ts" "$HOME/.pi/agent/extensions/trio.ts"
-    inject_orchestration "$HOME/.pi/agent/AGENTS.md"
+    echo "Orchestration policy injection is N/A for Pi; no documented global instructions file convention exists."
     echo "Installed native Pi Trio extension. Run /reload, then /trio <goal>."
     exit 0 ;;
   --opencode)
@@ -428,12 +428,15 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
   --dashboard)
     DASH_SHARE="${TRIO_DASH_HOME:-$HOME/.local/share/trio-agent-loop/dashboard}"
     DASH_BIN="$HOME/.local/bin"
-    mkdir -p "$DASH_SHARE" "$DASH_BIN" "$(dirname "$DASH_SHARE")/metrics"
+    mkdir -p "$DASH_SHARE" "$DASH_BIN" \
+      "$(dirname "$DASH_SHARE")/metrics" "$(dirname "$DASH_SHARE")/registry"
     # Shipped code: overwrite our own files on reinstall (not user config).
     cp -v "$ROOT/dashboard/serve.py" "$ROOT/dashboard/app.css" \
           "$ROOT/dashboard/app.js" "$ROOT/dashboard/index.html" \
-          "$ROOT/dashboard/README.md" "$DASH_SHARE/"
+          "$ROOT/dashboard/skills.html" "$ROOT/dashboard/skills.js" \
+          "$ROOT/dashboard/nav.js" "$ROOT/dashboard/README.md" "$DASH_SHARE/"
     cp -v "$ROOT/metrics/trio-metrics.py" "$(dirname "$DASH_SHARE")/metrics/"
+    cp -v "$ROOT/registry/scan.py" "$(dirname "$DASH_SHARE")/registry/"
     cp -v "$ROOT/dashboard/trio-dash" "$DASH_BIN/trio-dash"
     chmod +x "$DASH_BIN/trio-dash"
     echo "Installed trio-dash. From any project root (terminal or agent): trio-dash"

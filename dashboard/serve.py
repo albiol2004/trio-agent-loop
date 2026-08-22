@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""serve.py — read-only web dashboard backend for trio loops.
+"""serve.py — web dashboard backend for trio loops and skill registry.
 
 A stdlib-only HTTP server (Python 3.7+) that renders loop mailboxes as a
-live status board and tails omp agent session transcripts over SSE. It is
-strictly read-only: no endpoint mutates loops, sessions, or the repo.
+live status board, tails omp agent session transcripts over SSE, and serves
+the skill registry editor. Registry mutations are restricted to its
+explicitly allowlisted harness directories.
 
 Usage:
-    python3 dashboard/serve.py [--host 127.0.0.1] [--port <port>] [--root <dir>]
+    python3 dashboard/serve.py [--host 127.0.0.1] [--port <port>]
+        [--workspace <dir>] ...
 
-With no --port, the first free port in the range 9470-9479 is used
-(override the range with the TRIO_DASH_PORTS env var, e.g. "9500-9509").
-
-`--root` defaults to the current working directory and is scanned top-level
-for `loop*/` mailbox directories. Parsing logic for mailboxes is reused from
-`metrics/trio-metrics.py` (loaded by path relative to this file, never
-duplicated).
+With no --workspace, the current working directory and existing directories
+under ~/pruebas are discovered as workspace roots. Parsing logic for mailboxes
+is reused from `metrics/trio-metrics.py` (loaded by path relative to this file,
+never duplicated).
 
 API contract
 ------------
@@ -64,6 +63,7 @@ import re
 import subprocess
 import sys
 import time
+import threading
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,16 +80,74 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
 """Parsing module, resolved relative to this file (NOT cwd)."""
 
+REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
+"""Skill registry scanner, resolved relative to this file."""
+
+REPO_ROOT = DASHBOARD_DIR.parent.resolve()
+"""Repository root containing canonical harness sources."""
+
+HOME = Path.home()
+"""Current user's home directory, used for global harness locations."""
+
+REGISTRY_CACHE_SECONDS = 5.0
+"""Maximum age for the in-memory registry index."""
+
+WORKSPACE_SCAN_SECONDS = 60.0
+"""Maximum age of the automatically discovered workspace list."""
+
+_REGISTRY_MODULE = None
+_REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
+_REGISTRY_CACHE_LOCK = threading.Lock()
+
+SESSIONS_ROOT = HOME / ".omp" / "agent" / "sessions"
+
+
+_WRITABLE_ROOTS = (
+    HOME / ".claude" / "skills",
+    HOME / ".claude" / "commands",
+    HOME / ".claude" / "agents",
+    HOME / ".agents" / "skills",
+    HOME / ".codex" / "agents",
+    HOME / ".omp" / "agent" / "commands",
+    HOME / ".omp" / "agent" / "agents",
+    HOME / ".config" / "opencode" / "commands",
+    HOME / ".config" / "opencode" / "agents",
+    HOME / ".kimi-code" / "skills",
+    HOME / ".zcode" / "skills",
+    REPO_ROOT / ".claude",
+    REPO_ROOT / "codex",
+    REPO_ROOT / "kimi",
+    REPO_ROOT / "zcode",
+    REPO_ROOT / "opencode",
+    REPO_ROOT / "omp",
+    REPO_ROOT / "omnigent" / "entrypoints",
+)
+
+_GLOBAL_REGISTRY_DIRS = {
+    ("claude", "skill"): HOME / ".claude" / "skills",
+    ("claude", "command"): HOME / ".claude" / "commands",
+    ("claude", "agent"): HOME / ".claude" / "agents",
+    ("codex", "skill"): HOME / ".agents" / "skills",
+    ("codex", "agent"): HOME / ".codex" / "agents",
+    ("omp", "command"): HOME / ".omp" / "agent" / "commands",
+    ("omp", "agent"): HOME / ".omp" / "agent" / "agents",
+    ("opencode", "command"): HOME / ".config" / "opencode" / "commands",
+    ("opencode", "agent"): HOME / ".config" / "opencode" / "agents",
+    ("kimi", "skill"): HOME / ".kimi-code" / "skills",
+    ("zcode", "skill"): HOME / ".zcode" / "skills",
+}
+
+
 SHADOW_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-shadow.py"
 """Slice shadow module (slice-commit/git attribution), resolved like METRICS_PATH."""
-
-SESSIONS_ROOT = Path.home() / ".omp" / "agent" / "sessions"
-"""Root under which omp session JSONL files live."""
 
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/skills.html": ("skills.html", "text/html; charset=utf-8"),
+    "/skills.js": ("skills.js", "text/javascript; charset=utf-8"),
+    "/nav.js": ("nav.js", "text/javascript; charset=utf-8"),
 }
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")
@@ -142,6 +200,44 @@ def load_metrics_module():
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
     return module
+
+def load_registry_module():
+    """Load registry/scan.py by path and cache the module."""
+    global _REGISTRY_MODULE
+    if _REGISTRY_MODULE is not None:
+        return _REGISTRY_MODULE
+    spec = importlib.util.spec_from_file_location("trio_registry_scan", REGISTRY_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load registry module: {REGISTRY_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in ("collect", "collect_canonical", "build_index", "parse_frontmatter"):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"registry module missing required function: {fn}")
+    _REGISTRY_MODULE = module
+    return module
+
+def _registry_index(root: Path) -> dict:
+    """Return a per-project registry scan, refreshing it at most every five seconds."""
+    root_path = Path(root).resolve()
+    now = time.monotonic()
+    with _REGISTRY_CACHE_LOCK:
+        cached = _REGISTRY_CACHE.get(root_path)
+        if cached is not None and now - cached[1] <= REGISTRY_CACHE_SECONDS:
+            return cached[0]
+        registry = load_registry_module()
+        entries = registry.collect(root_path)
+        entries += registry.collect_canonical()
+        index = registry.build_index(entries)
+        _REGISTRY_CACHE[root_path] = (index, time.monotonic())
+        return index
+
+
+def _invalidate_registry_cache() -> None:
+    """Ensure subsequent reads observe a completed registry mutation."""
+    with _REGISTRY_CACHE_LOCK:
+        _REGISTRY_CACHE.clear()
 
 
 _SHADOW_MODULE = None
@@ -623,6 +719,149 @@ def _parse_session_file(path: Path) -> dict:
         "size": path.stat().st_size,
     }
 
+def _resolve_registry_path(value) -> Path:
+    """Resolve an API path, raising ``ValueError`` for malformed values."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing 'path'")
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("invalid path")
+
+
+def _writable_registry_path(
+    value, workspace_roots: tuple[Path, ...] = (),
+    project_root: Path | None = None,
+) -> Path:
+    """Resolve a path and enforce global or selected-project write roots."""
+    target = _resolve_registry_path(value)
+    for root in _WRITABLE_ROOTS:
+        try:
+            target.relative_to(root.resolve())
+            return target
+        except (ValueError, OSError, RuntimeError):
+            continue
+    for root in workspace_roots:
+        try:
+            target.relative_to(root.resolve())
+            if project_root is not None:
+                target.relative_to(project_root.resolve())
+            return target
+        except (ValueError, OSError, RuntimeError):
+            continue
+    raise PermissionError("path is outside writable registry roots")
+
+
+def _registry_entry(index: dict, target: Path) -> dict | None:
+    """Find a scanned file by resolved path."""
+    for entry in index.get("entries", []):
+        try:
+            if Path(entry["path"]).expanduser().resolve() == target:
+                return entry
+        except (KeyError, OSError, RuntimeError, ValueError):
+            continue
+    return None
+
+
+def _check_project_registry_entry(
+    entry: dict | None, target: Path, project_root: Path,
+    workspace_roots: tuple[Path, ...],
+) -> None:
+    """Keep project-scoped registry paths inside a known selected workspace."""
+    if not entry or entry.get("scope") != "project":
+        return
+    try:
+        target.relative_to(project_root.resolve())
+        if not any(
+            _path_is_under(target, workspace.resolve())
+            for workspace in workspace_roots
+        ):
+            raise PermissionError("project registry path is not in a workspace")
+    except (ValueError, OSError, RuntimeError):
+        raise PermissionError("project registry path is outside selected workspace")
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
+def _safe_registry_name(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing 'name'")
+    name = value.strip()
+    if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError("invalid name")
+    if Path(name).name != name:
+        raise ValueError("invalid name")
+    return name
+
+
+def _registry_target(harness, surface, name) -> Path:
+    """Map a global harness/surface/name tuple to its file layout."""
+    if not isinstance(harness, str) or not isinstance(surface, str):
+        raise ValueError("invalid harness or surface")
+    root = _GLOBAL_REGISTRY_DIRS.get((harness.strip().lower(), surface.strip().lower()))
+    if root is None:
+        raise ValueError("unsupported harness or surface")
+    name = _safe_registry_name(name)
+    surface = surface.strip().lower()
+    if surface == "skill":
+        return (root / name / "SKILL.md").resolve()
+    return (root / f"{name}.md").resolve()
+
+
+def _update_registry_name(text: str, name: str) -> str:
+    """Preserve source text while changing (or adding) frontmatter ``name``."""
+    registry = load_registry_module()
+    match = registry.FRONTMATTER_RE.match(text)
+    if match:
+        lines = match.group(1).splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*name\s*:", line):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}name: {name}"
+                prefix = text[:match.start(1)]
+                suffix = text[match.end(1):]
+                return prefix + "\n".join(lines) + suffix
+        block = "\n".join([f"name: {name}"] + lines)
+        return text[:match.start(1)] + block + text[match.end(1):]
+    return f"---\nname: {name}\ndescription: \n---\n\n{text}"
+
+
+def _write_registry_file(target: Path, content: str, *, create: bool = False) -> None:
+    """Write UTF-8 registry content after the target has passed policy checks."""
+    if target.exists() and target.is_dir():
+        raise IsADirectoryError(str(target))
+    if create:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("x", encoding="utf-8") as fh:
+            fh.write(content)
+    else:
+        if not target.parent.is_dir():
+            raise FileNotFoundError(str(target.parent))
+        target.write_text(content, encoding="utf-8")
+
+
+def _read_json_body(handler) -> dict:
+    raw_length = handler.headers.get("Content-Length")
+    try:
+        length = int(raw_length or "0")
+    except ValueError:
+        raise ValueError("invalid Content-Length")
+    if length < 0 or length > 32 * 1024 * 1024:
+        raise ValueError("invalid request body")
+    try:
+        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("invalid JSON body")
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
+
 
 # --------------------------------------------------------------------------
 # HTTP server
@@ -666,6 +905,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _resolve_root(self, query: dict) -> Path:
+        """Resolve and authorize a request's workspace root."""
+        value = (query.get("root") or [None])[0]
+        if value is None:
+            return self.server.default_root
+        if not isinstance(value, str) or not value.strip():
+            raise PermissionError("invalid workspace root")
+        try:
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                raise ValueError("workspace root must be absolute")
+            candidate = candidate.resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise PermissionError("invalid workspace root")
+        seeds = self.server.get_workspace_seeds()
+        if not any(_path_is_under(candidate, seed) for seed in seeds):
+            pruebas = HOME / "pruebas"
+            if (
+                self.server.workspace_discovery_enabled
+                and candidate.is_dir()
+                and _path_is_under(candidate, pruebas)
+            ):
+                seeds = self.server.get_workspace_seeds(force=True)
+        if not any(_path_is_under(candidate, seed) for seed in seeds):
+            raise PermissionError("workspace root is not allowed")
+        return candidate
+
+    def _request_root(self, query: dict) -> Path | None:
+        try:
+            return self._resolve_root(query)
+        except PermissionError as exc:
+            self._send_json(403, {"error": str(exc)})
+            return None
+
     # -- static files ------------------------------------------------------
 
     def _serve_static(self, name: str, ctype: str) -> None:
@@ -680,6 +953,169 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+    # -- /api/workspaces ----------------------------------------------------
+
+    def _handle_workspaces(self) -> None:
+        workspaces = []
+        for seed in self.server.get_workspace_seeds():
+            workspaces.append({
+                "id": str(seed),
+                "path": str(seed),
+                "has_loop": (seed / "loop").is_dir(),
+                "has_trio_config": any(
+                    (seed / marker).exists()
+                    for marker in (
+                        ".trio", "AGENTS.md", "CLAUDE.md",
+                        ".cursor", ".opencode", ".claude",
+                    )
+                ),
+            })
+        self._send_json(200, workspaces)
+
+    # -- /api/registry -----------------------------------------------------
+
+    def _handle_registry(self, root: Path) -> None:
+        self._send_json(200, _registry_index(root))
+
+    def _handle_registry_file(self, query: dict, root: Path) -> None:
+        value = (query.get("path") or [None])[0]
+        try:
+            target = _resolve_registry_path(value)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        index = _registry_index(root)
+        entry = _registry_entry(index, target)
+        if entry is None:
+            return self._send_json(404, {"error": "file not found"})
+        try:
+            _check_project_registry_entry(
+                entry, target, root, self.server.get_workspace_seeds())
+            text = target.read_text(encoding="utf-8", errors="replace")
+            registry = load_registry_module()
+            frontmatter, body = registry.parse_frontmatter(text)
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except OSError:
+            return self._send_json(404, {"error": "file not found"})
+        self._send_json(200, {
+            "path": str(target),
+            "frontmatter": frontmatter,
+            "body": body,
+        })
+
+    def _handle_registry_put(self, root: Path) -> None:
+        try:
+            payload = _read_json_body(self)
+            target = _writable_registry_path(
+                payload.get("path"), self.server.get_workspace_seeds(), root)
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise ValueError("missing or invalid 'content'")
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        try:
+            _write_registry_file(target, content)
+        except IsADirectoryError:
+            return self._send_json(400, {"error": "path is a directory"})
+        except FileNotFoundError:
+            return self._send_json(404, {"error": "parent directory not found"})
+        except OSError:
+            return self._send_json(500, {"error": "could not write file"})
+        _invalidate_registry_cache()
+        self._send_json(200, {"path": str(target)})
+
+    def _handle_registry_create(self) -> None:
+        try:
+            payload = _read_json_body(self)
+            harness = payload.get("harness")
+            surface = payload.get("surface")
+            name = _safe_registry_name(payload.get("name"))
+            target = _registry_target(harness, surface, name)
+            _writable_registry_path(str(target))
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise ValueError("missing or invalid 'content'")
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if os.path.lexists(target):
+            return self._send_json(409, {"error": "file already exists"})
+        if content == "":
+            content = f"---\nname: {name}\ndescription: \n---\n\n"
+        try:
+            _write_registry_file(target, content, create=True)
+        except FileExistsError:
+            return self._send_json(409, {"error": "file already exists"})
+        except OSError:
+            return self._send_json(500, {"error": "could not create file"})
+        _invalidate_registry_cache()
+        self._send_json(201, {"path": str(target)})
+
+    def _handle_registry_import(self, root: Path) -> None:
+        try:
+            payload = _read_json_body(self)
+            if payload.get("mode") != "copy":
+                raise ValueError("unsupported import mode")
+            source = _resolve_registry_path(payload.get("from_path"))
+            index = _registry_index(root)
+            entry = _registry_entry(index, source)
+            if entry is None:
+                return self._send_json(404, {"error": "source file not found"})
+            _check_project_registry_entry(
+                entry, source, root, self.server.get_workspace_seeds())
+            name = _safe_registry_name(payload.get("name"))
+            target = _registry_target(
+                payload.get("to_harness"), payload.get("to_surface"), name)
+            _writable_registry_path(str(target))
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if os.path.lexists(target):
+            return self._send_json(409, {"error": "file already exists"})
+        try:
+            content = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return self._send_json(404, {"error": "source file not found"})
+        content = _update_registry_name(content, name)
+        try:
+            _write_registry_file(target, content, create=True)
+        except FileExistsError:
+            return self._send_json(409, {"error": "file already exists"})
+        except OSError:
+            return self._send_json(500, {"error": "could not import file"})
+        _invalidate_registry_cache()
+        self._send_json(201, {"path": str(target)})
+
+    def _handle_registry_delete(self, query: dict, root: Path) -> None:
+        try:
+            target = _writable_registry_path(
+                (query.get("path") or [None])[0],
+                self.server.get_workspace_seeds(), root)
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if not target.exists():
+            return self._send_json(404, {"error": "file not found"})
+        if target.is_dir():
+            return self._send_json(400, {"error": "path is a directory"})
+        entry = _registry_entry(_registry_index(root), target)
+        try:
+            _check_project_registry_entry(
+                entry, target, root, self.server.get_workspace_seeds())
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        try:
+            target.unlink()
+        except OSError:
+            return self._send_json(500, {"error": "could not delete file"})
+        _invalidate_registry_cache()
+        self._send_json(200, {"path": str(target)})
 
     # -- /api/board --------------------------------------------------------
 
@@ -699,10 +1135,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "segments": analysis["segments"],
         }
 
-    def _handle_board(self) -> None:
+    def _handle_board(self, root: Path) -> None:
         metrics = self.server.metrics
+        loop_dirs = list(metrics.discover_loops(root))
         loops = []
-        for loop_dir in metrics.discover_loops(self.server.root):
+        for loop_dir in loop_dirs:
             try:
                 loops.append(self._loop_card(loop_dir, metrics))
             except Exception:
@@ -721,11 +1158,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "segments": [],
                 })
         inbox = []
-        for loop_dir, card in zip(
-            list(metrics.discover_loops(self.server.root)), loops
-        ):
+        for loop_dir, card in zip(loop_dirs, loops):
             try:
-                inbox.extend(_inbox_items(loop_dir, card, self.server.root))
+                inbox.extend(_inbox_items(loop_dir, card, root))
             except Exception:
                 traceback.print_exc()
         order = {"high": 0, "medium": 1, "low": 2}
@@ -738,10 +1173,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- /api/sessions -----------------------------------------------------
 
-    def _session_list(self, loop_dir: Path) -> list[dict]:
+    def _session_list(self, loop_dir: Path, root: Path) -> list[dict]:
         """Parents first (newest first), then subagents, for one loop."""
         sessions = []
-        for desc in _session_files_for_loop(loop_dir, self.server.root):
+        for desc in _session_files_for_loop(loop_dir, root):
             try:
                 session = _parse_session_file(desc["path"])
             except OSError:
@@ -756,40 +1191,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
         subagents.sort(key=lambda s: (s["timestamp"], s["label"]), reverse=True)
         return parents + subagents
 
-    def _find_loop_dir(self, name: str) -> Path | None:
+    def _find_loop_dir(self, name: str, root: Path) -> Path | None:
         metrics = self.server.metrics
         return next(
-            (p for p in metrics.discover_loops(self.server.root) if p.name == name),
+            (p for p in metrics.discover_loops(root) if p.name == name),
             None,
         )
 
-    def _handle_sessions(self, query: dict) -> None:
+    def _handle_sessions(self, query: dict, root: Path) -> None:
         name = (query.get("loop") or [None])[0]
         if not name:
             return self._send_json(400, {"error": "missing 'loop' parameter"})
-        loop_dir = self._find_loop_dir(name)
+        loop_dir = self._find_loop_dir(name, root)
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
-        self._send_json(200, self._session_list(loop_dir))
+        self._send_json(200, self._session_list(loop_dir, root))
 
     # -- /api/loop (detail) --------------------------------------------------
 
-    def _handle_loop_detail(self, query: dict) -> None:
+    def _handle_loop_detail(self, query: dict, root: Path) -> None:
         name = (query.get("name") or [None])[0]
         if not name:
             return self._send_json(400, {"error": "missing 'name' parameter"})
-        loop_dir = self._find_loop_dir(name)
+        loop_dir = self._find_loop_dir(name, root)
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
         card = self._loop_card(loop_dir, self.server.metrics)
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
-        card["commits"] = _loop_commits(loop_dir, self.server.root)
+        card["commits"] = _loop_commits(loop_dir, root)
         card["slices"] = _loop_slices(loop_dir)
-        card["slice_activity"] = _loop_slice_activity(loop_dir, self.server.root)
-        card["iterations"], card["overlaps"] = _loop_iterations(
-            loop_dir, self.server.root)
-        card["sessions"] = self._session_list(loop_dir)
+        card["slice_activity"] = _loop_slice_activity(loop_dir, root)
+        card["iterations"], card["overlaps"] = _loop_iterations(loop_dir, root)
+        card["sessions"] = self._session_list(loop_dir, root)
         self._send_json(200, card)
 
     # -- /api/transcript (SSE) ---------------------------------------------
@@ -946,35 +1380,146 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path in STATIC_ROUTES:
             name, ctype = STATIC_ROUTES[path]
             return self._serve_static(name, ctype)
+        if path == "/api/workspaces":
+            return self._api(self._handle_workspaces)
+        if path == "/api/registry":
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry(root))
+        if path == "/api/registry/file":
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_file(query, root))
         if path == "/api/board":
-            return self._api(self._handle_board)
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_board(root))
         if path == "/api/loop":
-            return self._api(lambda: self._handle_loop_detail(query))
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_loop_detail(query, root))
         if path == "/api/sessions":
-            return self._api(lambda: self._handle_sessions(query))
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_sessions(query, root))
         if path == "/api/transcript":
+            if self._request_root(query) is None:
+                return
             return self._handle_transcript(query)
         if path.startswith("/api/"):
             return self._send_json(404, {"error": "not found"})
         return self._send_text(404, "not found")
 
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/registry/file":
+            query = parse_qs(parsed.query)
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_put(root))
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        path = parsed.path
+        if path in ("/api/registry/create", "/api/registry/import"):
+            root = self._request_root(query)
+            if root is None:
+                return
+            if path == "/api/registry/create":
+                return self._api(self._handle_registry_create)
+            return self._api(lambda: self._handle_registry_import(root))
+        self._send_json(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/registry/file":
+            query = parse_qs(parsed.query)
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_delete(query, root))
+        self._send_json(404, {"error": "not found"})
+
 
 class DashboardServer(ThreadingHTTPServer):
-    """Threaded server carrying the project root and the loaded metrics module."""
+    """Threaded server carrying workspace roots and the loaded metrics module."""
 
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], root: Path):
-        self.root = Path(root).resolve()
+    def __init__(
+        self, address: tuple[str, int], root: Path | None = None,
+        workspaces: list[Path] | tuple[Path, ...] | None = None,
+        auto_discover: bool = False,
+    ):
+        if workspaces is None:
+            seeds = [Path(root or Path.cwd()).resolve()]
+        else:
+            seeds = [Path(path).resolve() for path in workspaces]
+            if not seeds:
+                seeds = [Path.cwd().resolve()]
+        unique_seeds = []
+        for seed in seeds:
+            if seed not in unique_seeds:
+                unique_seeds.append(seed)
+        self._fixed_workspace_seeds = tuple(unique_seeds)
+        self.workspace_discovery_enabled = bool(auto_discover)
+        self._workspace_lock = threading.Lock()
+        self.workspace_scan_at = 0.0
+        self.workspace_seeds = self._fixed_workspace_seeds
+        self.default_root = (
+            Path(root).resolve() if root is not None
+            else self._fixed_workspace_seeds[0]
+        )
+        self.root = self.default_root
         self.metrics = load_metrics_module()
+        self.get_workspace_seeds(force=True)
         super().__init__(address, DashboardHandler)
 
-
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
-
+    def get_workspace_seeds(self, force: bool = False) -> tuple[Path, ...]:
+        """Return fixed seeds plus a TTL-refreshed scan of project directories."""
+        if not self.workspace_discovery_enabled:
+            return self._fixed_workspace_seeds
+        now = time.monotonic()
+        with self._workspace_lock:
+            if (
+                not force
+                and now - self.workspace_scan_at <= WORKSPACE_SCAN_SECONDS
+            ):
+                return self.workspace_seeds
+            seeds = list(self._fixed_workspace_seeds)
+            scan_roots = [
+                HOME / "pruebas",
+                HOME / "Projects",
+                HOME / "projects",
+                HOME / "dev",
+                HOME / "src",
+                HOME / "code",
+                HOME / "repos",
+                HOME / "work",
+            ]
+            for scan_root in scan_roots:
+                try:
+                    discovered = sorted(
+                        path.resolve() for path in scan_root.iterdir()
+                        if path.is_dir() and not path.name.startswith(".")
+                    )
+                except OSError:
+                    continue
+                for seed in discovered:
+                    if seed not in seeds:
+                        seeds.append(seed)
+            self.workspace_seeds = tuple(seeds)
+            self.workspace_scan_at = now
+            return self.workspace_seeds
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -984,13 +1529,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None,
                         help="bind port (default: first free port in the TRIO_DASH_PORTS range, 9470-9479)")
-    parser.add_argument("--root", default=".", help="project root scanned for loop*/ dirs (default: cwd)")
+    parser.add_argument(
+        "--workspace", action="append", dest="workspace_paths", metavar="PATH",
+        help="workspace root (repeatable; default: cwd and ~/pruebas/* dirs)",
+    )
+    # Keep the old spelling for scripts that have not migrated yet.
+    parser.add_argument("--root", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    root = Path(args.root).resolve()
-    if not root.is_dir():
-        print(f"error: --root {args.root} is not a directory", file=sys.stderr)
-        return 2
+    if args.workspace_paths is not None:
+        raw_workspaces = args.workspace_paths
+        auto_discover = False
+    elif args.root is not None:
+        raw_workspaces = [args.root]
+        auto_discover = False
+    else:
+        raw_workspaces = [str(Path.cwd())]
+        auto_discover = True
+    workspaces = []
+    for value in raw_workspaces:
+        workspace = Path(value).expanduser().resolve()
+        if not workspace.is_dir():
+            print(
+                f"error: --workspace {value} is not a directory",
+                file=sys.stderr,
+            )
+            return 2
+        if workspace not in workspaces:
+            workspaces.append(workspace)
+    root = workspaces[0]
 
     port_range = os.environ.get("TRIO_DASH_PORTS", "9470-9479")
     try:
@@ -1003,7 +1570,11 @@ def main(argv: list[str] | None = None) -> int:
     server = None
     for port in candidate_ports:
         try:
-            server = DashboardServer((args.host, port), root)
+            server = DashboardServer(
+                (args.host, port),
+                workspaces=workspaces,
+                auto_discover=auto_discover,
+            )
             break
         except OSError as exc:
             if args.port is not None:

@@ -1,35 +1,21 @@
 ---
 name: trio-productionize
-description: Run a production-readiness audit of the current project against the production-readiness graph — batched probe scouts, tiered judgment assessors, user triage, then hand fix-triaged failures to the trio loop. Use when the user invokes /trio-productionize or asks to productionize the project.
+description: Run the production-readiness graph through the shared Trio productionize procedure.
 ---
 
-Run a production-readiness audit of the current project: the
-production-readiness graph is checked node-by-node by batched agents, the
-driver owns all state, failures are triaged with the user, and `fix`-triaged
-items seed the trio loop.
+# Codex Trio productionize
 
-**First, read and follow `$PZ_HOME/command.md`** where
-`PZ_HOME="${TRIO_PZ_HOME:-$HOME/.local/share/trio-agent-loop/productionize}"`
-(`cat "$PZ_HOME/command.md"`). It is the canonical procedure: setup, batch
-generation, the execution-loop rules (briefing rule, known-context preamble,
-context caps, delivery-first persistence, concurrency), recording, triage,
-and close-out. If `$PZ_HOME/command.md` is missing, stop and tell the user
-to install the assets (`install.sh --productionize` from the
-agent-trio-template repo).
+Read and follow `$PZ_HOME/command.md`; it is the canonical productionize procedure and owns the graph, driver, batching, recording, and close-out rules.
 
-## Dispatch (this harness)
+## Dispatch table
 
-- `scout` (probe batches) → the **trio-scout** custom agent when native
-  spawn controls exist; otherwise the trio skill's `scripts/run-role.sh scout`
-  fallback. One agent per batch file in `pz-run/batches/`.
-- `assessor:<tier>` (judgment batches) → **trio-lead** (standard) /
-  **trio-evaluator** (high), same native-or-fallback rule.
-- `user` nodes → ask the user in-session; record the decision verbatim.
+- `executor: scout` probe nodes: when native spawn controls exist, use the custom `trio-scout` agent. Otherwise use the Codex Trio skill's `scripts/run-role.sh` fallback with role `scout`.
+- `executor: assessor:standard` judgment nodes: when native spawn controls exist, use the custom `trio-lead` agent; otherwise use that same `scripts/run-role.sh` fallback with role `lead`.
+- `executor: assessor:high` judgment nodes: when native spawn controls exist, use the custom `trio-evaluator` agent; otherwise use the fallback with role `evaluator`.
+- `executor: user` nodes: ask in-session and record the user's decision verbatim as evidence.
 
-## Delivery (binding on every dispatched agent)
+Use the batch briefing rather than raw `plan.json`, and keep the Codex Trio preflight and fallback capability rules. The orchestrator records each result with the driver's `record-batch`.
 
-Every agent MUST write its verdict JSON array to
-`pz-run/results/<batch-file-stem>.json` BEFORE composing its final reply;
-you record from that file with the driver's `record-batch`. A dead agent
-whose results file exists is a success — record and move on; re-dispatch
-only the gaps.
+## Delivery
+
+Every agent MUST write its verdict array to `pz-run/results/<batch-stem>.json` before composing its final reply. Record from that file, accepting partial arrays and re-dispatching only gaps.
