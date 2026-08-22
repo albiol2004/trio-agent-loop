@@ -251,10 +251,15 @@ metrics/                            # cross-harness loop analytics
                                   #   normalization across template generations
   trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
   trio-shadow.py                  # shadow checker, declared-vs-actual slice writes
-dashboard/                          # read-only web dashboard (stdlib-only server)
-  serve.py                        # board/sessions/SSE-transcript API server
-  index.html app.css app.js       # self-contained dark-theme frontend (no CDN)
-  README.md                       # usage, CLI flags, and tailscale access notes
+dashboard/                          # web dashboard: loops, registry management (stdlib-only server)
+  serve.py                        # loop board/sessions/SSE API + registry/agents CRUD
+  index.html skills.html agents.html # self-contained dark-theme pages (no CDN)
+  README.md                       # usage, CLI flags, registry features, and tailscale access
+registry/                           # canonical-agent definitions + format layer
+  scan.py agents.py               # YAML/TOML parsers + harness renderers
+  canonical-agents/               # harness-neutral agent definitions
+  tests/                          # 164 tests covering parsers, validation, install API
+  README.md                       # architecture, model tiers, tool policies
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
 PIPELINE.md                         # experimental speculative-pipeline execution spec — slice contracts, frozen interfaces, shadow measurement
 kimi/                                # Kimi Code skills, prompts, and runner

@@ -1,6 +1,6 @@
 # Trio Loop Dashboard
 
-A production-quality, read-only web dashboard for trio agent loops. It runs on Python 3 stdlib only (no pip installs, no build step) and serves a live status board plus live transcript tailing for loop mailboxes.
+A production-quality web dashboard for trio agent loops: live status board, transcript tailing, and skill/agent registry management. It runs on Python 3.11+ stdlib only (no pip installs, no build step).
 
 ## Install and start (per project)
 
@@ -48,8 +48,24 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 - **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
 - **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
+## Skills editor
+
+The **Skills** page (`/skills.html`) edits skill registry files with a typed frontmatter interface:
+- **Schema-driven forms** — `GET /api/registry/schema` serves harness/surface destinations, formats (yaml/toml), and per-field specs (type, widget, required, help text).
+- **Server-side validation** — `POST /api/registry/serialize` validates frontmatter/body pairs. Raw YAML (via `{"$yaml": "<text>"}` escape hatch) is parsed strictly server-side; malformed input returns a 400 error naming the field.
+- **Read-only generated files** — files managed by `prompts/generate.py` are marked read-only and return 403 on write attempts.
+
+## Canonical agents & install matrix
+
+The **Agents** page (`/agents.html`) displays canonical-agent definitions and per-harness installation status:
+- **Canonical agents** (`registry/canonical-agents/`) are harness-neutral definitions: name, description, instructions, model tier (standard/high/cheap), and tool policy (read-only/edit/spawn).
+- **Install matrix** shows each canonical agent as a row with a cell per supported harness (claude, codex, omp, opencode) indicating sync status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported.
+- **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
+- **Install endpoint** — `POST /api/registry/install` renders a canonical agent into a harness's native format and writes it to the correct location (e.g., `~/.claude/agents/` for claude). Returns 404 for an unknown agent, 400 for an unsupported harness (e.g., omnigent), and 403 if the destination is managed by generate.py.
+
 ## Implementation notes
 
 - Mailbox parsing is delegated to `metrics/trio-metrics.py` (loaded by path; no regex duplication).
+- Registry scanning and serialization use `registry/scan.py`'s format layer (YAML-subset and TOML parsers) and `registry/agents.py` for canonical-agent models and per-harness renderers.
 - The browser side is self-contained: all CSS and JS are served from `dashboard/`.
-- The dashboard is read-only: no endpoint mutates loops, sessions, or the repo.
+- All registry writes are confined to explicitly allowlisted harness directories and reject paths managed by `prompts/generate.py`.
