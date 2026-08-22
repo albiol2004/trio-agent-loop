@@ -84,6 +84,8 @@ installer_replacement_contract() {
   local roles="$omnigent_home/agents/trio-omnigent-roles"
   local claude_skill="$home/.claude/skills/trio-omnigent"
   local codex_skill="$home/.agents/skills/trio-omnigent"
+  local claude_pz_skill="$home/.claude/skills/trio-productionize-omnigent"
+  local codex_pz_skill="$home/.agents/skills/trio-productionize-omnigent"
   local trioctl="$home/.local/bin/trioctl"
   local trioctl_config="$home/.config/trio-agent-loop/omnigent.toml"
   local snapshot="$TMP/install-snapshot"
@@ -104,6 +106,7 @@ installer_replacement_contract() {
   [[ "$(<"$roles/registry.json")" == '{"preserve":true}' ]] || return 1
   [[ "$(find "$roles" -type f -name config.yaml | wc -l)" -eq 4 ]] || return 1
   [[ -f "$claude_skill/SKILL.md" && -f "$codex_skill/SKILL.md" ]] || return 1
+  [[ -f "$claude_pz_skill/SKILL.md" && -f "$codex_pz_skill/SKILL.md" ]] || return 1
   [[ -x "$trioctl" && -f "$trioctl_config" ]] || return 1
   assert "$trioctl" omnigent resolve lead --config "$trioctl_config" --json \
     | grep -Fq '"model": "cursor-grok-4.6-medium"'
@@ -142,10 +145,29 @@ for role, (name, harness, model) in expected.items():
 PY
 }
 
+protocol_contract() {
+  assert grep -Fq 'cursor-grok-4.6-medium+luna-max-v2' "$ROOT/omnigent/trioctl"
+  assert grep -Fq 'cursor-grok-4.6-medium+luna-max-v2' \
+    "$ROOT/omnigent/entrypoints/trio-omnigent/SKILL.md"
+  assert grep -Fq 'Before any deep reconnaissance' \
+    "$ROOT/omnigent/trio-omnigent-roles/lead/config.yaml"
+  assert grep -Fq 'machine-readable YAML `slices:`' \
+    "$ROOT/omnigent/trio-omnigent-roles/lead/config.yaml"
+  assert grep -Fq 'LOG.md; its absence is a process failure' \
+    "$ROOT/omnigent/trio-omnigent-roles/evaluator/config.yaml"
+  assert grep -Fq 'trio-shadow.py --mailbox <dir> --json' \
+    "$ROOT/omnigent/trio-omnigent-roles/evaluator/config.yaml"
+  assert grep -Fq 'record-batch' \
+    "$ROOT/omnigent/entrypoints/trio-productionize-omnigent/SKILL.md"
+  assert grep -Fq 'source of batch state' \
+    "$ROOT/omnigent/entrypoints/trio-productionize-omnigent/SKILL.md"
+}
+
 check 'A3 installer probes session-create effort and registered-agent launch support' installer_probe_contract
 check 'A4 installer replaces owned trees and preserves registry' installer_replacement_contract
 check 'A6 role configs parse as YAML and match the documented role table' role_yaml_contract
-check 'A7 trioctl unit tests pass' python3 -m pytest -q "$ROOT/omnigent/tests/test_trioctl.py"
+check 'A7 Omnigent role and productionize protocol is pinned and complete' protocol_contract
+check 'A8 trioctl unit tests pass' python3 -m pytest -q "$ROOT/omnigent/tests/test_trioctl.py"
 
 if [[ -n "${OMNIGENT_SOURCE:-}" ]]; then
   if git -C "$OMNIGENT_SOURCE" apply --reverse --check \

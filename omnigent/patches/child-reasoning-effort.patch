@@ -1,5 +1,5 @@
 diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
-index 9b097c40..2663f0e9 100644
+index e23bd976..3dcf28cd 100644
 --- a/omnigent/runner/tool_dispatch.py
 +++ b/omnigent/runner/tool_dispatch.py
 @@ -58,6 +58,7 @@ from omnigent.model_override import (
@@ -10,7 +10,7 @@ index 9b097c40..2663f0e9 100644
  from omnigent.runtime import pending_elicitations
  from omnigent.session_lifecycle import (
      CLOSED_LABEL_KEY,
-@@ -2230,6 +2231,7 @@ def _build_session_create_body(
+@@ -2278,6 +2279,7 @@ def _build_session_create_body(
      title: object,
      message: object,
      model: object = None,
@@ -18,7 +18,7 @@ index 9b097c40..2663f0e9 100644
  ) -> _JsonObject:
      """
      Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
-@@ -2258,6 +2260,9 @@ def _build_session_create_body(
+@@ -2306,6 +2308,9 @@ def _build_session_create_body(
          body["title"] = title
      if isinstance(model, str) and model:
          body["model_override"] = model
@@ -28,7 +28,7 @@ index 9b097c40..2663f0e9 100644
      if isinstance(message, str) and message:
          body["initial_items"] = [
              {
-@@ -2406,13 +2411,17 @@ async def _execute_session_create(
+@@ -2454,13 +2459,17 @@ async def _execute_session_create(
              agent_spec=agent_spec,
              runner_workspace=runner_workspace,
          )
@@ -53,7 +53,7 @@ index 9b097c40..2663f0e9 100644
      try:
          resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
      except Exception as exc:  # noqa: BLE001
-@@ -2578,6 +2587,12 @@ async def _upload_config_bundle(
+@@ -2626,6 +2635,12 @@ async def _upload_config_bundle(
      title = args.get("title")
      if isinstance(title, str) and title:
          metadata["title"] = title
@@ -67,10 +67,10 @@ index 9b097c40..2663f0e9 100644
          resp = await server_client.post(
              "/v1/sessions",
 diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
-index a8da4d41..cf4397cc 100644
+index 9e048e85..28c05949 100644
 --- a/omnigent/server/routes/_sessions/helpers.py
 +++ b/omnigent/server/routes/_sessions/helpers.py
-@@ -7337,6 +7337,27 @@ async def _remove_session_worktree_best_effort(
+@@ -7803,6 +7803,27 @@ async def _remove_session_worktree_best_effort(
          )
  
  
@@ -98,7 +98,7 @@ index a8da4d41..cf4397cc 100644
  def _resolve_subagent_spec(
      *,
      agent: Agent,
-@@ -7362,24 +7383,10 @@ def _resolve_subagent_spec(
+@@ -7828,24 +7849,10 @@ def _resolve_subagent_spec(
      :returns: The matching child :class:`AgentSpec`, or ``None`` when the
          cache is absent, the bundle fails to load, or no sub-agent matches.
      """
@@ -125,7 +125,7 @@ index a8da4d41..cf4397cc 100644
          return None
      return _find_spec_by_name(parent_spec, sub_agent_name)
  
-@@ -8871,6 +8878,7 @@ __all__ = [
+@@ -9588,6 +9595,7 @@ __all__ = [
      "_require_host_conn_for_worktree",
      "_reset_runner_resources_after_switch",
      "_reset_runner_resources_after_switch_impl",
@@ -134,18 +134,18 @@ index a8da4d41..cf4397cc 100644
      "_resolve_llm_model",
      "_resolve_skill_meta_text_via_runner",
 diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
-index b24e0af9..7d135826 100644
+index 164ddca4..9c5e458e 100644
 --- a/omnigent/server/routes/_sessions/orchestration.py
 +++ b/omnigent/server/routes/_sessions/orchestration.py
-@@ -255,6 +255,7 @@ from omnigent.server.routes._sessions.helpers import (
-     _remove_session_worktree_best_effort,
+@@ -278,6 +278,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _repl_terminal_ui_labels,
      _require_declared_subagent,
      _require_external_status_forward,
 +    _resolve_agent_spec,
      _resolve_harness,
      _resolve_llm_model,
      _resolve_subagent_spec,
-@@ -5822,6 +5823,7 @@ async def _create_session_from_existing_agent(
+@@ -7915,6 +7916,7 @@ async def _create_session_from_existing_agent(
      # flat-list shape plus this bounds check is the security boundary;
      # mirrors the multipart create + PATCH paths.
      sub_spec: AgentSpec | None = None
@@ -153,7 +153,7 @@ index b24e0af9..7d135826 100644
      if body.sub_agent_name:
          sub_spec = _resolve_subagent_spec(
              agent=agent,
-@@ -5839,10 +5841,21 @@ async def _create_session_from_existing_agent(
+@@ -7932,10 +7934,21 @@ async def _create_session_from_existing_agent(
              ) from exc
      else:
          try:
@@ -177,31 +177,26 @@ index b24e0af9..7d135826 100644
                  code=ErrorCode.INVALID_INPUT,
              ) from exc
  
-@@ -5952,6 +5965,19 @@ async def _create_session_from_existing_agent(
-                 code=ErrorCode.INTERNAL_ERROR,
-             )
-         conv = updated_conv
+@@ -8035,6 +8048,13 @@ async def _create_session_from_existing_agent(
+         _merged.update(_sa_labels)
+         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
+         conv.labels.update(_merged)
 +    elif registered_agent_spec is not None and (
 +        _agent_labels := _native_subagent_wrapper_labels_from_spec(registered_agent_spec)
 +    ):
 +        _merged = dict(body.labels) if body.labels else {}
 +        _merged.update(_agent_labels)
 +        await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-+        if updated_conv is None:
-+            raise OmnigentError(
-+                f"Session {conv.id!r} disappeared while setting registered-agent labels",
-+                code=ErrorCode.INTERNAL_ERROR,
-+            )
-+        conv = updated_conv
-     elif body.labels:
-         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
- 
++        conv.labels.update(_merged)
+     elif (
+         body.sub_agent_name is None
+         and body.host_id is not None
 diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
-index 9c7be41a..60048c83 100644
+index c03cad12..996c9afc 100644
 --- a/omnigent/server/routes/sessions/__init__.py
 +++ b/omnigent/server/routes/sessions/__init__.py
-@@ -490,5 +490,6 @@ from omnigent.server.routes._sessions.helpers import (
+@@ -494,6 +494,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _require_external_status_forward as _require_external_status_forward,
      _require_host_conn_for_worktree as _require_host_conn_for_worktree,
      _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch_impl,
 +    _resolve_agent_spec as _resolve_agent_spec,
@@ -209,10 +204,10 @@ index 9c7be41a..60048c83 100644
      _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
      _resolve_subagent_spec as _resolve_subagent_spec,
 diff --git a/omnigent/tools/builtins/spawn.py b/omnigent/tools/builtins/spawn.py
-index 166f1269..655e71e9 100644
+index a5eeff0a..91de7bc2 100644
 --- a/omnigent/tools/builtins/spawn.py
 +++ b/omnigent/tools/builtins/spawn.py
-@@ -932,6 +932,23 @@ class SysSessionCreateTool(Tool):
+@@ -933,6 +933,23 @@ class SysSessionCreateTool(Tool):
                                  "agent's default."
                              ),
                          },
@@ -236,159 +231,3 @@ index 166f1269..655e71e9 100644
                      },
                      # Only the always-optional fields are listed in
                      # ``required`` (none): the agent_id-vs-config_path
-diff --git a/tests/runner/test_runner_dispatch.py b/tests/runner/test_runner_dispatch.py
-index f194f692..e66e3844 100644
---- a/tests/runner/test_runner_dispatch.py
-+++ b/tests/runner/test_runner_dispatch.py
-@@ -6158,7 +6158,14 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
-     ) as server_client:
-         output = await execute_tool(
-             tool_name="sys_session_create",
--            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
-+            arguments=json.dumps(
-+                {
-+                    "agent_id": "ag_x",
-+                    "title": "auth",
-+                    "message": "start",
-+                    "reasoning_effort": "medium",
-+                }
-+            ),
-             server_client=server_client,
-             conversation_id="conv_caller",
-         )
-@@ -6168,6 +6175,7 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
-     assert captured["parent_session_id"] == "conv_caller"
-     assert captured["agent_id"] == "ag_x"
-     assert captured["title"] == "auth"
-+    assert captured["reasoning_effort"] == "medium"
-     assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
-     handle = json.loads(output)
-     assert handle["conversation_id"] == "conv_child"
-diff --git a/tests/server/integration/test_sessions_child_sessions.py b/tests/server/integration/test_sessions_child_sessions.py
-index 8dcc39fe..92e70f95 100644
---- a/tests/server/integration/test_sessions_child_sessions.py
-+++ b/tests/server/integration/test_sessions_child_sessions.py
-@@ -1216,6 +1216,86 @@ async def _create_parent_with_subagents(
-     return {"session_id": session_id, "agent_id": agent_resp.json()["id"]}
- 
- 
-+def _bundle_with_native_root(
-+    name: str,
-+    harness: str,
-+    config: dict[str, Any],
-+) -> bytes:
-+    """Build a registered agent whose root executor uses a native harness."""
-+    root_config = {
-+        "spec_version": 1,
-+        "name": name,
-+        "executor": {
-+            "type": "omnigent",
-+            "model": f"test-{name}",
-+            "config": {"harness": harness, **config},
-+        },
-+        "prompt": "test native registered agent",
-+    }
-+    buf = io.BytesIO()
-+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-+        cfg = yaml.dump(root_config).encode()
-+        info = tarfile.TarInfo(name="config.yaml")
-+        info.size = len(cfg)
-+        tf.addfile(info, io.BytesIO(cfg))
-+    return buf.getvalue()
-+
-+
-+@pytest.mark.parametrize(
-+    "harness,root_config,expected_args",
-+    [
-+        (
-+            "claude-native",
-+            {"permission_mode": "bypassPermissions"},
-+            ["--permission-mode", "bypassPermissions"],
-+        ),
-+        (
-+            "codex-native",
-+            {"yolo": True},
-+            ["--dangerously-bypass-approvals-and-sandbox"],
-+        ),
-+        (
-+            "cursor-native",
-+            {"yolo": True},
-+            ["--yolo"],
-+        ),
-+    ],
-+)
-+async def test_registered_native_agent_create_derives_launch_args_from_root_spec(
-+    client: httpx.AsyncClient,
-+    harness: str,
-+    root_config: dict[str, Any],
-+    expected_args: list[str],
-+) -> None:
-+    """Durable agent-id launches inherit native permission flags from YAML."""
-+    bundle = _bundle_with_native_root(
-+        name=f"registered-{harness}",
-+        harness=harness,
-+        config=root_config,
-+    )
-+    bootstrap = await client.post(
-+        "/v1/sessions",
-+        data={"metadata": json.dumps({})},
-+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-+    )
-+    assert bootstrap.status_code == 201, bootstrap.text
-+    bootstrap_id = bootstrap.json()["session_id"]
-+    agent_resp = await client.get(f"/v1/sessions/{bootstrap_id}/agent")
-+    assert agent_resp.status_code == 200, agent_resp.text
-+
-+    created = await client.post(
-+        "/v1/sessions",
-+        json={
-+            "agent_id": agent_resp.json()["id"],
-+            "parent_session_id": bootstrap_id,
-+            "title": "registered native child",
-+        },
-+    )
-+    assert created.status_code == 201, created.text
-+    assert created.json()["terminal_launch_args"] == expected_args
-+    assert created.json()["labels"]["omnigent.ui"] == "terminal"
-+
-+
- @pytest.mark.parametrize(
-     "harness,expected_wrapper",
-     [
-diff --git a/tests/tools/builtins/test_spawn.py b/tests/tools/builtins/test_spawn.py
-index 78fc0d88..64bae167 100644
---- a/tests/tools/builtins/test_spawn.py
-+++ b/tests/tools/builtins/test_spawn.py
-@@ -13,7 +13,7 @@ import jsonschema
- import pytest
- 
- from omnigent.spec.types import AgentSpec
--from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
-+from omnigent.tools.builtins.spawn import SysSessionCreateTool, _build_sys_session_send_schema
- 
- 
- def _args_schema() -> dict:
-@@ -58,6 +58,23 @@ def test_file_ids_present_and_optional() -> None:
-     assert branch["additionalProperties"] is False
- 
- 
-+def test_session_create_reasoning_effort_present_and_optional() -> None:
-+    properties = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
-+    assert properties["reasoning_effort"]["enum"] == [
-+        "none",
-+        "minimal",
-+        "low",
-+        "medium",
-+        "high",
-+        "xhigh",
-+        "max",
-+    ]
-+    assert (
-+        "reasoning_effort"
-+        not in SysSessionCreateTool().get_schema()["function"]["parameters"]["required"]
-+    )
-+
-+
- def test_description_mentions_file_ids() -> None:
-     schema = _schema_with_subagent()
-     assert "file_ids" in schema["function"]["description"]

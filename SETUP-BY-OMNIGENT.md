@@ -115,14 +115,14 @@ the profile's exact fallback slug for diagnostics or recovery, but the
 
 ## Update the Omnigent source checkout
 
-The bundled compatibility patch is verified against the stable `v0.9.0`
+The bundled compatibility patch is verified against the stable `v0.10.0`
 release. For a stable installation, keep the Omnigent checkout on a local
 branch rooted at the release tag:
 
 ```bash
 cd /path/to/omnigent
 git fetch origin --tags
-git switch -c trio-v0.9.0 v0.9.0
+git switch -c trio-v0.10.0 v0.10.0
 ```
 
 Do not run `git pull` on that pinned branch: release tags do not advance. Move
@@ -170,11 +170,11 @@ The agent should:
 5. Discover Omnigent's deferred `sys_session_create`, `sys_session_close`, and
    `sys_agent_list` tools.
 6. Back up a registry whose `_profile` is not
-   `cursor-grok-4.6-medium+luna-max-v1`, then register only the two judgment
+   `cursor-grok-4.6-medium+luna-max-v2`, then register only the two judgment
    roles by creating an idle child from:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-7. Write `_profile: cursor-grok-4.6-medium+luna-max-v1` plus the exact returned
+7. Write `_profile: cursor-grok-4.6-medium+luna-max-v2` plus the exact returned
    `agent_id` and `bootstrap_conversation_id` values to
    `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`, keyed by
    `trio-omnigent-{lead,evaluator}`. Leave the idle bootstrap
@@ -224,13 +224,13 @@ point two live runs at one mailbox.
 
 ## Why the Omnigent patch is required
 
-Omnigent already stored `reasoning_effort` on sessions and translated it to
-native harness configuration at launch. Previously, the session-create tool
-exposed `model` but not `reasoning_effort`. Registered `agent_id` launches also
-skipped the role's native launch configuration, dropping Cursor's `--yolo`.
-The patch completes both existing paths. The current all-Cursor profile encodes
-effort in exact model IDs, while retaining the general effort seam for custom
-profiles.
+Omnigent v0.10.0 already handles Kimi Code's current 0.x release line and
+derives native launch flags for declared subagents. Its session-create tool
+still exposes `model` but not `reasoning_effort`, and direct launches by a
+persisted registered `agent_id` still skip the root role's native launch
+configuration, dropping Cursor's `--yolo`. The small patch completes those
+two paths. The current all-Cursor profile encodes effort in exact model IDs,
+while retaining the general effort seam for custom profiles.
 Effort is creation-only and cannot change on a continued child.
 
 The compatibility patch remains additive while released Omnigent builds lack
@@ -279,4 +279,6 @@ installations remain intact.
 ## Productionize audit
 
 Omnigent exposes the `trio-productionize-omnigent` entrypoint skill. `--productionize`
-(or the Omnigent install flag) installs the shared assets.
+(or the Omnigent install flag) installs the shared assets. Productionize uses
+the same registered Grok judgment roles and ephemeral Luna probe workers as
+Trio; the canonical productionize driver remains the source of batch state.

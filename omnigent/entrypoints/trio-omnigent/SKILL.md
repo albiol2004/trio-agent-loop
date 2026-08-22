@@ -24,7 +24,7 @@ coordinator.
 2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
    It maps the two exact judgment-role names to persisted `agent_id` values.
    Its `_profile` must be exactly
-   `cursor-grok-4.6-medium+luna-max-v1`. A missing or different marker means
+   `cursor-grok-4.6-medium+luna-max-v2`. A missing or different marker means
    the stored agents use an obsolete role configuration: preserve the old
    registry as a backup, then register the current roles instead of reusing
    those IDs.

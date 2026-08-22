@@ -20,7 +20,10 @@ VERSION = "0.4.0"
 ROLES = ("lead", "evaluator", "builder", "scout")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
 CURSOR_WORKER_ROLES = ("builder", "scout")
-REGISTRY_PROFILE = "cursor-grok-4.6-medium+luna-max-v1"
+# Registered Omnigent agents persist their bundle prompt at creation time.
+# Bump this marker whenever the Lead/Evaluator config changes materially so a
+# stale anchor is backed up and recreated by the entrypoint preflight.
+REGISTRY_PROFILE = "cursor-grok-4.6-medium+luna-max-v2"
 CURSOR_ROLE_PROMPTS = {
     "builder": (
         "You are the Trio Builder and primary implementor. Execute exactly one "

@@ -28,7 +28,9 @@ probes vs judgments — switching work/personal profiles retargets the audit.
    Use returned model/effort exactly; never `--allow-fallback`.
 3. Confirm the trio-omnigent Lead/Evaluator registration exactly as the
    `trio-omnigent` skill's preflight describes (registry.json, `_profile`
-   marker). Assessors reuse those registered roles.
+   marker, Cursor native `yolo` launch metadata). Assessors reuse those
+   registered roles; a stale marker must be backed up and re-registered before
+   dispatch, never silently reused.
 
 ## Dispatch (Omnigent)
 
@@ -54,6 +56,10 @@ probes vs judgments — switching work/personal profiles retargets the audit.
   missing node ids (record-batch reports skips).
 - Keep briefings lean: point at the batch file, give a KNOWN-CONTEXT
   preamble, cap reads (≤40-line windows, no files >100KB, never plan.json).
+- Deliver results before any final reply. After every returned results file,
+  invoke the canonical driver's `record-batch`; accept partial arrays and
+  re-dispatch only IDs it reports missing. The driver, not an agent's prose,
+  is the source of batch state.
 - If a child session's result is `failed (exit N)` from a provider transport
   error (`resource_exhausted`, `NGHTTP2_INTERNAL_ERROR`, `stream refused`),
   wake it ONCE via `hub send` with `continue` before treating it as failed.
