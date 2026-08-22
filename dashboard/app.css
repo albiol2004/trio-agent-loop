@@ -109,6 +109,7 @@ html, body {
 .status-connecting { color: var(--amber); }
 .status-error, .status-disconnected { color: var(--red); }
 .status-idle { color: var(--slate); }
+.status-missing { color: var(--amber); }
 
 /* -------------------------------- tabs --------------------------------- */
 

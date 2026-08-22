@@ -210,6 +210,8 @@ STATIC_ROUTES = {
     "/skills.html": ("skills.html", "text/html; charset=utf-8"),
     "/skills.js": ("skills.js", "text/javascript; charset=utf-8"),
     "/nav.js": ("nav.js", "text/javascript; charset=utf-8"),
+    "/agents.html": ("agents.html", "text/html; charset=utf-8"),
+    "/agents.js": ("agents.js", "text/javascript; charset=utf-8"),
 }
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")

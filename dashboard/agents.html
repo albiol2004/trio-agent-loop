@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Agent Install Matrix · Trio Loops</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230B1214'/%3E%3Crect%20x='3' y='6' width='4' height='4' rx='1' fill='%233FBF8F'/%3E%3Crect%20x='9' y='6' width='4' height='4' rx='1' fill='%23E8A33D'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script src="/nav.js" defer></script>
+<script src="/agents.js" defer></script>
+<style>
+  .agents-topbar { position: sticky; top: 0; z-index: 10; }
+  .agents-topbar a { color: var(--blue); text-decoration: none; }
+  .agents-topbar a:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+  .agents-topbar .page-state { color: var(--faint); }
+  .agents-topbar .page-state.is-error { color: var(--red); }
+  .agents-shell { min-height: 100vh; display: flex; flex-direction: column; }
+  .agents-layout {
+    width: 100%; max-width: 1680px; margin: 0 auto; padding: 18px 22px 42px;
+    display: grid; grid-template-columns: minmax(460px, 1.7fr) minmax(360px, 1fr);
+    gap: 1px; flex: 1; min-height: 0;
+  }
+  .agents-pane { background: var(--surface); border: 1px solid var(--border); min-width: 0; min-height: 600px; }
+  .agents-pane + .agents-pane { border-left: 0; }
+  .pane-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 18px 16px 14px; border-bottom: 1px solid var(--border); }
+  .pane-heading h2 { margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; }
+  .pane-count { color: var(--faint); font: 11px var(--mono); }
+  .quiet-button, .action-button {
+    appearance: none; font: inherit; border: 0; background: none; color: inherit; cursor: pointer;
+  }
+  .quiet-button { color: var(--muted); font: 11px var(--mono); padding: 3px 0; }
+  .quiet-button:hover { color: var(--text); }
+  .action-button { padding: 5px 12px; font: 11px var(--mono); border: 1px solid var(--border); border-radius: 3px; color: var(--muted); background: var(--surface-2); cursor: pointer; }
+  .action-button:hover { color: var(--text); border-color: var(--muted); }
+  .action-button.primary { color: var(--green); border-color: var(--green); }
+  .action-button.primary:hover { background: var(--green); color: var(--bg); }
+  .action-button.danger { color: var(--red); border-color: var(--red); }
+  .action-button.danger:hover { background: var(--red); color: var(--bg); }
+  .status-badge { display: inline-block; font: 10px var(--mono); letter-spacing: .03em; }
+  .status-in-sync { color: var(--green); } .status-stale { color: var(--red); }
+  .status-unknown { color: var(--faint); } .status-canonical { color: var(--blue); }
+  .status-managed { color: var(--muted); }
+  .status-unsupported { color: var(--faint); }
+  .editor-empty { padding: 40px 24px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .editor-empty strong { display: block; color: var(--text); font-size: 14px; margin-bottom: 6px; }
+  .field-label { display: block; color: var(--muted); font: 11px var(--mono); margin-bottom: 4px; }
+  .field-control { width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font: 12px var(--mono); }
+  .field-control:focus { outline: none; border-color: var(--amber); }
+  .subheading { margin: 0 0 8px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  .message.is-ok { color: var(--green); }
+  .message.is-error { color: var(--red); }
+
+  .matrix-wrap { overflow-x: auto; padding: 14px 16px 6px; }
+  .matrix-message { padding: 0 16px 10px; font-size: 12px; min-height: 1.2em; }
+  .matrix-table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 12.5px; }
+  .matrix-table th, .matrix-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; text-align: left; }
+  .matrix-table thead th { color: var(--faint); font: 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; border-bottom: 1px solid var(--border-strong); }
+  .matrix-table th.col-unsupported { color: var(--faint); opacity: .75; max-width: 170px; }
+  .th-reason { display: block; margin-top: 3px; font: 9.5px var(--mono); color: var(--faint); text-transform: none; letter-spacing: 0; white-space: normal; }
+  .matrix-row-btn { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+  .matrix-row-btn:hover .agent-name { color: var(--amber); }
+  tr.is-active td { background: var(--surface-3); }
+  .agent-name { color: var(--text); font-size: 13px; font-weight: 650; }
+  .agent-tags { margin: 3px 0; display: flex; gap: 6px; }
+  .agent-tag { font: 10px var(--mono); color: var(--faint); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
+  .agent-desc { margin: 2px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .matrix-cell { min-width: 96px; }
+  .matrix-cell.is-unsupported { color: var(--faint); opacity: .65; }
+  .matrix-cell-actions { margin-top: 4px; }
+  .matrix-action { padding: 2px 8px; font-size: 10px; }
+  .managed-section { border-top: 1px solid var(--border); padding: 16px 16px 20px; }
+  .managed-list { display: flex; flex-direction: column; gap: 1px; }
+  .managed-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 7px 8px; background: var(--surface-2); font-size: 12px; }
+  .managed-row .status-badge { flex: 0 0 auto; }
+  .managed-name { color: var(--text); font: 12px var(--mono); }
+  .managed-hw { color: var(--faint); font: 10.5px var(--mono); }
+  .managed-note-text { color: var(--faint); font-size: 10.5px; }
+
+  .editor-header { padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
+  .editor-kicker { color: var(--faint); font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+  .editor-title-row { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
+  .editor-title { margin: 0; font-size: 18px; font-weight: 700; }
+  .editor-path { margin: 4px 0 0; color: var(--faint); font: 11px var(--mono); }
+  .editor-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .editor-form { display: flex; flex-direction: column; gap: 12px; padding: 16px 20px; }
+  .field-textarea { min-height: 64px; resize: vertical; }
+  .field-instructions { min-height: 320px; resize: vertical; white-space: pre; font: 12px/1.5 var(--mono); }
+  .editor-footer { display: flex; justify-content: space-between; padding: 10px 20px; border-top: 1px solid var(--border); color: var(--faint); font: 10px var(--mono); }
+
+  #new-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 0; }
+  #new-dialog::backdrop { background: rgba(0,0,0,.6); }
+  .dialog-inner { padding: 24px; min-width: 340px; }
+  .dialog-inner h2 { margin: 0 0 16px; font-size: 15px; font-weight: 700; }
+  .dialog-inner .field-label { margin-top: 10px; }
+  .dialog-footer { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<div id="app" class="agents-shell">
+  <header class="topbar agents-topbar">
+    <div class="brand">
+      <h1><a href="/">Trio Loops</a> · Agent Install Matrix</h1>
+      <p class="brand-sub">install and edit canonical agents across harnesses</p>
+    </div>
+    <div class="topbar-meta">
+      <a href="/skills.html" style="color: var(--blue); text-decoration: none;" aria-label="Open skills registry">Skills</a>
+      <span id="page-state" class="page-state">loading registry…</span>
+    </div>
+  </header>
+
+  <main class="agents-layout" aria-label="Agent install matrix workspace">
+
+    <section class="agents-pane matrix-pane" aria-label="Canonical agents">
+      <div class="pane-heading">
+        <h2>Canonical Agents</h2>
+        <span id="matrix-count" class="pane-count">—</span>
+        <button id="new-agent" class="quiet-button" type="button">+ New agent</button>
+      </div>
+      <div id="matrix-message" class="matrix-message message"></div>
+      <div id="matrix-wrap" class="matrix-wrap"></div>
+
+      <section class="managed-section" aria-label="Generator-managed agent files">
+        <h3 class="subheading">Generator-managed (read only)</h3>
+        <p class="managed-note-text">These harness role files are produced by <code>prompts/generate.py</code> and cannot be edited here.</p>
+        <div id="managed-list" class="managed-list"></div>
+      </section>
+    </section>
+
+    <section class="agents-pane editor-pane" aria-label="Canonical agent editor">
+      <div id="editor-empty" class="editor-empty">
+        <strong>Select an agent</strong>
+        Choose a row from the matrix to inspect and edit its canonical definition.
+      </div>
+      <div id="editor-main" hidden>
+        <header class="editor-header">
+          <span class="editor-kicker">Canonical agent</span>
+          <div class="editor-title-row">
+            <h2 id="editor-title" class="editor-title">—</h2>
+          </div>
+          <p id="editor-path" class="editor-path">—</p>
+          <div class="editor-actions">
+            <button id="save-agent" class="action-button primary" type="button">Save</button>
+            <button id="delete-agent" class="action-button danger" type="button">Delete</button>
+          </div>
+        </header>
+        <div class="editor-form">
+          <label class="field-label">Description
+            <textarea id="field-description" class="field-control field-textarea" required></textarea>
+          </label>
+          <label class="field-label">Model tier
+            <select id="field-model-tier" class="field-control"></select>
+          </label>
+          <label class="field-label">Tool policy
+            <select id="field-tool-policy" class="field-control"></select>
+          </label>
+          <label class="field-label">Instructions
+            <textarea id="field-instructions" class="field-control field-instructions" spellcheck="false"></textarea>
+          </label>
+        </div>
+        <footer class="editor-footer">
+          <span id="editor-message" class="message">No changes</span>
+        </footer>
+      </div>
+    </section>
+
+  </main>
+
+  <dialog id="new-dialog" aria-labelledby="new-dialog-title">
+    <form id="new-form" method="dialog" class="dialog-inner">
+      <h2 id="new-dialog-title">New agent</h2>
+      <label class="field-label">Name
+        <input id="new-name" class="field-control" type="text" required autocomplete="off" pattern="^[a-z0-9][a-z0-9._-]*$" placeholder="my-agent">
+      </label>
+      <div class="dialog-footer">
+        <button id="new-cancel" class="action-button" type="submit" formnovalidate>Cancel</button>
+        <button id="new-create" class="action-button primary" type="submit">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>This dashboard requires JavaScript.</noscript>
+</div>
+</body>
+</html>
