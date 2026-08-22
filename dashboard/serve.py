@@ -80,6 +80,36 @@ Registry (format-aware):
         non-blocking: unknown key, `name` mismatching the
         target filename/dirname (suppressed for omnigent), or a format that
         disagrees with the harness/surface's canonical format.
+
+Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
+    GET /api/registry/agents
+    Response: {"agents": [{"name","description","model_tier","tool_policy","path"}],
+               "harnesses": [<render harness>, ...],
+               "support": {<harness>: {"supported": bool, "reason": str}},
+               "model_tiers": [...], "tool_policies": [...]}
+
+    GET /api/registry/agents/file?name=<name>
+    Response: 200 {"name","description","model_tier","tool_policy",
+                    "instructions","path"}; 404 {"error": "agent not found"}.
+
+    POST /api/registry/agents   (create)
+    PUT  /api/registry/agents/file   (update; 404 if the agent is absent)
+    Body: {"name","description","model_tier","tool_policy","instructions"}
+    Response: 201/200 {"path"}; 400 on validation failure (CanonicalAgent's
+        ValueError text verbatim); POST is 409 when the agent already exists.
+
+    DELETE /api/registry/agents/file?name=<name>
+    Response: 200 {"path"}; 404 {"error": "agent not found"}.
+
+    POST /api/registry/install
+    Body: {"agent": "<canonical agent name>", "harness": "<harness>"}
+    Response: 201 (new file) or 200 (overwrote an existing install)
+        {"path","harness","format","filename","created"}.
+        404 {"error": "agent not found"} for an unknown agent. 400
+        {"error","reason","harness","supported": false} for an unsupported
+        or unknown harness (e.g. omnigent) — never a 500. Writes are
+        confined to _WRITABLE_ROOTS (403) and refuse a
+        prompts/generate.py-managed destination (403).
 """
 from __future__ import annotations
 
@@ -111,6 +141,9 @@ METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
 REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
 """Skill registry scanner, resolved relative to this file."""
 
+AGENTS_PATH = DASHBOARD_DIR.parent / "registry" / "agents.py"
+"""Canonical-agent model module, resolved relative to this file."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -124,6 +157,7 @@ WORKSPACE_SCAN_SECONDS = 60.0
 """Maximum age of the automatically discovered workspace list."""
 
 _REGISTRY_MODULE = None
+_AGENTS_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -244,11 +278,42 @@ def load_registry_module():
         "collect", "collect_canonical", "build_index", "parse_frontmatter",
         "FRONTMATTER_RE", "file_format", "split_file", "join_file",
         "parse_yaml", "default_template", "SURFACE_FORMAT", "KEY_SCHEMA",
+        "generated_paths",
     ):
         if not hasattr(module, fn):
             raise RuntimeError(f"registry module missing required attribute: {fn}")
     _REGISTRY_MODULE = module
     return module
+
+
+def load_agents_module():
+    """Load registry/agents.py by path and cache the module.
+
+    Mirrors ``load_registry_module``: same by-path importlib load, cached
+    once, with its own required-attribute assertion covering the
+    ``api:AgentsAPI`` names this module actually calls.
+    """
+    global _AGENTS_MODULE
+    if _AGENTS_MODULE is not None:
+        return _AGENTS_MODULE
+    spec = importlib.util.spec_from_file_location("trio_registry_agents", AGENTS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load agents module: {AGENTS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in (
+        "MODEL_TIERS", "TOOL_POLICIES", "HARNESS_SUPPORT", "RENDER_HARNESSES",
+        "CanonicalAgent", "RenderedAgent", "UnsupportedHarness",
+        "agents_dir", "parse_agent", "dump_agent", "list_agents", "load_agent",
+        "save_agent", "delete_agent", "render_agent", "install_support",
+        "agent_index_records",
+    ):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"agents module missing required attribute: {fn}")
+    _AGENTS_MODULE = module
+    return module
+
 
 def _registry_index(root: Path) -> dict:
     """Return a per-project registry scan, refreshing it at most every five seconds."""
@@ -261,7 +326,14 @@ def _registry_index(root: Path) -> dict:
         registry = load_registry_module()
         entries = registry.collect(root_path)
         entries += registry.collect_canonical()
-        index = registry.build_index(entries)
+        try:
+            canonical_agents = load_agents_module().agent_index_records()
+        except Exception:
+            # A broken canonical agent file must not take down the whole
+            # registry index — degrade to an empty agent_matrix instead.
+            traceback.print_exc()
+            canonical_agents = []
+        index = registry.build_index(entries, canonical_agents=canonical_agents)
         _REGISTRY_CACHE[root_path] = (index, time.monotonic())
         return index
 
@@ -896,6 +968,19 @@ def _update_registry_name(text: str, name: str, fmt: str = "yaml") -> str:
     return f"---\nname: {name}\ndescription: \n---\n\n{text}"
 
 
+def _reject_if_managed(target: Path) -> None:
+    """Raise PermissionError when prompts/generate.py owns this path."""
+    registry = load_registry_module()
+    try:
+        resolved = str(target.resolve())
+    except (OSError, RuntimeError):
+        resolved = str(target)
+    if resolved in registry.generated_paths():
+        raise PermissionError(
+            "file is managed by prompts/generate.py and would be "
+            "overwritten by the next run")
+
+
 def _write_registry_file(target: Path, content: str, *, create: bool = False) -> None:
     """Write UTF-8 registry content after the target has passed policy checks."""
     if target.exists() and target.is_dir():
@@ -1206,6 +1291,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = _read_json_body(self)
             target = _writable_registry_path(
                 payload.get("path"), self.server.get_workspace_seeds(), root)
+            _reject_if_managed(target)
             content = payload.get("content")
             if not isinstance(content, str):
                 raise ValueError("missing or invalid 'content'")
@@ -1232,6 +1318,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             name = _safe_registry_name(payload.get("name"))
             target = _registry_target(harness, surface, name)
             _writable_registry_path(str(target))
+            _reject_if_managed(target)
             content = payload.get("content")
             if not isinstance(content, str):
                 raise ValueError("missing or invalid 'content'")
@@ -1271,6 +1358,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             target = _registry_target(
                 payload.get("to_harness"), payload.get("to_surface"), name)
             _writable_registry_path(str(target))
+            _reject_if_managed(target)
         except PermissionError as exc:
             return self._send_json(403, {"error": str(exc)})
         except ValueError as exc:
@@ -1305,6 +1393,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             target = _writable_registry_path(
                 (query.get("path") or [None])[0],
                 self.server.get_workspace_seeds(), root)
+            _reject_if_managed(target)
         except PermissionError as exc:
             return self._send_json(403, {"error": str(exc)})
         except ValueError as exc:
@@ -1325,6 +1414,170 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(500, {"error": "could not delete file"})
         _invalidate_registry_cache()
         self._send_json(200, {"path": str(target)})
+
+    # -- /api/registry/agents (canonical-agent CRUD) ------------------------
+
+    def _agent_summary(self, agent, agents) -> dict:
+        return {
+            "name": agent.name,
+            "description": agent.description,
+            "model_tier": agent.model_tier,
+            "tool_policy": agent.tool_policy,
+            "path": str(agents.agents_dir() / f"{agent.name}.md"),
+        }
+
+    def _agent_detail(self, agent, agents) -> dict:
+        detail = self._agent_summary(agent, agents)
+        detail["instructions"] = agent.instructions
+        return detail
+
+    def _agent_from_payload(self, agents, payload: dict):
+        instructions = payload.get("instructions")
+        if not isinstance(instructions, str):
+            raise ValueError("instructions must be a string")
+        return agents.CanonicalAgent(
+            name=payload.get("name"),
+            description=payload.get("description"),
+            instructions=instructions,
+            model_tier=payload.get("model_tier"),
+            tool_policy=payload.get("tool_policy"),
+        )
+
+    def _handle_agents_list(self) -> None:
+        agents = load_agents_module()
+        support = {
+            harness: {"supported": supported, "reason": reason}
+            for harness, (supported, reason) in agents.HARNESS_SUPPORT.items()
+        }
+        self._send_json(200, {
+            "agents": [
+                self._agent_summary(a, agents) for a in agents.list_agents()
+            ],
+            "harnesses": list(agents.RENDER_HARNESSES),
+            "support": support,
+            "model_tiers": sorted(agents.MODEL_TIERS),
+            "tool_policies": sorted(agents.TOOL_POLICIES),
+        })
+
+    def _handle_agent_file_get(self, query: dict) -> None:
+        agents = load_agents_module()
+        try:
+            name = _safe_registry_name((query.get("name") or [None])[0])
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        try:
+            agent = agents.load_agent(name)
+        except FileNotFoundError:
+            return self._send_json(404, {"error": "agent not found"})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        self._send_json(200, self._agent_detail(agent, agents))
+
+    def _handle_agent_create(self) -> None:
+        agents = load_agents_module()
+        try:
+            payload = _read_json_body(self)
+            agent = self._agent_from_payload(agents, payload)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if (agents.agents_dir() / f"{agent.name}.md").exists():
+            return self._send_json(409, {"error": "agent already exists"})
+        path = agents.save_agent(agent)
+        _invalidate_registry_cache()
+        self._send_json(201, {"path": str(path)})
+
+    def _handle_agent_update(self) -> None:
+        agents = load_agents_module()
+        try:
+            payload = _read_json_body(self)
+            agent = self._agent_from_payload(agents, payload)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if not (agents.agents_dir() / f"{agent.name}.md").exists():
+            return self._send_json(404, {"error": "agent not found"})
+        path = agents.save_agent(agent)
+        _invalidate_registry_cache()
+        self._send_json(200, {"path": str(path)})
+
+    def _handle_agent_delete(self, query: dict) -> None:
+        agents = load_agents_module()
+        try:
+            name = _safe_registry_name((query.get("name") or [None])[0])
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        path = agents.agents_dir() / f"{name}.md"
+        if not agents.delete_agent(name):
+            return self._send_json(404, {"error": "agent not found"})
+        _invalidate_registry_cache()
+        self._send_json(200, {"path": str(path)})
+
+    # -- /api/registry/install -----------------------------------------------
+
+    def _handle_agent_install(self) -> None:
+        agents = load_agents_module()
+        try:
+            payload = _read_json_body(self)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        harness = payload.get("harness")
+        harness_norm = (
+            harness.strip().lower() if isinstance(harness, str) and harness.strip()
+            else None
+        )
+        try:
+            name = _safe_registry_name(payload.get("agent"))
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        try:
+            agent = agents.load_agent(name)
+        except FileNotFoundError:
+            return self._send_json(404, {"error": "agent not found"})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        supported, reason = agents.install_support(harness_norm or "")
+        if not supported:
+            return self._send_json(400, {
+                "error": f"harness {harness!r} does not support "
+                         "canonical-agent install",
+                "reason": reason,
+                "harness": harness_norm if harness_norm is not None else harness,
+                "supported": False,
+            })
+        try:
+            # install_support already vetted the harness; this guards a
+            # HARNESS_SUPPORT entry that ever outlives its renderer.
+            rendered = agents.render_agent(agent, harness_norm)
+            target = _writable_registry_path(
+                str(_registry_target(harness_norm, "agent", agent.name)))
+            _reject_if_managed(target)
+        except agents.UnsupportedHarness as exc:
+            return self._send_json(400, {
+                "error": f"harness {harness!r} does not support "
+                         "canonical-agent install",
+                "reason": exc.reason,
+                "harness": harness_norm,
+                "supported": False,
+            })
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        created = not target.exists()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_registry_file(target, rendered.text)
+        except IsADirectoryError:
+            return self._send_json(400, {"error": "path is a directory"})
+        except OSError:
+            return self._send_json(500, {"error": "could not write file"})
+        _invalidate_registry_cache()
+        self._send_json(201 if created else 200, {
+            "path": str(target),
+            "harness": harness_norm,
+            "format": rendered.format,
+            "filename": rendered.filename,
+            "created": created,
+        })
 
     # -- /api/board --------------------------------------------------------
 
@@ -1603,6 +1856,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(lambda: self._handle_registry_file(query, root))
         if path == "/api/registry/schema":
             return self._api(self._handle_registry_schema)
+        if path == "/api/registry/agents":
+            return self._api(self._handle_agents_list)
+        if path == "/api/registry/agents/file":
+            return self._api(lambda: self._handle_agent_file_get(query))
         if path == "/api/board":
             root = self._request_root(query)
             if root is None:
@@ -1634,6 +1891,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_put(root))
+        if parsed.path == "/api/registry/agents/file":
+            return self._api(self._handle_agent_update)
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -1649,6 +1908,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/registry/create":
                 return self._api(self._handle_registry_create)
             return self._api(lambda: self._handle_registry_import(root))
+        if path == "/api/registry/agents":
+            return self._api(self._handle_agent_create)
+        if path == "/api/registry/install":
+            return self._api(self._handle_agent_install)
         self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
@@ -1659,6 +1922,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_delete(query, root))
+        if parsed.path == "/api/registry/agents/file":
+            query = parse_qs(parsed.query)
+            return self._api(lambda: self._handle_agent_delete(query))
         self._send_json(404, {"error": "not found"})
 
 
