@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """serve.py — web dashboard backend for trio loops and skill registry.
 
-A stdlib-only HTTP server (Python 3.7+) that renders loop mailboxes as a
-live status board, tails omp agent session transcripts over SSE, and serves
-the skill registry editor. Registry mutations are restricted to its
-explicitly allowlisted harness directories.
+A stdlib-only HTTP server (Python 3.11+, for `tomllib`) that renders loop
+mailboxes as a live status board, tails omp agent session transcripts over
+SSE, and serves the skill registry editor. Registry mutations are restricted
+to its explicitly allowlisted harness directories.
 
 Usage:
     python3 dashboard/serve.py [--host 127.0.0.1] [--port <port>]
@@ -52,6 +52,32 @@ Transcript tail (SSE):
     Path is validated to resolve under ~/.omp/agent/sessions/. Incomplete
     final lines are buffered until more bytes arrive. The stream polls the
     file every ~500 ms and emits a ":heartbeat" comment every ~15 s.
+
+Registry (format-aware):
+    GET /api/registry/file?path=<absolute-path>
+    Response: {"path", "format", "frontmatter", "body", "managed"}
+        format is one of "toml" | "yaml" | "text". "toml" bodies hold the
+        file's `developer_instructions` string; "text" means no frontmatter
+        fence was found (frontmatter is {}, body is the whole file).
+
+    GET /api/registry/schema
+    Response: {"destinations": {<harness>: [<surface>, ...]},
+               "formats": {"<harness>:<surface>": "yaml"|"toml"},
+               "keys": {"<harness>:<surface>": [<fieldspec>, ...]}}
+        fieldspec: {"key", "type", "widget", "required", "enum", "help"};
+        widget is one of text | textarea | checkbox | select | list | raw.
+        Derived from registry/scan.py's SURFACE_FORMAT/KEY_SCHEMA tables and
+        this module's _GLOBAL_REGISTRY_DIRS — no workspace root required.
+
+    POST /api/registry/serialize
+    Body: {"format", "frontmatter", "body", "harness"?, "surface"?, "path"?}
+    Response: 200 {"content", "warnings": [<str>]} or 400 {"error"}
+        Pure serialization + validation; never writes to disk. A frontmatter
+        value shaped {"$yaml": "<text>"} is parsed as YAML server-side (the
+        raw sub-editor escape hatch); a parse failure is a 400 naming the
+        key. Warnings are non-blocking: unknown key, `name` mismatching the
+        target filename/dirname (suppressed for omnigent), or a format that
+        disagrees with the harness/surface's canonical format.
 """
 from __future__ import annotations
 
@@ -212,9 +238,13 @@ def load_registry_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    for fn in ("collect", "collect_canonical", "build_index", "parse_frontmatter"):
+    for fn in (
+        "collect", "collect_canonical", "build_index", "parse_frontmatter",
+        "FRONTMATTER_RE", "file_format", "split_file", "join_file",
+        "parse_yaml", "default_template", "SURFACE_FORMAT", "KEY_SCHEMA",
+    ):
         if not hasattr(module, fn):
-            raise RuntimeError(f"registry module missing required function: {fn}")
+            raise RuntimeError(f"registry module missing required attribute: {fn}")
     _REGISTRY_MODULE = module
     return module
 
@@ -804,18 +834,50 @@ def _registry_target(harness, surface, name) -> Path:
     """Map a global harness/surface/name tuple to its file layout."""
     if not isinstance(harness, str) or not isinstance(surface, str):
         raise ValueError("invalid harness or surface")
-    root = _GLOBAL_REGISTRY_DIRS.get((harness.strip().lower(), surface.strip().lower()))
+    harness = harness.strip().lower()
+    surface = surface.strip().lower()
+    root = _GLOBAL_REGISTRY_DIRS.get((harness, surface))
     if root is None:
         raise ValueError("unsupported harness or surface")
     name = _safe_registry_name(name)
-    surface = surface.strip().lower()
     if surface == "skill":
         return (root / name / "SKILL.md").resolve()
-    return (root / f"{name}.md").resolve()
+    registry = load_registry_module()
+    fmt = registry.SURFACE_FORMAT.get((harness, surface), "yaml")
+    ext = "toml" if fmt == "toml" else "md"
+    return (root / f"{name}.{ext}").resolve()
 
 
-def _update_registry_name(text: str, name: str) -> str:
-    """Preserve source text while changing (or adding) frontmatter ``name``."""
+def _update_toml_name(text: str, name: str) -> str:
+    """Rewrite (or insert) a top-level ``name = "..."`` line in TOML text.
+
+    Every other byte of the source is left untouched: only the matched
+    line's content changes, its original line ending is preserved.
+    """
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    lines = text.splitlines(keepends=True)
+    pattern = re.compile(r"^\s*name\s*=")
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            ending = ""
+            if line.endswith("\r\n"):
+                ending = "\r\n"
+            elif line.endswith("\n"):
+                ending = "\n"
+            lines[i] = f'name = "{escaped}"{ending}'
+            return "".join(lines)
+    return f'name = "{escaped}"\n' + text
+
+
+def _update_registry_name(text: str, name: str, fmt: str = "yaml") -> str:
+    """Preserve source text while changing (or adding) the entity's ``name``.
+
+    ``fmt`` selects the dialect: "toml" rewrites (or prepends) a top-level
+    ``name = "..."`` line and never falls through to the YAML branch; any
+    other value uses today's frontmatter ``name:`` line splice.
+    """
+    if fmt == "toml":
+        return _update_toml_name(text, name)
     registry = load_registry_module()
     match = registry.FRONTMATTER_RE.match(text)
     if match:
@@ -993,16 +1055,145 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 entry, target, root, self.server.get_workspace_seeds())
             text = target.read_text(encoding="utf-8", errors="replace")
             registry = load_registry_module()
-            frontmatter, body = registry.parse_frontmatter(text)
+            fmt = registry.file_format(target)
+            if fmt == "toml":
+                frontmatter, body = registry.split_file(text, "toml")
+            elif registry.FRONTMATTER_RE.match(text):
+                fmt = "yaml"
+                frontmatter, body = registry.parse_frontmatter(text)
+            else:
+                fmt = "text"
+                frontmatter, body = {}, text
         except PermissionError as exc:
             return self._send_json(403, {"error": str(exc)})
         except OSError:
             return self._send_json(404, {"error": "file not found"})
         self._send_json(200, {
             "path": str(target),
+            "format": fmt,
             "frontmatter": frontmatter,
             "body": body,
+            "managed": bool(entry.get("managed")),
         })
+
+    def _handle_registry_schema(self) -> None:
+        """Static harness/surface schema: destinations, formats, key specs."""
+        registry = load_registry_module()
+        order = ("skill", "command", "agent")
+        destinations: dict[str, list[str]] = {}
+        for harness, surface in _GLOBAL_REGISTRY_DIRS:
+            surfaces = destinations.setdefault(harness, [])
+            if surface not in surfaces:
+                surfaces.append(surface)
+        for surfaces in destinations.values():
+            surfaces.sort(key=lambda s: order.index(s) if s in order else len(order))
+        formats = {
+            f"{harness}:{surface}": fmt
+            for (harness, surface), fmt in registry.SURFACE_FORMAT.items()
+        }
+        keys = dict(registry.KEY_SCHEMA)
+        self._send_json(200, {
+            "destinations": destinations,
+            "formats": formats,
+            "keys": keys,
+        })
+
+    def _handle_registry_serialize(self) -> None:
+        """Pure serialization + validation of a frontmatter/body pair; no I/O."""
+        try:
+            payload = _read_json_body(self)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        fmt = payload.get("format")
+        if fmt not in ("yaml", "toml", "text"):
+            return self._send_json(400, {"error": "invalid 'format'"})
+        body = payload.get("body")
+        if not isinstance(body, str):
+            return self._send_json(400, {"error": "missing or invalid 'body'"})
+        if fmt == "text":
+            return self._send_json(200, {"content": body, "warnings": []})
+        frontmatter = payload.get("frontmatter")
+        if not isinstance(frontmatter, dict):
+            return self._send_json(400, {"error": "missing or invalid 'frontmatter'"})
+
+        harness = payload.get("harness")
+        surface = payload.get("surface")
+        path_value = payload.get("path")
+        harness_norm = (
+            harness.strip().lower()
+            if isinstance(harness, str) and harness.strip() else None
+        )
+        surface_norm = (
+            surface.strip().lower()
+            if isinstance(surface, str) and surface.strip() else None
+        )
+
+        registry = load_registry_module()
+
+        resolved: dict = {}
+        for key, value in frontmatter.items():
+            if (isinstance(value, dict) and set(value.keys()) == {"$yaml"}
+                    and isinstance(value.get("$yaml"), str)):
+                raw = value["$yaml"]
+                try:
+                    parsed = registry.parse_yaml(raw)
+                except Exception as exc:
+                    return self._send_json(
+                        400, {"error": f"invalid YAML for key '{key}': {exc}"})
+                if raw.strip() and not parsed:
+                    # The scanner's parser is deliberately lenient (a bad file
+                    # must not kill a scan), so unparseable text comes back as
+                    # an empty map rather than an exception. In the editor that
+                    # is a save that would silently drop the user's block.
+                    return self._send_json(400, {
+                        "error": f"invalid YAML for key '{key}': "
+                                 "text is not a mapping or list"})
+                if isinstance(parsed, dict) and list(parsed.keys()) == [key]:
+                    parsed = parsed[key]
+                resolved[key] = parsed
+            else:
+                resolved[key] = value
+
+        warnings: list[str] = []
+        schema_key = (
+            f"{harness_norm}:{surface_norm}" if harness_norm and surface_norm else None
+        )
+        schema = registry.KEY_SCHEMA.get(schema_key) if schema_key else None
+        if schema:
+            schema_by_key = {spec["key"]: spec for spec in schema}
+            for spec in schema:
+                if spec.get("required"):
+                    value = resolved.get(spec["key"])
+                    if value is None or value == "":
+                        return self._send_json(
+                            400, {"error": f"missing required key '{spec['key']}'"})
+            for key in resolved:
+                if key not in schema_by_key:
+                    warnings.append(f"unknown key '{key}' for {schema_key}")
+            if ("name" in schema_by_key and harness_norm != "omnigent"
+                    and path_value):
+                try:
+                    p = Path(path_value)
+                    expected = p.parent.name if p.name == "SKILL.md" else p.stem
+                except (TypeError, ValueError):
+                    expected = None
+                actual = resolved.get("name")
+                if expected and actual and actual != expected:
+                    warnings.append(
+                        f"name '{actual}' does not match expected '{expected}'")
+        if harness_norm and surface_norm:
+            expected_fmt = registry.SURFACE_FORMAT.get((harness_norm, surface_norm))
+            if expected_fmt and expected_fmt != fmt:
+                warnings.append(
+                    f"format '{fmt}' does not match expected '{expected_fmt}' "
+                    f"for {harness_norm}:{surface_norm}")
+
+        try:
+            content = registry.join_file(resolved, body, fmt)
+        except Exception as exc:
+            return self._send_json(400, {"error": str(exc)})
+
+        self._send_json(200, {"content": content, "warnings": warnings})
 
     def _handle_registry_put(self, root: Path) -> None:
         try:
@@ -1045,7 +1236,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if os.path.lexists(target):
             return self._send_json(409, {"error": "file already exists"})
         if content == "":
-            content = f"---\nname: {name}\ndescription: \n---\n\n"
+            registry = load_registry_module()
+            h = harness.strip().lower() if isinstance(harness, str) else harness
+            s = surface.strip().lower() if isinstance(surface, str) else surface
+            content = registry.default_template(h, s, name)
         try:
             _write_registry_file(target, content, create=True)
         except FileExistsError:
@@ -1081,7 +1275,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content = source.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return self._send_json(404, {"error": "source file not found"})
-        content = _update_registry_name(content, name)
+        registry = load_registry_module()
+        target_fmt = registry.file_format(target)
+        if registry.file_format(source) != target_fmt:
+            # Renaming across dialects would splice a TOML `name =` line into
+            # Markdown (or vice versa) and write a corrupt file. Converting
+            # between dialects is a separate concern from copying.
+            return self._send_json(400, {
+                "error": "cannot import across formats "
+                         f"({registry.file_format(source)} -> {target_fmt})"})
+        content = _update_registry_name(content, name, target_fmt)
         try:
             _write_registry_file(target, content, create=True)
         except FileExistsError:
@@ -1392,6 +1595,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_file(query, root))
+        if path == "/api/registry/schema":
+            return self._api(self._handle_registry_schema)
         if path == "/api/board":
             root = self._request_root(query)
             if root is None:
@@ -1429,6 +1634,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
+        if path == "/api/registry/serialize":
+            return self._api(self._handle_registry_serialize)
         if path in ("/api/registry/create", "/api/registry/import"):
             root = self._request_root(query)
             if root is None:

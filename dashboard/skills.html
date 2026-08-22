@@ -80,10 +80,19 @@
   .import-footer { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
   .frontmatter { padding: 14px 20px; border-bottom: 1px solid var(--border); }
   .subheading { margin: 0 0 8px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
-  .frontmatter-table { width: 100%; border-collapse: collapse; font: 11px var(--mono); }
-  .frontmatter-table th { text-align: left; padding: 4px 12px 4px 0; color: var(--faint); font-weight: 400; vertical-align: top; white-space: nowrap; }
-  .frontmatter-table td { padding: 4px 0; color: var(--text); }
-  .frontmatter-empty { color: var(--faint); font-style: italic; }
+  .frontmatter-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+  .frontmatter-head .subheading { margin-bottom: 0; }
+  .raw-toggle-label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font: 11px var(--mono); cursor: pointer; }
+  .raw-toggle-label input { cursor: pointer; }
+  .managed-note { color: var(--amber); margin: 0 0 10px; }
+  .frontmatter-form { display: flex; flex-direction: column; gap: 10px; }
+  .field-row { display: block; }
+  .field-help { margin: 3px 0 0; color: var(--faint); font: 10px var(--mono); }
+  .field-tag { display: inline-block; margin-top: 3px; color: var(--faint); font: 10px var(--mono); text-transform: uppercase; letter-spacing: .04em; }
+  .field-textarea { min-height: 56px; resize: vertical; }
+  .field-raw { min-height: 90px; resize: vertical; white-space: pre; }
+  .frontmatter-raw textarea { width: 100%; }
+  .field-unknown-note { color: var(--amber-dim); margin: 2px 0 8px; }
   .body-editor { display: block; padding: 14px 20px; flex: 1; min-height: 0; }
   .body-editor textarea { width: 100%; min-height: 300px; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font: 12px/1.5 var(--mono); resize: vertical; }
   .body-editor textarea:focus { outline: none; border-color: var(--amber); }
@@ -170,12 +179,19 @@
             </div>
           </div>
         </header>
-        <section class="frontmatter" aria-labelledby="frontmatter-heading">
-          <h3 id="frontmatter-heading" class="subheading">Frontmatter · read only</h3>
-          <table class="frontmatter-table"><tbody id="frontmatter-table"></tbody></table>
+        <section class="frontmatter" id="frontmatter-section" aria-labelledby="frontmatter-heading">
+          <div class="frontmatter-head">
+            <h3 id="frontmatter-heading" class="subheading">Frontmatter</h3>
+            <label class="raw-toggle-label"><input type="checkbox" id="raw-toggle"> Raw frontmatter</label>
+          </div>
+          <p id="managed-note" class="field-help managed-note" hidden>Managed externally — read only.</p>
+          <div id="frontmatter-form" class="frontmatter-form"></div>
+          <div id="frontmatter-raw" class="frontmatter-raw" hidden>
+            <textarea id="frontmatter-raw-text" class="field-control field-raw" spellcheck="false" aria-label="Raw frontmatter text"></textarea>
+          </div>
         </section>
-        <label class="body-editor" for="body-text">
-          <span class="subheading">Body</span>
+        <label class="body-editor" id="body-editor" for="body-text">
+          <span id="body-label" class="subheading">Body</span>
           <textarea id="body-text" spellcheck="false" aria-label="Skill body"></textarea>
         </label>
         <footer class="editor-footer">

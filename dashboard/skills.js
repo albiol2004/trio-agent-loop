@@ -1,7 +1,10 @@
 (() => {
   "use strict";
 
-  const DESTINATIONS = {
+  // Fallback only: used if GET /api/registry/schema fails, so the page never
+  // breaks. The server (`registry/scan.py` SURFACE_FORMAT / KEY_SCHEMA) is
+  // the single source of truth once the fetch succeeds.
+  const FALLBACK_DESTINATIONS = {
     claude: ["skill", "command", "agent"],
     codex: ["skill", "agent"],
     kimi: ["skill"],
@@ -10,10 +13,12 @@
     opencode: ["command", "agent"]
   };
   let currentRoot = "";
+  let schema = { destinations: FALLBACK_DESTINATIONS, formats: {}, keys: {} };
   const state = {
     entries: [],
     selectedPath: null,
     current: null,
+    formControls: [],
     filter: { scope: "all", harness: "all", surface: "all" },
     busy: false
   };
@@ -21,10 +26,6 @@
   function withRoot(url) {
     return currentRoot ? `${url}${url.includes("?") ? "&" : "?"}root=${encodeURIComponent(currentRoot)}` : url;
   }
-  window.addEventListener("trio:workspace", (event) => {
-    currentRoot = event.detail && event.detail.path ? event.detail.path : "";
-    refresh();
-  });
 
   const $ = (id) => document.getElementById(id);
   const tree = $("skills-tree");
@@ -63,12 +64,6 @@
 
   function displayName(value) {
     return String(value || "").replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-  }
-
-  function valueText(value) {
-    if (Array.isArray(value)) return value.join(", ");
-    if (value && typeof value === "object") return JSON.stringify(value);
-    return String(value ?? "");
   }
 
   function statusClass(status) {
@@ -207,42 +202,418 @@
     });
   }
 
-  function renderFrontmatter(fields) {
-    const table = $("frontmatter-table");
-    table.replaceChildren();
-    const keys = Object.keys(fields || {}).sort();
-    if (!keys.length) {
-      const row = document.createElement("tr");
-      const cell = document.createElement("td"); cell.className = "frontmatter-empty"; cell.textContent = "No frontmatter fields";
-      row.append(cell); table.append(row); return;
-    }
-    keys.forEach((key) => {
-      const row = document.createElement("tr");
-      const heading = document.createElement("th"); heading.scope = "row"; heading.textContent = key;
-      const value = document.createElement("td"); value.textContent = valueText(fields[key]);
-      row.append(heading, value); table.append(row);
-    });
-  }
-
   function setEditorMessage(text, kind = "") {
     editorMessage.textContent = text;
     editorMessage.className = `message${kind ? ` is-${kind}` : ""}`;
   }
 
-  function renderEditor() {
+  // ---- Frontmatter helpers -------------------------------------------------
+  //
+  // The server is the only thing that ever turns a frontmatter value into
+  // file bytes (POST /api/registry/serialize). This file never String()s or
+  // JSON.stringify()s a value into on-disk content.
+  //
+  // For "raw" widgets (nested maps like opencode's `permission`, JSON-schema
+  // blocks like omp's `output`, or any unknown non-scalar key) we still need
+  // *some* YAML text to seed the textarea with. Rather than parsing YAML in
+  // JS, we ask the server to serialize exactly those keys in one combined
+  // call, then split the returned frontmatter block back into per-key text
+  // by scanning for un-indented "key:" lines — the same shape the server
+  // itself will accept back, wrapped as {"$yaml": "<edited text>"}.
+
+  function extractFrontmatterBlock(content, format) {
+    if (format !== "yaml") return String(content ?? "");
+    const lines = String(content ?? "").split("\n");
+    if (lines[0] !== "---") return String(content ?? "");
+    let end = lines.length;
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i] === "---") { end = i; break; }
+    }
+    return lines.slice(1, end).join("\n");
+  }
+
+  function splitTopLevelBlocks(text, format) {
+    const lines = String(text ?? "").split("\n");
+    const keyRe = format === "toml"
+      ? /^\s*("(?:[^"\\]|\\.)*"|[^\s=]+)\s*=(.*)$/
+      : /^("(?:[^"\\]|\\.)*"|'[^']*'|[^\s:'"][^:]*):(.*)$/;
+    const blocks = {};
+    let currentKey = null;
+    let currentLines = [];
+    const flush = () => {
+      if (currentKey !== null) blocks[currentKey] = currentLines.join("\n").replace(/^\n+/, "");
+    };
+    lines.forEach((line) => {
+      if (line.length && !/^\s/.test(line)) {
+        const match = line.match(keyRe);
+        if (match) {
+          flush();
+          let rawKey = match[1];
+          if (rawKey.startsWith('"') && rawKey.endsWith('"') && rawKey.length >= 2) rawKey = rawKey.slice(1, -1);
+          currentKey = rawKey;
+          const rest = match[2] || "";
+          currentLines = [rest.startsWith(" ") ? rest.slice(1) : rest];
+          return;
+        }
+      }
+      if (currentKey !== null) currentLines.push(line);
+    });
+    flush();
+    return blocks;
+  }
+
+  function classifyUnknownWidget(value) {
+    if (Array.isArray(value)) {
+      return value.some((item) => item && typeof item === "object") ? "raw" : "list";
+    }
+    if (value && typeof value === "object") return "raw";
+    return "text";
+  }
+
+  // Defensive: even for a *known* schema field, if the actual value on disk
+  // is a nested map (or array-of-maps) never trust the schema's declared
+  // widget over the data's real shape — force it onto the raw YAML path.
+  // This is the guard against the original [object Object] bug: a scalar
+  // widget (text/textarea/list) only ever calls String() on a value that is
+  // provably not an object, because non-scalars are always routed to "raw".
+  function effectiveWidgetFor(spec, hasValue, value) {
+    if (hasValue && spec.widget !== "raw" && classifyUnknownWidget(value) === "raw") return "raw";
+    return spec.widget || "text";
+  }
+
+  function buildFieldRow(spec, initialValue, opts = {}) {
+    const { unknown = false, disabled = false, rawText = "" } = opts;
+    const row = document.createElement("div");
+    row.className = `field-row${unknown ? " field-unknown" : ""}`;
+    const widget = spec.widget || "text";
+    const label = document.createElement("label");
+    label.className = "field-label";
+    const labelText = `${spec.key}${spec.required ? " *" : ""}`;
+    let control;
+    if (widget === "checkbox") {
+      control = document.createElement("input");
+      control.type = "checkbox";
+      control.checked = Boolean(initialValue);
+      label.append(control, ` ${labelText}`);
+    } else if (widget === "select") {
+      control = document.createElement("select");
+      control.className = "field-control";
+      if (!spec.required) {
+        const empty = document.createElement("option"); empty.value = ""; empty.textContent = "—";
+        control.append(empty);
+      }
+      (spec.enum || []).forEach((choice) => {
+        const option = document.createElement("option");
+        option.value = choice; option.textContent = choice;
+        option.selected = String(initialValue ?? "") === choice;
+        control.append(option);
+      });
+      label.append(labelText, control);
+    } else if (widget === "textarea") {
+      control = document.createElement("textarea");
+      control.className = "field-control field-textarea";
+      control.rows = 3;
+      control.value = initialValue == null ? "" : String(initialValue);
+      label.append(labelText, control);
+    } else if (widget === "raw") {
+      control = document.createElement("textarea");
+      control.className = "field-control field-raw";
+      control.rows = 6;
+      control.spellcheck = false;
+      control.value = rawText;
+      label.append(labelText, control);
+    } else if (widget === "list") {
+      control = document.createElement("input");
+      control.type = "text";
+      control.className = "field-control";
+      control.value = Array.isArray(initialValue) ? initialValue.join(", ") : (initialValue == null ? "" : String(initialValue));
+      label.append(labelText, control);
+    } else {
+      control = document.createElement("input");
+      control.type = "text";
+      control.className = "field-control";
+      control.value = initialValue == null ? "" : String(initialValue);
+      label.append(labelText, control);
+    }
+    if (spec.required && (widget === "text" || widget === "textarea" || widget === "select")) control.required = true;
+    if (disabled) control.disabled = true;
+    control.dataset.fieldKey = spec.key;
+    row.append(label);
+    if (unknown) {
+      const tag = document.createElement("span");
+      tag.className = "field-tag";
+      tag.textContent = "unknown key — not in schema";
+      row.append(tag);
+    }
+    if (spec.help) {
+      const help = document.createElement("p");
+      help.className = "field-help";
+      help.textContent = spec.help;
+      row.append(help);
+    }
+    return { row, control, widget, spec, isArrayOriginally: Array.isArray(initialValue), wasPresent: false, unknownOriginalType: null };
+  }
+
+  async function renderFrontmatterForm() {
+    const container = $("frontmatter-form");
+    container.replaceChildren();
+    state.formControls = [];
+    const cur = state.current;
+    if (!cur || cur.format === "text") return;
+
+    const schemaKey = `${cur.entry.harness}:${cur.entry.surface}`;
+    const specs = schema.keys[schemaKey] || [];
+    const frontmatter = cur.frontmatter || {};
+    const knownKeys = new Set(specs.map((spec) => spec.key));
+    const unknownKeys = Object.keys(frontmatter).filter((key) => !knownKeys.has(key));
+
+    const rawSpecKeys = specs.filter((spec) => {
+      const has = Object.prototype.hasOwnProperty.call(frontmatter, spec.key);
+      return has && effectiveWidgetFor(spec, has, frontmatter[spec.key]) === "raw";
+    }).map((spec) => spec.key);
+    const unknownRawKeys = unknownKeys.filter((key) => classifyUnknownWidget(frontmatter[key]) === "raw");
+    const rawKeys = [...rawSpecKeys, ...unknownRawKeys];
+
+    let rawTexts = {};
+    if (rawKeys.length) {
+      const payload = {};
+      rawKeys.forEach((key) => { payload[key] = frontmatter[key]; });
+      try {
+        const resp = await api("/api/registry/serialize", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ format: cur.format, frontmatter: payload, body: "", harness: cur.entry.harness, surface: cur.entry.surface })
+        });
+        rawTexts = splitTopLevelBlocks(extractFrontmatterBlock(resp.content, cur.format), cur.format);
+      } catch (error) {
+        setEditorMessage(`Could not preload raw YAML for: ${rawKeys.join(", ")} (${error.message})`, "error");
+      }
+    }
+
+    const disabled = Boolean(cur.managed);
+    specs.forEach((spec) => {
+      const has = Object.prototype.hasOwnProperty.call(frontmatter, spec.key);
+      const value = has ? frontmatter[spec.key] : (spec.type === "bool" ? false : "");
+      const effectiveWidget = effectiveWidgetFor(spec, has, value);
+      const specForRow = effectiveWidget === spec.widget ? spec : { ...spec, widget: effectiveWidget };
+      const rawText = effectiveWidget === "raw" ? (rawTexts[spec.key] || "") : "";
+      const built = buildFieldRow(specForRow, value, { disabled, rawText });
+      built.wasPresent = has;
+      container.append(built.row);
+      state.formControls.push(built);
+    });
+
+    if (unknownKeys.length) {
+      const note = document.createElement("p");
+      note.className = "field-help field-unknown-note";
+      note.textContent = `${unknownKeys.length} unknown key${unknownKeys.length === 1 ? "" : "s"} not in the ${schemaKey} schema — shown below, in file order.`;
+      container.append(note);
+      unknownKeys.forEach((key) => {
+        const value = frontmatter[key];
+        const widget = classifyUnknownWidget(value);
+        const spec = {
+          key, widget, required: false, enum: null, help: null,
+          type: widget === "raw" ? "map" : (widget === "list" ? "list" : (typeof value === "boolean" ? "bool" : "string"))
+        };
+        const rawText = widget === "raw" ? (rawTexts[key] || "") : "";
+        const built = buildFieldRow(spec, value, { unknown: true, disabled, rawText });
+        built.wasPresent = true;
+        built.unknownOriginalType = typeof value;
+        container.append(built.row);
+        state.formControls.push(built);
+      });
+    }
+  }
+
+  function computeFieldValue(fc) {
+    const { widget, control } = fc;
+    if (widget === "checkbox") return control.checked;
+    if (widget === "raw") return { "$yaml": control.value };
+    if (widget === "list") {
+      // A "list" widget is always comma-text <-> array, regardless of
+      // whether this key was originally present (and regardless of what
+      // shape its original value had) — otherwise a schema list field the
+      // user fills in for the first time would submit as a bare string.
+      const text = control.value;
+      return text.trim() === "" ? [] : text.split(",").map((item) => item.trim()).filter((item) => item.length > 0);
+    }
+    if (fc.unknownOriginalType === "boolean") return control.value.trim().toLowerCase() === "true";
+    if (fc.unknownOriginalType === "number") {
+      const num = Number(control.value);
+      return Number.isNaN(num) ? control.value : num;
+    }
+    if (fc.spec.type === "int") {
+      if (control.value === "") return "";
+      const num = Number(control.value);
+      return Number.isNaN(num) ? control.value : num;
+    }
+    return control.value;
+  }
+
+  function isEmptyForOmission(value, widget) {
+    if (widget === "checkbox") return value === false;
+    if (widget === "raw") return !value || !value.$yaml || value.$yaml.trim() === "";
+    if (Array.isArray(value)) return value.length === 0;
+    return value === "" || value === null || value === undefined;
+  }
+
+  // Preserve key order: untouched keys keep the original file's order, then
+  // any newly-filled-in schema keys are appended at the end. Never sort.
+  function buildOutgoingFrontmatter() {
+    const cur = state.current;
+    const original = cur.frontmatter || {};
+    const out = {};
+    const emitted = new Set();
+    const byKey = new Map(state.formControls.map((fc) => [fc.spec.key, fc]));
+    Object.keys(original).forEach((key) => {
+      const fc = byKey.get(key);
+      out[key] = fc ? computeFieldValue(fc) : original[key];
+      emitted.add(key);
+    });
+    state.formControls.forEach((fc) => {
+      if (emitted.has(fc.spec.key)) return;
+      const value = computeFieldValue(fc);
+      if (isEmptyForOmission(value, fc.widget)) return;
+      out[fc.spec.key] = value;
+      emitted.add(fc.spec.key);
+    });
+    return out;
+  }
+
+  function expectedNameFor(entry) {
+    const path = entry.path || "";
+    const segments = path.split("/");
+    const file = segments[segments.length - 1] || "";
+    // Case-sensitive to match the server's exact check (p.name == "SKILL.md")
+    // in _handle_registry_serialize — a differing case would make the client
+    // and server disagree about whether a name mismatch warning applies.
+    if (file === "SKILL.md") return segments[segments.length - 2] || "";
+    return file.replace(/\.[^.]+$/, "");
+  }
+
+  function validateForm() {
+    const cur = state.current;
+    for (const fc of state.formControls) {
+      if (!fc.spec.required) continue;
+      const value = computeFieldValue(fc);
+      if (isEmptyForOmission(value, fc.widget)) return `"${fc.spec.key}" is required`;
+    }
+    // Only enforce the name/filename match when the SCHEMA declares a
+    // "name" key for this harness:surface — not merely when some unrelated,
+    // unknown key happens to also be called "name".
+    const schemaKey = `${cur.entry.harness}:${cur.entry.surface}`;
+    const schemaHasName = (schema.keys[schemaKey] || []).some((spec) => spec.key === "name");
+    const nameControl = schemaHasName ? state.formControls.find((fc) => fc.spec.key === "name") : null;
+    if (nameControl && cur.entry.harness !== "omnigent") {
+      const nameValue = String(computeFieldValue(nameControl) || "").trim();
+      const expected = expectedNameFor(cur.entry);
+      if (nameValue && expected && nameValue !== expected) {
+        return `"name" (${nameValue}) does not match ${expected}`;
+      }
+    }
+    return null;
+  }
+
+  function snapshotFormControls() {
+    return state.formControls.map((fc) => ({
+      key: fc.spec.key,
+      widget: fc.widget,
+      value: fc.widget === "checkbox" ? fc.control.checked : fc.control.value
+    }));
+  }
+
+  function applyFormSnapshot(snapshot) {
+    if (!snapshot) return;
+    snapshot.forEach((item) => {
+      const fc = state.formControls.find((candidate) => candidate.spec.key === item.key);
+      if (!fc) return;
+      if (item.widget === "checkbox") fc.control.checked = item.value; else fc.control.value = item.value;
+    });
+  }
+
+  function ensureTrailingNewline(text) {
+    return text.endsWith("\n") ? text : `${text}\n`;
+  }
+
+  async function onRawToggle(event) {
+    const cur = state.current;
+    if (!cur || cur.format === "text") { event.target.checked = false; return; }
+    if (event.target.checked) {
+      cur.formSnapshot = snapshotFormControls();
+      setEditorMessage("Loading raw frontmatter…");
+      try {
+        const frontmatter = buildOutgoingFrontmatter();
+        const resp = await api("/api/registry/serialize", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            format: cur.format, frontmatter, body: cur.format === "toml" ? bodyText.value : "",
+            harness: cur.entry.harness, surface: cur.entry.surface
+          })
+        });
+        const block = extractFrontmatterBlock(resp.content, cur.format);
+        cur.rawBaseline = block;
+        cur.rawMode = true;
+        $("frontmatter-raw-text").value = block;
+        $("frontmatter-form").hidden = true;
+        $("frontmatter-raw").hidden = false;
+        $("body-editor").hidden = cur.format === "toml";
+        setEditorMessage("Editing raw frontmatter");
+      } catch (error) {
+        event.target.checked = false;
+        setEditorMessage(error.message, "error");
+      }
+    } else {
+      const rawNow = $("frontmatter-raw-text").value;
+      if (cur.rawBaseline !== undefined && rawNow !== cur.rawBaseline) {
+        const proceed = window.confirm("Discard raw frontmatter edits and return to the form view? Typed-field edits made before switching to raw mode are kept.");
+        if (!proceed) { event.target.checked = true; return; }
+      }
+      cur.rawMode = false;
+      $("frontmatter-raw").hidden = true;
+      $("frontmatter-form").hidden = false;
+      $("body-editor").hidden = false;
+      await renderFrontmatterForm();
+      applyFormSnapshot(cur.formSnapshot);
+      cur.formSnapshot = null;
+      setEditorMessage("No changes");
+    }
+  }
+
+  async function renderEditor() {
     if (!state.current) {
       editorEmpty.hidden = false; editorMain.hidden = true; return;
     }
     editorEmpty.hidden = true; editorMain.hidden = false;
-    const { entry, frontmatter, body } = state.current;
+    const cur = state.current;
+    const { entry, body, format, managed } = cur;
     $("editor-title").textContent = entry.name || "Untitled file";
     $("editor-path").textContent = entry.path;
     const status = $("editor-status");
     status.replaceChildren(makeStatus(entry.status));
-    renderFrontmatter(frontmatter);
+    $("body-label").textContent = format === "toml" ? "Developer instructions" : "Body";
+
+    $("frontmatter-section").hidden = format === "text";
+    $("managed-note").hidden = !managed;
+    $("raw-toggle").checked = false;
+    $("raw-toggle").disabled = managed || format === "text";
+    cur.rawMode = false;
+    cur.rawBaseline = undefined;
+    cur.formSnapshot = null;
+    $("frontmatter-form").hidden = false;
+    $("frontmatter-raw").hidden = true;
+    $("body-editor").hidden = false;
+
+    if (format !== "text") {
+      await renderFrontmatterForm();
+    } else {
+      $("frontmatter-form").replaceChildren();
+      state.formControls = [];
+    }
+
     bodyText.value = body;
+    bodyText.disabled = Boolean(managed);
     $("body-size").textContent = `${formatBytes(new TextEncoder().encode(body).length)} body`;
-    setEditorMessage("No changes");
+    setEditorMessage(managed ? "Managed externally — read only" : "No changes");
+    $("save-file").disabled = Boolean(managed);
     $("import-name").value = entry.name || "";
     updateImportSurfaces();
   }
@@ -257,8 +628,17 @@
     setPageState("reading file…");
     try {
       const file = await api(`/api/registry/file?path=${encodeURIComponent(path)}`);
-      state.current = { entry, frontmatter: file.frontmatter || {}, body: typeof file.body === "string" ? file.body : "" };
-      renderEditor();
+      state.current = {
+        entry,
+        format: file.format || "text",
+        frontmatter: file.frontmatter || {},
+        body: typeof file.body === "string" ? file.body : "",
+        managed: Boolean(file.managed),
+        rawMode: false,
+        rawBaseline: undefined,
+        formSnapshot: null
+      };
+      await renderEditor();
       setPageState("registry ready");
     } catch (error) {
       setPageState(error.message, true);
@@ -278,28 +658,13 @@
     renderTree(); renderList(); renderEditor();
   }
 
-  function serializeFrontmatter(fields) {
-    const keys = Object.keys(fields || {});
-    if (!keys.length) return "";
-    const lines = keys.sort().map((key) => {
-      const value = fields[key];
-      let encoded = Array.isArray(value) ? `[${value.join(", ")}]` : String(value ?? "");
-      encoded = encoded.replace(/[\r\n]/g, " ");
-      return `${key}: ${encoded}`;
-    });
-    return `---\n${lines.join("\n")}\n---\n`;
-  }
-
-  function fullContent() {
-    if (!state.current) return bodyText.value;
-    return serializeFrontmatter(state.current.frontmatter) + bodyText.value;
-  }
-
   function setBusy(busy) {
     state.busy = busy;
-    [$("save-file"), $("delete-file"), $("import-toggle"), $("new-skill"), $("import-file"), $("new-create")].forEach((button) => {
+    const managedLock = Boolean(state.current && state.current.managed);
+    [$("delete-file"), $("import-toggle"), $("new-skill"), $("import-file"), $("new-create")].forEach((button) => {
       if (button) button.disabled = busy;
     });
+    $("save-file").disabled = busy || managedLock;
   }
 
   async function refresh(selectPath = null) {
@@ -331,9 +696,22 @@
     }
   }
 
+  async function loadSchema() {
+    try {
+      const data = await api("/api/registry/schema");
+      schema = {
+        destinations: (data && data.destinations) || FALLBACK_DESTINATIONS,
+        formats: (data && data.formats) || {},
+        keys: (data && data.keys) || {}
+      };
+    } catch (_error) {
+      schema = { destinations: FALLBACK_DESTINATIONS, formats: {}, keys: {} };
+    }
+  }
+
   function destinationOptions(select, preferredHarness = "claude") {
     select.replaceChildren();
-    Object.keys(DESTINATIONS).forEach((harness) => {
+    Object.keys(schema.destinations).forEach((harness) => {
       const option = document.createElement("option"); option.value = harness; option.textContent = displayName(harness);
       option.selected = harness === preferredHarness; select.append(option);
     });
@@ -341,7 +719,7 @@
 
   function updateSurfaceSelect(select, harness, preferred = "skill") {
     select.replaceChildren();
-    (DESTINATIONS[harness] || ["skill"]).forEach((surface) => {
+    (schema.destinations[harness] || ["skill"]).forEach((surface) => {
       const option = document.createElement("option"); option.value = surface; option.textContent = displayName(surface);
       option.selected = surface === preferred; select.append(option);
     });
@@ -349,18 +727,51 @@
 
   function updateImportSurfaces() {
     const harness = $("import-harness").value || "claude";
-    const preferred = (DESTINATIONS[harness] || []).includes($("import-surface").value) ? $("import-surface").value : "skill";
+    const preferred = (schema.destinations[harness] || []).includes($("import-surface").value) ? $("import-surface").value : "skill";
     updateSurfaceSelect($("import-surface"), harness, preferred);
   }
 
+  function refreshDestinationSelects() {
+    destinationOptions($("import-harness"));
+    destinationOptions($("new-harness"));
+    updateSurfaceSelect($("import-surface"), $("import-harness").value, "skill");
+    updateSurfaceSelect($("new-surface"), $("new-harness").value, "skill");
+  }
+
   async function saveFile() {
-    if (!state.current || state.busy) return;
-    const path = state.current.entry.path;
+    if (!state.current || state.busy || state.current.managed) return;
+    const cur = state.current;
+    const path = cur.entry.path;
     setBusy(true); setEditorMessage("Saving…");
     try {
-      await api("/api/registry/file", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content: fullContent() }) });
+      let content;
+      let warnings = [];
+      if (cur.format === "text") {
+        content = bodyText.value;
+      } else if (cur.rawMode) {
+        // Raw mode bypasses /api/registry/serialize entirely: for TOML the
+        // textarea already holds the complete file (no separate frontmatter
+        // fence exists), so it is PUT verbatim; for YAML the fences are
+        // re-added around the edited block and the untouched body.
+        const rawValue = $("frontmatter-raw-text").value;
+        content = cur.format === "toml" ? rawValue : `---\n${ensureTrailingNewline(rawValue)}---\n${bodyText.value}`;
+      } else {
+        const problem = validateForm();
+        if (problem) { setEditorMessage(problem, "error"); setBusy(false); return; }
+        const frontmatter = buildOutgoingFrontmatter();
+        const resp = await api("/api/registry/serialize", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ format: cur.format, frontmatter, body: bodyText.value, harness: cur.entry.harness, surface: cur.entry.surface, path })
+        });
+        content = resp.content;
+        warnings = Array.isArray(resp.warnings) ? resp.warnings : [];
+      }
+      await api("/api/registry/file", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, content }) });
       await refresh(path);
-      setEditorMessage("Saved", "ok");
+      // Warnings are non-blocking: the save already succeeded, so surface
+      // them alongside the success message instead of a transient one the
+      // "Saved" message below would otherwise immediately overwrite.
+      setEditorMessage(warnings.length ? `Saved — ${warnings.join("; ")}` : "Saved", "ok");
     } catch (error) { setEditorMessage(error.message, "error"); setPageState(error.message, true); }
     finally { setBusy(false); }
   }
@@ -422,6 +833,11 @@
     finally { setBusy(false); }
   }
 
+  window.addEventListener("trio:workspace", (event) => {
+    currentRoot = event.detail && event.detail.path ? event.detail.path : "";
+    loadSchema().then(() => { refreshDestinationSelects(); return refresh(); });
+  });
+
   tree.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-scope]");
     if (!button) return;
@@ -436,6 +852,13 @@
     setEditorMessage("Unsaved changes", "error");
     $("body-size").textContent = `${formatBytes(new TextEncoder().encode(bodyText.value).length)} body`;
   });
+  $("frontmatter-form").addEventListener("input", () => {
+    if (state.current) setEditorMessage("Unsaved changes", "error");
+  });
+  $("frontmatter-raw-text").addEventListener("input", () => {
+    if (state.current) setEditorMessage("Unsaved changes", "error");
+  });
+  $("raw-toggle").addEventListener("change", onRawToggle);
   $("save-file").addEventListener("click", saveFile);
   $("delete-file").addEventListener("click", deleteFile);
   $("import-toggle").addEventListener("click", () => { $("import-panel").hidden = !$("import-panel").hidden; });
@@ -453,9 +876,10 @@
       renderTree(); renderList();
     });
   });
-  destinationOptions($("import-harness"));
-  destinationOptions($("new-harness"));
-  updateSurfaceSelect($("import-surface"), $("import-harness").value, "skill");
-  updateSurfaceSelect($("new-surface"), $("new-harness").value, "skill");
-  refresh();
+
+  (async () => {
+    await loadSchema();
+    refreshDestinationSelects();
+    await refresh();
+  })();
 })();
