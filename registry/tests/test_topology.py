@@ -90,6 +90,19 @@ class TopologyCollectorTests(unittest.TestCase):
         self.assertIn(
             ("dispatches_to", "trio-productionize", "trio-scout"), edges)
 
+    def test_opencode_productionize_dispatches_to_scout_and_orchestrator(self):
+        edges = _edge_tuples(self.graphs["opencode"])
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-scout"), edges)
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-orchestrator"),
+            edges)
+
+    def test_omp_productionize_dispatches_to_scout(self):
+        edges = _edge_tuples(self.graphs["omp"])
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-scout"), edges)
+
     def test_pi_has_trio_entrypoint(self):
         names = {
             node["name"] for node in self.graphs["pi"]["nodes"]

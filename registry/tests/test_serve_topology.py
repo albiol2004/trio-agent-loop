@@ -88,11 +88,19 @@ class TopologyEndpointTests(DashboardTopologyTestCase):
             for edge in graphs["opencode"]["edges"]
         }
         self.assertIn(("invokes", "trio", "trio-orchestrator"), opencode)
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-scout"),
+            opencode)
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-orchestrator"),
+            opencode)
 
         omp = {
             (edge["type"], edge["src"], edge["dst"])
             for edge in graphs["omp"]["edges"]
         }
+        self.assertIn(
+            ("dispatches_to", "trio-productionize", "trio-scout"), omp)
         self.assertIn(("spawns", "trio-lead", "trio-builder"), omp)
         self.assertIn(("spawns", "trio-lead", "trio-scout"), omp)
 

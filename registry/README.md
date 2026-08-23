@@ -36,6 +36,8 @@ Key functions:
 repository `root` and returns stable node/edge graphs for Claude, Codex, OMP,
 OpenCode, Omnigent, and Pi. It reuses `scan.py` parsers, records declared
 models and tool policies, and never falls back to `Path.home()`.
+Command Dispatch tables are parsed into `dispatches_to` edges alongside skill
+dispatches.
 
 ## `agents.py` — canonical-agent model and renderers
 

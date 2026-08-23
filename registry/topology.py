@@ -157,8 +157,19 @@ def _dispatch(body: str, skill: str, graph: _Graph) -> None:
         return
     section = re.split(
         r"(?m)^##\s+", body[heading.end():], maxsplit=1)[0]
+    # Keep the original trio-prefixed forms used by Claude and OpenCode.
     targets = re.findall(
-        r"(?:agent:\s*`?|`)(trio-[a-z0-9][a-z0-9-]*)", section)
+        r"""(?:agent:\s*[`"']?|`)(trio-[a-z0-9][a-z0-9-]*)""",
+        section)
+    # OMP uses quoted short role names; normalize only known agent roles so
+    # executor/user and executor/ask text can never become agent edges.
+    short_targets = re.findall(
+        r"""agent:\s*["'](scout|lead|evaluator|builder|orchestrator|repair)
+        ["']""",
+        section,
+        re.VERBOSE,
+    )
+    targets.extend(f"trio-{target}" for target in short_targets)
     for target in dict.fromkeys(targets):
         graph.edge("dispatches_to", skill, target)
 
@@ -172,11 +183,14 @@ def _markdown(root: Path, harness: str, *, agents=None, commands=None,
     """Collect the shared command, skill, and Markdown-agent conventions."""
     graph = _Graph()
     for path in _files(root, commands, "*.md"):
-        fields, _ = _parse(path)
+        fields, body = _parse(path)
         name = path.stem
         graph.node("entrypoint", name, harness, path)
         if fields.get("agent"):
             graph.edge("invokes", name, fields["agent"])
+        # Commands can declare a Dispatch table in their Markdown body, just
+        # like skills. Parse that body once to retain its dispatch edges.
+        _dispatch(body, name, graph)
     for path in _files(root, skills, "*/SKILL.md"):
         _, body = _parse(path)
         name = path.parent.name
