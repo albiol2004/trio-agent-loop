@@ -373,6 +373,99 @@ assert callable(_resolve_agent_spec)
     return "session-create effort and registered native launch propagation available"
 
 
+def cursor_cli_config_path() -> Path:
+    """Location of the Cursor CLI's user config (respects $HOME)."""
+    return Path.home() / ".cursor" / "cli-config.json"
+
+
+def check_cursor_approval_mode() -> dict[str, Any]:
+    """Doctor check: Cursor CLI must run with approvalMode="unrestricted".
+
+    --require-unrestricted: when a Lead/Evaluator --yolo session runs on
+    top of a Cursor CLI still set to "allowlist", cursor-agent surfaces
+    interactive approval prompts. Omnigent's _yolo_auto_accept workaround
+    retries those for 3 attempts and then gives up, surfacing a manual
+    ApprovalCard and stalling the loop.
+    """
+    path = cursor_cli_config_path()
+    fix_hint = (
+        "run `trioctl omnigent fix-approval-mode` (or set approvalMode to "
+        '"unrestricted" and sandbox.mode to "disabled" by hand) in '
+        f"{path}"
+    )
+    if not path.exists():
+        return {
+            "check": "cursor:approval-mode",
+            "ok": True,
+            "status": "WARN",
+            "detail": (
+                f"{path} not found; cursor-agent will use its built-in "
+                "default approval mode, which may not be unrestricted. "
+                f"--require-unrestricted: {fix_hint}"
+            ),
+        }
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "check": "cursor:approval-mode",
+            "ok": False,
+            "status": "FAIL",
+            "detail": f"cannot read/parse {path}: {exc}. {fix_hint}",
+        }
+    mode = data.get("approvalMode") if isinstance(data, dict) else None
+    if mode == "unrestricted":
+        return {
+            "check": "cursor:approval-mode",
+            "ok": True,
+            "status": "PASS",
+            "detail": f'{path}: approvalMode="unrestricted"',
+        }
+    return {
+        "check": "cursor:approval-mode",
+        "ok": False,
+        "status": "FAIL",
+        "detail": (
+            f"{path}: approvalMode={mode!r} (need \"unrestricted\"). "
+            "--require-unrestricted: Lead/Evaluator --yolo sessions "
+            "otherwise fall back to Omnigent's 3-attempt auto-accept and "
+            f"surface manual approval cards. Fix: {fix_hint}"
+        ),
+    }
+
+
+def command_fix_approval_mode(args: argparse.Namespace) -> int:
+    path = cursor_cli_config_path()
+    if not path.exists():
+        raise TrioctlError(
+            f"{path} does not exist; run cursor-agent once to create it, "
+            'or create it manually with {"approvalMode": "unrestricted"}'
+        )
+    raw = path.read_text()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise TrioctlError(f"{path} is not valid JSON, refusing to edit: {exc}") from exc
+    before = json.dumps(data, indent=2, sort_keys=True)
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-trio-{timestamp}")
+    shutil.copyfile(path, backup)
+    data["approvalMode"] = "unrestricted"
+    sandbox = data.get("sandbox")
+    if not isinstance(sandbox, dict):
+        sandbox = {}
+    sandbox["mode"] = "disabled"
+    data["sandbox"] = sandbox
+    after = json.dumps(data, indent=2, sort_keys=True)
+    path.write_text(after + "\n")
+    print(f"Backed up: {backup}")
+    print("Before:")
+    print(before)
+    print("After:")
+    print(after)
+    return 0
+
+
 def command_configure(args: argparse.Namespace) -> int:
     target = config_path(args.config)
     if target.exists() and not args.force:
@@ -548,6 +641,8 @@ def command_doctor(args: argparse.Namespace) -> int:
             }
         )
 
+    checks.append(check_cursor_approval_mode())
+
     catalogs: dict[str, list[dict[str, Any]]] = {}
     for provider, loader in (("codex", codex_models), ("cursor", cursor_models)):
         if provider not in providers:
@@ -631,9 +726,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         )
     else:
         for item in checks:
-            print(
-                f"{'PASS' if item['ok'] else 'FAIL'} {item['check']}: {item['detail']}"
-            )
+            status = item.get("status") or ("PASS" if item["ok"] else "FAIL")
+            print(f"{status} {item['check']}: {item['detail']}")
     return 0 if all(item["ok"] for item in checks) else 1
 
 
@@ -689,6 +783,12 @@ def parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--timeout", type=float, default=15.0)
     doctor.set_defaults(func=command_doctor)
+
+    fix_approval_mode = commands.add_parser(
+        "fix-approval-mode",
+        help='set the Cursor CLI to approvalMode="unrestricted"',
+    )
+    fix_approval_mode.set_defaults(func=command_fix_approval_mode)
     return root
 
 

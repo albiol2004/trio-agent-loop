@@ -63,6 +63,13 @@ coordinator.
 9. Require registered-agent native launch propagation. Lead/Evaluator launch
    metadata must contain `--yolo`. Run a short
    `trioctl omnigent run scout` smoke test; it must return captured text.
+   Doctor's `cursor:approval-mode` check must PASS: if the Cursor CLI's
+   `~/.cursor/cli-config.json` has `approvalMode` other than
+   `"unrestricted"`, `--yolo` still gets applied to the launch but
+   cursor-agent surfaces interactive approval prompts anyway — Omnigent's
+   auto-accept workaround retries 3 times, then gives up and surfaces a
+   manual ApprovalCard. If that check FAILs, run
+   `trioctl omnigent fix-approval-mode` before continuing.
 
 Lead/Evaluator use Cursor Native with `yolo: true`. `trioctl` launches Builder
 with Cursor `--force --trust` and Scout with those flags plus read-only
