@@ -63,8 +63,11 @@
     } else {
       cell.append(createElement("span", row.model || "—"));
       if (row.override_file) {
-        cell.append(createElement(
-          "span", `edit in ${row.override_file}`, "model-detail"));
+        const link = createElement(
+          "a", `edit in ${row.override_file}`, "model-detail");
+        link.href = `/skills.html?path=${
+          encodeURIComponent(row.override_file)}`;
+        cell.append(link);
       }
     }
     if (row.warning) {
