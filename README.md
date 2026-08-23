@@ -251,6 +251,8 @@ metrics/                            # cross-harness loop analytics
                                   #   normalization across template generations
   trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
   trio-shadow.py                  # shadow checker, declared-vs-actual slice writes
+  trio_loop.py                    # mechanical loop driver: gates, verdict,
+                                  #   repair, resume
 dashboard/                          # web dashboard: loops, registry management (stdlib-only server)
   serve.py                        # loop board/sessions/SSE API + registry/agents CRUD
   index.html skills.html agents.html # self-contained dark-theme pages (no CDN)

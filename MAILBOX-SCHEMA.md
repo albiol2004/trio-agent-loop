@@ -197,6 +197,18 @@ One list entry per slice. The restricted shape is exactly:
 | `status` | no (default `in_progress`) | `planned` \| `in_progress` \| `complete` | lifecycle state; `complete` marks a finished slice that stays in the cumulative history |
 | `iteration` | no | int | the iteration the slice belongs to; required in practice for completed entries, recommended for all |
 
+### Flow-list emission rule
+
+Leads MUST emit non-empty `writes:` and `reads:` values as a single-line
+bracket list, such as `writes: [a.py, "api:Name"]`. The
+`metrics/trio-metrics.py` `_parse_flow_list` helper (lines 384-391) requires
+that bracket form for non-empty values.
+
+An empty `writes:` followed by block-style `- item` lines is also parsed by
+the parser (lines 472-478 and 504-513), but that is the multi-line form.
+Drivers and Leads must not emit it in new plans. `metrics/trio-shadow.py`
+shares the same parser.
+
 Paths may be approximate (a directory entry covers everything beneath it);
 `api:` names are exact. The block is optional in v1 — a mailbox without it
 remains conformant, and `trio-check.py` does not validate it. The shadow
