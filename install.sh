@@ -216,6 +216,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     cp -r "$ROOT/omnigent/entrypoints/trio-productionize-omnigent/." "$CODEX_OMNIGENT_PZ_SKILL/"
     install_productionize_assets
     cp "$ROOT/omnigent/trioctl" "$TRIOCTL_BIN_DIR/trioctl"
+    cp "$ROOT/omnigent/broker_http.py" "$TRIOCTL_BIN_DIR/broker_http.py"
     cp "$ROOT/omnigent/trioctl.example.toml" "$TRIOCTL_BIN_DIR/trioctl.example.toml"
     chmod +x "$TRIOCTL_BIN_DIR/trioctl"
     "$TRIOCTL_BIN_DIR/trioctl" omnigent configure --config "$TRIOCTL_CONFIG"

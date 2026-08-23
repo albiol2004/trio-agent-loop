@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -45,6 +47,26 @@ CURSOR_ROLE_PROMPTS = {
 
 class TrioctlError(RuntimeError):
     """A user-actionable configuration or discovery failure."""
+
+
+def _load_broker_http() -> Any:
+    """Load the sibling client without importing this directory as a package."""
+    path = Path(__file__).with_name("broker_http.py")
+    loader = importlib.machinery.SourceFileLoader(
+        "trioctl_broker_http",
+        str(path),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"cannot load broker client: {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# The repository directory is named ``omnigent``.  A non-package loader keeps
+# running from the repository root from accidentally resolving that directory.
+broker_http = _load_broker_http()
 
 
 def config_path(value: str | None = None) -> Path:
@@ -595,6 +617,192 @@ def command_run(args: argparse.Namespace) -> int:
     return 0
 
 
+SESSION_TERMINAL_STATUSES = {"completed", "failed", "error"}
+
+
+def _session_client(base_url: str | None = None) -> Any:
+    """Build a client using the documented loopback default."""
+    return broker_http.BrokerClient(
+        base_url or broker_http.DEFAULT_BASE_URL,
+    )
+
+
+def _print_json(payload: Any) -> None:
+    """Keep all session subcommands machine-readable."""
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def command_session_create(args: argparse.Namespace) -> int:
+    """Create one broker session and print the server response."""
+    client = _session_client(args.base_url)
+    try:
+        result = client.create_session(
+            args.agent_id,
+            args.model,
+            args.message,
+            getattr(args, "title", None),
+        )
+    except broker_http.BrokerHttpError as exc:
+        raise TrioctlError(str(exc)) from exc
+    _print_json(result)
+    return 0
+
+
+def _session_status(snapshot: Any) -> str:
+    """Read a normalized status from a broker session snapshot."""
+    if not isinstance(snapshot, dict):
+        return ""
+    status = snapshot.get("status")
+    return status.lower() if isinstance(status, str) else ""
+
+
+def command_session_wait(args: argparse.Namespace) -> int:
+    """Poll a broker session until it reaches a terminal status."""
+    if args.timeout < 0:
+        raise TrioctlError("--timeout must be non-negative")
+    if args.interval < 0:
+        raise TrioctlError("--interval must be non-negative")
+
+    client = _session_client(getattr(args, "base_url", None))
+    deadline = time.monotonic() + args.timeout
+    while True:
+        try:
+            snapshot = client.get_session(args.session_id)
+        except broker_http.BrokerHttpError as exc:
+            raise TrioctlError(str(exc)) from exc
+        if _session_status(snapshot) in SESSION_TERMINAL_STATUSES:
+            _print_json(snapshot)
+            return 0
+        if time.monotonic() >= deadline:
+            raise TrioctlError(
+                f"session {args.session_id} timed out after "
+                f"{args.timeout:g} seconds"
+            )
+        remaining = deadline - time.monotonic()
+        time.sleep(min(args.interval, remaining))
+
+
+def command_session_read(args: argparse.Namespace) -> int:
+    """Read one session's committed items and print the response."""
+    if args.limit < 0:
+        raise TrioctlError("--limit must be non-negative")
+    if args.order not in {"asc", "desc"}:
+        raise TrioctlError("--order must be asc or desc")
+    client = _session_client(getattr(args, "base_url", None))
+    try:
+        result = client.get_items(
+            args.session_id,
+            limit=args.limit,
+            order=args.order,
+        )
+    except broker_http.BrokerHttpError as exc:
+        raise TrioctlError(str(exc)) from exc
+    _print_json(result)
+    return 0
+
+
+def omnigent_registry_path() -> Path:
+    """Return the existing user-owned role registry path."""
+    return (
+        Path(os.environ.get("OMNIGENT_HOME", str(Path.home() / ".omnigent")))
+        / "agents"
+        / "trio-omnigent-roles"
+        / "registry.json"
+    )
+
+
+def _scout_agent_id(entries: object) -> str | None:
+    """Read a scout registration from either supported registry key."""
+    if not isinstance(entries, dict):
+        return None
+    for key in ("trio-omnigent-scout", "scout"):
+        entry = entries.get(key)
+        if isinstance(entry, str) and entry.strip():
+            return entry.strip()
+        if isinstance(entry, dict):
+            for field in ("agent_id", "agentId", "id"):
+                value = entry.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def check_live_session(
+    config: dict[str, Any] | None,
+    catalogs: dict[str, list[dict[str, Any]]],
+    base_url: str,
+) -> dict[str, Any]:
+    """Probe session creation, snapshot, and item retrieval on demand."""
+    path = omnigent_registry_path()
+    if config is None:
+        return {
+            "check": "omnigent:session-api",
+            "ok": False,
+            "detail": "cannot resolve scout model because config is invalid",
+        }
+    try:
+        entries = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "check": "omnigent:session-api",
+            "ok": False,
+            "detail": f"scout agent registry unavailable at {path}: {exc}",
+        }
+    agent_id = _scout_agent_id(entries)
+    if not agent_id:
+        return {
+            "check": "omnigent:session-api",
+            "ok": False,
+            "detail": (
+                f"no scout agent_id in {path}; register a scout agent "
+                "before using --live-session"
+            ),
+        }
+
+    try:
+        provider = config["roles"]["scout"].get("provider")
+        resolved = resolve_role(
+            "scout",
+            config,
+            models=catalogs.get(provider, []),
+        )
+        client = _session_client(base_url)
+        created = client.create_session(
+            agent_id,
+            resolved["model"],
+            "Reply with the single word pong and stop.",
+            "trioctl doctor",
+        )
+        if not isinstance(created, dict):
+            raise TrioctlError("session create returned a non-object response")
+        session_id = created.get("id") or created.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise TrioctlError("session create response has no session id")
+        snapshot = client.get_session(session_id)
+        items = client.get_items(session_id)
+        if isinstance(items, dict) and isinstance(items.get("items"), list):
+            item_count = len(items["items"])
+        elif isinstance(items, list):
+            item_count = len(items)
+        else:
+            item_count = "received"
+        status = _session_status(snapshot) or "unknown"
+        return {
+            "check": "omnigent:session-api",
+            "ok": True,
+            "detail": (
+                f"{session_id}: status={status}, items={item_count}, "
+                f"model={resolved['model']}"
+            ),
+        }
+    except (TrioctlError, broker_http.BrokerHttpError) as exc:
+        return {
+            "check": "omnigent:session-api",
+            "ok": False,
+            "detail": str(exc),
+        }
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     path = config_path(args.config)
     checks: list[dict[str, Any]] = []
@@ -686,12 +894,7 @@ def command_doctor(args: argparse.Namespace) -> int:
                     {"check": f"role:{role}", "ok": False, "detail": str(exc)}
                 )
 
-    registry = (
-        Path(os.environ.get("OMNIGENT_HOME", str(Path.home() / ".omnigent")))
-        / "agents"
-        / "trio-omnigent-roles"
-        / "registry.json"
-    )
+    registry = omnigent_registry_path()
     try:
         entries = json.loads(registry.read_text())
         if entries.get("_profile") != REGISTRY_PROFILE:
@@ -717,6 +920,15 @@ def command_doctor(args: argparse.Namespace) -> int:
         checks.append({"check": "registry", "ok": True, "detail": str(registry)})
     except (OSError, json.JSONDecodeError, TypeError, TrioctlError) as exc:
         checks.append({"check": "registry", "ok": False, "detail": str(exc)})
+
+    if getattr(args, "live_session", False):
+        checks.append(
+            check_live_session(
+                config,
+                catalogs,
+                getattr(args, "base_url", broker_http.DEFAULT_BASE_URL),
+            )
+        )
 
     if args.json:
         print(
@@ -776,12 +988,66 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float)
     run.set_defaults(func=command_run)
 
+    session = commands.add_parser(
+        "session",
+        help="create, wait for, or read one broker session",
+    )
+    session_commands = session.add_subparsers(
+        dest="session_command",
+        required=True,
+    )
+
+    session_create = session_commands.add_parser(
+        "create",
+        help="create one broker session",
+    )
+    session_create.add_argument("--agent-id", required=True)
+    session_create.add_argument("--model", required=True)
+    session_create.add_argument("--message", required=True)
+    session_create.add_argument("--title")
+    session_create.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
+    session_create.set_defaults(func=command_session_create)
+
+    session_wait = session_commands.add_parser(
+        "wait",
+        help="wait for a broker session to finish",
+    )
+    session_wait.add_argument("session_id")
+    session_wait.add_argument("--timeout", type=float, default=300.0)
+    session_wait.add_argument("--interval", type=float, default=1.0)
+    session_wait.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
+    session_wait.set_defaults(func=command_session_wait)
+
+    session_read = session_commands.add_parser(
+        "read",
+        help="read a broker session's committed items",
+    )
+    session_read.add_argument("session_id")
+    session_read.add_argument("--limit", type=int, default=100)
+    session_read.add_argument("--order", choices=("asc", "desc"), default="asc")
+    session_read.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
+    session_read.set_defaults(func=command_session_read)
+
     doctor = commands.add_parser(
         "doctor", help="validate commands, models, and registry"
     )
     doctor.add_argument("--config")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--timeout", type=float, default=15.0)
+    doctor.add_argument("--live-session", action="store_true")
+    doctor.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
     doctor.set_defaults(func=command_doctor)
 
     fix_approval_mode = commands.add_parser(

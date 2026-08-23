@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import subprocess
+import sys
+import threading
 import textwrap
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -68,6 +73,72 @@ def model(name: str, *efforts: str):
             {"reasoningEffort": effort, "description": effort} for effort in efforts
         ],
     }
+
+
+@pytest.fixture
+def fake_broker():
+    """Run a local-only HTTP broker with deterministic session responses."""
+    state = {
+        "posts": [],
+        "authorization": [],
+        "session_gets": 0,
+        "item_queries": [],
+        "session_statuses": ["running", "completed"],
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def send_json(self, status, payload):
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            state["authorization"].append(self.headers.get("Authorization"))
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            state["posts"].append(body)
+            self.send_json(
+                201,
+                {"id": "session-1", "status": "running"},
+            )
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path.endswith("/items"):
+                state["item_queries"].append(parse_qs(parsed.query))
+                self.send_json(
+                    200,
+                    {"items": [{"id": "item-1", "role": "user"}]},
+                )
+                return
+            state["session_gets"] += 1
+            index = min(
+                state["session_gets"] - 1,
+                len(state["session_statuses"]) - 1,
+            )
+            self.send_json(
+                200,
+                {
+                    "id": "session-1",
+                    "status": state["session_statuses"][index],
+                },
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", state
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 def test_cursor_lead_resolves_grok_medium():
@@ -317,3 +388,184 @@ def test_cursor_scout_is_forced_read_only(
     )
 
     assert seen["command"][-2:] == ["--mode", "ask"]
+
+
+def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "create",
+            "--agent-id",
+            "agent-1",
+            "--model",
+            "model-1",
+            "--message",
+            "Do the task.",
+            "--title",
+            "A task",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["id"] == "session-1"
+    assert state["posts"] == [
+        {
+            "agent_id": "agent-1",
+            "model": "model-1",
+            "message": "Do the task.",
+            "title": "A task",
+            "model_override": "model-1",
+            "initial_items": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Do the task."}
+                    ],
+                }
+            ],
+        }
+    ]
+
+
+def test_session_wait_polls_until_completed(fake_broker, capsys):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "wait",
+            "session-1",
+            "--timeout",
+            "1",
+            "--interval",
+            "0.01",
+            "--base-url",
+            base_url,
+        ]
+    )
+    assert args.func(args) == 0
+
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    assert state["session_gets"] == 2
+
+
+def test_session_read_returns_items_and_query(fake_broker, capsys):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "read",
+            "session-1",
+            "--limit",
+            "7",
+            "--order",
+            "desc",
+            "--base-url",
+            base_url,
+        ]
+    )
+    assert args.func(args) == 0
+
+    assert json.loads(capsys.readouterr().out)["items"]
+    assert state["item_queries"] == [{"limit": ["7"], "order": ["desc"]}]
+
+
+def test_session_auth_uses_home_token(fake_broker, tmp_path, monkeypatch, capsys):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    token_dir = tmp_path / ".omnigent"
+    token_dir.mkdir()
+    (token_dir / "auth_tokens.json").write_text(
+        json.dumps({base_url: {"token": "file-token", "expires_at": 9e18}})
+    )
+    monkeypatch.delenv("OMNIGENT_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(trioctl.broker_http.Path, "home", lambda: tmp_path)
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "create",
+            "--agent-id",
+            "agent-1",
+            "--model",
+            "model-1",
+            "--message",
+            "hello",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 0
+    capsys.readouterr()
+    assert state["authorization"] == ["Bearer file-token"]
+
+
+def test_doctor_without_live_session_skips_session_api(
+    tmp_path, monkeypatch, capsys
+):
+    trioctl = load_trioctl()
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "_profile": trioctl.REGISTRY_PROFILE,
+                "trio-omnigent-lead": {},
+                "trio-omnigent-evaluator": {},
+            }
+        )
+    )
+    models = [
+        model("cursor-grok-4.6-medium"),
+        model("gpt-5.6-luna-max"),
+    ]
+    monkeypatch.setattr(trioctl, "load_config", lambda path: profile())
+    monkeypatch.setattr(
+        trioctl.shutil,
+        "which",
+        lambda command: f"/bin/{command}",
+    )
+    monkeypatch.setattr(trioctl, "omnigent_contract", lambda: "ok")
+    monkeypatch.setattr(
+        trioctl,
+        "check_cursor_approval_mode",
+        lambda: {"check": "cursor:approval-mode", "ok": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(trioctl, "cursor_models", lambda timeout: models)
+    monkeypatch.setattr(
+        trioctl,
+        "omnigent_registry_path",
+        lambda: registry,
+    )
+    args = trioctl.parser().parse_args(["omnigent", "doctor"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    assert "omnigent:session-api" not in output
+
+
+def test_doctor_live_session_flag_is_parsed_without_running_it():
+    trioctl = load_trioctl()
+
+    args = trioctl.parser().parse_args(
+        ["omnigent", "doctor", "--live-session"]
+    )
+
+    assert args.live_session is True
+
+
+def test_broker_loader_does_not_import_real_omnigent():
+    prior = sys.modules.get("omnigent")
+
+    load_trioctl()
+
+    assert sys.modules.get("omnigent") is prior

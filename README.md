@@ -270,6 +270,12 @@ kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/references/prompts/{lead,scout,builder,evaluator}.md
   smoke-test.sh
 ```
+`trioctl omnigent session create|wait|read` uses the local broker at
+`http://127.0.0.1:6767` by default. Auth prefers `OMNIGENT_TOKEN` or
+`OMNIGENT_REMOTE_AUTH_TOKEN`, then the server-keyed
+`~/.omnigent/auth_tokens.json` record when it is not expired.
+`trioctl omnigent doctor --live-session` is the only path that creates a
+real scout session; default doctor and tests stay offline.
 
 ## Setting it up with an AI agent
 Point an agent session at this repo and tell it to follow the setup doc for
