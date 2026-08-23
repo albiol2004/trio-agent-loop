@@ -681,8 +681,12 @@
       }));
       renderTree(); renderList();
       setPageState(`${state.entries.length} files · registry ready`);
+      // Topology nodes deep-link here with ?path=<absolute file>.
+      const linkedPath = new URLSearchParams(location.search).get("path");
       if (selectPath && state.entries.some((entry) => entry.path === selectPath)) {
         await selectEntry(selectPath);
+      } else if (linkedPath && state.entries.some((entry) => entry.path === linkedPath)) {
+        await selectEntry(linkedPath);
       } else if (state.selectedPath && state.entries.some((entry) => entry.path === state.selectedPath)) {
         await selectEntry(state.selectedPath);
       } else {

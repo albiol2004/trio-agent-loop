@@ -216,6 +216,8 @@ STATIC_ROUTES = {
     "/nav.js": ("nav.js", "text/javascript; charset=utf-8"),
     "/agents.html": ("agents.html", "text/html; charset=utf-8"),
     "/agents.js": ("agents.js", "text/javascript; charset=utf-8"),
+    "/topology.html": ("topology.html", "text/html; charset=utf-8"),
+    "/topology.js": ("topology.js", "text/javascript; charset=utf-8"),
 }
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")

@@ -77,6 +77,11 @@ edge graphs for the harness directories present below the explicit repository
 root. The `root` query is required; the endpoint does not scan the dashboard
 process user's home directory.
 
+The **Topology** page (`/topology.html`) renders those graphs as layered
+entrypoint → agent → model SVGs. Select a harness to inspect its wiring, or
+enable **Compare wiring** to see edges that differ across the loaded harnesses.
+Nodes with source paths link to the Skills registry for inspection.
+
 ## Implementation notes
 
 - Mailbox parsing is delegated to `metrics/trio-metrics.py` (loaded by path; no regex duplication).

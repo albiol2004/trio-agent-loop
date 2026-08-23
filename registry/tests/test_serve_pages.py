@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for dashboard/serve.py's static page surface: the agent install
-matrix page (agents.html/agents.js) plus a regression guard over the whole
-STATIC_ROUTES table.
+"""Tests for dashboard/serve.py's static page surface: registry and topology
+pages plus a regression guard over the whole STATIC_ROUTES table.
 
 Loads dashboard/serve.py by path with importlib, mirroring
 registry/tests/test_serve_registry.py.
@@ -79,11 +78,40 @@ class AgentsPageTests(DashboardPagesTestCase):
         self.assertIn("text/javascript", content_type)
 
 
+class TopologyPageTests(DashboardPagesTestCase):
+
+    def test_topology_html_serves_200_with_expected_markers(self):
+        status, content_type, body = self._get("/topology.html")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", content_type)
+        for marker in (
+            "topbar-meta", "/nav.js", "/topology.js", "page-state",
+            "topology-graph", "topology-svg", "compare-toggle",
+            "compare-list",
+            "harness-select",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
+    def test_topology_js_serves_200_as_javascript(self):
+        status, content_type, _body = self._get("/topology.js")
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", content_type)
+
+
 class StaticRoutesTableTests(unittest.TestCase):
 
     def test_static_routes_contains_agents_entries(self):
         self.assertEqual(serve.STATIC_ROUTES.get("/agents.html"), ("agents.html", "text/html; charset=utf-8"))
         self.assertEqual(serve.STATIC_ROUTES.get("/agents.js"), ("agents.js", "text/javascript; charset=utf-8"))
+
+    def test_static_routes_contains_topology_entries(self):
+        self.assertEqual(
+            serve.STATIC_ROUTES.get("/topology.html"),
+            ("topology.html", "text/html; charset=utf-8"))
+        self.assertEqual(
+            serve.STATIC_ROUTES.get("/topology.js"),
+            ("topology.js", "text/javascript; charset=utf-8"))
 
 
 class AppCssTests(unittest.TestCase):
@@ -97,7 +125,10 @@ class ExistingStaticRoutesRegressionTests(DashboardPagesTestCase):
     """Every static route present before this slice must keep working."""
 
     def test_all_pre_existing_static_routes_still_200(self):
-        for path in ("/", "/app.css", "/app.js", "/skills.html", "/skills.js", "/nav.js"):
+        for path in (
+            "/", "/app.css", "/app.js", "/skills.html", "/skills.js",
+            "/nav.js", "/topology.html", "/topology.js",
+        ):
             with self.subTest(path=path):
                 status, _content_type, _body = self._get(path)
                 self.assertEqual(status, 200, path)
@@ -109,8 +140,25 @@ class ReciprocalLinkTests(unittest.TestCase):
         html = (REPO_ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
         self.assertIn('href="/agents.html"', html)
 
+    def test_index_links_to_topology_page(self):
+        html = (REPO_ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('href="/topology.html"', html)
+
     def test_skills_links_to_agents_page(self):
         html = (REPO_ROOT / "dashboard" / "skills.html").read_text(encoding="utf-8")
+        self.assertIn('href="/agents.html"', html)
+
+    def test_skills_links_to_topology_page(self):
+        html = (REPO_ROOT / "dashboard" / "skills.html").read_text(encoding="utf-8")
+        self.assertIn('href="/topology.html"', html)
+
+    def test_agents_links_to_topology_page(self):
+        html = (REPO_ROOT / "dashboard" / "agents.html").read_text(encoding="utf-8")
+        self.assertIn('href="/topology.html"', html)
+
+    def test_topology_links_to_registry_pages(self):
+        html = (REPO_ROOT / "dashboard" / "topology.html").read_text(encoding="utf-8")
+        self.assertIn('href="/skills.html"', html)
         self.assertIn('href="/agents.html"', html)
 
 
@@ -121,6 +169,19 @@ class AgentsJsConventionTests(unittest.TestCase):
         source = (REPO_ROOT / "dashboard" / "agents.js").read_text(encoding="utf-8")
         self.assertNotIn("innerHTML", source)
         self.assertNotIn("<script", source)
+
+
+class TopologyJsConventionTests(unittest.TestCase):
+    """Keep topology rendering on safe DOM and SVG construction APIs."""
+
+    def test_topology_js_has_no_innerhtml_or_script_tag(self):
+        source = (REPO_ROOT / "dashboard" / "topology.js").read_text(encoding="utf-8")
+        self.assertNotIn("innerHTML", source)
+        self.assertNotIn("<script", source)
+
+    def test_skills_js_honors_path_query_from_topology(self):
+        source = (REPO_ROOT / "dashboard" / "skills.js").read_text(encoding="utf-8")
+        self.assertIn("URLSearchParams(location.search)", source)
 
 
 if __name__ == "__main__":
