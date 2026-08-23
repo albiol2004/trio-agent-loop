@@ -633,17 +633,6 @@ def _session_items(payload: Any) -> list[Any]:
     return []
 
 
-def _item_id(item: Any) -> str | None:
-    """Read the stable identifier used to distinguish a new transcript item."""
-    if not isinstance(item, dict):
-        return None
-    for key in ("id", "item_id", "response_id"):
-        value = item.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
 def _item_role(item: Any) -> str:
     """Read a conversation item's role across API envelope versions."""
     if not isinstance(item, dict):
@@ -656,26 +645,66 @@ def _item_role(item: Any) -> str:
     return role.lower() if isinstance(role, str) else ""
 
 
-def _is_assistant_or_turn_item(item: Any) -> bool:
-    """Return whether an item proves that the requested turn produced output."""
-    if _item_role(item) == "assistant":
-        return True
+def _is_completed_assistant_message(item: Any) -> bool:
+    """Return whether an item is a finished assistant message, not a turn.
+
+    Live Cursor rows use type=message, role=assistant, status=completed.
+    type=turn marks turn start and is not terminal. Mid-turn assistant
+    progress is also completed, so callers must still require idle-after-
+    running.
+    """
     if not isinstance(item, dict):
         return False
-    return str(item.get("type") or "").lower() in {"assistant", "response", "turn"}
+    if _item_role(item) != "assistant":
+        return False
+    kind = str(item.get("type") or "message").lower()
+    if kind in {"turn", "resource_event"}:
+        return False
+    if kind not in {"message", "assistant", "response"}:
+        return False
+    status = str(item.get("status") or "").lower()
+    return status in {"completed", "done"}
+
+
+def _has_completed_assistant_message(payload: Any) -> bool:
+    """Return whether any item in a poll page is a finished assistant message."""
+    return any(
+        _is_completed_assistant_message(item) for item in _session_items(payload)
+    )
 
 
 def _get_latest_items(client: Any, session_id: str) -> Any:
-    """Fetch only the newest item, as required for inexpensive polling."""
+    """Fetch a short newest-first page so wait can see assistant completion."""
     method = getattr(client, "get_items", None)
     if method is None:
         raise TrioctlError("broker client has no session-items method")
     try:
-        return method(session_id, limit=1, order="desc")
+        return method(session_id, limit=10, order="desc")
     except TypeError:
         # Keep small test doubles compatible while the real client uses the
         # explicit API query that prevents downloading the whole transcript.
         return method(session_id)
+
+
+def _session_runner_id(snapshot: Any) -> str | None:
+    """Return a bound runner id, or None when the runner has not attached."""
+    if not isinstance(snapshot, dict):
+        return None
+    value = snapshot.get("runner_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _runner_is_bound(snapshot: Any) -> bool:
+    """Treat a missing runner_id field as bound so older fakes still work.
+
+    Live snapshots include ``runner_id``. Null means the pre-running window
+    and is never a completion signal. Tests that omit the field are unchanged.
+    """
+    if not isinstance(snapshot, dict) or "runner_id" not in snapshot:
+        return True
+    return _session_runner_id(snapshot) is not None
 
 
 def _wait_for_session(
@@ -684,51 +713,65 @@ def _wait_for_session(
     *,
     timeout: float,
     interval: float,
+    stable_idle: float = 0.0,
 ) -> Any:
-    """Wait for a turn, not merely for the session's initial idle state.
+    """Wait until Cursor has run a turn, then returned to idle.
 
-    A newly created Omnigent session starts in ``idle`` before dispatch. It is
-    complete only after observing ``running`` followed by ``idle`` or after a
-    newer assistant/turn item appears in the transcript.
+    Live Grok Lead sessions often omit assistant rows from GET /items
+    (only a resource_event remains). Completion is therefore:
+
+    - idle + bound runner + a completed assistant message, or
+    - idle + bound runner after ``running``, held for ``stable_idle``
+      seconds so the post-bind idle blip is not treated as done.
+
+    A null ``runner_id`` and a type=turn row are never terminal. Failed
+    statuses return at once. Timeouts stay distinct.
     """
     if timeout < 0:
         raise TrioctlError("--timeout must be non-negative")
     if interval < 0:
         raise TrioctlError("--interval must be non-negative")
+    if stable_idle < 0:
+        raise TrioctlError("stable_idle must be non-negative")
 
     get_session = getattr(client, "get_session", None)
     if get_session is None:
         raise TrioctlError("broker client has no session-wait method")
-    seed_items = _session_items(_get_latest_items(client, session_id))
-    seed = seed_items[0] if seed_items else None
-    seed_id = _item_id(seed)
-    seed_is_output = _is_assistant_or_turn_item(seed)
     saw_running = False
+    idle_since: float | None = None
     deadline = time.monotonic() + timeout
 
     while True:
+        items = _get_latest_items(client, session_id)
         snapshot = get_session(session_id)
         status = _session_status(snapshot)
         if status in SESSION_FAILURE_STATUSES:
             return snapshot
+        bound = _runner_is_bound(snapshot)
+        has_assistant = _has_completed_assistant_message(items)
+        now = time.monotonic()
+
         if status == "running":
             saw_running = True
-
-        latest_items = _session_items(_get_latest_items(client, session_id))
-        latest = latest_items[0] if latest_items else None
-        latest_id = _item_id(latest)
-        is_new_output = _is_assistant_or_turn_item(latest) and (
-            (seed_id is not None and latest_id != seed_id)
-            or (seed_id is None and not seed_is_output)
-        )
-        if is_new_output or (status == "idle" and saw_running):
+            idle_since = None
+        elif status == "idle" and bound and has_assistant:
+            # Scout pong and any turn that records assistant items.
             return snapshot
+        elif status == "idle" and bound and saw_running:
+            # Lead Grok: items stay on resource_event. Require idle to
+            # stick so the post-bind blip does not finish the wait.
+            if idle_since is None:
+                idle_since = now
+            if now - idle_since >= stable_idle:
+                return snapshot
+        else:
+            idle_since = None
 
-        if time.monotonic() >= deadline:
+        if now >= deadline:
             raise TrioctlError(
                 f"session {session_id} timed out after {timeout:g} seconds"
             )
-        remaining = deadline - time.monotonic()
+        remaining = deadline - now
         time.sleep(min(interval, remaining))
 
 
@@ -969,6 +1012,10 @@ class OmnigentRunner:
             session_id,
             timeout=self._timeout,
             interval=self._interval,
+            # Live Grok Lead items often lack assistant rows. Hold idle
+            # after running so the post-bind blip is not terminal. Tests
+            # use interval=0 and skip the dwell.
+            stable_idle=0.0 if self._interval == 0 else 5.0,
         )
 
     @staticmethod

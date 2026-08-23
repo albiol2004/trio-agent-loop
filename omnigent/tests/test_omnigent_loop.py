@@ -108,13 +108,18 @@ class FakeBrokerClient:
         order: str = "asc",
     ) -> dict[str, list[dict[str, str]]]:
         """Return an assistant item only after the simulated turn settles."""
-        if limit == 1 and order == "desc":
+        if order == "desc" and limit in (1, 10):
             poll = self.item_polls[session_id]
             self.item_polls[session_id] += 1
             self.calls.append(f"items:{session_id}:{poll}")
-            item = {"id": "user-item", "role": "user"}
-            if poll >= 3:
-                item = {"id": "assistant-item", "role": "assistant"}
+            item = {"id": "user-item", "role": "user", "type": "message"}
+            if poll >= 2:
+                item = {
+                    "id": "assistant-item",
+                    "role": "assistant",
+                    "type": "message",
+                    "status": "completed",
+                }
             return {"data": [item]}
 
         role = self.sessions[session_id]

@@ -87,6 +87,8 @@ def fake_broker():
         "item_queries": [],
         "wait_item_reads": 0,
         "assistant_after": None,
+        "item_sequence": None,
+        "session_runner_ids": None,
         "runner_gets": 0,
         "session_statuses": ["idle", "running", "idle"],
     }
@@ -144,15 +146,34 @@ def fake_broker():
             if parsed.path.endswith("/items"):
                 query = parse_qs(parsed.query)
                 state["item_queries"].append(query)
-                if query.get("limit") == ["1"]:
+                limit = (query.get("limit") or [""])[0]
+                # Wait polls a short newest-first page (limit=10).
+                if limit in {"1", "10"}:
                     state["wait_item_reads"] += 1
-                    item = {"id": "item-1", "role": "user"}
-                    assistant_after = state["assistant_after"]
-                    if (
-                        assistant_after is not None
-                        and state["wait_item_reads"] >= assistant_after
-                    ):
-                        item = {"id": "item-2", "role": "assistant"}
+                    sequence = state["item_sequence"]
+                    if sequence:
+                        index = min(
+                            state["wait_item_reads"] - 1,
+                            len(sequence) - 1,
+                        )
+                        item = sequence[index]
+                    else:
+                        item = {
+                            "id": "item-1",
+                            "role": "user",
+                            "type": "message",
+                        }
+                        assistant_after = state["assistant_after"]
+                        if (
+                            assistant_after is not None
+                            and state["wait_item_reads"] >= assistant_after
+                        ):
+                            item = {
+                                "id": "item-2",
+                                "role": "assistant",
+                                "type": "message",
+                                "status": "completed",
+                            }
                     self.send_json(200, {"data": [item]})
                 else:
                     self.send_json(
@@ -172,17 +193,17 @@ def fake_broker():
                 state["session_gets"] - 1,
                 len(state["session_statuses"]) - 1,
             )
-            self.send_json(
-                200,
-                {
-                    "id": "session-1",
-                    "status": (
-                        state["session_statuses"][index]
-                        if state["session_statuses"]
-                        else "idle"
-                    ),
-                },
+            status = (
+                state["session_statuses"][index]
+                if state["session_statuses"]
+                else "idle"
             )
+            payload = {"id": "session-1", "status": status}
+            runner_ids = state["session_runner_ids"]
+            if runner_ids:
+                runner_index = min(index, len(runner_ids) - 1)
+                payload["runner_id"] = runner_ids[runner_index]
+            self.send_json(200, payload)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -493,6 +514,8 @@ def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
 def test_session_wait_polls_running_to_idle(fake_broker, capsys):
     trioctl = load_trioctl()
     base_url, state = fake_broker
+    # Final idle must include a completed assistant message.
+    state["assistant_after"] = 3
     args = trioctl.parser().parse_args(
         [
             "omnigent",
@@ -512,17 +535,134 @@ def test_session_wait_polls_running_to_idle(fake_broker, capsys):
     assert json.loads(capsys.readouterr().out)["status"] == "idle"
     assert state["session_gets"] == 3
     assert all(
-        query == {"limit": ["1"], "order": ["desc"]}
+        query == {"limit": ["10"], "order": ["desc"]}
         for query in state["item_queries"]
     )
 
 
-def test_session_wait_accepts_new_assistant_item_without_running_edge(
+def test_session_wait_keeps_polling_for_assistant_while_running(
     fake_broker, capsys
 ):
     trioctl = load_trioctl()
     base_url, state = fake_broker
-    state["assistant_after"] = 2
+    state["session_statuses"] = ["idle", "running", "running", "idle"]
+    # Assistant progress can appear while status is still running.
+    state["assistant_after"] = 3
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "wait",
+            "session-1",
+            "--timeout",
+            "1",
+            "--interval",
+            "0.01",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "idle"
+    assert state["session_gets"] == 4
+
+
+def test_session_wait_ignores_turn_item_while_idle_before_running(
+    fake_broker, capsys
+):
+    """Turn-start-while-idle must not complete the wait (live broker race)."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    # Live create returns idle with a turn item before Cursor is running.
+    state["session_statuses"] = ["idle", "idle", "running", "idle"]
+    state["session_runner_ids"] = [None, None, "runner-1", "runner-1"]
+    state["item_sequence"] = [
+        {"id": "item-user", "role": "user", "type": "message"},
+        {
+            "id": "item-turn",
+            "type": "turn",
+            "status": "in_progress",
+        },
+        {
+            "id": "item-turn",
+            "type": "turn",
+            "status": "in_progress",
+        },
+        {
+            "id": "item-assistant",
+            "role": "assistant",
+            "type": "message",
+            "status": "completed",
+        },
+    ]
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "wait",
+            "session-1",
+            "--timeout",
+            "1",
+            "--interval",
+            "0.01",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "idle"
+    assert state["session_gets"] == 4
+
+
+def test_session_wait_ignores_idle_blip_without_assistant_message(
+    fake_broker, capsys
+):
+    """Post-bind running→idle with only a resource_event is not terminal."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["idle", "running", "idle", "running", "idle"]
+    state["session_runner_ids"] = [
+        "runner-1",
+        "runner-1",
+        "runner-1",
+        "runner-1",
+        "runner-1",
+    ]
+    state["item_sequence"] = [
+        {"id": "res-1", "type": "resource_event", "status": "completed"},
+        {"id": "res-1", "type": "resource_event", "status": "completed"},
+        {"id": "res-1", "type": "resource_event", "status": "completed"},
+        {"id": "res-1", "type": "resource_event", "status": "completed"},
+        {
+            "id": "asst-1",
+            "role": "assistant",
+            "type": "message",
+            "status": "completed",
+        },
+    ]
+    client = trioctl._session_client(base_url)
+    snapshot = trioctl._wait_for_session(
+        client,
+        "session-1",
+        timeout=1,
+        interval=0.01,
+        stable_idle=0.05,
+    )
+    assert snapshot["status"] == "idle"
+    assert state["session_gets"] == 5
+
+
+def test_session_wait_completes_when_create_already_finished(
+    fake_broker, capsys
+):
+    """Create may return after the turn is already idle with a pong."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["idle"]
+    state["session_runner_ids"] = ["runner-1"]
+    state["assistant_after"] = 1
     args = trioctl.parser().parse_args(
         [
             "omnigent",
@@ -541,6 +681,53 @@ def test_session_wait_accepts_new_assistant_item_without_running_edge(
     assert args.func(args) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "idle"
     assert state["session_gets"] == 1
+
+
+def test_session_wait_does_not_complete_on_assistant_before_running(
+    fake_broker,
+):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["idle"]
+    state["session_runner_ids"] = [None]
+    state["assistant_after"] = 1
+
+    with pytest.raises(trioctl.TrioctlError, match="timed out"):
+        trioctl._wait_for_session(
+            trioctl._session_client(base_url),
+            "session-1",
+            timeout=0,
+            interval=0,
+        )
+
+
+def test_session_wait_times_out_before_turn_starts(fake_broker):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["idle"]
+
+    with pytest.raises(trioctl.TrioctlError, match="timed out"):
+        trioctl._wait_for_session(
+            trioctl._session_client(base_url),
+            "session-1",
+            timeout=0,
+            interval=0,
+        )
+
+
+def test_session_wait_timeout_is_distinct_from_failed_status(fake_broker):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["running"]
+    state["assistant_after"] = 1
+
+    with pytest.raises(trioctl.TrioctlError, match="timed out"):
+        trioctl._wait_for_session(
+            trioctl._session_client(base_url),
+            "session-1",
+            timeout=0,
+            interval=0,
+        )
 
 
 def test_session_wait_returns_failure_for_failed_status(fake_broker, capsys):

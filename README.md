@@ -116,8 +116,10 @@ to pause it yourself; `/loop 10m /trio` forces a fixed cadence instead.
 
 For unattended Omnigent iterations from the repository, run:
 `trioctl omnigent loop --mailbox loop/ --max-iterations 10 --wait-timeout 3600`.
-The default pre-turn `idle` status is not terminal; a wait completes after a
-`running` to `idle` edge or a new assistant item.
+The default pre-turn `idle` status is not terminal; a wait completes only
+after a `running` to `idle` edge (held briefly so the post-bind idle
+blip is ignored) or a completed assistant message. A new turn item or
+an idle flicker after runner bind is not enough.
 
 The dashboard board also provides Start and Stop controls for portable and
 Omnigent loop drivers. It exposes the same controls through
@@ -281,7 +283,7 @@ kimi/                                # Kimi Code skills, prompts, and runner
 ```
 `trioctl omnigent loop` uses loop-core with fresh Omnigent Lead and Evaluator
 sessions. Each loop wait defaults to 3600 seconds. `idle` is terminal only
-after a turn edge or assistant item. `trioctl omnigent session create|wait|read`
+after a `running` to `idle` edge (with a short idle dwell) or a completed assistant message. `trioctl omnigent session create|wait|read`
 uses the local broker at
 `http://127.0.0.1:6767` by default. Auth prefers `OMNIGENT_TOKEN` or
 `OMNIGENT_REMOTE_AUTH_TOKEN`, then the server-keyed
