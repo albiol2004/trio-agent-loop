@@ -48,6 +48,29 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 - **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
 - **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
+## Pages
+
+- `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only
+- `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
+- `/topology.html` — layered SVG graphs of harness wiring (entrypoint → agent → model); compare schemas across harnesses
+- `/models.html` — resolved model rows for each agent, showing layer precedence (frontmatter, OMP, OpenCode, trioctl, Omnigent)
+- `/health.html` — registry lineage, manifest drift, installed harnesses, dangling artifacts, and generate.py check result
+
+## API Endpoints
+
+- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag
+- `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
+- `POST /api/registry/serialize` — validate frontmatter/body pairs; strict YAML parsing server-side
+- `GET /api/registry/agents` — list canonical agents
+- `GET /api/registry/agents/file?name=<name>` — read a canonical agent by name
+- `POST /api/registry/agents` — create a canonical agent; validates against CanonicalAgent schema
+- `PUT /api/registry/agents/file` — update a canonical agent; returns 404 if absent, 403 if managed by generate.py
+- `DELETE /api/registry/agents/file?name=<name>` — delete a canonical agent
+- `POST /api/registry/install` — render a canonical agent into a harness's native format and write it
+- `GET /api/registry/topology?root=<repository>` — deterministic node and edge graphs for all harnesses below root
+- `GET /api/registry/models?root=<repository>` — resolved model rows per agent, showing layer and availability
+- `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
+
 ## Skills editor
 
 The **Skills** page (`/skills.html`) edits skill registry files with a typed frontmatter interface:

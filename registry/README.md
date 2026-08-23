@@ -8,6 +8,15 @@ One canonical entity is stored per harness and eliminated the need for hand-sync
 
 Installations are compared against canonical renders for drift detection: in-sync, stale, missing, or unsupported.
 
+### Canonical agent `spawns` and per-harness spawn-policy rendering
+
+A canonical agent's optional `spawns` field is a named allowlist (list of agent names) that constrains the agent's delegation scope. When rendering to a harness's native format, the spawns list is transformed per harness:
+
+- **Claude/OMP** — spawns rendered as a comma-separated scalar in frontmatter `spawns:` field
+- **OpenCode** — spawns rendered as nested `permission.task` entries with wildcard deny (deny `permission.task: '*'`, then allow each named spawn)
+- **Codex** — spawns rendered as a short delegation note appended to `developer_instructions`
+- **Empty spawns** — preserves each harness's safe default: key absent (Claude/OMP), wildcard remains denied (OpenCode), instructions unchanged (Codex)
+
 ## `scan.py` — format layer and registry index
 
 `registry/scan.py` is a **read-only scanner** that parses every harness's skill/command/agent registry, hashes content for drift detection, and emits `registry.json`. It also owns the **format layer** used by the dashboard editor:
@@ -37,6 +46,17 @@ repository `root` and returns stable node/edge graphs for Claude, Codex, OMP,
 OpenCode, Omnigent, and Pi. It reuses `scan.py` parsers, records declared
 models, tool policies, and non-empty agent output schemas, and never falls back
 to `Path.home()`.
+
+### Graph schema
+
+Each harness graph contains:
+- **Nodes** (sorted by kind, then name): `kind` (agent/model/entrypoint), `name`, `harness`, `path`, `model` (if applicable), `tool_policy` (read-only/edit/spawn), `output` (true if agent declares output schema)
+- **Edges** (sorted by type, src, dst): `type` (spawns/invokes/dispatches_to), `src`, `dst`
+
+Edge types:
+- `spawns` — agent A delegates to agent B (parsed from named `spawns` allowlist or delegation instructions)
+- `invokes` — agent invokes a model (implicit from agent's declared model)
+- `dispatches_to` — skill command dispatches to a subagent or role (parsed from Command Dispatch tables in agent instructions)
 Command Dispatch tables are parsed into `dispatches_to` edges alongside skill
 dispatches.
 
@@ -48,10 +68,20 @@ Omnigent executor configuration. Repository paths always come from the
 explicit `root`; optional live configuration is read only from an explicit
 `home` argument.
 
-`models.json` contains curated model IDs used for availability hints. A custom
-ID is retained in the result and marked `availability: "unknown"` instead of
-raising. `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner
-format layer for focused parsing.
+### Layer precedence
+
+Model resolution checks layers in this order (first non-empty value wins):
+1. **frontmatter** — YAML frontmatter `model:` declared in agent/skill definitions
+2. **omp-config** — OMP task-agent model overrides read from `~/.omp/task/agentModelOverrides`
+3. **opencode-jsonc** — OpenCode config.jsonc `agentModelOverrides`
+4. **trioctl-roles** — Omnigent trioctl profile roles
+5. **omnigent-executor** — Omnigent executor config `model:` for role agents
+
+When a layer wins, its name is recorded for display. If no layer provides a model, the result is `None` with layer `"none"`.
+
+### Availability and custom models
+
+`models.json` contains curated model IDs used for availability hints. When a custom (uncurated) model ID is found, it is retained in the result and marked `availability: "unknown"` instead of raising an error, with a warning message recommending it be added to `models.json`. `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner format layer for focused parsing.
 
 ## `health.py` — lineage and installation health
 
@@ -60,6 +90,17 @@ format layer for focused parsing.
 `home` directory. It compares generator targets with `prompts/generate.py`,
 verifies `.trio-hashes` manifests, reports dangling files and empty
 directories, and runs the generator's read-only `--check` command.
+
+### Lineage hops
+
+The lineage graph traces each canonical entity (agent, skill) from its source through generation targets and installation wrappers to optional global installations. Each hop records:
+- Source: canonical file (repository agent/skill)
+- Generated: `prompts/generate.py` target (if any)
+- Installed global: harness's user-global installation (if any, read from explicit `home` only)
+
+### Manifests and dangling artifacts
+
+`.trio-hashes` manifest files (`~/.local/share/trio-agent-loop/*/manifest`) record body hashes of installed files to detect drift. The health check verifies manifest presence and correctness for each harness. Dangling files are artifacts in harness directories that are not in the lineage and not marked as managed by `generate.py`; they may be obsolete or left behind by manual edits.
 
 ## `agents.py` — canonical-agent model and renderers
 

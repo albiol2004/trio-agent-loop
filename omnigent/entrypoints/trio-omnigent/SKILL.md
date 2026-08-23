@@ -20,6 +20,8 @@ coordinator.
 
 ## Preflight and one-time registration
 
+**Omnigent version requirement**: Omnigent >= commit 780962a5 (queue-aware yolo auto-accept) is required to avoid approval cards on batched tool calls during a loop iteration.
+
 1. Discover Omnigent's session tools if they are deferred.
 2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
    It maps the two exact judgment-role names to persisted `agent_id` values.
