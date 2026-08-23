@@ -35,7 +35,8 @@ Key functions:
 `collect_topology(root)` scans the canonical harness copies below the explicit
 repository `root` and returns stable node/edge graphs for Claude, Codex, OMP,
 OpenCode, Omnigent, and Pi. It reuses `scan.py` parsers, records declared
-models and tool policies, and never falls back to `Path.home()`.
+models, tool policies, and non-empty agent output schemas, and never falls back
+to `Path.home()`.
 Command Dispatch tables are parsed into `dispatches_to` edges alongside skill
 dispatches.
 
@@ -51,6 +52,14 @@ explicit `root`; optional live configuration is read only from an explicit
 ID is retained in the result and marked `availability: "unknown"` instead of
 raising. `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner
 format layer for focused parsing.
+
+## `health.py` — lineage and installation health
+
+`collect_health(root, home=None)` reads repository lineage from the explicit
+`root` and reads optional global harness installations only from the explicit
+`home` directory. It compares generator targets with `prompts/generate.py`,
+verifies `.trio-hashes` manifests, reports dangling files and empty
+directories, and runs the generator's read-only `--check` command.
 
 ## `agents.py` — canonical-agent model and renderers
 
@@ -100,7 +109,7 @@ The index builds `agent_matrix` by comparing each canonical render's `body_hash`
 
 ## Test suite
 
-Run all 183 tests:
+Run the full registry test suite:
 ```bash
 python3 -m unittest discover -s registry/tests -t .
 ```
@@ -110,6 +119,7 @@ Tests cover:
 - **agents.py** — canonical-agent parsing, validation, rendering, per-harness serialization
 - **topology.py** — per-harness graphs from canonical repo files (no $HOME scan)
 - **serve.py** — registry file serving, schema endpoints, serialization validation, agent CRUD, install API, topology GET
+- **health.py** — lineage, manifests, generator checks, and dangling files
 - **page rendering** — agents.html matrix generation, skills.html schema forms
 
 Key test files:
@@ -118,3 +128,4 @@ Key test files:
 - `test_serve_registry.py` — registry file API
 - `test_serve_agents.py` — canonical-agent CRUD and install endpoint
 - `test_serve_pages.py` — dashboard page generation
+- `test_health.py` and `test_serve_health.py` — health collector and endpoint

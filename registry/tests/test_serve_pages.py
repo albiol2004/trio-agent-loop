@@ -117,6 +117,25 @@ class ModelsPageTests(DashboardPagesTestCase):
         self.assertIn("text/javascript", content_type)
 
 
+class HealthPageTests(DashboardPagesTestCase):
+    def test_health_html_serves_200_with_expected_markers(self):
+        status, content_type, body = self._get("/health.html")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", content_type)
+        for marker in (
+            "topbar-meta", "/nav.js", "/health.js", "page-state",
+            "health-lineage", "health-manifests", "health-installed",
+            "health-generate", "health-dangling",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
+    def test_health_js_serves_200_as_javascript(self):
+        status, content_type, _body = self._get("/health.js")
+        self.assertEqual(status, 200)
+        self.assertIn("text/javascript", content_type)
+
+
 class StaticRoutesTableTests(unittest.TestCase):
 
     def test_static_routes_contains_agents_entries(self):
@@ -138,6 +157,14 @@ class StaticRoutesTableTests(unittest.TestCase):
         self.assertEqual(
             serve.STATIC_ROUTES.get("/models.js"),
             ("models.js", "text/javascript; charset=utf-8"))
+
+    def test_static_routes_contains_health_entries(self):
+        self.assertEqual(
+            serve.STATIC_ROUTES.get("/health.html"),
+            ("health.html", "text/html; charset=utf-8"))
+        self.assertEqual(
+            serve.STATIC_ROUTES.get("/health.js"),
+            ("health.js", "text/javascript; charset=utf-8"))
 
 
 class AppCssTests(unittest.TestCase):
@@ -161,6 +188,13 @@ class ExistingStaticRoutesRegressionTests(DashboardPagesTestCase):
 
 
 class ReciprocalLinkTests(unittest.TestCase):
+
+    def test_registry_pages_link_to_health(self):
+        for page in ("index", "skills", "agents", "topology", "models", "health"):
+            html = (REPO_ROOT / "dashboard" / f"{page}.html").read_text(
+                encoding="utf-8")
+            with self.subTest(page=page):
+                self.assertIn('href="/health.html"', html)
 
     def test_index_links_to_agents_page(self):
         html = (REPO_ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
@@ -235,6 +269,19 @@ class TopologyJsConventionTests(unittest.TestCase):
 class ModelsJsConventionTests(unittest.TestCase):
     def test_models_js_has_no_innerhtml_or_script_tag(self):
         source = (REPO_ROOT / "dashboard" / "models.js").read_text(encoding="utf-8")
+        self.assertNotIn("innerHTML", source)
+        self.assertNotIn("<script", source)
+
+    def test_models_js_links_overrides_to_skills(self):
+        source = (REPO_ROOT / "dashboard" / "models.js").read_text(
+            encoding="utf-8")
+        self.assertIn("skills.html?path=", source)
+
+
+class HealthJsConventionTests(unittest.TestCase):
+    def test_health_js_has_no_innerhtml_or_script_tag(self):
+        source = (REPO_ROOT / "dashboard" / "health.js").read_text(
+            encoding="utf-8")
         self.assertNotIn("innerHTML", source)
         self.assertNotIn("<script", source)
 

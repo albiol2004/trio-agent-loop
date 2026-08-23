@@ -110,6 +110,16 @@ html, body {
 .status-error, .status-disconnected { color: var(--red); }
 .status-idle { color: var(--slate); }
 .status-missing { color: var(--amber); }
+.status-in-sync, .status-match, .status-ok, .status-installed {
+  color: var(--green);
+}
+.status-canonical { color: var(--blue); }
+.status-stale, .status-mismatch, .status-drift, .status-timed-out {
+  color: var(--red);
+}
+.status-unknown, .status-missing-file, .status-missing-manifest {
+  color: var(--amber);
+}
 
 /* -------------------------------- tabs --------------------------------- */
 

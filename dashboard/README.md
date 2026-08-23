@@ -79,7 +79,8 @@ process user's home directory.
 
 The **Topology** page (`/topology.html`) renders those graphs as layered
 entrypoint → agent → model SVGs. Select a harness to inspect its wiring, or
-enable **Compare wiring** to see edges that differ across the loaded harnesses.
+enable **Compare wiring** to see edges and agent output schemas that differ
+across the loaded harnesses.
 Nodes with source paths link to the Skills registry for inspection.
 
 ## Model registry
@@ -93,7 +94,19 @@ executor configuration in that order.
 Optional live model lists are read only from the dashboard process home; an
 unknown custom model is reported as a warning and does not fail the request.
 Model pins declared in frontmatter can be edited from the page. Runtime
-override sources remain read-only.
+override sources remain read-only; their paths link to the Skills editor.
+
+## Registry health
+
+The **Health** page (`/health.html`) traces each registry concept from its
+canonical source through a generated target or hand wrapper to an optional
+global installation. It also reports `.trio-hashes` manifest drift, installed
+harness directories, dangling artifacts, and the read-only
+`python3 prompts/generate.py --check` result.
+
+`GET /api/registry/health?root=<repository>` requires an explicit workspace
+root. Global harness paths are read only from the dashboard process home, and
+deletable dangling files use the existing managed-file-safe DELETE endpoint.
 
 ## Implementation notes
 

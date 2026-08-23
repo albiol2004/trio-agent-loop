@@ -65,6 +65,10 @@ Registry (format-aware):
         The root query is required; optional runtime overrides are read only
         from the dashboard process home.
 
+    GET /api/registry/health?root=<absolute-path>
+    Response: lineage, manifest, installation, generator-check, and dangling
+        artifact health for the explicit repository and optional dashboard home.
+
     GET /api/registry/schema
     Response: {"destinations": {<harness>: [<surface>, ...]},
                "formats": {"<harness>:<surface>": "yaml"|"toml"},
@@ -155,6 +159,9 @@ TOPOLOGY_PATH = DASHBOARD_DIR.parent / "registry" / "topology.py"
 MODELS_PATH = DASHBOARD_DIR.parent / "registry" / "models.py"
 """Model collector module, resolved relative to this file."""
 
+HEALTH_PATH = DASHBOARD_DIR.parent / "registry" / "health.py"
+"""Health collector module, resolved relative to this file."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -171,6 +178,7 @@ _REGISTRY_MODULE = None
 _AGENTS_MODULE = None
 _TOPOLOGY_MODULE = None
 _MODELS_MODULE = None
+_HEALTH_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -229,6 +237,8 @@ STATIC_ROUTES = {
     "/topology.js": ("topology.js", "text/javascript; charset=utf-8"),
     "/models.html": ("models.html", "text/html; charset=utf-8"),
     "/models.js": ("models.js", "text/javascript; charset=utf-8"),
+    "/health.html": ("health.html", "text/html; charset=utf-8"),
+    "/health.js": ("health.js", "text/javascript; charset=utf-8"),
 }
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")
@@ -340,6 +350,25 @@ def load_models_module():
         raise RuntimeError(
             "models module missing required attribute: collect_models")
     _MODELS_MODULE = module
+    return module
+
+
+def load_health_module():
+    """Load registry/health.py by path and cache the module."""
+    global _HEALTH_MODULE
+    if _HEALTH_MODULE is not None:
+        return _HEALTH_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_registry_health", HEALTH_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load health module: {HEALTH_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if not hasattr(module, "collect_health"):
+        raise RuntimeError(
+            "health module missing required attribute: collect_health")
+    _HEALTH_MODULE = module
     return module
 
 
@@ -1230,6 +1259,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         models = load_models_module()
         self._send_json(200, models.collect_models(root, home=HOME))
 
+    def _handle_registry_health(self, root: Path) -> None:
+        """Return lineage and installation health for an explicit root."""
+        health = load_health_module()
+        self._send_json(200, health.collect_health(root, home=HOME))
+
     def _handle_registry_schema(self) -> None:
         """Static harness/surface schema: destinations, formats, key specs."""
         registry = load_registry_module()
@@ -1937,6 +1971,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_models(root))
+        if path == "/api/registry/health":
+            if not query.get("root"):
+                return self._send_json(400, {"error": "root is required"})
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_health(root))
         if path == "/api/registry/agents":
             return self._api(self._handle_agents_list)
         if path == "/api/registry/agents/file":
