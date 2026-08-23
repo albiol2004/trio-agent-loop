@@ -37,7 +37,8 @@
         .filter((node) => node && node.name != null)
         .map((node) => ({
           kind: LAYERS.includes(node.kind) ? node.kind : "agent",
-          name: String(node.name), path: String(node.path || "")
+          name: String(node.name), path: String(node.path || ""),
+          output: Boolean(node.output)
         }));
       const edges = (raw && Array.isArray(raw.edges) ? raw.edges : [])
         .filter((edge) => edge && edge.src != null && edge.dst != null);
@@ -147,7 +148,18 @@
     }));
     const differences = [...variants.values()].filter(
       (variant) => variant.harnesses.length < names.length);
-    if (!differences.length) {
+    const outputVariants = new Map();
+    names.forEach((name) => graphs[name].nodes
+      .filter((node) => node.kind === "agent")
+      .forEach((node) => {
+        const variant = outputVariants.get(node.name) ||
+          {name: node.name, values: new Map()};
+        variant.values.set(name, node.output);
+        outputVariants.set(node.name, variant);
+      }));
+    const outputDifferences = [...outputVariants.values()].filter((variant) =>
+      new Set(variant.values.values()).size > 1);
+    if (!differences.length && !outputDifferences.length) {
       const item = document.createElement("li");
       item.textContent = names.length ? "No wiring differences." : "Load workspace.";
       compareList.append(item);
@@ -158,6 +170,14 @@
       const item = document.createElement("li");
       item.textContent = `${edge.type}: ${edge.src} → ${edge.dst} · present in ${
         harnesses.join(", ")} · absent in ${missing.join(", ")}`;
+      compareList.append(item);
+    });
+    outputDifferences.forEach(({name, values}) => {
+      const item = document.createElement("li");
+      const details = [...values.entries()]
+        .map(([harness, output]) => `${harness}=${output ? "yes" : "no"}`)
+        .join(", ");
+      item.textContent = `output: ${name} · ${details}`;
       compareList.append(item);
     });
   }

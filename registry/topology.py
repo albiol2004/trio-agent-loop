@@ -55,9 +55,10 @@ def _parse(path: Path, fmt: str = "frontmatter") -> tuple[dict, str]:
 
 
 def _node(kind: str, name: str, harness: str, path: Path,
-          model=None, tool_policy=None) -> dict:
+          model=None, tool_policy=None, output=None) -> dict:
     return dict(kind=kind, name=str(name), harness=harness, path=str(path),
-                model=model or None, tool_policy=tool_policy or None)
+                model=model or None, tool_policy=tool_policy or None,
+                output=bool(output) if kind == "agent" else False)
 
 
 class _Graph:
@@ -67,20 +68,22 @@ class _Graph:
         self.nodes = {}
         self.edges = {}
 
-    def node(self, kind, name, harness, path, model=None, tool_policy=None):
+    def node(self, kind, name, harness, path, model=None, tool_policy=None,
+             output=None):
         key = (kind, str(name))
         self.nodes.setdefault(
-            key, _node(kind, name, harness, path, model, tool_policy))
+            key, _node(kind, name, harness, path, model, tool_policy, output))
 
     def edge(self, edge_type, src, dst):
         key = (edge_type, str(src), str(dst))
         self.edges[key] = dict(
             type=edge_type, src=str(src), dst=str(dst))
 
-    def agent(self, harness, name, path, model=None, tool_policy=None):
+    def agent(self, harness, name, path, model=None, tool_policy=None,
+              output=None):
         name = str(name)
         model = str(model).strip() if model is not None else ""
-        self.node("agent", name, harness, path, model, tool_policy)
+        self.node("agent", name, harness, path, model, tool_policy, output)
         if model:
             self.node("model", model, harness, path, model)
             self.edge("invokes", name, model)
@@ -200,7 +203,9 @@ def _markdown(root: Path, harness: str, *, agents=None, commands=None,
         fields, _ = _parse(path)
         name = path.stem
         policy, targets = _agent_info(fields, policy_kind)
-        graph.agent(harness, name, path, fields.get("model"), policy)
+        graph.agent(
+            harness, name, path, fields.get("model"), policy,
+            output=fields.get("output"))
         for target in targets:
             graph.edge("spawns", name, target)
     return graph
@@ -233,7 +238,8 @@ def _collect_codex(root: Path) -> dict:
         sandbox = fields.get("sandbox_mode")
         graph.agent(
             "codex", name, path, fields.get("model"),
-            f"sandbox_mode={sandbox}" if sandbox else None)
+            f"sandbox_mode={sandbox}" if sandbox else None,
+            output=fields.get("output"))
         instructions = fields.get("developer_instructions") or ""
         if not isinstance(instructions, str):
             instructions = str(instructions)
@@ -259,7 +265,8 @@ def _collect_omnigent(root: Path) -> dict:
         graph.agent(
             "omnigent", fields.get("name") or role.name, path,
             executor.get("model"),
-            f"spawn: {str(spawn).lower()}" if spawn is not None else None)
+            f"spawn: {str(spawn).lower()}" if spawn is not None else None,
+            output=fields.get("output"))
     return graph.result()
 
 

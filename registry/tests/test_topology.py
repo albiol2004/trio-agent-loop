@@ -73,6 +73,13 @@ class TopologyCollectorTests(unittest.TestCase):
         self.assertIn(("spawns", "trio-lead", "trio-builder"), edges)
         self.assertIn(("spawns", "trio-lead", "trio-scout"), edges)
 
+    def test_omp_evaluator_reports_output_schema(self):
+        evaluator = next(
+            node for node in self.graphs["omp"]["nodes"]
+            if node["kind"] == "agent" and node["name"] == "trio-evaluator"
+        )
+        self.assertTrue(evaluator["output"])
+
     def test_omnigent_lead_has_executor_model_node(self):
         graph = self.graphs["omnigent"]
         self.assertIn(
