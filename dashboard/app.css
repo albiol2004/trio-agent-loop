@@ -241,6 +241,7 @@ html, body {
 .status-label.status-blocked { color: var(--red); }
 .status-label.status-needs_human { color: var(--violet); }
 .status-label.status-idle    { color: var(--slate); }
+.status-label.status-phase   { color: var(--blue); }
 
 .card-iter {
   font-family: var(--mono);
@@ -282,6 +283,35 @@ html, body {
   color: var(--faint);
   font-family: var(--mono);
   white-space: nowrap;
+}
+
+.card-controls {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.card-controls button {
+  appearance: none;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: 11px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.card-controls button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.card-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 /* --------------------------- verdict segmented bar ---------------------- */

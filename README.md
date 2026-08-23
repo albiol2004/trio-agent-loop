@@ -117,6 +117,10 @@ to pause it yourself; `/loop 10m /trio` forces a fixed cadence instead.
 For unattended Omnigent iterations from the repository, run:
 `trioctl omnigent loop --mailbox loop/ --max-iterations 10`.
 
+The dashboard board also provides Start and Stop controls for portable and
+Omnigent loop drivers. It exposes the same controls through
+`/api/loop/start`, `/api/loop/stop`, and `/api/loop/status`.
+
 ## Control knobs while it runs
 - `loop/GOAL.md` — edit anytime; next iteration obeys it.
 - `loop/STATE.md` → `max_iterations` (default 10) — hard budget cap.

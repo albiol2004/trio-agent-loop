@@ -27,7 +27,13 @@ Board:
     Response: {"loops": [<loop>], "updated_at": "<ISO-8601 UTC>"}
     Each loop object:
         name, path, mission, iteration, max_iterations, status,
-        final_verdict, last_activity, last_entry_summary, segments
+        final_verdict, last_activity, last_entry_summary, segments,
+        driver_phase, driver, running
+
+Loop control:
+    POST /api/loop/start  Body: {"root", "driver", "max_iterations"?}
+    POST /api/loop/stop   Body: {"root"}
+    GET  /api/loop/status?root=<absolute-path>
 
 Sessions:
     GET /api/sessions?loop=<loop-name>
@@ -127,6 +133,7 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -183,6 +190,11 @@ _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
 SESSIONS_ROOT = HOME / ".omp" / "agent" / "sessions"
+
+# Keep handles for children started by this server so stop can reap a child
+# after sending SIGTERM without ever signalling its process group.
+_LOOP_PROCESSES = {}
+_LOOP_PROCESSES_LOCK = threading.Lock()
 
 
 _WRITABLE_ROOTS = (
@@ -479,6 +491,100 @@ def _to_int(value) -> int | None:
     if text.isdigit():
         return int(text)
     return None
+
+
+def _pid_is_live(pid: int) -> bool:
+    """Return whether the kernel accepts a no-op signal for ``pid``."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def _process_cmdline(pid: int) -> str:
+    """Read a Linux process command line, or an empty string on failure."""
+    if pid <= 0:
+        return ""
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+
+
+def _read_driver_state(loop_dir: Path) -> dict | None:
+    """Read the loop driver's private state file when it is valid JSON."""
+    try:
+        payload = json.loads(
+            (loop_dir / ".driver.json").read_text(
+                encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _driver_from_cmdline(pid: int) -> str | None:
+    """Infer the dashboard driver from a live driver's command line."""
+    cmdline = _process_cmdline(pid)
+    if "trioctl" in cmdline and "loop" in cmdline:
+        return "omnigent"
+    if "portable/driver.sh" in cmdline:
+        return "portable"
+    if "trio_loop.py" in cmdline:
+        return "omnigent" if "--runner omnigent" in cmdline else "portable"
+    return None
+
+
+def _driver_snapshot(loop_dir: Path) -> dict | None:
+    """Normalize driver state for the status endpoint and board cards."""
+    state = _read_driver_state(loop_dir)
+    if state is None:
+        return None
+    raw_pid = state.get("pid")
+    pid = _to_int(raw_pid) if not isinstance(raw_pid, bool) else None
+    pid = pid or 0
+    sessions = state.get("session_ids")
+    if not isinstance(sessions, dict):
+        sessions = {}
+    driver = state.get("driver")
+    if driver not in ("portable", "omnigent"):
+        driver = _driver_from_cmdline(pid)
+    phase = state.get("phase")
+    if phase is not None:
+        phase = str(phase)
+    return {
+        "pid": pid,
+        "iteration": _to_int(state.get("iteration")),
+        "phase": phase,
+        "session_ids": sessions,
+        "driver": driver,
+        "live": _pid_is_live(pid),
+    }
+
+
+def _live_lock_pid(mailbox: Path) -> int | None:
+    """Return a live lock owner PID, ignoring malformed or stale locks."""
+    lock = mailbox / ".lock"
+    try:
+        if not lock.exists():
+            return None
+        pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if _pid_is_live(pid) else None
+
+
+def _owns_loop_process(pid: int) -> bool:
+    """Allow stop only for the known loop command shapes."""
+    cmdline = _process_cmdline(pid)
+    return (
+        "trio_loop.py" in cmdline
+        or "portable/driver.sh" in cmdline
+        or ("trioctl" in cmdline and "loop" in cmdline)
+    )
 
 
 def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
@@ -1685,6 +1791,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _loop_card(self, loop_dir: Path, metrics) -> dict:
         analysis = metrics.analyze_loop(loop_dir)
         entries = metrics.parse_log(loop_dir / "LOG.md")
+        driver_state = _driver_snapshot(loop_dir)
         return {
             "name": analysis["name"],
             "path": analysis["name"],
@@ -1696,6 +1803,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "last_activity": _last_activity(loop_dir, entries),
             "last_entry_summary": _last_entry_summary(entries),
             "segments": analysis["segments"],
+            "driver_phase": (
+                driver_state["phase"] if driver_state else None
+            ),
+            "driver": driver_state["driver"] if driver_state else None,
+            "running": bool(driver_state and driver_state["live"]),
         }
 
     def _handle_board(self, root: Path) -> None:
@@ -1719,6 +1831,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "last_activity": None,
                     "last_entry_summary": "unreadable mailbox",
                     "segments": [],
+                    "driver_phase": None,
+                    "driver": None,
+                    "running": False,
                 })
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):
@@ -1788,6 +1903,162 @@ class DashboardHandler(BaseHTTPRequestHandler):
         card["iterations"], card["overlaps"] = _loop_iterations(loop_dir, root)
         card["sessions"] = self._session_list(loop_dir, root)
         self._send_json(200, card)
+
+    # -- /api/loop controls -------------------------------------------------
+
+    def _read_loop_body(self) -> dict | None:
+        """Read a loop-control body and turn malformed JSON into a 400."""
+        try:
+            return _read_json_body(self)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return None
+
+    def _resolve_loop_root(self, payload: dict) -> Path | None:
+        """Resolve a loop-control root through the existing seed allowlist."""
+        try:
+            return self._resolve_root({"root": [payload.get("root")]})
+        except PermissionError as exc:
+            self._send_json(403, {"error": str(exc)})
+            return None
+
+    def _loop_mailbox(
+        self, root: Path, *, require_goal: bool = True
+    ) -> Path | None:
+        """Return the in-workspace loop mailbox when it is available."""
+        try:
+            mailbox = (root / "loop").resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not _path_is_under(mailbox, root):
+            return None
+        if not mailbox.is_dir():
+            return None
+        if require_goal and not (mailbox / "GOAL.md").is_file():
+            return None
+        return mailbox
+
+    def _handle_loop_start(self) -> None:
+        payload = self._read_loop_body()
+        if payload is None:
+            return
+        root = self._resolve_loop_root(payload)
+        if root is None:
+            return
+        driver = payload.get("driver")
+        if driver not in ("portable", "omnigent"):
+            return self._send_json(
+                400, {"error": "driver must be portable or omnigent"})
+        max_iterations = payload.get("max_iterations", 10)
+        if (
+            isinstance(max_iterations, bool)
+            or not isinstance(max_iterations, int)
+            or max_iterations < 1
+        ):
+            return self._send_json(
+                400, {"error": "max_iterations must be a positive integer"})
+        mailbox = self._loop_mailbox(root)
+        if mailbox is None:
+            return self._send_json(
+                400, {"error": "loop mailbox or GOAL.md is missing"})
+        lock_pid = _live_lock_pid(mailbox)
+        if lock_pid is not None:
+            return self._send_json(
+                409, {"error": f"loop is already running (pid {lock_pid})"})
+        if driver == "portable":
+            command = [
+                "python3", "metrics/trio_loop.py", "run",
+                "--mailbox", str(mailbox),
+                "--max-iterations", str(max_iterations),
+                "--runner", "portable",
+            ]
+        else:
+            command = [
+                "python3", "omnigent/trioctl", "omnigent", "loop",
+                "--mailbox", str(mailbox),
+                "--max-iterations", str(max_iterations),
+            ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return self._send_json(500, {"error": "could not start loop"})
+        with _LOOP_PROCESSES_LOCK:
+            _LOOP_PROCESSES[process.pid] = process
+        # Seed driver state before the child overwrites it so status
+        # is not 404 in the window between spawn and first loop tick.
+        (mailbox / ".driver.json").write_text(
+            json.dumps({
+                "pid": process.pid,
+                "iteration": 0,
+                "phase": "starting",
+                "session_ids": {},
+                "driver": driver,
+            })
+            + "\n",
+            encoding="utf-8",
+        )
+        self._send_json(202, {
+            "pid": process.pid,
+            "driver": driver,
+            "mailbox": str(mailbox),
+        })
+
+    def _handle_loop_stop(self) -> None:
+        payload = self._read_loop_body()
+        if payload is None:
+            return
+        root = self._resolve_loop_root(payload)
+        if root is None:
+            return
+        mailbox = self._loop_mailbox(root, require_goal=False)
+        if mailbox is None:
+            return self._send_json(404, {"error": "loop mailbox not found"})
+        driver_state = _driver_snapshot(mailbox)
+        if driver_state is None:
+            return self._send_json(404, {"error": "driver state not found"})
+        pid = driver_state["pid"]
+        if not driver_state["live"]:
+            return self._send_json(404, {"error": "loop process is stale"})
+        if not _owns_loop_process(pid):
+            return self._send_json(403, {"error": "loop process is not owned"})
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return self._send_json(404, {"error": "loop process is stale"})
+        except PermissionError:
+            return self._send_json(403, {"error": "cannot stop loop process"})
+        with _LOOP_PROCESSES_LOCK:
+            process = _LOOP_PROCESSES.pop(pid, None)
+        if process is not None:
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self._send_json(200, {"stopped": True, "pid": pid})
+
+    def _handle_loop_status(self, root: Path) -> None:
+        mailbox = self._loop_mailbox(root, require_goal=False)
+        if mailbox is None:
+            return self._send_json(404, {"error": "loop mailbox not found"})
+        driver_state = _driver_snapshot(mailbox)
+        if driver_state is None:
+            return self._send_json(404, {"error": "driver state not found"})
+        payload = {
+            "live": driver_state["live"],
+            "pid": driver_state["pid"],
+            "iteration": driver_state["iteration"],
+            "phase": driver_state["phase"],
+            "session_ids": driver_state["session_ids"],
+        }
+        if driver_state["driver"] is not None:
+            payload["driver"] = driver_state["driver"]
+        self._send_json(200, payload)
 
     # -- /api/transcript (SSE) ---------------------------------------------
 
@@ -1987,6 +2258,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_board(root))
+        if path == "/api/loop/status":
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_loop_status(root))
         if path == "/api/loop":
             root = self._request_root(query)
             if root is None:
@@ -2034,6 +2310,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(self._handle_agent_create)
         if path == "/api/registry/install":
             return self._api(self._handle_agent_install)
+        if path == "/api/loop/start":
+            return self._api(self._handle_loop_start)
+        if path == "/api/loop/stop":
+            return self._api(self._handle_loop_stop)
         self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:

@@ -1,8 +1,8 @@
 "use strict";
 
-/* Trio Loop Dashboard — read-only frontend.
+/* Trio Loop Dashboard — frontend.
  * No build step, no external dependencies. Talks to the backend at
- * /api/board, /api/loop and /api/transcript (SSE). */
+ * /api/board, /api/loop, /api/transcript (SSE), and loop controls. */
 
 const state = {
   boardTimer: null,
@@ -169,6 +169,7 @@ function loopState(loop) {
   if (verdict === "blocked") return "blocked";
   if (verdict === "needs_human") return "needs_human";
   if (status === "blocked") return "blocked";
+  if (loop.running) return "running";
   // "running" only when the mailbox is actively moving (fresh activity).
   if (status === "running") {
     const last = loop.last_activity ? new Date(loop.last_activity).getTime() : NaN;
@@ -371,16 +372,24 @@ function renderBoard() {
 
 function cardEl(loop) {
   const display = loopState(loop);
-  const card = document.createElement("button");
-  card.type = "button";
+  const card = document.createElement("article");
   card.className = "loop-card";
   card.dataset.loop = loop.name;
   if (state.activeLoop === loop.name) card.classList.add("active");
+  card.setAttribute("role", "group");
+  card.tabIndex = 0;
   card.setAttribute("aria-label", "Open detail for " + loop.name);
 
   const top = document.createElement("div");
   top.className = "card-top";
   top.appendChild(span("status-label status-" + display, STATE_LABEL[display]));
+  const phase = loop.driver_phase || loop.phase || "idle";
+  top.appendChild(
+    span(
+      "status-label status-phase",
+      String(phase).replace(/[-_]/g, " ").toUpperCase()
+    )
+  );
   const iter = document.createElement("span");
   iter.className = "card-iter";
   const cur = loop.iteration != null ? loop.iteration : "–";
@@ -408,8 +417,54 @@ function cardEl(loop) {
   bottom.appendChild(span("card-activity", relTime(loop.last_activity)));
   card.appendChild(bottom);
 
+  const controls = document.createElement("div");
+  controls.className = "card-controls";
+  const driver = loop.driver === "omnigent" ? "omnigent" : "portable";
+  const start = document.createElement("button");
+  start.type = "button";
+  start.textContent = "Start";
+  start.title = "Start " + driver + " loop";
+  start.disabled = Boolean(loop.running);
+  start.addEventListener("click", (event) => {
+    event.stopPropagation();
+    controlLoop("start", driver);
+  });
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.textContent = "Stop";
+  stop.title = "Stop " + driver + " loop";
+  stop.disabled = !loop.running;
+  stop.addEventListener("click", (event) => {
+    event.stopPropagation();
+    controlLoop("stop", driver);
+  });
+  controls.appendChild(start);
+  controls.appendChild(stop);
+  card.appendChild(controls);
+
   card.addEventListener("click", () => openDrawer(loop.name));
+  card.addEventListener("keydown", (event) => {
+    if (event.target !== card) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    openDrawer(loop.name);
+  });
   return card;
+}
+
+async function controlLoop(action, driver) {
+  try {
+    const res = await fetch("/api/loop/" + action, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root: currentRoot, driver }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    await refreshBoard();
+  } catch (err) {
+    showBoardError("Loop " + action + " failed: " + err.message);
+  }
 }
 
 function markActiveCard() {
