@@ -42,6 +42,7 @@ class CanonicalAgent:
     instructions: str            # markdown body
     model_tier: str              # "standard" | "high" | "cheap"
     tool_policy: str             # "read-only" | "edit" | "spawn"
+    spawns: list[str]             # optional named delegation allowlist
 ```
 
 Canonical agents are stored as `registry/canonical-agents/<name>.md` (YAML frontmatter + Markdown body).
@@ -58,7 +59,11 @@ Map to each harness's native model selection:
 Control sandbox/permission levels:
 - **read-only** — disallow Write/Edit/Agent (claude), sandbox_mode read-only (codex), read-only tools (omp/opencode)
 - **edit** — allow file writes, disallow Agent spawn (except opencode which allows with permission)
-- **spawn** — full agent-spawn permissions
+- **spawn** — delegate only to the optional named `spawns` allowlist. OMP writes
+  `spawns` as a comma-separated scalar, OpenCode writes nested
+  `permission.task` entries with wildcard deny, and Codex appends a short
+  delegation note to `developer_instructions`. An empty list keeps OMP's key
+  absent, OpenCode's task wildcard denied, and Codex's instructions unchanged.
 
 ### Per-harness renderers
 
@@ -73,7 +78,7 @@ The index builds `agent_matrix` by comparing each canonical render's `body_hash`
 
 ## Test suite
 
-Run all 164 tests:
+Run all 173 tests:
 ```bash
 python3 -m unittest discover -s registry/tests -t .
 ```

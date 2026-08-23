@@ -31,11 +31,19 @@ agents = _load("trio_registry_agents_test", "registry/agents.py")
 SEED_NAMES = ("registry-scout", "registry-editor")
 
 
-def _make_agent(name="sample-agent", model_tier="standard", tool_policy="edit",
-                 instructions="Hello.\n", description="A sample agent."):
+def _make_agent(
+    name="sample-agent",
+    model_tier="standard",
+    tool_policy="edit",
+    instructions="Hello.\n",
+    description="A sample agent.",
+    spawns=None,
+):
+    if spawns is None:
+        spawns = []
     return agents.CanonicalAgent(
         name=name, description=description, instructions=instructions,
-        model_tier=model_tier, tool_policy=tool_policy)
+        model_tier=model_tier, tool_policy=tool_policy, spawns=spawns)
 
 
 # --------------------------------------------------------------------------
@@ -72,6 +80,33 @@ class RoundTrip(unittest.TestCase):
         again = agents.parse_agent(dumped, name="tricky-agent")
         self.assertEqual(again.instructions, instructions)
 
+    def test_spawns_round_trip(self):
+        agent = _make_agent(
+            name="delegating-agent",
+            tool_policy="spawn",
+            spawns=["trio-builder", "trio-scout"],
+        )
+        self._assert_round_trips(agent)
+        dumped = agents.dump_agent(agent)
+        self.assertIn(
+            "spawns:\n  - trio-builder\n  - trio-scout\n",
+            dumped,
+        )
+
+    def test_comma_separated_spawns_parse(self):
+        text = (
+            "---\n"
+            "name: parsed-agent\n"
+            "description: Parsed agent.\n"
+            "model_tier: standard\n"
+            "tool_policy: spawn\n"
+            "spawns: trio-builder, trio-scout\n"
+            "---\n"
+            "Instructions.\n"
+        )
+        parsed = agents.parse_agent(text, name="parsed-agent")
+        self.assertEqual(parsed.spawns, ["trio-builder", "trio-scout"])
+
 
 # --------------------------------------------------------------------------
 # Validation
@@ -98,6 +133,17 @@ class Validation(unittest.TestCase):
     def test_unknown_tool_policy_raises(self):
         with self.assertRaises(ValueError):
             _make_agent(tool_policy="god-mode")
+
+    def test_invalid_spawn_name_raises(self):
+        with self.assertRaises(ValueError):
+            _make_agent(tool_policy="spawn", spawns=["trio/builder"])
+
+    def test_duplicate_spawn_names_raise(self):
+        with self.assertRaises(ValueError):
+            _make_agent(
+                tool_policy="spawn",
+                spawns=["trio-builder", "trio-builder"],
+            )
 
     def test_name_stem_mismatch_raises(self):
         text = agents.dump_agent(_make_agent(name="foo"))
@@ -221,7 +267,68 @@ class OpencodePermission(unittest.TestCase):
         agent = _make_agent(tool_policy="spawn")
         r = agents.render_agent(agent, "opencode")
         fields, _ = scan.parse_frontmatter(r.text)
-        self.assertEqual(fields["permission"], {"task": "allow"})
+        self.assertEqual(fields["permission"], {"task": {"*": "deny"}})
+
+    def test_named_spawn_permission_dict(self):
+        agent = _make_agent(
+            name="opencode-spawn-agent",
+            tool_policy="spawn",
+            spawns=["trio-builder", "trio-scout"],
+        )
+        r = agents.render_agent(agent, "opencode")
+        fields, _ = scan.parse_frontmatter(r.text)
+        self.assertEqual(
+            fields["permission"],
+            {
+                "task": {
+                    "*": "deny",
+                    "trio-builder": "allow",
+                    "trio-scout": "allow",
+                }
+            },
+        )
+
+
+class SpawnRendering(unittest.TestCase):
+    def test_omp_uses_comma_separated_spawn_string(self):
+        agent = _make_agent(
+            name="omp-spawn-agent",
+            tool_policy="spawn",
+            spawns=["trio-builder", "trio-scout"],
+        )
+        r = agents.render_agent(agent, "omp")
+        fields, _ = scan.parse_frontmatter(r.text)
+        self.assertIn("spawns:", r.text)
+        self.assertIsInstance(fields["spawns"], str)
+        self.assertIn("trio-builder", fields["spawns"])
+        self.assertIn("trio-scout", fields["spawns"])
+
+    def test_empty_omp_spawn_list_omits_key(self):
+        agent = _make_agent(name="omp-empty-spawn", tool_policy="spawn")
+        r = agents.render_agent(agent, "omp")
+        fields, _ = scan.parse_frontmatter(r.text)
+        self.assertNotIn("spawns", fields)
+
+    def test_codex_appends_named_delegation_note(self):
+        instructions = "Original instructions.\n"
+        agent = _make_agent(
+            name="codex-spawn-agent",
+            tool_policy="spawn",
+            instructions=instructions,
+            spawns=["trio-builder", "trio-scout"],
+        )
+        r = agents.render_agent(agent, "codex")
+        fields = scan.parse_toml(r.text)
+        developer_instructions = fields["developer_instructions"]
+        self.assertIn(instructions, developer_instructions)
+        self.assertIn("trio-builder", developer_instructions)
+        self.assertIn("trio-scout", developer_instructions)
+
+    def test_empty_codex_spawn_list_keeps_instructions(self):
+        agent = _make_agent(name="codex-empty-spawn", tool_policy="spawn")
+        r = agents.render_agent(agent, "codex")
+        fields = scan.parse_toml(r.text)
+        self.assertEqual(fields["developer_instructions"], agent.instructions)
 
 
 # --------------------------------------------------------------------------
@@ -239,6 +346,10 @@ class AllCombinations(unittest.TestCase):
                     with self.subTest(tier=tier, policy=policy, harness=harness):
                         r = agents.render_agent(agent, harness)
                         self.assertTrue(r.text)
+                        if r.format == "toml":
+                            scan.parse_toml(r.text)
+                        else:
+                            scan.parse_frontmatter(r.text)
 
     def test_model_value_non_empty_for_claude_codex_omp(self):
         for tier in agents.MODEL_TIERS:
@@ -363,6 +474,7 @@ class AgentIndexRecords(unittest.TestCase):
             self.assertIn("path", r)
             self.assertIn("model_tier", r)
             self.assertIn("tool_policy", r)
+            self.assertEqual(r["spawns"], [])
             self.assertIn("description", r)
             self.assertEqual(set(r["renders"]), set(agents.RENDER_HARNESSES))
             for harness, render in r["renders"].items():

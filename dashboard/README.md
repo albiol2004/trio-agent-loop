@@ -58,7 +58,14 @@ The **Skills** page (`/skills.html`) edits skill registry files with a typed fro
 ## Canonical agents & install matrix
 
 The **Agents** page (`/agents.html`) displays canonical-agent definitions and per-harness installation status:
-- **Canonical agents** (`registry/canonical-agents/`) are harness-neutral definitions: name, description, instructions, model tier (standard/high/cheap), and tool policy (read-only/edit/spawn).
+- **Canonical agents** (`registry/canonical-agents/`) are harness-neutral
+  definitions: name, description, instructions, model tier
+  (standard/high/cheap), tool policy (read-only/edit/spawn), and an optional
+  named `spawns` allowlist.
+- **Spawn policy** — OMP renders named spawns as a comma-separated
+  frontmatter string; OpenCode uses nested `permission.task` entries with
+  wildcard deny; Codex appends a delegation note to
+  `developer_instructions`. Empty lists preserve each harness's safe default.
 - **Install matrix** shows each canonical agent as a row with a cell per supported harness (claude, codex, omp, opencode) indicating sync status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported.
 - **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
 - **Install endpoint** — `POST /api/registry/install` renders a canonical agent into a harness's native format and writes it to the correct location (e.g., `~/.claude/agents/` for claude). Returns 404 for an unknown agent, 400 for an unsupported harness (e.g., omnigent), and 403 if the destination is managed by generate.py.

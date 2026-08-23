@@ -22,7 +22,7 @@ import copy
 import importlib.util
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -87,7 +87,8 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
         "claude": {},
         "codex": {},
         "omp": {},
-        "opencode": {"permission": {"task": "allow"}},
+        # Named targets are added by the OpenCode renderer below.
+        "opencode": {"permission": {"task": {"*": "deny"}}},
     },
 }
 
@@ -129,6 +130,21 @@ def _validate(name: str, description, model_tier, tool_policy) -> None:
             f"{sorted(TOOL_POLICIES)}")
 
 
+def _validate_spawns(spawns: list[str]) -> None:
+    """Validate the named agents allowed by a canonical agent."""
+    if not isinstance(spawns, list):
+        raise ValueError(f"spawns must be a list, got {spawns!r}")
+
+    seen = set()
+    for spawn in spawns:
+        if not isinstance(spawn, str) or not NAME_RE.match(spawn):
+            raise ValueError(
+                f"invalid spawn name {spawn!r}: must match {NAME_RE.pattern!r}")
+        if spawn in seen:
+            raise ValueError(f"duplicate spawn name {spawn!r}")
+        seen.add(spawn)
+
+
 @dataclass
 class CanonicalAgent:
     name: str
@@ -136,9 +152,11 @@ class CanonicalAgent:
     instructions: str
     model_tier: str
     tool_policy: str
+    spawns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _validate(self.name, self.description, self.model_tier, self.tool_policy)
+        _validate_spawns(self.spawns)
 
 
 @dataclass
@@ -185,12 +203,28 @@ def parse_agent(text: str, *, name: str | None = None) -> CanonicalAgent:
         raise ValueError(
             "agent has no name: frontmatter has no 'name' key and no "
             "name argument was given")
+
+    raw_spawns = fields.get("spawns", [])
+    if isinstance(raw_spawns, str):
+        # OMP stores this field as one comma-separated scalar.
+        raw_spawns = (
+            [] if not raw_spawns.strip()
+            else [item.strip() for item in raw_spawns.split(",")]
+        )
+    elif isinstance(raw_spawns, list):
+        raw_spawns = list(raw_spawns)
+    else:
+        raise ValueError(
+            f"spawns must be a YAML list or comma-separated string, "
+            f"got {raw_spawns!r}")
+
     return CanonicalAgent(
         name=resolved_name,
         description=fields.get("description"),
         instructions=body,
         model_tier=fields.get("model_tier"),
         tool_policy=fields.get("tool_policy"),
+        spawns=raw_spawns,
     )
 
 
@@ -202,6 +236,9 @@ def dump_agent(agent: CanonicalAgent) -> str:
         "model_tier": agent.model_tier,
         "tool_policy": agent.tool_policy,
     }
+    # Empty spawns stay implicit so existing seed files keep their shape.
+    if agent.spawns:
+        fields["spawns"] = list(agent.spawns)
     return scan.join_file(fields, agent.instructions, "yaml")
 
 
@@ -266,7 +303,16 @@ def _render_codex(agent: CanonicalAgent) -> RenderedAgent:
     fields.update(_tier_fields("codex", agent.model_tier))
     fields.update(_policy_fields("codex", agent.tool_policy))
     fields["description"] = agent.description
-    text = scan.join_file(fields, agent.instructions, "toml")
+    instructions = agent.instructions
+    if agent.tool_policy == "spawn" and agent.spawns:
+        # Codex has no native per-agent spawn field, so explain delegation in
+        # the developer instructions while preserving the original body first.
+        note = (
+            f"Delegation: may spawn {', '.join(agent.spawns)} "
+            "via the task/spawn tool.\n"
+        )
+        instructions += f"\n\n{note}"
+    text = scan.join_file(fields, instructions, "toml")
     return RenderedAgent("codex", f"{agent.name}.toml", "toml", text)
 
 
@@ -274,6 +320,9 @@ def _render_omp(agent: CanonicalAgent) -> RenderedAgent:
     fields = {"name": agent.name, "description": agent.description}
     fields.update(_tier_fields("omp", agent.model_tier))
     fields.update(_policy_fields("omp", agent.tool_policy))
+    if agent.tool_policy == "spawn" and agent.spawns:
+        # OMP expects one comma-separated scalar; an empty key is invalid.
+        fields["spawns"] = ", ".join(agent.spawns)
     text = scan.join_file(fields, agent.instructions, "yaml")
     return RenderedAgent("omp", f"{agent.name}.md", "yaml", text)
 
@@ -282,6 +331,12 @@ def _render_opencode(agent: CanonicalAgent) -> RenderedAgent:
     fields = {"description": agent.description, "mode": "subagent", "hidden": True}
     fields.update(_tier_fields("opencode", agent.model_tier))
     fields.update(_policy_fields("opencode", agent.tool_policy))
+    if agent.tool_policy == "spawn":
+        # OpenCode uses task patterns, so deny every task before allowing the
+        # explicit named targets. This also gives empty spawn lists safe output.
+        task_permission = fields["permission"]["task"]
+        for spawn in agent.spawns:
+            task_permission[spawn] = "allow"
     text = scan.join_file(fields, agent.instructions, "yaml")
     return RenderedAgent("opencode", f"{agent.name}.md", "yaml", text)
 
@@ -341,6 +396,7 @@ def agent_index_records(root: Path | None = None) -> list[dict]:
             "surface": "canonical-agent",
             "model_tier": agent.model_tier,
             "tool_policy": agent.tool_policy,
+            "spawns": list(agent.spawns),
             "description": agent.description,
             "renders": renders,
             "unsupported": unsupported,
