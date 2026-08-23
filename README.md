@@ -114,6 +114,9 @@ ITERATE verdict and simply stops rescheduling on SHIP/BLOCKED/NEEDS_HUMAN.
 Press **Esc**
 to pause it yourself; `/loop 10m /trio` forces a fixed cadence instead.
 
+For unattended Omnigent iterations from the repository, run:
+`trioctl omnigent loop --mailbox loop/ --max-iterations 10`.
+
 ## Control knobs while it runs
 - `loop/GOAL.md` — edit anytime; next iteration obeys it.
 - `loop/STATE.md` → `max_iterations` (default 10) — hard budget cap.
@@ -270,7 +273,8 @@ kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/references/prompts/{lead,scout,builder,evaluator}.md
   smoke-test.sh
 ```
-`trioctl omnigent session create|wait|read` uses the local broker at
+`trioctl omnigent loop` uses loop-core with fresh Omnigent Lead and Evaluator
+sessions. `trioctl omnigent session create|wait|read` uses the local broker at
 `http://127.0.0.1:6767` by default. Auth prefers `OMNIGENT_TOKEN` or
 `OMNIGENT_REMOTE_AUTH_TOKEN`, then the server-keyed
 `~/.omnigent/auth_tokens.json` record when it is not expired.

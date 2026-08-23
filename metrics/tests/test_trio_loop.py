@@ -1,6 +1,7 @@
 """Behavioral tests for the stdlib Trio loop state machine."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -95,6 +96,71 @@ class LeadCrashRunner(FakeRunner):
 def state_text(mailbox: Path) -> str:
     """Read state for assertions without depending on the metrics parser."""
     return (mailbox / "STATE.md").read_text(encoding="utf-8")
+
+
+def test_gate_aliases_are_public() -> None:
+    assert trio_loop.run_commit_gate is trio_loop._commit_gate
+    assert trio_loop.run_log_gate is trio_loop._log_gate
+
+
+def test_ship_persists_driver_state(tmp_path: Path) -> None:
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"])
+    runner.session_ids = {
+        "lead": "lead-session",
+        "evaluator": "evaluator-session",
+    }
+
+    assert trio_loop.run_loop(mailbox, 1, runner) == 0
+
+    driver_state = json.loads(
+        (mailbox / ".driver.json").read_text(encoding="utf-8")
+    )
+    assert driver_state == {
+        "pid": os.getpid(),
+        "iteration": 1,
+        "phase": "shipped",
+        "session_ids": runner.session_ids,
+    }
+    assert "phase: shipped" in state_text(mailbox)
+
+
+def test_main_accepts_omnigent_runner_without_live_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeOmnigentRunner:
+        def __init__(self, **kwargs: object) -> None:
+            seen["runner_kwargs"] = kwargs
+
+    def fake_run_loop(*args: object, **kwargs: object) -> int:
+        seen["run_args"] = args
+        seen["run_kwargs"] = kwargs
+        return 23
+
+    monkeypatch.setattr(
+        trio_loop,
+        "_load_omnigent_runner",
+        lambda: FakeOmnigentRunner,
+    )
+    monkeypatch.setattr(trio_loop, "run_loop", fake_run_loop)
+
+    result = trio_loop.main(
+        [
+            "run",
+            "--mailbox",
+            str(tmp_path),
+            "--max-iterations",
+            "1",
+            "--runner",
+            "omnigent",
+        ]
+    )
+
+    assert result == 23
+    assert seen["runner_kwargs"] == {"repo": Path.cwd()}
 
 
 def init_git(path: Path) -> None:

@@ -701,6 +701,270 @@ def command_session_read(args: argparse.Namespace) -> int:
     return 0
 
 
+class OmnigentRunner:
+    """Run Trio judgment roles through fresh broker sessions."""
+
+    session_ids: dict[str, str]
+
+    def __init__(
+        self,
+        repo: Path | None = None,
+        *,
+        broker_client: Any | None = None,
+        client: Any | None = None,
+        config: dict[str, Any] | None = None,
+        models: dict[str, list[dict[str, Any]]] | None = None,
+        base_url: str | None = None,
+        timeout: float = 300.0,
+        interval: float = 1.0,
+    ) -> None:
+        if broker_client is not None and client is not None:
+            raise ValueError("provide only one broker client")
+        self.repo = Path(repo or Path.cwd()).resolve()
+        self._config = config
+        self._models = models or {}
+        self._broker_client = (
+            broker_client if broker_client is not None else client
+        )
+        self._base_url = base_url or broker_http.DEFAULT_BASE_URL
+        self._timeout = timeout
+        self._interval = interval
+        self.session_ids: dict[str, str] = {}
+
+    def _load_config(self) -> dict[str, Any]:
+        """Load the user profile only when the first role is dispatched."""
+        if self._config is None:
+            self._config = load_config(config_path())
+        return self._config
+
+    def _agent_id(self, role: str) -> str:
+        """Resolve only the exact persisted Lead/Evaluator registry key."""
+        path = omnigent_registry_path()
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TrioctlError(
+                f"cannot read Omnigent role registry {path}: {exc}"
+            ) from exc
+        key = f"trio-omnigent-{role}"
+        entry = entries.get(key) if isinstance(entries, dict) else None
+        agent_id = entry.get("agent_id") if isinstance(entry, dict) else None
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise TrioctlError(
+                f"{path}: {key} is missing a non-empty agent_id"
+            )
+        return agent_id.strip()
+
+    def _resolve_model(self, role: str) -> str:
+        """Resolve a role through trioctl's strict, no-fallback resolver."""
+        config = self._load_config()
+        spec = config["roles"][role]
+        provider = spec.get("provider")
+        if provider in self._models:
+            resolved = resolve_role(
+                role,
+                config,
+                models=self._models[provider],
+            )
+        else:
+            resolved = resolve_role(role, config)
+        model = resolved.get("model")
+        if not isinstance(model, str) or not model:
+            raise TrioctlError(f"roles.{role}: resolver returned no model")
+        return model
+
+    def _prompt_path(self, role: str) -> Path:
+        """Find the checked-in prompt, including from an installed trioctl."""
+        relative = Path(
+            "omnigent",
+            "entrypoints",
+            "trio-omnigent",
+            "prompts",
+            f"{role}.md",
+        )
+        source_root = Path(__file__).resolve().parent.parent
+        candidates = (self.repo / relative, source_root / relative)
+        for path in candidates:
+            if path.is_file():
+                return path
+        raise TrioctlError(f"missing Omnigent prompt: {relative}")
+
+    def _prompt(self, role: str, iteration: int, mailbox: Path) -> str:
+        """Fill a role prompt without interpreting braces in its prose."""
+        prompt_role = "lead" if role == "repair" else role
+        template = self._prompt_path(prompt_role).read_text(encoding="utf-8")
+        values = {
+            "{mailbox}": str(mailbox.resolve()),
+            "{iteration}": str(iteration),
+            "{repo}": str(self.repo),
+        }
+        for placeholder, value in values.items():
+            template = template.replace(placeholder, value)
+        if role != "repair":
+            return template.rstrip() + "\n"
+
+        verdict_path = mailbox / "VERDICT.md"
+        try:
+            verdict = verdict_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+        except OSError as exc:
+            raise TrioctlError(
+                f"cannot read repair verdict {verdict_path}: {exc}"
+            ) from exc
+        scope_note = next(
+            (line for line in verdict.splitlines() if line.strip()),
+            "VERDICT.md has no scope line",
+        )
+        return (
+            template.rstrip()
+            + "\n\n## Scoped repair\n"
+            + f"Read `{verdict_path}` and fix only its listed scope.\n"
+            + f"Scope note: {scope_note}\n"
+            + f"Append `- iter {iteration} | repair | <one-line summary>` "
+            "to LOG.md for this repair.\n"
+        )
+
+    def _client(self) -> Any:
+        """Reuse an injected fake or build the real HTTP client once."""
+        if self._broker_client is None:
+            self._broker_client = _session_client(self._base_url)
+        return self._broker_client
+
+    @staticmethod
+    def _create(
+        client: Any,
+        agent_id: str,
+        model: str,
+        prompt: str,
+        title: str,
+    ) -> Any:
+        """Call the checked-in client seam or a small test double."""
+        method = getattr(client, "create_session", None) or getattr(
+            client, "create", None
+        )
+        if method is None:
+            raise TrioctlError("broker client has no session-create method")
+        return method(agent_id, model, prompt, title)
+
+    def _wait(self, client: Any, session_id: str) -> Any:
+        """Wait through a fake seam or poll the real broker session."""
+        method = getattr(client, "wait_session", None) or getattr(
+            client, "wait", None
+        )
+        if method is not None:
+            try:
+                return method(
+                    session_id,
+                    timeout=self._timeout,
+                    interval=self._interval,
+                )
+            except TypeError:
+                return method(session_id)
+
+        deadline = time.monotonic() + self._timeout
+        while True:
+            get_session = getattr(client, "get_session", None)
+            if get_session is None:
+                raise TrioctlError("broker client has no session-wait method")
+            snapshot = get_session(session_id)
+            if _session_status(snapshot) in SESSION_TERMINAL_STATUSES:
+                return snapshot
+            if time.monotonic() >= deadline:
+                raise TrioctlError(
+                    f"session {session_id} timed out after "
+                    f"{self._timeout:g} seconds"
+                )
+            time.sleep(self._interval)
+
+    @staticmethod
+    def _read(client: Any, session_id: str) -> Any:
+        """Read committed session items before returning to the loop driver."""
+        method = (
+            getattr(client, "get_items", None)
+            or getattr(client, "read_session", None)
+            or getattr(client, "read", None)
+        )
+        if method is None:
+            raise TrioctlError("broker client has no session-read method")
+        return method(session_id)
+
+    @staticmethod
+    def _session_id(created: Any) -> str | None:
+        if isinstance(created, dict):
+            value = created.get("id") or created.get("session_id")
+            return value if isinstance(value, str) and value else None
+        return created if isinstance(created, str) and created else None
+
+    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+        """Create, await, and read one Lead, Evaluator, or repair session."""
+        if role not in {"lead", "evaluator", "repair"}:
+            raise TrioctlError(f"unknown Omnigent loop role: {role}")
+        mailbox = Path(mailbox).resolve()
+        registered_role = "lead" if role == "repair" else role
+        agent_id = self._agent_id(registered_role)
+        model = self._resolve_model(registered_role)
+        prompt = self._prompt(role, iteration, mailbox)
+        title = f"trioctl {mailbox.name} iteration {iteration} {role}"
+        client = self._client()
+        try:
+            created = self._create(
+                client,
+                agent_id,
+                model,
+                prompt,
+                title,
+            )
+            session_id = self._session_id(created)
+            if session_id is None:
+                raise TrioctlError("session create response has no session id")
+            self.session_ids[role] = session_id
+            snapshot = self._wait(client, session_id)
+            self._read(client, session_id)
+        except broker_http.BrokerHttpError as exc:
+            raise TrioctlError(str(exc)) from exc
+        if _session_status(snapshot) in {"failed", "error"}:
+            return 1
+        return 0
+
+
+def _load_trio_loop(repo: Path) -> Any:
+    """Load loop-core by path so the ``omnigent`` directory is not a package."""
+    path = repo / "metrics" / "trio_loop.py"
+    if not path.is_file():
+        raise TrioctlError(f"loop core is missing: {path}")
+    loader = importlib.machinery.SourceFileLoader("trio_loop", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise TrioctlError(f"cannot load loop core from {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    if not callable(getattr(module, "run_loop", None)):
+        raise TrioctlError(f"{path} does not expose run_loop")
+    return module
+
+
+def command_loop(args: argparse.Namespace) -> int:
+    """Run loop-core with the Omnigent role runner."""
+    repo = Path.cwd().resolve()
+    mailbox = Path(args.mailbox).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = repo / mailbox
+    mailbox = mailbox.resolve()
+    mailbox.mkdir(parents=True, exist_ok=True)
+    loop_core = _load_trio_loop(repo)
+    runner = OmnigentRunner(
+        repo=repo,
+        base_url=getattr(args, "base_url", None),
+    )
+    return loop_core.run_loop(
+        mailbox,
+        args.max_iterations,
+        runner,
+        repo=repo,
+    )
+
+
 def omnigent_registry_path() -> Path:
     """Return the existing user-owned role registry path."""
     return (
@@ -987,6 +1251,18 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--workspace", default=".")
     run.add_argument("--timeout", type=float)
     run.set_defaults(func=command_run)
+
+    loop = commands.add_parser(
+        "loop",
+        help="run loop-core with Omnigent Lead and Evaluator sessions",
+    )
+    loop.add_argument("--mailbox", type=Path, default=Path("loop"))
+    loop.add_argument("--max-iterations", type=int, default=10)
+    loop.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
+    loop.set_defaults(func=command_loop)
 
     session = commands.add_parser(
         "session",

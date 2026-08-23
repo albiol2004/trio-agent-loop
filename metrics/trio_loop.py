@@ -9,7 +9,9 @@ this driver accepts exactly what trio-check.py accepts.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -91,6 +93,22 @@ def _update_state(path: Path, updates: dict[str, str]) -> None:
             result.append(f"{key}: {updates[key]}")
     path.write_text(
         "\n".join(result) + ("\n" if result else ""), encoding="utf-8"
+    )
+
+
+def _write_driver_state(
+    mailbox: Path, runner: RoleRunner, iteration: int, phase: str
+) -> None:
+    """Persist the loop cursor and runner sessions outside the mailbox schema."""
+    payload = {
+        "pid": os.getpid(),
+        "iteration": iteration,
+        "phase": phase,
+        "session_ids": getattr(runner, "session_ids", {}) or {},
+    }
+    (mailbox / ".driver.json").write_text(
+        json.dumps(payload) + "\n",
+        encoding="utf-8",
     )
 
 def _append_log(mailbox: Path, line: str) -> None:
@@ -180,6 +198,10 @@ def _log_gate(mailbox: Path, iteration: int, role: str) -> tuple[bool, str]:
                 return True, "LOG gate passed"
     return False, f"LOG.md has no iter {iteration} | {role} | line"
 
+
+run_commit_gate = _commit_gate
+run_log_gate = _log_gate
+
 def _run_role(mailbox, iteration, role, runner, repo, state_path) -> bool:
     """Run a Lead/repair role, retrying a failed gate once."""
     for _attempt in range(2):
@@ -267,12 +289,21 @@ def run_loop(
             )
         state = _read_state(state_path)
         repair_path = mailbox / ".repairs"
+        _write_driver_state(
+            mailbox,
+            runner,
+            _number(state["iteration"]),
+            state["phase"].strip(),
+        )
         while True:
             status = state["status"].strip().lower()
             terminal = TERMINAL_CODES.get(status.split()[0] if status else "")
-            if terminal is not None:
-                return terminal
             iteration = _number(state["iteration"])
+            if terminal is not None:
+                _write_driver_state(
+                    mailbox, runner, iteration, state["phase"].strip()
+                )
+                return terminal
             # Crash-resume: Lead+gates already landed, so do not bump
             # iteration or re-run Lead (fixes driver.sh:107-108).
             if state["phase"].strip().lower() == "lead-done":
@@ -290,6 +321,7 @@ def run_loop(
                         mailbox,
                         f"- iter {iteration} | loop | unparseable verdict",
                     )
+                    _write_driver_state(mailbox, runner, iteration, "error")
                     return 3
                 code = _apply_verdict(
                     mailbox,
@@ -299,9 +331,15 @@ def run_loop(
                     verdict,
                     scope,
                 )
+                state = _read_state(state_path)
+                _write_driver_state(
+                    mailbox,
+                    runner,
+                    _number(state["iteration"]),
+                    state["phase"].strip(),
+                )
                 if code is not None:
                     return code
-                state = _read_state(state_path)
                 continue
             phase = state["phase"].strip().lower()
             if phase in ("lead-running", "repair-running"):
@@ -320,13 +358,22 @@ def run_loop(
                     "phase": f"{role}-running",
                 },
             )
+            _write_driver_state(mailbox, runner, iteration, f"{role}-running")
             if not _run_role(
                 mailbox, iteration, role, runner, repo, state_path
             ):
+                state = _read_state(state_path)
+                _write_driver_state(
+                    mailbox,
+                    runner,
+                    _number(state["iteration"]),
+                    state["phase"].strip(),
+                )
                 return 3
             _update_state(
                 state_path, {"status": "running", "phase": "lead-done"}
             )
+            _write_driver_state(mailbox, runner, iteration, "lead-done")
             state = _read_state(state_path)
     finally:
         shutil.rmtree(lock, ignore_errors=True)
@@ -349,19 +396,48 @@ class _PortableRunner:
         )
         return result.returncode
 
+
+def _load_omnigent_runner():
+    """Load OmnigentRunner without importing the ``omnigent`` package."""
+    path = Path(__file__).resolve().parent.parent / "omnigent" / "trioctl"
+    if not path.is_file():
+        raise ImportError(f"OmnigentRunner source is missing: {path}")
+    loader = importlib.machinery.SourceFileLoader("trioctl", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load OmnigentRunner from {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    runner = getattr(module, "OmnigentRunner", None)
+    if not callable(runner):
+        raise ImportError(f"{path} does not expose OmnigentRunner")
+    return runner
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="run the Trio state machine")
     run.add_argument("--mailbox", type=Path, required=True)
     run.add_argument("--max-iterations", type=int, required=True)
-    run.add_argument("--runner", choices=("portable",), default="portable")
+    run.add_argument(
+        "--runner",
+        choices=("portable", "omnigent"),
+        default="portable",
+    )
     args = parser.parse_args(argv)
-    try:
-        return run_loop(args.mailbox, args.max_iterations, _PortableRunner())
-    except NotImplementedError as exc:
-        print(f"trio_loop.py: {exc}", file=sys.stderr)
-        return 3
+    repo = Path.cwd()
+    runner = (
+        _PortableRunner()
+        if args.runner == "portable"
+        else _load_omnigent_runner()(repo=repo)
+    )
+    return run_loop(
+        args.mailbox,
+        args.max_iterations,
+        runner,
+        repo=repo,
+    )
 
 if __name__ == "__main__":
     sys.exit(main())
