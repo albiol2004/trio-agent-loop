@@ -22,6 +22,7 @@ VERSION = "0.4.0"
 ROLES = ("lead", "evaluator", "builder", "scout")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
 CURSOR_WORKER_ROLES = ("builder", "scout")
+DEFAULT_LOOP_WAIT_TIMEOUT = 3600.0
 # Registered Omnigent agents persist their bundle prompt at creation time.
 # Bump this marker whenever the Lead/Evaluator config changes materially so a
 # stale anchor is backed up and recreated by the entrypoint preflight.
@@ -617,7 +618,118 @@ def command_run(args: argparse.Namespace) -> int:
     return 0
 
 
-SESSION_TERMINAL_STATUSES = {"completed", "failed", "error"}
+SESSION_FAILURE_STATUSES = {"failed", "error"}
+
+
+def _session_items(payload: Any) -> list[Any]:
+    """Extract item rows from either the API list or envelope response."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _item_id(item: Any) -> str | None:
+    """Read the stable identifier used to distinguish a new transcript item."""
+    if not isinstance(item, dict):
+        return None
+    for key in ("id", "item_id", "response_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _item_role(item: Any) -> str:
+    """Read a conversation item's role across API envelope versions."""
+    if not isinstance(item, dict):
+        return ""
+    role = item.get("role")
+    if isinstance(role, str):
+        return role.lower()
+    data = item.get("data")
+    role = data.get("role") if isinstance(data, dict) else None
+    return role.lower() if isinstance(role, str) else ""
+
+
+def _is_assistant_or_turn_item(item: Any) -> bool:
+    """Return whether an item proves that the requested turn produced output."""
+    if _item_role(item) == "assistant":
+        return True
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("type") or "").lower() in {"assistant", "response", "turn"}
+
+
+def _get_latest_items(client: Any, session_id: str) -> Any:
+    """Fetch only the newest item, as required for inexpensive polling."""
+    method = getattr(client, "get_items", None)
+    if method is None:
+        raise TrioctlError("broker client has no session-items method")
+    try:
+        return method(session_id, limit=1, order="desc")
+    except TypeError:
+        # Keep small test doubles compatible while the real client uses the
+        # explicit API query that prevents downloading the whole transcript.
+        return method(session_id)
+
+
+def _wait_for_session(
+    client: Any,
+    session_id: str,
+    *,
+    timeout: float,
+    interval: float,
+) -> Any:
+    """Wait for a turn, not merely for the session's initial idle state.
+
+    A newly created Omnigent session starts in ``idle`` before dispatch. It is
+    complete only after observing ``running`` followed by ``idle`` or after a
+    newer assistant/turn item appears in the transcript.
+    """
+    if timeout < 0:
+        raise TrioctlError("--timeout must be non-negative")
+    if interval < 0:
+        raise TrioctlError("--interval must be non-negative")
+
+    get_session = getattr(client, "get_session", None)
+    if get_session is None:
+        raise TrioctlError("broker client has no session-wait method")
+    seed_items = _session_items(_get_latest_items(client, session_id))
+    seed = seed_items[0] if seed_items else None
+    seed_id = _item_id(seed)
+    seed_is_output = _is_assistant_or_turn_item(seed)
+    saw_running = False
+    deadline = time.monotonic() + timeout
+
+    while True:
+        snapshot = get_session(session_id)
+        status = _session_status(snapshot)
+        if status in SESSION_FAILURE_STATUSES:
+            return snapshot
+        if status == "running":
+            saw_running = True
+
+        latest_items = _session_items(_get_latest_items(client, session_id))
+        latest = latest_items[0] if latest_items else None
+        latest_id = _item_id(latest)
+        is_new_output = _is_assistant_or_turn_item(latest) and (
+            (seed_id is not None and latest_id != seed_id)
+            or (seed_id is None and not seed_is_output)
+        )
+        if is_new_output or (status == "idle" and saw_running):
+            return snapshot
+
+        if time.monotonic() >= deadline:
+            raise TrioctlError(
+                f"session {session_id} timed out after {timeout:g} seconds"
+            )
+        remaining = deadline - time.monotonic()
+        time.sleep(min(interval, remaining))
 
 
 def _session_client(base_url: str | None = None) -> Any:
@@ -657,29 +769,19 @@ def _session_status(snapshot: Any) -> str:
 
 
 def command_session_wait(args: argparse.Namespace) -> int:
-    """Poll a broker session until it reaches a terminal status."""
-    if args.timeout < 0:
-        raise TrioctlError("--timeout must be non-negative")
-    if args.interval < 0:
-        raise TrioctlError("--interval must be non-negative")
-
+    """Poll a broker session until the requested turn has finished."""
     client = _session_client(getattr(args, "base_url", None))
-    deadline = time.monotonic() + args.timeout
-    while True:
-        try:
-            snapshot = client.get_session(args.session_id)
-        except broker_http.BrokerHttpError as exc:
-            raise TrioctlError(str(exc)) from exc
-        if _session_status(snapshot) in SESSION_TERMINAL_STATUSES:
-            _print_json(snapshot)
-            return 0
-        if time.monotonic() >= deadline:
-            raise TrioctlError(
-                f"session {args.session_id} timed out after "
-                f"{args.timeout:g} seconds"
-            )
-        remaining = deadline - time.monotonic()
-        time.sleep(min(args.interval, remaining))
+    try:
+        snapshot = _wait_for_session(
+            client,
+            args.session_id,
+            timeout=args.timeout,
+            interval=args.interval,
+        )
+    except broker_http.BrokerHttpError as exc:
+        raise TrioctlError(str(exc)) from exc
+    _print_json(snapshot)
+    return 1 if _session_status(snapshot) in SESSION_FAILURE_STATUSES else 0
 
 
 def command_session_read(args: argparse.Namespace) -> int:
@@ -715,7 +817,7 @@ class OmnigentRunner:
         config: dict[str, Any] | None = None,
         models: dict[str, list[dict[str, Any]]] | None = None,
         base_url: str | None = None,
-        timeout: float = 300.0,
+        timeout: float = DEFAULT_LOOP_WAIT_TIMEOUT,
         interval: float = 1.0,
     ) -> None:
         if broker_client is not None and client is not None:
@@ -862,20 +964,12 @@ class OmnigentRunner:
             except TypeError:
                 return method(session_id)
 
-        deadline = time.monotonic() + self._timeout
-        while True:
-            get_session = getattr(client, "get_session", None)
-            if get_session is None:
-                raise TrioctlError("broker client has no session-wait method")
-            snapshot = get_session(session_id)
-            if _session_status(snapshot) in SESSION_TERMINAL_STATUSES:
-                return snapshot
-            if time.monotonic() >= deadline:
-                raise TrioctlError(
-                    f"session {session_id} timed out after "
-                    f"{self._timeout:g} seconds"
-                )
-            time.sleep(self._interval)
+        return _wait_for_session(
+            client,
+            session_id,
+            timeout=self._timeout,
+            interval=self._interval,
+        )
 
     @staticmethod
     def _read(client: Any, session_id: str) -> Any:
@@ -956,6 +1050,7 @@ def command_loop(args: argparse.Namespace) -> int:
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
+        timeout=getattr(args, "wait_timeout", DEFAULT_LOOP_WAIT_TIMEOUT),
     )
     return loop_core.run_loop(
         mailbox,
@@ -1271,6 +1366,12 @@ def parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--mailbox", type=Path, default=Path("loop"))
     loop.add_argument("--max-iterations", type=int, default=10)
+    loop.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_LOOP_WAIT_TIMEOUT,
+        help="maximum seconds to wait for each role turn",
+    )
     loop.add_argument(
         "--base-url",
         default=broker_http.DEFAULT_BASE_URL,

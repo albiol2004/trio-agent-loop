@@ -170,4 +170,5 @@ verdict.
 <!-- trio-protocol:end -->
 
 ## Headless
-Run `trioctl omnigent loop --mailbox loop/` for unattended iterations.
+Run `trioctl omnigent loop --mailbox loop/ --wait-timeout 3600` for unattended
+iterations; `idle` completes only after a turn edge or a new assistant item.

@@ -80,10 +80,15 @@ def fake_broker():
     """Run a local-only HTTP broker with deterministic session responses."""
     state = {
         "posts": [],
+        "events": [],
+        "patches": [],
         "authorization": [],
         "session_gets": 0,
         "item_queries": [],
-        "session_statuses": ["running", "completed"],
+        "wait_item_reads": 0,
+        "assistant_after": None,
+        "runner_gets": 0,
+        "session_statuses": ["idle", "running", "idle"],
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -102,19 +107,64 @@ def fake_broker():
             state["authorization"].append(self.headers.get("Authorization"))
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length))
-            state["posts"].append(body)
+            path = urlparse(self.path).path
+            if path == "/v1/sessions":
+                state["posts"].append(body)
+                self.send_json(
+                    201,
+                    {
+                        "id": "session-1",
+                        "status": "idle",
+                        "runner_id": None,
+                    },
+                )
+                return
+            if path == "/v1/sessions/session-1/events":
+                state["events"].append(body)
+                self.send_json(202, {"queued": True})
+                return
+            self.send_json(404, {"detail": "unknown POST"})
+
+        def do_PATCH(self):
+            state["authorization"].append(self.headers.get("Authorization"))
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            state["patches"].append(body)
             self.send_json(
-                201,
-                {"id": "session-1", "status": "running"},
+                200,
+                {
+                    "id": "session-1",
+                    "status": "idle",
+                    "runner_id": body["runner_id"],
+                },
             )
 
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path.endswith("/items"):
-                state["item_queries"].append(parse_qs(parsed.query))
+                query = parse_qs(parsed.query)
+                state["item_queries"].append(query)
+                if query.get("limit") == ["1"]:
+                    state["wait_item_reads"] += 1
+                    item = {"id": "item-1", "role": "user"}
+                    assistant_after = state["assistant_after"]
+                    if (
+                        assistant_after is not None
+                        and state["wait_item_reads"] >= assistant_after
+                    ):
+                        item = {"id": "item-2", "role": "assistant"}
+                    self.send_json(200, {"data": [item]})
+                else:
+                    self.send_json(
+                        200,
+                        {"items": [{"id": "item-1", "role": "user"}]},
+                    )
+                return
+            if parsed.path == "/v1/runners":
+                state["runner_gets"] += 1
                 self.send_json(
                     200,
-                    {"items": [{"id": "item-1", "role": "user"}]},
+                    {"data": [{"runner_id": "runner-1", "online": True}]},
                 )
                 return
             state["session_gets"] += 1
@@ -126,7 +176,11 @@ def fake_broker():
                 200,
                 {
                     "id": "session-1",
-                    "status": state["session_statuses"][index],
+                    "status": (
+                        state["session_statuses"][index]
+                        if state["session_statuses"]
+                        else "idle"
+                    ),
                 },
             )
 
@@ -420,22 +474,23 @@ def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
             "message": "Do the task.",
             "title": "A task",
             "model_override": "model-1",
-            "initial_items": [
-                {
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "Do the task."}
-                        ],
-                    },
-                }
-            ],
+            "initial_items": [],
+        }
+    ]
+    assert state["runner_gets"] == 1
+    assert state["patches"] == [{"runner_id": "runner-1"}]
+    assert state["events"] == [
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Do the task."}],
+            },
         }
     ]
 
 
-def test_session_wait_polls_until_completed(fake_broker, capsys):
+def test_session_wait_polls_running_to_idle(fake_broker, capsys):
     trioctl = load_trioctl()
     base_url, state = fake_broker
     args = trioctl.parser().parse_args(
@@ -454,8 +509,61 @@ def test_session_wait_polls_until_completed(fake_broker, capsys):
     )
     assert args.func(args) == 0
 
-    assert json.loads(capsys.readouterr().out)["status"] == "completed"
-    assert state["session_gets"] == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "idle"
+    assert state["session_gets"] == 3
+    assert all(
+        query == {"limit": ["1"], "order": ["desc"]}
+        for query in state["item_queries"]
+    )
+
+
+def test_session_wait_accepts_new_assistant_item_without_running_edge(
+    fake_broker, capsys
+):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["assistant_after"] = 2
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "wait",
+            "session-1",
+            "--timeout",
+            "1",
+            "--interval",
+            "0.01",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "idle"
+    assert state["session_gets"] == 1
+
+
+def test_session_wait_returns_failure_for_failed_status(fake_broker, capsys):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_statuses"] = ["failed"]
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "session",
+            "wait",
+            "session-1",
+            "--timeout",
+            "1",
+            "--interval",
+            "0",
+            "--base-url",
+            base_url,
+        ]
+    )
+
+    assert args.func(args) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "failed"
 
 
 def test_session_read_returns_items_and_query(fake_broker, capsys):
@@ -510,7 +618,11 @@ def test_session_auth_uses_home_token(fake_broker, tmp_path, monkeypatch, capsys
 
     assert args.func(args) == 0
     capsys.readouterr()
-    assert state["authorization"] == ["Bearer file-token"]
+    assert state["authorization"] == [
+        "Bearer file-token",
+        "Bearer file-token",
+        "Bearer file-token",
+    ]
 
 
 def test_doctor_without_live_session_skips_session_api(

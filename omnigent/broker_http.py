@@ -134,27 +134,82 @@ class BrokerClient:
         message: str,
         title: str | None = None,
     ) -> Any:
-        """Create a session with both goal fields and live API extras."""
+        """Create and start one session through the live broker sequence.
+
+        ``initial_items`` only seeds history when no runner is bound. The
+        follow-up message event is therefore the important dispatch step:
+        it lets the server bind the session to the current runner and start
+        the native Cursor turn, matching the web UI flow.
+        """
         payload: dict[str, Any] = {
             "agent_id": agent_id,
             "model": model,
             "message": message,
             "model_override": model,
-            "initial_items": [
-                {
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": message},
-                        ],
-                    },
-                }
-            ],
+            # Keep creation metadata-only. A history seed plus the dispatch
+            # event below would duplicate the user's message in native
+            # terminal transcripts.
+            "initial_items": [],
         }
         if title:
             payload["title"] = title
-        return self._request("POST", "/v1/sessions", payload, 201)
+        created = self._request("POST", "/v1/sessions", payload, 201)
+        if not isinstance(created, dict):
+            raise BrokerHttpError("POST /v1/sessions returned a non-object response")
+        session_id = created.get("id") or created.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise BrokerHttpError("POST /v1/sessions returned no session id")
+
+        # JSON session creation has no runner_id field. Match the UI's
+        # unambiguous-runner binding so the first event can reach Cursor.
+        if not created.get("runner_id"):
+            runners = self.list_runners()
+            rows = runners.get("data") if isinstance(runners, dict) else runners
+            online = [
+                row
+                for row in (rows if isinstance(rows, list) else [])
+                if isinstance(row, dict)
+                and row.get("online") is True
+                and isinstance(row.get("runner_id"), str)
+                and row["runner_id"]
+            ]
+            if len(online) != 1:
+                raise BrokerHttpError(
+                    "cannot start session: expected exactly one online runner, "
+                    f"found {len(online)}"
+                )
+            bound = self.bind_session(session_id, online[0]["runner_id"])
+            if isinstance(bound, dict):
+                created = {**created, **bound}
+                created.setdefault("id", session_id)
+
+        self.send_message(session_id, message)
+        return created
+
+    def list_runners(self) -> Any:
+        """List runners available for binding a newly created session."""
+        return self._request("GET", "/v1/runners")
+
+    def bind_session(self, session_id: str, runner_id: str) -> Any:
+        """Bind a session to one already-online runner."""
+        path = f"/v1/sessions/{quote(session_id, safe='')}"
+        return self._request("PATCH", path, {"runner_id": runner_id})
+
+    def send_message(self, session_id: str, message: str) -> Any:
+        """Dispatch a user message to a created session."""
+        path = f"/v1/sessions/{quote(session_id, safe='')}/events"
+        return self._request(
+            "POST",
+            path,
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                },
+            },
+            202,
+        )
 
     def list_agents(self) -> Any:
         """List broker agents so live doctor can pick a probe target."""
