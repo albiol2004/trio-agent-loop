@@ -151,6 +151,10 @@ class BrokerClient:
             payload["title"] = title
         return self._request("POST", "/v1/sessions", payload, 201)
 
+    def list_agents(self) -> Any:
+        """List broker agents so live doctor can pick a probe target."""
+        return self._request("GET", "/v1/agents")
+
     def get_session(self, session_id: str) -> Any:
         """Fetch one session snapshot."""
         path = f"/v1/sessions/{quote(session_id, safe='')}"
