@@ -39,6 +39,19 @@ models and tool policies, and never falls back to `Path.home()`.
 Command Dispatch tables are parsed into `dispatches_to` edges alongside skill
 dispatches.
 
+## `models.py` — model resolution
+
+`registry/models.py` collects one model-resolution row per agent and preserves
+the winning layer: frontmatter, OMP config, OpenCode JSONC, trioctl roles, or
+Omnigent executor configuration. Repository paths always come from the
+explicit `root`; optional live configuration is read only from an explicit
+`home` argument.
+
+`models.json` contains curated model IDs used for availability hints. A custom
+ID is retained in the result and marked `availability: "unknown"` instead of
+raising. `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner
+format layer for focused parsing.
+
 ## `agents.py` — canonical-agent model and renderers
 
 `registry/agents.py` defines the **harness-neutral canonical agent**:

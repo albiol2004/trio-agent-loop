@@ -60,6 +60,11 @@ Registry (format-aware):
         file's `developer_instructions` string; "text" means no frontmatter
         fence was found (frontmatter is {}, body is the whole file).
 
+    GET /api/registry/models?root=<absolute-path>
+    Response: {"root", "rows"} describing model resolution for each agent.
+        The root query is required; optional runtime overrides are read only
+        from the dashboard process home.
+
     GET /api/registry/schema
     Response: {"destinations": {<harness>: [<surface>, ...]},
                "formats": {"<harness>:<surface>": "yaml"|"toml"},
@@ -147,6 +152,9 @@ AGENTS_PATH = DASHBOARD_DIR.parent / "registry" / "agents.py"
 TOPOLOGY_PATH = DASHBOARD_DIR.parent / "registry" / "topology.py"
 """Topology collector module, resolved relative to this file."""
 
+MODELS_PATH = DASHBOARD_DIR.parent / "registry" / "models.py"
+"""Model collector module, resolved relative to this file."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -162,6 +170,7 @@ WORKSPACE_SCAN_SECONDS = 60.0
 _REGISTRY_MODULE = None
 _AGENTS_MODULE = None
 _TOPOLOGY_MODULE = None
+_MODELS_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -218,6 +227,8 @@ STATIC_ROUTES = {
     "/agents.js": ("agents.js", "text/javascript; charset=utf-8"),
     "/topology.html": ("topology.html", "text/html; charset=utf-8"),
     "/topology.js": ("topology.js", "text/javascript; charset=utf-8"),
+    "/models.html": ("models.html", "text/html; charset=utf-8"),
+    "/models.js": ("models.js", "text/javascript; charset=utf-8"),
 }
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")
@@ -310,6 +321,25 @@ def load_topology_module():
         raise RuntimeError(
             "topology module missing required attribute: collect_topology")
     _TOPOLOGY_MODULE = module
+    return module
+
+
+def load_models_module():
+    """Load registry/models.py by path and cache the module."""
+    global _MODELS_MODULE
+    if _MODELS_MODULE is not None:
+        return _MODELS_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_registry_models", MODELS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load models module: {MODELS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if not hasattr(module, "collect_models"):
+        raise RuntimeError(
+            "models module missing required attribute: collect_models")
+    _MODELS_MODULE = module
     return module
 
 
@@ -1195,6 +1225,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         topology = load_topology_module()
         self._send_json(200, topology.collect_topology(root))
 
+    def _handle_registry_models(self, root: Path) -> None:
+        """Return model resolution rows for an explicit root."""
+        models = load_models_module()
+        self._send_json(200, models.collect_models(root, home=HOME))
+
     def _handle_registry_schema(self) -> None:
         """Static harness/surface schema: destinations, formats, key specs."""
         registry = load_registry_module()
@@ -1895,6 +1930,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_topology(root))
+        if path == "/api/registry/models":
+            if not query.get("root"):
+                return self._send_json(400, {"error": "root is required"})
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_models(root))
         if path == "/api/registry/agents":
             return self._api(self._handle_agents_list)
         if path == "/api/registry/agents/file":

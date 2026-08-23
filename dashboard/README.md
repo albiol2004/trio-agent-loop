@@ -82,6 +82,19 @@ entrypoint → agent → model SVGs. Select a harness to inspect its wiring, or
 enable **Compare wiring** to see edges that differ across the loaded harnesses.
 Nodes with source paths link to the Skills registry for inspection.
 
+## Model registry
+
+The **Models** page (`/models.html`) shows one resolved model row for each agent
+defined below the selected repository root. Resolution follows frontmatter,
+explicit OMP overrides, OpenCode JSONC, trioctl role fallbacks, and Omnigent
+executor configuration in that order.
+
+`GET /api/registry/models?root=<repository>` returns the same rows as JSON.
+Optional live model lists are read only from the dashboard process home; an
+unknown custom model is reported as a warning and does not fail the request.
+Model pins declared in frontmatter can be edited from the page. Runtime
+override sources remain read-only.
+
 ## Implementation notes
 
 - Mailbox parsing is delegated to `metrics/trio-metrics.py` (loaded by path; no regex duplication).
