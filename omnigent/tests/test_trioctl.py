@@ -422,10 +422,13 @@ def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
             "model_override": "model-1",
             "initial_items": [
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Do the task."}
-                    ],
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Do the task."}
+                        ],
+                    },
                 }
             ],
         }

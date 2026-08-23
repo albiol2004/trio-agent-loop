@@ -142,8 +142,13 @@ class BrokerClient:
             "model_override": model,
             "initial_items": [
                 {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": message},
+                        ],
+                    },
                 }
             ],
         }
