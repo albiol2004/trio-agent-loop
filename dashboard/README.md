@@ -70,6 +70,13 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
 - **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
 - **Install endpoint** — `POST /api/registry/install` renders a canonical agent into a harness's native format and writes it to the correct location (e.g., `~/.claude/agents/` for claude). Returns 404 for an unknown agent, 400 for an unsupported harness (e.g., omnigent), and 403 if the destination is managed by generate.py.
 
+## Harness topology API
+
+`GET /api/registry/topology?root=<repository>` returns deterministic node and
+edge graphs for the harness directories present below the explicit repository
+root. The `root` query is required; the endpoint does not scan the dashboard
+process user's home directory.
+
 ## Implementation notes
 
 - Mailbox parsing is delegated to `metrics/trio-metrics.py` (loaded by path; no regex duplication).

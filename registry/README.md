@@ -30,6 +30,13 @@ Key functions:
 - `parse_frontmatter()`, `join_file()` — frontmatter/body manipulation
 - `parse_yaml()`, `parse_toml()` — format-specific parsing
 
+## `topology.py` — canonical harness graph
+
+`collect_topology(root)` scans the canonical harness copies below the explicit
+repository `root` and returns stable node/edge graphs for Claude, Codex, OMP,
+OpenCode, Omnigent, and Pi. It reuses `scan.py` parsers, records declared
+models and tool policies, and never falls back to `Path.home()`.
+
 ## `agents.py` — canonical-agent model and renderers
 
 `registry/agents.py` defines the **harness-neutral canonical agent**:
@@ -78,7 +85,7 @@ The index builds `agent_matrix` by comparing each canonical render's `body_hash`
 
 ## Test suite
 
-Run all 173 tests:
+Run all 183 tests:
 ```bash
 python3 -m unittest discover -s registry/tests -t .
 ```
@@ -86,7 +93,8 @@ python3 -m unittest discover -s registry/tests -t .
 Tests cover:
 - **scan.py** — YAML/TOML parsing, frontmatter splitting, format round-tripping, lenient vs strict modes
 - **agents.py** — canonical-agent parsing, validation, rendering, per-harness serialization
-- **serve.py** — registry file serving, schema endpoints, serialization validation, agent CRUD, install API
+- **topology.py** — per-harness graphs from canonical repo files (no $HOME scan)
+- **serve.py** — registry file serving, schema endpoints, serialization validation, agent CRUD, install API, topology GET
 - **page rendering** — agents.html matrix generation, skills.html schema forms
 
 Key test files:

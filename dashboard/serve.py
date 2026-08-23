@@ -144,6 +144,9 @@ REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
 AGENTS_PATH = DASHBOARD_DIR.parent / "registry" / "agents.py"
 """Canonical-agent model module, resolved relative to this file."""
 
+TOPOLOGY_PATH = DASHBOARD_DIR.parent / "registry" / "topology.py"
+"""Topology collector module, resolved relative to this file."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -158,6 +161,7 @@ WORKSPACE_SCAN_SECONDS = 60.0
 
 _REGISTRY_MODULE = None
 _AGENTS_MODULE = None
+_TOPOLOGY_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -285,6 +289,25 @@ def load_registry_module():
         if not hasattr(module, fn):
             raise RuntimeError(f"registry module missing required attribute: {fn}")
     _REGISTRY_MODULE = module
+    return module
+
+
+def load_topology_module():
+    """Load registry/topology.py by path and cache the module."""
+    global _TOPOLOGY_MODULE
+    if _TOPOLOGY_MODULE is not None:
+        return _TOPOLOGY_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_registry_topology", TOPOLOGY_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load topology module: {TOPOLOGY_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    if not hasattr(module, "collect_topology"):
+        raise RuntimeError(
+            "topology module missing required attribute: collect_topology")
+    _TOPOLOGY_MODULE = module
     return module
 
 
@@ -1165,6 +1188,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "managed": bool(entry.get("managed")),
         })
 
+    def _handle_registry_topology(self, root: Path) -> None:
+        """Return the canonical harness topology for an explicit root."""
+        topology = load_topology_module()
+        self._send_json(200, topology.collect_topology(root))
+
     def _handle_registry_schema(self) -> None:
         """Static harness/surface schema: destinations, formats, key specs."""
         registry = load_registry_module()
@@ -1858,6 +1886,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(lambda: self._handle_registry_file(query, root))
         if path == "/api/registry/schema":
             return self._api(self._handle_registry_schema)
+        if path == "/api/registry/topology":
+            if not query.get("root"):
+                return self._send_json(400, {"error": "root is required"})
+            root = self._request_root(query)
+            if root is None:
+                return
+            return self._api(lambda: self._handle_registry_topology(root))
         if path == "/api/registry/agents":
             return self._api(self._handle_agents_list)
         if path == "/api/registry/agents/file":
