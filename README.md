@@ -167,11 +167,10 @@ Per-harness setup docs: `portable/SETUP-codex.md`, `SETUP-cursor.md`,
 `SETUP-antigravity.md` (Antigravity IDE isn't scriptable; its `agy` CLI /
 Gemini CLI are), `SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the GLM Coding Plan
 endpoint runs the NATIVE template via Claude Code env vars instead),
-`SETUP-generic.md`. The driver
-parses only VERDICT.md's first line (verdict word plus optional `scope=`
-suffix — `scope=local:<paths>` routes to a builder-direct repair pass capped
-at 2 consecutive repairs); exit codes 0=SHIP, 2=BLOCKED, 3=bad verdict,
-4=iteration cap, 5=NEEDS_HUMAN (or mailbox locked by another driver)
+`SETUP-generic.md`. `portable/driver.sh` execs `metrics/trio_loop.py` for
+gates, verdicts, repairs, and resume; HARNESS role dispatch stays in Bash.
+Exit codes are 0=SHIP, 2=BLOCKED, 3=bad verdict, 4=iteration cap, and
+5=NEEDS_HUMAN (or mailbox locked by another driver)
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
 agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.

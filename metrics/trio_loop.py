@@ -333,9 +333,21 @@ def run_loop(
 
 class _PortableRunner:
     def run(self, role: str, iteration: int, mailbox: Path) -> int:
-        raise NotImplementedError(
-            "the portable runner is wired by the portable-driver slice"
+        script = (
+            Path(__file__).resolve().parent.parent
+            / "portable"
+            / "driver.sh"
         )
+        environment = os.environ.copy()
+        environment["LOOP_DIR"] = str(Path(mailbox).resolve())
+        # The shell shim only runs one role. Gates, verdicts, repairs, and
+        # resume stay in run_loop so this runner never parses VERDICT.md.
+        result = subprocess.run(
+            [str(script), "--run-role", role],
+            check=False,
+            env=environment,
+        )
+        return result.returncode
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
