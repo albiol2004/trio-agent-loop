@@ -2932,7 +2932,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not query.get("root"):
                 return self._send_json(400, {"error": "root is required"})
             workflow = (query.get("workflow") or ["roles"])[0]
-            if workflow not in ("roles", "productionize"):
+            topology = load_topology_module()
+            if workflow not in topology.WORKFLOWS:
                 return self._send_json(
                     400, {"error": f"unknown topology workflow: {workflow}"})
             root = self._request_root(query)

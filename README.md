@@ -125,7 +125,7 @@ The dashboard board also provides Start and Stop controls for portable and
 Omnigent loop drivers. It exposes the same controls through
 `/api/loop/start`, `/api/loop/stop`, and `/api/loop/status`.
 Its `/topology.html` page defaults to role wiring and can switch to the
-productionize wrapper dispatch graphs.
+productionize wrapper dispatch graphs or entrypoint-only wiring graphs.
 
 ## Control knobs while it runs
 - `loop/GOAL.md` — edit anytime; next iteration obeys it.

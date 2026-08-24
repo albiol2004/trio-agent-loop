@@ -54,7 +54,8 @@ Key functions:
 below the explicit repository `root` and returns stable node/edge graphs for
 Claude, Codex, OMP, OpenCode, Omnigent, and Pi. The `productionize` workflow
 instead scans each in-repository `trio-productionize` wrapper and records its
-dispatch-table executor roles. It reuses `scan.py` parsers, records declared
+dispatch-table executor roles, while `entrypoints` keeps Trio entrypoints and
+their destination-agent wiring. It reuses `scan.py` parsers, records declared
 models, tool policies, and non-empty agent output schemas, and never falls back
 to `Path.home()`.
 

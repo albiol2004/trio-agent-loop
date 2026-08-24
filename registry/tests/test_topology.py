@@ -51,10 +51,19 @@ class TopologyCollectorTests(unittest.TestCase):
         cls.graphs = cls.result["graphs"]
         cls.productionize = topology.collect_topology(
             REPO, workflow="productionize")
+        cls.entrypoints = topology.collect_topology(
+            REPO, workflow="entrypoints")
 
     def test_required_harness_graphs_are_present(self):
         required = {"claude", "codex", "omp", "opencode", "omnigent", "pi"}
         self.assertTrue(required.issubset(self.graphs), self.graphs.keys())
+
+    def test_default_workflow_remains_roles_with_spawn_edges(self):
+        self.assertEqual(self.result["workflow"], "roles")
+        self.assertIn(
+            ("spawns", "trio-lead", "trio-builder"),
+            _edge_tuples(self.graphs["omp"]),
+        )
 
     def test_required_graphs_have_nodes(self):
         for harness in ("claude", "codex", "omp",
@@ -106,6 +115,98 @@ class TopologyCollectorTests(unittest.TestCase):
         self.assertEqual(
             set(self.productionize["graphs"]),
             {"claude", "codex", "omp", "opencode", "kimi", "zcode"},
+        )
+
+    def test_entrypoints_include_only_trio_entrypoint_wiring(self):
+        result = self.entrypoints
+        self.assertEqual(result["workflow"], "entrypoints")
+        claude_names = {
+            node["name"] for node in result["graphs"]["claude"]["nodes"]
+            if node["kind"] == "entrypoint"
+        }
+        self.assertTrue(
+            {"trio", "trio-productionize"}.issubset(claude_names))
+
+        for graph in result["graphs"].values():
+            entries = {
+                node["name"] for node in graph["nodes"]
+                if node["kind"] == "entrypoint"
+            }
+            self.assertTrue(
+                all(edge["src"] in entries for edge in graph["edges"]))
+            self.assertNotIn("spawns", {
+                edge["type"] for edge in graph["edges"]})
+            self.assertNotIn("subagent", {
+                edge["type"] for edge in graph["edges"]})
+
+        opencode_edges = _edge_tuples(result["graphs"]["opencode"])
+        self.assertIn(
+            ("invokes", "trio", "trio-orchestrator"), opencode_edges)
+        for harness in ("claude", "opencode", "omp"):
+            self.assertIn(
+                ("dispatches_to", "trio-productionize", "trio-scout"),
+                _edge_tuples(result["graphs"][harness]),
+            )
+
+    def test_entrypoints_include_kimi_zcode_omnigent_and_pi(self):
+        graphs = self.entrypoints["graphs"]
+        for harness in ("kimi", "zcode"):
+            self.assertIn(harness, graphs)
+            names = {
+                node["name"] for node in graphs[harness]["nodes"]
+                if node["kind"] == "entrypoint"
+            }
+            self.assertIn("trio-productionize", names)
+
+        omnigent_names = {
+            node["name"] for node in graphs["omnigent"]["nodes"]
+            if node["kind"] == "entrypoint"
+        }
+        self.assertTrue({
+            "trio-omnigent", "trio-productionize-omnigent"
+        }.issubset(omnigent_names))
+        omnigent_edges = _edge_tuples(graphs["omnigent"])
+        self.assertIn(
+            ("dispatches_to", "trio-omnigent", "trio-omnigent-lead"),
+            omnigent_edges,
+        )
+        pi_names = {
+            node["name"] for node in graphs["pi"]["nodes"]
+            if node["kind"] == "entrypoint"
+        }
+        self.assertIn("trio", pi_names)
+
+    def test_entrypoints_fixture_dispatches_without_home_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = root / ".claude" / "skills" / "trio" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "# Fixture\n\n"
+                "## Dispatch table\n\n"
+                "- agent: `trio-lead`\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                topology.Path,
+                "home",
+                side_effect=AssertionError("Path.home used"),
+            ):
+                result = topology.collect_topology(
+                    root,
+                    home=Path("/never-read"),
+                    workflow="entrypoints",
+                )
+
+        graph = result["graphs"]["claude"]
+        self.assertIn(
+            ("dispatches_to", "trio", "trio-lead"),
+            _edge_tuples(graph),
+        )
+        self.assertIn(
+            ("agent", "trio-lead"),
+            {(node["kind"], node["name"]) for node in graph["nodes"]},
         )
 
     def test_productionize_claude_dispatches_to_all_trio_roles(self):

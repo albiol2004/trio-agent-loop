@@ -127,6 +127,18 @@ class TopologyEndpointTests(DashboardTopologyTestCase):
                 claude_edges,
             )
 
+    def test_topology_endpoint_returns_entrypoint_graphs(self):
+        status, payload = _get_json(
+            self._topology_url(workflow="entrypoints"))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["workflow"], "entrypoints")
+        claude_names = {
+            node["name"]
+            for node in payload["graphs"]["claude"]["nodes"]
+            if node["kind"] == "entrypoint"
+        }
+        self.assertIn("trio", claude_names)
+
     def test_topology_endpoint_rejects_unknown_workflow(self):
         status, payload = _get_json(self._topology_url(workflow="nope"))
         self.assertEqual(status, 400, payload)

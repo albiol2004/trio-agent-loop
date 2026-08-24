@@ -22,7 +22,7 @@ PRODUCTIONIZE_WRAPPERS = (
     ("kimi", "kimi/skills/trio-productionize/SKILL.md"),
     ("zcode", "zcode/skills/trio-productionize/SKILL.md"),
 )
-WORKFLOWS = frozenset(("roles", "productionize"))
+WORKFLOWS = frozenset(("roles", "productionize", "entrypoints"))
 
 
 def _load_scan():
@@ -459,6 +459,141 @@ def _collect_pi(root: Path) -> dict:
     return graph.result()
 
 
+def _is_trio_entrypoint(name: str) -> bool:
+    """Return whether a surface name is a Trio entrypoint."""
+    return name == "trio" or name.startswith("trio-")
+
+
+def _entrypoint_graph(source: _Graph | dict) -> dict:
+    """Keep Trio entrypoints and only their destination-agent wiring."""
+    if isinstance(source, _Graph):
+        source = source.result()
+
+    entrypoints = {
+        node["name"]: node
+        for node in source["nodes"]
+        if node["kind"] == "entrypoint"
+        and _is_trio_entrypoint(node["name"])
+    }
+    outbound = [
+        edge for edge in source["edges"]
+        if edge["src"] in entrypoints
+    ]
+    agents = {
+        node["name"]: node
+        for node in source["nodes"]
+        if node["kind"] == "agent"
+    }
+    graph = _Graph()
+
+    for node in entrypoints.values():
+        graph.node("entrypoint", node["name"], node["harness"], node["path"])
+
+    for edge in outbound:
+        destination = agents.get(edge["dst"])
+        if destination is None:
+            # Dispatch tables may name an agent that is not installed locally.
+            # Keep that destination visible, just like productionize does.
+            entrypoint = entrypoints[edge["src"]]
+            graph.node(
+                "agent",
+                edge["dst"],
+                entrypoint["harness"],
+                entrypoint["path"],
+            )
+        else:
+            graph.node(
+                "agent",
+                destination["name"],
+                destination["harness"],
+                destination["path"],
+                destination.get("model"),
+                destination.get("tool_policy"),
+                destination.get("output"),
+            )
+        graph.edge(edge["type"], edge["src"], edge["dst"])
+
+    return graph.result()
+
+
+def _collect_omnigent_entrypoints(root: Path) -> dict:
+    """Collect Omnigent entrypoints and the roles they explicitly dispatch."""
+    source = _Graph()
+    entrypoint_root = root / "omnigent" / "entrypoints"
+    linked_targets = set()
+    dispatch_targets = {
+        "trio-omnigent": (
+            "trio-omnigent-lead",
+            "trio-omnigent-evaluator",
+        ),
+        "trio-productionize-omnigent": (
+            "trio-omnigent-lead",
+            "trio-omnigent-evaluator",
+        ),
+    }
+
+    for path in sorted(entrypoint_root.glob("*/SKILL.md")):
+        name = path.parent.name
+        source.node("entrypoint", name, "omnigent", path)
+        for target in dispatch_targets.get(name, ()):
+            source.edge("dispatches_to", name, target)
+            linked_targets.add(target)
+
+    role_nodes = {
+        node["name"]: node
+        for node in _collect_omnigent(root)["nodes"]
+        if node["kind"] == "agent"
+    }
+    for target in linked_targets:
+        role = role_nodes.get(target)
+        if role is None:
+            continue
+        source.node(
+            "agent",
+            role["name"],
+            role["harness"],
+            role["path"],
+            role.get("model"),
+            role.get("tool_policy"),
+            role.get("output"),
+        )
+
+    return _entrypoint_graph(source)
+
+
+def _collect_entrypoints(root: Path) -> dict:
+    """Collect entrypoint-only graphs without role or productionize meshes."""
+    graphs = {}
+    source_collectors = (
+        ("claude", ".claude", _collect_claude),
+        ("codex", "codex", _collect_codex),
+        ("omp", "omp", _collect_omp),
+        ("opencode", "opencode", _collect_opencode),
+        ("pi", "pi", _collect_pi),
+    )
+    for harness, directory, collector in source_collectors:
+        if (root / directory).is_dir():
+            graphs[harness] = _entrypoint_graph(collector(root))
+
+    if (root / "kimi").is_dir():
+        graphs["kimi"] = _entrypoint_graph(
+            _markdown(root, "kimi", skills="kimi/skills"))
+    if (root / "zcode").is_dir():
+        graphs["zcode"] = _entrypoint_graph(
+            _markdown(root, "zcode", skills="zcode/skills"))
+    if (root / "omnigent").is_dir():
+        graphs["omnigent"] = _collect_omnigent_entrypoints(root)
+    if (root / "bridge").is_dir():
+        graphs["bridge"] = _entrypoint_graph(
+            _markdown(
+                root,
+                "bridge",
+                commands="bridge/commands",
+                skills="bridge/skills",
+            ))
+    return graphs
+
+
 def collect_topology(root: Path, *, home: Path | None = None,
                      workflow: str = "roles") -> dict:
     """Scan canonical copies below ``root`` for one supported workflow."""
@@ -472,6 +607,12 @@ def collect_topology(root: Path, *, home: Path | None = None,
             "root": str(root),
             "workflow": workflow,
             "graphs": _collect_productionize(root),
+        }
+    if workflow == "entrypoints":
+        return {
+            "root": str(root),
+            "workflow": workflow,
+            "graphs": _collect_entrypoints(root),
         }
 
     collectors = (

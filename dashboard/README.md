@@ -83,7 +83,7 @@ Registry and agents:
 - `POST /api/registry/install` — render a canonical agent into a harness's native format and write it
 - `GET /api/registry/topology?root=<repository>&workflow=<name>` —
   deterministic node and edge graphs below root; `workflow` is `roles`
-  (default) or `productionize`
+  (default), `productionize`, or `entrypoints`
 - `GET /api/registry/models?root=<repository>` — resolved model rows per agent, showing layer and availability
 - `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
 
@@ -137,8 +137,8 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
 `GET /api/registry/topology?root=<repository>&workflow=<name>` returns
 deterministic node and edge graphs for the harness directories present below
 the explicit repository root. The `root` query is required; `workflow` accepts
-`roles` (default) or `productionize`. The endpoint does not scan the dashboard
-process user's home directory.
+`roles` (default), `productionize`, or `entrypoints`. The endpoint does not
+scan the dashboard process user's home directory.
 
 The **Topology** page (`/topology.html`) renders those graphs as layered
 entrypoint → agent → model SVGs. Select a workflow and harness to inspect its
