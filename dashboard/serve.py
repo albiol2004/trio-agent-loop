@@ -2978,6 +2978,7 @@ def main(argv: list[str] | None = None) -> int:
     candidate_ports = [args.port] if args.port is not None else list(range(range_start, range_end + 1))
 
     server = None
+    bind_host = args.host
     for port in candidate_ports:
         try:
             server = DashboardServer(
@@ -2987,6 +2988,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             break
         except OSError as exc:
+            # A wildcard bind collides with `tailscale serve` holding the
+            # same port on the tailnet address; the proxy targets loopback,
+            # so binding 127.0.0.1 on that port is what remote access needs.
+            if args.host in ("0.0.0.0", "::", ""):
+                try:
+                    server = DashboardServer(
+                        ("127.0.0.1", port),
+                        workspaces=workspaces,
+                        auto_discover=auto_discover,
+                    )
+                    bind_host = "127.0.0.1"
+                    print(f"note: {args.host}:{port} is taken (tailscale serve?); bound 127.0.0.1:{port} instead", file=sys.stderr)
+                    break
+                except OSError:
+                    pass
             if args.port is not None:
                 print(f"error: cannot bind {args.host}:{port} — {exc}", file=sys.stderr)
                 return 1
@@ -2998,7 +3014,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: no free port in range {port_range} on {args.host}", file=sys.stderr)
         return 1
 
-    print(f"Trio Loop Dashboard listening on http://{args.host}:{port} (root: {root})", flush=True)
+    print(f"Trio Loop Dashboard listening on http://{bind_host}:{port} (root: {root})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
