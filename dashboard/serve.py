@@ -79,8 +79,10 @@ Registry (format-aware):
     Response: {"destinations": {<harness>: [<surface>, ...]},
                "formats": {"<harness>:<surface>": "yaml"|"toml"},
                "keys": {"<harness>:<surface>": [<fieldspec>, ...]}}
-        fieldspec: {"key", "type", "widget", "required", "enum", "help"};
-        widget is one of text | textarea | checkbox | select | list | raw.
+        fieldspec: {"key", "type", "widget", "required", "enum", "help",
+                    "values_from"};
+        widget is one of text | textarea | checkbox | select | list | raw |
+        permission-grid | spawns-select | json-schema.
         Derived from registry/scan.py's SURFACE_FORMAT/KEY_SCHEMA tables and
         this module's _GLOBAL_REGISTRY_DIRS — no workspace root required.
 
@@ -1459,6 +1461,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         schema = registry.KEY_SCHEMA.get(schema_key) if schema_key else None
         if schema:
             schema_by_key = {spec["key"]: spec for spec in schema}
+            # The browser keeps JSON-schema text as a YAML literal string.
+            # Validate it here too so non-browser callers cannot save bad JSON.
+            for spec in schema:
+                if spec.get("widget") != "json-schema":
+                    continue
+                key = spec["key"]
+                value = resolved.get(key)
+                if isinstance(value, str):
+                    try:
+                        json.loads(value)
+                    except (TypeError, ValueError) as exc:
+                        return self._send_json(
+                            400,
+                            {"error": f"invalid JSON for key '{key}': {exc}"},
+                        )
             for spec in schema:
                 if spec.get("required"):
                     value = resolved.get(spec["key"])

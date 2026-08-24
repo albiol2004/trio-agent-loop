@@ -161,6 +161,33 @@ class SchemaEndpointTests(DashboardServerTestCase):
         keys = payload["keys"].get("opencode:agent", [])
         self.assertNotIn("name", [spec.get("key") for spec in keys])
 
+    def test_schema_exposes_sources_and_specialized_widgets(self):
+        _, payload = self._get("/api/registry/schema")
+        keys = payload["keys"]
+
+        def spec_for(surface, field):
+            return next(
+                spec for spec in keys[surface] if spec["key"] == field)
+
+        self.assertEqual(
+            spec_for("claude:agent", "model")["values_from"],
+            "models:claude")
+        self.assertEqual(
+            spec_for("codex:agent", "model")["values_from"],
+            "models:codex")
+        self.assertEqual(
+            spec_for("omp:agent", "model")["values_from"],
+            "models:omp")
+        self.assertEqual(
+            spec_for("opencode:agent", "permission")["widget"],
+            "permission-grid")
+        self.assertEqual(
+            spec_for("omp:agent", "spawns")["widget"],
+            "spawns-select")
+        self.assertEqual(
+            spec_for("omp:agent", "output")["widget"],
+            "json-schema")
+
 
 class RegistryFileEndpointTests(DashboardServerTestCase):
 
@@ -264,6 +291,43 @@ class SerializeValidationTests(DashboardServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["content"], "whole file body\n")
         self.assertEqual(payload["warnings"], [])
+
+    def test_json_schema_invalid_json_is_400(self):
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml",
+                "frontmatter": {
+                    "name": "trio-evaluator",
+                    "description": "test output schema",
+                    "output": '{"type": invalid}',
+                },
+                "body": "body\n",
+                "harness": "omp",
+                "surface": "agent",
+            })
+        self.assertEqual(status, 400, payload)
+        self.assertIn("output", payload["error"])
+
+    def test_json_schema_valid_json_is_200(self):
+        value = '{\n  "type": "object"\n}\n'
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml",
+                "frontmatter": {
+                    "name": "trio-evaluator",
+                    "description": "test output schema",
+                    "output": value,
+                },
+                "body": "body\n",
+                "harness": "omp",
+                "surface": "agent",
+            })
+        self.assertEqual(status, 200, payload)
+        self.assertIn("output: |", payload["content"])
+        fields, _body = registry.parse_frontmatter(payload["content"])
+        self.assertEqual(json.loads(fields["output"]), {"type": "object"})
 
     def test_yaml_wrapper_value_is_parsed(self):
         status, payload = _http_json(

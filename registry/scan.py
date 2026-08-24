@@ -748,9 +748,11 @@ SURFACE_FORMAT: dict[tuple[str, str], str] = {
 }
 
 
-def _field(key, type_="string", widget="text", required=False, enum=None, help_=""):
+def _field(key, type_="string", widget="text", required=False, enum=None,
+           help_="", values_from=None):
     return {"key": key, "type": type_, "widget": widget,
-            "required": required, "enum": enum, "help": help_}
+            "required": required, "enum": enum, "help": help_,
+            "values_from": values_from}
 
 
 _SKILL_FIELDS = [
@@ -785,28 +787,35 @@ KEY_SCHEMA: dict[str, list[dict]] = {
     "claude:agent": [
         _field("name", required=True, help_="must equal the filename stem"),
         _field("description", widget="textarea", required=True),
-        _field("model", help_="short alias (sonnet) or full model id"),
+        _field("model", help_="short alias (sonnet) or full model id",
+               values_from="models:claude"),
         _field("effort", widget="select", enum=["low", "medium", "high"]),
         _field("disallowedTools", "string", "list",
                help_="comma-separated denylist; there is no positive tools list"),
     ],
     "codex:agent": [
         _field("name", required=True, help_="must equal the filename stem"),
-        _field("model", help_="e.g. gpt-5.6-luna"),
+        _field("model", help_="e.g. gpt-5.6-luna",
+               values_from="models:codex"),
         _field("model_reasoning_effort", widget="select",
                enum=["low", "medium", "high"]),
         _field("description", required=True),
         _field("sandbox_mode", widget="select",
-               enum=["read-only", "workspace-write", "danger-full-access"]),
+               enum=["read-only", "workspace-write", "danger-full-access"],
+               help_="optional; read-only on trio-scout"),
     ],
     "omp:agent": [
         _field("name", required=True, help_="must equal the filename stem"),
         _field("description", widget="textarea", required=True),
-        _field("model", help_="provider-qualified, e.g. deepseek/deepseek-v4-flash"),
-        _field("spawns", "string", "list", help_="comma-separated agent allowlist"),
+        _field("model",
+               help_="provider-qualified, e.g. deepseek/deepseek-v4-flash",
+               values_from="models:omp"),
+        _field("spawns", "string", "spawns-select",
+               help_="comma-separated agent allowlist"),
         _field("tools", "string", "list", help_="comma-separated lowercase tool names"),
         _field("read-summarize", "bool", "checkbox"),
-        _field("output", "map", "raw", help_="JSON schema in a YAML literal block"),
+        _field("output", "map", "json-schema",
+               help_="JSON schema in a YAML literal block"),
     ],
     "omp:command": [
         _field("description", widget="textarea", required=True),
@@ -815,7 +824,7 @@ KEY_SCHEMA: dict[str, list[dict]] = {
         _field("description", widget="textarea", required=True),
         _field("mode", widget="select", enum=["subagent", "primary"]),
         _field("hidden", "bool", "checkbox"),
-        _field("permission", "map", "raw",
+        _field("permission", "map", "permission-grid",
                help_="nested allow/deny map; quoted \"*\" is the default rule"),
     ],
     "opencode:command": [

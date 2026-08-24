@@ -452,18 +452,98 @@ class Schema(unittest.TestCase):
                          ["description"])
 
     def test_every_field_spec_is_well_formed(self):
-        widgets = {"text", "textarea", "checkbox", "select", "list", "raw"}
+        widgets = {
+            "text", "textarea", "checkbox", "select", "list", "raw",
+            "permission-grid", "spawns-select", "json-schema",
+        }
         types = {"string", "bool", "int", "list", "map"}
         for key, specs in scan.KEY_SCHEMA.items():
             for spec in specs:
                 with self.subTest(surface=key, field=spec["key"]):
                     self.assertEqual(set(spec),
-                                     {"key", "type", "widget", "required", "enum", "help"})
+                                     {"key", "type", "widget", "required", "enum",
+                                      "help", "values_from"})
                     self.assertIn(spec["widget"], widgets)
                     self.assertIn(spec["type"], types)
                     self.assertIsInstance(spec["required"], bool)
                     if spec["widget"] == "select":
                         self.assertTrue(spec["enum"])
+
+    def test_schema_catalog_contains_required_surfaces(self):
+        expected = {
+            "claude:skill", "claude:command", "claude:agent",
+            "codex:agent", "omp:agent", "omp:command",
+            "opencode:agent", "opencode:command", "kimi:skill",
+            "zcode:skill",
+        }
+        self.assertTrue(
+            expected.issubset(scan.KEY_SCHEMA),
+            f"missing surfaces: {expected - scan.KEY_SCHEMA.keys()}")
+
+    def test_schema_enums_match_brief(self):
+        expected = {
+            ("claude:agent", "effort"): ["low", "medium", "high"],
+            ("codex:agent", "model_reasoning_effort"):
+                ["low", "medium", "high"],
+            ("codex:agent", "sandbox_mode"):
+                ["read-only", "workspace-write", "danger-full-access"],
+            ("opencode:agent", "mode"): ["subagent", "primary"],
+            ("kimi:skill", "type"): ["prompt"],
+        }
+        for (surface, key), enum in expected.items():
+            with self.subTest(surface=surface, field=key):
+                spec = next(
+                    field for field in scan.KEY_SCHEMA[surface]
+                    if field["key"] == key)
+                self.assertEqual(spec["enum"], enum)
+
+    def test_schema_model_fields_use_model_sources(self):
+        expected = {
+            "claude:agent": "models:claude",
+            "codex:agent": "models:codex",
+            "omp:agent": "models:omp",
+        }
+        for surface, values_from in expected.items():
+            with self.subTest(surface=surface):
+                model = next(
+                    field for field in scan.KEY_SCHEMA[surface]
+                    if field["key"] == "model")
+                self.assertEqual(model["values_from"], values_from)
+
+        for surface, fields in scan.KEY_SCHEMA.items():
+            for field in fields:
+                if (surface, field["key"]) not in {
+                    (surface, "model") for surface in expected
+                }:
+                    with self.subTest(surface=surface, field=field["key"]):
+                        self.assertIsNone(field["values_from"])
+
+    def test_schema_uses_specialized_widgets(self):
+        expected = {
+            ("opencode:agent", "permission"): "permission-grid",
+            ("omp:agent", "spawns"): "spawns-select",
+            ("omp:agent", "output"): "json-schema",
+        }
+        for (surface, key), widget in expected.items():
+            with self.subTest(surface=surface, field=key):
+                spec = next(
+                    field for field in scan.KEY_SCHEMA[surface]
+                    if field["key"] == key)
+                self.assertEqual(spec["widget"], widget)
+
+    def test_schema_help_matches_brief_for_restricted_fields(self):
+        claude_tools = next(
+            field for field in scan.KEY_SCHEMA["claude:agent"]
+            if field["key"] == "disallowedTools")
+        self.assertIn("denylist", claude_tools["help"])
+        self.assertIn("no positive tools list", claude_tools["help"])
+
+        sandbox = next(
+            field for field in scan.KEY_SCHEMA["codex:agent"]
+            if field["key"] == "sandbox_mode")
+        self.assertIn("optional", sandbox["help"])
+        self.assertIn("read-only", sandbox["help"])
+        self.assertIn("trio-scout", sandbox["help"])
 
     def test_codex_agent_template_is_valid_toml(self):
         text = scan.default_template("codex", "agent", "my-agent")
