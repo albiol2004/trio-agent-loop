@@ -62,10 +62,11 @@ Transcript tail (SSE):
 Registry (format-aware):
     GET /api/registry/file?path=<absolute-path>
     Response: {"path", "format", "frontmatter", "body", "managed",
-               "quoted_keys"}
+               "source", "quoted_keys"}
         format is one of "toml" | "yaml" | "text". "toml" bodies hold the
         file's `developer_instructions` string; "text" means no frontmatter
-        fence was found (frontmatter is {}, body is the whole file).
+        fence was found (frontmatter is {}, body is the whole file). `source`
+        is the generate.py prompt/overlay descriptor or null.
 
     GET /api/registry/models?root=<absolute-path>
     Response: {"root", "rows"} describing model resolution for each agent.
@@ -98,6 +99,12 @@ Registry (format-aware):
         non-blocking: unknown key, `name` mismatching the
         target filename/dirname (suppressed for omnigent), or a format that
         disagrees with the harness/surface's canonical format.
+
+    POST /api/registry/regenerate
+    Body: {"path": "<generate.py-managed destination>", "root"?}
+    Response: 200 {"source", "wrote", "diff", "install"}; a dirty workspace
+        returns 409 {"error": "working tree dirty", "files": [...]}; an
+        unmanaged destination returns 400.
 
 Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
     GET /api/registry/agents
@@ -1431,7 +1438,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         index = _registry_index(root)
         entry = _registry_entry(index, target)
         if entry is None:
-            return self._send_json(404, {"error": "file not found"})
+            # Prompt inputs are not registry entries, but exposing them
+            # read-only lets the managed-file editor open its producing source.
+            if not _path_is_under(target, root / "prompts") or not target.is_file():
+                return self._send_json(404, {"error": "file not found"})
+            entry = {"managed": False, "source": None}
         try:
             _check_project_registry_entry(
                 entry, target, root, self.server.get_workspace_seeds())
@@ -1456,7 +1467,120 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "frontmatter": frontmatter,
             "body": body,
             "managed": bool(entry.get("managed")),
+            "source": entry.get("source"),
             "quoted_keys": registry.quoted_key_paths(frontmatter),
+        })
+
+    def _handle_registry_regenerate(self, query: dict) -> None:
+        """Regenerate a managed destination after a clean-tree check."""
+        try:
+            payload = _read_json_body(self)
+            target = _resolve_registry_path(payload.get("path"))
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+
+        root_query = query
+        if "root" in payload:
+            root_query = {"root": [payload.get("root")]}
+        try:
+            root = self._resolve_root(root_query)
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+
+        registry = load_registry_module()
+        source = registry.generated_sources().get(str(target))
+        if not source:
+            return self._send_json(
+                400, {"error": "path is not managed by prompts/generate.py"})
+        entry = _registry_entry(_registry_index(root), target)
+        if not entry or not entry.get("source"):
+            return self._send_json(
+                400, {"error": "path is not managed by prompts/generate.py"})
+        source = entry["source"]
+
+        install_flags = {
+            "claude": "--global",
+            "codex": "--codex",
+            "omnigent": "--omnigent",
+            "kimi": "--kimi",
+            "zcode": "--zcode",
+            "opencode": "--opencode",
+            "omp": "--omp",
+            "pi": "--pi",
+        }
+        harness = str(entry.get("harness") or "").strip().lower()
+        install_flag = install_flags.get(harness)
+        if install_flag is None:
+            return self._send_json(400, {
+                "error": f"unsupported generator harness: {harness or 'unknown'}",
+            })
+
+        try:
+            status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return self._send_json(400, {"error": "workspace is not a git repository"})
+        if status.returncode != 0:
+            return self._send_json(400, {"error": "workspace is not a git repository"})
+        dirty_files = [
+            line[3:].strip() if len(line) > 3 else line.strip()
+            for line in status.stdout.splitlines()
+            if line.strip()
+        ]
+        if dirty_files:
+            return self._send_json(409, {
+                "error": "working tree dirty",
+                "files": dirty_files,
+            })
+
+        try:
+            generated = subprocess.run(
+                ["python3", "prompts/generate.py"],
+                cwd=root, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return self._send_json(500, {"error": "generate.py failed"})
+        if generated.returncode != 0:
+            detail = generated.stderr or generated.stdout
+            return self._send_json(500, {
+                "error": "generate.py failed",
+                "detail": detail[:65536],
+            })
+
+        env = os.environ.copy()
+        # Keep global harness installation under the dashboard's configured
+        # home. Tests replace serve.HOME with a temporary directory here.
+        env["HOME"] = str(HOME)
+        try:
+            installed = subprocess.run(
+                ["./install.sh", install_flag],
+                cwd=root, env=env, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return self._send_json(500, {"error": "install.sh failed"})
+        if installed.returncode != 0:
+            detail = installed.stderr or installed.stdout
+            return self._send_json(500, {
+                "error": "install.sh failed",
+                "detail": detail[:65536],
+            })
+
+        wrote = []
+        for line in generated.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("wrote "):
+                wrote.append(line[len("wrote "):])
+        install_output = installed.stdout
+        if len(install_output) > 65536:
+            install_output = install_output[:65536] + "\n[output truncated]"
+        _invalidate_registry_cache()
+        self._send_json(200, {
+            "source": source,
+            "wrote": wrote,
+            "diff": generated.stdout,
+            "install": install_output,
         })
 
     def _handle_registry_topology(self, root: Path) -> None:
@@ -1623,6 +1747,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = _read_json_body(self)
             target = _writable_registry_path(
                 payload.get("path"), self.server.get_workspace_seeds(), root)
+            if _path_is_under(target, root / "prompts"):
+                raise PermissionError("prompt source files are read-only")
             _reject_if_managed(target)
             content = payload.get("content")
             if not isinstance(content, str):
@@ -1742,6 +1868,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             target = _writable_registry_path(
                 (query.get("path") or [None])[0],
                 self.server.get_workspace_seeds(), root)
+            if _path_is_under(target, root / "prompts"):
+                raise PermissionError("prompt source files are read-only")
             _reject_if_managed(target)
         except PermissionError as exc:
             return self._send_json(403, {"error": str(exc)})
@@ -2698,6 +2826,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/registry/serialize":
             return self._api(self._handle_registry_serialize)
+        if path == "/api/registry/regenerate":
+            return self._api(lambda: self._handle_registry_regenerate(query))
         if path in ("/api/registry/create", "/api/registry/import"):
             root = self._request_root(query)
             if root is None:

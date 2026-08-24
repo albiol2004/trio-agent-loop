@@ -289,6 +289,16 @@ class SkillsJsWidgetTests(unittest.TestCase):
         self.assertIn(".field-offlist", html)
         self.assertIn(".field-error", html)
 
+    def test_skills_managed_source_controls_exist(self):
+        html = (REPO_ROOT / "dashboard" / "skills.html").read_text(
+            encoding="utf-8")
+        source = (REPO_ROOT / "dashboard" / "skills.js").read_text(
+            encoding="utf-8")
+        self.assertIn('id="managed-source"', html)
+        self.assertIn('id="regen-file"', html)
+        self.assertIn("/api/registry/regenerate", source)
+        self.assertNotIn("innerHTML", source)
+
     def test_skills_js_helpers_exercise_save_guard_catalog_and_root(self):
         script = r"""
 const assert = require("node:assert/strict");

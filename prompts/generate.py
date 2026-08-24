@@ -292,6 +292,35 @@ def all_outputs() -> dict[Path, str]:
     return outputs
 
 
+def all_output_sources() -> dict[Path, dict[str, str | None]]:
+    """Return the prompt inputs responsible for every generated destination."""
+    sources: dict[Path, dict[str, str | None]] = {}
+    for flavor in sorted(p.stem for p in OVERLAYS_DIR.glob("*.md")):
+        ov = load_overlay(flavor)
+        for role, _target, relpath in ov.targets:
+            sources[ROOT / relpath] = {
+                "kind": "role",
+                "prompt": f"prompts/canonical/{role}.md",
+                "overlay": f"prompts/overlays/{flavor}.md",
+            }
+    for relpath, _style in EMBEDDED:
+        path = ROOT / relpath
+        if path.is_file():
+            sources[path] = {
+                "kind": "embedded",
+                "prompt": "prompts/protocol-essentials.md",
+                "overlay": None,
+            }
+    for source, dests in DOCUMENTS:
+        for relpath, _frontmatter in dests:
+            sources[ROOT / relpath] = {
+                "kind": "document",
+                "prompt": f"prompts/documents/{source}.md",
+                "overlay": None,
+            }
+    return sources
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true",

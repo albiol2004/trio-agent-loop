@@ -65,7 +65,10 @@ Loop control:
 - `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
 
 Registry and agents:
-- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag and YAML `quoted_keys` metadata
+- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated
+  files return read-only, source, and YAML `quoted_keys` metadata
+- `POST /api/registry/regenerate` — regenerate a managed file's prompt outputs
+  and re-install its harness after a clean-tree check
 - `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
 - `POST /api/registry/create` — create a registry file; `scope` may be `global` or
   `project`, with `project` required for project scope
@@ -88,7 +91,7 @@ The **Skills** page (`/skills.html`) edits skill registry files with a typed fro
 - **Format-preserving saves** — the editor sends `quoted_keys` metadata with form saves so an unchanged YAML key keeps its explicit quoting across the JSON API boundary.
 - **Scoped creation** — New skill defaults to the selected project when one is active,
   previews its resolved destination, and filters unsupported project layouts.
-- **Read-only generated files** — files managed by `prompts/generate.py` are marked read-only and return 403 on write attempts.
+- **Managed generated files** — source prompt and overlay paths stay visible beside the read-only form, with a clean-tree Regenerate & re-install action.
 
 ## Canonical agents & install matrix
 

@@ -19,12 +19,13 @@ preserved (never sorted).
 
 ``generated_paths()`` loads ``prompts/generate.py`` by file path and asks it
 for the absolute paths of every file it generates (the trio role prompts and
-generated documents); ``entry_record`` marks a scanned file ``managed`` when
-its caller passes ``managed=True`` (the Cursor builtin-skill cache) *or* the
-file's resolved path is in that set, so the dashboard can render it read-only
-instead of letting an edit be silently overwritten by the next generate.py
-run. Loading is best-effort and memoized - any failure yields an empty set
-rather than breaking a scan.
+generated documents); ``generated_sources()`` provides the corresponding
+prompt and overlay metadata. ``entry_record`` marks a scanned file
+``managed`` when its caller passes ``managed=True`` (the Cursor builtin-skill
+cache) *or* the file's resolved path is in that set, so the dashboard can
+render it read-only instead of letting an edit be silently overwritten by the
+next generate.py run. Loading is best-effort and memoized - any failure yields
+an empty result rather than breaking a scan.
 
 ``build_index`` groups ``skill``/``command``/``agent`` entries by name into
 the canonical-vs-installation drift view described above. It also accepts an
@@ -956,6 +957,7 @@ def default_template(harness: str, surface: str, name: str) -> str:
 # --------------------------------------------------------------------------
 
 _generated_paths_cache: frozenset[str] | None = None
+_generated_sources_cache: dict[str, dict[str, str | None]] | None = None
 
 
 def generated_paths() -> frozenset[str]:
@@ -987,10 +989,31 @@ def generated_paths() -> frozenset[str]:
     return _generated_paths_cache
 
 
+def generated_sources() -> dict[str, dict[str, str | None]]:
+    """Map absolute generated paths to their prompt and overlay sources."""
+    global _generated_sources_cache
+    if _generated_sources_cache is not None:
+        return _generated_sources_cache
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "trio_prompts_generate_sources", REPO / "prompts" / "generate.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sources = module.all_output_sources()
+        _generated_sources_cache = {
+            str(path.resolve()): source
+            for path, source in sources.items()
+        }
+    except Exception:
+        _generated_sources_cache = {}
+    return _generated_sources_cache
+
+
 def reset_generated_paths_cache() -> None:
     """Test hook: clear the memoized :func:`generated_paths` result."""
-    global _generated_paths_cache
+    global _generated_paths_cache, _generated_sources_cache
     _generated_paths_cache = None
+    _generated_sources_cache = None
 
 
 # --------------------------------------------------------------------------
@@ -1013,7 +1036,8 @@ def entry_record(path: Path, harness: str, surface: str, scope: str,
         name = fields.get("name") or path.parent.name
     else:
         name = fields.get("name") or path.stem
-    managed = managed or str(path.resolve()) in generated_paths()
+    resolved_path = str(path.resolve())
+    managed = managed or resolved_path in generated_paths()
     return {
         "name": name,
         "path": str(path),
@@ -1021,6 +1045,7 @@ def entry_record(path: Path, harness: str, surface: str, scope: str,
         "surface": surface,
         "scope": scope,
         "managed": managed,
+        "source": generated_sources().get(resolved_path),
         "frontmatter": fields,
         "frontmatter_hash": sha256(json.dumps(fields, sort_keys=True, default=str)),
         "body_hash": sha256(body.strip()),

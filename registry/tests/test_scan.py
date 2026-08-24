@@ -671,6 +671,17 @@ class GeneratedPaths(unittest.TestCase):
         self.assertEqual(third, first)
         self.assertIsNot(third, first)
 
+    def test_generated_sources_match_generated_paths(self):
+        paths = scan.generated_paths()
+        sources = scan.generated_sources()
+        self.assertIsInstance(sources, dict)
+        self.assertEqual(set(sources), set(paths))
+        self.assertEqual(
+            sources[str((REPO / ".claude/agents/trio-lead.md").resolve())]
+            ["kind"],
+            "role",
+        )
+
 
 class ManagedFlag(unittest.TestCase):
     def setUp(self):
@@ -681,6 +692,9 @@ class ManagedFlag(unittest.TestCase):
         record = scan.entry_record(
             REPO / ".claude/agents/trio-lead.md", "claude", "agent", "canonical")
         self.assertTrue(record["managed"])
+        self.assertTrue(
+            record["source"]["prompt"].endswith("prompts/canonical/lead.md"))
+        self.assertIn("overlays/.claude", record["source"]["overlay"])
 
     def test_non_generated_canonical_file_reports_managed_false(self):
         # trio-init is a canonical skill that generate.py does not own (its
@@ -689,6 +703,7 @@ class ManagedFlag(unittest.TestCase):
         self.assertNotIn(str(path.resolve()), scan.generated_paths())
         record = scan.entry_record(path, "claude", "skill", "canonical")
         self.assertFalse(record["managed"])
+        self.assertIsNone(record["source"])
 
     def test_explicit_managed_true_still_works(self):
         path = REPO / ".claude/skills/trio-init/SKILL.md"

@@ -11,6 +11,7 @@ import difflib
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -19,6 +20,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SERVE_PATH = REPO_ROOT / "dashboard" / "serve.py"
@@ -329,6 +331,34 @@ class RegistryFileEndpointTests(DashboardServerTestCase):
         self.assertIn("\n", payload["body"].strip())
         self.assertNotIn("developer_instructions", payload["frontmatter"])
 
+    def test_generated_claude_agent_includes_source_metadata(self):
+        path = REPO_ROOT / ".claude" / "agents" / "trio-lead.md"
+        status, payload = self._get(f"/api/registry/file?path={path}")
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(
+            payload["source"]["prompt"].endswith(
+                "prompts/canonical/lead.md"))
+        self.assertIn("overlays/.claude", payload["source"]["overlay"])
+
+    def test_prompt_source_file_is_readable_without_registry_entry(self):
+        path = REPO_ROOT / "prompts" / "canonical" / "lead.md"
+        status, payload = self._get(f"/api/registry/file?path={path}")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["format"], "text")
+        self.assertIn("{{lead.", payload["body"])
+        self.assertIsNone(payload["source"])
+
+    def test_prompt_source_file_is_read_only_for_put(self):
+        path = REPO_ROOT / "prompts" / "canonical" / "lead.md"
+        before = path.read_bytes()
+        status, payload = _http_json(
+            "PUT",
+            f"{self.base}/api/registry/file",
+            {"path": str(path), "content": "must not write\n"},
+        )
+        self.assertEqual(status, 403, payload)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_text_format_for_frontmatter_less_file(self):
         # ~/.claude/CLAUDE.md is scanned as scope="global" harness="claude"
         # surface="instructions" (registry.scan_instructions) with no ---
@@ -342,6 +372,104 @@ class RegistryFileEndpointTests(DashboardServerTestCase):
         self.assertEqual(payload["format"], "text")
         self.assertEqual(payload["frontmatter"], {})
         self.assertEqual(payload["body"], claude_md.read_text(encoding="utf-8"))
+
+
+class RegenerateEndpointTests(unittest.TestCase):
+    """Regeneration must inspect an isolated git workspace before writing."""
+
+    def _post(self, project: Path, payload: dict) -> tuple[int, dict]:
+        server = serve.DashboardServer(
+            ("127.0.0.1", 0),
+            root=project,
+            workspaces=[project],
+            auto_discover=False,
+        )
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            return _http_json(
+                "POST", f"{base}/api/registry/regenerate", payload)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def _init_git_repo(self, project: Path) -> None:
+        subprocess.run(
+            ["git", "init", "-q"], cwd=project, check=True,
+            capture_output=True, text=True)
+
+    def test_dirty_workspace_returns_conflict_without_running_generator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            self._init_git_repo(project)
+            dirty = project / "dirty.txt"
+            dirty.write_text("do not regenerate\n", encoding="utf-8")
+            status, payload = self._post(project, {
+                "path": str(REPO_ROOT / ".claude/agents/trio-lead.md"),
+                "root": str(project),
+            })
+        self.assertEqual(status, 409, payload)
+        self.assertEqual(payload["error"], "working tree dirty")
+        self.assertIn("dirty.txt", payload["files"])
+
+    def test_unmanaged_path_returns_bad_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp).resolve()
+            self._init_git_repo(project)
+            status, payload = self._post(project, {
+                "path": str(REPO_ROOT / ".claude/skills/trio-init/SKILL.md"),
+                "root": str(project),
+            })
+        self.assertEqual(status, 400, payload)
+
+    def test_clean_workspace_runs_generator_then_isolated_install(self):
+        responses = [
+            subprocess.CompletedProcess(
+                [], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0,
+                stdout="  wrote .claude/agents/trio-lead.md\n",
+                stderr=""),
+            subprocess.CompletedProcess(
+                [], 0, stdout="installed\n", stderr=""),
+        ]
+        with tempfile.TemporaryDirectory() as project_tmp, \
+                tempfile.TemporaryDirectory() as home_tmp:
+            project = Path(project_tmp).resolve()
+            fake_home = Path(home_tmp).resolve()
+            self._init_git_repo(project)
+            original_home = serve.HOME
+            try:
+                serve.HOME = fake_home
+                with mock.patch.object(
+                    serve.subprocess, "run",
+                    side_effect=responses,
+                ) as run:
+                    status, payload = self._post(project, {
+                        "path": str(REPO_ROOT / ".claude/agents/trio-lead.md"),
+                        "root": str(project),
+                    })
+            finally:
+                serve.HOME = original_home
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["wrote"], [".claude/agents/trio-lead.md"])
+        self.assertEqual(payload["install"], "installed\n")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["python3", "prompts/generate.py"],
+        )
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["./install.sh", "--global"],
+        )
+        self.assertEqual(
+            run.call_args_list[2].kwargs["env"]["HOME"],
+            str(fake_home),
+        )
 
 
 class RoundTripTests(DashboardServerTestCase):
