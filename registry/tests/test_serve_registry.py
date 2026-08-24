@@ -108,6 +108,28 @@ class RegistryTargetTests(unittest.TestCase):
                 serve._registry_target(
                     "omp", "skill", "x", scope="project", project=Path(tmp))
 
+    def test_agent_registry_target_falls_back_when_project_agent_dir_missing(self):
+        original_home = serve.HOME
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            serve.HOME = tmp_path
+            try:
+                project = tmp_path / "project"
+                project.mkdir()
+                target, scope_used = serve._agent_registry_target(
+                    "codex", "x", scope="project", project=project)
+                self.assertEqual(scope_used, "global")
+                expected = tmp_path / ".codex" / "agents" / "x.toml"
+                self.assertEqual(target, expected.resolve())
+
+                target, scope_used = serve._agent_registry_target(
+                    "claude", "x", scope="project", project=project)
+                self.assertEqual(scope_used, "project")
+                expected = project / ".claude" / "agents" / "x.md"
+                self.assertEqual(target, expected.resolve())
+            finally:
+                serve.HOME = original_home
+
     def test_update_registry_name_codex_toml_changes_only_name_line(self):
         source = (REPO_ROOT / "codex" / "agents" / "trio-evaluator.toml").read_text(
             encoding="utf-8")

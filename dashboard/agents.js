@@ -139,11 +139,7 @@
   }
 
   function targetableHarnesses(prefix) {
-    const scope = $(`${prefix}-scope`);
-    if (!scope || scope.value === "global") return supportedHarnesses();
-    return supportedHarnesses().filter((harness) =>
-      ["claude", "opencode"].includes(harness)
-    );
+    return supportedHarnesses();
   }
 
   function selectedTargets(prefix) {
@@ -440,7 +436,11 @@
       if (token !== state.destinationTokens[prefix]) return;
       (result.destinations || []).forEach((destination) => {
         const item = document.createElement("li");
-        item.textContent = `${destination.harness} · ${destination.path} (${destination.format})`;
+        const globalOnly = scope === "project" &&
+          destination.scope_used === "global";
+        item.textContent = globalOnly
+          ? `${destination.harness} · global only → ${destination.path}`
+          : `${destination.harness} · ${destination.path} (${destination.format})`;
         list.append(item);
       });
     } catch (error) {

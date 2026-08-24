@@ -126,16 +126,19 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
 
     GET /api/registry/agents/destinations?name=<name>&scope=<scope>
     Response: 200 {"name","scope","destinations"} with resolved native paths.
+                    Each destination includes its effective per-harness
+                    "scope_used" ("project" or "global").
 
     POST /api/registry/agents   (create)
     PUT  /api/registry/agents/file   (update; 404 if the agent is absent)
     Body: {"name","description","model_tier","tool_policy","spawns"?,
            "harness_overrides"?, "instructions", "harnesses"?, "scope"?,
            "project"?}
-    Response: 201/200 {"path"}; 400 on validation failure (CanonicalAgent's
-        ValueError text verbatim); selected harnesses are installed in the
-        requested project or global scope; POST is 409 when the agent already
-        exists.
+    Response: 201/200 {"path","scope","installations"}; 400 on validation
+        failure (CanonicalAgent's ValueError text verbatim); selected
+        harnesses are installed in the requested project or global scope,
+        with each installation reporting its effective "scope_used"; POST is
+        409 when the agent already exists.
 
     DELETE /api/registry/agents/file?name=<name>
     Response: 200 {"path"}; 404 {"error": "agent not found"}.
@@ -144,7 +147,7 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
     Body: {"agent": "<canonical agent name>", "harness": "<harness>",
            "harnesses"?, "scope"?, "project"?}
     Response: 201 (new file) or 200 (overwrote an existing install)
-        {"path","harness","format","filename","created"}.
+        {"path","harness","format","filename","created","scope_used"}.
         404 {"error": "agent not found"} for an unknown agent. 400
         {"error","reason","harness","supported": false} for an unsupported
         or unknown harness (e.g. omnigent) — never a 500. Writes are
@@ -1224,6 +1227,36 @@ def _registry_target(
     return (root / f"{name}.{ext}").resolve()
 
 
+def _agent_registry_target(
+    harness, name, scope, project=None, home=None
+) -> tuple[Path, str]:
+    """Resolve an agent target and report its effective destination scope."""
+    requested_scope = _normalize_agent_scope(scope)
+    try:
+        target = _registry_target(
+            harness,
+            "agent",
+            name,
+            scope=requested_scope,
+            project=project,
+            home=home,
+        )
+    except ValueError as exc:
+        # Only an absent project layout is allowed to fall back. Other
+        # validation errors must retain _registry_target's behavior.
+        if str(exc) != "unsupported project registry destination":
+            raise
+        target = _registry_target(
+            harness,
+            "agent",
+            name,
+            scope="global",
+            home=home,
+        )
+        return target, "global"
+    return target, requested_scope
+
+
 def _update_toml_name(text: str, name: str) -> str:
     """Rewrite (or insert) a top-level ``name = "..."`` line in TOML text.
 
@@ -2005,23 +2038,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not supported:
                 raise agents.UnsupportedHarness(harness, reason)
             rendered = agents.render_agent(agent, harness)
-            target = _registry_target(
+            target, scope_used = _agent_registry_target(
                 harness,
-                "agent",
                 agent.name,
-                scope=scope,
+                scope,
                 project=project_root,
             )
             target = _writable_registry_path(
                 str(target),
                 self.server.get_workspace_seeds(),
-                project_root if scope == "project" else None,
+                project_root if scope_used == "project" else None,
             )
             _reject_if_managed(target)
             plan.append({
                 "harness": harness,
                 "rendered": rendered,
                 "target": target,
+                "scope_used": scope_used,
             })
         return plan
 
@@ -2041,6 +2074,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "format": rendered.format,
                 "filename": rendered.filename,
                 "created": created,
+                "scope_used": item["scope_used"],
             })
         return results
 
@@ -2054,17 +2088,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             supported, reason = agents.install_support(harness)
             if not supported:
                 raise agents.UnsupportedHarness(harness, reason)
-            target = _registry_target(
+            target, scope_used = _agent_registry_target(
                 harness,
-                "agent",
                 name,
-                scope=scope,
+                scope,
                 project=project_root,
             )
             destinations.append({
                 "harness": harness,
                 "path": str(target),
                 "format": registry.SURFACE_FORMAT[(harness, "agent")],
+                "scope_used": scope_used,
             })
         return destinations
 

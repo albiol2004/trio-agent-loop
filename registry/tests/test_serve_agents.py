@@ -22,6 +22,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SERVE_PATH = REPO_ROOT / "dashboard" / "serve.py"
@@ -313,6 +314,8 @@ class MultiHarnessCreateTests(DashboardServerTestCase):
             [item["harness"] for item in global_payload["destinations"]],
             ["claude", "codex", "omp"],
         )
+        for item in global_payload["destinations"]:
+            self.assertEqual(item["scope_used"], "global")
         self.assertTrue(
             global_payload["destinations"][1]["path"].endswith(".toml"))
 
@@ -320,6 +323,8 @@ class MultiHarnessCreateTests(DashboardServerTestCase):
             f"/api/registry/agents/destinations?name={self.NAME}"
             f"&scope=project&project={REPO_ROOT}&harnesses=claude,opencode")
         self.assertEqual(status, 200, project_payload)
+        for item in project_payload["destinations"]:
+            self.assertEqual(item["scope_used"], "project")
         project_paths = {
             item["harness"]: item["path"]
             for item in project_payload["destinations"]
@@ -379,6 +384,120 @@ class MultiHarnessCreateTests(DashboardServerTestCase):
                     fields, _ = registry.parse_frontmatter(
                         installed.read_text(encoding="utf-8"))
                     self.assertNotIn("sandbox_mode", fields)
+
+
+class ProjectScopeFallbackTests(DashboardServerTestCase):
+    """Project requests fall back globally only for unsupported layouts."""
+
+    NAME = "z_trio_agent_test_scopefb"
+    HARNESSES = ("claude", "codex", "omp")
+
+    def setUp(self):
+        self._orig_home = serve.HOME
+        self._home = tempfile.TemporaryDirectory()
+        self._project = tempfile.TemporaryDirectory()
+        self._project_root = Path(self._project.name)
+        serve.HOME = Path(self._home.name)
+
+        # The project must be an allowed workspace while global writes must
+        # resolve below the temporary HOME used by this test.
+        self.server = serve.DashboardServer(
+            ("127.0.0.1", 0),
+            workspaces=[REPO_ROOT, self._project_root],
+            auto_discover=False,
+        )
+        self.port = self.server.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        try:
+            agents.delete_agent(self.NAME)
+        finally:
+            serve.HOME = self._orig_home
+            try:
+                super().tearDown()
+            finally:
+                self._project.cleanup()
+                self._home.cleanup()
+
+    def test_project_scope_resolves_each_harness_independently(self):
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/agents",
+            {
+                "name": self.NAME,
+                "description": "project scope fallback test agent",
+                "model_tier": "cheap",
+                "tool_policy": "read-only",
+                "instructions": "Use the requested harnesses.\n",
+                "harnesses": list(self.HARNESSES),
+                "scope": "project",
+                "project": str(self._project_root),
+            })
+        self.assertEqual(status, 201, payload)
+        self.assertEqual(payload["scope"], "project")
+        self.assertEqual(len(payload["installations"]), 3)
+
+        installations = {
+            item["harness"]: item for item in payload["installations"]}
+        self.assertEqual(set(installations), set(self.HARNESSES))
+        for item in installations.values():
+            self.assertTrue({
+                "harness", "scope_used", "path"
+            }.issubset(item))
+
+        expected_dirs = {
+            "claude": self._project_root / ".claude" / "agents",
+            "codex": Path(self._home.name) / ".codex" / "agents",
+            "omp": Path(self._home.name) / ".omp" / "agent" / "agents",
+        }
+        self.assertEqual(installations["claude"]["scope_used"], "project")
+        self.assertEqual(
+            Path(installations["claude"]["path"]).parent,
+            expected_dirs["claude"].resolve(),
+        )
+        for harness in ("codex", "omp"):
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    installations[harness]["scope_used"], "global")
+                path = Path(installations[harness]["path"])
+                self.assertEqual(path.parent, expected_dirs[harness].resolve())
+                self.assertNotIn(self._project_root.resolve(), path.parents)
+
+        query = (
+            "/api/registry/agents/destinations?"
+            f"name={self.NAME}&scope=project"
+            f"&project={quote(str(self._project_root), safe='')}"
+            f"&harnesses={','.join(self.HARNESSES)}"
+        )
+        status, destinations = self._get(query)
+        self.assertEqual(status, 200, destinations)
+        by_harness = {
+            item["harness"]: item for item in destinations["destinations"]}
+        self.assertEqual(set(by_harness), set(self.HARNESSES))
+        self.assertEqual(by_harness["claude"]["scope_used"], "project")
+        self.assertEqual(by_harness["codex"]["scope_used"], "global")
+        self.assertEqual(by_harness["omp"]["scope_used"], "global")
+        for item in by_harness.values():
+            self.assertIn("scope_used", item)
+            self.assertIn("path", item)
+
+        # The generic registry resolver remains strict; only agent handlers
+        # are allowed to apply the per-harness global fallback.
+        with self.assertRaises(ValueError) as error:
+            serve._registry_target(
+                "codex",
+                "agent",
+                "x",
+                scope="project",
+                project=self._project_root,
+            )
+        self.assertEqual(
+            str(error.exception),
+            "unsupported project registry destination",
+        )
 
 
 class InstallEndpointTests(DashboardServerTestCase):
