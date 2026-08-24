@@ -102,18 +102,30 @@ class BrokerClient:
         if body is not None:
             request.add_header("Content-Type", "application/json")
 
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                status = response.getcode()
-                raw = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace").strip()
-            suffix = f": {detail}" if detail else ""
-            raise BrokerHttpError(
-                f"{method} {url} failed with HTTP {exc.code}{suffix}"
-            ) from exc
-        except (OSError, URLError, TimeoutError) as exc:
-            raise BrokerHttpError(f"{method} {url} failed: {exc}") from exc
+        # Transient network faults (socket timeouts, connection resets) on
+        # idempotent GETs must not surface as role failures: a poll that
+        # dies mid-loop makes the driver re-dispatch a duplicate Lead. Retry
+        # GETs a few times before giving up; non-idempotent verbs never retry.
+        attempts = 4 if method == "GET" else 1
+        status = raw = None
+        for attempt in range(attempts):
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    status = response.getcode()
+                    raw = response.read()
+                break
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace").strip()
+                suffix = f": {detail}" if detail else ""
+                raise BrokerHttpError(
+                    f"{method} {url} failed with HTTP {exc.code}{suffix}"
+                ) from exc
+            except (OSError, URLError, TimeoutError) as exc:
+                if attempt + 1 >= attempts:
+                    raise BrokerHttpError(
+                        f"{method} {url} failed: {exc}"
+                    ) from exc
+                time.sleep(2.0 * (attempt + 1))
 
         if status != expected_status:
             raise BrokerHttpError(
