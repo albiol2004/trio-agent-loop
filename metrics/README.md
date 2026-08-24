@@ -47,3 +47,18 @@ block did not match the restricted shape. With `--require-commits` the
 script becomes the active commit gate: exit 1 when any code-changing slice
 (a `writes:` entry neither `api:` nor under `loop/`) lacks a
 `slice(<id>): ` commit.
+
+## Loop driver
+
+`metrics/trio_loop.py` is the authoritative implementation of gate, verdict,
+repair, and resume semantics used by both `portable/driver.sh` and
+`trioctl omnigent loop`. It owns the mailbox lock, parses verdicts and slice
+declarations, tracks repair attempts (max 2 consecutive scoped repairs before
+forcing a full Lead iteration), and resumes from phase bookkeeping written to
+`loop/STATE.md` or `loop/.driver.json` (the latter used by headless runners).
+
+Exit code contract: 0 (SHIP), 2 (BLOCKED), 3 (bad verdict or state error), 4
+(iteration cap reached), 5 (NEEDS_HUMAN or mailbox already locked by another
+driver). All writes to mailbox state must be recorded in a single-line `writes:`
+flow-list format so parallel analysis (dashboard, shadow metrics) can safely
+scan the log without parsing agent transcripts.

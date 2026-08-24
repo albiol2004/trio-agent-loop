@@ -281,9 +281,11 @@ kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/references/prompts/{lead,scout,builder,evaluator}.md
   smoke-test.sh
 ```
-`trioctl omnigent loop` uses loop-core with fresh Omnigent Lead and Evaluator
-sessions. Each loop wait defaults to 3600 seconds. `idle` is terminal only
-after a `running` to `idle` edge (with a short idle dwell) or a completed assistant message. `trioctl omnigent session create|wait|read`
+`trioctl omnigent loop` uses `metrics/trio_loop.py` with fresh Omnigent Lead and Evaluator
+sessions. Wait semantics: session `wait` defaults to 3600 seconds and completes
+on a `running` to `idle` edge (dwell ignores bind flicker), a completed assistant message,
+or timeout; exit 0 (SHIP), 2 (BLOCKED), 3 (bad verdict), 4 (iteration cap), 5
+(NEEDS_HUMAN or locked). `trioctl omnigent session create|wait|read`
 uses the local broker at
 `http://127.0.0.1:6767` by default. Auth prefers `OMNIGENT_TOKEN` or
 `OMNIGENT_REMOTE_AUTH_TOKEN`, then the server-keyed

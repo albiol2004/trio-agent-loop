@@ -50,6 +50,7 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## Pages
 
+- `/` — status board: loop cards with state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration count, mission, verdict history, **Start/Stop buttons**, **phase badge** (lead-done / eval-done / idle), and last activity
 - `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
 - `/topology.html` — layered SVG graphs of harness wiring (entrypoint → agent → model); compare schemas across harnesses
@@ -58,6 +59,12 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## API Endpoints
 
+Loop control:
+- `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`)
+- `POST /api/loop/stop` — stop a running loop: `{"root"}`
+- `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
+
+Registry and agents:
 - `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag
 - `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
 - `POST /api/registry/serialize` — validate frontmatter/body pairs; strict YAML parsing server-side

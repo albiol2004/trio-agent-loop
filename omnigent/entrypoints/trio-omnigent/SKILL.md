@@ -170,6 +170,24 @@ verdict.
 <!-- trio-protocol:end -->
 
 ## Headless
-Run `trioctl omnigent loop --mailbox loop/ --wait-timeout 3600` for unattended
-iterations; `idle` completes after a stable `running` to `idle` edge
-or a completed assistant message.
+
+`trioctl omnigent loop` runs unattended iterations over the broker's HTTP API:
+```bash
+trioctl omnigent loop --mailbox loop/ [--max-iterations N] [--wait-timeout S]
+```
+
+The command owns the mailbox lock and manages verdict parsing, repairs (max 2
+consecutive scoped repairs), resume state, and exit codes. `--wait-timeout`
+defaults to 3600 seconds; session `wait` completes on a `running` to `idle`
+edge (with idle dwell to ignore bind flicker), a completed assistant message,
+or `--wait-timeout` expiry. Distinct outcomes: exit 0 (SHIP), 2 (BLOCKED), 3
+(bad verdict), 4 (iteration cap), 5 (NEEDS_HUMAN or mailbox lock held).
+
+`trioctl omnigent loop` writes `loop/.driver.json` with the PID, iteration
+count, phase (`idle` / `lead-done` / `eval-done`), and Lead/Evaluator session
+IDs. This is the authoritative resume cursor; killing the process and re-running
+continues where it left off.
+
+Alternatively, the supervised chat-coordinator procedure (one iteration per
+`sys_session_create` in the current session, with inbox polling between roles)
+remains available for interactive debugging or custom iteration logic.
