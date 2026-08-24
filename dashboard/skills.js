@@ -19,6 +19,12 @@
     selectedPath: null,
     current: null,
     formControls: [],
+    modelChoices: {},
+    agentNames: [],
+    catalogRoot: null,
+    catalogKey: null,
+    catalogPromise: null,
+    formRenderToken: 0,
     filter: { scope: "all", harness: "all", surface: "all" },
     busy: false
   };
@@ -270,26 +276,167 @@
     return "text";
   }
 
+  const STRUCTURED_WIDGETS = new Set([
+    "permission-grid", "spawns-select", "json-schema"
+  ]);
+  const CUSTOM_VALUE = "__trio_custom__";
+
+  function declaredWidgetFor(spec) {
+    if (typeof spec.values_from === "string" &&
+        spec.values_from.startsWith("models:")) return "select";
+    if (spec.widget) return spec.widget;
+    return "text";
+  }
+
   // Defensive: even for a *known* schema field, if the actual value on disk
-  // is a nested map (or array-of-maps) never trust the schema's declared
-  // widget over the data's real shape — force it onto the raw YAML path.
-  // This is the guard against the original [object Object] bug: a scalar
-  // widget (text/textarea/list) only ever calls String() on a value that is
-  // provably not an object, because non-scalars are always routed to "raw".
+  // is a nested map (or array-of-maps) never trust a scalar widget over the
+  // data's real shape — force it onto the raw YAML path. Structured catalog
+  // widgets are the deliberate exceptions because they own their object shape.
   function effectiveWidgetFor(spec, hasValue, value) {
-    if (hasValue && spec.widget !== "raw" && classifyUnknownWidget(value) === "raw") return "raw";
-    return spec.widget || "text";
+    const widget = declaredWidgetFor(spec);
+    if (hasValue && !STRUCTURED_WIDGETS.has(widget) &&
+        widget !== "raw" && classifyUnknownWidget(value) === "raw") {
+      return "raw";
+    }
+    return widget;
+  }
+
+  function isObjectMap(value) {
+    return value && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function cloneValue(value) {
+    if (Array.isArray(value)) return value.map((item) => cloneValue(item));
+    if (isObjectMap(value)) {
+      const copy = {};
+      Object.entries(value).forEach(([key, child]) => {
+        copy[key] = cloneValue(child);
+      });
+      return copy;
+    }
+    return value;
+  }
+
+  function uniqueStrings(values) {
+    const seen = new Set();
+    const output = [];
+    values.forEach((value) => {
+      if (typeof value !== "string" || !value.trim()) return;
+      const text = value.trim();
+      if (seen.has(text)) return;
+      seen.add(text);
+      output.push(text);
+    });
+    return output;
+  }
+
+  function commaValues(value) {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item).trim()).filter(Boolean);
+    }
+    if (value === null || value === undefined || value === "") return [];
+    return String(value).split(",").map((item) => item.trim()).filter(Boolean);
+  }
+
+  function jsonText(value) {
+    if (typeof value === "string") return value;
+    if (value === null || value === undefined) return "";
+    try {
+      return JSON.stringify(value, null, 2) || "";
+    } catch (_) {
+      return String(value);
+    }
+  }
+
+  function makePermissionGrid(initialValue) {
+    const grid = document.createElement("div");
+    grid.className = "permission-grid";
+    const header = document.createElement("div");
+    header.className = "permission-grid-head";
+    const patternHead = document.createElement("span");
+    patternHead.textContent = "Tool pattern";
+    const ruleHead = document.createElement("span");
+    ruleHead.textContent = "Rule";
+    header.append(patternHead, ruleHead);
+    grid.append(header);
+
+    const source = isObjectMap(initialValue) ? cloneValue(initialValue) : {};
+    const rows = [];
+    const appendMap = (map, path, depth) => {
+      Object.entries(map).forEach(([pattern, value]) => {
+        const row = document.createElement("div");
+        row.className = "permission-row";
+        const patternText = document.createElement("span");
+        patternText.className = "permission-pattern";
+        patternText.textContent = pattern;
+        patternText.style.paddingLeft = `${depth * 16}px`;
+        row.append(patternText);
+
+        if (isObjectMap(value)) {
+          row.classList.add("permission-group");
+          const groupNote = document.createElement("span");
+          groupNote.className = "field-help";
+          groupNote.textContent = "nested rules";
+          row.append(groupNote);
+          grid.append(row);
+          appendMap(value, path.concat(pattern), depth + 1);
+          return;
+        }
+
+        const select = document.createElement("select");
+        select.className = "field-control permission-value";
+        ["allow", "deny"].forEach((choice) => {
+          const option = document.createElement("option");
+          option.value = choice;
+          option.textContent = choice;
+          select.append(option);
+        });
+        const current = value === null || value === undefined ? "" : String(value);
+        if (!["allow", "deny"].includes(current)) {
+          const option = document.createElement("option");
+          option.value = current;
+          option.textContent = current || "empty";
+          select.append(option);
+        }
+        select.value = current;
+        row.append(select);
+        grid.append(row);
+        rows.push({
+          path: path.concat(pattern),
+          control: select,
+          originalValue: value
+        });
+      });
+    };
+    appendMap(source, [], 0);
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "field-help";
+      empty.textContent = "No permission rules.";
+      grid.append(empty);
+    }
+    return { grid, value: source, rows };
   }
 
   function buildFieldRow(spec, initialValue, opts = {}) {
-    const { unknown = false, disabled = false, rawText = "" } = opts;
+    const {
+      unknown = false,
+      disabled = false,
+      rawText = "",
+      choices = []
+    } = opts;
     const row = document.createElement("div");
     row.className = `field-row${unknown ? " field-unknown" : ""}`;
-    const widget = spec.widget || "text";
+    const widget = declaredWidgetFor(spec);
     const label = document.createElement("label");
     label.className = "field-label";
     const labelText = `${spec.key}${spec.required ? " *" : ""}`;
     let control;
+    let customControl = null;
+    let permissionValue = null;
+    let permissionRows = null;
+    let offList = false;
+    let errorNode = null;
     if (widget === "checkbox") {
       control = document.createElement("input");
       control.type = "checkbox";
@@ -302,18 +449,70 @@
         const empty = document.createElement("option"); empty.value = ""; empty.textContent = "—";
         control.append(empty);
       }
-      (spec.enum || []).forEach((choice) => {
+      const sourceChoices = spec.values_from ? choices : (spec.enum || []);
+      const knownChoices = uniqueStrings(sourceChoices.map((choice) => String(choice)));
+      const current = initialValue === null || initialValue === undefined
+        ? "" : String(initialValue);
+      offList = Boolean(current) && !knownChoices.includes(current);
+      const visibleChoices = [...knownChoices];
+      if (offList && spec.values_from) visibleChoices.push(current);
+      visibleChoices.forEach((choice) => {
         const option = document.createElement("option");
         option.value = choice; option.textContent = choice;
-        option.selected = String(initialValue ?? "") === choice;
         control.append(option);
       });
-      label.append(labelText, control);
+      const customOption = document.createElement("option");
+      customOption.value = CUSTOM_VALUE;
+      customOption.textContent = "custom…";
+      control.append(customOption);
+      customControl = document.createElement("input");
+      customControl.type = "text";
+      customControl.className = "field-control";
+      customControl.value = current;
+      customControl.hidden = !offList;
+      customControl.disabled = disabled || !offList;
+      control.value = offList ? CUSTOM_VALUE : current;
+      control.addEventListener("change", () => {
+        const custom = control.value === CUSTOM_VALUE;
+        customControl.hidden = !custom;
+        customControl.disabled = disabled || !custom;
+      });
+      label.append(labelText, control, customControl);
     } else if (widget === "textarea") {
       control = document.createElement("textarea");
       control.className = "field-control field-textarea";
       control.rows = 3;
       control.value = initialValue == null ? "" : String(initialValue);
+      label.append(labelText, control);
+    } else if (widget === "permission-grid") {
+      const built = makePermissionGrid(initialValue);
+      control = built.grid;
+      permissionValue = built.value;
+      permissionRows = built.rows;
+      label.append(labelText, control);
+    } else if (widget === "spawns-select") {
+      control = document.createElement("select");
+      control.className = "field-control field-spawns";
+      control.multiple = true;
+      const current = commaValues(initialValue);
+      const knownChoices = uniqueStrings(choices);
+      const visibleChoices = uniqueStrings([...knownChoices, ...current]);
+      control.size = Math.min(Math.max(visibleChoices.length, 3), 8);
+      visibleChoices.forEach((choice) => {
+        const option = document.createElement("option");
+        option.value = choice;
+        option.textContent = choice;
+        option.selected = current.includes(choice);
+        control.append(option);
+      });
+      offList = current.some((choice) => !knownChoices.includes(choice));
+      label.append(labelText, control);
+    } else if (widget === "json-schema") {
+      control = document.createElement("textarea");
+      control.className = "field-control field-textarea field-json-schema";
+      control.rows = 8;
+      control.spellcheck = false;
+      control.value = jsonText(initialValue);
       label.append(labelText, control);
     } else if (widget === "raw") {
       control = document.createElement("textarea");
@@ -335,8 +534,27 @@
       control.value = initialValue == null ? "" : String(initialValue);
       label.append(labelText, control);
     }
-    if (spec.required && (widget === "text" || widget === "textarea" || widget === "select")) control.required = true;
-    if (disabled) control.disabled = true;
+    if (spec.required &&
+        ["text", "textarea", "select", "json-schema"].includes(widget)) {
+      control.required = true;
+    }
+    if (offList) {
+      row.classList.add("field-offlist");
+      control.classList.add("field-offlist");
+      if (customControl) customControl.classList.add("field-offlist");
+      const warning = document.createElement("p");
+      warning.className = "field-help field-offlist-help";
+      warning.textContent = "Current value is not in the known catalog.";
+      row.append(warning);
+    }
+    if (disabled) {
+      if (widget === "permission-grid") {
+        permissionRows.forEach((item) => { item.control.disabled = true; });
+      } else {
+        control.disabled = true;
+      }
+      if (customControl) customControl.disabled = true;
+    }
     control.dataset.fieldKey = spec.key;
     row.append(label);
     if (unknown) {
@@ -351,16 +569,72 @@
       help.textContent = spec.help;
       row.append(help);
     }
-    return { row, control, widget, spec, isArrayOriginally: Array.isArray(initialValue), wasPresent: false, unknownOriginalType: null };
+    if (widget === "json-schema") {
+      errorNode = document.createElement("p");
+      errorNode.className = "field-help field-error";
+      errorNode.hidden = true;
+      row.append(errorNode);
+    }
+    return {
+      row, control, widget, spec, customControl, permissionValue,
+      permissionRows, errorNode,
+      isArrayOriginally: Array.isArray(initialValue), wasPresent: false,
+      unknownOriginalType: null, jsonError: null
+    };
+  }
+
+  async function preloadWidgetCatalogs() {
+    const rootKey = currentRoot || "";
+    if (state.catalogRoot === rootKey) return;
+    if (state.catalogPromise && state.catalogKey === rootKey) {
+      await state.catalogPromise;
+      return;
+    }
+    state.catalogKey = rootKey;
+    state.catalogPromise = (async () => {
+      try {
+        const data = await api("/api/registry/models");
+        const choices = {};
+        const rows = data && Array.isArray(data.rows) ? data.rows : [];
+        rows.forEach((row) => {
+          if (!row || typeof row.harness !== "string" ||
+              typeof row.model !== "string") return;
+          const values = choices[row.harness] || [];
+          values.push(row.model);
+          choices[row.harness] = values;
+        });
+        if (currentRoot === rootKey) {
+          Object.keys(choices).forEach((harness) => {
+            choices[harness] = uniqueStrings(choices[harness]);
+          });
+          state.modelChoices = choices;
+          state.catalogRoot = rootKey;
+        }
+      } catch (_) {
+        if (currentRoot === rootKey) {
+          state.modelChoices = {};
+          state.catalogRoot = rootKey;
+        }
+      }
+    })();
+    await state.catalogPromise;
+    if (state.catalogKey === rootKey) state.catalogPromise = null;
   }
 
   async function renderFrontmatterForm() {
+    const renderToken = ++state.formRenderToken;
     const container = $("frontmatter-form");
+    const cur = state.current;
+    if (!cur || cur.format === "text") {
+      container.replaceChildren();
+      state.formControls = [];
+      return;
+    }
+
+    await preloadWidgetCatalogs();
+    if (renderToken !== state.formRenderToken || cur !== state.current) return;
     container.replaceChildren();
     state.formControls = [];
-    const cur = state.current;
-    if (!cur || cur.format === "text") return;
-
     const schemaKey = `${cur.entry.harness}:${cur.entry.surface}`;
     const specs = schema.keys[schemaKey] || [];
     const frontmatter = cur.frontmatter || {};
@@ -385,19 +659,33 @@
         });
         rawTexts = splitTopLevelBlocks(extractFrontmatterBlock(resp.content, cur.format), cur.format);
       } catch (error) {
+        if (renderToken !== state.formRenderToken || cur !== state.current) return;
         setEditorMessage(`Could not preload raw YAML for: ${rawKeys.join(", ")} (${error.message})`, "error");
       }
     }
+    if (renderToken !== state.formRenderToken || cur !== state.current) return;
 
     const disabled = Boolean(cur.managed);
     specs.forEach((spec) => {
       const has = Object.prototype.hasOwnProperty.call(frontmatter, spec.key);
-      const value = has ? frontmatter[spec.key] : (spec.type === "bool" ? false : "");
+      const value = has ? frontmatter[spec.key] : (
+        spec.type === "bool" ? false :
+        spec.widget === "permission-grid" ? {} : ""
+      );
       const effectiveWidget = effectiveWidgetFor(spec, has, value);
       const specForRow = effectiveWidget === spec.widget ? spec : { ...spec, widget: effectiveWidget };
       const rawText = effectiveWidget === "raw" ? (rawTexts[spec.key] || "") : "";
-      const built = buildFieldRow(specForRow, value, { disabled, rawText });
+      const source = typeof spec.values_from === "string" &&
+        spec.values_from.startsWith("models:")
+        ? spec.values_from.slice("models:".length) : null;
+      const choices = source
+        ? (state.modelChoices[source] || [])
+        : (spec.widget === "spawns-select" ? state.agentNames : []);
+      const built = buildFieldRow(specForRow, value, {
+        disabled, rawText, choices
+      });
       built.wasPresent = has;
+      if (built.widget === "json-schema") updateJsonSchemaError(built);
       container.append(built.row);
       state.formControls.push(built);
     });
@@ -424,10 +712,78 @@
     }
   }
 
+  function valueAtPath(root, path) {
+    let value = root;
+    for (const key of path) {
+      if (!isObjectMap(value)) return undefined;
+      value = value[key];
+    }
+    return value;
+  }
+
+  function setValueAtPath(root, path, value) {
+    if (!path.length) return;
+    let target = root;
+    path.slice(0, -1).forEach((key) => {
+      if (!isObjectMap(target[key])) target[key] = {};
+      target = target[key];
+    });
+    target[path[path.length - 1]] = value;
+  }
+
+  function permissionGridValue(fc) {
+    const value = cloneValue(fc.permissionValue || {});
+    fc.permissionRows.forEach((row) => {
+      const original = row.originalValue;
+      const originalText = original === null || original === undefined
+        ? "" : String(original);
+      const selected = row.control.value;
+      const next = selected === originalText ? original : selected;
+      setValueAtPath(value, row.path, next);
+    });
+    return value;
+  }
+
+  function updateJsonSchemaError(fc) {
+    if (fc.widget !== "json-schema") return null;
+    const text = String(fc.control.value || "");
+    let message = null;
+    if (text.trim() || fc.wasPresent) {
+      try {
+        JSON.parse(text);
+      } catch (error) {
+        message = `Invalid JSON: ${error.message}`;
+      }
+    }
+    if (fc.errorNode) {
+      fc.errorNode.textContent = message || "";
+      fc.errorNode.hidden = !message;
+    }
+    fc.row.classList.toggle("field-error", Boolean(message));
+    fc.control.classList.toggle("field-error", Boolean(message));
+    fc.jsonError = message;
+    return message;
+  }
+
   function computeFieldValue(fc) {
     const { widget, control } = fc;
     if (widget === "checkbox") return control.checked;
     if (widget === "raw") return { "$yaml": control.value };
+    if (widget === "permission-grid") return permissionGridValue(fc);
+    if (widget === "spawns-select") {
+      return [...control.options]
+        .filter((option) => option.selected)
+        .map((option) => option.value)
+        .join(", ");
+    }
+    if (widget === "json-schema") {
+      updateJsonSchemaError(fc);
+      return control.value;
+    }
+    if (widget === "select" && fc.customControl) {
+      return control.value === CUSTOM_VALUE
+        ? fc.customControl.value : control.value;
+    }
     if (widget === "list") {
       // A "list" widget is always comma-text <-> array, regardless of
       // whether this key was originally present (and regardless of what
@@ -452,6 +808,9 @@
   function isEmptyForOmission(value, widget) {
     if (widget === "checkbox") return value === false;
     if (widget === "raw") return !value || !value.$yaml || value.$yaml.trim() === "";
+    if (widget === "permission-grid") {
+      return !isObjectMap(value) || Object.keys(value).length === 0;
+    }
     if (Array.isArray(value)) return value.length === 0;
     return value === "" || value === null || value === undefined;
   }
@@ -493,8 +852,11 @@
   function validateForm() {
     const cur = state.current;
     for (const fc of state.formControls) {
-      if (!fc.spec.required) continue;
       const value = computeFieldValue(fc);
+      if (fc.widget === "json-schema" && fc.jsonError) {
+        return `"${fc.spec.key}" must contain valid JSON`;
+      }
+      if (!fc.spec.required) continue;
       if (isEmptyForOmission(value, fc.widget)) return `"${fc.spec.key}" is required`;
     }
     // Only enforce the name/filename match when the SCHEMA declares a
@@ -513,11 +875,70 @@
     return null;
   }
 
+  function setFormControlValue(fc, value) {
+    if (fc.widget === "checkbox") {
+      fc.control.checked = Boolean(value);
+      return;
+    }
+    if (fc.widget === "permission-grid") {
+      const source = isObjectMap(value) ? value : {};
+      fc.permissionValue = cloneValue(source);
+      fc.permissionRows.forEach((row) => {
+        const current = valueAtPath(source, row.path);
+        if (current !== undefined) row.originalValue = current;
+        const text = current === null || current === undefined
+          ? "" : String(current);
+        if (![...row.control.options].some((option) => option.value === text)) {
+          const option = document.createElement("option");
+          option.value = text;
+          option.textContent = text || "empty";
+          row.control.append(option);
+        }
+        row.control.value = text;
+      });
+      return;
+    }
+    if (fc.widget === "spawns-select") {
+      const selected = new Set(commaValues(value));
+      selected.forEach((name) => {
+        if ([...fc.control.options].some((option) => option.value === name)) return;
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        fc.control.append(option);
+      });
+      [...fc.control.options].forEach((option) => {
+        option.selected = selected.has(option.value);
+      });
+      return;
+    }
+    if (fc.widget === "json-schema") {
+      fc.control.value = jsonText(value);
+      updateJsonSchemaError(fc);
+      return;
+    }
+    if (fc.widget === "select" && fc.customControl) {
+      const text = value === null || value === undefined ? "" : String(value);
+      const regular = [...fc.control.options].some(
+        (option) => option.value === text && option.value !== CUSTOM_VALUE
+      );
+      fc.control.value = regular ? text : CUSTOM_VALUE;
+      fc.customControl.value = text;
+      const custom = fc.control.value === CUSTOM_VALUE;
+      fc.customControl.hidden = !custom;
+      fc.customControl.disabled = fc.control.disabled || !custom;
+      return;
+    }
+    fc.control.value = value === null || value === undefined ? "" : value;
+  }
+
   function snapshotFormControls() {
     return state.formControls.map((fc) => ({
       key: fc.spec.key,
       widget: fc.widget,
-      value: fc.widget === "checkbox" ? fc.control.checked : fc.control.value
+      value: STRUCTURED_WIDGETS.has(fc.widget) || fc.customControl
+        ? computeFieldValue(fc)
+        : (fc.widget === "checkbox" ? fc.control.checked : fc.control.value)
     }));
   }
 
@@ -526,7 +947,7 @@
     snapshot.forEach((item) => {
       const fc = state.formControls.find((candidate) => candidate.spec.key === item.key);
       if (!fc) return;
-      if (item.widget === "checkbox") fc.control.checked = item.value; else fc.control.value = item.value;
+      setFormControlValue(fc, item.value);
     });
   }
 
@@ -679,6 +1100,11 @@
         ...entry,
         status: entry.managed ? "managed" : (statusByPath.get(entry.path) || (entry.scope === "canonical" ? "canonical" : "unknown"))
       }));
+      state.agentNames = uniqueStrings(
+        state.entries
+          .filter((entry) => entry.surface === "agent")
+          .map((entry) => String(entry.name || ""))
+      );
       renderTree(); renderList();
       setPageState(`${state.entries.length} files · registry ready`);
       // Topology nodes deep-link here with ?path=<absolute file>.
@@ -839,6 +1265,10 @@
 
   window.addEventListener("trio:workspace", (event) => {
     currentRoot = event.detail && event.detail.path ? event.detail.path : "";
+    state.modelChoices = {};
+    state.catalogRoot = null;
+    state.catalogKey = null;
+    state.catalogPromise = null;
     loadSchema().then(() => { refreshDestinationSelects(); return refresh(); });
   });
 
@@ -856,8 +1286,10 @@
     setEditorMessage("Unsaved changes", "error");
     $("body-size").textContent = `${formatBytes(new TextEncoder().encode(bodyText.value).length)} body`;
   });
-  $("frontmatter-form").addEventListener("input", () => {
+  $("frontmatter-form").addEventListener("input", (event) => {
     if (state.current) setEditorMessage("Unsaved changes", "error");
+    const fc = state.formControls.find((item) => item.control === event.target);
+    if (fc && fc.widget === "json-schema") updateJsonSchemaError(fc);
   });
   $("frontmatter-raw-text").addEventListener("input", () => {
     if (state.current) setEditorMessage("Unsaved changes", "error");

@@ -266,6 +266,29 @@ class TopologyJsConventionTests(unittest.TestCase):
         self.assertIn("URLSearchParams(location.search)", source)
 
 
+class SkillsJsWidgetTests(unittest.TestCase):
+    """Keep structured catalog widgets in the safe plain-DOM frontend."""
+
+    def test_skills_js_contains_structured_widget_paths(self):
+        source = (REPO_ROOT / "dashboard" / "skills.js").read_text(
+            encoding="utf-8")
+        for marker in (
+            "permission-grid",
+            "spawns-select",
+            "json-schema",
+            "custom…",
+            "/api/registry/models",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
+        self.assertNotIn("innerHTML", source)
+        self.assertNotIn("<script", source)
+        html = (REPO_ROOT / "dashboard" / "skills.html").read_text(
+            encoding="utf-8")
+        self.assertIn(".field-offlist", html)
+        self.assertIn(".field-error", html)
+
+
 class ModelsJsConventionTests(unittest.TestCase):
     def test_models_js_has_no_innerhtml_or_script_tag(self):
         source = (REPO_ROOT / "dashboard" / "models.js").read_text(encoding="utf-8")
