@@ -52,18 +52,21 @@ MODEL_TIERS: dict[str, dict[str, dict]] = {
         "codex": {"model": "gpt-5.6-terra", "model_reasoning_effort": "high"},
         "omp": {"model": "cursor/cursor-grok-4.6-high"},
         "opencode": {},
+        "omnigent": {"model": "cursor-grok-4.6-high"},
     },
     "standard": {
         "claude": {"model": "sonnet", "effort": "high"},
         "codex": {"model": "gpt-5.6-luna", "model_reasoning_effort": "high"},
         "omp": {"model": "cursor/cursor-grok-4.6-medium"},
         "opencode": {},
+        "omnigent": {"model": "cursor-grok-4.6-medium"},
     },
     "cheap": {
         "claude": {"model": "haiku"},
         "codex": {"model": "gpt-5.6-luna", "model_reasoning_effort": "low"},
         "omp": {"model": "deepseek/deepseek-v4-flash"},
         "opencode": {},
+        "omnigent": {"model": "gpt-5.6-luna-max"},
     },
 }
 
@@ -76,12 +79,14 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
             "*": "deny", "read": "allow", "grep": "allow", "glob": "allow",
             "webfetch": "allow", "edit": "deny", "bash": "deny", "task": "deny",
         }},
+        "omnigent": {},
     },
     "edit": {
         "claude": {"disallowedTools": "Agent"},
         "codex": {},
         "omp": {},
         "opencode": {"permission": {"task": "deny"}},
+        "omnigent": {},
     },
     "spawn": {
         "claude": {},
@@ -89,6 +94,7 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
         "omp": {},
         # Named targets are added by the OpenCode renderer below.
         "opencode": {"permission": {"task": {"*": "deny"}}},
+        "omnigent": {},
     },
 }
 
@@ -97,15 +103,11 @@ HARNESS_SUPPORT: dict[str, tuple[bool, str]] = {
     "codex": (True, ""),
     "omp": (True, ""),
     "opencode": (True, ""),
-    "omnigent": (False,
-                 "omnigent agents are role directories with a config.yaml "
-                 "(spec_version/executor/os_env/guardrails/prompt) rather than "
-                 "a frontmatter agent file; they are managed by "
-                 "prompts/generate.py and cannot be rendered from a canonical "
-                 "agent."),
+    "omnigent": (True, ""),
 }
 
-RENDER_HARNESSES: tuple[str, ...] = ("claude", "codex", "omp", "opencode")
+RENDER_HARNESSES: tuple[str, ...] = (
+    "claude", "codex", "omp", "opencode", "omnigent")
 
 
 # --------------------------------------------------------------------------
@@ -317,12 +319,13 @@ def _policy_fields(harness: str, tool_policy: str) -> dict:
 
 
 def _apply_harness_overrides(
-    fields: dict, agent: CanonicalAgent, harness: str
+    fields: dict, agent: CanonicalAgent, harness: str, *, exclude=()
 ) -> None:
     """Apply native fields after all tier and policy defaults are resolved."""
     overrides = agent.harness_overrides.get(harness, {})
-    if overrides:
-        fields.update(copy.deepcopy(overrides))
+    fields.update(copy.deepcopy({
+        key: value for key, value in overrides.items() if key not in exclude
+    }))
 
 
 def _render_claude(agent: CanonicalAgent) -> RenderedAgent:
@@ -380,11 +383,55 @@ def _render_opencode(agent: CanonicalAgent) -> RenderedAgent:
     return RenderedAgent("opencode", f"{agent.name}.md", "yaml", text)
 
 
+def _render_omnigent(agent: CanonicalAgent) -> RenderedAgent:
+    """Render a canonical agent as an Omnigent role config document."""
+    executor = {"type": "omnigent"}
+    executor.update(_tier_fields("omnigent", agent.model_tier))
+    executor["config"] = scan.flow_map({
+        "harness": "cursor-native",
+        "yolo": True,
+    })
+
+    # Omnigent's native model and executor settings are nested, while
+    # guardrails are a top-level opt-in override. Support both direct native
+    # fields and an optional nested executor override for callers.
+    overrides = agent.harness_overrides.get("omnigent", {})
+    _apply_harness_overrides(
+        executor, agent, "omnigent", exclude={"guardrails", "executor"})
+    nested_executor = overrides.get("executor")
+    if isinstance(nested_executor, dict):
+        executor.update(copy.deepcopy(nested_executor))
+
+    fields = {
+        "spec_version": 1,
+        "name": agent.name,
+        "description": agent.description,
+    }
+    if agent.tool_policy == "spawn":
+        fields["spawn"] = True
+    fields["executor"] = executor
+
+    os_env = {
+        "type": "caller_process",
+        "cwd": ".",
+    }
+    if agent.tool_policy != "read-only":
+        os_env["sandbox"] = scan.flow_map({"type": "none"})
+    fields["os_env"] = os_env
+
+    if "guardrails" in overrides:
+        fields["guardrails"] = copy.deepcopy(overrides["guardrails"])
+    fields["prompt"] = agent.instructions
+    return RenderedAgent(
+        "omnigent", "config.yaml", "yaml-document", scan.dump_yaml(fields))
+
+
 _RENDERERS = {
     "claude": _render_claude,
     "codex": _render_codex,
     "omp": _render_omp,
     "opencode": _render_opencode,
+    "omnigent": _render_omnigent,
 }
 
 

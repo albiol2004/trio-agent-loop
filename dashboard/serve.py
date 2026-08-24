@@ -63,10 +63,11 @@ Registry (format-aware):
     GET /api/registry/file?path=<absolute-path>
     Response: {"path", "format", "frontmatter", "body", "managed",
                "source", "quoted_keys"}
-        format is one of "toml" | "yaml" | "text". "toml" bodies hold the
-        file's `developer_instructions` string; "text" means no frontmatter
-        fence was found (frontmatter is {}, body is the whole file). `source`
-        is the generate.py prompt/overlay descriptor or null.
+        format is one of "toml" | "yaml" | "yaml-document" | "text".
+        "toml" bodies hold the file's `developer_instructions` string;
+        "yaml-document" bodies hold the file's `prompt` string; "text" means
+        no frontmatter fence was found (frontmatter is {}, body is the whole
+        file). `source` is the generate.py prompt/overlay descriptor or null.
 
     GET /api/registry/models?root=<absolute-path>
     Response: {"root", "rows"} describing model resolution for each agent.
@@ -79,7 +80,7 @@ Registry (format-aware):
 
     GET /api/registry/schema
     Response: {"destinations": {<harness>: [<surface>, ...]},
-               "formats": {"<harness>:<surface>": "yaml"|"toml"},
+               "formats": {"<harness>:<surface>": "yaml"|"yaml-document"|"toml"},
                "keys": {"<harness>:<surface>": [<fieldspec>, ...]}}
         fieldspec: {"key", "type", "widget", "required", "enum", "help",
                     "values_from"};
@@ -148,10 +149,13 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
            "harnesses"?, "scope"?, "project"?}
     Response: 201 (new file) or 200 (overwrote an existing install)
         {"path","harness","format","filename","created","scope_used"}.
+        Omnigent results also include a `register` command for the config.
         404 {"error": "agent not found"} for an unknown agent. 400
         {"error","reason","harness","supported": false} for an unsupported
-        or unknown harness (e.g. omnigent) — never a 500. Writes are
-        confined to _WRITABLE_ROOTS (403) and refuse a
+        or unknown harness — never a 500. Omnigent is supported at
+        `~/.omnigent/agents/<name>/config.yaml`; use its returned
+        `sys_session_create(config_path=...)` command to register it. Writes
+        are confined to _WRITABLE_ROOTS (403) and refuse a
         prompts/generate.py-managed destination (403).
 """
 from __future__ import annotations
@@ -237,6 +241,7 @@ _WRITABLE_ROOTS = (
     HOME / ".omp" / "agent" / "agents",
     HOME / ".config" / "opencode" / "commands",
     HOME / ".config" / "opencode" / "agents",
+    HOME / ".omnigent" / "agents",
     HOME / ".kimi-code" / "skills",
     HOME / ".zcode" / "skills",
     REPO_ROOT / ".claude",
@@ -258,6 +263,7 @@ _GLOBAL_REGISTRY_DIRS = {
     ("omp", "agent"): HOME / ".omp" / "agent" / "agents",
     ("opencode", "command"): HOME / ".config" / "opencode" / "commands",
     ("opencode", "agent"): HOME / ".config" / "opencode" / "agents",
+    ("omnigent", "agent"): HOME / ".omnigent" / "agents",
     ("kimi", "skill"): HOME / ".kimi-code" / "skills",
     ("zcode", "skill"): HOME / ".zcode" / "skills",
 }
@@ -272,6 +278,7 @@ _GLOBAL_REGISTRY_RELATIVE_DIRS = {
     ("omp", "agent"): Path(".omp/agent/agents"),
     ("opencode", "command"): Path(".config/opencode/commands"),
     ("opencode", "agent"): Path(".config/opencode/agents"),
+    ("omnigent", "agent"): Path(".omnigent/agents"),
     ("kimi", "skill"): Path(".kimi-code/skills"),
     ("zcode", "skill"): Path(".zcode/skills"),
 }
@@ -1212,15 +1219,16 @@ def _registry_target(
         if home is None and HOME != _INITIAL_HOME:
             home = HOME
         root = _GLOBAL_REGISTRY_DIRS.get((harness, surface))
+        relative = _GLOBAL_REGISTRY_RELATIVE_DIRS.get((harness, surface))
+        if home is not None and relative is not None:
+            root = Path(home).expanduser().resolve() / relative
         if root is None:
             raise ValueError("unsupported harness or surface")
-        if home is not None:
-            relative = _GLOBAL_REGISTRY_RELATIVE_DIRS.get((harness, surface))
-            if relative is not None:
-                root = Path(home).expanduser().resolve() / relative
     name = _safe_registry_name(name)
     if surface == "skill":
         return (root / name / "SKILL.md").resolve()
+    if (harness, surface) == ("omnigent", "agent"):
+        return (root / name / "config.yaml").resolve()
     registry = load_registry_module()
     fmt = registry.SURFACE_FORMAT.get((harness, surface), "yaml")
     ext = "toml" if fmt == "toml" else "md"
@@ -1482,8 +1490,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             text = target.read_text(encoding="utf-8", errors="replace")
             registry = load_registry_module()
             fmt = registry.file_format(target)
-            if fmt == "toml":
-                frontmatter, body = registry.split_file(text, "toml")
+            surface_fmt = registry.SURFACE_FORMAT.get(
+                (entry.get("harness"), entry.get("surface")))
+            if surface_fmt == "yaml-document":
+                fmt = surface_fmt
+                frontmatter, body = registry.split_file(text, fmt)
+            elif fmt == "toml":
+                frontmatter, body = registry.split_file(text, fmt)
             elif registry.FRONTMATTER_RE.match(text):
                 fmt = "yaml"
                 frontmatter, body = registry.parse_frontmatter(text)
@@ -1660,7 +1673,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         fmt = payload.get("format")
-        if fmt not in ("yaml", "toml", "text"):
+        if fmt not in ("yaml", "yaml-document", "toml", "text"):
             return self._send_json(400, {"error": "invalid 'format'"})
         body = payload.get("body")
         if not isinstance(body, str):
@@ -1715,7 +1728,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         # JSON turns scan.py's quoted string-key markers into plain strings.
         # Restore them before the existing YAML writer renders the response.
-        if fmt == "yaml":
+        if fmt in ("yaml", "yaml-document"):
             registry.apply_quoted_key_paths(
                 resolved, payload.get("quoted_keys"))
 
@@ -2076,6 +2089,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "created": created,
                 "scope_used": item["scope_used"],
             })
+            if item["harness"] == "omnigent":
+                results[-1]["register"] = (
+                    f"sys_session_create(config_path={target})")
         return results
 
     def _agent_destination_list(
@@ -2100,6 +2116,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "format": registry.SURFACE_FORMAT[(harness, "agent")],
                 "scope_used": scope_used,
             })
+            if harness == "omnigent":
+                destinations[-1]["register"] = (
+                    f"sys_session_create(config_path={target})")
         return destinations
 
     def _handle_agents_list(self) -> None:

@@ -65,11 +65,13 @@ Loop control:
 - `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
 
 Registry and agents:
-- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated
-  files return read-only, source, and YAML `quoted_keys` metadata
+- `GET /api/registry/file?path=<absolute-path>` — read a registry file;
+  generated files return read-only, source, and YAML `quoted_keys` metadata.
+  Omnigent role documents report `yaml-document` format with `prompt` as body.
 - `POST /api/registry/regenerate` — regenerate a managed file's prompt outputs
   and re-install its harness after a clean-tree check
-- `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
+- `GET /api/registry/schema` — harness/surface destinations, formats
+  (yaml/yaml-document/toml), and per-field specs
 - `POST /api/registry/create` — create a registry file; `scope` may be `global` or
   `project`, with `project` required for project scope
 - `POST /api/registry/serialize` — validate frontmatter/body pairs; strict YAML parsing server-side
@@ -109,13 +111,21 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
   frontmatter string; OpenCode uses nested `permission.task` entries with
   wildcard deny; Codex appends a delegation note to
   `developer_instructions`. Empty lists preserve each harness's safe default.
-- **Install matrix** shows each canonical agent as a row with a cell per supported harness (claude, codex, omp, opencode) indicating sync status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported.
+- **Install matrix** shows each canonical agent as a row with a cell per
+  supported harness (claude, codex, omp, opencode, omnigent) indicating sync
+  status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported.
 - **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
 - **Scoped agent installs** — project scope keeps every supported harness
   selectable. Harnesses without a project agent directory fall back to global
   installation and report `scope_used: "global"` in each destination or
   installation.
-- **Install endpoint** — `POST /api/registry/install` renders a canonical agent into a harness's native format and writes it to the correct location (e.g., `~/.claude/agents/` for claude). Returns 404 for an unknown agent, 400 for an unsupported harness (e.g., omnigent), and 403 if the destination is managed by generate.py.
+- **Install endpoint** — `POST /api/registry/install` renders a canonical
+  agent into a harness's native format and writes it to the correct location
+  (e.g., `~/.claude/agents/` for claude or
+  `~/.omnigent/agents/<name>/config.yaml` for omnigent). Omnigent results
+  include a `sys_session_create(config_path=...)` registration command.
+  Returns 404 for an unknown agent and 403 if the destination is managed by
+  generate.py.
 
 ## Harness topology API
 

@@ -75,6 +75,37 @@ class _YamlKey(str):
         return key
 
 
+class _YamlFlowMap(dict):
+    """Mapping that must be serialized as a YAML flow collection."""
+
+    _yaml_flow = True
+
+
+class _YamlFlowList(list):
+    """Sequence that must be serialized as a YAML flow collection."""
+
+    _yaml_flow = True
+
+
+class _YamlBlockString(str):
+    """Block scalar value carrying source indentation for blank lines."""
+
+    def __new__(cls, value: str, *, blank_lines=()):
+        result = super().__new__(cls, value)
+        result._yaml_blank_lines = tuple(blank_lines)
+        return result
+
+
+def flow_map(values: dict | None = None) -> dict:
+    """Build a mapping that ``dump_yaml`` writes on one line."""
+    return _YamlFlowMap({} if values is None else values)
+
+
+def flow_list(values: list | tuple | None = None) -> list:
+    """Build a list that ``dump_yaml`` writes on one line."""
+    return _YamlFlowList([] if values is None else values)
+
+
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
@@ -263,7 +294,9 @@ def _parse_flow(text: str, pos: int = 0):
             mapping[map_key] = sub
         else:
             items.append(value)
-    return (mapping if is_map else items), i
+    if is_map:
+        return _YamlFlowMap(mapping), i
+    return _YamlFlowList(items), i
 
 
 class _YamlReader:
@@ -446,7 +479,7 @@ class _YamlReader:
         while not self._at_end():
             line = self.lines[self.i]
             if line.strip() == "":
-                pending.append("")
+                pending.append(line)
                 self.i += 1
                 continue
             if self._indent(line) <= key_indent:
@@ -465,6 +498,7 @@ class _YamlReader:
         if not collected:
             return "" if chomp == "-" else ""
 
+        blank_lines = [line for line in collected if not line.strip()]
         if explicit is not None:
             content_indent = key_indent + explicit
         else:
@@ -475,11 +509,11 @@ class _YamlReader:
         if style == ">":
             text = _fold(text)
         if chomp == "-":
-            return text.rstrip("\n")
-        if chomp == "+":
-            return text
-        stripped = text.rstrip("\n")
-        return stripped + "\n" if stripped else ""
+            text = text.rstrip("\n")
+        elif chomp != "+":
+            stripped = text.rstrip("\n")
+            text = stripped + "\n" if stripped else ""
+        return _YamlBlockString(text, blank_lines=blank_lines)
 
 
 def _fold(text: str) -> str:
@@ -669,8 +703,39 @@ def _dump_block_scalar(value: str, indent: int) -> str:
     else:
         header, body = "|+", value[:-1]
     lines = body.split("\n")
-    rendered = "\n".join(f"{pad}{line}" if line else "" for line in lines)
+    blank_lines = getattr(value, "_yaml_blank_lines", ())
+    blank_index = 0
+    rendered_lines = []
+    for line in lines:
+        if line:
+            rendered_lines.append(f"{pad}{line}")
+        elif blank_index < len(blank_lines):
+            rendered_lines.append(blank_lines[blank_index])
+            blank_index += 1
+        else:
+            rendered_lines.append("")
+    rendered = "\n".join(rendered_lines)
     return f"{header}\n{rendered}\n"
+
+
+def _dump_flow(value) -> str:
+    """Serialize a flow-marked collection and nested values on one line."""
+    if isinstance(value, dict):
+        items = ", ".join(
+            f"{_dump_key(key)}: {_dump_flow(item)}"
+            if isinstance(item, (dict, list))
+            else f"{_dump_key(key)}: {_dump_scalar(item)}"
+            for key, item in value.items()
+        )
+        return "{" + items + "}"
+    if isinstance(value, list):
+        items = ", ".join(
+            _dump_flow(item) if isinstance(item, (dict, list))
+            else _dump_scalar(item)
+            for item in value
+        )
+        return "[" + items + "]"
+    return _dump_scalar(value)
 
 
 def _dump_node(data, indent: int) -> str:
@@ -679,10 +744,15 @@ def _dump_node(data, indent: int) -> str:
     for key, value in data.items():
         label = f"{pad}{_dump_key(key)}:"
         if isinstance(value, dict):
-            out.append(f"{label} {{}}\n" if not value
-                       else f"{label}\n{_dump_node(value, indent + 2)}")
+            if getattr(value, "_yaml_flow", False):
+                out.append(f"{label} {_dump_flow(value)}\n")
+            else:
+                out.append(f"{label} {{}}\n" if not value
+                           else f"{label}\n{_dump_node(value, indent + 2)}")
         elif isinstance(value, list):
-            if not value:
+            if getattr(value, "_yaml_flow", False):
+                out.append(f"{label} {_dump_flow(value)}\n")
+            elif not value:
                 out.append(f"{label} []\n")
             else:
                 out.append(f"{label}\n")
@@ -705,7 +775,9 @@ def _dump_node(data, indent: int) -> str:
 def dump_yaml(data: dict) -> str:
     """Serialize a dict to the YAML subset, preserving insertion order."""
     if not data:
-        return ""
+        return "{}\n" if getattr(data, "_yaml_flow", False) else ""
+    if getattr(data, "_yaml_flow", False):
+        return f"{_dump_flow(data)}\n"
     return _dump_node(data, 0)
 
 
@@ -813,6 +885,13 @@ def split_file(text: str, fmt: str) -> tuple[dict, str]:
             return {}, text
         body = fields.pop("developer_instructions", "")
         return fields, body if isinstance(body, str) else ""
+    if fmt == "yaml-document":
+        try:
+            fields = parse_yaml(text)
+        except Exception:
+            return {}, text
+        body = fields.pop("prompt", "")
+        return fields, body if isinstance(body, str) else ""
     return parse_frontmatter(text)
 
 
@@ -822,6 +901,10 @@ def join_file(fields: dict, body: str, fmt: str) -> str:
         merged = {k: v for k, v in fields.items() if k != "developer_instructions"}
         merged["developer_instructions"] = body
         return dump_toml(merged)
+    if fmt == "yaml-document":
+        merged = {k: v for k, v in fields.items() if k != "prompt"}
+        merged["prompt"] = body
+        return dump_yaml(merged)
     return dump_frontmatter(fields, body)
 
 
@@ -835,6 +918,7 @@ SURFACE_FORMAT: dict[tuple[str, str], str] = {
     ("claude", "agent"): "yaml",
     ("codex", "skill"): "yaml",
     ("codex", "agent"): "toml",
+    ("omnigent", "agent"): "yaml-document",
     ("omp", "command"): "yaml",
     ("omp", "agent"): "yaml",
     ("opencode", "command"): "yaml",
@@ -949,6 +1033,8 @@ def default_template(harness: str, surface: str, name: str) -> str:
         fields[spec["key"]] = name if spec["key"] == "name" else ""
     if not fields:
         fields = {"description": ""}
+    if fmt == "yaml-document":
+        return dump_yaml(fields)
     return dump_frontmatter(fields, "\n")
 
 
@@ -1030,6 +1116,8 @@ def entry_record(path: Path, harness: str, surface: str, scope: str,
         except ValueError:
             fields = {}
         body = text          # body_hash for TOML stays the whole file
+    elif SURFACE_FORMAT.get((harness, surface)) == "yaml-document":
+        fields, body = split_file(text, "yaml-document")
     else:
         fields, body = parse_frontmatter(text)
     if path.name == "SKILL.md":

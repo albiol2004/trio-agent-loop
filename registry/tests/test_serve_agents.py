@@ -99,17 +99,20 @@ class AgentsListEndpointTests(DashboardServerTestCase):
         self.assertEqual(status, 200, payload)
         for key in ("agents", "harnesses", "support", "model_tiers", "tool_policies"):
             self.assertIn(key, payload)
-        self.assertEqual(set(payload["harnesses"]), {"claude", "codex", "omp", "opencode"})
+        self.assertEqual(
+            set(payload["harnesses"]),
+            {"claude", "codex", "omp", "opencode", "omnigent"},
+        )
         for agent in payload["agents"]:
             for key in ("name", "description", "model_tier", "tool_policy", "path"):
                 self.assertIn(key, agent)
 
-    def test_omnigent_is_unsupported_with_a_reason(self):
+    def test_omnigent_is_supported(self):
         status, payload = self._get("/api/registry/agents")
         self.assertEqual(status, 200, payload)
         omnigent = payload["support"]["omnigent"]
-        self.assertFalse(omnigent["supported"])
-        self.assertTrue(omnigent["reason"])
+        self.assertTrue(omnigent["supported"])
+        self.assertEqual(omnigent["reason"], "")
 
     def test_support_covers_every_harness_support_key(self):
         status, payload = self._get("/api/registry/agents")
@@ -514,6 +517,7 @@ class InstallEndpointTests(DashboardServerTestCase):
             ("codex", "agent"): tmp_root / "codex-agents",
             ("omp", "agent"): tmp_root / "omp-agents",
             ("opencode", "agent"): tmp_root / "opencode-agents",
+            ("omnigent", "agent"): tmp_root / "omnigent-agents",
         }
         serve._GLOBAL_REGISTRY_DIRS = fake_dirs
         serve._WRITABLE_ROOTS = (tmp_root,)
@@ -525,10 +529,14 @@ class InstallEndpointTests(DashboardServerTestCase):
         self._tmp.cleanup()
         super().tearDown()
 
-    def _install(self, agent="registry-scout", harness="claude") -> tuple[int, dict]:
+    def _install(
+        self, agent="registry-scout", harness="claude", **overrides
+    ) -> tuple[int, dict]:
+        payload = {"agent": agent, "harness": harness}
+        payload.update(overrides)
         return _http_json(
             "POST", f"{self.base}/api/registry/install",
-            {"agent": agent, "harness": harness})
+            payload)
 
     def test_install_claude_written_to_temp_dir_not_home(self):
         status, payload = self._install(harness="claude")
@@ -580,20 +588,35 @@ class InstallEndpointTests(DashboardServerTestCase):
         content2 = path.read_text(encoding="utf-8")
         self.assertEqual(content1, content2)
 
-    def test_install_omnigent_is_400_with_reason_and_writes_nothing(self):
-        before = set()
-        for d in serve._GLOBAL_REGISTRY_DIRS.values():
-            if d.is_dir():
-                before |= set(d.rglob("*"))
-        status, payload = self._install(harness="omnigent")
-        self.assertEqual(status, 400, payload)
-        self.assertFalse(payload["supported"])
-        self.assertTrue(payload["reason"])
-        after = set()
-        for d in serve._GLOBAL_REGISTRY_DIRS.values():
-            if d.is_dir():
-                after |= set(d.rglob("*"))
-        self.assertEqual(before, after)
+    def test_install_omnigent_uses_temp_home_and_registers_config(self):
+        original_home = serve.HOME
+        with tempfile.TemporaryDirectory() as home:
+            fake_home = Path(home)
+            target = (
+                fake_home / ".omnigent" / "agents" /
+                "registry-scout" / "config.yaml"
+            )
+            try:
+                serve.HOME = fake_home
+                status, payload = self._install(
+                    harness="omnigent",
+                    scope="project",
+                    project=str(REPO_ROOT),
+                )
+                self.assertEqual(status, 201, payload)
+                self.assertEqual(Path(payload["path"]), target.resolve())
+                self.assertTrue(target.is_file(), payload)
+                fields = registry.parse_yaml(
+                    target.read_text(encoding="utf-8"))
+                self.assertEqual(fields["spec_version"], 1)
+                self.assertEqual(fields["name"], "registry-scout")
+                self.assertEqual(payload["scope_used"], "global")
+                self.assertIn("sys_session_create", payload["register"])
+                self.assertIn(str(target.resolve()), payload["register"])
+            finally:
+                serve.HOME = original_home
+                if target.is_file():
+                    target.unlink()
 
     def test_install_unknown_harness_is_400_never_500(self):
         status, payload = self._install(harness="totally-unknown-harness")

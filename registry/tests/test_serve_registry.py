@@ -741,7 +741,7 @@ class SerializeValidationTests(DashboardServerTestCase):
         status, payload = _http_json(
             "POST", f"{self.base}/api/registry/serialize",
             {
-                "format": "yaml",
+                "format": "yaml-document",
                 "frontmatter": {"name": "trio-omnigent-lead", "description": "d"},
                 "body": "body\n",
                 "harness": "omnigent",

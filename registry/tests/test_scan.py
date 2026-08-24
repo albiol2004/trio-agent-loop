@@ -210,6 +210,35 @@ class BlockScalars(unittest.TestCase, YamlRoundTripMixin):
         self.assertIn("# Role: Lead", fields["prompt"])
 
 
+class OmnigentYamlDocument(unittest.TestCase):
+    """Omnigent role configs must preserve their native YAML document shape."""
+
+    ROLE_CONFIGS = tuple(sorted(
+        (REPO / "omnigent" / "trio-omnigent-roles").glob(
+            "*/config.yaml")))
+
+    def test_role_configs_round_trip_byte_identically(self):
+        self.assertEqual(len(self.ROLE_CONFIGS), 4)
+        for path in self.ROLE_CONFIGS:
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                fields = scan.parse_yaml(text)
+                self.assertEqual(
+                    scan.dump_yaml(fields).encode("utf-8"),
+                    path.read_bytes())
+
+    def test_split_and_join_preserve_prompt_body(self):
+        path = (
+            REPO / "omnigent" / "trio-omnigent-roles" /
+            "lead" / "config.yaml"
+        )
+        text = path.read_text(encoding="utf-8")
+        fields, body = scan.split_file(text, "yaml-document")
+        self.assertNotIn("prompt", fields)
+        self.assertEqual(body, scan.parse_yaml(text)["prompt"])
+        self.assertEqual(scan.join_file(fields, body, "yaml-document"), text)
+
+
 # --------------------------------------------------------------------------
 # Lists, flow collections, scalars
 # --------------------------------------------------------------------------

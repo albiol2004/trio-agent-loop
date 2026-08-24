@@ -21,7 +21,12 @@ A canonical agent's optional `spawns` field is a named allowlist (list of agent 
 
 `registry/scan.py` is a **read-only scanner** that parses every harness's skill/command/agent registry, hashes content for drift detection, and emits `registry.json`. It also owns the **format layer** used by the dashboard editor:
 
-- **YAML-subset parser/serializer** — hand-written (no PyYAML; stdlib only), lenient for on-disk scanning (a bad file must not kill a scan), strict when parsing user-submitted YAML. Round-trips: `parse(dump(parse(text))) == parse(text)` with key insertion order and explicit key quoting preserved. The dashboard carries nested `quoted_keys` metadata across its JSON boundary.
+- **YAML-subset parser/serializer** — hand-written (no PyYAML; stdlib only),
+  lenient for on-disk scanning (a bad file must not kill a scan), strict when
+  parsing user-submitted YAML. Round-trips:
+  `parse(dump(parse(text))) == parse(text)` with key insertion order, explicit
+  key quoting, and flow collection style preserved. Omnigent role files use
+  the `yaml-document` format: YAML fields plus a final literal-block `prompt`.
 - **TOML parser/serializer** — `tomllib`-backed for parsing, minimal custom serializer for output. Round-trips order-preserving.
 - **Frontmatter parsing** — YAML frontmatter (delimited by `---`) is split from body; body digests are computed separately from frontmatter for drift detection (frontmatter legitimately differs per harness; body drift signals staleness).
 - **KEY_SCHEMA — field catalog** — `KEY_SCHEMA[harness:surface]` is a list of per-field specs (`{key, type, widget, required, enum, help, values_from}`), defining the schema for frontmatter editing. `values_from` names a model source (e.g., `"models:claude"`); widget hints route to specialized UI controls (e.g., `select`, `textarea`, `permission-grid`, `spawns-select`, `json-schema`, `checkbox`).
@@ -161,7 +166,8 @@ A canonical agent is rendered into each harness's native file format via `render
 - **codex** — `<name>.toml` (TOML frontmatter, `developer_instructions` body)
 - **omp** — `<name>.md` (YAML frontmatter + body)
 - **opencode** — `<name>.md` (YAML frontmatter + body, `mode: subagent` + `hidden: true`)
-- **omnigent** — not supported (omnigent agents are Terraform role directories with config.yaml, managed by `prompts/generate.py`)
+- **omnigent** — `<name>/config.yaml` (a `yaml-document` with a
+  literal-block `prompt`)
 
 The index builds `agent_matrix` by comparing each canonical render's `body_hash` against installed agent body hashes to detect staleness.
 

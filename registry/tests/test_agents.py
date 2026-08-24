@@ -245,6 +245,53 @@ class RendererOutputParses(unittest.TestCase):
             self.assertNotEqual(value, "")
 
 
+class OmnigentRenderer(unittest.TestCase):
+    def test_registry_scout_uses_yaml_document_without_sandbox(self):
+        agent = agents.load_agent("registry-scout")
+        rendered = agents.render_agent(agent, "omnigent")
+        self.assertEqual(rendered.format, "yaml-document")
+        self.assertEqual(rendered.filename, "config.yaml")
+        self.assertNotIn("---", rendered.text)
+
+        fields = scan.parse_yaml(rendered.text)
+        self.assertEqual(fields["spec_version"], 1)
+        self.assertEqual(fields["prompt"], agent.instructions)
+        self.assertNotIn("sandbox", fields["os_env"])
+        self.assertNotIn("spawn", fields)
+        self.assertEqual(fields["executor"]["type"], "omnigent")
+
+    def test_spawn_policy_enables_spawn_and_sandbox(self):
+        agent = _make_agent(
+            name="omnigent-spawn-agent",
+            tool_policy="spawn",
+        )
+        rendered = agents.render_agent(agent, "omnigent")
+        fields = scan.parse_yaml(rendered.text)
+        self.assertTrue(fields["spawn"])
+        self.assertEqual(fields["os_env"]["sandbox"], {"type": "none"})
+        self.assertIn(
+            "config: {harness: cursor-native, yolo: true}",
+            rendered.text,
+        )
+
+    def test_guardrails_are_opt_in_overrides(self):
+        guardrails = {
+            "policies": {
+                "audit": {
+                    "type": "function",
+                    "on": scan.flow_list(["tool_call"]),
+                },
+            },
+        }
+        agent = _make_agent(
+            name="omnigent-guardrails-agent",
+            harness_overrides={"omnigent": {"guardrails": guardrails}},
+        )
+        fields = scan.parse_yaml(
+            agents.render_agent(agent, "omnigent").text)
+        self.assertEqual(fields["guardrails"], guardrails)
+
+
 # --------------------------------------------------------------------------
 # Codex developer_instructions exactness
 # --------------------------------------------------------------------------
@@ -421,19 +468,6 @@ class AllCombinations(unittest.TestCase):
 
 
 class UnsupportedHarnessTest(unittest.TestCase):
-    def test_omnigent_raises_unsupported_harness(self):
-        agent = _make_agent()
-        with self.assertRaises(agents.UnsupportedHarness) as ctx:
-            agents.render_agent(agent, "omnigent")
-        self.assertEqual(ctx.exception.harness, "omnigent")
-        self.assertTrue(ctx.exception.reason)
-
-    def test_install_support_matches_render_agent_reason(self):
-        agent = _make_agent()
-        with self.assertRaises(agents.UnsupportedHarness) as ctx:
-            agents.render_agent(agent, "omnigent")
-        self.assertEqual(agents.install_support("omnigent"), (False, ctx.exception.reason))
-
     def test_install_support_unknown_harness(self):
         supported, reason = agents.install_support("totally-unknown-harness")
         self.assertFalse(supported)
@@ -519,8 +553,7 @@ class AgentIndexRecords(unittest.TestCase):
                 self.assertIn("format", render)
                 self.assertIn("body_hash", render)
                 self.assertIn("frontmatter", render)
-            self.assertIn("omnigent", r["unsupported"])
-            self.assertTrue(r["unsupported"]["omnigent"])
+            self.assertNotIn("omnigent", r["unsupported"])
 
     def test_body_hash_matches_entry_record_for_every_harness(self):
         agent = agents.load_agent("registry-scout")
