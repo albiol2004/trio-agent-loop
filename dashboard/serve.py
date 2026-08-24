@@ -107,20 +107,35 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
                "model_tiers": [...], "tool_policies": [...]}
 
     GET /api/registry/agents/file?name=<name>
-    Response: 200 {"name","description","model_tier","tool_policy",
-                    "instructions","path"}; 404 {"error": "agent not found"}.
+    Response: 200 {"name","description","model_tier","tool_policy","spawns",
+                    "harness_overrides","instructions","path"}; 404
+                    {"error": "agent not found"}.
+
+    GET /api/registry/agents/defaults?model_tier=<tier>&tool_policy=<policy>
+    Response: 200 {"model_tier","tool_policy","harness_defaults"}; 400 for
+                    an unknown model tier or tool policy. The defaults are
+                    renderer output for a hypothetical agent and never write
+                    to disk.
+
+    GET /api/registry/agents/destinations?name=<name>&scope=<scope>
+    Response: 200 {"name","scope","destinations"} with resolved native paths.
 
     POST /api/registry/agents   (create)
     PUT  /api/registry/agents/file   (update; 404 if the agent is absent)
-    Body: {"name","description","model_tier","tool_policy","instructions"}
+    Body: {"name","description","model_tier","tool_policy","spawns"?,
+           "harness_overrides"?, "instructions", "harnesses"?, "scope"?,
+           "project"?}
     Response: 201/200 {"path"}; 400 on validation failure (CanonicalAgent's
-        ValueError text verbatim); POST is 409 when the agent already exists.
+        ValueError text verbatim); selected harnesses are installed in the
+        requested project or global scope; POST is 409 when the agent already
+        exists.
 
     DELETE /api/registry/agents/file?name=<name>
     Response: 200 {"path"}; 404 {"error": "agent not found"}.
 
     POST /api/registry/install
-    Body: {"agent": "<canonical agent name>", "harness": "<harness>"}
+    Body: {"agent": "<canonical agent name>", "harness": "<harness>",
+           "harnesses"?, "scope"?, "project"?}
     Response: 201 (new file) or 200 (overwrote an existing install)
         {"path","harness","format","filename","created"}.
         404 {"error": "agent not found"} for an unknown agent. 400
@@ -132,6 +147,7 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -177,6 +193,7 @@ REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 
 HOME = Path.home()
 """Current user's home directory, used for global harness locations."""
+_INITIAL_HOME = HOME
 
 REGISTRY_CACHE_SECONDS = 5.0
 """Maximum age for the in-memory registry index."""
@@ -233,6 +250,25 @@ _GLOBAL_REGISTRY_DIRS = {
     ("opencode", "agent"): HOME / ".config" / "opencode" / "agents",
     ("kimi", "skill"): HOME / ".kimi-code" / "skills",
     ("zcode", "skill"): HOME / ".zcode" / "skills",
+}
+
+_GLOBAL_REGISTRY_RELATIVE_DIRS = {
+    ("claude", "skill"): Path(".claude/skills"),
+    ("claude", "command"): Path(".claude/commands"),
+    ("claude", "agent"): Path(".claude/agents"),
+    ("codex", "skill"): Path(".agents/skills"),
+    ("codex", "agent"): Path(".codex/agents"),
+    ("omp", "command"): Path(".omp/agent/commands"),
+    ("omp", "agent"): Path(".omp/agent/agents"),
+    ("opencode", "command"): Path(".config/opencode/commands"),
+    ("opencode", "agent"): Path(".config/opencode/agents"),
+    ("kimi", "skill"): Path(".kimi-code/skills"),
+    ("zcode", "skill"): Path(".zcode/skills"),
+}
+
+_PROJECT_AGENT_DIRS = {
+    "claude": Path(".claude/agents"),
+    "opencode": Path(".opencode/agents"),
 }
 
 
@@ -1034,7 +1070,14 @@ def _writable_registry_path(
 ) -> Path:
     """Resolve a path and enforce global or selected-project write roots."""
     target = _resolve_registry_path(value)
-    for root in _WRITABLE_ROOTS:
+    writable_roots = list(_WRITABLE_ROOTS)
+    writable_roots.extend(_GLOBAL_REGISTRY_DIRS.values())
+    if HOME != _INITIAL_HOME:
+        writable_roots.extend(
+            Path(HOME) / relative
+            for relative in _GLOBAL_REGISTRY_RELATIVE_DIRS.values()
+        )
+    for root in writable_roots:
         try:
             target.relative_to(root.resolve())
             return target
@@ -1099,15 +1142,67 @@ def _safe_registry_name(value) -> str:
     return name
 
 
-def _registry_target(harness, surface, name) -> Path:
-    """Map a global harness/surface/name tuple to its file layout."""
+def _normalize_agent_harnesses(value) -> list[str]:
+    """Normalize one or more install-harness values without duplicates."""
+    if value is None:
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("harnesses must be a list")
+    normalized = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError("harnesses must contain strings")
+        for raw in item.split(","):
+            harness = raw.strip().lower()
+            if harness and harness not in normalized:
+                normalized.append(harness)
+    return normalized
+
+
+def _agent_payload_harnesses(payload: dict):
+    """Read the plural target field while retaining singular compatibility."""
+    for key in ("harnesses", "target_harnesses", "targets"):
+        if key in payload:
+            return payload[key]
+    return payload.get("harness")
+
+
+def _normalize_agent_scope(value) -> str:
+    """Return the supported canonical-agent destination scope."""
+    scope = "global" if value is None else value
+    if not isinstance(scope, str) or scope.strip().lower() not in (
+        "global", "project",
+    ):
+        raise ValueError("scope must be 'project' or 'global'")
+    return scope.strip().lower()
+
+
+def _registry_target(
+    harness, surface, name, scope="global", project=None, home=None
+) -> Path:
+    """Map a harness/surface/name tuple to its scoped file layout."""
     if not isinstance(harness, str) or not isinstance(surface, str):
         raise ValueError("invalid harness or surface")
     harness = harness.strip().lower()
     surface = surface.strip().lower()
-    root = _GLOBAL_REGISTRY_DIRS.get((harness, surface))
-    if root is None:
-        raise ValueError("unsupported harness or surface")
+    scope = _normalize_agent_scope(scope)
+    if scope == "project":
+        if surface != "agent" or harness not in _PROJECT_AGENT_DIRS:
+            raise ValueError("unsupported project agent destination")
+        if project is None:
+            raise ValueError("project is required for project scope")
+        root = Path(project).expanduser().resolve() / _PROJECT_AGENT_DIRS[harness]
+    else:
+        if home is None and HOME != _INITIAL_HOME:
+            home = HOME
+        root = _GLOBAL_REGISTRY_DIRS.get((harness, surface))
+        if root is None:
+            raise ValueError("unsupported harness or surface")
+        if home is not None:
+            relative = _GLOBAL_REGISTRY_RELATIVE_DIRS.get((harness, surface))
+            if relative is not None:
+                root = Path(home).expanduser().resolve() / relative
     name = _safe_registry_name(name)
     if surface == "skill":
         return (root / name / "SKILL.md").resolve()
@@ -1655,25 +1750,173 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "description": agent.description,
             "model_tier": agent.model_tier,
             "tool_policy": agent.tool_policy,
+            "spawns": list(agent.spawns),
+            "harness_overrides": agent.harness_overrides,
             "path": str(agents.agents_dir() / f"{agent.name}.md"),
         }
 
     def _agent_detail(self, agent, agents) -> dict:
         detail = self._agent_summary(agent, agents)
         detail["instructions"] = agent.instructions
+        detail["harness_defaults"] = self._harness_defaults(agents, agent)
         return detail
 
-    def _agent_from_payload(self, agents, payload: dict):
+    def _handle_agent_defaults(self, query: dict) -> None:
+        """Return renderer defaults for a hypothetical canonical agent."""
+        agents = load_agents_module()
+        model_tier = (query.get("model_tier") or [None])[0]
+        tool_policy = (query.get("tool_policy") or [None])[0]
+        try:
+            hypothetical = agents.CanonicalAgent(
+                name="new-agent",
+                description="TODO: describe this agent.",
+                instructions="",
+                model_tier=model_tier,
+                tool_policy=tool_policy,
+                harness_overrides={},
+            )
+            defaults = self._harness_defaults(agents, hypothetical)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        self._send_json(200, {
+            "model_tier": model_tier,
+            "tool_policy": tool_policy,
+            "harness_defaults": defaults,
+        })
+
+    @staticmethod
+    def _harness_defaults(agents, agent) -> dict:
+        """Renderer fields with overrides stripped, used as the catalog baseline."""
+        bare = agents.CanonicalAgent(
+            name=agent.name,
+            description=agent.description,
+            instructions=agent.instructions,
+            model_tier=agent.model_tier,
+            tool_policy=agent.tool_policy,
+            spawns=list(agent.spawns),
+            harness_overrides={},
+        )
+        defaults = {}
+        for harness in agents.RENDER_HARNESSES:
+            rendered = agents.render_agent(bare, harness)
+            fields, _body = agents.scan.split_file(
+                rendered.text, rendered.format)
+            defaults[harness] = fields
+        return defaults
+
+    def _agent_from_payload(self, agents, payload: dict, *, existing=None):
         instructions = payload.get("instructions")
         if not isinstance(instructions, str):
             raise ValueError("instructions must be a string")
+        # Omitted spawns/overrides on PUT must not wipe the stored maps.
+        if "spawns" in payload:
+            spawns = payload.get("spawns")
+        elif existing is not None:
+            spawns = list(existing.spawns)
+        else:
+            spawns = []
+        if "harness_overrides" in payload:
+            overrides = payload.get("harness_overrides")
+        elif existing is not None:
+            overrides = copy.deepcopy(existing.harness_overrides)
+        else:
+            overrides = {}
         return agents.CanonicalAgent(
             name=payload.get("name"),
             description=payload.get("description"),
             instructions=instructions,
             model_tier=payload.get("model_tier"),
             tool_policy=payload.get("tool_policy"),
+            spawns=spawns,
+            harness_overrides=overrides,
         )
+
+    def _agent_project_root(self, value) -> Path:
+        """Resolve a project target and keep it inside a selected workspace."""
+        root = (
+            self.server.default_root
+            if value is None or (isinstance(value, str) and not value.strip())
+            else _resolve_registry_path(value)
+        )
+        if not any(
+            _path_is_under(root, workspace)
+            for workspace in self.server.get_workspace_seeds()
+        ):
+            raise PermissionError("project registry path is not in a workspace")
+        return root
+
+    def _agent_install_plan(
+        self, agent, agents, harnesses, scope, project_root=None
+    ) -> list[dict]:
+        """Render and authorize every requested install before writing any."""
+        plan = []
+        for harness in harnesses:
+            supported, reason = agents.install_support(harness)
+            if not supported:
+                raise agents.UnsupportedHarness(harness, reason)
+            rendered = agents.render_agent(agent, harness)
+            target = _registry_target(
+                harness,
+                "agent",
+                agent.name,
+                scope=scope,
+                project=project_root,
+            )
+            target = _writable_registry_path(
+                str(target),
+                self.server.get_workspace_seeds(),
+                project_root if scope == "project" else None,
+            )
+            _reject_if_managed(target)
+            plan.append({
+                "harness": harness,
+                "rendered": rendered,
+                "target": target,
+            })
+        return plan
+
+    @staticmethod
+    def _write_agent_plan(plan) -> list[dict]:
+        """Write an already-authorized install plan and report each target."""
+        results = []
+        for item in plan:
+            target = item["target"]
+            created = not target.exists()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_registry_file(target, item["rendered"].text)
+            rendered = item["rendered"]
+            results.append({
+                "path": str(target),
+                "harness": item["harness"],
+                "format": rendered.format,
+                "filename": rendered.filename,
+                "created": created,
+            })
+        return results
+
+    def _agent_destination_list(
+        self, agents, harnesses, scope, project_root=None, name="__preview__"
+    ) -> list[dict]:
+        """Return resolved paths for the pre-confirmation destination preview."""
+        destinations = []
+        registry = load_registry_module()
+        for harness in harnesses:
+            supported, reason = agents.install_support(harness)
+            if not supported:
+                raise agents.UnsupportedHarness(harness, reason)
+            target = _registry_target(
+                harness,
+                "agent",
+                name,
+                scope=scope,
+                project=project_root,
+            )
+            destinations.append({
+                "harness": harness,
+                "path": str(target),
+                "format": registry.SURFACE_FORMAT[(harness, "agent")],
+            })
+        return destinations
 
     def _handle_agents_list(self) -> None:
         agents = load_agents_module()
@@ -1710,26 +1953,92 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             payload = _read_json_body(self)
             agent = self._agent_from_payload(agents, payload)
+            raw_harnesses = _agent_payload_harnesses(payload)
+            harnesses = _normalize_agent_harnesses(raw_harnesses)
+            scope = _normalize_agent_scope(payload.get("scope"))
+            project_root = (
+                self._agent_project_root(payload.get("project"))
+                if scope == "project"
+                else None
+            )
+            plan = self._agent_install_plan(
+                agent, agents, harnesses, scope, project_root)
+        except agents.UnsupportedHarness as exc:
+            return self._send_json(400, {
+                "error": f"harness {exc.harness!r} does not support "
+                         "canonical-agent install",
+                "reason": exc.reason,
+                "harness": exc.harness,
+                "supported": False,
+            })
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         if (agents.agents_dir() / f"{agent.name}.md").exists():
             return self._send_json(409, {"error": "agent already exists"})
         path = agents.save_agent(agent)
+        try:
+            installations = self._write_agent_plan(plan)
+        except IsADirectoryError:
+            return self._send_json(400, {"error": "path is a directory"})
+        except OSError:
+            return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()
-        self._send_json(201, {"path": str(path)})
+        self._send_json(201, {
+            "path": str(path),
+            "scope": scope,
+            "installations": installations,
+        })
 
     def _handle_agent_update(self) -> None:
         agents = load_agents_module()
         try:
             payload = _read_json_body(self)
-            agent = self._agent_from_payload(agents, payload)
+            existing = None
+            try:
+                existing = agents.load_agent(payload.get("name"))
+            except (FileNotFoundError, TypeError, ValueError, OSError):
+                existing = None
+            agent = self._agent_from_payload(
+                agents, payload, existing=existing)
+            raw_harnesses = _agent_payload_harnesses(payload)
+            harnesses = _normalize_agent_harnesses(raw_harnesses)
+            scope = _normalize_agent_scope(payload.get("scope"))
+            project_root = (
+                self._agent_project_root(payload.get("project"))
+                if scope == "project"
+                else None
+            )
+            plan = self._agent_install_plan(
+                agent, agents, harnesses, scope, project_root)
+        except agents.UnsupportedHarness as exc:
+            return self._send_json(400, {
+                "error": f"harness {exc.harness!r} does not support "
+                         "canonical-agent install",
+                "reason": exc.reason,
+                "harness": exc.harness,
+                "supported": False,
+            })
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         if not (agents.agents_dir() / f"{agent.name}.md").exists():
             return self._send_json(404, {"error": "agent not found"})
         path = agents.save_agent(agent)
+        try:
+            installations = self._write_agent_plan(plan)
+        except IsADirectoryError:
+            return self._send_json(400, {"error": "path is a directory"})
+        except OSError:
+            return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()
-        self._send_json(200, {"path": str(path)})
+        self._send_json(200, {
+            "path": str(path),
+            "scope": scope,
+            "installations": installations,
+        })
 
     def _handle_agent_delete(self, query: dict) -> None:
         agents = load_agents_module()
@@ -1745,6 +2054,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- /api/registry/install -----------------------------------------------
 
+    def _handle_agent_destinations(self, query: dict) -> None:
+        """Resolve agent install paths for the editor's pre-confirmation view."""
+        agents = load_agents_module()
+        try:
+            name = _safe_registry_name((query.get("name") or [None])[0])
+            raw_harnesses = query.get("harnesses") or query.get("harness")
+            harnesses = _normalize_agent_harnesses(raw_harnesses)
+            if not harnesses:
+                harnesses = list(agents.RENDER_HARNESSES)
+            scope = _normalize_agent_scope(
+                (query.get("scope") or [None])[0])
+            project_root = (
+                self._agent_project_root((query.get("project") or [None])[0])
+                if scope == "project"
+                else None
+            )
+            destinations = self._agent_destination_list(
+                agents, harnesses, scope, project_root, name)
+        except agents.UnsupportedHarness as exc:
+            return self._send_json(400, {
+                "error": f"harness {exc.harness!r} does not support "
+                         "canonical-agent install",
+                "reason": exc.reason,
+                "harness": exc.harness,
+                "supported": False,
+            })
+        except PermissionError as exc:
+            return self._send_json(403, {"error": str(exc)})
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        self._send_json(200, {
+            "name": name,
+            "scope": scope,
+            "destinations": destinations,
+        })
+
     def _handle_agent_install(self) -> None:
         agents = load_agents_module()
         try:
@@ -1752,10 +2097,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
         harness = payload.get("harness")
-        harness_norm = (
-            harness.strip().lower() if isinstance(harness, str) and harness.strip()
-            else None
-        )
+        raw_harnesses = _agent_payload_harnesses(payload)
+        try:
+            harnesses = _normalize_agent_harnesses(raw_harnesses)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        if not harnesses:
+            return self._send_json(400, {
+                "error": f"harness {harness!r} does not support "
+                         "canonical-agent install",
+                "reason": "missing harness",
+                "harness": harness,
+                "supported": False,
+            })
+        harness_norm = harnesses[0] if len(harnesses) == 1 else None
         try:
             name = _safe_registry_name(payload.get("agent"))
         except ValueError as exc:
@@ -1766,50 +2121,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "agent not found"})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
-        supported, reason = agents.install_support(harness_norm or "")
-        if not supported:
-            return self._send_json(400, {
-                "error": f"harness {harness!r} does not support "
-                         "canonical-agent install",
-                "reason": reason,
-                "harness": harness_norm if harness_norm is not None else harness,
-                "supported": False,
-            })
         try:
-            # install_support already vetted the harness; this guards a
-            # HARNESS_SUPPORT entry that ever outlives its renderer.
-            rendered = agents.render_agent(agent, harness_norm)
-            target = _writable_registry_path(
-                str(_registry_target(harness_norm, "agent", agent.name)))
-            _reject_if_managed(target)
+            scope = _normalize_agent_scope(payload.get("scope"))
+            project_root = (
+                self._agent_project_root(payload.get("project"))
+                if scope == "project"
+                else None
+            )
+            plan = self._agent_install_plan(
+                agent, agents, harnesses, scope, project_root)
         except agents.UnsupportedHarness as exc:
             return self._send_json(400, {
                 "error": f"harness {harness!r} does not support "
                          "canonical-agent install",
                 "reason": exc.reason,
-                "harness": harness_norm,
+                "harness": exc.harness,
                 "supported": False,
             })
         except PermissionError as exc:
             return self._send_json(403, {"error": str(exc)})
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
-        created = not target.exists()
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _write_registry_file(target, rendered.text)
+            results = self._write_agent_plan(plan)
         except IsADirectoryError:
             return self._send_json(400, {"error": "path is a directory"})
         except OSError:
             return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()
-        self._send_json(201 if created else 200, {
-            "path": str(target),
-            "harness": harness_norm,
-            "format": rendered.format,
-            "filename": rendered.filename,
-            "created": created,
-        })
+        if len(results) == 1:
+            result = results[0]
+            self._send_json(201 if result["created"] else 200, result)
+        else:
+            self._send_json(201, {
+                "agent": agent.name,
+                "scope": scope,
+                "installations": results,
+            })
 
     # -- /api/board --------------------------------------------------------
 
@@ -2274,6 +2622,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_registry_health(root))
+        if path == "/api/registry/agents/defaults":
+            return self._api(lambda: self._handle_agent_defaults(query))
+        if path == "/api/registry/agents/destinations":
+            return self._api(lambda: self._handle_agent_destinations(query))
         if path == "/api/registry/agents":
             return self._api(self._handle_agents_list)
         if path == "/api/registry/agents/file":

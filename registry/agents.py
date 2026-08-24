@@ -145,6 +145,20 @@ def _validate_spawns(spawns: list[str]) -> None:
         seen.add(spawn)
 
 
+def _validate_harness_overrides(overrides: dict) -> None:
+    """Validate the per-harness native field maps without limiting keys."""
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"harness_overrides must be a mapping, got {overrides!r}")
+    for harness, fields in overrides.items():
+        if not isinstance(harness, str) or not harness:
+            raise ValueError(f"invalid harness override key {harness!r}")
+        if not isinstance(fields, dict):
+            raise ValueError(
+                f"harness override for {harness!r} must be a mapping, "
+                f"got {fields!r}")
+
+
 @dataclass
 class CanonicalAgent:
     name: str
@@ -153,10 +167,12 @@ class CanonicalAgent:
     model_tier: str
     tool_policy: str
     spawns: list[str] = field(default_factory=list)
+    harness_overrides: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate(self.name, self.description, self.model_tier, self.tool_policy)
         _validate_spawns(self.spawns)
+        _validate_harness_overrides(self.harness_overrides)
 
 
 @dataclass
@@ -218,6 +234,12 @@ def parse_agent(text: str, *, name: str | None = None) -> CanonicalAgent:
             f"spawns must be a YAML list or comma-separated string, "
             f"got {raw_spawns!r}")
 
+    raw_overrides = fields.get("harness_overrides", {})
+    if not isinstance(raw_overrides, dict):
+        raise ValueError(
+            "harness_overrides must be a YAML mapping, "
+            f"got {raw_overrides!r}")
+
     return CanonicalAgent(
         name=resolved_name,
         description=fields.get("description"),
@@ -225,6 +247,7 @@ def parse_agent(text: str, *, name: str | None = None) -> CanonicalAgent:
         model_tier=fields.get("model_tier"),
         tool_policy=fields.get("tool_policy"),
         spawns=raw_spawns,
+        harness_overrides=copy.deepcopy(raw_overrides),
     )
 
 
@@ -239,6 +262,9 @@ def dump_agent(agent: CanonicalAgent) -> str:
     # Empty spawns stay implicit so existing seed files keep their shape.
     if agent.spawns:
         fields["spawns"] = list(agent.spawns)
+    # Empty overrides stay implicit for backward-compatible seed output.
+    if agent.harness_overrides:
+        fields["harness_overrides"] = copy.deepcopy(agent.harness_overrides)
     return scan.join_file(fields, agent.instructions, "yaml")
 
 
@@ -290,10 +316,20 @@ def _policy_fields(harness: str, tool_policy: str) -> dict:
     return copy.deepcopy(TOOL_POLICIES[tool_policy][harness])
 
 
+def _apply_harness_overrides(
+    fields: dict, agent: CanonicalAgent, harness: str
+) -> None:
+    """Apply native fields after all tier and policy defaults are resolved."""
+    overrides = agent.harness_overrides.get(harness, {})
+    if overrides:
+        fields.update(copy.deepcopy(overrides))
+
+
 def _render_claude(agent: CanonicalAgent) -> RenderedAgent:
     fields = {"name": agent.name, "description": agent.description}
     fields.update(_tier_fields("claude", agent.model_tier))
     fields.update(_policy_fields("claude", agent.tool_policy))
+    _apply_harness_overrides(fields, agent, "claude")
     text = scan.join_file(fields, agent.instructions, "yaml")
     return RenderedAgent("claude", f"{agent.name}.md", "yaml", text)
 
@@ -303,6 +339,7 @@ def _render_codex(agent: CanonicalAgent) -> RenderedAgent:
     fields.update(_tier_fields("codex", agent.model_tier))
     fields.update(_policy_fields("codex", agent.tool_policy))
     fields["description"] = agent.description
+    _apply_harness_overrides(fields, agent, "codex")
     instructions = agent.instructions
     if agent.tool_policy == "spawn" and agent.spawns:
         # Codex has no native per-agent spawn field, so explain delegation in
@@ -323,6 +360,7 @@ def _render_omp(agent: CanonicalAgent) -> RenderedAgent:
     if agent.tool_policy == "spawn" and agent.spawns:
         # OMP expects one comma-separated scalar; an empty key is invalid.
         fields["spawns"] = ", ".join(agent.spawns)
+    _apply_harness_overrides(fields, agent, "omp")
     text = scan.join_file(fields, agent.instructions, "yaml")
     return RenderedAgent("omp", f"{agent.name}.md", "yaml", text)
 
@@ -337,6 +375,7 @@ def _render_opencode(agent: CanonicalAgent) -> RenderedAgent:
         task_permission = fields["permission"]["task"]
         for spawn in agent.spawns:
             task_permission[spawn] = "allow"
+    _apply_harness_overrides(fields, agent, "opencode")
     text = scan.join_file(fields, agent.instructions, "yaml")
     return RenderedAgent("opencode", f"{agent.name}.md", "yaml", text)
 

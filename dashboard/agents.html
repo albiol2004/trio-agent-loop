@@ -87,10 +87,24 @@
   .field-textarea { min-height: 64px; resize: vertical; }
   .field-instructions { min-height: 320px; resize: vertical; white-space: pre; font: 12px/1.5 var(--mono); }
   .editor-footer { display: flex; justify-content: space-between; padding: 10px 20px; border-top: 1px solid var(--border); color: var(--faint); font: 10px var(--mono); }
+  .field-group { display: flex; flex-direction: column; gap: 6px; }
+  .harness-checks { display: flex; flex-wrap: wrap; gap: 6px; }
+  .harness-check { display: inline-flex; align-items: center; gap: 5px; color: var(--text); font: 11px var(--mono); }
+  .harness-check input { accent-color: var(--green); }
+  .catalog-tabs { display: flex; flex-direction: column; gap: 8px; }
+  .catalog-tab-list { display: flex; flex-wrap: wrap; gap: 4px; }
+  .catalog-tab { padding: 4px 8px; border: 1px solid var(--border); border-radius: 3px; color: var(--muted); background: var(--surface-2); font: 11px var(--mono); cursor: pointer; }
+  .catalog-tab.is-active { color: var(--green); border-color: var(--green); }
+  .catalog-panel { display: flex; flex-direction: column; gap: 8px; }
+  .catalog-panel[hidden] { display: none; }
+  .catalog-field { display: flex; flex-direction: column; gap: 4px; }
+  .catalog-custom[hidden] { display: none; }
+  .destination-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; color: var(--faint); font: 10px var(--mono); }
+  .destination-list li { overflow-wrap: anywhere; }
 
   #new-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 0; }
   #new-dialog::backdrop { background: rgba(0,0,0,.6); }
-  .dialog-inner { padding: 24px; min-width: 340px; }
+  .dialog-inner { padding: 24px; min-width: min(520px, 80vw); }
   .dialog-inner h2 { margin: 0 0 16px; font-size: 15px; font-weight: 700; }
   .dialog-inner .field-label { margin-top: 10px; }
   .dialog-footer { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
@@ -160,6 +174,24 @@
           <label class="field-label">Tool policy
             <select id="field-tool-policy" class="field-control"></select>
           </label>
+          <div class="field-group">
+            <span class="field-label">Install target harnesses</span>
+            <div id="editor-harnesses" class="harness-checks"></div>
+          </div>
+          <label class="field-label">Install scope
+            <select id="editor-scope" class="field-control">
+              <option value="project">project</option>
+              <option value="global">global</option>
+            </select>
+          </label>
+          <div class="field-group">
+            <span class="field-label">Resolved destinations</span>
+            <ul id="editor-destinations" class="destination-list"></ul>
+          </div>
+          <div class="field-group">
+            <span class="field-label">Harness catalog fields</span>
+            <div id="editor-catalog" class="catalog-tabs"></div>
+          </div>
           <label class="field-label">Instructions
             <textarea id="field-instructions" class="field-control field-instructions" spellcheck="false"></textarea>
           </label>
@@ -178,6 +210,24 @@
       <label class="field-label">Name
         <input id="new-name" class="field-control" type="text" required autocomplete="off" pattern="^[a-z0-9][a-z0-9._-]*$" placeholder="my-agent">
       </label>
+      <div class="field-group">
+        <span class="field-label">Install target harnesses</span>
+        <div id="new-harnesses" class="harness-checks"></div>
+      </div>
+      <label class="field-label">Install scope
+        <select id="new-scope" class="field-control">
+          <option value="project">project</option>
+          <option value="global">global</option>
+        </select>
+      </label>
+      <div class="field-group">
+        <span class="field-label">Resolved destinations</span>
+        <ul id="new-destinations" class="destination-list"></ul>
+      </div>
+      <div class="field-group">
+        <span class="field-label">Harness catalog fields</span>
+        <div id="new-catalog" class="catalog-tabs"></div>
+      </div>
       <div class="dialog-footer">
         <button id="new-cancel" class="action-button" type="submit" formnovalidate>Cancel</button>
         <button id="new-create" class="action-button primary" type="submit">Create</button>

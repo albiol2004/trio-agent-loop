@@ -38,12 +38,16 @@ def _make_agent(
     instructions="Hello.\n",
     description="A sample agent.",
     spawns=None,
+    harness_overrides=None,
 ):
     if spawns is None:
         spawns = []
+    if harness_overrides is None:
+        harness_overrides = {}
     return agents.CanonicalAgent(
         name=name, description=description, instructions=instructions,
-        model_tier=model_tier, tool_policy=tool_policy, spawns=spawns)
+        model_tier=model_tier, tool_policy=tool_policy, spawns=spawns,
+        harness_overrides=harness_overrides)
 
 
 # --------------------------------------------------------------------------
@@ -92,6 +96,23 @@ class RoundTrip(unittest.TestCase):
             "spawns:\n  - trio-builder\n  - trio-scout\n",
             dumped,
         )
+
+    def test_harness_overrides_round_trip(self):
+        agent = _make_agent(
+            name="override-agent",
+            harness_overrides={
+                "codex": {"sandbox_mode": "read-only"},
+                "claude": {"effort": "low"},
+            },
+        )
+        self._assert_round_trips(agent)
+        dumped = agents.dump_agent(agent)
+        self.assertIn("harness_overrides:", dumped)
+        self.assertIn("sandbox_mode: read-only", dumped)
+
+    def test_empty_harness_overrides_stay_implicit(self):
+        dumped = agents.dump_agent(_make_agent())
+        self.assertNotIn("harness_overrides:", dumped)
 
     def test_comma_separated_spawns_parse(self):
         text = (
@@ -186,6 +207,22 @@ class RendererOutputParses(unittest.TestCase):
             if key == "developer_instructions":
                 continue
             self.assertNotEqual(value, "")
+
+    def test_codex_override_does_not_leak_to_other_harnesses(self):
+        agent = _make_agent(
+            name="codex-sandbox-agent",
+            harness_overrides={"codex": {"sandbox_mode": "read-only"}},
+        )
+
+        codex = scan.parse_toml(agents.render_agent(agent, "codex").text)
+        claude, _ = scan.parse_frontmatter(
+            agents.render_agent(agent, "claude").text)
+        omp, _ = scan.parse_frontmatter(
+            agents.render_agent(agent, "omp").text)
+
+        self.assertEqual(codex["sandbox_mode"], "read-only")
+        self.assertNotIn("sandbox_mode", claude)
+        self.assertNotIn("sandbox_mode", omp)
 
     def test_omp_parses_and_has_name(self):
         r = agents.render_agent(self.agent, "omp")

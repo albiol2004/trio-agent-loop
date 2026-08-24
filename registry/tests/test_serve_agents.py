@@ -116,6 +116,32 @@ class AgentsListEndpointTests(DashboardServerTestCase):
         self.assertEqual(set(payload["support"].keys()), set(agents.HARNESS_SUPPORT.keys()))
 
 
+class AgentDefaultsEndpointTests(DashboardServerTestCase):
+    def test_standard_edit_defaults_include_codex_fields_without_sandbox(self):
+        original_home = serve.HOME
+        with tempfile.TemporaryDirectory() as tmp:
+            serve.HOME = Path(tmp)
+            try:
+                status, payload = self._get(
+                    "/api/registry/agents/defaults"
+                    "?model_tier=standard&tool_policy=edit")
+            finally:
+                serve.HOME = original_home
+
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["model_tier"], "standard")
+            self.assertEqual(payload["tool_policy"], "edit")
+            codex = payload["harness_defaults"]["codex"]
+            self.assertTrue({
+                "name", "model", "model_reasoning_effort", "description"
+            }.issubset(codex))
+            self.assertEqual(
+                codex["model"], agents.MODEL_TIERS["standard"]["codex"]["model"])
+            self.assertEqual(codex["model_reasoning_effort"], "high")
+            self.assertNotIn("sandbox_mode", codex)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+
 class AgentMatrixInRegistryIndexTests(DashboardServerTestCase):
 
     def test_registry_index_has_agent_matrix_row_per_canonical_agent(self):
@@ -201,6 +227,37 @@ class AgentCrudTests(DashboardServerTestCase):
         status, gone = self._get(f"/api/registry/agents/file?name={name}")
         self.assertEqual(status, 404, gone)
 
+    def test_put_omits_spawns_and_overrides_preserve_stored(self):
+        name = THROWAWAY_PREFIX + "keepmaps"
+        status, payload = self._post_agent(
+            name=name,
+            tool_policy="spawn",
+            spawns=["registry-scout"],
+            harness_overrides={"codex": {"sandbox_mode": "read-only"}},
+        )
+        self.assertEqual(status, 201, payload)
+
+        status, put_payload = _http_json(
+            "PUT", f"{self.base}/api/registry/agents/file",
+            {
+                "name": name,
+                "description": "kept maps",
+                "model_tier": "cheap",
+                "tool_policy": "spawn",
+                "instructions": "Do the throwaway thing.\n",
+            })
+        self.assertEqual(status, 200, put_payload)
+
+        status, detail = self._get(f"/api/registry/agents/file?name={name}")
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(detail["spawns"], ["registry-scout"])
+        self.assertEqual(
+            detail["harness_overrides"],
+            {"codex": {"sandbox_mode": "read-only"}},
+        )
+        self.assertIn("codex", detail["harness_defaults"])
+        self.assertIn("name", detail["harness_defaults"]["codex"])
+
     def test_post_unknown_model_tier_is_400_naming_model_tier(self):
         status, payload = self._post_agent(
             name=THROWAWAY_PREFIX + "badtier", model_tier="ultra-mega")
@@ -226,6 +283,102 @@ class AgentCrudTests(DashboardServerTestCase):
                 "instructions": "x\n",
             })
         self.assertEqual(status, 404, payload)
+
+
+class MultiHarnessCreateTests(DashboardServerTestCase):
+    """Creating a canonical agent can install several isolated targets."""
+
+    NAME = "z_trio_agent_test_multi"
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp_root = Path(self._tmp.name)
+        self._orig_home = serve.HOME
+        serve.HOME = tmp_root
+        self._tmp_root = tmp_root
+
+    def tearDown(self):
+        agents.delete_agent(self.NAME)
+        serve.HOME = self._orig_home
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def test_destination_preview_resolves_global_and_project_paths(self):
+        status, global_payload = self._get(
+            f"/api/registry/agents/destinations?name={self.NAME}"
+            "&scope=global&harnesses=claude,codex,omp")
+        self.assertEqual(status, 200, global_payload)
+        self.assertEqual(
+            [item["harness"] for item in global_payload["destinations"]],
+            ["claude", "codex", "omp"],
+        )
+        self.assertTrue(
+            global_payload["destinations"][1]["path"].endswith(".toml"))
+
+        status, project_payload = self._get(
+            f"/api/registry/agents/destinations?name={self.NAME}"
+            f"&scope=project&project={REPO_ROOT}&harnesses=claude,opencode")
+        self.assertEqual(status, 200, project_payload)
+        project_paths = {
+            item["harness"]: item["path"]
+            for item in project_payload["destinations"]
+        }
+        self.assertTrue(
+            project_paths["claude"].endswith(
+                f".claude/agents/{self.NAME}.md"))
+        self.assertTrue(
+            project_paths["opencode"].endswith(
+                f".opencode/agents/{self.NAME}.md"))
+
+    def test_create_installs_selected_harnesses_with_overrides(self):
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/agents",
+            {
+                "name": self.NAME,
+                "description": "multi-target test agent",
+                "model_tier": "standard",
+                "tool_policy": "edit",
+                "instructions": "Use the test harnesses.\n",
+                "harnesses": ["claude", "codex", "omp"],
+                "scope": "global",
+                "harness_overrides": {
+                    "codex": {"sandbox_mode": "read-only"},
+                },
+            })
+        self.assertEqual(status, 201, payload)
+        self.assertTrue(Path(payload["path"]).is_file())
+
+        canonical = agents.load_agent(self.NAME)
+        self.assertEqual(
+            canonical.harness_overrides,
+            {"codex": {"sandbox_mode": "read-only"}},
+        )
+        status, detail = self._get(
+            f"/api/registry/agents/file?name={self.NAME}")
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(
+            detail["harness_overrides"],
+            {"codex": {"sandbox_mode": "read-only"}},
+        )
+
+        for harness in ("claude", "codex", "omp"):
+            with self.subTest(harness=harness):
+                directories = {
+                    "claude": self._tmp_root / ".claude" / "agents",
+                    "codex": self._tmp_root / ".codex" / "agents",
+                    "omp": self._tmp_root / ".omp" / "agent" / "agents",
+                }
+                installed = next(directories[harness].glob(
+                    f"{self.NAME}.*"))
+                if harness == "codex":
+                    fields = registry.parse_toml(
+                        installed.read_text(encoding="utf-8"))
+                    self.assertEqual(fields["sandbox_mode"], "read-only")
+                else:
+                    fields, _ = registry.parse_frontmatter(
+                        installed.read_text(encoding="utf-8"))
+                    self.assertNotIn("sandbox_mode", fields)
 
 
 class InstallEndpointTests(DashboardServerTestCase):
