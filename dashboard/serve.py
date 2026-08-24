@@ -149,13 +149,14 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
            "harnesses"?, "scope"?, "project"?}
     Response: 201 (new file) or 200 (overwrote an existing install)
         {"path","harness","format","filename","created","scope_used"}.
-        Omnigent results also include a `register` command for the config.
+        Omnigent results also include the broker's durable `agent_id` and
+        `session_id`, plus a `register` command naming that agent id.
         404 {"error": "agent not found"} for an unknown agent. 400
         {"error","reason","harness","supported": false} for an unsupported
         or unknown harness — never a 500. Omnigent is supported at
-        `~/.omnigent/agents/<name>/config.yaml`; use its returned
-        `sys_session_create(config_path=...)` command to register it. Writes
-        are confined to _WRITABLE_ROOTS (403) and refuse a
+        `~/.omnigent/agents/<name>/config.yaml`; installation uploads that
+        bundle and writes a `broker.json` sidecar. Writes are confined to
+        _WRITABLE_ROOTS (403) and refuse a
         prompts/generate.py-managed destination (403).
 """
 from __future__ import annotations
@@ -202,6 +203,9 @@ MODELS_PATH = DASHBOARD_DIR.parent / "registry" / "models.py"
 HEALTH_PATH = DASHBOARD_DIR.parent / "registry" / "health.py"
 """Health collector module, resolved relative to this file."""
 
+BROKER_HTTP_PATH = DASHBOARD_DIR.parent / "omnigent" / "broker_http.py"
+"""Omnigent broker client, resolved relative to this file."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -220,6 +224,7 @@ _AGENTS_MODULE = None
 _TOPOLOGY_MODULE = None
 _MODELS_MODULE = None
 _HEALTH_MODULE = None
+_BROKER_HTTP_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -441,6 +446,28 @@ def load_health_module():
         raise RuntimeError(
             "health module missing required attribute: collect_health")
     _HEALTH_MODULE = module
+    return module
+
+
+def load_broker_http_module():
+    """Load the stdlib Omnigent broker client by path and cache it."""
+    global _BROKER_HTTP_MODULE
+    if _BROKER_HTTP_MODULE is not None:
+        return _BROKER_HTTP_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_omnigent_broker_http", BROKER_HTTP_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load broker module: {BROKER_HTTP_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in (
+        "bundle_agent_dir", "register_agent_bundle", "update_agent_bundle",
+        "BrokerHttpError",
+    ):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"broker module missing required attribute: {fn}")
+    _BROKER_HTTP_MODULE = module
     return module
 
 
@@ -1338,6 +1365,15 @@ def _write_registry_file(target: Path, content: str, *, create: bool = False) ->
         target.write_text(content, encoding="utf-8")
 
 
+class _OmnigentRegistrationError(RuntimeError):
+    """A broker failure that still leaves the rendered YAML on disk."""
+
+    def __init__(self, path: Path, broker_error: Exception):
+        self.path = path
+        self.broker_error = str(broker_error)
+        super().__init__(self.broker_error)
+
+
 def _read_json_body(handler) -> dict:
     raw_length = handler.headers.get("Content-Length")
     try:
@@ -2078,6 +2114,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return plan
 
     @staticmethod
+    def _register_omnigent_bundle(target: Path) -> tuple[str, str]:
+        """Upload an Omnigent config and persist its broker identity."""
+        broker = load_broker_http_module()
+        sidecar_path = target.parent / "broker.json"
+        try:
+            sidecar = json.loads(
+                sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            sidecar = {}
+        if not isinstance(sidecar, dict):
+            sidecar = {}
+
+        session_id = sidecar.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+        bundle = broker.bundle_agent_dir(target)
+        title = f"dashboard-install-{target.parent.name}"
+        try:
+            if session_id:
+                try:
+                    agent_id = broker.update_agent_bundle(session_id, bundle)
+                    agent_name = sidecar.get("agent_name")
+                except broker.BrokerHttpError as exc:
+                    if exc.status_code != 404:
+                        raise
+                    registration = broker.register_agent_bundle(bundle, title)
+                    agent_id = registration["agent_id"]
+                    session_id = registration["session_id"]
+                    agent_name = registration["agent_name"]
+            else:
+                registration = broker.register_agent_bundle(bundle, title)
+                agent_id = registration["agent_id"]
+                session_id = registration["session_id"]
+                agent_name = registration["agent_name"]
+        except broker.BrokerHttpError as exc:
+            raise _OmnigentRegistrationError(target, exc) from exc
+
+        if not isinstance(agent_name, str) or not agent_name:
+            agent_name = target.parent.name
+        sidecar = {
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "agent_name": agent_name,
+        }
+        sidecar_path.write_text(
+            json.dumps(sidecar, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return agent_id, session_id
+
+    @staticmethod
     def _write_agent_plan(plan) -> list[dict]:
         """Write an already-authorized install plan and report each target."""
         results = []
@@ -2096,8 +2183,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "scope_used": item["scope_used"],
             })
             if item["harness"] == "omnigent":
+                agent_id, session_id = DashboardHandler._register_omnigent_bundle(
+                    target)
+                results[-1]["agent_id"] = agent_id
+                results[-1]["session_id"] = session_id
                 results[-1]["register"] = (
-                    f"sys_session_create(config_path={target})")
+                    f"sys_session_create(agent_id={agent_id})")
         return results
 
     def _agent_destination_list(
@@ -2191,6 +2282,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             installations = self._write_agent_plan(plan)
         except IsADirectoryError:
             return self._send_json(400, {"error": "path is a directory"})
+        except _OmnigentRegistrationError as exc:
+            _invalidate_registry_cache()
+            return self._send_json(502, {
+                "error": f"omnigent broker registration failed: "
+                         f"{exc.broker_error}",
+                "broker_error": exc.broker_error,
+                "path": str(exc.path),
+            })
         except OSError:
             return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()
@@ -2240,6 +2339,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             installations = self._write_agent_plan(plan)
         except IsADirectoryError:
             return self._send_json(400, {"error": "path is a directory"})
+        except _OmnigentRegistrationError as exc:
+            _invalidate_registry_cache()
+            return self._send_json(502, {
+                "error": f"omnigent broker registration failed: "
+                         f"{exc.broker_error}",
+                "broker_error": exc.broker_error,
+                "path": str(exc.path),
+            })
         except OSError:
             return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()
@@ -2355,6 +2462,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             results = self._write_agent_plan(plan)
         except IsADirectoryError:
             return self._send_json(400, {"error": "path is a directory"})
+        except _OmnigentRegistrationError as exc:
+            _invalidate_registry_cache()
+            return self._send_json(502, {
+                "error": f"omnigent broker registration failed: "
+                         f"{exc.broker_error}",
+                "broker_error": exc.broker_error,
+                "path": str(exc.path),
+            })
         except OSError:
             return self._send_json(500, {"error": "could not write file"})
         _invalidate_registry_cache()

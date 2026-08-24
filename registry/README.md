@@ -172,7 +172,11 @@ A canonical agent is rendered into each harness's native file format via `render
 - **omnigent** — `<name>/config.yaml` (a `yaml-document` with a
   literal-block `prompt`)
 
-The index builds `agent_matrix` by comparing each canonical render's `body_hash` against installed agent body hashes to detect staleness.
+The index builds `agent_matrix` by comparing each canonical render's
+`body_hash` against installed agent body hashes to detect staleness. Omnigent
+installs upload the rendered bundle to the broker, keep the `config.yaml`
+source artifact, and persist broker IDs in a `broker.json` sidecar. The install
+response includes the durable `agent_id` and `session_id`.
 
 ## Test suite
 

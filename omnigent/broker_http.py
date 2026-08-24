@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import os
+import tarfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +21,10 @@ DEFAULT_BASE_URL = "http://127.0.0.1:6767"
 
 class BrokerHttpError(RuntimeError):
     """An actionable failure while talking to the broker."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _expired(expires_at: object) -> bool:
@@ -71,6 +79,145 @@ def auth_token(base_url: str) -> str | None:
     if isinstance(record, str) and record.strip():
         return record.strip()
     return None
+
+
+def _broker_base_url() -> str:
+    """Resolve the dashboard broker URL without importing Omnigent."""
+    for name in ("OMNIGENT_URL", "OMNIGENT_BASE_URL"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip().rstrip("/")
+    return DEFAULT_BASE_URL
+
+
+def bundle_agent_dir(config_yaml_path: str | os.PathLike[str]) -> bytes:
+    """Build a gzip-compressed tar containing a root-level ``config.yaml``."""
+    path = Path(config_yaml_path)
+    content = path.read_bytes()
+    archive = io.BytesIO()
+    with gzip.GzipFile(fileobj=archive, mode="wb", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w") as tar:
+            info = tarfile.TarInfo("config.yaml")
+            info.size = len(content)
+            info.mode = 0o644
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(content))
+    return archive.getvalue()
+
+
+def _multipart_body(
+    bundle_bytes: bytes, title: str | None = None
+) -> tuple[bytes, str]:
+    """Encode the broker's metadata and bundle multipart fields."""
+    boundary = f"----trio-broker-{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    if title is not None:
+        metadata = json.dumps({"title": title}, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        parts.append(
+            f"--{boundary}\r\n".encode("ascii")
+            + b'Content-Disposition: form-data; name="metadata"\r\n'
+            + b"Content-Type: application/json\r\n\r\n"
+            + metadata
+            + b"\r\n"
+        )
+    parts.append(
+        f"--{boundary}\r\n".encode("ascii")
+        + b'Content-Disposition: form-data; name="bundle"; '
+        + b'filename="bundle.tar.gz"\r\n'
+        + b"Content-Type: application/gzip\r\n\r\n"
+        + bytes(bundle_bytes)
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(parts), boundary
+
+
+def _multipart_request(
+    method: str,
+    path: str,
+    bundle_bytes: bytes,
+    *,
+    title: str | None = None,
+    expected_status: int,
+) -> Any:
+    """Send one broker multipart request and decode its JSON response."""
+    base_url = _broker_base_url()
+    body, boundary = _multipart_body(bundle_bytes, title)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    token = auth_token(base_url)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    url = f"{base_url}/{path.lstrip('/')}"
+    request = Request(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=30.0) as response:
+            status = response.getcode()
+            raw = response.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise BrokerHttpError(
+            f"{method} {url} failed with HTTP {exc.code}{suffix}",
+            status_code=exc.code,
+        ) from exc
+    except (OSError, URLError, TimeoutError) as exc:
+        raise BrokerHttpError(f"{method} {url} failed: {exc}") from exc
+    if status != expected_status:
+        raise BrokerHttpError(
+            f"{method} {url} returned HTTP {status}, expected "
+            f"{expected_status}",
+            status_code=status,
+        )
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerHttpError(
+            f"{method} {url} returned invalid JSON", status_code=status
+        ) from exc
+
+
+def register_agent_bundle(bundle_bytes: bytes, title: str) -> dict[str, str]:
+    """Register a rendered bundle and return the broker's durable IDs."""
+    response = _multipart_request(
+        "POST",
+        "/v1/sessions",
+        bundle_bytes,
+        title=title,
+        expected_status=201,
+    )
+    if not isinstance(response, dict):
+        raise BrokerHttpError("POST /v1/sessions returned a non-object response")
+    result = {
+        "agent_id": response.get("agent_id"),
+        "session_id": response.get("session_id"),
+        "agent_name": response.get("agent_name"),
+    }
+    if not all(isinstance(value, str) and value for value in result.values()):
+        raise BrokerHttpError(
+            "POST /v1/sessions returned incomplete agent registration"
+        )
+    return result
+
+
+def update_agent_bundle(session_id: str, bundle_bytes: bytes) -> str:
+    """Replace a session's bundle and return its durable agent ID."""
+    path = f"/v1/sessions/{quote(session_id, safe='')}/agent"
+    response = _multipart_request(
+        "PUT", path, bundle_bytes, expected_status=200
+    )
+    if not isinstance(response, dict):
+        raise BrokerHttpError(f"PUT {path} returned a non-object response")
+    agent_id = response.get("id")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise BrokerHttpError(f"PUT {path} returned no agent id")
+    return agent_id
 
 
 class BrokerClient:

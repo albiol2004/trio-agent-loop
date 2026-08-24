@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -236,6 +237,25 @@ class OmnigentYamlDocument(unittest.TestCase):
                 self.assertEqual(body, scan.parse_yaml(text)["prompt"])
                 self.assertEqual(
                     scan.join_file(fields, body, "yaml-document"), text)
+
+    def test_installed_role_reads_broker_agent_id_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agents"
+            role = root / "registry-scout"
+            role.mkdir(parents=True)
+            (role / "config.yaml").write_text(
+                "spec_version: 1\nname: registry-scout\nprompt: |\n  hello\n",
+                encoding="utf-8",
+            )
+            (role / "broker.json").write_text(
+                json.dumps({"agent_id": "ag-1"}),
+                encoding="utf-8",
+            )
+
+            entries = scan.scan_omnigent_roles(root)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["agent_id"], "ag-1")
 
     def test_unflatten_dotted_keys_preserves_nested_siblings(self):
         fields = {
@@ -983,6 +1003,36 @@ class BuildIndexAgentMatrix(unittest.TestCase):
         # the render hash, per the documented deterministic tie-break.
         self.assertEqual(cell["path"], "/first")
         self.assertEqual(cell["status"], "stale")
+
+    def test_omnigent_agent_id_is_copied_to_matching_cell(self):
+        entry = _entry(
+            "registry-scout", "omnigent", "agent", "global", "hash1",
+            path="/home/u/.omnigent/agents/registry-scout/config.yaml")
+        entry["agent_id"] = "ag-1"
+        index = scan.build_index(
+            [entry],
+            [{
+                "name": "registry-scout",
+                "path": "/repo/registry-scout.md",
+                "surface": "canonical-agent",
+                "description": "",
+                "model_tier": "cheap",
+                "tool_policy": "read-only",
+                "renders": {
+                    "omnigent": {
+                        "filename": "config.yaml",
+                        "format": "yaml-document",
+                        "body_hash": "hash1",
+                        "frontmatter": {},
+                    },
+                },
+                "unsupported": {},
+            }],
+        )
+
+        cell = index["agent_matrix"][0]["cells"][0]
+        self.assertEqual(cell["status"], "in-sync")
+        self.assertEqual(cell["agent_id"], "ag-1")
 
 
 if __name__ == "__main__":

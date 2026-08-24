@@ -13,6 +13,8 @@ tempdir for the duration of the test.
 """
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 import importlib.util
 import json
 import sys
@@ -21,8 +23,10 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SERVE_PATH = REPO_ROOT / "dashboard" / "serve.py"
@@ -58,6 +62,61 @@ def _http_json(method: str, url: str, payload: dict | None = None) -> tuple[int,
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+@contextmanager
+def _fake_broker():
+    """Run the multipart session endpoints used by Omnigent installs."""
+    state = {"posts": [], "puts": [], "bundle_parts": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def _send_json(self, status, payload):
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _body(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            return self.rfile.read(length)
+
+        def do_POST(self):
+            if self.path != "/v1/sessions":
+                return self._send_json(404, {"error": "unknown POST"})
+            body = self._body()
+            state["posts"].append(body)
+            state["bundle_parts"].append(b'name="bundle"' in body)
+            self._send_json(
+                201,
+                {
+                    "session_id": "sess-1",
+                    "agent_id": "ag-1",
+                    "agent_name": "registry-scout",
+                },
+            )
+
+        def do_PUT(self):
+            if self.path != "/v1/sessions/sess-1/agent":
+                return self._send_json(404, {"error": "unknown PUT"})
+            body = self._body()
+            state["puts"].append(body)
+            state["bundle_parts"].append(b'name="bundle"' in body)
+            self._send_json(200, {"id": "ag-1"})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", state
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 class DashboardServerTestCase(unittest.TestCase):
@@ -596,27 +655,72 @@ class InstallEndpointTests(DashboardServerTestCase):
                 fake_home / ".omnigent" / "agents" /
                 "registry-scout" / "config.yaml"
             )
-            try:
-                serve.HOME = fake_home
-                status, payload = self._install(
-                    harness="omnigent",
-                    scope="project",
-                    project=str(REPO_ROOT),
-                )
-                self.assertEqual(status, 201, payload)
-                self.assertEqual(Path(payload["path"]), target.resolve())
-                self.assertTrue(target.is_file(), payload)
-                fields = registry.parse_yaml(
-                    target.read_text(encoding="utf-8"))
-                self.assertEqual(fields["spec_version"], 1)
-                self.assertEqual(fields["name"], "registry-scout")
-                self.assertEqual(payload["scope_used"], "global")
-                self.assertIn("sys_session_create", payload["register"])
-                self.assertIn(str(target.resolve()), payload["register"])
-            finally:
-                serve.HOME = original_home
-                if target.is_file():
-                    target.unlink()
+            with _fake_broker() as (broker_url, broker_state), patch.dict(
+                os.environ, {"OMNIGENT_URL": broker_url}
+            ):
+                try:
+                    serve.HOME = fake_home
+                    status, payload = self._install(
+                        harness="omnigent",
+                        scope="project",
+                        project=str(REPO_ROOT),
+                    )
+                    self.assertEqual(status, 201, payload)
+                    self.assertEqual(Path(payload["path"]), target.resolve())
+                    self.assertTrue(target.is_file(), payload)
+                    fields = registry.parse_yaml(
+                        target.read_text(encoding="utf-8"))
+                    self.assertEqual(fields["spec_version"], 1)
+                    self.assertEqual(fields["name"], "registry-scout")
+                    self.assertEqual(payload["scope_used"], "global")
+                    self.assertEqual(payload["agent_id"], "ag-1")
+                    self.assertEqual(payload["session_id"], "sess-1")
+                    self.assertEqual(
+                        payload["register"],
+                        "sys_session_create(agent_id=ag-1)",
+                    )
+                    sidecar = target.parent / "broker.json"
+                    self.assertEqual(
+                        json.loads(sidecar.read_text(encoding="utf-8")),
+                        {
+                            "agent_id": "ag-1",
+                            "session_id": "sess-1",
+                            "agent_name": "registry-scout",
+                        },
+                    )
+                    self.assertEqual(len(broker_state["posts"]), 1)
+                    self.assertEqual(broker_state["bundle_parts"], [True])
+                finally:
+                    serve.HOME = original_home
+                    if target.is_file():
+                        target.unlink()
+
+    def test_install_omnigent_twice_reuses_agent_id(self):
+        original_home = serve.HOME
+        with tempfile.TemporaryDirectory() as home:
+            fake_home = Path(home)
+            target = (
+                fake_home / ".omnigent" / "agents" /
+                "registry-scout" / "config.yaml"
+            )
+            with _fake_broker() as (broker_url, broker_state), patch.dict(
+                os.environ, {"OMNIGENT_URL": broker_url}
+            ):
+                try:
+                    serve.HOME = fake_home
+                    status1, payload1 = self._install(harness="omnigent")
+                    status2, payload2 = self._install(harness="omnigent")
+                finally:
+                    serve.HOME = original_home
+            self.assertEqual(status1, 201, payload1)
+            self.assertEqual(status2, 200, payload2)
+            self.assertEqual(payload1["agent_id"], "ag-1")
+            self.assertEqual(payload2["agent_id"], "ag-1")
+            self.assertEqual(payload2["session_id"], "sess-1")
+            self.assertTrue(target.is_file())
+            self.assertEqual(len(broker_state["posts"]), 1)
+            self.assertEqual(len(broker_state["puts"]), 1)
+            self.assertEqual(broker_state["bundle_parts"], [True, True])
 
     def test_install_unknown_harness_is_400_never_500(self):
         status, payload = self._install(harness="totally-unknown-harness")

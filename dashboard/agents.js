@@ -463,6 +463,16 @@
     return badge;
   }
 
+  function appendBrokerAgentId(cell, target) {
+    if (!cell || cell.harness !== "omnigent" ||
+        typeof cell.agent_id !== "string" || !cell.agent_id) return;
+    const label = document.createElement("span");
+    label.className = "matrix-agent-id";
+    label.title = cell.agent_id;
+    label.textContent = `id ${cell.agent_id.slice(0, 12)}`;
+    target.append(label);
+  }
+
   function computeColumns(matrix, support) {
     const seen = new Set();
     const columns = [];
@@ -568,8 +578,10 @@
           td.classList.add("is-unsupported");
           td.title = cell.reason || "";
           td.append(makeStatusBadge(cell.status));
+          appendBrokerAgentId(cell, td);
         } else {
           td.append(makeStatusBadge(cell.status));
+          appendBrokerAgentId(cell, td);
           if (cell.status === "missing" || cell.status === "stale") {
             const actions = document.createElement("div");
             actions.className = "matrix-cell-actions";

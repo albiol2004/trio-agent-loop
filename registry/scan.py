@@ -1234,6 +1234,15 @@ def scan_omnigent_roles(root: Path, scope: str = "global") -> list[dict]:
         if role.is_dir() and cfg.is_file():
             rec = entry_record(cfg, "omnigent", "agent", scope)
             rec["name"] = role.name
+            sidecar = role / "broker.json"
+            try:
+                broker = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                broker = None
+            if isinstance(broker, dict):
+                agent_id = broker.get("agent_id")
+                if isinstance(agent_id, str) and agent_id:
+                    rec["agent_id"] = agent_id
             out.append(rec)
     return out
 
@@ -1292,7 +1301,9 @@ def collect(project: Path | None) -> list[dict]:
     entries += scan_toml_dir(HOME / ".codex/agents", "codex", "agent", "global")
     entries += scan_instructions(HOME / ".codex/AGENTS.md", "codex", "global")
 
-    # Omnigent (roles; skills come from claude/agents dirs natively)
+    # Omnigent custom bundles live directly under agents; built-in roles keep
+    # their nested directory so both layouts remain visible to the registry.
+    entries += scan_omnigent_roles(HOME / ".omnigent/agents")
     entries += scan_omnigent_roles(HOME / ".omnigent/agents/trio-omnigent-roles")
     entries += scan_instructions(HOME / ".omnigent/config.yaml", "omnigent", "global")
 
@@ -1358,16 +1369,19 @@ def _build_agent_matrix(entries: list[dict], canonical_agents: list[dict]) -> li
                              None)
             filename = render.get("filename")
             if candidate is None:
-                cells.append({"harness": harness, "status": "missing",
-                              "path": None, "filename": filename, "reason": None})
+                cell = {"harness": harness, "status": "missing",
+                        "path": None, "filename": filename, "reason": None}
             elif candidate["body_hash"] == render.get("body_hash"):
-                cells.append({"harness": harness, "status": "in-sync",
-                              "path": candidate["path"], "filename": filename,
-                              "reason": None})
+                cell = {"harness": harness, "status": "in-sync",
+                        "path": candidate["path"], "filename": filename,
+                        "reason": None}
             else:
-                cells.append({"harness": harness, "status": "stale",
-                              "path": candidate["path"], "filename": filename,
-                              "reason": None})
+                cell = {"harness": harness, "status": "stale",
+                        "path": candidate["path"], "filename": filename,
+                        "reason": None}
+            if candidate and candidate.get("agent_id"):
+                cell["agent_id"] = candidate["agent_id"]
+            cells.append(cell)
         for harness, reason in unsupported.items():
             cells.append({"harness": harness, "status": "unsupported",
                           "path": None, "filename": None, "reason": reason})
@@ -1406,6 +1420,8 @@ def build_index(entries: list[dict], canonical_agents: list[dict] | None = None)
             inst = {"harness": m["harness"], "surface": m["surface"], "scope": m["scope"],
                     "path": m["path"], "body_hash": m["body_hash"],
                     "is_symlink": m["is_symlink"], "managed": m["managed"]}
+            if m.get("agent_id"):
+                inst["agent_id"] = m["agent_id"]
             if m["scope"] == "canonical":
                 inst["status"] = "canonical"
             else:

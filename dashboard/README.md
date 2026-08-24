@@ -124,8 +124,9 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
 - **Install endpoint** — `POST /api/registry/install` renders a canonical
   agent into a harness's native format and writes it to the correct location
   (e.g., `~/.claude/agents/` for claude or
-  `~/.omnigent/agents/<name>/config.yaml` for omnigent). Omnigent results
-  include a `sys_session_create(config_path=...)` registration command.
+  `~/.omnigent/agents/<name>/config.yaml` for omnigent). Omnigent installs
+  upload the bundle, write a `broker.json` sidecar, and return the durable
+  `agent_id` and `session_id` in its installation response.
   Returns 404 for an unknown agent and 403 if the destination is managed by
   generate.py.
 
