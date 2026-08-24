@@ -173,10 +173,20 @@ class BrokerClient:
                 and isinstance(row.get("runner_id"), str)
                 and row["runner_id"]
             ]
+            preferred = os.environ.get("TRIO_OMNIGENT_RUNNER_ID", "")
+            if preferred:
+                online = [row for row in online if row["runner_id"] == preferred]
+                if not online:
+                    raise BrokerHttpError(
+                        "cannot start session: TRIO_OMNIGENT_RUNNER_ID="
+                        f"{preferred} is not an online runner"
+                    )
             if len(online) != 1:
+                ids = ", ".join(row["runner_id"] for row in online) or "none"
                 raise BrokerHttpError(
                     "cannot start session: expected exactly one online runner, "
-                    f"found {len(online)}"
+                    f"found {len(online)} ({ids}); set TRIO_OMNIGENT_RUNNER_ID "
+                    "to choose one"
                 )
             bound = self.bind_session(session_id, online[0]["runner_id"])
             if isinstance(bound, dict):
