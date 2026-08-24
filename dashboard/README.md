@@ -65,7 +65,7 @@ Loop control:
 - `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
 
 Registry and agents:
-- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag
+- `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag and YAML `quoted_keys` metadata
 - `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
 - `POST /api/registry/serialize` — validate frontmatter/body pairs; strict YAML parsing server-side
 - `GET /api/registry/agents` — list canonical agents
@@ -83,6 +83,7 @@ Registry and agents:
 The **Skills** page (`/skills.html`) edits skill registry files with a typed frontmatter interface:
 - **Schema-driven forms** — `GET /api/registry/schema` serves harness/surface destinations, formats (yaml/toml), and per-field specs (type, widget, required, help text).
 - **Server-side validation** — `POST /api/registry/serialize` validates frontmatter/body pairs. Raw YAML (via `{"$yaml": "<text>"}` escape hatch) is parsed strictly server-side; malformed input returns a 400 error naming the field.
+- **Format-preserving saves** — the editor sends `quoted_keys` metadata with form saves so an unchanged YAML key keeps its explicit quoting across the JSON API boundary.
 - **Read-only generated files** — files managed by `prompts/generate.py` are marked read-only and return 403 on write attempts.
 
 ## Canonical agents & install matrix

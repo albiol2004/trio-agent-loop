@@ -65,6 +65,15 @@ _FLOAT_RE = re.compile(r"[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?\Z")
 _UNSAFE_PLAIN_HEAD = set("-?:,[]{}#&*!|>'\"%@`")
 
 
+class _YamlKey(str):
+    """String key carrying whether the source YAML explicitly quoted it."""
+
+    def __new__(cls, value: str, *, quoted: bool = False):
+        key = super().__new__(cls, value)
+        key.quoted = quoted
+        return key
+
+
 def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
@@ -172,7 +181,7 @@ def _split_key(line: str) -> tuple[str | None, str]:
         rest = line[end + 1:].lstrip()
         if not rest.startswith(":"):
             return None, ""
-        return _unquote(line[:end + 1]), rest[1:].strip()
+        return _YamlKey(_unquote(line[:end + 1]), quoted=True), rest[1:].strip()
     key, sep, rest = line.partition(":")
     if not sep:
         return None, ""
@@ -212,7 +221,7 @@ def _parse_flow(text: str, pos: int = 0):
             i += 1
         return i
 
-    def read_token(i):
+    def read_token(i, *, key=False):
         """Read a scalar / nested flow, returning (value, next_index)."""
         i = skip_ws(i)
         if i >= len(text):
@@ -223,7 +232,8 @@ def _parse_flow(text: str, pos: int = 0):
             end = _quoted_end(text, i)
             if end is None:
                 return text[i:], len(text)
-            return _unquote(text[i:end + 1]), end + 1
+            value = _unquote(text[i:end + 1])
+            return (_YamlKey(value, quoted=True) if key else value), end + 1
         start = i
         while i < len(text) and text[i] not in ",]}:":
             i += 1
@@ -243,12 +253,13 @@ def _parse_flow(text: str, pos: int = 0):
         if i < len(text) and text[i] == ",":
             i += 1
             continue
-        value, i = read_token(i)
+        value, i = read_token(i, key=is_map)
         i = skip_ws(i)
         if i < len(text) and text[i] == ":":
             is_map = True
             sub, i = read_token(i + 1)
-            mapping[str(value)] = sub
+            map_key = value if isinstance(value, str) else str(value)
+            mapping[map_key] = sub
         else:
             items.append(value)
     return (mapping if is_map else items), i
@@ -537,8 +548,92 @@ def _quote(text: str) -> str:
 
 
 def _dump_key(key) -> str:
+    quoted = getattr(key, "quoted", False)
     key = str(key)
+    if quoted:
+        return _quote(key)
     return key if _PLAIN_KEY_RE.match(key) else _quote(key)
+
+
+def _encode_key_path(parts: tuple[str, ...]) -> str:
+    """Encode nested key names as dotted paths without losing dots."""
+    return ".".join(
+        part.replace("\\", "\\\\").replace(".", "\\.") for part in parts
+    )
+
+
+def _decode_key_path(path: str) -> tuple[str, ...]:
+    """Decode the escaped dotted paths used by the dashboard metadata."""
+    parts: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in path:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ".":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    parts.append("".join(current))
+    return tuple(parts)
+
+
+def _collect_quoted_key_paths(
+    data: dict, prefix: tuple[str, ...] = ()
+) -> list[str]:
+    paths: list[str] = []
+    for key, value in data.items():
+        path = prefix + (str(key),)
+        if getattr(key, "quoted", False):
+            paths.append(_encode_key_path(path))
+        if isinstance(value, dict):
+            paths.extend(_collect_quoted_key_paths(value, path))
+    return paths
+
+
+def quoted_key_paths(data: dict) -> list[str]:
+    """Return explicitly quoted mapping keys for JSON round-trip metadata."""
+    if not isinstance(data, dict):
+        return []
+    return _collect_quoted_key_paths(data)
+
+
+def _mark_quoted_key(data: dict, path: tuple[str, ...]) -> None:
+    if not path or not isinstance(data, dict):
+        return
+    target = path[0]
+    for key in list(data):
+        if str(key) != target:
+            continue
+        if len(path) > 1:
+            _mark_quoted_key(data[key], path[1:])
+            return
+        if getattr(key, "quoted", False):
+            return
+        replacement = _YamlKey(str(key), quoted=True)
+        items = [
+            (replacement if candidate is key else candidate, value)
+            for candidate, value in data.items()
+        ]
+        data.clear()
+        data.update(items)
+        return
+
+
+def apply_quoted_key_paths(data: dict, paths) -> dict:
+    """Restore quoted key markers after a frontmatter JSON round trip."""
+    if not isinstance(data, dict) or not isinstance(paths, list):
+        return data
+    for path in paths:
+        if isinstance(path, str):
+            _mark_quoted_key(data, _decode_key_path(path))
+    return data
 
 
 def _plain_safe(value: str) -> bool:

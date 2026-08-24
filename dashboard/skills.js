@@ -1,3 +1,55 @@
+const CUSTOM_VALUE = "__trio_custom__";
+
+// These small pure helpers are also exported for the no-DOM regression tests.
+// The browser editor uses the same functions, so tests exercise real save
+// validation and catalog selection decisions rather than source markers.
+function withRoot(url, root = "") {
+  return root
+    ? `${url}${url.includes("?") ? "&" : "?"}root=${encodeURIComponent(root)}`
+    : url;
+}
+
+function jsonSchemaError(text, wasPresent = false) {
+  const value = text == null ? "" : String(text);
+  if (!value.trim() && !wasPresent) return null;
+  try {
+    JSON.parse(value);
+    return null;
+  } catch (error) {
+    return `Invalid JSON: ${error.message}`;
+  }
+}
+
+function validateJsonSchemaField(text, wasPresent = false) {
+  const error = jsonSchemaError(text, wasPresent);
+  return {
+    valid: !error,
+    fieldError: Boolean(error),
+    blocksSave: Boolean(error),
+    error,
+  };
+}
+
+function catalogChoiceState(value, choices) {
+  const current = value === null || value === undefined ? "" : String(value);
+  const known = Array.isArray(choices)
+    ? choices.map((choice) => String(choice)) : [];
+  const offList = Boolean(current) && !known.includes(current);
+  return {
+    value: current,
+    selected: offList ? CUSTOM_VALUE : current,
+    offList,
+  };
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    catalogChoiceState,
+    jsonSchemaError,
+    validateJsonSchemaField,
+    withRoot,
+  };
+} else {
 (() => {
   "use strict";
 
@@ -29,10 +81,6 @@
     busy: false
   };
 
-  function withRoot(url) {
-    return currentRoot ? `${url}${url.includes("?") ? "&" : "?"}root=${encodeURIComponent(currentRoot)}` : url;
-  }
-
   const $ = (id) => document.getElementById(id);
   const tree = $("skills-tree");
   const entryList = $("entry-list");
@@ -48,7 +96,7 @@
   }
 
   async function api(url, options = {}) {
-    const response = await fetch(withRoot(url), options);
+    const response = await fetch(withRoot(url, currentRoot), options);
     const raw = await response.text();
     let data = null;
     if (raw) {
@@ -279,7 +327,6 @@
   const STRUCTURED_WIDGETS = new Set([
     "permission-grid", "spawns-select", "json-schema"
   ]);
-  const CUSTOM_VALUE = "__trio_custom__";
 
   function declaredWidgetFor(spec) {
     if (typeof spec.values_from === "string" &&
@@ -451,9 +498,9 @@
       }
       const sourceChoices = spec.values_from ? choices : (spec.enum || []);
       const knownChoices = uniqueStrings(sourceChoices.map((choice) => String(choice)));
-      const current = initialValue === null || initialValue === undefined
-        ? "" : String(initialValue);
-      offList = Boolean(current) && !knownChoices.includes(current);
+      const choiceState = catalogChoiceState(initialValue, knownChoices);
+      const current = choiceState.value;
+      offList = choiceState.offList;
       const visibleChoices = [...knownChoices];
       if (offList && spec.values_from) visibleChoices.push(current);
       visibleChoices.forEach((choice) => {
@@ -471,7 +518,7 @@
       customControl.value = current;
       customControl.hidden = !offList;
       customControl.disabled = disabled || !offList;
-      control.value = offList ? CUSTOM_VALUE : current;
+      control.value = choiceState.selected;
       control.addEventListener("change", () => {
         const custom = control.value === CUSTOM_VALUE;
         customControl.hidden = !custom;
@@ -655,7 +702,14 @@
       try {
         const resp = await api("/api/registry/serialize", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ format: cur.format, frontmatter: payload, body: "", harness: cur.entry.harness, surface: cur.entry.surface })
+          body: JSON.stringify({
+            format: cur.format,
+            frontmatter: payload,
+            body: "",
+            harness: cur.entry.harness,
+            surface: cur.entry.surface,
+            quoted_keys: cur.quotedKeys || []
+          })
         });
         rawTexts = splitTopLevelBlocks(extractFrontmatterBlock(resp.content, cur.format), cur.format);
       } catch (error) {
@@ -746,21 +800,15 @@
 
   function updateJsonSchemaError(fc) {
     if (fc.widget !== "json-schema") return null;
-    const text = String(fc.control.value || "");
-    let message = null;
-    if (text.trim() || fc.wasPresent) {
-      try {
-        JSON.parse(text);
-      } catch (error) {
-        message = `Invalid JSON: ${error.message}`;
-      }
-    }
+    const text = fc.control.value;
+    const validation = validateJsonSchemaField(text, fc.wasPresent);
+    const message = validation.error;
     if (fc.errorNode) {
       fc.errorNode.textContent = message || "";
       fc.errorNode.hidden = !message;
     }
-    fc.row.classList.toggle("field-error", Boolean(message));
-    fc.control.classList.toggle("field-error", Boolean(message));
+    fc.row.classList.toggle("field-error", validation.fieldError);
+    fc.control.classList.toggle("field-error", validation.fieldError);
     fc.jsonError = message;
     return message;
   }
@@ -967,7 +1015,8 @@
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             format: cur.format, frontmatter, body: cur.format === "toml" ? bodyText.value : "",
-            harness: cur.entry.harness, surface: cur.entry.surface
+            harness: cur.entry.harness, surface: cur.entry.surface,
+            quoted_keys: cur.quotedKeys || []
           })
         });
         const block = extractFrontmatterBlock(resp.content, cur.format);
@@ -1054,6 +1103,7 @@
         format: file.format || "text",
         frontmatter: file.frontmatter || {},
         body: typeof file.body === "string" ? file.body : "",
+        quotedKeys: file.quoted_keys || [],
         managed: Boolean(file.managed),
         rawMode: false,
         rawBaseline: undefined,
@@ -1191,7 +1241,15 @@
         const frontmatter = buildOutgoingFrontmatter();
         const resp = await api("/api/registry/serialize", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ format: cur.format, frontmatter, body: bodyText.value, harness: cur.entry.harness, surface: cur.entry.surface, path })
+          body: JSON.stringify({
+            format: cur.format,
+            frontmatter,
+            body: bodyText.value,
+            harness: cur.entry.harness,
+            surface: cur.entry.surface,
+            path,
+            quoted_keys: cur.quotedKeys || []
+          })
         });
         content = resp.content;
         warnings = Array.isArray(resp.warnings) ? resp.warnings : [];
@@ -1319,3 +1377,4 @@
     await refresh();
   })();
 })();
+}

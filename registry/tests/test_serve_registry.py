@@ -235,15 +235,19 @@ class RoundTripTests(DashboardServerTestCase):
         path = REPO_ROOT / "opencode" / "agents" / "trio-evaluator.md"
         status, get_payload = self._get(f"/api/registry/file?path={path}")
         self.assertEqual(status, 200)
+        self.assertIn("permission.bash.sort", get_payload["quoted_keys"])
+        self.assertNotIn("permission.read", get_payload["quoted_keys"])
         status, ser_payload = _http_json(
             "POST", f"{self.base}/api/registry/serialize",
             {
                 "format": get_payload["format"],
                 "frontmatter": get_payload["frontmatter"],
                 "body": get_payload["body"],
+                "quoted_keys": get_payload["quoted_keys"],
             })
         self.assertEqual(status, 200, ser_payload)
         content = ser_payload["content"]
+        self.assertEqual(content.encode("utf-8"), path.read_bytes())
         self.assertNotIn("[object Object]", content)
         for line in content.splitlines():
             if line.strip() == "permission:":
@@ -261,6 +265,27 @@ class RoundTripTests(DashboardServerTestCase):
         refields, rebody = registry.parse_frontmatter(content)
         self.assertEqual(refields, get_payload["frontmatter"])
         self.assertEqual(rebody, get_payload["body"])
+
+    def test_opencode_edit_preserves_untouched_key_quoting(self):
+        path = REPO_ROOT / "opencode" / "agents" / "trio-evaluator.md"
+        status, get_payload = self._get(f"/api/registry/file?path={path}")
+        self.assertEqual(status, 200)
+        frontmatter = dict(get_payload["frontmatter"])
+        frontmatter["description"] = "Updated evaluator description."
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": get_payload["format"],
+                "frontmatter": frontmatter,
+                "body": get_payload["body"],
+                "quoted_keys": get_payload["quoted_keys"],
+            })
+        self.assertEqual(status, 200, payload)
+        content = payload["content"]
+        self.assertIn('    "sort": allow\n', content)
+        self.assertIn("  read: allow\n", content)
+        self.assertNotIn("    sort: allow\n", content)
+        self.assertNotIn('  "read": allow\n', content)
 
     def test_codex_agent_http_round_trip(self):
         path = REPO_ROOT / "codex" / "agents" / "trio-evaluator.toml"

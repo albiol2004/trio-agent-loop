@@ -21,7 +21,7 @@ A canonical agent's optional `spawns` field is a named allowlist (list of agent 
 
 `registry/scan.py` is a **read-only scanner** that parses every harness's skill/command/agent registry, hashes content for drift detection, and emits `registry.json`. It also owns the **format layer** used by the dashboard editor:
 
-- **YAML-subset parser/serializer** — hand-written (no PyYAML; stdlib only), lenient for on-disk scanning (a bad file must not kill a scan), strict when parsing user-submitted YAML. Round-trips: `parse(dump(parse(text))) == parse(text)` with key insertion order preserved.
+- **YAML-subset parser/serializer** — hand-written (no PyYAML; stdlib only), lenient for on-disk scanning (a bad file must not kill a scan), strict when parsing user-submitted YAML. Round-trips: `parse(dump(parse(text))) == parse(text)` with key insertion order and explicit key quoting preserved. The dashboard carries nested `quoted_keys` metadata across its JSON boundary.
 - **TOML parser/serializer** — `tomllib`-backed for parsing, minimal custom serializer for output. Round-trips order-preserving.
 - **Frontmatter parsing** — YAML frontmatter (delimited by `---`) is split from body; body digests are computed separately from frontmatter for drift detection (frontmatter legitimately differs per harness; body drift signals staleness).
 

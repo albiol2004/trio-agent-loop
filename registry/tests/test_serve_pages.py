@@ -9,6 +9,7 @@ Run: python3 -m unittest discover -s registry/tests -t . (from repo root)
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import threading
 import unittest
@@ -287,6 +288,52 @@ class SkillsJsWidgetTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn(".field-offlist", html)
         self.assertIn(".field-error", html)
+
+    def test_skills_js_helpers_exercise_save_guard_catalog_and_root(self):
+        script = r"""
+const assert = require("node:assert/strict");
+const {
+  catalogChoiceState,
+  validateJsonSchemaField,
+  withRoot,
+} = require(process.argv[1]);
+
+assert.equal(
+  withRoot("/api/registry/models", "/tmp/project"),
+  "/api/registry/models?root=%2Ftmp%2Fproject"
+);
+assert.equal(
+  withRoot("/api/registry/models?scope=all", "/tmp/project"),
+  "/api/registry/models?scope=all&root=%2Ftmp%2Fproject"
+);
+
+const invalidOutput = validateJsonSchemaField('{"type": invalid}', true);
+assert.equal(invalidOutput.valid, false);
+assert.equal(invalidOutput.fieldError, true);
+assert.equal(invalidOutput.blocksSave, true);
+assert.match(invalidOutput.error, /Invalid JSON/);
+
+const validOutput = validateJsonSchemaField('{"type": "object"}', true);
+assert.equal(validOutput.valid, true);
+assert.equal(validOutput.fieldError, false);
+assert.equal(validOutput.blocksSave, false);
+
+const offList = catalogChoiceState("custom-model", ["known-model"]);
+assert.equal(offList.value, "custom-model");
+assert.equal(offList.selected, "__trio_custom__");
+assert.equal(offList.offList, true);
+
+const known = catalogChoiceState("known-model", ["known-model"]);
+assert.equal(known.selected, "known-model");
+assert.equal(known.offList, false);
+"""
+        result = subprocess.run(
+            ["node", "-e", script, str(REPO_ROOT / "dashboard" / "skills.js")],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class ModelsJsConventionTests(unittest.TestCase):

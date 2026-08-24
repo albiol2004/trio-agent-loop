@@ -61,7 +61,8 @@ Transcript tail (SSE):
 
 Registry (format-aware):
     GET /api/registry/file?path=<absolute-path>
-    Response: {"path", "format", "frontmatter", "body", "managed"}
+    Response: {"path", "format", "frontmatter", "body", "managed",
+               "quoted_keys"}
         format is one of "toml" | "yaml" | "text". "toml" bodies hold the
         file's `developer_instructions` string; "text" means no frontmatter
         fence was found (frontmatter is {}, body is the whole file).
@@ -1355,6 +1356,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "frontmatter": frontmatter,
             "body": body,
             "managed": bool(entry.get("managed")),
+            "quoted_keys": registry.quoted_key_paths(frontmatter),
         })
 
     def _handle_registry_topology(self, root: Path) -> None:
@@ -1453,6 +1455,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 resolved[key] = parsed
             else:
                 resolved[key] = value
+
+        # JSON turns scan.py's quoted string-key markers into plain strings.
+        # Restore them before the existing YAML writer renders the response.
+        if fmt == "yaml":
+            registry.apply_quoted_key_paths(
+                resolved, payload.get("quoted_keys"))
 
         warnings: list[str] = []
         schema_key = (

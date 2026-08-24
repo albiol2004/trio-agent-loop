@@ -615,6 +615,13 @@ class RealFileRoundTrip(unittest.TestCase):
         self.assertIsInstance(fields["permission"]["bash"], dict)
         self.assertTrue(any(" " in key for key in fields["permission"]["bash"]))
 
+    def test_opencode_evaluator_dump_is_byte_identical(self):
+        path = REPO / "opencode/agents/trio-evaluator.md"
+        text = path.read_text(encoding="utf-8")
+        fields, body = scan.parse_frontmatter(text)
+        rebuilt = scan.dump_frontmatter(fields, body)
+        self.assertEqual(rebuilt.encode("utf-8"), path.read_bytes())
+
     def test_codex_evaluator_body_hash_is_whole_file(self):
         path = REPO / "codex/agents/trio-evaluator.toml"
         record = scan.entry_record(path, "codex", "agent", "canonical")
