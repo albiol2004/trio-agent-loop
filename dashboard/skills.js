@@ -730,6 +730,13 @@ if (typeof module !== "undefined" && module.exports) {
       try {
         const data = await api("/api/registry/models");
         const choices = {};
+        const available = data && data.available &&
+          typeof data.available === "object" ? data.available : {};
+        Object.keys(available).forEach((harness) => {
+          if (!Array.isArray(available[harness])) return;
+          choices[harness] = available[harness]
+            .filter((model) => typeof model === "string" && model);
+        });
         const rows = data && Array.isArray(data.rows) ? data.rows : [];
         rows.forEach((row) => {
           if (!row || typeof row.harness !== "string" ||
@@ -1344,6 +1351,17 @@ if (typeof module !== "undefined" && module.exports) {
     return scope === "project" ? PROJECT_DESTINATIONS : schema.destinations;
   }
 
+  // Agents are authored on the Agents page (canonical entity + per-harness
+  // renderers); this page's create dialog only makes raw skill/command files.
+  function creatableDestinations(destinations) {
+    const filtered = {};
+    Object.keys(destinations || {}).forEach((harness) => {
+      const surfaces = (destinations[harness] || []).filter((s) => s !== "agent");
+      if (surfaces.length) filtered[harness] = surfaces;
+    });
+    return filtered;
+  }
+
   function destinationOptions(
     select, preferredHarness = "claude", destinations = schema.destinations
   ) {
@@ -1392,7 +1410,7 @@ if (typeof module !== "undefined" && module.exports) {
     const scope = $("new-scope");
     if (!scope) return;
     if (resetScope) scope.value = currentRoot ? "project" : "global";
-    const destinations = destinationsForScope(scope.value);
+    const destinations = creatableDestinations(destinationsForScope(scope.value));
     const harness = $("new-harness").value;
     destinationOptions($("new-harness"), harness, destinations);
     updateSurfaceSelect(

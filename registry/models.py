@@ -415,4 +415,10 @@ def collect_models(root: Path, home: Path | None = None) -> dict:
                 "warning": None if model is None or known
                 else "unknown model id",
             })
-    return {"root": str(root), "rows": rows}
+    return {
+        "root": str(root),
+        "rows": rows,
+        "available": {
+            harness: sorted(models) for harness, models in available.items()
+        },
+    }

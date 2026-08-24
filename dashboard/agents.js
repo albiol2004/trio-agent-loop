@@ -863,6 +863,13 @@
     if (currentRoot) {
       try {
         const models = await apiRoot("/api/registry/models");
+        const available = models && models.available &&
+          typeof models.available === "object" ? models.available : {};
+        Object.keys(available).forEach((harness) => {
+          if (!Array.isArray(available[harness])) return;
+          state.modelChoices[harness] = available[harness]
+            .filter((model) => typeof model === "string" && model);
+        });
         (models.rows || []).forEach((row) => {
           if (!row || typeof row.harness !== "string" ||
               typeof row.model !== "string") return;

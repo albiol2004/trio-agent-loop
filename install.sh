@@ -432,12 +432,17 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     mkdir -p "$DASH_SHARE" "$DASH_BIN" \
       "$(dirname "$DASH_SHARE")/metrics" "$(dirname "$DASH_SHARE")/registry"
     # Shipped code: overwrite our own files on reinstall (not user config).
-    cp -v "$ROOT/dashboard/serve.py" "$ROOT/dashboard/app.css" \
-          "$ROOT/dashboard/app.js" "$ROOT/dashboard/index.html" \
-          "$ROOT/dashboard/skills.html" "$ROOT/dashboard/skills.js" \
-          "$ROOT/dashboard/nav.js" "$ROOT/dashboard/README.md" "$DASH_SHARE/"
+    # Every page/module the server serves or imports by sibling path:
+    # dashboard/*.{html,js,css,py}, registry/*.py + models.json +
+    # canonical-agents/, metrics/trio-metrics.py.
+    cp -v "$ROOT"/dashboard/*.html "$ROOT"/dashboard/*.js "$ROOT"/dashboard/*.css \
+          "$ROOT"/dashboard/*.py "$ROOT/dashboard/README.md" "$DASH_SHARE/"
     cp -v "$ROOT/metrics/trio-metrics.py" "$(dirname "$DASH_SHARE")/metrics/"
-    cp -v "$ROOT/registry/scan.py" "$(dirname "$DASH_SHARE")/registry/"
+    cp -v "$ROOT"/registry/*.py "$ROOT/registry/models.json" \
+          "$(dirname "$DASH_SHARE")/registry/"
+    mkdir -p "$(dirname "$DASH_SHARE")/registry/canonical-agents"
+    cp -v "$ROOT"/registry/canonical-agents/*.md \
+          "$(dirname "$DASH_SHARE")/registry/canonical-agents/"
     cp -v "$ROOT/dashboard/trio-dash" "$DASH_BIN/trio-dash"
     chmod +x "$DASH_BIN/trio-dash"
     echo "Installed trio-dash. From any project root (terminal or agent): trio-dash"
