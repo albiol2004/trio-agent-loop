@@ -3,6 +3,8 @@ name: trio-omnigent
 description: Run the Cursor-backed Omnigent Trio loop from the current Claude/Codex UI session when the user explicitly says “Trio Omnigent”, “Omnigent Trio”, or invokes /trio-omnigent. Do not use for an ordinary native Trio request.
 ---
 
+Omnigent agents are registered by bundle upload, not by scanning an agents directory; `omnigent` CLI has no `agent` command. The dashboard install (via `install.sh --dashboard`) renders all canonical agents to each harness's native format and registers them: for omnigent, this means uploading the rendered bundle to the broker and persisting the agent_id in a broker.json sidecar.
+
 You are the Trio coordinator. Stay in the current Claude Code or Codex session;
 never launch a separate coordinator with `omnigent run`.
 

@@ -10,7 +10,9 @@ Install once:
 ./install.sh --dashboard
 ```
 
-Then from any project root — terminal or agent session:
+This ships all pages and registry modules (`agents.html`, `topology.html`,
+`models.html`, `health.html` and their corresponding JavaScript/CSS
+dependencies). Then from any project root — terminal or agent session:
 
 ```bash
 trio-dash
@@ -22,7 +24,13 @@ This serves that project's `loop*/` mailboxes. Defaults:
 - root: `$PWD` (override with `--root`)
 - install dir: `~/.local/share/trio-agent-loop/dashboard` (override with `TRIO_DASH_HOME`)
 
-The printed `listening on http://...` line names the actual bound port.
+When `tailscale serve` holds the wildcard port, `trio-dash` falls back to
+`127.0.0.1` for local access only. The printed `listening on http://...` line
+names the actual bound address and port.
+
+**Managed files caveat**: The installed copy has no `prompts/` directory, so
+managed-file provenance display and Regenerate & re-install only work when
+the dashboard is served from the repo checkout (development mode).
 
 ## Remote / Tailscale access
 
@@ -117,18 +125,22 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
   `developer_instructions`. Empty lists preserve each harness's safe default.
 - **Install matrix** shows each canonical agent as a row with a cell per
   supported harness (claude, codex, omp, opencode, omnigent) indicating sync
-  status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported.
+  status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported. Every supported
+  harness is always listed; `scope_used: "global"` appears when the harness
+  has no project agent directory and falls back to global installation.
 - **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
 - **Scoped agent installs** — project scope keeps every supported harness
   selectable. Harnesses without a project agent directory fall back to global
   installation and report `scope_used: "global"` in each destination or
-  installation.
+  installation response.
 - **Install endpoint** — `POST /api/registry/install` renders a canonical
   agent into a harness's native format and writes it to the correct location
   (e.g., `~/.claude/agents/` for claude or
-  `~/.omnigent/agents/<name>/config.yaml` for omnigent). Omnigent installs
-  upload the bundle, write a `broker.json` sidecar, and return the durable
-  `agent_id` and `session_id` in its installation response.
+  `~/.omnigent/agents/<name>/config.yaml` for omnigent). Omnigent is a target
+  harness: install uploads the rendered bundle (multipart POST to `/v1/sessions`
+  on the broker), writes a `broker.json` sidecar persisting the durable `agent_id`,
+  and is idempotent (re-install via PUT `/v1/sessions/{id}/agent`). The
+  installation response includes `agent_id` and `session_id`.
   Returns 404 for an unknown agent and 403 if the destination is managed by
   generate.py.
 
@@ -141,10 +153,12 @@ the explicit repository root. The `root` query is required; `workflow` accepts
 scan the dashboard process user's home directory.
 
 The **Topology** page (`/topology.html`) renders those graphs as layered
-entrypoint → agent → model SVGs. Select a workflow and harness to inspect its
-wiring, or enable **Compare wiring** to see edges and agent output schemas that
-differ across the loaded harnesses. Productionize warnings remain visible as
-warning nodes.
+entrypoint → agent → model SVGs. A **Workflow selector** offers `roles`,
+`productionize`, and `entrypoints` choices. `productionize` graphs come from
+each wrapper's `## Dispatch table` section; unparseable tables become warning
+nodes. Select a workflow and harness to inspect its wiring, or enable
+**Compare wiring** to see edges and agent output schemas that differ across
+the loaded harnesses.
 Nodes with source paths link to the Skills registry for inspection.
 
 ## Model registry
