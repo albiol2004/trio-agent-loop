@@ -266,9 +266,13 @@ _GLOBAL_REGISTRY_RELATIVE_DIRS = {
     ("zcode", "skill"): Path(".zcode/skills"),
 }
 
-_PROJECT_AGENT_DIRS = {
-    "claude": Path(".claude/agents"),
-    "opencode": Path(".opencode/agents"),
+# Mirrors the project-scoped directories collected by registry/scan.py.
+_PROJECT_REGISTRY_DIRS = {
+    ("claude", "skill"): Path(".claude/skills"),
+    ("claude", "command"): Path(".claude/commands"),
+    ("claude", "agent"): Path(".claude/agents"),
+    ("opencode", "agent"): Path(".opencode/agents"),
+    ("cursor", "skill"): Path(".cursor/skills"),
 }
 
 
@@ -1188,11 +1192,12 @@ def _registry_target(
     surface = surface.strip().lower()
     scope = _normalize_agent_scope(scope)
     if scope == "project":
-        if surface != "agent" or harness not in _PROJECT_AGENT_DIRS:
-            raise ValueError("unsupported project agent destination")
+        relative = _PROJECT_REGISTRY_DIRS.get((harness, surface))
+        if relative is None:
+            raise ValueError("unsupported project registry destination")
         if project is None:
             raise ValueError("project is required for project scope")
-        root = Path(project).expanduser().resolve() / _PROJECT_AGENT_DIRS[harness]
+        root = Path(project).expanduser().resolve() / relative
     else:
         if home is None and HOME != _INITIAL_HOME:
             home = HOME
@@ -1643,8 +1648,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             harness = payload.get("harness")
             surface = payload.get("surface")
             name = _safe_registry_name(payload.get("name"))
-            target = _registry_target(harness, surface, name)
-            _writable_registry_path(str(target))
+            scope = _normalize_agent_scope(payload.get("scope"))
+            project_root = None
+            if scope == "project":
+                project_value = payload.get("project")
+                if not isinstance(project_value, str) or not project_value.strip():
+                    raise ValueError("project is required for project scope")
+                project_root = self._agent_project_root(project_value)
+            target = _registry_target(
+                harness,
+                surface,
+                name,
+                scope=scope,
+                project=project_root,
+            )
+            _writable_registry_path(
+                str(target),
+                self.server.get_workspace_seeds(),
+                project_root if scope == "project" else None,
+            )
             _reject_if_managed(target)
             content = payload.get("content")
             if not isinstance(content, str):

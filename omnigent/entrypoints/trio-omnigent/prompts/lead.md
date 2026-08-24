@@ -14,9 +14,18 @@ mailbox `{mailbox}` at iteration {iteration}.
    return and correct integration or correctness issues yourself.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
-5. Append one Format-A line to `{mailbox}/LOG.md`:
+5. Commit every code-changing slice as its own commit
+   `slice(<id>): <summary>` ending with the trailer
+   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`. Leave the
+   working tree clean, then verify the commit gate passes:
+   `python3 metrics/trio-shadow.py --mailbox {mailbox} --require-commits`.
+   In `PLAN.md` slice metadata, `status:` must be exactly one of
+   `planned`, `in_progress`, `complete` and `writes:` must be a
+   single-line bracketed list.
+6. Append one Format-A line to `{mailbox}/LOG.md`:
    `- iter {iteration} | lead | <one-line summary>`.
 
 The loop driver owns gates, state transitions, verdict application, repair
 selection, and resume. Do not re-implement those mechanisms. Never edit
-`GOAL.md` or `VERDICT.md`, commit, or push.
+`GOAL.md` or `VERDICT.md`, never amend or rebase existing commits, and
+never push.

@@ -294,6 +294,7 @@ class SkillsJsWidgetTests(unittest.TestCase):
 const assert = require("node:assert/strict");
 const {
   catalogChoiceState,
+  registryDestinationPath,
   validateJsonSchemaField,
   withRoot,
 } = require(process.argv[1]);
@@ -326,6 +327,21 @@ assert.equal(offList.offList, true);
 const known = catalogChoiceState("known-model", ["known-model"]);
 assert.equal(known.selected, "known-model");
 assert.equal(known.offList, false);
+
+assert.equal(
+  registryDestinationPath(
+    "project", "claude", "skill", "x", "/tmp/ws", {}),
+  "/tmp/ws/.claude/skills/x/SKILL.md"
+);
+assert.equal(
+  registryDestinationPath(
+    "global", "codex", "agent", "x", "", {"codex:agent": "toml"}),
+  "~/.codex/agents/x.toml"
+);
+assert.equal(
+  registryDestinationPath("project", "omp", "skill", "x", "/tmp/ws"),
+  null
+);
 """
         result = subprocess.run(
             ["node", "-e", script, str(REPO_ROOT / "dashboard" / "skills.js")],

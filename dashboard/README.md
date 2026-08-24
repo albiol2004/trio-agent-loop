@@ -51,7 +51,7 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 ## Pages
 
 - `/` — status board: loop cards with state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration count, mission, verdict history, **Start/Stop buttons**, **phase badge** (lead-done / eval-done / idle), and last activity
-- `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only
+- `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only, and scoped creation
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
 - `/topology.html` — layered SVG graphs of harness wiring (entrypoint → agent → model); compare schemas across harnesses
 - `/models.html` — resolved model rows for each agent, showing layer precedence (frontmatter, OMP, OpenCode, trioctl, Omnigent)
@@ -67,6 +67,8 @@ Loop control:
 Registry and agents:
 - `GET /api/registry/file?path=<absolute-path>` — read a registry file; generated files return read-only flag and YAML `quoted_keys` metadata
 - `GET /api/registry/schema` — harness/surface destinations, formats (yaml/toml), and per-field specs
+- `POST /api/registry/create` — create a registry file; `scope` may be `global` or
+  `project`, with `project` required for project scope
 - `POST /api/registry/serialize` — validate frontmatter/body pairs; strict YAML parsing server-side
 - `GET /api/registry/agents` — list canonical agents
 - `GET /api/registry/agents/file?name=<name>` — read a canonical agent by name
@@ -84,6 +86,8 @@ The **Skills** page (`/skills.html`) edits skill registry files with a typed fro
 - **Schema-driven forms** — `GET /api/registry/schema` serves harness/surface destinations, formats (yaml/toml), and per-field specs (type, widget, required, help text).
 - **Server-side validation** — `POST /api/registry/serialize` validates frontmatter/body pairs. Raw YAML (via `{"$yaml": "<text>"}` escape hatch) is parsed strictly server-side; malformed input returns a 400 error naming the field.
 - **Format-preserving saves** — the editor sends `quoted_keys` metadata with form saves so an unchanged YAML key keeps its explicit quoting across the JSON API boundary.
+- **Scoped creation** — New skill defaults to the selected project when one is active,
+  previews its resolved destination, and filters unsupported project layouts.
 - **Read-only generated files** — files managed by `prompts/generate.py` are marked read-only and return 403 on write attempts.
 
 ## Canonical agents & install matrix

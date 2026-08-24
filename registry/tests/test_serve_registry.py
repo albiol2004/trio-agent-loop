@@ -12,6 +12,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import tempfile
 import tomllib
 import threading
 import unittest
@@ -63,6 +64,47 @@ class RegistryTargetTests(unittest.TestCase):
         self.assertTrue(str(target).endswith("x/SKILL.md".replace("/", "/")), target)
         self.assertEqual(target.name, "SKILL.md")
         self.assertEqual(target.parent.name, "x")
+
+    def test_registry_target_project_claude_skill_is_under_project_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "claude", "skill", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".claude" / "skills" / "x" / "SKILL.md"
+            self.assertEqual(target, expected.resolve())
+
+    def test_registry_target_project_cursor_skill_is_under_project_skills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "cursor", "skill", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".cursor" / "skills" / "x" / "SKILL.md"
+            self.assertEqual(target, expected.resolve())
+
+    def test_registry_target_project_claude_command_is_under_project_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "claude", "command", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".claude" / "commands" / "x.md"
+            self.assertEqual(target, expected.resolve())
+
+    def test_registry_target_project_claude_agent_is_under_project_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "claude", "agent", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".claude" / "agents" / "x.md"
+            self.assertEqual(target, expected.resolve())
+
+    def test_registry_target_project_opencode_agent_is_under_project_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "opencode", "agent", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".opencode" / "agents" / "x.md"
+            self.assertEqual(target, expected.resolve())
+
+    def test_registry_target_rejects_unsupported_project_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                serve._registry_target(
+                    "omp", "skill", "x", scope="project", project=Path(tmp))
 
     def test_update_registry_name_codex_toml_changes_only_name_line(self):
         source = (REPO_ROOT / "codex" / "agents" / "trio-evaluator.toml").read_text(
@@ -130,6 +172,79 @@ class DashboardServerTestCase(unittest.TestCase):
 
     def _get(self, path: str) -> tuple[int, dict]:
         return _http_json("GET", f"{self.base}{path}")
+
+
+class ScopedRegistryCreateTests(unittest.TestCase):
+    """Create scoped files without touching the real home directory."""
+
+    NAME = "throwaway"
+
+    def test_create_skill_uses_project_and_fake_global_destinations(self):
+        real_target = (
+            Path.home() / ".claude" / "skills" / self.NAME / "SKILL.md")
+        real_before = (
+            real_target.read_bytes() if real_target.exists() else None)
+        original_home = serve.HOME
+        server = None
+        thread = None
+        with tempfile.TemporaryDirectory() as project_tmp, \
+                tempfile.TemporaryDirectory() as home_tmp:
+            project = Path(project_tmp).resolve()
+            fake_home = Path(home_tmp).resolve()
+            try:
+                serve.HOME = fake_home
+                server = serve.DashboardServer(
+                    ("127.0.0.1", 0),
+                    workspaces=[project],
+                    auto_discover=False)
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                thread = threading.Thread(
+                    target=server.serve_forever, daemon=True)
+                thread.start()
+
+                status, payload = _http_json(
+                    "POST",
+                    f"{base}/api/registry/create",
+                    {
+                        "harness": "claude",
+                        "surface": "skill",
+                        "name": self.NAME,
+                        "content": "",
+                        "scope": "project",
+                        "project": str(project),
+                    })
+                self.assertEqual(status, 201, payload)
+                project_target = (
+                    project / ".claude" / "skills" / self.NAME / "SKILL.md")
+                self.assertEqual(Path(payload["path"]), project_target)
+                self.assertTrue(project_target.is_file())
+
+                status, payload = _http_json(
+                    "POST",
+                    f"{base}/api/registry/create",
+                    {
+                        "harness": "claude",
+                        "surface": "skill",
+                        "name": self.NAME,
+                        "content": "",
+                        "scope": "global",
+                    })
+                self.assertEqual(status, 201, payload)
+                global_target = (
+                    fake_home / ".claude" / "skills" / self.NAME / "SKILL.md")
+                self.assertEqual(Path(payload["path"]), global_target)
+                self.assertTrue(global_target.is_file())
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                if thread is not None:
+                    thread.join(timeout=5)
+                serve.HOME = original_home
+
+        self.assertEqual(
+            real_target.read_bytes() if real_target.exists() else None,
+            real_before)
 
 
 class SchemaEndpointTests(DashboardServerTestCase):

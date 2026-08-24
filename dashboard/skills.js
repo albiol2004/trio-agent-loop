@@ -1,5 +1,53 @@
 const CUSTOM_VALUE = "__trio_custom__";
 
+// Mirrors registry/scan.py's project collect directories. Unsupported pairs
+// never reach the create endpoint.
+const PROJECT_REGISTRY_DIRS = {
+  "claude:skill": ".claude/skills",
+  "claude:command": ".claude/commands",
+  "claude:agent": ".claude/agents",
+  "opencode:agent": ".opencode/agents",
+  "cursor:skill": ".cursor/skills",
+};
+const PROJECT_DESTINATIONS = {
+  claude: ["skill", "command", "agent"],
+  opencode: ["agent"],
+  cursor: ["skill"],
+};
+const GLOBAL_REGISTRY_DIRS = {
+  "claude:skill": ".claude/skills",
+  "claude:command": ".claude/commands",
+  "claude:agent": ".claude/agents",
+  "codex:skill": ".agents/skills",
+  "codex:agent": ".codex/agents",
+  "omp:command": ".omp/agent/commands",
+  "omp:agent": ".omp/agent/agents",
+  "opencode:command": ".config/opencode/commands",
+  "opencode:agent": ".config/opencode/agents",
+  "kimi:skill": ".kimi-code/skills",
+  "zcode:skill": ".zcode/skills",
+};
+
+function registryDestinationPath(
+  scope, harness, surface, name, project = "", formats = {}
+) {
+  const normalizedScope = String(scope || "global").toLowerCase();
+  const normalizedSurface = String(surface || "").toLowerCase();
+  const key = `${String(harness || "").toLowerCase()}:${normalizedSurface}`;
+  const relative = normalizedScope === "project"
+    ? PROJECT_REGISTRY_DIRS[key] : GLOBAL_REGISTRY_DIRS[key];
+  if (
+    !relative || !name ||
+    (normalizedScope === "project" && !project)
+  ) return null;
+  const base = normalizedScope === "project"
+    ? String(project).replace(/\/+$/, "") : "~";
+  const extension = normalizedSurface === "skill"
+    ? `${name}/SKILL.md`
+    : `${name}.${formats[key] === "toml" ? "toml" : "md"}`;
+  return `${base}/${relative}/${extension}`;
+}
+
 // These small pure helpers are also exported for the no-DOM regression tests.
 // The browser editor uses the same functions, so tests exercise real save
 // validation and catalog selection decisions rather than source markers.
@@ -46,6 +94,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     catalogChoiceState,
     jsonSchemaError,
+    registryDestinationPath,
     validateJsonSchemaField,
     withRoot,
   };
@@ -1189,19 +1238,39 @@ if (typeof module !== "undefined" && module.exports) {
     }
   }
 
-  function destinationOptions(select, preferredHarness = "claude") {
+  function destinationsForScope(scope) {
+    return scope === "project" ? PROJECT_DESTINATIONS : schema.destinations;
+  }
+
+  function destinationOptions(
+    select, preferredHarness = "claude", destinations = schema.destinations
+  ) {
     select.replaceChildren();
-    Object.keys(schema.destinations).forEach((harness) => {
-      const option = document.createElement("option"); option.value = harness; option.textContent = displayName(harness);
-      option.selected = harness === preferredHarness; select.append(option);
+    const harnesses = Object.keys(destinations || {});
+    const selectedHarness = harnesses.includes(preferredHarness)
+      ? preferredHarness : harnesses[0];
+    harnesses.forEach((harness) => {
+      const option = document.createElement("option");
+      option.value = harness;
+      option.textContent = displayName(harness);
+      option.selected = harness === selectedHarness;
+      select.append(option);
     });
   }
 
-  function updateSurfaceSelect(select, harness, preferred = "skill") {
+  function updateSurfaceSelect(
+    select, harness, preferred = "skill", destinations = schema.destinations
+  ) {
     select.replaceChildren();
-    (schema.destinations[harness] || ["skill"]).forEach((surface) => {
-      const option = document.createElement("option"); option.value = surface; option.textContent = displayName(surface);
-      option.selected = surface === preferred; select.append(option);
+    const surfaces = (destinations && destinations[harness]) || [];
+    const selectedSurface = surfaces.includes(preferred)
+      ? preferred : surfaces[0];
+    surfaces.forEach((surface) => {
+      const option = document.createElement("option");
+      option.value = surface;
+      option.textContent = displayName(surface);
+      option.selected = surface === selectedSurface;
+      select.append(option);
     });
   }
 
@@ -1213,9 +1282,50 @@ if (typeof module !== "undefined" && module.exports) {
 
   function refreshDestinationSelects() {
     destinationOptions($("import-harness"));
-    destinationOptions($("new-harness"));
     updateSurfaceSelect($("import-surface"), $("import-harness").value, "skill");
-    updateSurfaceSelect($("new-surface"), $("new-harness").value, "skill");
+    refreshNewDestinationSelects(true);
+  }
+
+  function refreshNewDestinationSelects(resetScope = false) {
+    const scope = $("new-scope");
+    if (!scope) return;
+    if (resetScope) scope.value = currentRoot ? "project" : "global";
+    const destinations = destinationsForScope(scope.value);
+    const harness = $("new-harness").value;
+    destinationOptions($("new-harness"), harness, destinations);
+    updateSurfaceSelect(
+      $("new-surface"),
+      $("new-harness").value,
+      $("new-surface").value || "skill",
+      destinations,
+    );
+    renderNewDestination();
+  }
+
+  function renderNewDestination() {
+    const list = $("new-destinations");
+    if (!list) return;
+    list.replaceChildren();
+    const item = document.createElement("li");
+    const scope = $("new-scope").value;
+    const harness = $("new-harness").value;
+    const surface = $("new-surface").value;
+    const name = $("new-name").value.trim();
+    const destinations = destinationsForScope(scope);
+    if (!name) {
+      item.textContent = "Enter a name.";
+    } else if (scope === "project" && !currentRoot) {
+      item.textContent = "Choose a workspace for project scope.";
+    } else if (
+      !destinations[harness] || !destinations[harness].includes(surface)
+    ) {
+      item.textContent = "Selected destination is unavailable in this scope.";
+    } else {
+      const path = registryDestinationPath(
+        scope, harness, surface, name, currentRoot, schema.formats);
+      item.textContent = `${harness}:${surface} · ${path}`;
+    }
+    list.append(item);
   }
 
   async function saveFile() {
@@ -1302,23 +1412,53 @@ if (typeof module !== "undefined" && module.exports) {
     const form = $("new-form");
     if (state.busy || !form.checkValidity()) { form.reportValidity(); return; }
     const name = $("new-name").value.trim();
+    const scope = $("new-scope").value;
+    const harness = $("new-harness").value;
+    const surface = $("new-surface").value;
+    const destinations = destinationsForScope(scope);
+    if (
+      !destinations[harness] || !destinations[harness].includes(surface)
+    ) {
+      setPageState("Selected destination is unavailable in this scope.", true);
+      return;
+    }
+    if (scope === "project" && !currentRoot) {
+      setPageState("Choose a workspace for project scope.", true);
+      return;
+    }
+    const payload = {
+      harness,
+      surface,
+      name,
+      content: "",
+      scope,
+    };
+    if (scope === "project") payload.project = currentRoot;
     setBusy(true);
     try {
-      const result = await api("/api/registry/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-        harness: $("new-harness").value,
-        surface: $("new-surface").value,
-        name,
-        content: ""
-      }) });
+      const result = await api("/api/registry/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
       $("new-dialog").close();
       $("new-name").value = "";
       await refresh(result && result.path ? result.path : null);
       if (!result || !result.path) {
-        const created = state.entries.find((entry) => entry.name === name && entry.harness === $("new-harness").value && entry.surface === $("new-surface").value);
+        const created = state.entries.find((entry) =>
+          entry.name === name && entry.harness === harness &&
+          entry.surface === surface);
         if (created) await selectEntry(created.path);
       }
     } catch (error) { setPageState(error.message, true); }
     finally { setBusy(false); }
+  }
+
+  function openNewDialog() {
+    $("new-scope").value = currentRoot ? "project" : "global";
+    refreshNewDestinationSelects();
+    $("new-dialog").showModal();
+    $("new-name").focus();
   }
 
   window.addEventListener("trio:workspace", (event) => {
@@ -1359,8 +1499,20 @@ if (typeof module !== "undefined" && module.exports) {
   $("import-cancel").addEventListener("click", () => { $("import-panel").hidden = true; });
   $("import-file").addEventListener("click", importFile);
   $("import-harness").addEventListener("change", updateImportSurfaces);
-  $("new-harness").addEventListener("change", () => updateSurfaceSelect($("new-surface"), $("new-harness").value));
-  $("new-skill").addEventListener("click", () => { $("new-dialog").showModal(); $("new-name").focus(); });
+  $("new-scope").addEventListener("change", () => refreshNewDestinationSelects());
+  $("new-harness").addEventListener("change", () => {
+    const destinations = destinationsForScope($("new-scope").value);
+    updateSurfaceSelect(
+      $("new-surface"),
+      $("new-harness").value,
+      "skill",
+      destinations,
+    );
+    renderNewDestination();
+  });
+  $("new-surface").addEventListener("change", renderNewDestination);
+  $("new-name").addEventListener("input", renderNewDestination);
+  $("new-skill").addEventListener("click", openNewDialog);
   $("new-form").addEventListener("submit", (event) => { event.preventDefault(); if (event.submitter && event.submitter.id === "new-cancel") $("new-dialog").close(); else createSkill(); });
   $("new-dialog").addEventListener("click", (event) => { if (event.target === $("new-dialog")) $("new-dialog").close(); });
 

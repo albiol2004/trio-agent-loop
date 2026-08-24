@@ -90,6 +90,9 @@
   .raw-toggle-label input { cursor: pointer; }
   .managed-note { color: var(--amber); margin: 0 0 10px; }
   .frontmatter-form { display: flex; flex-direction: column; gap: 10px; }
+  .field-group { display: flex; flex-direction: column; gap: 6px; }
+  .destination-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; color: var(--faint); font: 10px var(--mono); }
+  .destination-list li { overflow-wrap: anywhere; }
   .field-row { display: block; }
   .field-help { margin: 3px 0 0; color: var(--faint); font: 10px var(--mono); }
   .field-tag { display: inline-block; margin-top: 3px; color: var(--faint); font: 10px var(--mono); text-transform: uppercase; letter-spacing: .04em; }
@@ -233,6 +236,16 @@
       <label class="field-label">Name
         <input id="new-name" class="field-control" type="text" required autocomplete="off" placeholder="my-skill">
       </label>
+      <label class="field-label">Install scope
+        <select id="new-scope" class="field-control">
+          <option value="project">project</option>
+          <option value="global">global</option>
+        </select>
+      </label>
+      <div class="field-group">
+        <span class="field-label">Resolved destinations</span>
+        <ul id="new-destinations" class="destination-list"></ul>
+      </div>
       <div class="dialog-footer">
         <button id="new-cancel" class="action-button" type="submit" formnovalidate>Cancel</button>
         <button id="new-create" class="action-button primary" type="submit">Create</button>
