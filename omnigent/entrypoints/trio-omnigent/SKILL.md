@@ -79,6 +79,11 @@ with Cursor `--force --trust` and Scout with those flags plus read-only
 requires re-registration because the stored `agent_id` was created from the
 config as it read at registration time.
 
+When multiple brokers are online, set `TRIO_OMNIGENT_RUNNER_ID=<runner_id>` to
+select the broker runner for this loop; without it, exactly one online runner is
+required. The error message lists available runners if several are online and the
+variable is unset.
+
 For offline verification, run `omnigent/smoke-test.sh`. The focused validation
 command is:
 `uv run pytest -q tests/tools/builtins/test_spawn.py tests/runner/test_runner_dispatch.py tests/server/integration/test_sessions_child_sessions.py -k 'reasoning_effort or session_create_spawns_child_under_caller or registered_native_agent_create_derives_launch_args_from_root_spec'`
@@ -97,11 +102,13 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
    perform its own Luna delegation through `trioctl omnigent run`,
-   review/correct, verify, and write REPORT. Hand it **diagnosed line
-   ranges** (from cheap grep/symbol search) for every product file it must
-   touch — never "read the file" for a large file; first-turn full-file
-   ingest of the 2.1 MB monolith crashed the provider transport twice.
-   Use a title containing mailbox and iteration.
+   review/correct, verify, and write REPORT. The headless Lead prompt
+   enforces a clean working tree on start and mandates per-slice commits
+   (`slice(<id>): …`) before finishing — no uncommitted changes or amends to
+   existing commits. Hand it **diagnosed line ranges** (from cheap grep/symbol
+   search) for every product file it must touch — never "read the file" for a
+   large file; first-turn full-file ingest of the 2.1 MB monolith crashed the
+   provider transport twice. Use a title containing mailbox and iteration.
 3. Inspect the Lead result and actual diff. Its report must identify the
    profile-resolved Luna worker and include the captured `trioctl` result.
 4. Resolve Evaluator with `trioctl`, then create a fresh Evaluator child with
