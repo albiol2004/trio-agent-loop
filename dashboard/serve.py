@@ -1665,10 +1665,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "install": install_output,
         })
 
-    def _handle_registry_topology(self, root: Path) -> None:
+    def _handle_registry_topology(
+        self, root: Path, workflow: str = "roles"
+    ) -> None:
         """Return the canonical harness topology for an explicit root."""
         topology = load_topology_module()
-        self._send_json(200, topology.collect_topology(root))
+        self._send_json(
+            200, topology.collect_topology(root, workflow=workflow))
 
     def _handle_registry_models(self, root: Path) -> None:
         """Return model resolution rows for an explicit root."""
@@ -2928,10 +2931,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/registry/topology":
             if not query.get("root"):
                 return self._send_json(400, {"error": "root is required"})
+            workflow = (query.get("workflow") or ["roles"])[0]
+            if workflow not in ("roles", "productionize"):
+                return self._send_json(
+                    400, {"error": f"unknown topology workflow: {workflow}"})
             root = self._request_root(query)
             if root is None:
                 return
-            return self._api(lambda: self._handle_registry_topology(root))
+            return self._api(
+                lambda: self._handle_registry_topology(root, workflow))
         if path == "/api/registry/models":
             if not query.get("root"):
                 return self._send_json(400, {"error": "root is required"})

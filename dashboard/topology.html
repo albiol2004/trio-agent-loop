@@ -62,6 +62,9 @@
   .topology-edge.edge-reads_doc {
     stroke: var(--muted); stroke-dasharray: 4 4;
   }
+  .topology-edge.edge-subagent { stroke: var(--blue); }
+  .topology-edge.edge-skill { stroke: var(--green); }
+  .topology-edge.edge-command { stroke: var(--amber); }
   .topology-marker.marker-blue { fill: var(--blue); }
   .topology-marker.marker-green { fill: var(--green); }
   .topology-marker.marker-amber { fill: var(--amber); }
@@ -74,6 +77,7 @@
   .topology-node.kind-entrypoint rect { stroke: var(--blue); }
   .topology-node.kind-agent rect { stroke: var(--green); }
   .topology-node.kind-model rect { stroke: var(--amber); }
+  .topology-node.kind-warning rect { stroke: var(--red); }
   .topology-node.is-external rect { stroke-dasharray: 4 3; opacity: .75; }
   .topology-node.is-clickable { cursor: pointer; }
   .topology-node.is-clickable:hover rect,
@@ -128,6 +132,13 @@
 
   <main class="topology-layout" aria-label="Harness topology workspace">
     <section class="topology-toolbar" aria-label="Topology controls">
+      <label class="topology-field" for="workflow-select">
+        <span>Workflow</span>
+        <select id="workflow-select" aria-label="Workflow" disabled>
+          <option value="roles">Roles</option>
+          <option value="productionize">Productionize</option>
+        </select>
+      </label>
       <label class="topology-field" for="harness-select">
         <span>Harness</span>
         <select id="harness-select" aria-label="Harness" disabled>
@@ -162,6 +173,15 @@
         </span>
         <span class="legend-item">
           <i class="legend-swatch legend-reads"></i> reads_doc
+        </span>
+        <span class="legend-item">
+          <i class="legend-swatch legend-invokes"></i> subagent
+        </span>
+        <span class="legend-item">
+          <i class="legend-swatch legend-spawns"></i> skill
+        </span>
+        <span class="legend-item">
+          <i class="legend-swatch legend-dispatches"></i> command
         </span>
       </div>
     </section>

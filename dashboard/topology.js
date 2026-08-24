@@ -1,23 +1,32 @@
 (() => {
   "use strict";
   const SVG_NS = "http://www.w3.org/2000/svg";
-  const LAYERS = ["entrypoint", "agent", "model"];
-  const Y = { entrypoint: 82, agent: 232, model: 382 };
-  const TITLES = { entrypoint: "Entrypoints", agent: "Agents", model: "Models" };
+  const LAYERS = ["entrypoint", "agent", "model", "warning"];
+  const Y = { entrypoint: 82, agent: 232, model: 382, warning: 382 };
+  const TITLES = {
+    entrypoint: "Entrypoints", agent: "Agents", model: "Models",
+    warning: "Warnings"
+  };
   const COLORS = {
     invokes: "blue", spawns: "green",
-    dispatches_to: "amber", reads_doc: "muted"
+    dispatches_to: "amber", reads_doc: "muted",
+    subagent: "blue", skill: "green", command: "amber"
   };
   const BW = 154, BH = 52;
-  let currentRoot = "", currentHarness = "", graphs = {};
+  let currentRoot = "", currentWorkflow = "roles";
+  let currentHarness = "", graphs = {};
   const $ = (id) => document.getElementById(id);
-  const pageState = $("page-state"), harnessSelect = $("harness-select");
+  const pageState = $("page-state");
+  const workflowSelect = $("workflow-select");
+  const harnessSelect = $("harness-select");
   const topologySvg = $("topology-svg");
   const compareToggle = $("compare-toggle"), comparePanel = $("compare-panel");
   const compareList = $("compare-list");
   // Match nav.js: the selected workspace is always sent to the API.
   function withRoot(url) {
-    return currentRoot ? `${url}?root=${encodeURIComponent(currentRoot)}` : url;
+    const params = new URLSearchParams({workflow: currentWorkflow});
+    if (currentRoot) params.set("root", currentRoot);
+    return `${url}?${params}`;
   }
   function createSvg(name, attributes = {}) {
     const element = document.createElementNS(SVG_NS, name);
@@ -188,6 +197,11 @@
     currentHarness = harnessSelect.value;
     renderGraph();
   });
+  workflowSelect.addEventListener("change", () => {
+    currentWorkflow = workflowSelect.value;
+    currentHarness = "";
+    refresh();
+  });
   async function refresh() {
     pageState.textContent = "scanning topology…";
     pageState.classList.remove("is-error");
@@ -214,6 +228,7 @@
   }
   window.addEventListener("trio:workspace", (event) => {
     currentRoot = event.detail && event.detail.path ? event.detail.path : "";
+    workflowSelect.disabled = !currentRoot;
     refresh();
   });
 })();

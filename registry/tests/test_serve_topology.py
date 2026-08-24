@@ -70,8 +70,11 @@ class DashboardTopologyTestCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def _topology_url(self) -> str:
-        query = urllib.parse.urlencode({"root": str(REPO_ROOT)})
+    def _topology_url(self, workflow: str | None = None) -> str:
+        params = {"root": str(REPO_ROOT)}
+        if workflow is not None:
+            params["workflow"] = workflow
+        query = urllib.parse.urlencode(params)
         return f"{self.base}/api/registry/topology?{query}"
 
 
@@ -79,6 +82,7 @@ class TopologyEndpointTests(DashboardTopologyTestCase):
     def test_topology_endpoint_returns_required_graphs_and_edges(self):
         status, payload = _get_json(self._topology_url())
         self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["workflow"], "roles")
         graphs = payload["graphs"]
         required = {"claude", "codex", "omp", "opencode", "omnigent", "pi"}
         self.assertTrue(required.issubset(graphs), graphs.keys())
@@ -103,6 +107,30 @@ class TopologyEndpointTests(DashboardTopologyTestCase):
             ("dispatches_to", "trio-productionize", "trio-scout"), omp)
         self.assertIn(("spawns", "trio-lead", "trio-builder"), omp)
         self.assertIn(("spawns", "trio-lead", "trio-scout"), omp)
+
+    def test_topology_endpoint_returns_productionize_graphs(self):
+        status, payload = _get_json(
+            self._topology_url(workflow="productionize"))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["workflow"], "productionize")
+        self.assertEqual(
+            set(payload["graphs"]),
+            {"claude", "codex", "omp", "opencode", "kimi", "zcode"},
+        )
+        claude_edges = {
+            (edge["type"], edge["src"], edge["dst"])
+            for edge in payload["graphs"]["claude"]["edges"]
+        }
+        for target in ("trio-scout", "trio-lead", "trio-evaluator"):
+            self.assertIn(
+                ("subagent", "trio-productionize", target),
+                claude_edges,
+            )
+
+    def test_topology_endpoint_rejects_unknown_workflow(self):
+        status, payload = _get_json(self._topology_url(workflow="nope"))
+        self.assertEqual(status, 400, payload)
+        self.assertIn("workflow", payload["error"])
 
     def test_topology_endpoint_requires_root_query(self):
         status, payload = _get_json(

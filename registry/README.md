@@ -50,17 +50,23 @@ Key functions:
 
 ## `topology.py` — canonical harness graph
 
-`collect_topology(root)` scans the canonical harness copies below the explicit
-repository `root` and returns stable node/edge graphs for Claude, Codex, OMP,
-OpenCode, Omnigent, and Pi. It reuses `scan.py` parsers, records declared
+`collect_topology(root, workflow="roles")` scans the canonical harness copies
+below the explicit repository `root` and returns stable node/edge graphs for
+Claude, Codex, OMP, OpenCode, Omnigent, and Pi. The `productionize` workflow
+instead scans each in-repository `trio-productionize` wrapper and records its
+dispatch-table executor roles. It reuses `scan.py` parsers, records declared
 models, tool policies, and non-empty agent output schemas, and never falls back
 to `Path.home()`.
 
 ### Graph schema
 
 Each harness graph contains:
-- **Nodes** (sorted by kind, then name): `kind` (agent/model/entrypoint), `name`, `harness`, `path`, `model` (if applicable), `tool_policy` (read-only/edit/spawn), `output` (true if agent declares output schema)
-- **Edges** (sorted by type, src, dst): `type` (spawns/invokes/dispatches_to), `src`, `dst`
+- **Nodes** (sorted by kind, then name): `kind` (agent/model/entrypoint/warning),
+  `name`, `harness`, `path`, `model` (if applicable), `tool_policy`
+  (read-only/edit/spawn), `output` (true if agent declares output schema)
+- **Edges** (sorted by type, src, dst): `type`
+  (spawns/invokes/dispatches_to or productionize subagent/skill/command),
+  `src`, `dst`
 
 Edge types:
 - `spawns` — agent A delegates to agent B (parsed from named `spawns` allowlist or delegation instructions)
@@ -68,6 +74,9 @@ Edge types:
 - `dispatches_to` — skill command dispatches to a subagent or role (parsed from Command Dispatch tables in agent instructions)
 Command Dispatch tables are parsed into `dispatches_to` edges alongside skill
 dispatches.
+The productionize workflow uses `subagent`, `skill`, and `command` for the
+mechanism named by each wrapper's Dispatch table. A wrapper with no parseable
+executor rows is retained as a `warning` node instead of being omitted.
 
 ## `models.py` — model resolution
 

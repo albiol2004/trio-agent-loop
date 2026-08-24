@@ -14,6 +14,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+PRODUCTIONIZE_WRAPPERS = (
+    ("claude", ".claude/skills/trio-productionize/SKILL.md"),
+    ("codex", "codex/skills/trio-productionize/SKILL.md"),
+    ("omp", "omp/commands/trio-productionize.md"),
+    ("opencode", "opencode/commands/trio-productionize.md"),
+    ("kimi", "kimi/skills/trio-productionize/SKILL.md"),
+    ("zcode", "zcode/skills/trio-productionize/SKILL.md"),
+)
+WORKFLOWS = frozenset(("roles", "productionize"))
+
 
 def _load_scan():
     """Load the shared parser once, without optional YAML dependencies."""
@@ -153,13 +163,21 @@ def _agent_info(fields: dict, kind: str) -> tuple[str | None, list[str]]:
     return None, []
 
 
-def _dispatch(body: str, skill: str, graph: _Graph) -> None:
-    """Read trio-agent targets only from a Dispatch table section."""
+def _dispatch_section(body: str) -> str | None:
+    """Return the body of a Markdown Dispatch table, if one exists."""
     heading = re.search(r"(?m)^##\s+Dispatch table\s*$", body)
     if not heading:
-        return
+        return None
     section = re.split(
         r"(?m)^##\s+", body[heading.end():], maxsplit=1)[0]
+    return section
+
+
+def _dispatch(body: str, skill: str, graph: _Graph) -> None:
+    """Read trio-agent targets only from a Dispatch table section."""
+    section = _dispatch_section(body)
+    if section is None:
+        return
     # Keep the original trio-prefixed forms used by Claude and OpenCode.
     targets = re.findall(
         r"""(?:agent:\s*[`"']?|`)(trio-[a-z0-9][a-z0-9-]*)""",
@@ -175,6 +193,147 @@ def _dispatch(body: str, skill: str, graph: _Graph) -> None:
     targets.extend(f"trio-{target}" for target in short_targets)
     for target in dict.fromkeys(targets):
         graph.edge("dispatches_to", skill, target)
+
+
+_PRODUCTIONIZE_EXECUTORS = {
+    "scout": "trio-scout",
+    "lead": "trio-lead",
+    "evaluator": "trio-evaluator",
+    "assessor:standard": "trio-lead",
+    "assessor:high": "trio-evaluator",
+}
+
+
+def _productionize_role(value: str) -> str:
+    """Normalize short role aliases to the repository's trio-prefixed names."""
+    value = value.strip("`\"' .,")
+    if value.startswith("trio-") or value == "default task agent":
+        return value
+    return _PRODUCTIONIZE_EXECUTORS.get(value, value)
+
+
+def _productionize_targets(line: str) -> list[str]:
+    """Extract named executor roles from one Dispatch table row."""
+    targets = []
+    if re.search(
+        r"\bdefault\s+[`\"']?task[`\"']?\s+agent\b",
+        line,
+        re.IGNORECASE,
+    ):
+        targets.append("default task agent")
+
+    # A task(agent:...), custom agent, or named subtask gives an explicit
+    # harness alias. Keep the extraction narrow so prose cannot become a node.
+    explicit = re.findall(
+        r"""agent\s*:\s*[`"']?([a-z0-9][a-z0-9-]*)""",
+        line,
+        re.IGNORECASE,
+    )
+    explicit.extend(re.findall(
+        r"""custom\s+(?:subagent\s+)?[`"']?
+        (trio-[a-z0-9][a-z0-9-]*)""",
+        line,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+    explicit.extend(re.findall(
+        r"""(?:subtask|subagent)\s+agent\s+[`"']?
+        (trio-[a-z0-9][a-z0-9-]*)""",
+        line,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+    explicit.extend(re.findall(
+        r"""(trio-[a-z0-9][a-z0-9-]*)\s*[`"']?\s+agent\b""",
+        line,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+    explicit.extend(re.findall(
+        r"""\brole\s+[`"']?
+        (scout|lead|evaluator|builder|orchestrator|repair)""",
+        line,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+    explicit.extend(re.findall(
+        r"""(?<![\w-])/(trio-[a-z0-9][a-z0-9-]*|scout|lead|evaluator)
+        \b""",
+        line,
+        re.IGNORECASE | re.VERBOSE,
+    ))
+    targets.extend(_productionize_role(target) for target in explicit)
+
+    # A minimal fixture may only say "executor: scout"; map that logical
+    # executor so a valid table does not require harness-specific prose.
+    if targets:
+        return list(dict.fromkeys(targets))
+    executor_re = (
+        r"\bexecutor\s*:\s*"
+        r"(assessor:(?:standard|high)|scout|lead|evaluator)\b")
+    targets.extend(
+        _productionize_role(match.group(1))
+        for match in re.finditer(executor_re, line, re.IGNORECASE))
+    return list(dict.fromkeys(targets))
+
+
+def _productionize_mechanisms(line: str, surface: str) -> set[str]:
+    """Classify the mechanisms named by one Dispatch table row."""
+    mechanisms = set()
+    if re.search(
+        r"\b(?:slash\s+command|omp\s+command)\b",
+        line,
+        re.IGNORECASE,
+    ):
+        mechanisms.add("command")
+    if re.search(r"\b(?:skill|run-role\.sh|fallback)\b", line,
+                 re.IGNORECASE):
+        mechanisms.add("skill")
+    if re.search(
+        r"\b(?:Task|Agent|subagent)\b|agent\s*:",
+        line,
+        re.IGNORECASE,
+    ):
+        mechanisms.add("subagent")
+    # A terse row can identify only its wrapper surface. Use that as the
+    # conservative fallback instead of inventing a dispatch type.
+    return mechanisms or {surface}
+
+
+def _productionize_surface(path: Path) -> str:
+    """Return the native surface used by a productionize wrapper."""
+    return "skill" if path.name == "SKILL.md" else "command"
+
+
+def _collect_productionize(root: Path) -> dict:
+    """Collect one graph per in-repository trio-productionize wrapper."""
+    graphs = {}
+    for harness, relative in PRODUCTIONIZE_WRAPPERS:
+        path = root / relative
+        if not path.is_file():
+            continue
+
+        graph = _Graph()
+        section = _dispatch_section(_text(path))
+        entrypoint = "trio-productionize"
+        parsed = False
+        if section is not None:
+            graph.node("entrypoint", entrypoint, harness, path)
+            surface = _productionize_surface(path)
+            for line in section.splitlines():
+                if not re.search(r"\bexecutor\s*:", line, re.IGNORECASE):
+                    continue
+                targets = _productionize_targets(line)
+                if not targets:
+                    continue
+                parsed = True
+                for target in targets:
+                    graph.node("agent", target, harness, path)
+                    for mechanism in _productionize_mechanisms(line, surface):
+                        graph.edge(mechanism, entrypoint, target)
+        if not parsed:
+            # Keep a present but malformed wrapper visible to the dashboard.
+            graph = _Graph()
+            graph.node(
+                "warning", "unparseable-dispatch-table", harness, path)
+        graphs[harness] = graph.result()
+    return graphs
 
 
 def _files(root: Path, relative: str | None, pattern: str):
@@ -300,11 +459,21 @@ def _collect_pi(root: Path) -> dict:
     return graph.result()
 
 
-def collect_topology(root: Path, *, home: Path | None = None) -> dict:
-    """Scan canonical copies below ``root``; never infer a real home path."""
+def collect_topology(root: Path, *, home: Path | None = None,
+                     workflow: str = "roles") -> dict:
+    """Scan canonical copies below ``root`` for one supported workflow."""
     # ``home`` is explicit but unused: this slice is repository-layout only.
     _ = home
+    if workflow not in WORKFLOWS:
+        raise ValueError(f"unknown topology workflow: {workflow}")
     root = Path(root)
+    if workflow == "productionize":
+        return {
+            "root": str(root),
+            "workflow": workflow,
+            "graphs": _collect_productionize(root),
+        }
+
     collectors = (
         ("claude", ".claude", _collect_claude),
         ("codex", "codex", _collect_codex),
@@ -318,4 +487,4 @@ def collect_topology(root: Path, *, home: Path | None = None) -> dict:
         for name, directory, collector in collectors
         if (root / directory).is_dir()
     }
-    return {"root": str(root), "graphs": graphs}
+    return {"root": str(root), "workflow": workflow, "graphs": graphs}

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -47,6 +49,8 @@ class TopologyCollectorTests(unittest.TestCase):
     def setUpClass(cls):
         cls.result = topology.collect_topology(REPO)
         cls.graphs = cls.result["graphs"]
+        cls.productionize = topology.collect_topology(
+            REPO, workflow="productionize")
 
     def test_required_harness_graphs_are_present(self):
         required = {"claude", "codex", "omp", "opencode", "omnigent", "pi"}
@@ -96,6 +100,93 @@ class TopologyCollectorTests(unittest.TestCase):
         edges = _edge_tuples(self.graphs["claude"])
         self.assertIn(
             ("dispatches_to", "trio-productionize", "trio-scout"), edges)
+
+    def test_productionize_has_a_graph_for_every_wrapper(self):
+        self.assertEqual(self.productionize["workflow"], "productionize")
+        self.assertEqual(
+            set(self.productionize["graphs"]),
+            {"claude", "codex", "omp", "opencode", "kimi", "zcode"},
+        )
+
+    def test_productionize_claude_dispatches_to_all_trio_roles(self):
+        edges = _edge_tuples(self.productionize["graphs"]["claude"])
+        expected = {
+            ("subagent", "trio-productionize", target)
+            for target in ("trio-scout", "trio-lead", "trio-evaluator")
+        }
+        self.assertTrue(expected.issubset(edges), expected - edges)
+
+    def test_productionize_preserves_harness_dispatch_mechanisms(self):
+        graphs = self.productionize["graphs"]
+        self.assertIn(
+            ("skill", "trio-productionize", "trio-scout"),
+            _edge_tuples(graphs["kimi"]),
+        )
+        self.assertIn(
+            ("subagent", "trio-productionize", "trio-scout"),
+            _edge_tuples(graphs["zcode"]),
+        )
+        self.assertIn(
+            ("subagent", "trio-productionize", "default task agent"),
+            _edge_tuples(graphs["omp"]),
+        )
+
+    def test_productionize_fixture_warns_and_parses_without_home_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            malformed = (
+                root / ".claude" / "skills" / "trio-productionize" /
+                "SKILL.md")
+            malformed.parent.mkdir(parents=True)
+            malformed.write_text(
+                "# Fixture\n\n## Dispatch table\n\nNo executor rows.\n",
+                encoding="utf-8",
+            )
+            parsed = (
+                root / "zcode" / "skills" / "trio-productionize" / "SKILL.md")
+            parsed.parent.mkdir(parents=True)
+            parsed.write_text(
+                "## Dispatch table\n\n"
+                "- executor: scout: invoke Agent with custom subagent "
+                "`trio-scout`.\n",
+                encoding="utf-8",
+            )
+            command = (
+                root / "opencode" / "commands" / "trio-productionize.md")
+            command.parent.mkdir(parents=True)
+            command.write_text(
+                "## Dispatch table\n\n"
+                "- executor: scout: use the slash command `/trio-scout`.\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                topology.Path,
+                "home",
+                side_effect=AssertionError("Path.home used"),
+            ):
+                result = topology.collect_topology(
+                    root, home=Path("/never-read"), workflow="productionize")
+
+        warning = result["graphs"]["claude"]["nodes"]
+        self.assertEqual(len(warning), 1)
+        self.assertEqual(warning[0]["kind"], "warning")
+        self.assertEqual(warning[0]["name"], "unparseable-dispatch-table")
+        self.assertEqual(warning[0]["path"], str(malformed))
+
+        parsed_graph = result["graphs"]["zcode"]
+        self.assertIn(
+            ("agent", "trio-scout"),
+            {(node["kind"], node["name"]) for node in parsed_graph["nodes"]},
+        )
+        self.assertIn(
+            ("subagent", "trio-productionize", "trio-scout"),
+            _edge_tuples(parsed_graph),
+        )
+        self.assertIn(
+            ("command", "trio-productionize", "trio-scout"),
+            _edge_tuples(result["graphs"]["opencode"]),
+        )
 
     def test_opencode_productionize_dispatches_to_scout_and_orchestrator(self):
         edges = _edge_tuples(self.graphs["opencode"])

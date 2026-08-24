@@ -81,7 +81,9 @@ Registry and agents:
 - `PUT /api/registry/agents/file` — update a canonical agent; returns 404 if absent, 403 if managed by generate.py
 - `DELETE /api/registry/agents/file?name=<name>` — delete a canonical agent
 - `POST /api/registry/install` — render a canonical agent into a harness's native format and write it
-- `GET /api/registry/topology?root=<repository>` — deterministic node and edge graphs for all harnesses below root
+- `GET /api/registry/topology?root=<repository>&workflow=<name>` —
+  deterministic node and edge graphs below root; `workflow` is `roles`
+  (default) or `productionize`
 - `GET /api/registry/models?root=<repository>` — resolved model rows per agent, showing layer and availability
 - `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
 
@@ -132,15 +134,17 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
 
 ## Harness topology API
 
-`GET /api/registry/topology?root=<repository>` returns deterministic node and
-edge graphs for the harness directories present below the explicit repository
-root. The `root` query is required; the endpoint does not scan the dashboard
+`GET /api/registry/topology?root=<repository>&workflow=<name>` returns
+deterministic node and edge graphs for the harness directories present below
+the explicit repository root. The `root` query is required; `workflow` accepts
+`roles` (default) or `productionize`. The endpoint does not scan the dashboard
 process user's home directory.
 
 The **Topology** page (`/topology.html`) renders those graphs as layered
-entrypoint → agent → model SVGs. Select a harness to inspect its wiring, or
-enable **Compare wiring** to see edges and agent output schemas that differ
-across the loaded harnesses.
+entrypoint → agent → model SVGs. Select a workflow and harness to inspect its
+wiring, or enable **Compare wiring** to see edges and agent output schemas that
+differ across the loaded harnesses. Productionize warnings remain visible as
+warning nodes.
 Nodes with source paths link to the Skills registry for inspection.
 
 ## Model registry
