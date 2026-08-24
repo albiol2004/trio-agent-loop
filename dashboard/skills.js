@@ -780,12 +780,13 @@ if (typeof module !== "undefined" && module.exports) {
     const schemaKey = `${cur.entry.harness}:${cur.entry.surface}`;
     const specs = schema.keys[schemaKey] || [];
     const frontmatter = cur.frontmatter || {};
-    const knownKeys = new Set(specs.map((spec) => spec.key));
+    const knownKeys = new Set(specs.map((spec) => fieldPath(spec.key)[0]));
     const unknownKeys = Object.keys(frontmatter).filter((key) => !knownKeys.has(key));
 
     const rawSpecKeys = specs.filter((spec) => {
-      const has = Object.prototype.hasOwnProperty.call(frontmatter, spec.key);
-      return has && effectiveWidgetFor(spec, has, frontmatter[spec.key]) === "raw";
+      const current = fieldState(frontmatter, spec);
+      return current.has &&
+        effectiveWidgetFor(spec, current.has, current.value) === "raw";
     }).map((spec) => spec.key);
     const unknownRawKeys = unknownKeys.filter((key) => classifyUnknownWidget(frontmatter[key]) === "raw");
     const rawKeys = [...rawSpecKeys, ...unknownRawKeys];
@@ -816,8 +817,9 @@ if (typeof module !== "undefined" && module.exports) {
 
     const disabled = Boolean(cur.managed);
     specs.forEach((spec) => {
-      const has = Object.prototype.hasOwnProperty.call(frontmatter, spec.key);
-      const value = has ? frontmatter[spec.key] : (
+      const current = fieldState(frontmatter, spec);
+      const has = current.has;
+      const value = has ? current.value : (
         spec.type === "bool" ? false :
         spec.widget === "permission-grid" ? {} : ""
       );
@@ -868,6 +870,15 @@ if (typeof module !== "undefined" && module.exports) {
       value = value[key];
     }
     return value;
+  }
+
+  function fieldPath(key) {
+    return key.includes(".") ? key.split(".") : [key];
+  }
+
+  function fieldState(root, spec) {
+    const value = valueAtPath(root, fieldPath(spec.key));
+    return { has: value !== undefined, value };
   }
 
   function setValueAtPath(root, path, value) {
@@ -958,25 +969,16 @@ if (typeof module !== "undefined" && module.exports) {
     return value === "" || value === null || value === undefined;
   }
 
-  // Preserve key order: untouched keys keep the original file's order, then
-  // any newly-filled-in schema keys are appended at the end. Never sort.
+  // Clone nested maps first so dotted schema keys overlay in place
+  // (executor.model) instead of becoming top-level YAML keys.
   function buildOutgoingFrontmatter() {
     const cur = state.current;
     const original = cur.frontmatter || {};
-    const out = {};
-    const emitted = new Set();
-    const byKey = new Map(state.formControls.map((fc) => [fc.spec.key, fc]));
-    Object.keys(original).forEach((key) => {
-      const fc = byKey.get(key);
-      out[key] = fc ? computeFieldValue(fc) : original[key];
-      emitted.add(key);
-    });
+    const out = cloneValue(original);
     state.formControls.forEach((fc) => {
-      if (emitted.has(fc.spec.key)) return;
       const value = computeFieldValue(fc);
-      if (isEmptyForOmission(value, fc.widget)) return;
-      out[fc.spec.key] = value;
-      emitted.add(fc.spec.key);
+      if (!fc.wasPresent && isEmptyForOmission(value, fc.widget)) return;
+      setValueAtPath(out, fieldPath(fc.spec.key), value);
     });
     return out;
   }

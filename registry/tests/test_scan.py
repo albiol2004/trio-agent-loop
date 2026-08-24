@@ -228,15 +228,35 @@ class OmnigentYamlDocument(unittest.TestCase):
                     path.read_bytes())
 
     def test_split_and_join_preserve_prompt_body(self):
-        path = (
-            REPO / "omnigent" / "trio-omnigent-roles" /
-            "lead" / "config.yaml"
+        for path in self.ROLE_CONFIGS:
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                fields, body = scan.split_file(text, "yaml-document")
+                self.assertNotIn("prompt", fields)
+                self.assertEqual(body, scan.parse_yaml(text)["prompt"])
+                self.assertEqual(
+                    scan.join_file(fields, body, "yaml-document"), text)
+
+    def test_unflatten_dotted_keys_preserves_nested_siblings(self):
+        fields = {
+            "name": "role",
+            "executor": {"type": "omnigent"},
+            "executor.model": "model-id",
+            "executor.config.harness": "cursor-native",
+        }
+        result = scan.unflatten_dotted_keys(
+            fields,
+            {"executor.model", "executor.config.harness"},
         )
-        text = path.read_text(encoding="utf-8")
-        fields, body = scan.split_file(text, "yaml-document")
-        self.assertNotIn("prompt", fields)
-        self.assertEqual(body, scan.parse_yaml(text)["prompt"])
-        self.assertEqual(scan.join_file(fields, body, "yaml-document"), text)
+        self.assertNotIn("executor.model", result)
+        self.assertEqual(
+            result["executor"],
+            {
+                "type": "omnigent",
+                "model": "model-id",
+                "config": {"harness": "cursor-native"},
+            },
+        )
 
 
 # --------------------------------------------------------------------------
@@ -501,7 +521,7 @@ class Schema(unittest.TestCase):
     def test_schema_catalog_contains_required_surfaces(self):
         expected = {
             "claude:skill", "claude:command", "claude:agent",
-            "codex:agent", "omp:agent", "omp:command",
+            "codex:agent", "omnigent:agent", "omp:agent", "omp:command",
             "opencode:agent", "opencode:command", "kimi:skill",
             "zcode:skill",
         }
@@ -518,6 +538,8 @@ class Schema(unittest.TestCase):
                 ["read-only", "workspace-write", "danger-full-access"],
             ("opencode:agent", "mode"): ["subagent", "primary"],
             ("kimi:skill", "type"): ["prompt"],
+            ("omnigent:agent", "executor.config.harness"):
+                ["cursor-native", "claude-native", "codex"],
         }
         for (surface, key), enum in expected.items():
             with self.subTest(surface=surface, field=key):
@@ -528,22 +550,21 @@ class Schema(unittest.TestCase):
 
     def test_schema_model_fields_use_model_sources(self):
         expected = {
-            "claude:agent": "models:claude",
-            "codex:agent": "models:codex",
-            "omp:agent": "models:omp",
+            ("claude:agent", "model"): "models:claude",
+            ("codex:agent", "model"): "models:codex",
+            ("omp:agent", "model"): "models:omp",
+            ("omnigent:agent", "executor.model"): "models:omnigent",
         }
-        for surface, values_from in expected.items():
-            with self.subTest(surface=surface):
+        for (surface, key), values_from in expected.items():
+            with self.subTest(surface=surface, field=key):
                 model = next(
                     field for field in scan.KEY_SCHEMA[surface]
-                    if field["key"] == "model")
+                    if field["key"] == key)
                 self.assertEqual(model["values_from"], values_from)
 
         for surface, fields in scan.KEY_SCHEMA.items():
             for field in fields:
-                if (surface, field["key"]) not in {
-                    (surface, "model") for surface in expected
-                }:
+                if (surface, field["key"]) not in expected:
                     with self.subTest(surface=surface, field=field["key"]):
                         self.assertIsNone(field["values_from"])
 
@@ -590,6 +611,14 @@ class Schema(unittest.TestCase):
         fields, _ = scan.parse_frontmatter(
             scan.default_template("claude", "skill", "my-skill"))
         self.assertEqual(fields["name"], "my-skill")
+
+    def test_omnigent_agent_template_has_name_and_description(self):
+        text = scan.default_template("omnigent", "agent", "my-agent")
+        self.assertEqual(
+            text,
+            'name: my-agent\ndescription: ""\n',
+        )
+        self.assertNotIn("---", text)
 
 
 # --------------------------------------------------------------------------
@@ -755,6 +784,9 @@ class HashStabilityGuard(unittest.TestCase):
                 except ValueError:
                     fields = {}
                 body = text
+            elif scan.SURFACE_FORMAT.get(
+                    (e["harness"], e["surface"])) == "yaml-document":
+                fields, body = scan.split_file(text, "yaml-document")
             else:
                 fields, body = scan.parse_frontmatter(text)
             with self.subTest(path=str(path.relative_to(REPO))):

@@ -379,7 +379,7 @@ def load_registry_module():
         "collect", "collect_canonical", "build_index", "parse_frontmatter",
         "FRONTMATTER_RE", "file_format", "split_file", "join_file",
         "parse_yaml", "default_template", "SURFACE_FORMAT", "KEY_SCHEMA",
-        "generated_paths",
+        "unflatten_dotted_keys", "generated_paths",
     ):
         if not hasattr(module, fn):
             raise RuntimeError(f"registry module missing required attribute: {fn}")
@@ -1698,6 +1698,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         registry = load_registry_module()
 
+        schema_key = (
+            f"{harness_norm}:{surface_norm}" if harness_norm and surface_norm else None
+        )
+        schema = registry.KEY_SCHEMA.get(schema_key) if schema_key else None
+        dotted_schema_keys = {
+            spec["key"] for spec in (schema or []) if "." in spec["key"]
+        }
         resolved: dict = {}
         for key, value in frontmatter.items():
             if (isinstance(value, dict) and set(value.keys()) == {"$yaml"}
@@ -1726,6 +1733,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 resolved[key] = value
 
+        resolved = registry.unflatten_dotted_keys(resolved, dotted_schema_keys)
+
         # JSON turns scan.py's quoted string-key markers into plain strings.
         # Restore them before the existing YAML writer renders the response.
         if fmt in ("yaml", "yaml-document"):
@@ -1733,10 +1742,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 resolved, payload.get("quoted_keys"))
 
         warnings: list[str] = []
-        schema_key = (
-            f"{harness_norm}:{surface_norm}" if harness_norm and surface_norm else None
-        )
-        schema = registry.KEY_SCHEMA.get(schema_key) if schema_key else None
         if schema:
             schema_by_key = {spec["key"]: spec for spec in schema}
             # The browser keeps JSON-schema text as a YAML literal string.
@@ -1760,8 +1765,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if value is None or value == "":
                         return self._send_json(
                             400, {"error": f"missing required key '{spec['key']}'"})
+            known_keys = {key.split(".", 1)[0] for key in schema_by_key}
             for key in resolved:
-                if key not in schema_by_key:
+                if key not in known_keys:
                     warnings.append(f"unknown key '{key}' for {schema_key}")
             if ("name" in schema_by_key and harness_norm != "omnigent"
                     and path_value):

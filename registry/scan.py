@@ -903,9 +903,41 @@ def join_file(fields: dict, body: str, fmt: str) -> str:
         return dump_toml(merged)
     if fmt == "yaml-document":
         merged = {k: v for k, v in fields.items() if k != "prompt"}
+        # JSON loses the parser's flow-map marker at the HTTP boundary.
+        # Omnigent role documents use this native inline config shape.
+        executor = merged.get("executor")
+        config = executor.get("config") if isinstance(executor, dict) else None
+        if isinstance(config, dict) and not getattr(config, "_yaml_flow", False):
+            executor = dict(executor)
+            executor["config"] = flow_map(config)
+            merged["executor"] = executor
         merged["prompt"] = body
         return dump_yaml(merged)
     return dump_frontmatter(fields, body)
+
+
+def unflatten_dotted_keys(data: dict, paths=None) -> dict:
+    """Expand selected top-level dotted keys into nested mappings."""
+    if not isinstance(data, dict):
+        return data
+    allowed = set(paths) if paths is not None else None
+    result = dict(data)
+    for key, value in data.items():
+        if not isinstance(key, str) or "." not in key:
+            continue
+        if allowed is not None and key not in allowed:
+            continue
+        parts = key.split(".")
+        target = result
+        for part in parts[:-1]:
+            child = target.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                target[part] = child
+            target = child
+        target[parts[-1]] = value
+        del result[key]
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -983,6 +1015,18 @@ KEY_SCHEMA: dict[str, list[dict]] = {
         _field("sandbox_mode", widget="select",
                enum=["read-only", "workspace-write", "danger-full-access"],
                help_="optional; read-only on trio-scout"),
+    ],
+    "omnigent:agent": [
+        _field("name", required=True),
+        _field("description", widget="textarea", required=True),
+        _field("spawn", "bool", "checkbox"),
+        _field("executor.model", values_from="models:omnigent"),
+        _field(
+            "executor.config.harness",
+            widget="select",
+            enum=["cursor-native", "claude-native", "codex"],
+        ),
+        _field("executor.config.yolo", "bool", "checkbox"),
     ],
     "omp:agent": [
         _field("name", required=True, help_="must equal the filename stem"),
@@ -1181,14 +1225,14 @@ def scan_instructions(path: Path, harness: str, scope: str) -> list[dict]:
     return [entry_record(path, harness, "instructions", scope)]
 
 
-def scan_omnigent_roles(root: Path) -> list[dict]:
+def scan_omnigent_roles(root: Path, scope: str = "global") -> list[dict]:
     out = []
     if not root.is_dir():
         return out
     for role in sorted(root.iterdir()):
         cfg = role / "config.yaml"
         if role.is_dir() and cfg.is_file():
-            rec = entry_record(cfg, "omnigent", "agent", "global")
+            rec = entry_record(cfg, "omnigent", "agent", scope)
             rec["name"] = role.name
             out.append(rec)
     return out
@@ -1229,6 +1273,8 @@ def collect_canonical() -> list[dict]:
     entries += scan_md_dir(REPO / "omp/commands", "omp", "command", "canonical")
     entries += scan_md_dir(REPO / "omp/agents", "omp", "agent", "canonical")
     entries += scan_skill_dir(REPO / "omnigent/entrypoints", "omnigent", "canonical")
+    entries += scan_omnigent_roles(
+        REPO / "omnigent/trio-omnigent-roles", "canonical")
     return entries
 
 

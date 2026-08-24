@@ -327,6 +327,24 @@ class SchemaEndpointTests(DashboardServerTestCase):
             spec_for("omp:agent", "output")["widget"],
             "json-schema")
 
+    def test_schema_exposes_omnigent_agent_document_fields(self):
+        status, payload = self._get("/api/registry/schema")
+        self.assertEqual(status, 200, payload)
+        expected = [
+            "name",
+            "description",
+            "spawn",
+            "executor.model",
+            "executor.config.harness",
+            "executor.config.yolo",
+        ]
+        actual = [
+            spec["key"] for spec in payload["keys"]["omnigent:agent"]
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            payload["formats"]["omnigent:agent"], "yaml-document")
+
 
 class RegistryFileEndpointTests(DashboardServerTestCase):
 
@@ -495,6 +513,9 @@ class RegenerateEndpointTests(unittest.TestCase):
 
 
 class RoundTripTests(DashboardServerTestCase):
+    ROLE_CONFIGS = tuple(sorted(
+        (REPO_ROOT / "omnigent" / "trio-omnigent-roles").glob(
+            "*/config.yaml")))
 
     def test_opencode_agent_http_round_trip(self):
         path = REPO_ROOT / "opencode" / "agents" / "trio-evaluator.md"
@@ -570,6 +591,80 @@ class RoundTripTests(DashboardServerTestCase):
         expected = dict(get_payload["frontmatter"])
         self.assertEqual(parsed, expected)
         self.assertEqual(developer_instructions, get_payload["body"])
+
+    def test_omnigent_role_http_round_trip_keeps_nested_document(self):
+        self.assertEqual(len(self.ROLE_CONFIGS), 4)
+        for path in self.ROLE_CONFIGS:
+            with self.subTest(path=path):
+                status, get_payload = self._get(
+                    f"/api/registry/file?path={path}")
+                self.assertEqual(status, 200, get_payload)
+                self.assertEqual(get_payload["format"], "yaml-document")
+
+                frontmatter = get_payload["frontmatter"]
+                body = get_payload["body"]
+                self.assertNotIn("prompt", frontmatter)
+                self.assertTrue(body.strip())
+                config = frontmatter["executor"]["config"]
+
+                status, ser_payload = _http_json(
+                    "POST",
+                    f"{self.base}/api/registry/serialize",
+                    {
+                        "format": get_payload["format"],
+                        "frontmatter": frontmatter,
+                        "body": body,
+                        "harness": "omnigent",
+                        "surface": "agent",
+                    },
+                )
+                self.assertEqual(status, 200, ser_payload)
+                content = ser_payload["content"]
+                self.assertNotIn("---", content)
+                self.assertIn("prompt: |", content)
+
+                parsed = registry.parse_yaml(content)
+                self.assertEqual(parsed["prompt"], body)
+                self.assertEqual(
+                    parsed["executor"]["config"], config)
+                expected_config_line = (
+                    "  config: {harness: "
+                    f"{config['harness']}, yolo: "
+                    f"{str(config['yolo']).lower()}}}\n"
+                )
+                self.assertIn(expected_config_line, content)
+                for key in ("os_env", "guardrails"):
+                    if key in frontmatter:
+                        self.assertIn(key, parsed)
+                        self.assertEqual(parsed[key], frontmatter[key])
+
+    def test_serialize_unflattens_omnigent_dotted_executor_keys(self):
+        status, payload = _http_json(
+            "POST", f"{self.base}/api/registry/serialize",
+            {
+                "format": "yaml-document",
+                "harness": "omnigent",
+                "surface": "agent",
+                "body": "hello\n",
+                "frontmatter": {
+                    "name": "throwaway",
+                    "description": "x",
+                    "executor": {"type": "omnigent"},
+                    "executor.model": "gpt-5.6-luna-max",
+                    "executor.config.harness": "cursor-native",
+                    "executor.config.yolo": True,
+                },
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        parsed = registry.parse_yaml(payload["content"])
+        self.assertNotIn("executor.model", parsed)
+        self.assertEqual(parsed["executor"]["type"], "omnigent")
+        self.assertEqual(parsed["executor"]["model"], "gpt-5.6-luna-max")
+        self.assertIn(
+            "config: {harness: cursor-native, yolo: true}",
+            payload["content"],
+        )
 
 
 class SerializeValidationTests(DashboardServerTestCase):

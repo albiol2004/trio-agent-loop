@@ -89,6 +89,8 @@ Registry and agents:
 
 The **Skills** page (`/skills.html`) edits skill registry files with a typed frontmatter interface:
 - **Schema-driven forms** — `GET /api/registry/schema` serves harness/surface destinations, formats (yaml/toml), and per-field specs (type, widget, required, help text).
+- **Omnigent agent forms** — dotted `executor.*` fields map into nested YAML;
+  `yaml-document` sends `prompt` as the body.
 - **Structured widgets** — specialized input controls render per field type and widget hint:
   - Enum select dropdowns with custom YAML escape for off-list values and warning on save
   - Model dropdowns fed by `/api/registry/models` (provider-specific sets per harness)
