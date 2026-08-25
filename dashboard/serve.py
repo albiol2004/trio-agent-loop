@@ -24,11 +24,19 @@ Static files:
 
 Board:
     GET /api/board
-    Response: {"loops": [<loop>], "updated_at": "<ISO-8601 UTC>"}
+    Response: {"loops": [<loop>], "inbox": [<item>],
+               "updated_at": "<ISO-8601 UTC>"}
     Each loop object:
         name, path, mission, iteration, max_iterations, status,
         final_verdict, last_activity, last_entry_summary, segments,
         driver_phase, driver, running
+    Each inbox item includes: loop, kind, severity, headline, detail, id,
+    read, first_seen.
+
+Inbox:
+    POST /api/inbox/read    Body: {"ids": ["<id>"], "root": "<absolute-path>"}
+    POST /api/inbox/unread  Body: {"ids": ["<id>"], "root": "<absolute-path>"}
+    Response: {"ok": true, "ids": ["<id>", ...]}
 
 Loop control:
     POST /api/loop/start  Body: {"root", "driver", "max_iterations"?}
@@ -203,6 +211,9 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
 """Parsing module, resolved relative to this file (NOT cwd)."""
 
+INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
+"""Inbox identity and read-state module, resolved relative to this file."""
+
 REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
 """Skill registry scanner, resolved relative to this file."""
 
@@ -240,6 +251,7 @@ _TOPOLOGY_MODULE = None
 _MODELS_MODULE = None
 _HEALTH_MODULE = None
 _BROKER_HTTP_MODULE = None
+_INBOX_STATE_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -410,6 +422,26 @@ def load_metrics_module():
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
     return module
+
+
+def load_inbox_state_module():
+    """Load dashboard/inbox_state.py by path and cache the module."""
+    global _INBOX_STATE_MODULE
+    if _INBOX_STATE_MODULE is not None:
+        return _INBOX_STATE_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_inbox_state", INBOX_STATE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load inbox state module: {INBOX_STATE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in ("decorate_items", "set_read"):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"inbox state module missing required function: {fn}")
+    _INBOX_STATE_MODULE = module
+    return module
+
 
 def load_registry_module():
     """Load registry/scan.py by path and cache the module."""
@@ -888,11 +920,6 @@ def _loop_iterations(loop_dir: Path, root: Path) -> tuple[list[dict], list[dict]
 _SLICE_COMMIT_RE = re.compile(r"^slice\(([^)]+)\):\s*(.*)$")
 """Conventional slice commit subject: ``slice(<id>): <subject>``."""
 
-STALE_MINUTES = 45
-"""An active-looking loop with no activity for this long is flagged stale."""
-
-_ACTIVE_STATUS_WORDS = ("running", "pending", "in_progress", "planning", "building")
-
 
 def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
     """Git metadata for a loop: slice-attributed commits newest first.
@@ -928,32 +955,26 @@ def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
     return commits
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
-    Kinds: needs_human / blocked (high), stale / drift (medium),
-    repair (low). Anything that cannot be determined is simply absent —
-    the inbox never guesses.
+    Kinds: needs_human / blocked (high), drift / overlap (medium), and
+    repair (low). Anything that cannot be determined is simply absent — the
+    inbox never guesses.
     """
     items = []
 
-    def add(severity, kind, headline, detail):
-        items.append({
+    def add(severity, kind, headline, detail, anchor=None):
+        item = {
             "loop": card["name"],
             "kind": kind,
             "severity": severity,
             "headline": headline,
             "detail": detail,
-        })
+        }
+        if anchor is not None:
+            item["_inbox_anchor"] = anchor
+        items.append(item)
 
     verdict = (card.get("final_verdict") or "").upper()
     if verdict == "NEEDS_HUMAN":
@@ -962,17 +983,6 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     elif verdict == "BLOCKED":
         add("high", "blocked", "Loop blocked",
             card.get("last_entry_summary") or "")
-
-    status = (card.get("status") or "").lower()
-    if any(w in status for w in _ACTIVE_STATUS_WORDS):
-        last = _parse_iso(card.get("last_activity"))
-        if last is not None:
-            idle = (datetime.now(timezone.utc) - last).total_seconds() / 60
-            if idle >= STALE_MINUTES:
-                hours = idle / 60
-                span = f"{int(hours)}h" if hours >= 1 else f"{int(idle)}m"
-                add("medium", "stale", f"No activity for {span}",
-                    f"Status is '{card['status']}' but the mailbox has not moved.")
 
     plan = loop_dir / "PLAN.md"
     try:
@@ -990,13 +1000,15 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                     drift_slices += 1
                     drift_files.update(sl["undeclared"])
             if drift_files:
+                sorted_drift_files = sorted(drift_files)
                 add("medium", "drift",
                     f"{len(drift_files)} undeclared write"
                     f"{'s' if len(drift_files) != 1 else ''}",
                     f"Across {drift_slices} slice"
                     f"{'s' if drift_slices != 1 else ''}: "
-                    + ", ".join(sorted(drift_files)[:4])
-                    + ("…" if len(drift_files) > 4 else ""))
+                    + ", ".join(sorted_drift_files[:4])
+                    + ("…" if len(sorted_drift_files) > 4 else ""),
+                    ",".join(sorted_drift_files))
 
     try:
         _, overlaps = _loop_iterations(loop_dir, root)
@@ -1007,7 +1019,8 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                     else "overlap read/write paths" if ov["relation"] == "write-read"
                     else "share write paths and read/write paths")
             add("medium", "overlap",
-                f"Iterations {ov['a']} and {ov['b']} {verb}", shown)
+                f"Iterations {ov['a']} and {ov['b']} {verb}", shown,
+                f"{ov['a']}:{ov['b']}:{ov['relation']}")
     except Exception:
         traceback.print_exc()
 
@@ -1018,11 +1031,14 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     if repairs >= 1:
         add("low", "repair", f"{repairs} consecutive scoped repair"
              f"{'s' if repairs != 1 else ''}",
-            "Repair-only loop risk: a full Lead pass is forced at 2.")
+            "Repair-only loop risk: a full Lead pass is forced at 2.",
+            str(repairs))
 
     order = {"high": 0, "medium": 1, "low": 2}
     items.sort(key=lambda i: order[i["severity"]])
-    return items
+    return load_inbox_state_module().decorate_items(
+        items, root, card["name"], loop_dir, HOME
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2693,6 +2709,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         card["sessions"] = self._session_list(loop_dir, root)
         self._send_json(200, card)
 
+    # -- /api/inbox/read and /api/inbox/unread ------------------------------
+
+    def _handle_inbox_read(self, read: bool) -> None:
+        """Update inbox state without reading or writing any mailbox files."""
+        payload = self._read_loop_body()
+        if payload is None:
+            return
+        ids = payload.get("ids")
+        if not isinstance(ids, list):
+            return self._send_json(400, {"error": "ids must be a list"})
+        if any(not isinstance(identity, str) for identity in ids):
+            return self._send_json(400, {"error": "ids must contain strings"})
+        root = self._resolve_loop_root(payload)
+        if root is None:
+            return
+        load_inbox_state_module().set_read(root, ids, read, HOME)
+        self._send_json(200, {"ok": True, "ids": ids})
+
     # -- /api/loop controls -------------------------------------------------
 
     def _read_loop_body(self) -> dict | None:
@@ -3130,6 +3164,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(self._handle_agent_create)
         if path == "/api/registry/install":
             return self._api(self._handle_agent_install)
+        if path == "/api/inbox/read":
+            return self._api(lambda: self._handle_inbox_read(True))
+        if path == "/api/inbox/unread":
+            return self._api(lambda: self._handle_inbox_read(False))
         if path == "/api/loop/start":
             return self._api(self._handle_loop_start)
         if path == "/api/loop/stop":

@@ -53,6 +53,9 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 ## What it shows
 
 - **Status board** — one card per `loop*/` mailbox: state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration counter, mission, a verdict-history strip (S/I/H/B tiles — the loop's fingerprint), and last activity. Refreshes every 5 seconds; running loops sort first.
+- **Attention inbox** — needs-human, blocked, drift, overlap, and repair
+  signals have stable identities and can be marked read or unread. Read items
+  are hidden by default; the unread count remains the inbox badge.
 - **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
 - **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
@@ -72,6 +75,13 @@ Loop control:
 - `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`)
 - `POST /api/loop/stop` — stop a running loop: `{"root"}`
 - `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
+
+Inbox:
+- `POST /api/inbox/read` — mark IDs read:
+  `{"ids": ["<id>"], "root": "<absolute workspace>"}`
+- `POST /api/inbox/unread` — mark IDs unread with the same body
+- `GET /api/board` — includes each inbox item's `id`, `read`, and
+  first-observation `first_seen` fields
 
 Registry and agents:
 - `GET /api/registry/file?path=<absolute-path>` — read a registry file;

@@ -39,7 +39,11 @@
   <main class="board" aria-label="Loop board">
     <div id="board-error" class="board-error" hidden></div>
     <section id="inbox" class="inbox" hidden aria-label="Attention inbox">
-      <h2 class="inbox-title">Needs attention <span id="inbox-count" class="inbox-count"></span></h2>
+      <header class="inbox-header">
+        <h2 class="inbox-title">Needs attention <span id="inbox-count" class="inbox-count"></span></h2>
+        <button id="inbox-toggle" class="inbox-toggle" type="button"
+                aria-expanded="false" hidden>show read (0)</button>
+      </header>
       <div id="inbox-list" class="inbox-list"></div>
     </section>
     <div id="card-grid" class="card-grid"></div>
@@ -76,6 +80,12 @@
         <section id="commits-section" class="drawer-section" aria-label="Commits" hidden>
           <h3 class="section-label">Commits</h3>
           <div id="commit-list" class="commit-list"></div>
+        </section>
+
+        <section id="drawer-inbox-section" class="drawer-section"
+                 aria-label="Attention inbox" hidden>
+          <h3 class="section-label">Attention inbox</h3>
+          <div id="drawer-inbox-list" class="inbox-list"></div>
         </section>
 
         <section class="drawer-section" aria-label="Activity timeline">

@@ -7,6 +7,8 @@
 const state = {
   boardTimer: null,
   loops: [],
+  inbox: [],
+  showReadInbox: false,
   updatedAt: null,
   tab: "all",
 
@@ -48,20 +50,6 @@ const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
 
 function el(id) {
   return document.getElementById(id);
-}
-
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  }[c]));
-}
-
-function escAttr(value) {
-  return esc(value).replace(/`/g, "&#96;");
 }
 
 function cssClass(value) {
@@ -233,34 +221,103 @@ function seqLegendEl(seq) {
 
 /* ------------------------------ board ------------------------------ */
 
+function inboxMarkButton(item) {
+  const mark = document.createElement("button");
+  mark.type = "button";
+  mark.className = "inbox-mark";
+  mark.textContent = item.read ? "Mark unread" : "Mark read";
+  mark.setAttribute(
+    "aria-label",
+    (item.read ? "Mark unread: " : "Mark read: ") + (item.headline || "item")
+  );
+  mark.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setInboxRead(item, !item.read);
+  });
+  return mark;
+}
+
+function inboxRow(item, opensDrawer) {
+  const row = document.createElement("div");
+  row.className = "inbox-item inbox-" + cssClass(item.severity || "low");
+  if (item.read) row.classList.add("is-read");
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
+
+  row.appendChild(span("inbox-sev", (item.severity || "").toUpperCase()));
+  const main = document.createElement("span");
+  main.className = "inbox-main";
+  const head = document.createElement("span");
+  head.className = "inbox-headline";
+  head.appendChild(span("inbox-loop", item.loop || "?"));
+  head.appendChild(document.createTextNode(item.headline || ""));
+  main.appendChild(head);
+  if (item.detail) {
+    const det = span("inbox-detail", item.detail);
+    det.title = item.detail;
+    main.appendChild(det);
+  }
+  row.appendChild(main);
+  row.appendChild(inboxMarkButton(item));
+
+  if (opensDrawer) {
+    row.addEventListener("click", () => openDrawer(item.loop));
+    row.addEventListener("keydown", (event) => {
+      if (event.target !== row) return;
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openDrawer(item.loop);
+    });
+  }
+  return row;
+}
+
+function renderDrawerInbox() {
+  const section = el("drawer-inbox-section");
+  const list = el("drawer-inbox-list");
+  if (!section || !list) return;
+  list.textContent = "";
+  const items = state.inbox.filter((item) => item.loop === state.activeLoop);
+  section.hidden = items.length === 0;
+  for (const item of items) list.appendChild(inboxRow(item, false));
+}
+
 function renderInbox(inbox) {
   const section = el("inbox");
   const list = el("inbox-list");
-  list.textContent = "";
   const items = Array.isArray(inbox) ? inbox : [];
+  const readCount = items.filter((item) => item.read).length;
+  const unreadCount = items.length - readCount;
+  const toggle = el("inbox-toggle");
+
+  /* Keep the badge as unread work even while read history is revealed. */
+  el("inbox-count").textContent = String(unreadCount);
+  toggle.hidden = readCount === 0;
+  toggle.textContent = (state.showReadInbox ? "hide read (" : "show read (") +
+    readCount + ")";
+  toggle.setAttribute("aria-expanded", String(state.showReadInbox));
   section.hidden = items.length === 0;
-  if (!items.length) return;
-  el("inbox-count").textContent = String(items.length);
-  for (const item of items) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "inbox-item inbox-" + cssClass(item.severity || "low");
-    row.appendChild(span("inbox-sev", (item.severity || "").toUpperCase()));
-    const main = document.createElement("span");
-    main.className = "inbox-main";
-    const head = document.createElement("span");
-    head.className = "inbox-headline";
-    head.appendChild(span("inbox-loop", item.loop || "?"));
-    head.appendChild(document.createTextNode(item.headline || ""));
-    main.appendChild(head);
-    if (item.detail) {
-      const det = span("inbox-detail", item.detail);
-      det.title = item.detail;
-      main.appendChild(det);
-    }
-    row.appendChild(main);
-    row.addEventListener("click", () => openDrawer(item.loop));
-    list.appendChild(row);
+  list.textContent = "";
+
+  const visible = state.showReadInbox
+    ? items
+    : items.filter((item) => !item.read);
+  for (const item of visible) list.appendChild(inboxRow(item, true));
+  renderDrawerInbox();
+}
+
+async function setInboxRead(item, read) {
+  try {
+    const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ids: [item.id], root: currentRoot}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+    await refreshBoard();
+  } catch (err) {
+    showBoardError("Inbox update failed: " + err.message);
   }
 }
 
@@ -270,7 +327,8 @@ async function refreshBoard() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     state.loops = Array.isArray(data.loops) ? data.loops : [];
-  renderInbox(data.inbox);
+    state.inbox = Array.isArray(data.inbox) ? data.inbox : [];
+    renderInbox(state.inbox);
     state.updatedAt = data.updated_at || null;
     setBoardStatus("live", "live");
     hideBoardError();
@@ -466,7 +524,10 @@ function cardEl(loop) {
   iter.className = "card-iter";
   const cur = loop.iteration != null ? loop.iteration : "–";
   const max = loop.max_iterations != null ? loop.max_iterations : "–";
-  iter.innerHTML = "<strong>" + esc(cur) + "</strong> / " + esc(max) + " iter";
+  const current = document.createElement("strong");
+  current.textContent = cur;
+  iter.appendChild(current);
+  iter.appendChild(document.createTextNode(" / " + max + " iter"));
   top.appendChild(iter);
   card.appendChild(top);
 
@@ -568,7 +629,8 @@ async function openDrawer(name) {
   el("fact-activity").textContent = "—";
   el("fact-sessions").textContent = "—";
   el("drawer-strip").textContent = "";
-  el("drawer-timeline").innerHTML = '<div class="timeline-empty">Loading…</div>';
+  el("drawer-timeline").textContent = "";
+  el("drawer-timeline").appendChild(span("timeline-empty", "Loading…"));
   el("session-list").textContent = "";
   setPaneStatus("idle", "loading…");
   renderTranscript();
@@ -578,6 +640,7 @@ async function openDrawer(name) {
   markActiveCard();
   renderDrawerTabs();
   showDrawerTab();
+  renderDrawerInbox();
   await refreshDetail({ quiet: false });
 }
 
@@ -612,8 +675,10 @@ async function refreshDetail({ quiet }) {
     if (!quiet) renderSessionList();
   } catch (err) {
     if (!quiet) {
-      el("drawer-timeline").innerHTML =
-        '<div class="timeline-empty">Failed to load detail: ' + esc(err.message) + "</div>";
+      el("drawer-timeline").textContent = "";
+      el("drawer-timeline").appendChild(
+        span("timeline-empty", "Failed to load detail: " + err.message)
+      );
     }
   }
 }
@@ -1745,10 +1810,10 @@ function sessionItem(s, depth = 0, subCount = 0) {
     meta.push(subCount + " sub" + (subCount === 1 ? "" : "s"));
   }
 
-  item.innerHTML =
-    '<span class="session-label" title="' + escAttr(s.label ?? "") + '">' +
-      esc(label) + "</span>" +
-    '<span class="session-meta">' + meta.join(" · ") + "</span>";
+  const labelEl = span("session-label", label);
+  labelEl.title = s.label ?? "";
+  item.appendChild(labelEl);
+  item.appendChild(span("session-meta", meta.join(" · ")));
   item.addEventListener("click", () => openSession(s.path));
   return item;
 }
@@ -1808,7 +1873,7 @@ function openSession(path) {
         msg = JSON.parse(ev.data).error || msg;
       } catch { msg = ev.data; }
       setPaneStatus("error", "error");
-      showTranscriptNotice("Stream error: " + esc(msg));
+      showTranscriptNotice("Stream error: " + msg);
       es.close();
       if (state.es === es) state.es = null;
       return;
@@ -2082,13 +2147,18 @@ function init() {
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
   });
+  el("inbox-toggle").addEventListener("click", () => {
+    state.showReadInbox = !state.showReadInbox;
+    renderInbox(state.inbox);
+  });
   el("follow-btn").addEventListener("click", () => {
     state.follow = !state.follow;
     updateFollowBtn();
   });
 
-  el("card-grid").innerHTML =
-    '<div class="board-empty">Loading loops…</div>';
+  const grid = el("card-grid");
+  grid.textContent = "";
+  grid.appendChild(boardEmpty("Loading loops…"));
   refreshBoard();
 }
 
