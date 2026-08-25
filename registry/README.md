@@ -110,13 +110,17 @@ When a layer wins, its name is recorded for display. If no layer provides a mode
 
 ### Availability and custom models
 
-`models.json` contains curated model IDs used for availability hints and is exposed
-via `/api/registry/models?root=...` as an `available` map combining curated IDs
-plus any live model overrides read from the dashboard process home (e.g., from
-`~/.omp/task/agentModelOverrides`). Model dropdowns in the Skills and Agents editors
-are populated from this `available` set. When a custom (uncurated) model ID is found,
-it is retained in the result and marked `availability: "unknown"` instead of raising
-an error, with a warning message recommending it be added to `models.json`.
+`models.json` contains curated model IDs used as an offline fallback. The
+`harvest_catalog(home, ...)` API merges those IDs with explicit-home configuration
+files and, when `allow_cli=True`, live harness catalogs. The dashboard endpoint
+returns `available` for claude, codex, omp, opencode, cursor, and omnigent;
+`omnigent` is the union of the executor catalogs. It also returns `by_executor`,
+which exposes each executor under both its short and `-native` names, and
+`sources`, which reports each source's `ok`, `count`, and error details.
+Model dropdowns in the Skills and Agents editors are populated from `available`.
+When a custom (uncurated) model ID is found, it is retained in the result and
+marked `availability: "unknown"` instead of raising an error, with a warning
+message recommending it be added to `models.json`.
 `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner format layer
 for focused parsing.
 

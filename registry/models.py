@@ -3,17 +3,41 @@
 The collector deliberately reads repository files from ``root`` and optional
 runtime files from the caller-provided ``home`` only.  It never guesses the
 user's home directory, which keeps the API deterministic and tests hermetic.
+``harvest_catalog`` additionally reports configured and optional live model
+catalogs, while keeping curated IDs available when a live source fails.
 """
 from __future__ import annotations
 
+import argparse
+import copy
 import importlib.util
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
 SCAN_PATH = Path(__file__).with_name("scan.py")
 _SCAN_MODULE = None
+
+CATALOG_HARNESSES = (
+    "claude",
+    "codex",
+    "omp",
+    "opencode",
+    "cursor",
+    "omnigent",
+)
+EXECUTOR_HARNESSES = ("claude", "codex", "cursor", "omp", "opencode")
+KNOWN_CLAUDE_ALIASES = {"sonnet", "opus", "haiku"}
+CATALOG_CACHE_SECONDS = 300.0
+_CATALOG_CACHE: dict[tuple[str, str, bool], tuple[float, dict]] = {}
+_CATALOG_CACHE_LOCK = threading.RLock()
 
 LAYER_ORDER = (
     "frontmatter",
@@ -278,22 +302,29 @@ def resolve_model(
     return None, "none"
 
 
-def _curated_models() -> dict[str, set[str]]:
-    """Load the checked-in availability hints without ever writing to disk."""
+def _read_curated_models() -> tuple[dict[str, set[str]], str | None]:
+    """Load the checked-in catalog and retain a useful parse error."""
     path = Path(__file__).with_name("models.json")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
     if not isinstance(data, dict):
-        return {}
+        return {}, "models.json top level must be an object"
     return {
         str(harness): {
-            model for model in values if isinstance(model, str) and model
+            model.strip() for model in values
+            if isinstance(model, str) and model.strip()
         }
         for harness, values in data.items()
         if isinstance(values, list)
-    }
+    }, None
+
+
+def _curated_models() -> dict[str, set[str]]:
+    """Load the checked-in availability hints without writing to disk."""
+    models, _error = _read_curated_models()
+    return models
 
 
 def _harvest_model_ids(
@@ -332,38 +363,467 @@ def _harvest_model_ids(
     return found
 
 
-def _available_models(
-    home: Path | None, curated: dict[str, set[str]]
-) -> dict[str, set[str]]:
-    """Combine curated ids with explicitly supplied live configuration."""
-    available = {harness: set(models) for harness, models in curated.items()}
-    if home is None or not home.is_dir():
-        return available
-
-    omnigent = home / ".omnigent" / "config.yaml"
-    if omnigent.is_file():
-        available.setdefault("omnigent", set()).update(
-            _harvest_model_ids(_load_yaml(omnigent)))
-
-    opencode = home / ".config" / "opencode" / "opencode.json"
-    if opencode.is_file():
-        try:
-            data = json.loads(opencode.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            data = {}
-        available.setdefault("opencode", set()).update(
-            _harvest_model_ids(data))
-
-    codex = home / ".codex" / "config.toml"
-    if codex.is_file():
-        model = _model_value(load_toml(codex).get("model"))
-        if model is not None:
-            available.setdefault("codex", set()).add(model)
-    return available
+def _source_record(
+    source: str | Path,
+    models: set[str],
+    ok: bool = True,
+    error: str | None = None,
+) -> dict:
+    """Build the small, JSON-safe status record used by the public API."""
+    return {
+        "source": str(source),
+        "ok": bool(ok),
+        "count": len(models),
+        "error": error if not ok else None,
+    }
 
 
-def collect_models(root: Path, home: Path | None = None) -> dict:
-    """Collect deterministic model rows from a repository and optional home."""
+def _read_catalog_file(path: Path, parser) -> tuple[set[str], bool, str | None]:
+    """Read and parse one optional catalog file without hiding failures."""
+    try:
+        data = parser(path.read_text(encoding="utf-8"))
+        return _harvest_model_ids(data), True, None
+    except Exception as exc:
+        message = str(exc).strip()
+        detail = (
+            f"{type(exc).__name__}: {message}"
+            if message
+            else type(exc).__name__
+        )
+        return set(), False, detail
+
+
+def _parse_toml_document(text: str) -> dict:
+    """Parse TOML while preserving errors for the catalog source record."""
+    data = _load_scan_module().parse_toml(text)
+    if not isinstance(data, dict):
+        raise ValueError("TOML top level must be an object")
+    return data
+
+
+def _parse_yaml_document(text: str) -> dict:
+    """Parse YAML while preserving errors for the catalog source record."""
+    data = _load_scan_module().parse_yaml(text)
+    if not isinstance(data, dict):
+        raise ValueError("YAML top level must be an object")
+    return data
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z")
+_CATALOG_HEADERS = {
+    "available",
+    "available models",
+    "model",
+    "models",
+    "name",
+    "provider",
+}
+_CURSOR_ROW_RE = re.compile(r"^(\S+)\s+-\s+(.+?)\s*$")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove terminal color/control sequences before parsing CLI output."""
+    return _ANSI_RE.sub("", text)
+
+
+def _looks_like_model_id(value: str) -> bool:
+    """Accept a conservative bare token while skipping common table labels."""
+    value = value.strip()
+    if not value or value.lower().rstrip(":") in _CATALOG_HEADERS:
+        return False
+    return bool(_MODEL_ID_RE.fullmatch(value))
+
+
+def _parse_cursor_catalog(text: str) -> set[str]:
+    """Parse Cursor's ``id - display name`` rows and bare model ids."""
+    found = set()
+    for raw_line in text.splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if not line:
+            continue
+        match = _CURSOR_ROW_RE.match(line)
+        if match:
+            model_id = match.group(1)
+            if _looks_like_model_id(model_id):
+                found.add(model_id)
+            continue
+        if " " not in line and _looks_like_model_id(line):
+            found.add(line)
+    return found
+
+
+def _parse_line_catalog(text: str) -> set[str]:
+    """Parse CLIs that print exactly one model id on each non-empty line."""
+    found = set()
+    for raw_line in text.splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if _looks_like_model_id(line):
+            found.add(line)
+    return found
+
+
+def _parse_codex_lines(text: str) -> set[str]:
+    """Parse Codex's possible one-column or table-like text output."""
+    found = set()
+    for raw_line in text.splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        if _looks_like_model_id(token):
+            found.add(token)
+    return found
+
+
+def _parse_claude_help(text: str) -> set[str]:
+    """Keep only known Claude aliases; help text is not a model catalog."""
+    found = set()
+    for alias in KNOWN_CLAUDE_ALIASES:
+        if re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(alias)}(?![A-Za-z0-9_-])",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            found.add(alias)
+    return found
+
+
+def _json_catalog_ids(value) -> set[str]:
+    """Extract common id fields from a JSON model-list response."""
+    found = set()
+    if isinstance(value, str):
+        if _looks_like_model_id(value):
+            found.add(value.strip())
+        return found
+    if isinstance(value, list):
+        for item in value:
+            found.update(_json_catalog_ids(item))
+        return found
+    if not isinstance(value, dict):
+        return found
+
+    provider = _model_value(value.get("provider"))
+    identifier = _model_value(value.get("id"))
+    if provider is not None and identifier is not None:
+        found.add(
+            identifier if "/" in identifier
+            else f"{provider}/{identifier}"
+        )
+    for key, child in value.items():
+        name = str(key).lower()
+        if name in {"id", "model", "model_id", "modelid", "selector"}:
+            model = _model_value(child)
+            if model is not None:
+                found.add(model)
+        elif name != "provider":
+            found.update(_json_catalog_ids(child))
+    return found
+
+
+def _omp_json_ids(value) -> set[str]:
+    """Extract OMP selectors, or construct them from provider and id."""
+    found = set()
+    if isinstance(value, list):
+        for item in value:
+            found.update(_omp_json_ids(item))
+        return found
+    if isinstance(value, str):
+        if _looks_like_model_id(value):
+            found.add(value.strip())
+        return found
+    if not isinstance(value, dict):
+        return found
+
+    selector = _model_value(value.get("selector"))
+    if selector is not None:
+        found.add(selector)
+    else:
+        provider = _model_value(value.get("provider"))
+        identifier = _model_value(value.get("id"))
+        if provider is not None and identifier is not None:
+            found.add(
+                identifier if "/" in identifier
+                else f"{provider}/{identifier}"
+            )
+    for key, child in value.items():
+        if str(key).lower() not in {"selector", "provider", "id"}:
+            found.update(_omp_json_ids(child))
+    return found
+
+
+def _parse_omp_catalog(text: str) -> set[str]:
+    """Parse the JSON returned by ``omp models --json``."""
+    return _omp_json_ids(json.loads(text))
+
+
+def _parse_codex_catalog(text: str) -> set[str]:
+    """Parse JSON when available, otherwise take ids from table-like lines."""
+    try:
+        return _json_catalog_ids(json.loads(text))
+    except json.JSONDecodeError:
+        return _parse_codex_lines(text)
+
+
+def _command_environment(home: Path | None, env) -> dict:
+    """Copy the caller environment and redirect HOME when requested."""
+    values = dict(os.environ if env is None else env)
+    if home is not None:
+        values["HOME"] = str(home)
+    return values
+
+
+def _run_catalog_cli(
+    command: str,
+    arguments: tuple[str, ...],
+    home: Path | None,
+    env,
+    parser,
+) -> tuple[set[str], dict]:
+    """Run one explicitly enabled CLI and turn failures into status data."""
+    label = " ".join((command, *arguments))
+    try:
+        process_env = _command_environment(home, env)
+        path = process_env.get("PATH")
+        if path is None and env is not None:
+            path = ""
+        elif path is not None:
+            path = os.fspath(path)
+        executable = shutil.which(command, path=path)
+    except Exception as exc:
+        message = str(exc).strip()
+        detail = (
+            f"{type(exc).__name__}: {message}"
+            if message
+            else type(exc).__name__
+        )
+        return set(), _source_record(label, set(), False, detail)
+    if executable is None:
+        return set(), _source_record(
+            label, set(), False, f"{command} not found on PATH"
+        )
+
+    try:
+        result = subprocess.run(
+            [executable, *arguments],
+            env=process_env,
+            timeout=20,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        stderr = getattr(exc, "stderr", None)
+        detail = (
+            stderr.strip()
+            if isinstance(stderr, str) and stderr.strip()
+            else str(exc)
+        )
+        detail = detail or type(exc).__name__
+        return set(), _source_record(label, set(), False, detail)
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        detail = stderr or (result.stdout or "").strip()
+        detail = detail or f"exit status {result.returncode}"
+        return set(), _source_record(label, set(), False, detail)
+
+    try:
+        models = parser(result.stdout or "")
+    except Exception as exc:
+        message = str(exc).strip()
+        detail = (
+            f"{type(exc).__name__}: {message}"
+            if message
+            else type(exc).__name__
+        )
+        return set(), _source_record(label, set(), False, detail)
+    return models, _source_record(label, models)
+
+
+def _add_file_catalog(
+    catalogs: dict[str, set[str]],
+    sources: dict[str, list[dict]],
+    harness: str,
+    path: Path,
+    parser,
+) -> None:
+    """Add one existing file and its status to a harness catalog."""
+    try:
+        if not path.is_file():
+            return
+    except OSError as exc:
+        message = str(exc).strip()
+        detail = (
+            f"{type(exc).__name__}: {message}"
+            if message
+            else type(exc).__name__
+        )
+        sources[harness].append(
+            _source_record(path, set(), False, detail)
+        )
+        return
+    models, ok, error = _read_catalog_file(path, parser)
+    catalogs[harness].update(models)
+    sources[harness].append(_source_record(path, models, ok, error))
+
+
+def _harvest_catalog_uncached(
+    home: Path | None,
+    env,
+    allow_cli: bool,
+) -> dict:
+    """Build a catalog from curated, configured, and optional live sources."""
+    catalogs = {harness: set() for harness in CATALOG_HARNESSES}
+    sources = {harness: [] for harness in CATALOG_HARNESSES}
+    curated, curated_error = _read_curated_models()
+    curated_path = Path(__file__).with_name("models.json")
+
+    # Curated ids are deliberately loaded first so a missing CLI never removes
+    # the offline choices shipped with the dashboard.
+    for harness in EXECUTOR_HARNESSES:
+        models = curated.get(harness, set())
+        catalogs[harness].update(models)
+        sources[harness].append(
+            _source_record(
+                curated_path,
+                models,
+                curated_error is None,
+                curated_error,
+            )
+        )
+    aliases = set(KNOWN_CLAUDE_ALIASES)
+    catalogs["claude"].update(aliases)
+    sources["claude"].append(_source_record("known aliases", aliases))
+
+    if home is not None:
+        _add_file_catalog(
+            catalogs,
+            sources,
+            "claude",
+            home / ".claude" / "settings.json",
+            json.loads,
+        )
+        _add_file_catalog(
+            catalogs,
+            sources,
+            "codex",
+            home / ".codex" / "config.toml",
+            _parse_toml_document,
+        )
+        _add_file_catalog(
+            catalogs,
+            sources,
+            "opencode",
+            home / ".config" / "opencode" / "opencode.json",
+            json.loads,
+        )
+        _add_file_catalog(
+            catalogs,
+            sources,
+            "opencode",
+            home / ".config" / "opencode" / "opencode.jsonc",
+            parse_jsonc,
+        )
+
+        # Only well-known OMP config files — never walk session trees.
+        for relative in (
+            Path(".omp") / "config.yml",
+            Path(".omp") / "config.yaml",
+            Path(".omp") / "agent" / "config.yml",
+            Path(".omp") / "agent" / "config.yaml",
+        ):
+            _add_file_catalog(
+                catalogs,
+                sources,
+                "omp",
+                home / relative,
+                _parse_yaml_document,
+            )
+
+    if allow_cli:
+        cli_specs = (
+            ("claude", "claude", ("--help",), _parse_claude_help),
+            # Codex has no simple catalog CLI; a failed `codex models`
+            # becomes a source error. Never spawn `codex app-server`.
+            ("codex", "codex", ("models",), _parse_codex_catalog),
+            ("opencode", "opencode", ("models",), _parse_line_catalog),
+            ("omp", "omp", ("models", "--json"), _parse_omp_catalog),
+            ("cursor", "cursor-agent", ("models",), _parse_cursor_catalog),
+        )
+        for harness, command, arguments, parser in cli_specs:
+            models, status = _run_catalog_cli(
+                command, arguments, home, env, parser
+            )
+            catalogs[harness].update(models)
+            sources[harness].append(status)
+
+    catalogs["omnigent"] = set().union(
+        *(catalogs[harness] for harness in EXECUTOR_HARNESSES)
+    )
+    sources["omnigent"].append(
+        _source_record("executor-union", catalogs["omnigent"])
+    )
+
+    available = {
+        harness: sorted(catalogs[harness])
+        for harness in CATALOG_HARNESSES
+    }
+    by_executor = {}
+    for harness in EXECUTOR_HARNESSES:
+        values = available[harness]
+        by_executor[harness] = list(values)
+        by_executor[f"{harness}-native"] = list(values)
+    return {
+        "available": available,
+        "by_executor": by_executor,
+        "sources": sources,
+    }
+
+
+def _catalog_cache_key(
+    home: Path | None, env, allow_cli: bool
+) -> tuple[str, str, bool]:
+    """Use only the documented inputs to identify an in-process cache entry."""
+    home_key = str(home) if home is not None else ""
+    if env is None:
+        path = os.environ.get("PATH", "")
+    else:
+        path = env.get("PATH", "")
+    return home_key, str(path or ""), bool(allow_cli)
+
+
+def harvest_catalog(
+    home,
+    *,
+    env=None,
+    allow_cli=False,
+    use_cache=True,
+) -> dict:
+    """Harvest model ids from an explicit home and optional harness CLIs."""
+    explicit_home = Path(home) if home is not None else None
+    cache_key = _catalog_cache_key(explicit_home, env, allow_cli)
+    now = time.monotonic()
+    if use_cache:
+        with _CATALOG_CACHE_LOCK:
+            cached = _CATALOG_CACHE.get(cache_key)
+            if cached is not None and now - cached[0] <= CATALOG_CACHE_SECONDS:
+                return copy.deepcopy(cached[1])
+
+    result = _harvest_catalog_uncached(explicit_home, env, bool(allow_cli))
+    with _CATALOG_CACHE_LOCK:
+        _CATALOG_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(result))
+    return copy.deepcopy(result)
+
+
+def collect_models(
+    root: Path,
+    home: Path | None = None,
+    *,
+    env=None,
+    allow_cli=False,
+) -> dict:
+    """Collect model rows and live catalogs from a repository and home."""
     root = Path(root)
     explicit_home = Path(home) if home is not None else None
     frontmatter = _frontmatter_sources(root)
@@ -371,19 +831,26 @@ def collect_models(root: Path, home: Path | None = None) -> dict:
     omp_models, omp_path = _omp_overrides(explicit_home)
     jsonc_models, jsonc_path = _opencode_jsonc(root, explicit_home)
     trioctl_models, trioctl_path = _trioctl_models(root)
+    catalog = harvest_catalog(
+        explicit_home,
+        env=env,
+        allow_cli=allow_cli,
+    )
+    catalog_sets = {
+        harness: set(models)
+        for harness, models in catalog["available"].items()
+    }
 
-    sources = {
+    row_sources = {
         harness: dict(agents) for harness, agents in frontmatter.items()
     }
     if omnigent:
-        sources["omnigent"] = omnigent
+        row_sources["omnigent"] = omnigent
 
     rows = []
-    curated = _curated_models()
-    available = _available_models(explicit_home, curated)
     for harness in ("claude", "codex", "omp", "opencode", "omnigent"):
-        for agent in sorted(sources.get(harness, {})):
-            source = sources[harness][agent]
+        for agent in sorted(row_sources.get(harness, {})):
+            source = row_sources[harness][agent]
             layers = {
                 "frontmatter": source.get("model"),
                 "omp-config": omp_models.get(agent),
@@ -402,7 +869,10 @@ def collect_models(root: Path, home: Path | None = None) -> dict:
             elif layer == "omnigent-executor":
                 override_file = source.get("executor_path")
 
-            known = model is not None and model in available.get(harness, set())
+            known = (
+                model is not None
+                and model in catalog_sets.get(harness, set())
+            )
             rows.append({
                 "harness": harness,
                 "agent": agent,
@@ -418,7 +888,49 @@ def collect_models(root: Path, home: Path | None = None) -> dict:
     return {
         "root": str(root),
         "rows": rows,
-        "available": {
-            harness: sorted(models) for harness, models in available.items()
-        },
+        "available": catalog["available"],
+        "by_executor": catalog["by_executor"],
+        "sources": catalog["sources"],
     }
+
+
+def _refresh_curated_file() -> int:
+    """Refresh only the checked-in fallback file from the live catalog."""
+    catalog = harvest_catalog(
+        Path.home(),
+        env=os.environ,
+        allow_cli=True,
+        use_cache=False,
+    )
+    path = Path(__file__).with_name("models.json")
+    path.write_text(
+        json.dumps(catalog["available"], indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+    for harness in CATALOG_HARNESSES:
+        print(f"{harness}: {len(catalog['available'][harness])}")
+        for source in catalog["sources"][harness]:
+            if not source["ok"]:
+                print(
+                    f"{harness}: {source['source']}: {source['error']}",
+                    file=sys.stderr,
+                )
+    return 0
+
+
+def main(argv=None) -> int:
+    """Run the offline-fallback refresh command when requested."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="harvest live catalogs into registry/models.json",
+    )
+    args = parser.parse_args(argv)
+    if not args.refresh:
+        parser.error("one of --refresh is required")
+    return _refresh_curated_file()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

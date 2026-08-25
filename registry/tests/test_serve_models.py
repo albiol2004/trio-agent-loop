@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -47,6 +48,10 @@ class DashboardModelsTestCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.TemporaryDirectory()
         self.original_home = serve.HOME
+        self.original_path = os.environ.get("PATH")
+        self.empty_bin = Path(self.home.name) / "empty-bin"
+        self.empty_bin.mkdir()
+        os.environ["PATH"] = str(self.empty_bin)
         serve.HOME = Path(self.home.name)
         self.server = serve.DashboardServer(
             ("127.0.0.1", 0),
@@ -64,6 +69,10 @@ class DashboardModelsTestCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
         serve.HOME = self.original_home
+        if self.original_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = self.original_path
         self.home.cleanup()
 
     def url(self, root: Path | None = REPO_ROOT) -> str:
@@ -78,6 +87,26 @@ class ModelsEndpointTests(DashboardModelsTestCase):
     def test_models_endpoint_returns_resolved_rows(self):
         status, payload = _get_json(self.url())
         self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            set(payload["available"]),
+            {"claude", "codex", "omp", "opencode", "cursor", "omnigent"},
+        )
+        self.assertEqual(
+            set(payload["by_executor"]),
+            {
+                "claude", "claude-native", "codex", "codex-native",
+                "cursor", "cursor-native", "omp", "omp-native",
+                "opencode", "opencode-native",
+            },
+        )
+        self.assertEqual(
+            set(payload["sources"]),
+            set(payload["available"]),
+        )
+        self.assertEqual(
+            payload["by_executor"]["cursor"],
+            payload["by_executor"]["cursor-native"],
+        )
         rows = {
             (row["harness"], row["agent"]): row
             for row in payload["rows"]

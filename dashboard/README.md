@@ -95,7 +95,8 @@ Registry and agents:
 - `GET /api/registry/topology?root=<repository>&workflow=<name>` —
   deterministic node and edge graphs below root; `workflow` is `roles`
   (default), `productionize`, or `entrypoints`
-- `GET /api/registry/models?root=<repository>` — resolved model rows per agent, showing layer and availability
+- `GET /api/registry/models?root=<repository>` — resolved model rows per agent,
+  plus `available`, `by_executor`, and per-source `sources` status
 - `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
 
 ## Skills editor
@@ -175,9 +176,11 @@ defined below the selected repository root. Resolution follows frontmatter,
 explicit OMP overrides, OpenCode JSONC, trioctl role fallbacks, and Omnigent
 executor configuration in that order.
 
-`GET /api/registry/models?root=<repository>` returns the same rows as JSON.
-Optional live model lists are read only from the dashboard process home; an
-unknown custom model is reported as a warning and does not fail the request.
+`GET /api/registry/models?root=<repository>` returns the resolved rows plus
+`available` catalogs, `by_executor` short/native aliases, and `sources` status
+records. Optional live model lists are read only from the dashboard process
+home; an unknown custom model is reported as a warning and does not fail the
+request.
 Model pins declared in frontmatter can be edited from the page. Runtime
 override sources remain read-only; their paths link to the Skills editor.
 

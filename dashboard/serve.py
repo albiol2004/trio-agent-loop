@@ -70,7 +70,8 @@ Registry (format-aware):
         file). `source` is the generate.py prompt/overlay descriptor or null.
 
     GET /api/registry/models?root=<absolute-path>
-    Response: {"root", "rows"} describing model resolution for each agent.
+    Response: {"root", "rows", "available", "by_executor", "sources"}.
+        The catalog fields describe available model ids and source status.
         The root query is required; optional runtime overrides are read only
         from the dashboard process home.
 
@@ -1733,7 +1734,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_registry_models(self, root: Path) -> None:
         """Return model resolution rows for an explicit root."""
         models = load_models_module()
-        self._send_json(200, models.collect_models(root, home=HOME))
+        self._send_json(
+            200,
+            models.collect_models(
+                root,
+                home=HOME,
+                env=os.environ,
+                allow_cli=True,
+            ),
+        )
 
     def _handle_registry_health(self, root: Path) -> None:
         """Return lineage and installation health for an explicit root."""
