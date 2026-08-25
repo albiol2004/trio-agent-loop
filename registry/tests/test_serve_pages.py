@@ -88,7 +88,7 @@ class TopologyPageTests(DashboardPagesTestCase):
         for marker in (
             "topbar-meta", "/nav.js", "/topology.js", "page-state",
             "topology-graph", "topology-svg", "compare-toggle",
-            "compare-list",
+            "compare-list", "home-toggle",
             "harness-select",
         ):
             with self.subTest(marker=marker):

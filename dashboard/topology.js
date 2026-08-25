@@ -22,10 +22,16 @@
   const topologySvg = $("topology-svg");
   const compareToggle = $("compare-toggle"), comparePanel = $("compare-panel");
   const compareList = $("compare-list");
+  const homeToggle = $("home-toggle");
+  let homeToggleTouched = false, homeQueryInitialized = false;
   // Match nav.js: the selected workspace is always sent to the API.
   function withRoot(url) {
     const params = new URLSearchParams({workflow: currentWorkflow});
     if (currentRoot) params.set("root", currentRoot);
+    // Let the server choose the installed-copy default on the first request.
+    if (homeQueryInitialized || homeToggleTouched) {
+      params.set("home", homeToggle.checked ? "1" : "0");
+    }
     return `${url}?${params}`;
   }
   function createSvg(name, attributes = {}) {
@@ -47,7 +53,8 @@
         .map((node) => ({
           kind: LAYERS.includes(node.kind) ? node.kind : "agent",
           name: String(node.name), path: String(node.path || ""),
-          output: Boolean(node.output)
+          output: Boolean(node.output),
+          origin: node.origin === "installed" ? "installed" : "workspace"
         }));
       const edges = (raw && Array.isArray(raw.edges) ? raw.edges : [])
         .filter((edge) => edge && edge.src != null && edge.dst != null);
@@ -73,13 +80,14 @@
   }
   function drawNode(node, position) {
     const group = createSvg("g", { class: `topology-node kind-${node.kind}` });
+    if (node.origin === "installed") group.classList.add("origin-installed");
     group.append(createSvg("rect", {
       x: position.x - BW / 2, y: position.y - BH / 2,
       width: BW, height: BH, rx: 4
     }), svgText(fitLabel(node.name), {
       class: "topology-node-label",
       x: position.x - BW / 2 + 10, y: position.y - 4
-    }), svgText(node.kind, {
+    }), svgText(`${node.kind} · ${node.origin}`, {
       class: "topology-node-meta",
       x: position.x - BW / 2 + 10, y: position.y + 14
     }));
@@ -193,6 +201,11 @@
   compareToggle.addEventListener("change", () => {
     comparePanel.hidden = !compareToggle.checked;
   });
+  homeToggle.addEventListener("change", () => {
+    homeToggleTouched = true;
+    homeQueryInitialized = true;
+    refresh();
+  });
   harnessSelect.addEventListener("change", () => {
     currentHarness = harnessSelect.value;
     renderGraph();
@@ -215,6 +228,10 @@
       }
       if (!data || typeof data !== "object" || !data.graphs) {
         throw new Error("Topology response is missing graphs");
+      }
+      if (!homeToggleTouched && typeof data.include_home === "boolean") {
+        homeToggle.checked = data.include_home;
+        homeQueryInitialized = true;
       }
       graphs = parseGraphs(data);
       renderHarnesses(); renderGraph(); renderComparison();

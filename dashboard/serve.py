@@ -79,6 +79,12 @@ Registry (format-aware):
     Response: lineage, manifest, installation, generator-check, and dangling
         artifact health for the explicit repository and optional dashboard home.
 
+    GET /api/registry/topology?root=<absolute-path>&workflow=<name>&home=<bool>
+    Response: {"root", "workflow", "graphs", "include_home"}.
+        ``home`` accepts 0, 1, true, or false (case-insensitive). When omitted,
+        installed graphs are included only by the installed trio-dash copy,
+        which has no sibling ``omnigent`` directory.
+
     GET /api/registry/schema
     Response: {"destinations": {<harness>: {
                    <surface>: {"project": <relative-path>|null,
@@ -1732,12 +1738,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_registry_topology(
-        self, root: Path, workflow: str = "roles"
+        self, root: Path, workflow: str = "roles",
+        include_home: bool = False,
     ) -> None:
-        """Return the canonical harness topology for an explicit root."""
+        """Return topology for an explicit root and optional dashboard home."""
         topology = load_topology_module()
-        self._send_json(
-            200, topology.collect_topology(root, workflow=workflow))
+        if include_home:
+            payload = topology.collect_topology(
+                root, home=HOME, workflow=workflow)
+        else:
+            payload = topology.collect_topology(root, workflow=workflow)
+        payload["include_home"] = include_home
+        self._send_json(200, payload)
 
     def _handle_registry_models(self, root: Path) -> None:
         """Return model resolution rows for an explicit root."""
@@ -3008,8 +3020,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             root = self._request_root(query)
             if root is None:
                 return
+            home_values = query.get("home")
+            if home_values:
+                home_value = home_values[0].strip().casefold()
+                if home_value in ("1", "true"):
+                    include_home = True
+                elif home_value in ("0", "false"):
+                    include_home = False
+                else:
+                    return self._send_json(
+                        400,
+                        {"error": "home must be 0, 1, true, or false"},
+                    )
+            else:
+                # Repo checkouts have the workspace's Omnigent sources nearby;
+                # installed trio-dash copies rely on the explicit home scan.
+                include_home = not (
+                    DASHBOARD_DIR.parent / "omnigent"
+                ).is_dir()
             return self._api(
-                lambda: self._handle_registry_topology(root, workflow))
+                lambda: self._handle_registry_topology(
+                    root, workflow, include_home))
         if path == "/api/registry/models":
             if not query.get("root"):
                 return self._send_json(400, {"error": "root is required"})

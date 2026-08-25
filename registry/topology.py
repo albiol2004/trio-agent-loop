@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Build deterministic topology graphs from canonical harness files.
 
-Only the repository passed by the caller is scanned.  This module never
-infers or reads ``Path.home()`` for a dashboard request.
+Only the repository and optional home paths passed by the caller are scanned.
+This module never infers or reads ``Path.home()`` for a dashboard request.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -21,6 +22,14 @@ PRODUCTIONIZE_WRAPPERS = (
     ("opencode", "opencode/commands/trio-productionize.md"),
     ("kimi", "kimi/skills/trio-productionize/SKILL.md"),
     ("zcode", "zcode/skills/trio-productionize/SKILL.md"),
+)
+INSTALLED_PRODUCTIONIZE_WRAPPERS = (
+    ("claude", ".claude/skills/trio-productionize/SKILL.md"),
+    ("codex", ".agents/skills/trio-productionize/SKILL.md"),
+    ("omp", ".omp/agent/commands/trio-productionize.md"),
+    ("opencode", ".config/opencode/commands/trio-productionize.md"),
+    ("kimi", ".kimi-code/skills/trio-productionize/SKILL.md"),
+    ("zcode", ".zcode/skills/trio-productionize/SKILL.md"),
 )
 WORKFLOWS = frozenset(("roles", "productionize", "entrypoints"))
 
@@ -65,24 +74,29 @@ def _parse(path: Path, fmt: str = "frontmatter") -> tuple[dict, str]:
 
 
 def _node(kind: str, name: str, harness: str, path: Path,
-          model=None, tool_policy=None, output=None) -> dict:
+          model=None, tool_policy=None, output=None, *, origin="workspace") -> dict:
     return dict(kind=kind, name=str(name), harness=harness, path=str(path),
                 model=model or None, tool_policy=tool_policy or None,
-                output=bool(output) if kind == "agent" else False)
+                output=bool(output) if kind == "agent" else False,
+                origin=origin)
 
 
 class _Graph:
     """Small deduplicating graph builder shared by all harness adapters."""
 
-    def __init__(self):
+    def __init__(self, origin="workspace"):
         self.nodes = {}
         self.edges = {}
+        self.origin = origin
 
     def node(self, kind, name, harness, path, model=None, tool_policy=None,
-             output=None):
+             output=None, *, origin=None):
         key = (kind, str(name))
+        node_origin = self.origin if origin is None else origin
         self.nodes.setdefault(
-            key, _node(kind, name, harness, path, model, tool_policy, output))
+            key, _node(
+                kind, name, harness, path, model, tool_policy, output,
+                origin=node_origin))
 
     def edge(self, edge_type, src, dst):
         key = (edge_type, str(src), str(dst))
@@ -90,12 +104,14 @@ class _Graph:
             type=edge_type, src=str(src), dst=str(dst))
 
     def agent(self, harness, name, path, model=None, tool_policy=None,
-              output=None):
+              output=None, *, origin=None):
         name = str(name)
         model = str(model).strip() if model is not None else ""
-        self.node("agent", name, harness, path, model, tool_policy, output)
+        self.node(
+            "agent", name, harness, path, model, tool_policy, output,
+            origin=origin)
         if model:
-            self.node("model", model, harness, path, model)
+            self.node("model", model, harness, path, model, origin=origin)
             self.edge("invokes", name, model)
 
     def result(self) -> dict:
@@ -301,15 +317,17 @@ def _productionize_surface(path: Path) -> str:
     return "skill" if path.name == "SKILL.md" else "command"
 
 
-def _collect_productionize(root: Path) -> dict:
-    """Collect one graph per in-repository trio-productionize wrapper."""
+def _collect_productionize(root: Path, *, origin="workspace",
+                           wrappers=None) -> dict:
+    """Collect one graph per trio-productionize wrapper."""
     graphs = {}
-    for harness, relative in PRODUCTIONIZE_WRAPPERS:
+    wrappers = PRODUCTIONIZE_WRAPPERS if wrappers is None else wrappers
+    for harness, relative in wrappers:
         path = root / relative
         if not path.is_file():
             continue
 
-        graph = _Graph()
+        graph = _Graph(origin)
         section = _dispatch_section(_text(path))
         entrypoint = "trio-productionize"
         parsed = False
@@ -329,7 +347,7 @@ def _collect_productionize(root: Path) -> dict:
                         graph.edge(mechanism, entrypoint, target)
         if not parsed:
             # Keep a present but malformed wrapper visible to the dashboard.
-            graph = _Graph()
+            graph = _Graph(origin)
             graph.node(
                 "warning", "unparseable-dispatch-table", harness, path)
         graphs[harness] = graph.result()
@@ -341,9 +359,9 @@ def _files(root: Path, relative: str | None, pattern: str):
 
 
 def _markdown(root: Path, harness: str, *, agents=None, commands=None,
-              skills=None, policy_kind=None) -> _Graph:
+              skills=None, policy_kind=None, origin="workspace") -> _Graph:
     """Collect the shared command, skill, and Markdown-agent conventions."""
-    graph = _Graph()
+    graph = _Graph(origin)
     for path in _files(root, commands, "*.md"):
         fields, body = _parse(path)
         name = path.stem
@@ -370,34 +388,44 @@ def _markdown(root: Path, harness: str, *, agents=None, commands=None,
     return graph
 
 
-def _collect_opencode(root: Path) -> dict:
+def _collect_opencode(root: Path, *, origin="workspace",
+                      agents="opencode/agents",
+                      commands="opencode/commands") -> dict:
     return _markdown(
-        root, "opencode", agents="opencode/agents",
-        commands="opencode/commands", policy_kind="opencode").result()
+        root, "opencode", agents=agents, commands=commands,
+        policy_kind="opencode", origin=origin).result()
 
 
-def _collect_omp(root: Path) -> dict:
+def _collect_omp(root: Path, *, origin="workspace",
+                 agents="omp/agents", commands="omp/commands") -> dict:
     return _markdown(
-        root, "omp", agents="omp/agents", commands="omp/commands",
-        policy_kind="omp").result()
+        root, "omp", agents=agents, commands=commands,
+        policy_kind="omp", origin=origin).result()
 
 
-def _collect_claude(root: Path) -> dict:
+def _collect_claude(root: Path, *, origin="workspace",
+                    agents=".claude/agents",
+                    skills=".claude/skills") -> dict:
     return _markdown(
-        root, "claude", agents=".claude/agents", skills=".claude/skills",
-        policy_kind="claude").result()
+        root, "claude", agents=agents, skills=skills,
+        policy_kind="claude", origin=origin).result()
 
 
-def _collect_cursor(root: Path) -> dict:
+def _collect_cursor(root: Path, *, origin="workspace",
+                    agents=".cursor/agents",
+                    commands=".cursor/commands",
+                    skills=".cursor/skills") -> dict:
     return _markdown(
-        root, "cursor", agents=".cursor/agents", skills=".cursor/skills",
-        commands=".cursor/commands").result()
+        root, "cursor", agents=agents, skills=skills, commands=commands,
+        origin=origin).result()
 
 
-def _collect_codex(root: Path) -> dict:
-    graph = _markdown(root, "codex", skills="codex/skills")
+def _collect_codex(root: Path, *, origin="workspace",
+                   agents="codex/agents", skills="codex/skills") -> dict:
+    graph = _markdown(
+        root, "codex", skills=skills, origin=origin)
     role_re = re.compile(r"\btrio-[a-z0-9][a-z0-9-]*\b")
-    for path in _files(root, "codex/agents", "*.toml"):
+    for path in _files(root, agents, "*.toml"):
         fields, _ = _parse(path, "toml")
         name = path.stem
         sandbox = fields.get("sandbox_mode")
@@ -414,24 +442,44 @@ def _collect_codex(root: Path) -> dict:
     return graph.result()
 
 
-def _collect_omnigent(root: Path) -> dict:
-    graph = _Graph()
-    roles = root / "omnigent" / "trio-omnigent-roles"
-    if not roles.is_dir():
-        return graph.result()
-    for role in sorted(roles.iterdir()):
-        path = role / "config.yaml"
-        if not role.is_dir() or not path.is_file():
-            continue
-        fields, _ = _parse(path, "yaml")
-        executor = fields.get("executor")
-        executor = executor if isinstance(executor, dict) else {}
-        spawn = fields.get("spawn")
-        graph.agent(
-            "omnigent", fields.get("name") or role.name, path,
-            executor.get("model"),
-            f"spawn: {str(spawn).lower()}" if spawn is not None else None,
-            output=fields.get("output"))
+def _collect_omnigent(root: Path, *, roles=None, origin="workspace") -> dict:
+    """Collect Omnigent role configs and optional registered role names."""
+    graph = _Graph(origin)
+    roles = (
+        Path(roles) if roles is not None
+        else root / "omnigent" / "trio-omnigent-roles"
+    )
+    config_names = set()
+    if roles.is_dir():
+        for role in sorted(roles.iterdir()):
+            path = role / "config.yaml"
+            if not role.is_dir() or not path.is_file():
+                continue
+            fields, _ = _parse(path, "yaml")
+            executor = fields.get("executor")
+            executor = executor if isinstance(executor, dict) else {}
+            spawn = fields.get("spawn")
+            name = str(fields.get("name") or role.name)
+            config_names.update((name, role.name))
+            graph.agent(
+                "omnigent", name, path, executor.get("model"),
+                f"spawn: {str(spawn).lower()}" if spawn is not None else None,
+                output=fields.get("output"))
+
+    # The registry is a name index, not a replacement for a role config.
+    registry = roles / "registry.json"
+    if registry.is_file():
+        try:
+            registered = json.loads(_text(registry))
+        except (TypeError, ValueError):
+            registered = {}
+        if isinstance(registered, dict):
+            for name, value in registered.items():
+                if name == "_profile" or not isinstance(value, dict):
+                    continue
+                if str(name) in config_names:
+                    continue
+                graph.node("agent", name, "omnigent", registry)
     return graph.result()
 
 
@@ -444,9 +492,12 @@ def _pi_policy(source: str, label: str) -> str | None:
     return f"{label}={','.join(tools)}" if tools else None
 
 
-def _collect_pi(root: Path) -> dict:
-    graph = _Graph()
-    path = root / "pi" / "extensions" / "trio.ts"
+def _collect_pi(root: Path, *, extension=None, origin="workspace") -> dict:
+    graph = _Graph(origin)
+    path = (
+        Path(extension) if extension is not None
+        else root / "pi" / "extensions" / "trio.ts"
+    )
     source = _text(path)
     command_re = re.compile(
         r"""(?:pi\.)?registerCommand\(\s*["']([^"']+)""")
@@ -493,7 +544,9 @@ def _entrypoint_graph(source: _Graph | dict) -> dict:
     graph = _Graph()
 
     for node in entrypoints.values():
-        graph.node("entrypoint", node["name"], node["harness"], node["path"])
+        graph.node(
+            "entrypoint", node["name"], node["harness"], node["path"],
+            origin=node.get("origin", "workspace"))
 
     for edge in outbound:
         destination = agents.get(edge["dst"])
@@ -506,6 +559,7 @@ def _entrypoint_graph(source: _Graph | dict) -> dict:
                 edge["dst"],
                 entrypoint["harness"],
                 entrypoint["path"],
+                origin=entrypoint.get("origin", "workspace"),
             )
         else:
             graph.node(
@@ -516,15 +570,18 @@ def _entrypoint_graph(source: _Graph | dict) -> dict:
                 destination.get("model"),
                 destination.get("tool_policy"),
                 destination.get("output"),
+                origin=destination.get("origin", "workspace"),
             )
         graph.edge(edge["type"], edge["src"], edge["dst"])
 
     return graph.result()
 
 
-def _collect_omnigent_entrypoints(root: Path) -> dict:
+def _collect_omnigent_entrypoints(
+    root: Path, *, origin="workspace", entrypoint_paths=None, roles=None
+) -> dict:
     """Collect Omnigent entrypoints and the roles they explicitly dispatch."""
-    source = _Graph()
+    source = _Graph(origin)
     entrypoint_root = root / "omnigent" / "entrypoints"
     linked_targets = set()
     dispatch_targets = {
@@ -538,8 +595,16 @@ def _collect_omnigent_entrypoints(root: Path) -> dict:
         ),
     }
 
-    for path in sorted(entrypoint_root.glob("*/SKILL.md")):
+    paths = (
+        sorted(entrypoint_root.glob("*/SKILL.md"))
+        if entrypoint_paths is None else entrypoint_paths
+    )
+    seen_names = set()
+    for path in paths:
         name = path.parent.name
+        if name in seen_names:
+            continue
+        seen_names.add(name)
         source.node("entrypoint", name, "omnigent", path)
         for target in dispatch_targets.get(name, ()):
             source.edge("dispatches_to", name, target)
@@ -547,7 +612,8 @@ def _collect_omnigent_entrypoints(root: Path) -> dict:
 
     role_nodes = {
         node["name"]: node
-        for node in _collect_omnigent(root)["nodes"]
+        for node in _collect_omnigent(
+            root, roles=roles, origin=origin)["nodes"]
         if node["kind"] == "agent"
     }
     for target in linked_targets:
@@ -562,12 +628,13 @@ def _collect_omnigent_entrypoints(root: Path) -> dict:
             role.get("model"),
             role.get("tool_policy"),
             role.get("output"),
+            origin=role.get("origin", origin),
         )
 
     return _entrypoint_graph(source)
 
 
-def _collect_entrypoints(root: Path) -> dict:
+def _collect_entrypoints(root: Path, *, origin="workspace") -> dict:
     """Collect entrypoint-only graphs without role or productionize meshes."""
     graphs = {}
     source_collectors = (
@@ -580,16 +647,20 @@ def _collect_entrypoints(root: Path) -> dict:
     )
     for harness, directory, collector in source_collectors:
         if (root / directory).is_dir():
-            graphs[harness] = _entrypoint_graph(collector(root))
+            graphs[harness] = _entrypoint_graph(
+                collector(root, origin=origin))
 
     if (root / "kimi").is_dir():
         graphs["kimi"] = _entrypoint_graph(
-            _markdown(root, "kimi", skills="kimi/skills"))
+            _markdown(
+                root, "kimi", skills="kimi/skills", origin=origin))
     if (root / "zcode").is_dir():
         graphs["zcode"] = _entrypoint_graph(
-            _markdown(root, "zcode", skills="zcode/skills"))
+            _markdown(
+                root, "zcode", skills="zcode/skills", origin=origin))
     if (root / "omnigent").is_dir():
-        graphs["omnigent"] = _collect_omnigent_entrypoints(root)
+        graphs["omnigent"] = _collect_omnigent_entrypoints(
+            root, origin=origin)
     if (root / "bridge").is_dir():
         graphs["bridge"] = _entrypoint_graph(
             _markdown(
@@ -597,31 +668,166 @@ def _collect_entrypoints(root: Path) -> dict:
                 "bridge",
                 commands="bridge/commands",
                 skills="bridge/skills",
+                origin=origin,
             ))
     return graphs
 
 
-def collect_topology(root: Path, *, home: Path | None = None,
-                     workflow: str = "roles") -> dict:
-    """Scan canonical copies below ``root`` for one supported workflow."""
-    # ``home`` is explicit but unused: this slice is repository-layout only.
-    _ = home
-    if workflow not in WORKFLOWS:
-        raise ValueError(f"unknown topology workflow: {workflow}")
-    root = Path(root)
-    if workflow == "productionize":
-        return {
-            "root": str(root),
-            "workflow": workflow,
-            "graphs": _collect_productionize(root),
-        }
-    if workflow == "entrypoints":
-        return {
-            "root": str(root),
-            "workflow": workflow,
-            "graphs": _collect_entrypoints(root),
-        }
+def _has_dir(root: Path, *relatives: str) -> bool:
+    """Return whether any of the listed relative layout directories exists."""
+    return any((root / relative).is_dir() for relative in relatives)
 
+
+def _collect_installed_roles(home: Path) -> dict:
+    """Collect role graphs from documented user-global harness locations."""
+    graphs = {}
+    collectors = (
+        (
+            "claude",
+            (".claude/agents", ".claude/skills"),
+            lambda: _collect_claude(home, origin="installed"),
+        ),
+        (
+            "cursor",
+            (".cursor/agents", ".cursor/skills", ".cursor/commands"),
+            lambda: _collect_cursor(home, origin="installed"),
+        ),
+        (
+            "codex",
+            (".codex/agents", ".agents/skills"),
+            lambda: _collect_codex(
+                home, origin="installed", agents=".codex/agents",
+                skills=".agents/skills"),
+        ),
+        (
+            "omp",
+            (".omp/agent/agents", ".omp/agent/commands"),
+            lambda: _collect_omp(
+                home, origin="installed", agents=".omp/agent/agents",
+                commands=".omp/agent/commands"),
+        ),
+        (
+            "opencode",
+            (".config/opencode/agents", ".config/opencode/commands"),
+            lambda: _collect_opencode(
+                home, origin="installed",
+                agents=".config/opencode/agents",
+                commands=".config/opencode/commands"),
+        ),
+    )
+    for harness, directories, collector in collectors:
+        if _has_dir(home, *directories):
+            graphs[harness] = collector()
+
+    roles = home / ".omnigent" / "agents" / "trio-omnigent-roles"
+    if roles.is_dir() or (roles / "registry.json").is_file():
+        graphs["omnigent"] = _collect_omnigent(
+            home, roles=roles, origin="installed")
+
+    # Installed Kimi/Zcode surfaces are skill trees, not repo copies.
+    for harness, relative in (
+        ("kimi", ".kimi-code/skills"),
+        ("zcode", ".zcode/skills"),
+    ):
+        if _has_dir(home, relative):
+            graphs[harness] = _markdown(
+                home, harness, skills=relative,
+                origin="installed").result()
+
+    # Pi has one documented global extension location; do not guess another.
+    extension = home / ".pi" / "agent" / "extensions" / "trio.ts"
+    if extension.is_file():
+        graphs["pi"] = _collect_pi(
+            home, extension=extension, origin="installed")
+    return graphs
+
+
+def _collect_installed_entrypoint_paths(home: Path) -> list[Path]:
+    """Choose one global copy of each Omnigent entrypoint name."""
+    paths = []
+    for name in ("trio-omnigent", "trio-productionize-omnigent"):
+        candidates = (
+            home / ".claude" / "skills" / name / "SKILL.md",
+            home / ".agents" / "skills" / name / "SKILL.md",
+        )
+        for path in candidates:
+            if path.is_file():
+                paths.append(path)
+                break
+    return paths
+
+
+def _collect_installed_entrypoints(home: Path) -> dict:
+    """Collect entrypoint graphs from documented user-global locations."""
+    graphs = {}
+    collectors = (
+        (
+            "claude",
+            (".claude/agents", ".claude/skills"),
+            lambda: _entrypoint_graph(
+                _collect_claude(home, origin="installed")),
+        ),
+        (
+            "cursor",
+            (".cursor/agents", ".cursor/skills", ".cursor/commands"),
+            lambda: _entrypoint_graph(
+                _collect_cursor(home, origin="installed")),
+        ),
+        (
+            "codex",
+            (".codex/agents", ".agents/skills"),
+            lambda: _entrypoint_graph(
+                _collect_codex(
+                    home, origin="installed", agents=".codex/agents",
+                    skills=".agents/skills")),
+        ),
+        (
+            "omp",
+            (".omp/agent/agents", ".omp/agent/commands"),
+            lambda: _entrypoint_graph(
+                _collect_omp(
+                    home, origin="installed", agents=".omp/agent/agents",
+                    commands=".omp/agent/commands")),
+        ),
+        (
+            "opencode",
+            (".config/opencode/agents", ".config/opencode/commands"),
+            lambda: _entrypoint_graph(
+                _collect_opencode(
+                    home, origin="installed",
+                    agents=".config/opencode/agents",
+                    commands=".config/opencode/commands")),
+        ),
+    )
+    for harness, directories, collector in collectors:
+        if _has_dir(home, *directories):
+            graphs[harness] = collector()
+
+    for harness, relative in (
+        ("kimi", ".kimi-code/skills"),
+        ("zcode", ".zcode/skills"),
+    ):
+        if _has_dir(home, relative):
+            graphs[harness] = _entrypoint_graph(
+                _markdown(
+                    home, harness, skills=relative, origin="installed"))
+
+    extension = home / ".pi" / "agent" / "extensions" / "trio.ts"
+    if extension.is_file():
+        graphs["pi"] = _entrypoint_graph(
+            _collect_pi(home, extension=extension, origin="installed"))
+
+    roles = home / ".omnigent" / "agents" / "trio-omnigent-roles"
+    omnigent_paths = _collect_installed_entrypoint_paths(home)
+    if omnigent_paths or roles.is_dir() or (roles / "registry.json").is_file():
+        graphs["omnigent"] = _collect_omnigent_entrypoints(
+            home, origin="installed", entrypoint_paths=omnigent_paths,
+            roles=roles)
+    return graphs
+
+
+def _collect_roles(root: Path, *, origin="workspace") -> dict:
+    """Collect the repository-style role graphs for one source root."""
     collectors = (
         ("claude", ".claude", _collect_claude),
         ("cursor", ".cursor", _collect_cursor),
@@ -631,9 +837,66 @@ def collect_topology(root: Path, *, home: Path | None = None,
         ("omnigent", "omnigent", _collect_omnigent),
         ("pi", "pi", _collect_pi),
     )
-    graphs = {
-        name: collector(root)
+    return {
+        name: collector(root, origin=origin)
         for name, directory, collector in collectors
         if (root / directory).is_dir()
     }
+
+
+def _merge_graphs(*sources: dict | None) -> dict:
+    """Union graph edges while retaining the first node for each graph key."""
+    graph = _Graph()
+    for source in sources:
+        if not source:
+            continue
+        for node in source.get("nodes", ()):
+            graph.node(
+                node["kind"], node["name"], node["harness"], node["path"],
+                node.get("model"), node.get("tool_policy"),
+                node.get("output"),
+                origin=node.get("origin", "workspace"),
+            )
+        for edge in source.get("edges", ()):
+            graph.edge(edge["type"], edge["src"], edge["dst"])
+    return graph.result()
+
+
+def _merge_graph_maps(workspace: dict, installed: dict) -> dict:
+    """Merge same-harness graphs and retain harnesses from either source."""
+    names = sorted(set(workspace) | set(installed))
+    return {
+        name: _merge_graphs(workspace.get(name), installed.get(name))
+        for name in names
+    }
+
+
+def collect_topology(root: Path, *, home: Path | None = None,
+                     workflow: str = "roles") -> dict:
+    """Scan workspace graphs and optional installations from explicit paths."""
+    if workflow not in WORKFLOWS:
+        raise ValueError(f"unknown topology workflow: {workflow}")
+    root = Path(root)
+    home_path = Path(home) if home is not None else None
+    installed = {}
+    if home_path is not None and home_path.is_dir():
+        # Workspace wins duplicate keys; Path.home() is forbidden because
+        # requests must never scan an implicit user's home.
+        # The explicit home is the only source allowed for installed graphs.
+        if workflow == "productionize":
+            installed = _collect_productionize(
+                home_path, origin="installed",
+                wrappers=INSTALLED_PRODUCTIONIZE_WRAPPERS)
+        elif workflow == "entrypoints":
+            installed = _collect_installed_entrypoints(home_path)
+        else:
+            installed = _collect_installed_roles(home_path)
+
+    if workflow == "productionize":
+        workspace = _collect_productionize(root)
+    elif workflow == "entrypoints":
+        workspace = _collect_entrypoints(root)
+    else:
+        workspace = _collect_roles(root)
+    graphs = _merge_graph_maps(workspace, installed)
     return {"root": str(root), "workflow": workflow, "graphs": graphs}

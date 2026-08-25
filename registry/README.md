@@ -58,10 +58,11 @@ Key functions:
 
 ## `topology.py` — canonical harness graph
 
-`collect_topology(root, workflow="roles")` scans the canonical harness copies
-below the explicit repository `root` and returns stable node/edge graphs for
-Claude, Cursor, Codex, OMP, OpenCode, Omnigent, and Pi. The workflow parameter selects
-the graph source:
+`collect_topology(root, home=None, workflow="roles")` scans the canonical harness
+copies below the explicit repository `root` and, when `home` is an existing
+directory, the documented installed harness layouts below that explicit path.
+It returns stable node/edge graphs for Claude, Cursor, Codex, OMP, OpenCode,
+Omnigent, and Pi. The workflow parameter selects the graph source:
 - `roles` (default) — canonical agent and model declarations from harness directories
 - `productionize` — scans each in-repository `trio-productionize` wrapper;
   records executor roles from each wrapper's `## Dispatch table` section (unparseable
@@ -69,14 +70,17 @@ the graph source:
 - `entrypoints` — scans Trio entrypoints and records destination-agent wiring
 
 All workflows reuse `scan.py` parsers, record declared models, tool policies, and
-non-empty agent output schemas, and never fall back to `Path.home()`.
+non-empty agent output schemas. Every node has an `origin` of `workspace` or
+`installed`; duplicate `(kind, name)` nodes prefer the workspace copy. The
+collector never infers a home directory or falls back to `Path.home()`.
 
 ### Graph schema
 
 Each harness graph contains:
 - **Nodes** (sorted by kind, then name): `kind` (agent/model/entrypoint/warning),
   `name`, `harness`, `path`, `model` (if applicable), `tool_policy`
-  (read-only/edit/spawn), `output` (true if agent declares output schema)
+  (read-only/edit/spawn), `output` (true if agent declares output schema),
+  `origin` (`workspace` or `installed`)
 - **Edges** (sorted by type, src, dst): `type`
   (spawns/invokes/dispatches_to or productionize subagent/skill/command),
   `src`, `dst`

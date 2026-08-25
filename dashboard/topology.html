@@ -79,6 +79,9 @@
   .topology-node.kind-model rect { stroke: var(--amber); }
   .topology-node.kind-warning rect { stroke: var(--red); }
   .topology-node.is-external rect { stroke-dasharray: 4 3; opacity: .75; }
+  .topology-node.origin-installed rect {
+    stroke-dasharray: 2 3; opacity: .82;
+  }
   .topology-node.is-clickable { cursor: pointer; }
   .topology-node.is-clickable:hover rect,
   .topology-node.is-clickable:focus rect {
@@ -149,6 +152,10 @@
       <label class="topology-toggle" for="compare-toggle">
         <input id="compare-toggle" type="checkbox">
         <span>Compare wiring</span>
+      </label>
+      <label class="topology-toggle" for="home-toggle">
+        <input id="home-toggle" type="checkbox">
+        <span>include installed</span>
       </label>
       <span id="topology-summary" class="topology-summary">waiting for workspace…</span>
     </section>

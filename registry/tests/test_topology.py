@@ -102,6 +102,116 @@ class TopologyCollectorTests(unittest.TestCase):
         self.assertIn(("entrypoint", "demo", "cursor"), node_keys)
         self.assertIn(("agent", "demo", "cursor"), node_keys)
 
+    def test_explicit_home_collects_installed_omnigent_topology(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "workspace"
+            home = base / "home"
+            root.mkdir()
+            role = (
+                home / ".omnigent" / "agents" /
+                "trio-omnigent-roles" / "lead")
+            role.mkdir(parents=True)
+            (role / "config.yaml").write_text(
+                "name: installed-omnigent-role\n"
+                "executor:\n"
+                "  model: test/installed-model\n",
+                encoding="utf-8",
+            )
+            for parent in (
+                home / ".claude" / "skills" / "trio-omnigent",
+                home / ".agents" / "skills" / "trio-omnigent",
+            ):
+                parent.mkdir(parents=True)
+                (parent / "SKILL.md").write_text(
+                    "# Installed Omnigent entrypoint\n",
+                    encoding="utf-8",
+                )
+            productionize = (
+                home / ".claude" / "skills" /
+                "trio-productionize-omnigent" / "SKILL.md")
+            productionize.parent.mkdir(parents=True)
+            productionize.write_text(
+                "# Installed productionize entrypoint\n",
+                encoding="utf-8",
+            )
+
+            roles = topology.collect_topology(root, home=home)
+            entrypoints = topology.collect_topology(
+                root, home=home, workflow="entrypoints")
+            workspace_only = topology.collect_topology(root)
+
+        role_nodes = roles["graphs"]["omnigent"]["nodes"]
+        installed_role = next(
+            node for node in role_nodes
+            if node["name"] == "installed-omnigent-role")
+        self.assertEqual(installed_role["origin"], "installed")
+        entrypoint = next(
+            node for node in entrypoints["graphs"]["omnigent"]["nodes"]
+            if node["kind"] == "entrypoint" and
+            node["name"] == "trio-omnigent")
+        self.assertEqual(entrypoint["origin"], "installed")
+        self.assertEqual(
+            entrypoint["path"],
+            str(home / ".claude" / "skills" /
+                "trio-omnigent" / "SKILL.md"),
+        )
+        self.assertNotIn("omnigent", workspace_only["graphs"])
+
+    def test_workspace_node_wins_installed_name_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "workspace"
+            home = base / "home"
+            workspace_agent = root / ".claude" / "agents" / "shared.md"
+            installed_agent = home / ".claude" / "agents" / "shared.md"
+            workspace_agent.parent.mkdir(parents=True)
+            installed_agent.parent.mkdir(parents=True)
+            workspace_agent.write_text(
+                "---\nname: shared\nmodel: workspace/model\n---\n",
+                encoding="utf-8",
+            )
+            installed_agent.write_text(
+                "---\nname: shared\nmodel: installed/model\n---\n",
+                encoding="utf-8",
+            )
+
+            result = topology.collect_topology(root, home=home)
+
+        shared = next(
+            node for node in result["graphs"]["claude"]["nodes"]
+            if node["kind"] == "agent" and node["name"] == "shared")
+        self.assertEqual(shared["origin"], "workspace")
+        self.assertEqual(shared["path"], str(workspace_agent))
+
+    def test_installed_omnigent_registry_adds_unmaterialized_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "workspace"
+            root.mkdir()
+            roles = (
+                base / "home" / ".omnigent" / "agents" /
+                "trio-omnigent-roles")
+            roles.mkdir(parents=True)
+            registry = roles / "registry.json"
+            registry.write_text(
+                '{"_profile": "test", "registry-only": {}, '
+                '"ignored": "not a role"}',
+                encoding="utf-8",
+            )
+
+            result = topology.collect_topology(root, home=base / "home")
+
+        node = next(
+            node for node in result["graphs"]["omnigent"]["nodes"]
+            if node["name"] == "registry-only")
+        self.assertEqual(node["origin"], "installed")
+        self.assertEqual(node["path"], str(registry))
+        self.assertNotIn(
+            "ignored",
+            {item["name"] for item in result["graphs"]["omnigent"]["nodes"]},
+        )
+
     def test_opencode_invokes_orchestrator_and_spawns_allowed_agents(self):
         edges = _edge_tuples(self.graphs["opencode"])
         self.assertIn(("invokes", "trio", "trio-orchestrator"), edges)

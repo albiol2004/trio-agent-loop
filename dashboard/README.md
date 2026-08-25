@@ -61,7 +61,8 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 - `/` — status board: loop cards with state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration count, mission, verdict history, **Start/Stop buttons**, **phase badge** (lead-done / eval-done / idle), and last activity
 - `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only, and scoped creation
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
-- `/topology.html` — layered SVG graphs of harness wiring (entrypoint → agent → model); compare schemas across harnesses
+- `/topology.html` — layered SVG graphs of harness wiring;
+  optionally include installed nodes and compare schemas
 - `/models.html` — resolved model rows for each agent, showing layer precedence (frontmatter, OMP, OpenCode, trioctl, Omnigent)
 - `/health.html` — registry lineage, manifest drift, installed harnesses, dangling artifacts, and generate.py check result
 
@@ -92,9 +93,10 @@ Registry and agents:
 - `PUT /api/registry/agents/file` — update a canonical agent; returns 404 if absent, 403 if managed by generate.py
 - `DELETE /api/registry/agents/file?name=<name>` — delete a canonical agent
 - `POST /api/registry/install` — render a canonical agent into a harness's native format and write it
-- `GET /api/registry/topology?root=<repository>&workflow=<name>` —
+- `GET /api/registry/topology?root=<repository>&workflow=<name>&home=<bool>` —
   deterministic node and edge graphs below root; `workflow` is `roles`
-  (default), `productionize`, or `entrypoints`
+  (default), `productionize`, or `entrypoints`; response nodes include
+  `origin` and the response includes `include_home`
 - `GET /api/registry/models?root=<repository>` — resolved model rows per agent,
   plus `available`, `by_executor`, and per-source `sources` status
 - `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
@@ -160,15 +162,19 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
 
 ## Harness topology API
 
-`GET /api/registry/topology?root=<repository>&workflow=<name>` returns
-deterministic node and edge graphs for the harness directories present below
-the explicit repository root. The `root` query is required; `workflow` accepts
-`roles` (default), `productionize`, or `entrypoints`. The endpoint does not
-scan the dashboard process user's home directory.
+`GET /api/registry/topology?root=<repository>&workflow=<name>&home=<bool>`
+returns deterministic node and edge graphs for the harness directories present
+below the explicit repository root. The `root` query is required;
+`workflow` accepts `roles` (default), `productionize`, or `entrypoints`.
+`home` accepts `0`, `1`, `false`, or `true` case-insensitively. When omitted,
+the installed trio-dash copy defaults to including the dashboard process home;
+the repository checkout defaults to workspace-only. The response includes
+`include_home`, and every node has `origin` set to `workspace` or `installed`.
 
 The **Topology** page (`/topology.html`) renders those graphs as layered
-entrypoint → agent → model SVGs. A **Workflow selector** offers `roles`,
-`productionize`, and `entrypoints` choices. `productionize` graphs come from
+entrypoint → agent → model SVGs. An **include installed** toggle sends
+`home=1` or `home=0` and styles `origin: installed` nodes. A **Workflow
+selector** offers `roles`, `productionize`, and `entrypoints` choices. `productionize` graphs come from
 each wrapper's `## Dispatch table` section; unparseable tables become warning
 nodes. Select a workflow and harness to inspect its wiring, or enable
 **Compare wiring** to see edges and agent output schemas that differ across

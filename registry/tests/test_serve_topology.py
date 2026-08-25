@@ -10,12 +10,14 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -70,10 +72,14 @@ class DashboardTopologyTestCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def _topology_url(self, workflow: str | None = None) -> str:
+    def _topology_url(
+        self, workflow: str | None = None, home: str | None = None
+    ) -> str:
         params = {"root": str(REPO_ROOT)}
         if workflow is not None:
             params["workflow"] = workflow
+        if home is not None:
+            params["home"] = home
         query = urllib.parse.urlencode(params)
         return f"{self.base}/api/registry/topology?{query}"
 
@@ -138,6 +144,46 @@ class TopologyEndpointTests(DashboardTopologyTestCase):
             if node["kind"] == "entrypoint"
         }
         self.assertIn("trio", claude_names)
+
+    def test_topology_endpoint_selects_installed_home_graphs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            role = (
+                home / ".omnigent" / "agents" /
+                "trio-omnigent-roles" / "installed")
+            role.mkdir(parents=True)
+            (role / "config.yaml").write_text(
+                "name: installed-only-role\nexecutor:\n  model: test/model\n",
+                encoding="utf-8",
+            )
+            with patch.object(serve, "HOME", home):
+                status, included = _get_json(
+                    self._topology_url(home="1"))
+                self.assertEqual(status, 200, included)
+                self.assertTrue(included["include_home"])
+                installed = next(
+                    node for node in included["graphs"]["omnigent"]["nodes"]
+                    if node["name"] == "installed-only-role")
+                self.assertEqual(installed["origin"], "installed")
+
+                status, excluded = _get_json(
+                    self._topology_url(home="0"))
+                self.assertEqual(status, 200, excluded)
+                self.assertFalse(excluded["include_home"])
+                self.assertNotIn(
+                    "installed-only-role",
+                    {node["name"]
+                     for node in excluded["graphs"]["omnigent"]["nodes"]},
+                )
+
+                status, defaulted = _get_json(self._topology_url())
+                self.assertEqual(status, 200, defaulted)
+                self.assertFalse(defaulted["include_home"])
+                self.assertNotIn(
+                    "installed-only-role",
+                    {node["name"]
+                     for node in defaulted["graphs"]["omnigent"]["nodes"]},
+                )
 
     def test_topology_endpoint_rejects_unknown_workflow(self):
         status, payload = _get_json(self._topology_url(workflow="nope"))
