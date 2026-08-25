@@ -35,7 +35,7 @@ A canonical agent's optional `spawns` field is a named allowlist (list of agent 
   during round-trips; parsed frontmatter and body are separately managed.
 - **TOML parser/serializer** — `tomllib`-backed for parsing, minimal custom serializer for output. Round-trips order-preserving.
 - **Frontmatter parsing** — YAML frontmatter (delimited by `---`) is split from body; body digests are computed separately from frontmatter for drift detection (frontmatter legitimately differs per harness; body drift signals staleness).
-- **KEY_SCHEMA — field catalog** — `KEY_SCHEMA[harness:surface]` is a list of per-field specs (`{key, type, widget, required, enum, help, values_from}`), defining the schema for frontmatter editing. `values_from` names a model source (e.g., `"models:claude"`); widget hints route to specialized UI controls (e.g., `select`, `textarea`, `permission-grid`, `spawns-select`, `json-schema`, `checkbox`).
+- **KEY_SCHEMA — field catalog** — `KEY_SCHEMA[harness:surface]` is a list of per-field specs (`{key, type, widget, required, enum, help, values_from}`), defining the schema for frontmatter editing. `values_from` names a model source (e.g., `"models:claude"`); widget hints route to specialized UI controls (e.g., `select`, `textarea`, `permission-grid`, `spawns-select`, `json-schema`, `checkbox`). Cursor harness uses the same KEY_SCHEMA as Claude for compatibility, with required `name` and `description` fields in frontmatter.
 - **Omnigent agents** — `KEY_SCHEMA["omnigent:agent"]` defines the role
   config schema with dotted `executor.*` paths mapping to nested YAML (e.g.,
   `executor.model`, `executor.reasoning_effort`). The `yaml-document` format
@@ -95,13 +95,17 @@ The productionize workflow uses `subagent`, `skill`, and `command` for the
 mechanism named by each wrapper's Dispatch table. A wrapper with no parseable
 executor rows is retained as a `warning` node instead of being omitted.
 
-## `models.py` — model resolution
+## `models.py` — model resolution and live harvesters
 
 `registry/models.py` collects one model-resolution row per agent and preserves
 the winning layer: frontmatter, OMP config, OpenCode JSONC, trioctl roles, or
 Omnigent executor configuration. Repository paths always come from the
 explicit `root`; optional live configuration is read only from an explicit
 `home` argument.
+
+The `harvest_catalog(home, ...)` API reads live model catalogs from each harness
+with per-harness source attribution. Results are cached in-process with a 300-second
+TTL; `use_cache=False` bypasses caching for administrative refreshes.
 
 ### Layer precedence
 
@@ -127,6 +131,15 @@ Model dropdowns in the Skills and Agents editors are populated from `available`.
 When a custom (uncurated) model ID is found, it is retained in the result and
 marked `availability: "unknown"` instead of raising an error, with a warning
 message recommending it be added to `models.json`.
+
+To refresh `models.json` with live catalogs from installed harnesses, run:
+```bash
+python3 registry/models.py --refresh
+```
+This command reads live catalogs from the dashboard process home and regenerates
+the checked-in `models.json` file as the offline fallback. It never writes to
+`$HOME` — all writes go to the repository's `registry/models.json` only.
+
 `strip_jsonc()`, `parse_jsonc()`, and `load_toml()` reuse the scanner format layer
 for focused parsing.
 
