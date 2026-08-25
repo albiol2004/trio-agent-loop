@@ -183,7 +183,9 @@ function loopTagElements(loop) {
     );
   }
   if (Boolean(loop.running)) {
-    tags.push(span("status-label status-running", "RUNNING"));
+    const running = span("status-label status-running", "RUNNING");
+    running.title = (loop.running_sources || []).join(", ");
+    tags.push(running);
   }
   if (isArchived(loop)) {
     tags.push(span("status-label status-archived", "ARCHIVED"));
@@ -423,6 +425,7 @@ function boardSignature(loops) {
       loop.status ?? null,
       loop.final_verdict ?? null,
       Boolean(loop.running),
+      loop.running_sources || [],
       isArchived(loop),
       loop.verdict_mtime ?? null,
       loop.iteration,

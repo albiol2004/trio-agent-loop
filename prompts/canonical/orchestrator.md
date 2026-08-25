@@ -78,6 +78,11 @@ On the 3rd consecutive scoped verdict, or for any other ITERATE, run the full
 Lead pass as usual.
 
 ## Rules
+Harness wrappers own the optional `loop/.session.json` sidecar: at iteration
+start, write `{driver, session, pid, started_at, phase}`; on finish set
+`done: true` and `phase: "done"` or delete the file. The `pid` is the
+orchestrator process, and the dashboard treats a dead-pid sidecar as orphaned,
+not running.
 - **Auto-resume on provider transport failure:** when a role's task result
   is `failed (exit N)` and the broker log for that session shows a provider
   transport error — the observed triggers are `resource_exhausted`,

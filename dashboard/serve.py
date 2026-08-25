@@ -29,7 +29,7 @@ Board:
     Each loop object:
         name, path, mission, iteration, max_iterations, status,
         final_verdict, last_activity, verdict_mtime, last_entry_summary,
-        segments, driver_phase, driver, running
+        segments, driver_phase, driver, running, running_sources
     Each inbox item includes: loop, kind, severity, headline, detail, id,
     read, first_seen.
 
@@ -196,6 +196,8 @@ import sys
 import time
 import threading
 import traceback
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -238,6 +240,12 @@ REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 HOME = Path.home()
 """Current user's home directory, used for global harness locations."""
 _INITIAL_HOME = HOME
+
+PROC_ROOT = Path("/proc")
+"""Process root used for liveness and mailbox command-line scans."""
+
+BROKER_BASE_URL = os.environ.get("TRIO_BOARD_BROKER_URL", "").strip()
+"""Optional broker base URL; an empty value disables broker probing."""
 
 REGISTRY_CACHE_SECONDS = 5.0
 """Maximum age for the in-memory registry index."""
@@ -654,10 +662,23 @@ def _to_int(value) -> int | None:
     return None
 
 
+def _using_real_proc() -> bool:
+    """Return whether liveness should use the host kernel's process table."""
+    try:
+        return Path(PROC_ROOT).resolve() == Path("/proc").resolve()
+    except OSError:
+        return False
+
+
 def _pid_is_live(pid: int) -> bool:
-    """Return whether the kernel accepts a no-op signal for ``pid``."""
+    """Return whether ``pid`` is live in the configured process environment."""
     if pid <= 0:
         return False
+    if not _using_real_proc():
+        try:
+            return (Path(PROC_ROOT) / str(pid) / "cmdline").is_file()
+        except OSError:
+            return False
     try:
         os.kill(pid, 0)
     except (OSError, OverflowError, ValueError):
@@ -670,7 +691,7 @@ def _process_cmdline(pid: int) -> str:
     if pid <= 0:
         return ""
     try:
-        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        raw = (Path(PROC_ROOT) / str(pid) / "cmdline").read_bytes()
     except OSError:
         return ""
     return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
@@ -736,6 +757,138 @@ def _live_lock_pid(mailbox: Path) -> int | None:
     except (OSError, ValueError):
         return None
     return pid if _pid_is_live(pid) else None
+
+
+def _read_session_sidecar(loop_dir: Path) -> dict | None:
+    """Read the optional wrapper-owned session sidecar."""
+    try:
+        payload = json.loads(
+            (loop_dir / ".session.json").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _proc_matches_mailbox(loop_dir: Path) -> bool:
+    """Return whether a live process command line names this mailbox."""
+    try:
+        mailbox_text = str(loop_dir.resolve())
+        entries = list(Path(PROC_ROOT).iterdir())
+    except (OSError, RuntimeError):
+        return False
+
+    current_pid = os.getpid()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if pid == current_pid or not _pid_is_live(pid):
+            continue
+        if mailbox_text in _process_cmdline(pid):
+            return True
+    return False
+
+
+def _broker_session_ids(
+    driver_state: dict | None, session_state: dict | None
+) -> list[str]:
+    """Collect unique broker session IDs in stable input order."""
+    values = []
+    if driver_state:
+        session_ids = driver_state.get("session_ids")
+        if isinstance(session_ids, dict):
+            values.extend(session_ids.values())
+    if session_state:
+        values.append(session_state.get("session"))
+
+    session_ids = []
+    for value in values:
+        if value is None or isinstance(value, (dict, list, tuple)):
+            continue
+        text = str(value).strip()
+        if text and text not in session_ids:
+            session_ids.append(text)
+    return session_ids
+
+
+def _broker_has_running_session(session_ids: list[str]) -> bool:
+    """Probe configured broker sessions, treating failures as unknown."""
+    base_url = str(BROKER_BASE_URL).strip()
+    if not base_url:
+        return False
+
+    for session_id in session_ids:
+        url = (
+            base_url.rstrip("/")
+            + "/v1/sessions/"
+            + urllib.parse.quote(session_id, safe="")
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as response:
+                payload = json.loads(
+                    response.read().decode("utf-8", errors="replace")
+                )
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for field in ("status", "state"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip().lower() == "running":
+                return True
+    return False
+
+
+def _running_detection(loop_dir: Path) -> dict:
+    """Return concrete running evidence and any stale session sidecar."""
+    driver_state = _driver_snapshot(loop_dir)
+    session_state = _read_session_sidecar(loop_dir)
+    sources = []
+
+    driver_running = bool(driver_state and driver_state["live"])
+    driver_running = driver_running or _live_lock_pid(loop_dir) is not None
+    if driver_running:
+        sources.append("driver")
+
+    if _proc_matches_mailbox(loop_dir):
+        sources.append("proc")
+
+    orphaned_session = None
+    session_running = False
+    if session_state is not None:
+        phase = str(session_state.get("phase") or "").strip().lower()
+        done = session_state.get("done") is True
+        done = done or phase in {"done", "finished", "cleared"}
+        raw_pid = session_state.get("pid")
+        pid = (
+            _to_int(raw_pid)
+            if not isinstance(raw_pid, bool)
+            else None
+        )
+        if not done and pid is not None and _pid_is_live(pid):
+            session_running = True
+        elif not done:
+            orphaned_session = {
+                "pid": pid,
+                "started_at": session_state.get("started_at"),
+            }
+    if session_running:
+        sources.append("session")
+
+    session_ids = _broker_session_ids(driver_state, session_state)
+    if _broker_has_running_session(session_ids):
+        sources.append("broker")
+
+    return {
+        "sources": sources,
+        "orphaned_session": orphaned_session,
+    }
 
 
 def _owns_loop_process(pid: int) -> bool:
@@ -972,9 +1125,9 @@ def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
-    Kinds: needs_human / blocked (high), drift / overlap (medium), and
-    repair (low). Anything that cannot be determined is simply absent — the
-    inbox never guesses.
+    Kinds: needs_human / blocked (high), orphaned / drift / overlap (medium),
+    and repair (low). Anything that cannot be determined is simply absent —
+    the inbox never guesses.
     """
     items = []
 
@@ -989,6 +1142,21 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         if anchor is not None:
             item["_inbox_anchor"] = anchor
         items.append(item)
+
+    detection = _running_detection(loop_dir)
+    orphaned = detection["orphaned_session"]
+    if orphaned is not None and not detection["sources"]:
+        pid = orphaned.get("pid")
+        started_at = orphaned.get("started_at")
+        pid_text = "" if pid is None else str(pid)
+        started_text = "" if started_at is None else str(started_at)
+        add(
+            "medium",
+            "orphaned",
+            "Orphaned session sidecar",
+            f"Session PID {pid_text or 'missing'} is not live.",
+            f"session:{pid_text}:{started_text}",
+        )
 
     verdict = (card.get("final_verdict") or "").upper()
     if verdict == "NEEDS_HUMAN":
@@ -2603,6 +2771,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         analysis = metrics.analyze_loop(loop_dir, root)
         entries = metrics.parse_log(loop_dir / "LOG.md")
         driver_state = _driver_snapshot(loop_dir)
+        detection = _running_detection(loop_dir)
+        sources = detection["sources"]
         return {
             "name": analysis["name"],
             "path": analysis["name"],
@@ -2619,7 +2789,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 driver_state["phase"] if driver_state else None
             ),
             "driver": driver_state["driver"] if driver_state else None,
-            "running": bool(driver_state and driver_state["live"]),
+            "running": bool(sources),
+            "running_sources": sources,
         }
 
     def _handle_board(self, root: Path) -> None:
@@ -2632,6 +2803,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 traceback.print_exc()
                 # Keep the board alive even if one loop's mailbox is broken.
+                detection = _running_detection(loop_dir)
+                sources = detection["sources"]
                 loops.append({
                     "name": metrics.loop_name(root, loop_dir),
                     "path": metrics.loop_name(root, loop_dir),
@@ -2646,7 +2819,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "segments": [],
                     "driver_phase": None,
                     "driver": None,
-                    "running": False,
+                    "running": bool(sources),
+                    "running_sources": sources,
                 })
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):

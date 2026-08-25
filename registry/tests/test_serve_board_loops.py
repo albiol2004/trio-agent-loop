@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -201,3 +202,157 @@ class FactOnlyBoardHttpTests(unittest.TestCase):
         }
         self.assertIsInstance(loops["loop"]["verdict_mtime"], str)
         self.assertTrue(loops["loop"]["verdict_mtime"])
+
+
+class _RunningBrokerHandler(BaseHTTPRequestHandler):
+    """Return one running session for the broker probe test."""
+
+    def do_GET(self):
+        if self.path != "/v1/sessions/sess-1":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = b'{"status":"running"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+class RealRunningDetectionTests(unittest.TestCase):
+    """Board activity comes from live process and session evidence."""
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.home = tempfile.TemporaryDirectory()
+        self.proc = tempfile.TemporaryDirectory()
+        self.root = Path(self.workspace.name)
+        self.mailbox = self.root / "loop"
+        self.mailbox.mkdir()
+        (self.mailbox / "GOAL.md").write_text(
+            "# Detection loop\n\nmission: running detection\n",
+            encoding="utf-8",
+        )
+        (self.mailbox / "STATE.md").write_text(
+            "iteration: 1\nstatus: running\n",
+            encoding="utf-8",
+        )
+        (self.mailbox / "LOG.md").write_text("# LOG\n", encoding="utf-8")
+
+        self.original_home = serve.HOME
+        self.original_proc_root = serve.PROC_ROOT
+        self.original_broker_url = serve.BROKER_BASE_URL
+        serve.HOME = Path(self.home.name)
+        serve.PROC_ROOT = Path(self.proc.name)
+        serve.BROKER_BASE_URL = ""
+        self.server = serve.DashboardServer(
+            ("127.0.0.1", 0), workspaces=[self.root], auto_discover=False
+        )
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        serve.HOME = self.original_home
+        serve.PROC_ROOT = self.original_proc_root
+        serve.BROKER_BASE_URL = self.original_broker_url
+        self.proc.cleanup()
+        self.workspace.cleanup()
+        self.home.cleanup()
+
+    def _board(self) -> dict:
+        query = urllib.parse.urlencode({"root": str(self.root)})
+        status, data = _get(f"{self.base}/api/board?{query}")
+        self.assertEqual(status, 200)
+        return data
+
+    def _loop(self) -> dict:
+        return next(loop for loop in self._board()["loops"] if loop["name"] == "loop")
+
+    def _write_proc_cmdline(self, pid: int, command: bytes):
+        process = Path(self.proc.name) / str(pid)
+        process.mkdir()
+        (process / "cmdline").write_bytes(command)
+
+    def test_state_running_without_evidence_is_not_running(self):
+        loop = self._loop()
+        self.assertFalse(loop["running"])
+        self.assertEqual(loop["running_sources"], [])
+        self.assertIn("running", loop["status"])
+
+    def test_proc_mailbox_command_line_marks_loop_running(self):
+        pid = 42001
+        command = (
+            b"python3\0--mailbox\0"
+            + str(self.mailbox.resolve()).encode("utf-8")
+            + b"\0"
+        )
+        self._write_proc_cmdline(pid, command)
+        loop = self._loop()
+        self.assertTrue(loop["running"])
+        self.assertIn("proc", loop["running_sources"])
+
+    def test_session_sidecar_live_then_orphaned(self):
+        live_pid = 42002
+        self._write_proc_cmdline(live_pid, b"python3\0worker\0")
+        sidecar = {
+            "driver": "portable",
+            "session": "sess-sidecar",
+            "pid": live_pid,
+            "started_at": "2026-08-25T13:00:00Z",
+            "phase": "running",
+        }
+        path = self.mailbox / ".session.json"
+        path.write_text(json.dumps(sidecar), encoding="utf-8")
+        loop = self._loop()
+        self.assertTrue(loop["running"])
+        self.assertIn("session", loop["running_sources"])
+
+        dead_pid = 42003
+        sidecar["pid"] = dead_pid
+        path.write_text(json.dumps(sidecar), encoding="utf-8")
+        board = self._board()
+        loop = next(item for item in board["loops"] if item["name"] == "loop")
+        self.assertFalse(loop["running"])
+        self.assertEqual(loop["running_sources"], [])
+        orphaned = next(item for item in board["inbox"]
+                        if item["kind"] == "orphaned")
+        self.assertIn(str(dead_pid), orphaned["detail"])
+
+    def test_broker_running_session_and_failed_probe(self):
+        broker = ThreadingHTTPServer(
+            ("127.0.0.1", 0), _RunningBrokerHandler
+        )
+        broker_thread = threading.Thread(
+            target=broker.serve_forever, daemon=True
+        )
+        broker_thread.start()
+        try:
+            serve.BROKER_BASE_URL = (
+                f"http://127.0.0.1:{broker.server_address[1]}"
+            )
+            (self.mailbox / ".session.json").write_text(
+                json.dumps({"session": "sess-1", "pid": 0}),
+                encoding="utf-8",
+            )
+            loop = self._loop()
+            self.assertTrue(loop["running"])
+            self.assertIn("broker", loop["running_sources"])
+        finally:
+            broker.shutdown()
+            broker.server_close()
+            broker_thread.join(timeout=5)
+
+        serve.BROKER_BASE_URL = "http://127.0.0.1:0"
+        loop = self._loop()
+        self.assertFalse(loop["running"])
+        self.assertNotIn("broker", loop["running_sources"])
