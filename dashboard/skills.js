@@ -8,11 +8,14 @@ const PROJECT_REGISTRY_DIRS = {
   "claude:agent": ".claude/agents",
   "opencode:agent": ".opencode/agents",
   "cursor:skill": ".cursor/skills",
+  "cursor:agent": ".cursor/agents",
 };
 const GLOBAL_REGISTRY_DIRS = {
   "claude:skill": ".claude/skills",
   "claude:command": ".claude/commands",
   "claude:agent": ".claude/agents",
+  "cursor:skill": ".cursor/skills",
+  "cursor:agent": ".cursor/agents",
   "codex:skill": ".agents/skills",
   "codex:agent": ".codex/agents",
   "omp:command": ".omp/agent/commands",
@@ -172,7 +175,8 @@ if (typeof module !== "undefined" && module.exports) {
       skill: { project: null, global: ".zcode/skills" },
     },
     cursor: {
-      skill: { project: ".cursor/skills", global: null },
+      skill: { project: ".cursor/skills", global: ".cursor/skills" },
+      agent: { project: ".cursor/agents", global: ".cursor/agents" },
     },
   };
   let currentRoot = "";

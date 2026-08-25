@@ -249,6 +249,8 @@ _WRITABLE_ROOTS = (
     HOME / ".claude" / "skills",
     HOME / ".claude" / "commands",
     HOME / ".claude" / "agents",
+    HOME / ".cursor" / "skills",
+    HOME / ".cursor" / "agents",
     HOME / ".agents" / "skills",
     HOME / ".codex" / "agents",
     HOME / ".omp" / "agent" / "commands",
@@ -259,6 +261,7 @@ _WRITABLE_ROOTS = (
     HOME / ".kimi-code" / "skills",
     HOME / ".zcode" / "skills",
     REPO_ROOT / ".claude",
+    REPO_ROOT / ".cursor",
     REPO_ROOT / "codex",
     REPO_ROOT / "kimi",
     REPO_ROOT / "zcode",
@@ -271,6 +274,8 @@ _GLOBAL_REGISTRY_DIRS = {
     ("claude", "skill"): HOME / ".claude" / "skills",
     ("claude", "command"): HOME / ".claude" / "commands",
     ("claude", "agent"): HOME / ".claude" / "agents",
+    ("cursor", "skill"): HOME / ".cursor" / "skills",
+    ("cursor", "agent"): HOME / ".cursor" / "agents",
     ("codex", "skill"): HOME / ".agents" / "skills",
     ("codex", "agent"): HOME / ".codex" / "agents",
     ("omp", "command"): HOME / ".omp" / "agent" / "commands",
@@ -286,6 +291,8 @@ _GLOBAL_REGISTRY_RELATIVE_DIRS = {
     ("claude", "skill"): Path(".claude/skills"),
     ("claude", "command"): Path(".claude/commands"),
     ("claude", "agent"): Path(".claude/agents"),
+    ("cursor", "skill"): Path(".cursor/skills"),
+    ("cursor", "agent"): Path(".cursor/agents"),
     ("codex", "skill"): Path(".agents/skills"),
     ("codex", "agent"): Path(".codex/agents"),
     ("omp", "command"): Path(".omp/agent/commands"),
@@ -304,6 +311,7 @@ _PROJECT_REGISTRY_DIRS = {
     ("claude", "agent"): Path(".claude/agents"),
     ("opencode", "agent"): Path(".opencode/agents"),
     ("cursor", "skill"): Path(".cursor/skills"),
+    ("cursor", "agent"): Path(".cursor/agents"),
 }
 
 

@@ -50,6 +50,7 @@ MODEL_TIERS: dict[str, dict[str, dict]] = {
     "high": {
         "claude": {"model": "claude-opus-5", "effort": "high"},
         "codex": {"model": "gpt-5.6-terra", "model_reasoning_effort": "high"},
+        "cursor": {"model": "cursor-grok-4.6-high"},
         "omp": {"model": "cursor/cursor-grok-4.6-high"},
         "opencode": {},
         "omnigent": {"model": "cursor-grok-4.6-high"},
@@ -57,6 +58,7 @@ MODEL_TIERS: dict[str, dict[str, dict]] = {
     "standard": {
         "claude": {"model": "sonnet", "effort": "high"},
         "codex": {"model": "gpt-5.6-luna", "model_reasoning_effort": "high"},
+        "cursor": {"model": "cursor-grok-4.6-medium"},
         "omp": {"model": "cursor/cursor-grok-4.6-medium"},
         "opencode": {},
         "omnigent": {"model": "cursor-grok-4.6-medium"},
@@ -64,6 +66,7 @@ MODEL_TIERS: dict[str, dict[str, dict]] = {
     "cheap": {
         "claude": {"model": "haiku"},
         "codex": {"model": "gpt-5.6-luna", "model_reasoning_effort": "low"},
+        "cursor": {"model": "gpt-5.6-luna-max"},
         "omp": {"model": "deepseek/deepseek-v4-flash"},
         "opencode": {},
         "omnigent": {"model": "gpt-5.6-luna-max"},
@@ -74,6 +77,7 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
     "read-only": {
         "claude": {"disallowedTools": "Write, Edit, NotebookEdit, Agent"},
         "codex": {"sandbox_mode": "read-only"},
+        "cursor": {},
         "omp": {"tools": "read, grep, glob, web_search", "read-summarize": False},
         "opencode": {"permission": {
             "*": "deny", "read": "allow", "grep": "allow", "glob": "allow",
@@ -84,6 +88,7 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
     "edit": {
         "claude": {"disallowedTools": "Agent"},
         "codex": {},
+        "cursor": {},
         "omp": {},
         "opencode": {"permission": {"task": "deny"}},
         "omnigent": {},
@@ -91,6 +96,7 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
     "spawn": {
         "claude": {},
         "codex": {},
+        "cursor": {},
         "omp": {},
         # Named targets are added by the OpenCode renderer below.
         "opencode": {"permission": {"task": {"*": "deny"}}},
@@ -101,13 +107,14 @@ TOOL_POLICIES: dict[str, dict[str, dict]] = {
 HARNESS_SUPPORT: dict[str, tuple[bool, str]] = {
     "claude": (True, ""),
     "codex": (True, ""),
+    "cursor": (True, ""),
     "omp": (True, ""),
     "opencode": (True, ""),
     "omnigent": (True, ""),
 }
 
 RENDER_HARNESSES: tuple[str, ...] = (
-    "claude", "codex", "omp", "opencode", "omnigent")
+    "claude", "codex", "cursor", "omp", "opencode", "omnigent")
 
 
 # --------------------------------------------------------------------------
@@ -337,6 +344,24 @@ def _render_claude(agent: CanonicalAgent) -> RenderedAgent:
     return RenderedAgent("claude", f"{agent.name}.md", "yaml", text)
 
 
+def _render_cursor(agent: CanonicalAgent) -> RenderedAgent:
+    """Render Cursor's Markdown agent file with YAML frontmatter."""
+    fields = {"name": agent.name, "description": agent.description}
+    fields.update(_tier_fields("cursor", agent.model_tier))
+    _apply_harness_overrides(fields, agent, "cursor")
+    instructions = agent.instructions
+    if agent.spawns:
+        # Cursor has no native spawn frontmatter, so keep delegation in the
+        # body while preserving the canonical instructions first.
+        note = (
+            f"Delegation: may spawn {', '.join(agent.spawns)} "
+            "via the task/spawn tool.\n"
+        )
+        instructions += f"\n\n{note}"
+    text = scan.join_file(fields, instructions, "yaml")
+    return RenderedAgent("cursor", f"{agent.name}.md", "yaml", text)
+
+
 def _render_codex(agent: CanonicalAgent) -> RenderedAgent:
     fields = {"name": agent.name}
     fields.update(_tier_fields("codex", agent.model_tier))
@@ -429,6 +454,7 @@ def _render_omnigent(agent: CanonicalAgent) -> RenderedAgent:
 _RENDERERS = {
     "claude": _render_claude,
     "codex": _render_codex,
+    "cursor": _render_cursor,
     "omp": _render_omp,
     "opencode": _render_opencode,
     "omnigent": _render_omnigent,

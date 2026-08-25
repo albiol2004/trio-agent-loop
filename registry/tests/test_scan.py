@@ -541,6 +541,7 @@ class Schema(unittest.TestCase):
     def test_schema_catalog_contains_required_surfaces(self):
         expected = {
             "claude:skill", "claude:command", "claude:agent",
+            "cursor:skill", "cursor:agent",
             "codex:agent", "omnigent:agent", "omp:agent", "omp:command",
             "opencode:agent", "opencode:command", "kimi:skill",
             "zcode:skill",
@@ -571,6 +572,7 @@ class Schema(unittest.TestCase):
     def test_schema_model_fields_use_model_sources(self):
         expected = {
             ("claude:agent", "model"): "models:claude",
+            ("cursor:agent", "model"): "models:cursor",
             ("codex:agent", "model"): "models:codex",
             ("omp:agent", "model"): "models:omp",
             ("omnigent:agent", "executor.model"): "models:omnigent",
@@ -639,6 +641,54 @@ class Schema(unittest.TestCase):
             'name: my-agent\ndescription: ""\n',
         )
         self.assertNotIn("---", text)
+
+
+class CursorCollection(unittest.TestCase):
+    def test_user_skill_and_project_agent_use_cursor_destinations(self):
+        original_home = scan.HOME
+        with tempfile.TemporaryDirectory() as home_tmp, \
+                tempfile.TemporaryDirectory() as project_tmp:
+            home = Path(home_tmp)
+            project = Path(project_tmp)
+            skill = home / ".cursor" / "skills" / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "---\n"
+                "name: demo\n"
+                "description: Demo skill.\n"
+                "---\n\n"
+                "Skill instructions.\n",
+                encoding="utf-8",
+            )
+            agent = project / ".cursor" / "agents" / "demo.md"
+            agent.parent.mkdir(parents=True)
+            agent.write_text(
+                "---\n"
+                "name: demo\n"
+                "description: Demo agent.\n"
+                "model: cursor-grok-4.6-medium\n"
+                "---\n\n"
+                "Agent instructions.\n",
+                encoding="utf-8",
+            )
+            scan.HOME = home
+            try:
+                entries = scan.collect(project)
+            finally:
+                scan.HOME = original_home
+
+        records = {
+            (entry["harness"], entry["surface"], entry["scope"]): entry
+            for entry in entries
+            if entry["name"] == "demo"
+        }
+        self.assertIn(("cursor", "skill", "global"), records)
+        self.assertIn(("cursor", "agent", "project"), records)
+        self.assertFalse(records[("cursor", "skill", "global")]["managed"])
+        self.assertEqual(
+            records[("cursor", "agent", "project")]["frontmatter"]["model"],
+            "cursor-grok-4.6-medium",
+        )
 
 
 # --------------------------------------------------------------------------

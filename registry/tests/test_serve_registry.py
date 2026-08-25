@@ -81,6 +81,13 @@ class RegistryTargetTests(unittest.TestCase):
             expected = Path(tmp) / ".cursor" / "skills" / "x" / "SKILL.md"
             self.assertEqual(target, expected.resolve())
 
+    def test_registry_target_project_cursor_agent_is_under_project_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = serve._registry_target(
+                "cursor", "agent", "x", scope="project", project=Path(tmp))
+            expected = Path(tmp) / ".cursor" / "agents" / "x.md"
+            self.assertEqual(target, expected.resolve())
+
     def test_registry_target_project_claude_command_is_under_project_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = serve._registry_target(
@@ -126,6 +133,12 @@ class RegistryTargetTests(unittest.TestCase):
                     "claude", "x", scope="project", project=project)
                 self.assertEqual(scope_used, "project")
                 expected = project / ".claude" / "agents" / "x.md"
+                self.assertEqual(target, expected.resolve())
+
+                target, scope_used = serve._agent_registry_target(
+                    "cursor", "x", scope="project", project=project)
+                self.assertEqual(scope_used, "project")
+                expected = project / ".cursor" / "agents" / "x.md"
                 self.assertEqual(target, expected.resolve())
             finally:
                 serve.HOME = original_home
@@ -358,6 +371,15 @@ class SchemaEndpointTests(DashboardServerTestCase):
             destinations["omnigent"]["agent"]["global"],
             ".omnigent/agents")
         self.assertIsNotNone(destinations["cursor"]["skill"]["project"])
+        self.assertEqual(
+            destinations["cursor"]["skill"]["global"],
+            ".cursor/skills")
+        self.assertEqual(
+            destinations["cursor"]["agent"]["project"],
+            ".cursor/agents")
+        self.assertEqual(
+            destinations["cursor"]["agent"]["global"],
+            ".cursor/agents")
 
     def test_schema_opencode_agent_keys_have_no_name_field(self):
         _, payload = self._get("/api/registry/schema")
@@ -381,6 +403,9 @@ class SchemaEndpointTests(DashboardServerTestCase):
         self.assertEqual(
             spec_for("omp:agent", "model")["values_from"],
             "models:omp")
+        self.assertEqual(
+            spec_for("cursor:agent", "model")["values_from"],
+            "models:cursor")
         self.assertEqual(
             spec_for("opencode:agent", "permission")["widget"],
             "permission-grid")

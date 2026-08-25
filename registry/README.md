@@ -15,6 +15,8 @@ A canonical agent's optional `spawns` field is a named allowlist (list of agent 
 - **Claude/OMP** — spawns rendered as a comma-separated scalar in frontmatter `spawns:` field
 - **OpenCode** — spawns rendered as nested `permission.task` entries with wildcard deny (deny `permission.task: '*'`, then allow each named spawn)
 - **Codex** — spawns rendered as a short delegation note appended to `developer_instructions`
+- **Cursor** — spawns rendered as a short delegation note appended to the
+  Markdown body because Cursor has no spawn frontmatter
 - **Empty spawns** — preserves each harness's safe default: key absent (Claude/OMP), wildcard remains denied (OpenCode), instructions unchanged (Codex)
 
 ## `scan.py` — format layer and registry index
@@ -58,7 +60,7 @@ Key functions:
 
 `collect_topology(root, workflow="roles")` scans the canonical harness copies
 below the explicit repository `root` and returns stable node/edge graphs for
-Claude, Codex, OMP, OpenCode, Omnigent, and Pi. The workflow parameter selects
+Claude, Cursor, Codex, OMP, OpenCode, Omnigent, and Pi. The workflow parameter selects
 the graph source:
 - `roles` (default) — canonical agent and model declarations from harness directories
 - `productionize` — scans each in-repository `trio-productionize` wrapper;
@@ -198,6 +200,8 @@ Control sandbox/permission levels:
 
 A canonical agent is rendered into each harness's native file format via `render_agent()`:
 - **claude** — `<name>.md` (YAML frontmatter + body)
+- **cursor** — `<name>.md` (YAML frontmatter with required `name` and
+  `description`, optional `model`, plus the Markdown body)
 - **codex** — `<name>.toml` (TOML frontmatter, `developer_instructions` body)
 - **omp** — `<name>.md` (YAML frontmatter + body)
 - **opencode** — `<name>.md` (YAML frontmatter + body, `mode: subagent` + `hidden: true`)

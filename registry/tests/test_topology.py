@@ -71,6 +71,37 @@ class TopologyCollectorTests(unittest.TestCase):
             with self.subTest(harness=harness):
                 self.assertGreaterEqual(len(self.graphs[harness]["nodes"]), 1)
 
+    def test_cursor_fixture_collects_project_skill_and_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = root / ".cursor" / "skills" / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "# Demo skill\n\nUse this skill.\n",
+                encoding="utf-8",
+            )
+            agent = root / ".cursor" / "agents" / "demo.md"
+            agent.parent.mkdir(parents=True)
+            agent.write_text(
+                "---\n"
+                "name: demo\n"
+                "description: Demo agent.\n"
+                "model: cursor-grok-4.6-medium\n"
+                "---\n\n"
+                "Follow these instructions.\n",
+                encoding="utf-8",
+            )
+
+            result = topology.collect_topology(root)
+
+        graph = result["graphs"]["cursor"]
+        node_keys = {
+            (node["kind"], node["name"], node["harness"])
+            for node in graph["nodes"]
+        }
+        self.assertIn(("entrypoint", "demo", "cursor"), node_keys)
+        self.assertIn(("agent", "demo", "cursor"), node_keys)
+
     def test_opencode_invokes_orchestrator_and_spawns_allowed_agents(self):
         edges = _edge_tuples(self.graphs["opencode"])
         self.assertIn(("invokes", "trio", "trio-orchestrator"), edges)

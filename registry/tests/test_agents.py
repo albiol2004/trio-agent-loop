@@ -197,6 +197,17 @@ class RendererOutputParses(unittest.TestCase):
         for value in fields.values():
             self.assertNotEqual(value, "")
 
+    def test_cursor_parses_with_name_description_model_and_body(self):
+        r = agents.render_agent(self.agent, "cursor")
+        self.assertEqual(r.format, "yaml")
+        self.assertEqual(r.filename, "registry-scout.md")
+        fields, body = scan.parse_frontmatter(r.text)
+        self.assertEqual(fields["name"], self.agent.name)
+        self.assertEqual(fields["description"], self.agent.description)
+        self.assertTrue(fields["model"])
+        self.assertEqual(body, self.agent.instructions)
+        self.assertEqual(set(fields), {"name", "description", "model"})
+
     def test_codex_parses_and_has_name(self):
         r = agents.render_agent(self.agent, "codex")
         self.assertEqual(r.format, "toml")
@@ -408,6 +419,21 @@ class SpawnRendering(unittest.TestCase):
         self.assertIn("trio-builder", developer_instructions)
         self.assertIn("trio-scout", developer_instructions)
 
+    def test_cursor_appends_named_delegation_note_to_body(self):
+        agent = _make_agent(
+            name="cursor-spawn-agent",
+            instructions="Original instructions.\n",
+            spawns=["trio-builder", "trio-scout"],
+        )
+        r = agents.render_agent(agent, "cursor")
+        fields, body = scan.parse_frontmatter(r.text)
+        self.assertEqual(fields["name"], "cursor-spawn-agent")
+        self.assertIn("Original instructions.\n", body)
+        self.assertIn(
+            "Delegation: may spawn trio-builder, trio-scout",
+            body,
+        )
+
     def test_empty_codex_spawn_list_keeps_instructions(self):
         agent = _make_agent(name="codex-empty-spawn", tool_policy="spawn")
         r = agents.render_agent(agent, "codex")
@@ -435,12 +461,12 @@ class AllCombinations(unittest.TestCase):
                         else:
                             scan.parse_frontmatter(r.text)
 
-    def test_model_value_non_empty_for_claude_codex_omp(self):
+    def test_model_value_non_empty_for_model_harnesses(self):
         for tier in agents.MODEL_TIERS:
             for policy in agents.TOOL_POLICIES:
                 agent = _make_agent(
                     name=f"model-{tier}-{policy}", model_tier=tier, tool_policy=policy)
-                for harness in ("claude", "codex", "omp"):
+                for harness in ("claude", "codex", "cursor", "omp"):
                     with self.subTest(tier=tier, policy=policy, harness=harness):
                         r = agents.render_agent(agent, harness)
                         if harness == "codex":

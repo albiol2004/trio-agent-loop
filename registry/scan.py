@@ -948,6 +948,8 @@ SURFACE_FORMAT: dict[tuple[str, str], str] = {
     ("claude", "skill"): "yaml",
     ("claude", "command"): "yaml",
     ("claude", "agent"): "yaml",
+    ("cursor", "skill"): "yaml",
+    ("cursor", "agent"): "yaml",
     ("codex", "skill"): "yaml",
     ("codex", "agent"): "toml",
     ("omnigent", "agent"): "yaml-document",
@@ -980,6 +982,7 @@ _SKILL_FIELDS = [
 
 KEY_SCHEMA: dict[str, list[dict]] = {
     "claude:skill": _SKILL_FIELDS,
+    "cursor:skill": _SKILL_FIELDS,
     "codex:skill": _SKILL_FIELDS,
     "kimi:skill": [
         _field("name", required=True, help_="must equal the skill's directory name"),
@@ -1004,6 +1007,12 @@ KEY_SCHEMA: dict[str, list[dict]] = {
         _field("effort", widget="select", enum=["low", "medium", "high"]),
         _field("disallowedTools", "string", "list",
                help_="comma-separated denylist; there is no positive tools list"),
+    ],
+    "cursor:agent": [
+        _field("name", required=True, help_="must equal the filename stem"),
+        _field("description", widget="textarea", required=True),
+        _field("model", help_="short alias or full model id",
+               values_from="models:cursor"),
     ],
     "codex:agent": [
         _field("name", required=True, help_="must equal the filename stem"),
@@ -1325,7 +1334,8 @@ def collect(project: Path | None) -> list[dict]:
     entries += scan_skill_dir(HOME / ".zcode/skills", "zcode", "global")
     entries += scan_instructions(HOME / ".zcode/AGENTS.md", "zcode", "global")
 
-    # Cursor (~/.cursor/skills-cursor is Cursor-managed cache, not user content)
+    # Cursor personal skills are user content; skills-cursor is a managed cache.
+    entries += scan_skill_dir(HOME / ".cursor/skills", "cursor", "global")
     entries += scan_skill_dir(HOME / ".cursor/skills-cursor", "cursor", "global", managed=True)
     entries += scan_cursor_rules(HOME / ".cursor/rules", "global")
     entries += scan_md_dir(HOME / ".cursor/agents", "cursor", "agent", "global")
@@ -1342,6 +1352,7 @@ def collect(project: Path | None) -> list[dict]:
         entries += scan_instructions(project / "AGENTS.md", "codex", "project")
         entries += scan_cursor_rules(project / ".cursor/rules", "project")
         entries += scan_md_dir(project / ".opencode/agents", "opencode", "agent", "project")
+        entries += scan_md_dir(project / ".cursor/agents", "cursor", "agent", "project")
         entries += scan_skill_dir(project / ".cursor/skills", "cursor", "project")
 
     return entries

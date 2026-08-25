@@ -160,7 +160,7 @@ class AgentsListEndpointTests(DashboardServerTestCase):
             self.assertIn(key, payload)
         self.assertEqual(
             set(payload["harnesses"]),
-            {"claude", "codex", "omp", "opencode", "omnigent"},
+            set(agents.RENDER_HARNESSES),
         )
         for agent in payload["agents"]:
             for key in ("name", "description", "model_tier", "tool_policy", "path"):

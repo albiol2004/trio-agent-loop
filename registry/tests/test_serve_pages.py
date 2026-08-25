@@ -363,7 +363,10 @@ assert.equal(
 
 const catalog = {
   codex: { skill: { project: null, global: ".agents/skills" } },
-  cursor: { skill: { project: ".cursor/skills", global: null } },
+  cursor: {
+    skill: { project: ".cursor/skills", global: ".cursor/skills" },
+    agent: { project: ".cursor/agents", global: ".cursor/agents" },
+  },
 };
 assert.deepEqual(destinationSurfaces(catalog, "codex"), ["skill"]);
 assert.equal(

@@ -388,6 +388,12 @@ def _collect_claude(root: Path) -> dict:
         policy_kind="claude").result()
 
 
+def _collect_cursor(root: Path) -> dict:
+    return _markdown(
+        root, "cursor", agents=".cursor/agents", skills=".cursor/skills",
+        commands=".cursor/commands").result()
+
+
 def _collect_codex(root: Path) -> dict:
     graph = _markdown(root, "codex", skills="codex/skills")
     role_re = re.compile(r"\btrio-[a-z0-9][a-z0-9-]*\b")
@@ -566,6 +572,7 @@ def _collect_entrypoints(root: Path) -> dict:
     graphs = {}
     source_collectors = (
         ("claude", ".claude", _collect_claude),
+        ("cursor", ".cursor", _collect_cursor),
         ("codex", "codex", _collect_codex),
         ("omp", "omp", _collect_omp),
         ("opencode", "opencode", _collect_opencode),
@@ -617,6 +624,7 @@ def collect_topology(root: Path, *, home: Path | None = None,
 
     collectors = (
         ("claude", ".claude", _collect_claude),
+        ("cursor", ".cursor", _collect_cursor),
         ("codex", "codex", _collect_codex),
         ("omp", "omp", _collect_omp),
         ("opencode", "opencode", _collect_opencode),
