@@ -11,6 +11,7 @@
     modelTiers: [],
     toolPolicies: [],
     modelChoices: {},
+    byExecutor: {},
     schema: { keys: {} },
     managedEntries: [],
     selectedName: null,
@@ -119,6 +120,93 @@
       );
     });
     return result;
+  }
+
+  function catalogChoiceIds(values) {
+    const seen = new Set();
+    return (Array.isArray(values) ? values : []).filter((value) => {
+      if (typeof value !== "string" || !value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+  }
+
+  function defaultExecutorHarness(spec = null) {
+    const specs = state.schema && state.schema.keys
+      ? state.schema.keys["omnigent:agent"] || [] : [];
+    const harnessSpec = spec && spec.key === "executor.config.harness"
+      ? spec : specs.find(
+        (candidate) => candidate.key === "executor.config.harness");
+    const enumChoices = harnessSpec && Array.isArray(harnessSpec.enum)
+      ? catalogChoiceIds(harnessSpec.enum) : [];
+    if (enumChoices.length) return enumChoices[0];
+    return Object.keys(state.byExecutor || {}).find((harness) =>
+      catalogChoiceIds(state.byExecutor[harness]).length
+    ) || "";
+  }
+
+  function modelChoicesFor(spec, values) {
+    const source = typeof spec.values_from === "string" &&
+      spec.values_from.startsWith("models:")
+      ? spec.values_from.slice("models:".length) : "";
+    if (source !== "omnigent") {
+      return catalogChoiceIds(state.modelChoices[source] || []);
+    }
+
+    const configured = values && values["executor.config.harness"];
+    const harness = typeof configured === "string" && configured.trim()
+      ? configured.trim() : defaultExecutorHarness();
+    const candidates = harness ? [
+      harness,
+      `${harness}-native`,
+      harness.replace(/-native$/, "")
+    ] : [];
+    for (const candidate of candidates) {
+      const choices = catalogChoiceIds(state.byExecutor[candidate]);
+      if (choices.length) return choices;
+    }
+    return catalogChoiceIds(state.modelChoices.omnigent || []);
+  }
+
+  // Keep the current model id when it is still in the new executor
+  // catalog. Off-list ids stay editable via custom… instead of being
+  // silently replaced with the first catalog entry.
+  function refillModelControl(control, choices, currentValue) {
+    if (!control || !control.control || !control.customControl ||
+        !control.spec) return;
+    const known = catalogChoiceIds(choices);
+    const current = currentValue === null || currentValue === undefined
+      ? "" : String(currentValue);
+    const offList = Boolean(current) && !known.includes(current);
+    const select = control.control;
+    select.replaceChildren();
+    if (!control.spec.required) {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "—";
+      select.append(empty);
+    }
+    known.forEach((choice) => {
+      const option = document.createElement("option");
+      option.value = choice;
+      option.textContent = choice;
+      select.append(option);
+    });
+    if (offList) {
+      const option = document.createElement("option");
+      option.value = current;
+      option.textContent = current;
+      select.append(option);
+    }
+    const custom = document.createElement("option");
+    custom.value = CUSTOM_VALUE;
+    custom.textContent = "custom…";
+    select.append(custom);
+    select.value = offList ? CUSTOM_VALUE : current;
+    control.customControl.value = current;
+    const isCustom = select.value === CUSTOM_VALUE;
+    control.customControl.hidden = !isCustom;
+    control.customControl.disabled = select.disabled || !isCustom;
   }
 
   function newAgentSettings() {
@@ -250,7 +338,12 @@
     row.append(title);
 
     const hasValue = Object.prototype.hasOwnProperty.call(values, spec.key);
-    const initial = hasValue ? values[spec.key] : "";
+    let initial = hasValue ? values[spec.key] : "";
+    if (spec.key === "executor.config.harness" &&
+        (initial === null || initial === undefined ||
+         String(initial).trim() === "")) {
+      initial = defaultExecutorHarness(spec);
+    }
     let control;
     let customControl = null;
     let widget = spec.widget || "text";
@@ -268,7 +361,7 @@
         ? spec.values_from.slice("models:".length) : "";
       const choices = Array.isArray(spec.enum)
         ? spec.enum
-        : (state.modelChoices[source] || []);
+        : modelChoicesFor(spec, values);
       if (!spec.required) {
         const empty = document.createElement("option");
         empty.value = "";
@@ -305,6 +398,20 @@
         const customValue = control.value === CUSTOM_VALUE;
         customControl.hidden = !customValue;
         customControl.disabled = !customValue;
+        if (spec.key !== "executor.config.harness") return;
+        collectCatalogValues(prefix);
+        const catalogValues = state.catalogValues[prefix] || {};
+        const harnessValues = catalogValues[harness] || {};
+        const modelControl = state.catalogControls[prefix].get(
+          `${harness}:executor.model`);
+        if (!modelControl) return;
+        const currentModel = catalogFieldValue(modelControl);
+        refillModelControl(
+          modelControl,
+          modelChoicesFor(modelControl.spec, harnessValues),
+          currentModel,
+        );
+        collectCatalogValues(prefix);
       });
       row.append(control, customControl);
     } else if (widget === "permission-grid" || spec.type === "map") {
@@ -339,6 +446,7 @@
     return {
       harness,
       key: spec.key,
+      spec,
       widget,
       control,
       customControl,
@@ -872,15 +980,20 @@
       state.schema = { keys: {} };
     }
     state.modelChoices = {};
+    state.byExecutor = {};
     if (currentRoot) {
       try {
         const models = await apiRoot("/api/registry/models");
         const available = models && models.available &&
           typeof models.available === "object" ? models.available : {};
+        const byExecutor = models && models.by_executor &&
+          typeof models.by_executor === "object" ? models.by_executor : {};
+        Object.keys(byExecutor).forEach((harness) => {
+          state.byExecutor[harness] = catalogChoiceIds(byExecutor[harness]);
+        });
         Object.keys(available).forEach((harness) => {
           if (!Array.isArray(available[harness])) return;
-          state.modelChoices[harness] = available[harness]
-            .filter((model) => typeof model === "string" && model);
+          state.modelChoices[harness] = catalogChoiceIds(available[harness]);
         });
         (models.rows || []).forEach((row) => {
           if (!row || typeof row.harness !== "string" ||
@@ -891,6 +1004,7 @@
         });
       } catch (_) {
         state.modelChoices = {};
+        state.byExecutor = {};
       }
     }
   }

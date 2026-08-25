@@ -1,7 +1,37 @@
+const CUSTOM_VALUE = "__trio_custom__";
+
+function catalogChoiceState(value, choices) {
+  const current = value === null || value === undefined ? "" : String(value);
+  const known = Array.isArray(choices)
+    ? choices.map((choice) => String(choice)) : [];
+  const offList = Boolean(current) && !known.includes(current);
+  return {
+    value: current,
+    selected: offList ? CUSTOM_VALUE : current,
+    offList,
+  };
+}
+
+function choicesForHarness(available, harness) {
+  const values = available && typeof available === "object"
+    ? available[harness] : null;
+  if (!Array.isArray(values)) return [];
+  const seen = new Set();
+  return values.filter((value) => {
+    if (typeof value !== "string" || !value || seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { catalogChoiceState, choicesForHarness };
+} else {
 (() => {
   "use strict";
 
   let currentRoot = "";
+  let available = {};
   const pageState = document.getElementById("page-state");
   const modelsTable = document.getElementById("models-table");
   const tableBody = modelsTable.querySelector("tbody");
@@ -19,6 +49,12 @@
     if (className) element.className = className;
     element.textContent = text == null ? "" : String(text);
     return element;
+  }
+
+  function effectiveModelValue(select) {
+    const value = select.value === CUSTOM_VALUE && select.customControl
+      ? select.customControl.value : select.value;
+    return value || "";
   }
 
   function setPageState(text, error = false) {
@@ -52,14 +88,44 @@
 
   function renderModelCell(cell, row) {
     if (row.editable && row.path) {
-      const input = createElement("input", "", "model-input");
-      input.type = "text";
-      input.value = row.model || "";
-      input.setAttribute("aria-label", `${row.agent} model`);
+      const select = createElement("select", "", "model-input");
+      const choices = choicesForHarness(available, row.harness);
+      const choiceState = catalogChoiceState(row.model, choices);
+      const current = choiceState.value;
+      if (!current) {
+        const empty = createElement("option", "—");
+        empty.value = "";
+        select.append(empty);
+      }
+      const visibleChoices = [...choices];
+      if (choiceState.offList) visibleChoices.push(current);
+      visibleChoices.forEach((choice) => {
+        const option = createElement("option", choice);
+        option.value = choice;
+        select.append(option);
+      });
+      const customOption = createElement("option", "custom…");
+      customOption.value = CUSTOM_VALUE;
+      select.append(customOption);
+      const customControl = createElement(
+        "input", "", "model-input model-custom");
+      customControl.type = "text";
+      customControl.value = current;
+      customControl.hidden = !choiceState.offList;
+      customControl.disabled = !choiceState.offList;
+      customControl.setAttribute("aria-label", `${row.agent} custom model`);
+      select.value = choiceState.selected;
+      select.customControl = customControl;
+      select.setAttribute("aria-label", `${row.agent} model`);
+      select.addEventListener("change", () => {
+        const custom = select.value === CUSTOM_VALUE;
+        customControl.hidden = !custom;
+        customControl.disabled = !custom;
+      });
       const save = createElement("button", "Save", "model-save");
       save.type = "button";
-      save.addEventListener("click", () => saveModel(row, input, save));
-      cell.append(input, save);
+      save.addEventListener("click", () => saveModel(row, select, save));
+      cell.append(select, customControl, save);
     } else {
       cell.append(createElement("span", row.model || "—"));
       if (row.override_file) {
@@ -76,6 +142,8 @@
   }
 
   function render(data) {
+    available = data && data.available &&
+      typeof data.available === "object" ? data.available : {};
     tableBody.replaceChildren();
     const rows = Array.isArray(data && data.rows) ? data.rows : [];
     rows.forEach((row) => {
@@ -114,7 +182,7 @@
         typeof file.frontmatter === "object"
         ? { ...file.frontmatter }
         : {};
-      const value = input.value.trim();
+      const value = effectiveModelValue(input).trim();
       if (value) {
         frontmatter.model = value;
       } else {
@@ -165,3 +233,4 @@
     loadModels();
   });
 })();
+}

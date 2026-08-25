@@ -183,6 +183,7 @@ if (typeof module !== "undefined" && module.exports) {
     current: null,
     formControls: [],
     modelChoices: {},
+    byExecutor: {},
     agentNames: [],
     catalogRoot: null,
     catalogKey: null,
@@ -517,7 +518,7 @@ if (typeof module !== "undefined" && module.exports) {
   function uniqueStrings(values) {
     const seen = new Set();
     const output = [];
-    values.forEach((value) => {
+    (Array.isArray(values) ? values : []).forEach((value) => {
       if (typeof value !== "string" || !value.trim()) return;
       const text = value.trim();
       if (seen.has(text)) return;
@@ -525,6 +526,49 @@ if (typeof module !== "undefined" && module.exports) {
       output.push(text);
     });
     return output;
+  }
+
+  function defaultExecutorHarness() {
+    const specs = schema.keys && schema.keys["omnigent:agent"]
+      ? schema.keys["omnigent:agent"] : [];
+    const harnessSpec = specs.find(
+      (spec) => spec.key === "executor.config.harness");
+    const enumChoices = harnessSpec && Array.isArray(harnessSpec.enum)
+      ? uniqueStrings(harnessSpec.enum) : [];
+    if (enumChoices.length) return enumChoices[0];
+    return Object.keys(state.byExecutor || {}).find((harness) =>
+      uniqueStrings(state.byExecutor[harness]).length
+    ) || "";
+  }
+
+  function executorHarnessFrom(values) {
+    if (!values || typeof values !== "object") return "";
+    const direct = values["executor.config.harness"];
+    if (typeof direct === "string" && direct.trim()) return direct.trim();
+    const nested = valueAtPath(
+      values, ["executor", "config", "harness"]);
+    return typeof nested === "string" ? nested.trim() : "";
+  }
+
+  function modelChoicesFor(spec, values) {
+    const source = typeof spec.values_from === "string" &&
+      spec.values_from.startsWith("models:")
+      ? spec.values_from.slice("models:".length) : "";
+    if (source !== "omnigent") {
+      return uniqueStrings(state.modelChoices[source] || []);
+    }
+
+    const harness = executorHarnessFrom(values) || defaultExecutorHarness();
+    const candidates = harness ? [
+      harness,
+      `${harness}-native`,
+      harness.replace(/-native$/, "")
+    ] : [];
+    for (const candidate of candidates) {
+      const choices = uniqueStrings(state.byExecutor[candidate]);
+      if (choices.length) return choices;
+    }
+    return uniqueStrings(state.modelChoices.omnigent || []);
   }
 
   function commaValues(value) {
@@ -615,6 +659,91 @@ if (typeof module !== "undefined" && module.exports) {
     return { grid, value: source, rows };
   }
 
+  function populateCatalogSelect(
+    control, customControl, spec, choices, value, disabled
+  ) {
+    const knownChoices = uniqueStrings(
+      (Array.isArray(choices) ? choices : []).map((choice) => String(choice))
+    );
+    const choiceState = catalogChoiceState(value, knownChoices);
+    const visibleChoices = [...knownChoices];
+    if (choiceState.offList && spec.values_from) {
+      visibleChoices.push(choiceState.value);
+    }
+    control.replaceChildren();
+    if (!spec.required) {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "—";
+      control.append(empty);
+    }
+    visibleChoices.forEach((choice) => {
+      const option = document.createElement("option");
+      option.value = choice;
+      option.textContent = choice;
+      control.append(option);
+    });
+    const customOption = document.createElement("option");
+    customOption.value = CUSTOM_VALUE;
+    customOption.textContent = "custom…";
+    control.append(customOption);
+    control.value = choiceState.selected;
+    customControl.value = choiceState.value;
+    const custom = control.value === CUSTOM_VALUE;
+    customControl.hidden = !custom;
+    customControl.disabled = disabled || !custom;
+    return choiceState;
+  }
+
+  function setCatalogOffListState(fieldControl, offList) {
+    fieldControl.offList = offList;
+    fieldControl.row.classList.toggle("field-offlist", offList);
+    fieldControl.control.classList.toggle("field-offlist", offList);
+    if (fieldControl.customControl) {
+      fieldControl.customControl.classList.toggle("field-offlist", offList);
+    }
+    const warning = fieldControl.row.querySelector(".field-offlist-help");
+    if (offList && !warning) {
+      const note = document.createElement("p");
+      note.className = "field-help field-offlist-help";
+      note.textContent = "Current value is not in the known catalog.";
+      fieldControl.row.append(note);
+    } else if (!offList && warning) {
+      warning.remove();
+    }
+  }
+
+  function refillModelControl(fieldControl, choices, currentValue) {
+    if (!fieldControl || fieldControl.widget !== "select" ||
+        !fieldControl.customControl) return;
+    const choiceState = populateCatalogSelect(
+      fieldControl.control,
+      fieldControl.customControl,
+      fieldControl.spec,
+      choices,
+      currentValue,
+      fieldControl.control.disabled,
+    );
+    setCatalogOffListState(fieldControl, choiceState.offList);
+  }
+
+  function refreshOmnigentModelControl() {
+    const harnessControl = state.formControls.find(
+      (fieldControl) => fieldControl.spec.key === "executor.config.harness");
+    const modelControl = state.formControls.find(
+      (fieldControl) => fieldControl.spec.key === "executor.model");
+    if (!harnessControl || !modelControl) return;
+    const harness = computeFieldValue(harnessControl);
+    const currentModel = computeFieldValue(modelControl);
+    refillModelControl(
+      modelControl,
+      modelChoicesFor(modelControl.spec, {
+        "executor.config.harness": harness
+      }),
+      currentModel,
+    );
+  }
+
   function buildFieldRow(spec, initialValue, opts = {}) {
     const {
       unknown = false,
@@ -642,33 +771,13 @@ if (typeof module !== "undefined" && module.exports) {
     } else if (widget === "select") {
       control = document.createElement("select");
       control.className = "field-control";
-      if (!spec.required) {
-        const empty = document.createElement("option"); empty.value = ""; empty.textContent = "—";
-        control.append(empty);
-      }
       const sourceChoices = spec.values_from ? choices : (spec.enum || []);
-      const knownChoices = uniqueStrings(sourceChoices.map((choice) => String(choice)));
-      const choiceState = catalogChoiceState(initialValue, knownChoices);
-      const current = choiceState.value;
-      offList = choiceState.offList;
-      const visibleChoices = [...knownChoices];
-      if (offList && spec.values_from) visibleChoices.push(current);
-      visibleChoices.forEach((choice) => {
-        const option = document.createElement("option");
-        option.value = choice; option.textContent = choice;
-        control.append(option);
-      });
-      const customOption = document.createElement("option");
-      customOption.value = CUSTOM_VALUE;
-      customOption.textContent = "custom…";
-      control.append(customOption);
       customControl = document.createElement("input");
       customControl.type = "text";
       customControl.className = "field-control";
-      customControl.value = current;
-      customControl.hidden = !offList;
-      customControl.disabled = disabled || !offList;
-      control.value = choiceState.selected;
+      const choiceState = populateCatalogSelect(
+        control, customControl, spec, sourceChoices, initialValue, disabled);
+      offList = choiceState.offList;
       control.addEventListener("change", () => {
         const custom = control.value === CUSTOM_VALUE;
         customControl.hidden = !custom;
@@ -775,6 +884,7 @@ if (typeof module !== "undefined" && module.exports) {
     return {
       row, control, widget, spec, customControl, permissionValue,
       permissionRows, errorNode,
+      offList,
       isArrayOriginally: Array.isArray(initialValue), wasPresent: false,
       unknownOriginalType: null, jsonError: null
     };
@@ -792,8 +902,14 @@ if (typeof module !== "undefined" && module.exports) {
       try {
         const data = await api("/api/registry/models");
         const choices = {};
+        const byExecutor = {};
         const available = data && data.available &&
           typeof data.available === "object" ? data.available : {};
+        const executorCatalogs = data && data.by_executor &&
+          typeof data.by_executor === "object" ? data.by_executor : {};
+        Object.keys(executorCatalogs).forEach((harness) => {
+          byExecutor[harness] = uniqueStrings(executorCatalogs[harness]);
+        });
         Object.keys(available).forEach((harness) => {
           if (!Array.isArray(available[harness])) return;
           choices[harness] = available[harness]
@@ -812,11 +928,13 @@ if (typeof module !== "undefined" && module.exports) {
             choices[harness] = uniqueStrings(choices[harness]);
           });
           state.modelChoices = choices;
+          state.byExecutor = byExecutor;
           state.catalogRoot = rootKey;
         }
       } catch (_) {
         if (currentRoot === rootKey) {
           state.modelChoices = {};
+          state.byExecutor = {};
           state.catalogRoot = rootKey;
         }
       }
@@ -881,17 +999,24 @@ if (typeof module !== "undefined" && module.exports) {
     specs.forEach((spec) => {
       const current = fieldState(frontmatter, spec);
       const has = current.has;
-      const value = has ? current.value : (
+      let value = has ? current.value : (
         spec.type === "bool" ? false :
         spec.widget === "permission-grid" ? {} : ""
       );
+      if (spec.key === "executor.config.harness" &&
+          (value === null || value === undefined ||
+           String(value).trim() === "")) {
+        value = defaultExecutorHarness();
+      }
       const effectiveWidget = effectiveWidgetFor(spec, has, value);
       const specForRow = effectiveWidget === spec.widget ? spec : { ...spec, widget: effectiveWidget };
       const rawText = effectiveWidget === "raw" ? (rawTexts[spec.key] || "") : "";
       const source = typeof spec.values_from === "string" &&
         spec.values_from.startsWith("models:")
         ? spec.values_from.slice("models:".length) : null;
-      const choices = source
+      const choices = source === "omnigent"
+        ? modelChoicesFor(spec, frontmatter)
+        : source
         ? (state.modelChoices[source] || [])
         : (spec.widget === "spawns-select" ? state.agentNames : []);
       const built = buildFieldRow(specForRow, value, {
@@ -902,6 +1027,18 @@ if (typeof module !== "undefined" && module.exports) {
       container.append(built.row);
       state.formControls.push(built);
     });
+
+    const harnessControl = state.formControls.find(
+      (fieldControl) => fieldControl.spec.key === "executor.config.harness");
+    const modelControl = state.formControls.find(
+      (fieldControl) => fieldControl.spec.key === "executor.model");
+    if (harnessControl && modelControl) {
+      harnessControl.control.addEventListener(
+        "change", refreshOmnigentModelControl);
+      // Schema lists executor.model before the harness field, so refill
+      // once both controls exist using the live harness value.
+      refreshOmnigentModelControl();
+    }
 
     if (unknownKeys.length) {
       const note = document.createElement("p");
@@ -1156,6 +1293,7 @@ if (typeof module !== "undefined" && module.exports) {
       if (!fc) return;
       setFormControlValue(fc, item.value);
     });
+    refreshOmnigentModelControl();
   }
 
   function ensureTrailingNewline(text) {
@@ -1680,6 +1818,7 @@ if (typeof module !== "undefined" && module.exports) {
   window.addEventListener("trio:workspace", (event) => {
     currentRoot = event.detail && event.detail.path ? event.detail.path : "";
     state.modelChoices = {};
+    state.byExecutor = {};
     state.catalogRoot = null;
     state.catalogKey = null;
     state.catalogPromise = null;

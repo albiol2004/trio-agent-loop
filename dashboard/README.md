@@ -107,7 +107,9 @@ The **Skills** page (`/skills.html`) edits skill registry files with a typed fro
   `yaml-document` sends `prompt` as the body.
 - **Structured widgets** — specialized input controls render per field type and widget hint:
   - Enum select dropdowns with custom YAML escape for off-list values and warning on save
-  - Model dropdowns fed by `/api/registry/models` (provider-specific sets per harness)
+  - Model dropdowns fed by `/api/registry/models` (provider-specific sets per
+    harness); Omnigent `executor.config.harness` changes swap
+    `executor.model` options through `by_executor`
   - OpenCode permission grid with nested allow/deny map editing and byte-exact no-op round-trip
   - OMP spawns multi-select (agent allowlist, comma-separated scalar serialization)
   - JSON-schema field with JSON validation in a YAML literal block
@@ -136,6 +138,8 @@ The **Agents** page (`/agents.html`) displays canonical-agent definitions and pe
   status: ✓ in-sync, ⚡ stale, ✗ missing, or unsupported. Every supported
   harness is always listed; `scope_used: "global"` appears when the harness
   has no project agent directory and falls back to global installation.
+- **Omnigent model dropdowns** use the selected `executor.config.harness`;
+  changing it swaps `executor.model` options through `by_executor`.
 - **Agent CRUD** — `POST /api/registry/agents` creates, `PUT /api/registry/agents/file` updates, `DELETE /api/registry/agents/file` deletes canonical agents. All validate against the CanonicalAgent schema.
 - **Scoped agent installs** — project scope keeps every supported harness
   selectable. Harnesses without a project agent directory fall back to global
@@ -183,6 +187,10 @@ home; an unknown custom model is reported as a warning and does not fail the
 request.
 Model pins declared in frontmatter can be edited from the page. Runtime
 override sources remain read-only; their paths link to the Skills editor.
+Editable model rows are `<select>` controls filtered by row harness, with a
+custom-id escape for values outside the catalog. Omnigent forms use the
+selected executor harness and swap `executor.model` options through
+`by_executor` when `executor.config.harness` changes.
 
 ## Registry health
 

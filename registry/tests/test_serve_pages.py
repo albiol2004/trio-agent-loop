@@ -392,10 +392,61 @@ class ModelsJsConventionTests(unittest.TestCase):
         self.assertNotIn("innerHTML", source)
         self.assertNotIn("<script", source)
 
+    def test_models_js_uses_select_not_free_text_input(self):
+        source = (REPO_ROOT / "dashboard" / "models.js").read_text(
+            encoding="utf-8")
+        self.assertTrue(
+            'document.createElement("select")' in source or
+            'createElement("select"' in source
+        )
+        self.assertIn("__trio_custom__", source)
+        self.assertNotIn('input.type = "text"', source)
+
+    def test_models_js_helpers_exercise_catalog_state(self):
+        script = r"""
+const assert = require("node:assert/strict");
+const {
+  catalogChoiceState,
+  choicesForHarness,
+} = require(process.argv[1]);
+
+assert.deepEqual(
+  choicesForHarness({claude: ["a"], omnigent: ["x"]}, "claude"),
+  ["a"],
+);
+const offList = catalogChoiceState("z", ["a"]);
+assert.equal(offList.offList, true);
+assert.equal(offList.selected, "__trio_custom__");
+"""
+        result = subprocess.run(
+            ["node", "-e", script, str(REPO_ROOT / "dashboard" / "models.js")],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_models_js_links_overrides_to_skills(self):
         source = (REPO_ROOT / "dashboard" / "models.js").read_text(
             encoding="utf-8")
         self.assertIn("skills.html?path=", source)
+
+
+class ModelDropdownConventionTests(unittest.TestCase):
+    def test_omnigent_model_refill_uses_executor_catalogs(self):
+        for filename in ("agents.js", "skills.js"):
+            source = (REPO_ROOT / "dashboard" / filename).read_text(
+                encoding="utf-8")
+            with self.subTest(filename=filename):
+                self.assertIn("by_executor", source)
+                self.assertIn("executor.config.harness", source)
+
+    def test_model_dropdown_scripts_have_no_innerhtml(self):
+        for filename in ("models.js", "agents.js", "skills.js"):
+            source = (REPO_ROOT / "dashboard" / filename).read_text(
+                encoding="utf-8")
+            with self.subTest(filename=filename):
+                self.assertNotIn("innerHTML", source)
 
 
 class HealthJsConventionTests(unittest.TestCase):
