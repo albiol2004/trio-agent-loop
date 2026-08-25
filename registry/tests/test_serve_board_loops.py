@@ -48,6 +48,7 @@ def _get(url: str) -> tuple[int, dict]:
 class NestedMailboxBoardTests(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory()
+        self.home = tempfile.TemporaryDirectory()
         root = Path(self.workspace.name)
         (root / "loop").mkdir()
         (root / "loop" / "LOG.md").write_text("# LOG\n", encoding="utf-8")
@@ -57,6 +58,8 @@ class NestedMailboxBoardTests(unittest.TestCase):
         (root / "loop" / "briefs").mkdir()
         (root / "loop" / "briefs" / "GOAL.md").write_text("x\n", encoding="utf-8")
         self.root = root
+        self.original_home = serve.HOME
+        serve.HOME = Path(self.home.name)
         self.server = serve.DashboardServer(
             ("127.0.0.1", 0), workspaces=[root], auto_discover=False)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -65,17 +68,41 @@ class NestedMailboxBoardTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
+        serve.HOME = self.original_home
         self.workspace.cleanup()
+        self.home.cleanup()
 
     def _url(self, path: str, **query) -> str:
         query["root"] = str(self.root)
         return self.base + path + "?" + urllib.parse.urlencode(query)
 
     def test_board_lists_nested_mailbox(self):
+        # The regression target must remain the real home, not the fake one.
+        real_state = (
+            Path.home() / ".local" / "share" / "trio-agent-loop"
+            / "inbox-state.json"
+        )
+        real_exists = real_state.exists()
+        real_before = real_state.stat() if real_exists else None
+
         status, data = _get(self._url("/api/board"))
         self.assertEqual(status, 200)
         names = [loop["name"] for loop in data["loops"]]
         self.assertEqual(names, ["loop", "loop/foo"])
+
+        if real_before is None:
+            self.assertFalse(real_state.exists())
+        else:
+            self.assertTrue(real_state.exists())
+            real_after = real_state.stat()
+            self.assertEqual(real_after.st_mtime_ns, real_before.st_mtime_ns)
+            self.assertEqual(real_after.st_size, real_before.st_size)
+
+        fake_state = (
+            Path(self.home.name) / ".local" / "share" / "trio-agent-loop"
+            / "inbox-state.json"
+        )
+        self.assertTrue(fake_state.exists())
 
     def test_loop_detail_accepts_slash_name(self):
         status, data = _get(self._url("/api/loop", name="loop/foo"))
