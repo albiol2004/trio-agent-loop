@@ -405,7 +405,7 @@ def load_metrics_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     for fn in ("discover_loops", "analyze_loop", "parse_log", "parse_timeline",
-               "parse_slices_block"):
+               "parse_slices_block", "loop_name"):
         if not hasattr(module, fn):
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
@@ -2569,8 +2569,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- /api/board --------------------------------------------------------
 
-    def _loop_card(self, loop_dir: Path, metrics) -> dict:
-        analysis = metrics.analyze_loop(loop_dir)
+    def _loop_card(self, loop_dir: Path, metrics, root: Path | None = None) -> dict:
+        analysis = metrics.analyze_loop(loop_dir, root)
         entries = metrics.parse_log(loop_dir / "LOG.md")
         driver_state = _driver_snapshot(loop_dir)
         return {
@@ -2597,13 +2597,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         loops = []
         for loop_dir in loop_dirs:
             try:
-                loops.append(self._loop_card(loop_dir, metrics))
+                loops.append(self._loop_card(loop_dir, metrics, root))
             except Exception:
                 traceback.print_exc()
                 # Keep the board alive even if one loop's mailbox is broken.
                 loops.append({
-                    "name": loop_dir.name,
-                    "path": loop_dir.name,
+                    "name": metrics.loop_name(root, loop_dir),
+                    "path": metrics.loop_name(root, loop_dir),
                     "mission": "",
                     "iteration": None,
                     "max_iterations": None,
@@ -2652,8 +2652,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _find_loop_dir(self, name: str, root: Path) -> Path | None:
         metrics = self.server.metrics
+        name = str(name).strip()
+        if (
+            not name
+            or name.startswith(("/", "\\"))
+            or ".." in name.replace("\\", "/").split("/")
+        ):
+            return None
         return next(
-            (p for p in metrics.discover_loops(root) if p.name == name),
+            (p for p in metrics.discover_loops(root)
+             if metrics.loop_name(root, p) == name),
             None,
         )
 
@@ -2675,7 +2683,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         loop_dir = self._find_loop_dir(name, root)
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
-        card = self._loop_card(loop_dir, self.server.metrics)
+        card = self._loop_card(loop_dir, self.server.metrics, root)
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
         card["commits"] = _loop_commits(loop_dir, root)

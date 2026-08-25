@@ -12,6 +12,7 @@ const state = {
 
   /* drawer */
   activeLoop: null,
+  boardSignature: null,
   detail: null,
   drawerTab: "overview",
   graphSel: null,
@@ -344,30 +345,101 @@ function visibleLoops() {
     });
 }
 
+function boardSignature(loops) {
+  return JSON.stringify(
+    loops.map((loop) => [
+      loop.name,
+      loopState(loop),
+      loop.driver_phase || loop.phase || "idle",
+      loop.iteration,
+      loop.max_iterations,
+      loop.mission || "",
+      verdictSeq(loop),
+      loop.last_activity || null,
+      loop.driver || null,
+      Boolean(loop.running),
+    ])
+  );
+}
+
+function boardEmpty(text) {
+  const empty = document.createElement("div");
+  empty.className = "board-empty";
+  empty.textContent = text;
+  return empty;
+}
+
 function renderBoard() {
   updateAggregates();
   const grid = el("card-grid");
-  grid.textContent = "";
-  if (!state.loops.length) {
-    const empty = document.createElement("div");
-    empty.className = "board-empty";
-    empty.textContent = "No loop mailboxes found. Start one with /trio-init in this project.";
-    grid.appendChild(empty);
+  const loops = state.loops.length ? visibleLoops() : [];
+  const emptyText = !state.loops.length
+    ? "No loop mailboxes found. Start one with /trio-init in this project."
+    : loops.length ? "" : "No " + state.tab + " loops.";
+  const sig = state.tab + "|" + emptyText + "|" + boardSignature(loops);
+  if (sig === state.boardSignature) return;
+  state.boardSignature = sig;
+
+  if (emptyText) {
+    grid.textContent = "";
+    grid.appendChild(boardEmpty(emptyText));
     return;
   }
-  const loops = visibleLoops();
-  if (!loops.length) {
-    const empty = document.createElement("div");
-    empty.className = "board-empty";
-    empty.textContent = "No " + state.tab + " loops.";
-    grid.appendChild(empty);
-    return;
+  for (const stale of Array.from(grid.querySelectorAll(".board-empty"))) stale.remove();
+
+  const existing = new Map();
+  for (const card of grid.querySelectorAll(".loop-card")) {
+    existing.set(card.dataset.loop, card);
   }
-  loops.forEach((loop, i) => {
+  const wanted = new Set(loops.map((loop) => loop.name));
+  for (const [name, card] of existing) {
+    if (!wanted.has(name)) {
+      card.remove();
+      existing.delete(name);
+    }
+  }
+  let added = 0;
+  const ordered = loops.map((loop) => {
+    const old = existing.get(loop.name);
+    if (old) {
+      patchCard(old, loop);
+      return old;
+    }
     const card = cardEl(loop);
-    card.style.animationDelay = Math.min(i * 40, 320) + "ms";
-    grid.appendChild(card);
+    card.style.animationDelay = Math.min(added * 40, 320) + "ms";
+    added += 1;
+    return card;
   });
+  let cursor = grid.firstElementChild;
+  for (const card of ordered) {
+    if (card === cursor) {
+      cursor = cursor.nextElementSibling;
+      continue;
+    }
+    grid.insertBefore(card, cursor);
+  }
+}
+
+function patchCard(card, loop) {
+  const fresh = cardEl(loop);
+  fresh.classList.remove("active");
+  card.className = fresh.className;
+  if (state.activeLoop === loop.name) card.classList.add("active");
+  card.setAttribute("aria-label", fresh.getAttribute("aria-label"));
+  for (const sel of [".card-top", ".card-name", ".card-mission", ".card-bottom", ".card-controls"]) {
+    const oldPart = card.querySelector(sel);
+    const newPart = fresh.querySelector(sel);
+    if (oldPart && newPart) {
+      if (!oldPart.isEqualNode(newPart)) oldPart.replaceWith(newPart);
+    } else if (oldPart) {
+      oldPart.remove();
+    } else if (newPart) {
+      const controls = card.querySelector(".card-controls");
+      const bottom = card.querySelector(".card-bottom");
+      const anchor = sel === ".card-mission" ? bottom || controls : controls;
+      card.insertBefore(newPart, anchor);
+    }
+  }
 }
 
 function cardEl(loop) {

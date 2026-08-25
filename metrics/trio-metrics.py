@@ -679,8 +679,8 @@ def summarize_segment(seg: list[dict]) -> dict:
     }
 
 
-def analyze_loop(loop_dir: Path) -> dict:
-    name = loop_dir.name
+def analyze_loop(loop_dir: Path, root: Path | None = None) -> dict:
+    name = loop_name(root, loop_dir) if root is not None else loop_dir.name
     log_path = loop_dir / "LOG.md"
     state_path = loop_dir / "STATE.md"
     verdict_path = loop_dir / "VERDICT.md"
@@ -706,13 +706,55 @@ def analyze_loop(loop_dir: Path) -> dict:
     }
 
 
+MAILBOX_MARKERS = ("LOG.md", "GOAL.md", "STATE.md", "VERDICT.md", "PLAN.md")
+SKIP_DIR_NAMES = {".git", "briefs", "__pycache__"}
+
+
+def is_mailbox(path: Path) -> bool:
+    """A directory is a loop mailbox if it holds any of the mailbox files."""
+    return path.is_dir() and any((path / m).is_file() for m in MAILBOX_MARKERS)
+
+
+def _skip_dir(path: Path) -> bool:
+    n = path.name
+    return (
+        n.startswith(".") or n in SKIP_DIR_NAMES or n.startswith("evidence")
+    )
+
+
+def loop_name(root: Path, loop_dir: Path) -> str:
+    """Board name for a mailbox: relative POSIX path under root (or dir name)."""
+    try:
+        rel = loop_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        return loop_dir.name
+    return rel.as_posix() if rel.parts else loop_dir.name
+
+
 def discover_loops(root: Path) -> list[Path]:
-    """Return loop dirs for a project root, or a single loop dir."""
+    """Return loop mailbox dirs for a project root, or a single mailbox dir.
+
+    Every top-level ``loop*`` dir is inspected: it is listed when it is itself
+    a mailbox, and its direct subdirectories that are mailboxes are listed
+    too (depth 2). ``.git``, ``briefs``, ``evidence*``, ``__pycache__`` and
+    dot-dirs are skipped.
+    """
     if not root.is_dir():
         return []
-    if (root / "LOG.md").is_file():
+    if (root / "LOG.md").is_file() and not any(
+        p.is_dir() and p.name.startswith("loop") for p in root.iterdir()
+    ):
         return [root]
-    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("loop"))
+    found: list[Path] = []
+    for top in sorted(root.iterdir()):
+        if not top.is_dir() or not top.name.startswith("loop") or _skip_dir(top):
+            continue
+        if is_mailbox(top):
+            found.append(top)
+        for sub in sorted(top.iterdir()):
+            if sub.is_dir() and not _skip_dir(sub) and is_mailbox(sub):
+                found.append(sub)
+    return found
 
 
 def aggregate(loops: list[dict]) -> dict:
@@ -827,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.path).expanduser().resolve()
-    loops = [analyze_loop(p) for p in discover_loops(root)]
+    loops = [analyze_loop(p, root) for p in discover_loops(root)]
     agg = aggregate(loops)
     report = {"loops": loops, "aggregate": agg}
 
