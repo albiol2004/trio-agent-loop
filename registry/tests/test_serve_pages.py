@@ -304,7 +304,9 @@ class SkillsJsWidgetTests(unittest.TestCase):
 const assert = require("node:assert/strict");
 const {
   catalogChoiceState,
+  destinationSurfaces,
   registryDestinationPath,
+  registryDestinationPreview,
   validateJsonSchemaField,
   withRoot,
 } = require(process.argv[1]);
@@ -349,8 +351,30 @@ assert.equal(
   "~/.codex/agents/x.toml"
 );
 assert.equal(
+  registryDestinationPath(
+    "global", "omnigent", "agent", "x", "",
+    {"omnigent:agent": "yaml-document"}),
+  "~/.omnigent/agents/x/config.yaml"
+);
+assert.equal(
   registryDestinationPath("project", "omp", "skill", "x", "/tmp/ws"),
   null
+);
+
+const catalog = {
+  codex: { skill: { project: null, global: ".agents/skills" } },
+  cursor: { skill: { project: ".cursor/skills", global: null } },
+};
+assert.deepEqual(destinationSurfaces(catalog, "codex"), ["skill"]);
+assert.equal(
+  registryDestinationPreview(
+    "project", "codex", "skill", "x", "/tmp/ws", {}, catalog),
+  "codex:skill · global only → ~/.agents/skills/x/SKILL.md"
+);
+assert.equal(
+  registryDestinationPreview(
+    "project", "cursor", "skill", "x", "/tmp/ws", {}, catalog),
+  "cursor:skill · /tmp/ws/.cursor/skills/x/SKILL.md"
 );
 """
         result = subprocess.run(

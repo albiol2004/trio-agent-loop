@@ -270,6 +270,60 @@ class ScopedRegistryCreateTests(unittest.TestCase):
             real_target.read_bytes() if real_target.exists() else None,
             real_before)
 
+    def test_create_codex_skill_project_scope_falls_back_to_fake_global(self):
+        name = self.NAME + "-codex"
+        real_target = (
+            Path.home() / ".agents" / "skills" / name / "SKILL.md")
+        real_before = (
+            real_target.read_bytes() if real_target.exists() else None)
+        original_home = serve.HOME
+        server = None
+        thread = None
+        with tempfile.TemporaryDirectory() as project_tmp, \
+                tempfile.TemporaryDirectory() as home_tmp:
+            project = Path(project_tmp).resolve()
+            fake_home = Path(home_tmp).resolve()
+            try:
+                serve.HOME = fake_home
+                server = serve.DashboardServer(
+                    ("127.0.0.1", 0),
+                    workspaces=[project],
+                    auto_discover=False)
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                thread = threading.Thread(
+                    target=server.serve_forever, daemon=True)
+                thread.start()
+
+                status, payload = _http_json(
+                    "POST",
+                    f"{base}/api/registry/create",
+                    {
+                        "harness": "codex",
+                        "surface": "skill",
+                        "name": name,
+                        "content": "",
+                        "scope": "project",
+                        "project": str(project),
+                    })
+                self.assertEqual(status, 201, payload)
+                self.assertEqual(payload["scope_used"], "global")
+                global_target = (
+                    fake_home / ".agents" / "skills" / name / "SKILL.md")
+                self.assertEqual(Path(payload["path"]), global_target)
+                self.assertTrue(global_target.is_file())
+                self.assertNotIn(project, global_target.parents)
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                if thread is not None:
+                    thread.join(timeout=5)
+                serve.HOME = original_home
+
+        self.assertEqual(
+            real_target.read_bytes() if real_target.exists() else None,
+            real_before)
+
 
 class SchemaEndpointTests(DashboardServerTestCase):
 
@@ -285,15 +339,25 @@ class SchemaEndpointTests(DashboardServerTestCase):
 
     def test_schema_destinations_match_global_registry_dirs(self):
         _, payload = self._get("/api/registry/schema")
-        expected_harnesses = {h for (h, _s) in serve._GLOBAL_REGISTRY_DIRS}
-        expected_pairs = set(serve._GLOBAL_REGISTRY_DIRS.keys())
+        expected_pairs = (
+            set(serve._PROJECT_REGISTRY_DIRS)
+            | set(serve._GLOBAL_REGISTRY_RELATIVE_DIRS)
+        )
+        expected_harnesses = {h for (h, _s) in expected_pairs}
         self.assertEqual(set(payload["destinations"].keys()), expected_harnesses)
         actual_pairs = {
             (harness, surface)
             for harness, surfaces in payload["destinations"].items()
-            for surface in surfaces
+            for surface in surfaces.keys()
         }
         self.assertEqual(actual_pairs, expected_pairs)
+        destinations = payload["destinations"]
+        self.assertIsNone(destinations["codex"]["skill"]["project"])
+        self.assertIsNone(destinations["omnigent"]["agent"]["project"])
+        self.assertEqual(
+            destinations["omnigent"]["agent"]["global"],
+            ".omnigent/agents")
+        self.assertIsNotNone(destinations["cursor"]["skill"]["project"])
 
     def test_schema_opencode_agent_keys_have_no_name_field(self):
         _, payload = self._get("/api/registry/schema")

@@ -1,18 +1,13 @@
 const CUSTOM_VALUE = "__trio_custom__";
 
-// Mirrors registry/scan.py's project collect directories. Unsupported pairs
-// never reach the create endpoint.
+// Mirrors registry/scan.py's project collect directories. Pairs omitted here
+// may still be created in project scope through the global fallback.
 const PROJECT_REGISTRY_DIRS = {
   "claude:skill": ".claude/skills",
   "claude:command": ".claude/commands",
   "claude:agent": ".claude/agents",
   "opencode:agent": ".opencode/agents",
   "cursor:skill": ".cursor/skills",
-};
-const PROJECT_DESTINATIONS = {
-  claude: ["skill", "command", "agent"],
-  opencode: ["agent"],
-  cursor: ["skill"],
 };
 const GLOBAL_REGISTRY_DIRS = {
   "claude:skill": ".claude/skills",
@@ -24,18 +19,38 @@ const GLOBAL_REGISTRY_DIRS = {
   "omp:agent": ".omp/agent/agents",
   "opencode:command": ".config/opencode/commands",
   "opencode:agent": ".config/opencode/agents",
+  "omnigent:agent": ".omnigent/agents",
   "kimi:skill": ".kimi-code/skills",
   "zcode:skill": ".zcode/skills",
 };
 
+function destinationSpec(destinations, harness, surface) {
+  const normalizedHarness = String(harness || "").toLowerCase();
+  const normalizedSurface = String(surface || "").toLowerCase();
+  const surfaces = destinations && destinations[normalizedHarness];
+  const spec = surfaces && !Array.isArray(surfaces)
+    ? surfaces[normalizedSurface] : null;
+  return spec && typeof spec === "object" ? spec : null;
+}
+
+function destinationSurfaces(destinations, harness) {
+  const normalizedHarness = String(harness || "").toLowerCase();
+  const surfaces = destinations && destinations[normalizedHarness];
+  return surfaces && typeof surfaces === "object" && !Array.isArray(surfaces)
+    ? Object.keys(surfaces) : [];
+}
+
 function registryDestinationPath(
-  scope, harness, surface, name, project = "", formats = {}
+  scope, harness, surface, name, project = "", formats = {}, catalog = null
 ) {
   const normalizedScope = String(scope || "global").toLowerCase();
+  const normalizedHarness = String(harness || "").toLowerCase();
   const normalizedSurface = String(surface || "").toLowerCase();
-  const key = `${String(harness || "").toLowerCase()}:${normalizedSurface}`;
-  const relative = normalizedScope === "project"
+  const key = `${normalizedHarness}:${normalizedSurface}`;
+  const spec = destinationSpec(catalog, normalizedHarness, normalizedSurface);
+  const fallback = normalizedScope === "project"
     ? PROJECT_REGISTRY_DIRS[key] : GLOBAL_REGISTRY_DIRS[key];
+  const relative = catalog ? spec && spec[normalizedScope] : fallback;
   if (
     !relative || !name ||
     (normalizedScope === "project" && !project)
@@ -44,8 +59,29 @@ function registryDestinationPath(
     ? String(project).replace(/\/+$/, "") : "~";
   const extension = normalizedSurface === "skill"
     ? `${name}/SKILL.md`
-    : `${name}.${formats[key] === "toml" ? "toml" : "md"}`;
+    : normalizedHarness === "omnigent" && normalizedSurface === "agent"
+      ? `${name}/config.yaml`
+      : `${name}.${formats[key] === "toml" ? "toml" : "md"}`;
   return `${base}/${relative}/${extension}`;
+}
+
+function registryDestinationPreview(
+  scope, harness, surface, name, project = "", formats = {}, catalog = null
+) {
+  const normalizedScope = String(scope || "global").toLowerCase();
+  const spec = destinationSpec(catalog, harness, surface);
+  const globalOnly = normalizedScope === "project" &&
+    spec && spec.project == null && spec.global;
+  const effectiveScope = globalOnly ? "global" : normalizedScope;
+  const path = registryDestinationPath(
+    effectiveScope, harness, surface, name, project, formats, catalog
+  );
+  if (!path) return null;
+  const key = `${String(harness || "").toLowerCase()}:` +
+    `${String(surface || "").toLowerCase()}`;
+  return globalOnly
+    ? `${key} · global only → ${path}`
+    : `${key} · ${path}`;
 }
 
 // These small pure helpers are also exported for the no-DOM regression tests.
@@ -93,8 +129,11 @@ function catalogChoiceState(value, choices) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     catalogChoiceState,
+    destinationSpec,
+    destinationSurfaces,
     jsonSchemaError,
     registryDestinationPath,
+    registryDestinationPreview,
     validateJsonSchemaField,
     withRoot,
   };
@@ -106,12 +145,35 @@ if (typeof module !== "undefined" && module.exports) {
   // breaks. The server (`registry/scan.py` SURFACE_FORMAT / KEY_SCHEMA) is
   // the single source of truth once the fetch succeeds.
   const FALLBACK_DESTINATIONS = {
-    claude: ["skill", "command", "agent"],
-    codex: ["skill", "agent"],
-    kimi: ["skill"],
-    zcode: ["skill"],
-    omp: ["command", "agent"],
-    opencode: ["command", "agent"]
+    claude: {
+      skill: { project: ".claude/skills", global: ".claude/skills" },
+      command: { project: ".claude/commands", global: ".claude/commands" },
+      agent: { project: ".claude/agents", global: ".claude/agents" },
+    },
+    codex: {
+      skill: { project: null, global: ".agents/skills" },
+      agent: { project: null, global: ".codex/agents" },
+    },
+    omp: {
+      command: { project: null, global: ".omp/agent/commands" },
+      agent: { project: null, global: ".omp/agent/agents" },
+    },
+    opencode: {
+      command: { project: null, global: ".config/opencode/commands" },
+      agent: { project: ".opencode/agents", global: ".config/opencode/agents" },
+    },
+    omnigent: {
+      agent: { project: null, global: ".omnigent/agents" },
+    },
+    kimi: {
+      skill: { project: null, global: ".kimi-code/skills" },
+    },
+    zcode: {
+      skill: { project: null, global: ".zcode/skills" },
+    },
+    cursor: {
+      skill: { project: ".cursor/skills", global: null },
+    },
   };
   let currentRoot = "";
   let schema = { destinations: FALLBACK_DESTINATIONS, formats: {}, keys: {} };
@@ -1349,19 +1411,15 @@ if (typeof module !== "undefined" && module.exports) {
     }
   }
 
-  function destinationsForScope(scope) {
-    return scope === "project" ? PROJECT_DESTINATIONS : schema.destinations;
+  function destinationsForScope(_scope) {
+    return schema.destinations;
   }
 
   // Agents are authored on the Agents page (canonical entity + per-harness
-  // renderers); this page's create dialog only makes raw skill/command files.
+  // renderers); keep the complete catalog here so project scope never hides a
+  // harness that can fall back to a global destination.
   function creatableDestinations(destinations) {
-    const filtered = {};
-    Object.keys(destinations || {}).forEach((harness) => {
-      const surfaces = (destinations[harness] || []).filter((s) => s !== "agent");
-      if (surfaces.length) filtered[harness] = surfaces;
-    });
-    return filtered;
+    return destinations || {};
   }
 
   function destinationOptions(
@@ -1384,7 +1442,7 @@ if (typeof module !== "undefined" && module.exports) {
     select, harness, preferred = "skill", destinations = schema.destinations
   ) {
     select.replaceChildren();
-    const surfaces = (destinations && destinations[harness]) || [];
+    const surfaces = destinationSurfaces(destinations, harness);
     const selectedSurface = surfaces.includes(preferred)
       ? preferred : surfaces[0];
     surfaces.forEach((surface) => {
@@ -1398,7 +1456,9 @@ if (typeof module !== "undefined" && module.exports) {
 
   function updateImportSurfaces() {
     const harness = $("import-harness").value || "claude";
-    const preferred = (schema.destinations[harness] || []).includes($("import-surface").value) ? $("import-surface").value : "skill";
+    const surfaces = destinationSurfaces(schema.destinations, harness);
+    const preferred = surfaces.includes($("import-surface").value)
+      ? $("import-surface").value : "skill";
     updateSurfaceSelect($("import-surface"), harness, preferred);
   }
 
@@ -1434,18 +1494,23 @@ if (typeof module !== "undefined" && module.exports) {
     const surface = $("new-surface").value;
     const name = $("new-name").value.trim();
     const destinations = destinationsForScope(scope);
+    const spec = destinationSpec(destinations, harness, surface);
     if (!name) {
       item.textContent = "Enter a name.";
     } else if (scope === "project" && !currentRoot) {
       item.textContent = "Choose a workspace for project scope.";
-    } else if (
-      !destinations[harness] || !destinations[harness].includes(surface)
-    ) {
+    } else if (!spec) {
       item.textContent = "Selected destination is unavailable in this scope.";
     } else {
-      const path = registryDestinationPath(
-        scope, harness, surface, name, currentRoot, schema.formats);
-      item.textContent = `${harness}:${surface} · ${path}`;
+      item.textContent = registryDestinationPreview(
+        scope,
+        harness,
+        surface,
+        name,
+        currentRoot,
+        schema.formats,
+        destinations,
+      ) || "Selected destination is unavailable in this scope.";
     }
     list.append(item);
   }
@@ -1569,9 +1634,7 @@ if (typeof module !== "undefined" && module.exports) {
     const harness = $("new-harness").value;
     const surface = $("new-surface").value;
     const destinations = destinationsForScope(scope);
-    if (
-      !destinations[harness] || !destinations[harness].includes(surface)
-    ) {
+    if (!destinationSpec(destinations, harness, surface)) {
       setPageState("Selected destination is unavailable in this scope.", true);
       return;
     }

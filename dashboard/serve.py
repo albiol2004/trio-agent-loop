@@ -79,15 +79,23 @@ Registry (format-aware):
         artifact health for the explicit repository and optional dashboard home.
 
     GET /api/registry/schema
-    Response: {"destinations": {<harness>: [<surface>, ...]},
+    Response: {"destinations": {<harness>: {
+                   <surface>: {"project": <relative-path>|null,
+                               "global": <relative-path>|null}}},
                "formats": {"<harness>:<surface>": "yaml"|"yaml-document"|"toml"},
                "keys": {"<harness>:<surface>": [<fieldspec>, ...]}}
         fieldspec: {"key", "type", "widget", "required", "enum", "help",
                     "values_from"};
         widget is one of text | textarea | checkbox | select | list | raw |
         permission-grid | spawns-select | json-schema.
-        Derived from registry/scan.py's SURFACE_FORMAT/KEY_SCHEMA tables and
-        this module's _GLOBAL_REGISTRY_DIRS — no workspace root required.
+        Destination paths are relative to the selected project or dashboard
+        home and come from the project/global registry directory tables; no
+        workspace root is required.
+
+    POST /api/registry/create
+    Body: {"harness", "surface", "name", "content"?, "scope"?, "project"?}
+    Response: 201 {"path", "scope_used"}; project scope falls back to the
+        global destination when that harness/surface has no project layout.
 
     POST /api/registry/serialize
     Body: {"format", "frontmatter", "body", "harness"?, "surface"?, "path"?}
@@ -296,6 +304,25 @@ _PROJECT_REGISTRY_DIRS = {
     ("opencode", "agent"): Path(".opencode/agents"),
     ("cursor", "skill"): Path(".cursor/skills"),
 }
+
+
+def _registry_destination_catalog() -> dict[str, dict[str, dict[str, str | None]]]:
+    """Build the browser-facing project/global registry path catalog."""
+    pairs = list(_GLOBAL_REGISTRY_RELATIVE_DIRS)
+    pairs.extend(
+        pair for pair in _PROJECT_REGISTRY_DIRS if pair not in pairs
+    )
+    destinations: dict[str, dict[str, dict[str, str | None]]] = {}
+    for harness, surface in pairs:
+        project = _PROJECT_REGISTRY_DIRS.get((harness, surface))
+        global_path = _GLOBAL_REGISTRY_RELATIVE_DIRS.get((harness, surface))
+        destinations.setdefault(harness, {})[surface] = {
+            "project": project.as_posix() if project is not None else None,
+            "global": (
+                global_path.as_posix() if global_path is not None else None
+            ),
+        }
+    return destinations
 
 
 SHADOW_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-shadow.py"
@@ -1262,6 +1289,36 @@ def _registry_target(
     return (root / f"{name}.{ext}").resolve()
 
 
+def _registry_target_with_scope(
+    harness, surface, name, scope, project=None, home=None
+) -> tuple[Path, str]:
+    """Resolve a registry target and report its effective destination scope."""
+    requested_scope = _normalize_agent_scope(scope)
+    try:
+        target = _registry_target(
+            harness,
+            surface,
+            name,
+            scope=requested_scope,
+            project=project,
+            home=home,
+        )
+    except ValueError as exc:
+        # Only an absent project layout is allowed to fall back. Other
+        # validation errors must retain _registry_target's behavior.
+        if str(exc) != "unsupported project registry destination":
+            raise
+        target = _registry_target(
+            harness,
+            surface,
+            name,
+            scope="global",
+            home=home,
+        )
+        return target, "global"
+    return target, requested_scope
+
+
 def _agent_registry_target(
     harness, name, scope, project=None, home=None
 ) -> tuple[Path, str]:
@@ -1686,21 +1743,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_registry_schema(self) -> None:
         """Static harness/surface schema: destinations, formats, key specs."""
         registry = load_registry_module()
-        order = ("skill", "command", "agent")
-        destinations: dict[str, list[str]] = {}
-        for harness, surface in _GLOBAL_REGISTRY_DIRS:
-            surfaces = destinations.setdefault(harness, [])
-            if surface not in surfaces:
-                surfaces.append(surface)
-        for surfaces in destinations.values():
-            surfaces.sort(key=lambda s: order.index(s) if s in order else len(order))
         formats = {
             f"{harness}:{surface}": fmt
             for (harness, surface), fmt in registry.SURFACE_FORMAT.items()
         }
         keys = dict(registry.KEY_SCHEMA)
         self._send_json(200, {
-            "destinations": destinations,
+            "destinations": _registry_destination_catalog(),
             "formats": formats,
             "keys": keys,
         })
@@ -1872,7 +1921,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(project_value, str) or not project_value.strip():
                     raise ValueError("project is required for project scope")
                 project_root = self._agent_project_root(project_value)
-            target = _registry_target(
+            target, scope_used = _registry_target_with_scope(
                 harness,
                 surface,
                 name,
@@ -1882,7 +1931,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _writable_registry_path(
                 str(target),
                 self.server.get_workspace_seeds(),
-                project_root if scope == "project" else None,
+                project_root if scope_used == "project" else None,
             )
             _reject_if_managed(target)
             content = payload.get("content")
@@ -1906,7 +1955,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except OSError:
             return self._send_json(500, {"error": "could not create file"})
         _invalidate_registry_cache()
-        self._send_json(201, {"path": str(target)})
+        self._send_json(201, {
+            "path": str(target),
+            "scope_used": scope_used,
+        })
 
     def _handle_registry_import(self, root: Path) -> None:
         try:
