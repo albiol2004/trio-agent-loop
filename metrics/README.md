@@ -1,8 +1,6 @@
 # Trio metrics
 
-`metrics/trio-metrics.py` scans project-level `loop*/` directories (or a single
-loop mailbox) and reports per-loop iteration counts, verdict sequences, and
-final `VERDICT.md` outcomes.
+`metrics/trio-metrics.py` scans project-level `loop*/` directories and their direct subdirectories (nested mailbox discovery) for mailboxes containing any of LOG.md, GOAL.md, STATE.md, VERDICT.md, or PLAN.md (briefs/ and evidence* skipped). Reports per-loop iteration counts, verdict sequences, and final `VERDICT.md` outcomes. Single mailboxes can be scanned directly.
 
 Usage:
 

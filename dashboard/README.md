@@ -52,16 +52,15 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## What it shows
 
-- **Status board** — one card per `loop*/` mailbox: state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration counter, mission, a verdict-history strip (S/I/H/B tiles — the loop's fingerprint), and last activity. Refreshes every 5 seconds; running loops sort first.
-- **Attention inbox** — needs-human, blocked, drift, overlap, and repair
-  signals have stable identities and can be marked read or unread. Read items
-  are hidden by default; the unread count remains the inbox badge.
+- **Status board** — nested mailbox discovery: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped). One card per mailbox; cards patch in place on poll with no full re-render. Cards show status fact (from STATE.md status word), verdict fact (latest VERDICT.md word), RUNNING tag (when running_sources union is non-empty), ARCHIVED tag (loop-archive-* directory), phase label when non-idle, iteration count, mission, verdict-history strip (S/I/H/B tiles — the loop's fingerprint), and last activity. Running detection polls three sources: driver pid, /proc cmdline referencing the mailbox path, and .session.json sidecar with live pid; a dead-pid sidecar becomes an 'orphaned' inbox item. Dead pids and a broker probe on running_sources.
+- **Tabs** — Running (running loops first), Attention (unflagged inbox items), All (all mailboxes), Archived (loop-archive-*). Refreshes every 5 seconds.
+- **Attention inbox** — stable item ids (sha256 hash of root, loop_name, kind, anchor) and per-workspace read/unread state persisted in `~/.local/share/trio-agent-loop/inbox-state.json` (POST /api/inbox/read or /api/inbox/unread). Read items are hidden by default; unread count remains the inbox badge.
 - **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
 - **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
 ## Pages
 
-- `/` — status board: loop cards with state badge (RUNNING / SHIPPED / BLOCKED / NEEDS HUMAN / IDLE), iteration count, mission, verdict history, **Start/Stop buttons**, **phase badge** (lead-done / eval-done / idle), and last activity
+- `/` — status board with tabs: **Running** (running loops), **Attention** (inbox items not yet read), **All** (all mailboxes), **Archived** (loop-archive-* directories). Each card shows status and verdict facts, iteration count, mission, verdict history, and last activity. Fact tags are STATE.md status word, latest verdict word, RUNNING (when running_sources is non-empty), and ARCHIVED (for loop-archive-* paths); phase label appears when non-idle. **Start/Stop buttons** control loop execution
 - `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only, and scoped creation
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
 - `/topology.html` — layered SVG graphs of harness wiring;
