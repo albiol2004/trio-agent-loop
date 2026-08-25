@@ -43,7 +43,7 @@ window.addEventListener("trio:workspace", (event) => {
 });
 
 const BOARD_POLL_MS = 5000;
-const TABS = ["all", "running", "shipped", "blocked", "idle"];
+const TABS = ["running", "attention", "all", "archived"];
 const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
 
 /* ------------------------------ helpers ------------------------------ */
@@ -118,20 +118,6 @@ function fmtDuration(sec) {
   return hrs + "h " + (mins % 60) + "m";
 }
 
-/* Map arbitrary STATE.md status text onto buckets. */
-function normStatus(raw) {
-  const s = String(raw ?? "").trim().toLowerCase();
-  if (!s) return "unknown";
-  if (/(running|active|iterating|in progress|working)/.test(s)) {
-    return "running";
-  }
-  if (/(complet|done|finish|ship|passed|succeed|closed)/.test(s)) {
-    return "completed";
-  }
-  if (/(block|fail|error|stuck|abort|halt)/.test(s)) return "blocked";
-  return "unknown";
-}
-
 function normVerdict(raw) {
   if (!raw) return "none";
   const v = String(raw).trim().toUpperCase();
@@ -141,40 +127,6 @@ function normVerdict(raw) {
   if (v === "NEEDS_HUMAN") return "needs_human";
   return "none";
 }
-
-/* Single display state for a loop: running beats verdict, verdict beats rest. */
-function loopState(loop) {
-  const status = normStatus(loop.status);
-  const verdict = normVerdict(loop.final_verdict);
-  // A terminal verdict always wins over a stale status word. Fall back to
-  // the latest logged segment verdict when VERDICT.md is not yet written.
-  const seg = verdictSeq(loop);
-  const lastSeg = seg.length ? seg[seg.length - 1] : "none";
-  const eff = verdict !== "none" ? verdict : lastSeg;
-  if (eff === "ship") return "shipped";
-  if (eff === "blocked") return "blocked";
-  if (eff === "needs_human") return "needs_human";
-  if (verdict === "ship") return "shipped";
-  if (verdict === "blocked") return "blocked";
-  if (verdict === "needs_human") return "needs_human";
-  if (status === "blocked") return "blocked";
-  if (loop.running) return "running";
-  // "running" only when the mailbox is actively moving (fresh activity).
-  if (status === "running") {
-    const last = loop.last_activity ? new Date(loop.last_activity).getTime() : NaN;
-    if (Number.isFinite(last) && Date.now() - last < 2 * 60 * 1000) return "running";
-    return "idle";
-  }
-  return "idle";
-}
-
-const STATE_LABEL = {
-  running: "RUNNING",
-  shipped: "SHIPPED",
-  blocked: "BLOCKED",
-  needs_human: "NEEDS HUMAN",
-  idle: "IDLE",
-};
 
 /* Verdict sequence from segments, e.g. ["iterate", "ship"]. */
 function verdictSeq(loop) {
@@ -189,6 +141,59 @@ function verdictSeq(loop) {
     else if (ch === "H") out.push("needs_human");
   }
   return out;
+}
+
+function isArchived(loop) {
+  return String(loop.name || "").split("/")[0].startsWith("loop-archive");
+}
+
+/* Keep the STATE.md word factual; "unknown" is the API's missing-value marker. */
+function statusWord(loop) {
+  const raw = loop.status == null ? "" : String(loop.status);
+  const value = raw.trim();
+  return !value || value === "unknown" ? "—" : raw;
+}
+
+/* Prefer the persisted verdict, then the last parsed segment verdict. */
+function latestVerdict(loop) {
+  const final = String(loop.final_verdict || "").trim();
+  if (final) return final.toUpperCase();
+  const seq = verdictSeq(loop);
+  return seq.length ? String(seq[seq.length - 1]).toUpperCase() : null;
+}
+
+function loopTagElements(loop) {
+  const tags = [
+    span("status-label status-status", statusWord(loop)),
+  ];
+  const verdict = latestVerdict(loop);
+  if (verdict) {
+    // Map SHIP onto the existing .status-shipped color, not a missing .status-ship.
+    const tone = {
+      ship: "shipped",
+      iterate: "iterate",
+      blocked: "blocked",
+      needs_human: "needs_human",
+    }[normVerdict(verdict)];
+    tags.push(
+      span(
+        "status-label status-verdict" + (tone ? " status-" + tone : ""),
+        verdict
+      )
+    );
+  }
+  if (Boolean(loop.running)) {
+    tags.push(span("status-label status-running", "RUNNING"));
+  }
+  if (isArchived(loop)) {
+    tags.push(span("status-label status-archived", "ARCHIVED"));
+  }
+  return tags;
+}
+
+function appendLoopTags(container, loop) {
+  container.textContent = "";
+  for (const tag of loopTagElements(loop)) container.appendChild(tag);
 }
 
 /* Segmented verdict bar: one hairline segment per verdict. */
@@ -359,7 +364,7 @@ function hideBoardError() {
 
 function updateAggregates() {
   const total = state.loops.length;
-  const active = state.loops.filter((l) => loopState(l) === "running").length;
+  const active = state.loops.filter((l) => Boolean(l.running)).length;
   el("agg-loops").textContent = total + (total === 1 ? " loop" : " loops");
   el("agg-active").textContent = active + " active";
   el("agg-active").classList.toggle("is-active", active > 0);
@@ -367,13 +372,20 @@ function updateAggregates() {
   el("updated-at").textContent = "updated " + (at || "—");
 }
 
+function matchesTab(tab, loop) {
+  if (tab === "running") return Boolean(loop.running);
+  if (tab === "attention") {
+    return state.inbox.some((item) => item.loop === loop.name && !item.read);
+  }
+  if (tab === "archived") return isArchived(loop);
+  return true;
+}
+
 function renderTabs() {
   const nav = el("tabs");
   nav.textContent = "";
   for (const tab of TABS) {
-    const count = tab === "all"
-      ? state.loops.length
-      : state.loops.filter((l) => loopState(l) === tab).length;
+    const count = state.loops.filter((loop) => matchesTab(tab, loop)).length;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "tab";
@@ -393,13 +405,14 @@ function renderTabs() {
 }
 
 function visibleLoops() {
-  const rank = { running: 0, blocked: 1, idle: 2, shipped: 3 };
   return state.loops
-    .filter((l) => state.tab === "all" || loopState(l) === state.tab)
+    .filter((l) => matchesTab(state.tab, l))
     .sort((a, b) => {
-      const r = rank[loopState(a)] - rank[loopState(b)];
-      if (r !== 0) return r;
-      return String(b.last_activity || "").localeCompare(String(a.last_activity || ""));
+      const running = Number(Boolean(b.running)) - Number(Boolean(a.running));
+      if (running !== 0) return running;
+      return String(b.verdict_mtime || "").localeCompare(
+        String(a.verdict_mtime || "")
+      );
     });
 }
 
@@ -407,15 +420,17 @@ function boardSignature(loops) {
   return JSON.stringify(
     loops.map((loop) => [
       loop.name,
-      loopState(loop),
-      loop.driver_phase || loop.phase || "idle",
+      loop.status ?? null,
+      loop.final_verdict ?? null,
+      Boolean(loop.running),
+      isArchived(loop),
+      loop.verdict_mtime ?? null,
       loop.iteration,
       loop.max_iterations,
       loop.mission || "",
       verdictSeq(loop),
-      loop.last_activity || null,
-      loop.driver || null,
-      Boolean(loop.running),
+      loop.driver_phase ?? null,
+      loop.driver ?? null,
     ])
   );
 }
@@ -501,7 +516,6 @@ function patchCard(card, loop) {
 }
 
 function cardEl(loop) {
-  const display = loopState(loop);
   const card = document.createElement("article");
   card.className = "loop-card";
   card.dataset.loop = loop.name;
@@ -512,14 +526,20 @@ function cardEl(loop) {
 
   const top = document.createElement("div");
   top.className = "card-top";
-  top.appendChild(span("status-label status-" + display, STATE_LABEL[display]));
-  const phase = loop.driver_phase || loop.phase || "idle";
-  top.appendChild(
-    span(
-      "status-label status-phase",
-      String(phase).replace(/[-_]/g, " ").toUpperCase()
-    )
-  );
+  const tags = document.createElement("div");
+  tags.className = "card-tags";
+  appendLoopTags(tags, loop);
+  const phase = String(loop.driver_phase || loop.phase || "").trim();
+  // An idle phase is not a useful board tag; do not reintroduce an inference.
+  if (phase && phase.toLowerCase() !== "idle") {
+    tags.appendChild(
+      span(
+        "status-label status-phase",
+        phase.replace(/[-_]/g, " ").toUpperCase()
+      )
+    );
+  }
+  top.appendChild(tags);
   const iter = document.createElement("span");
   iter.className = "card-iter";
   const cur = loop.iteration != null ? loop.iteration : "–";
@@ -547,7 +567,12 @@ function cardEl(loop) {
   const bottom = document.createElement("div");
   bottom.className = "card-bottom";
   bottom.appendChild(segbarEl(verdictSeq(loop), false));
-  bottom.appendChild(span("card-activity", relTime(loop.last_activity)));
+  bottom.appendChild(
+    span(
+      "card-activity",
+      "updated " + (loop.verdict_mtime ? relTime(loop.verdict_mtime) : "—")
+    )
+  );
   card.appendChild(bottom);
 
   const controls = document.createElement("div");
@@ -620,7 +645,7 @@ async function openDrawer(name) {
   state.graphSel = null;
 
   el("drawer-name").textContent = name;
-  el("drawer-badge").className = "status-label status-idle";
+  el("drawer-badge").className = "status-tags";
   el("drawer-badge").textContent = "LOADING";
   el("drawer-mission").textContent = "";
   el("fact-iter").textContent = "—";
@@ -737,10 +762,9 @@ function toggleCompare(n) {
 }
 
 function renderDetail(detail) {
-  const display = loopState(detail);
   const badge = el("drawer-badge");
-  badge.className = "status-label status-" + display;
-  badge.textContent = STATE_LABEL[display];
+  badge.className = "status-tags";
+  appendLoopTags(badge, detail);
 
   const missionEl = el("drawer-mission");
   missionEl.textContent = detail.mission || "No mission recorded.";

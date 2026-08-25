@@ -229,18 +229,27 @@ html, body {
   gap: 10px;
 }
 
-/* Status as colored type — the only badge that exists. */
+/* Tags use colors for emphasis while their text stays tied to a fact. */
 .status-label {
   font-family: var(--mono);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.14em;
 }
+.card-tags, .status-tags {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.status-label.status-status { color: var(--muted); }
+.status-label.status-verdict { color: var(--muted); }
 .status-label.status-shipped { color: var(--green); }
 .status-label.status-running { color: var(--amber); }
+.status-label.status-iterate { color: var(--amber); }
 .status-label.status-blocked { color: var(--red); }
 .status-label.status-needs_human { color: var(--violet); }
-.status-label.status-idle    { color: var(--slate); }
+.status-label.status-archived { color: var(--slate); }
 .status-label.status-phase   { color: var(--blue); }
 
 .card-iter {

@@ -28,8 +28,8 @@ Board:
                "updated_at": "<ISO-8601 UTC>"}
     Each loop object:
         name, path, mission, iteration, max_iterations, status,
-        final_verdict, last_activity, last_entry_summary, segments,
-        driver_phase, driver, running
+        final_verdict, last_activity, verdict_mtime, last_entry_summary,
+        segments, driver_phase, driver, running
     Each inbox item includes: loop, kind, severity, headline, detail, id,
     read, first_seen.
 
@@ -810,6 +810,20 @@ def _last_activity(loop_dir: Path, entries: list[dict]) -> str | None:
             except ValueError:
                 continue
     return _utc_iso(max(candidates)) if candidates else None
+
+
+def _verdict_mtime(loop_dir: Path) -> str | None:
+    """Return VERDICT.md's modification time as an ISO UTC timestamp."""
+    try:
+        verdict_path = loop_dir / "VERDICT.md"
+        if not verdict_path.is_file():
+            return None
+        modified = datetime.fromtimestamp(
+            verdict_path.stat().st_mtime, tz=timezone.utc
+        )
+    except OSError:
+        return None
+    return _utc_iso(modified)
 
 
 def _last_entry_summary(entries: list[dict]) -> str:
@@ -2598,6 +2612,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "status": analysis["state_status"] or "unknown",
             "final_verdict": analysis["final_verdict"],
             "last_activity": _last_activity(loop_dir, entries),
+            "verdict_mtime": _verdict_mtime(loop_dir),
             "last_entry_summary": _last_entry_summary(entries),
             "segments": analysis["segments"],
             "driver_phase": (
@@ -2626,6 +2641,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "status": "unknown",
                     "final_verdict": None,
                     "last_activity": None,
+                    "verdict_mtime": _verdict_mtime(loop_dir),
                     "last_entry_summary": "unreadable mailbox",
                     "segments": [],
                     "driver_phase": None,

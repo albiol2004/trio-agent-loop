@@ -119,6 +119,17 @@ class NestedMailboxBoardTests(unittest.TestCase):
 class BoardJsInPlacePatchTests(unittest.TestCase):
     """renderBoard must patch cards in place instead of wiping the grid."""
 
+    def test_board_uses_fact_only_tabs_and_has_no_loop_state(self):
+        source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("function loopState", source)
+        self.assertNotIn("loopState(", source)
+        match = re.search(r"const TABS = \[(.*?)\];", source, re.S)
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            re.findall(r'"([^"]+)"', match.group(1)),
+            ["running", "attention", "all", "archived"],
+        )
+
     def test_render_board_has_no_grid_wipe(self):
         source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
         match = re.search(r"function renderBoard\(\) \{(.*?)\n\}\n", source, re.S)
@@ -130,3 +141,63 @@ class BoardJsInPlacePatchTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, body)
         self.assertIn("state.boardSignature", source)
+
+
+class FactOnlyBoardHttpTests(unittest.TestCase):
+    """Board facts must not infer activity from STATE.md status text."""
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.home = tempfile.TemporaryDirectory()
+        root = Path(self.workspace.name)
+        (root / "loop").mkdir()
+        (root / "loop" / "STATE.md").write_text(
+            "status: running\n", encoding="utf-8"
+        )
+        archive = root / "loop-archive-demo"
+        archive.mkdir()
+        (archive / "GOAL.md").write_text(
+            "# Archived loop\n\nmission: retained\n", encoding="utf-8"
+        )
+        self.root = root
+        self.original_home = serve.HOME
+        serve.HOME = Path(self.home.name)
+        self.server = serve.DashboardServer(
+            ("127.0.0.1", 0), workspaces=[root], auto_discover=False
+        )
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        ).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        serve.HOME = self.original_home
+        self.workspace.cleanup()
+        self.home.cleanup()
+
+    def _board(self) -> dict:
+        query = urllib.parse.urlencode({"root": str(self.root)})
+        status, data = _get(f"{self.base}/api/board?{query}")
+        self.assertEqual(status, 200)
+        return data
+
+    def test_board_exposes_status_archive_and_verdict_mtime_facts(self):
+        data = self._board()
+        loops = {loop["name"]: loop for loop in data["loops"]}
+
+        self.assertIn("loop", loops)
+        self.assertFalse(loops["loop"]["running"])
+        self.assertIn("running", loops["loop"]["status"])
+        self.assertIsNone(loops["loop"]["verdict_mtime"])
+        self.assertIn("loop-archive-demo", loops)
+
+        (self.root / "loop" / "VERDICT.md").write_text(
+            "VERDICT: SHIP\n", encoding="utf-8"
+        )
+        loops = {
+            loop["name"]: loop for loop in self._board()["loops"]
+        }
+        self.assertIsInstance(loops["loop"]["verdict_mtime"], str)
+        self.assertTrue(loops["loop"]["verdict_mtime"])
