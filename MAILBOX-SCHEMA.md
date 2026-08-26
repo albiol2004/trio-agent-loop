@@ -37,6 +37,10 @@ A v1 mailbox must contain these files in the mailbox directory:
 | `VERDICT.md` | the evaluator's verdict (see first-line contract) |
 | `LOG.md` | the append-only flight recorder |
 
+`QUEUE.md` is not in this list: it is an OPTIONAL file (see "v1
+open-loop extension (optional)" below). A mailbox without `QUEUE.md`
+is still a fully conformant v1 mailbox.
+
 ## STATE.md required fields
 
 In addition to `schema: 1`, a v1 STATE.md must define these top-level fields
@@ -175,6 +179,7 @@ slices:
     gate: false                     # optional; default false
     status: in_progress             # optional; default in_progress
     iteration: 1                    # optional; int
+    accepts: []                     # optional; default []; see v1 open-loop extension (optional)
 ```
 
 The block is **cumulative** across the loop's life — it is the single
@@ -196,6 +201,7 @@ One list entry per slice. The restricted shape is exactly:
 | `gate` | no (default `false`) | bool | foundation slice: never speculated, regardless of predictor state |
 | `status` | no (default `in_progress`) | `planned` \| `in_progress` \| `complete` | lifecycle state; `complete` marks a finished slice that stays in the cumulative history |
 | `iteration` | no | int | the iteration the slice belongs to; required in practice for completed entries, recommended for all |
+| `accepts` | no (default `[]`) | list of strings | slice-scoped acceptance statements the Evaluator grades this slice against (see "v1 open-loop extension (optional)" below) |
 
 ### Flow-list emission rule
 
@@ -301,6 +307,153 @@ interrupted run) — is recovered manually with the `/trio-ship` command (omp),
 which performs the same two-commit pattern from the verdict's suggested commit
 message.
 
+## v1 open-loop extension (optional)
+
+This is an **optional** extension to schema version 1: a mailbox without
+`QUEUE.md` remains a valid v1 lockstep mailbox, and every role behaves
+exactly as documented above. Everything in this section is gated on the
+presence of `QUEUE.md` in the mailbox directory.
+
+### `QUEUE.md`
+
+`QUEUE.md` lives in the mailbox directory next to `STATE.md`. It carries
+two fenced ```yaml blocks, each with exactly one top-level key. Either
+block may be absent, and `QUEUE.md` itself may be absent — absent always
+means an empty queue, never an error. A present block's list may be empty
+(`retired:` with no entries).
+
+```yaml
+retired:
+  - slice: <kebab-case slice id>
+    sha: <full 40-char sha of the last slice(<id>): commit>
+    at: <ISO-8601 timestamp>
+```
+
+| Field | Required | Type | Meaning |
+|---|---|---|---|
+| `slice` | yes | kebab-case string | the slice id; must exist in the PLAN.md `slices:` block |
+| `sha` | yes | full 40-char sha | the last `slice(<id>): ` commit for this slice |
+| `at` | yes | ISO-8601 timestamp | when the slice was retired |
+
+`retired:` is **append-only, Lead only**: the Lead is the only role that
+appends an entry, and no role ever edits or removes an existing one.
+
+```yaml
+faults:
+  - id: f1
+    slice: <kebab-case slice id>
+    observed_at: <sha the Evaluator evaluated>
+    scope: [path/one.py, path/two.md]
+    reason: <one line>
+    status: open
+```
+
+| Field | Required | Type | Meaning |
+|---|---|---|---|
+| `id` | yes | `f<N>` (lowercase `f` followed by digits) | fault identifier; unique within the file |
+| `slice` | yes | kebab-case string | the slice the fault was raised against |
+| `observed_at` | yes | full sha | the sha the Evaluator evaluated when it raised the fault |
+| `scope` | yes | single-line bracket flow list of paths | same style/semantics as `scope=local:<paths>` in the VERDICT.md first-line contract |
+| `reason` | yes | one line | why the fault was raised |
+| `status` | yes | `open` \| `taken` \| `done` \| `stale` | fault lifecycle state |
+
+`faults:` entries are **appended by the Evaluator only**; the Lead only
+transitions an existing entry's `status:` — the Lead never appends a new
+fault and never edits `slice`, `observed_at`, `scope`, or `reason`.
+
+### `accepts:` (PLAN.md slices field)
+
+The PLAN.md `slices:` block gains one **optional** field, `accepts:` (see
+"PLAN.md slice contracts (shadow mode)" above, and its field table) — a
+single-line bracket list of slice-scoped acceptance statements, e.g.
+`accepts: ["trio-check exits 0 on every loop-* dir", "no QUEUE.md -> empty
+queues"]`. Default is `[]`. It is what the Evaluator grades that slice
+against in open-loop mode. It must remain optional so every existing
+mailbox — with or without `accepts:` on any slice — stays conformant.
+
+### Per-slice verdicts in VERDICT.md
+
+Each slice evaluation is recorded as an **appended** section in
+`VERDICT.md` whose heading is exactly one of:
+
+```markdown
+## slice <id> @<sha> — SHIP
+## slice <id> @<sha> — ITERATE
+```
+
+(em dash, `@` immediately before the full sha). VERDICT.md's
+first-non-empty-line contract (see "## VERDICT.md first-line contract"
+above — unchanged) stays **reserved for the final integration verdict**
+(see "Termination" below). Until that integration verdict exists, an
+open-loop `VERDICT.md` may consist only of per-slice sections and
+therefore has no `VERDICT:` first line — that is valid for a mailbox that
+has `QUEUE.md`, and is **not** valid for a lockstep mailbox. A per-slice
+section body **MUST NOT** contain any line beginning with `VERDICT:` —
+that token stays reserved for the integration verdict so existing verdict
+parsers are unaffected.
+
+### Lead loop (open-loop mode)
+
+1. Take `open` faults first: mark the fault `taken`, fix strictly within
+   its `scope:`, commit `slice(<id>): fix f<N> …`, then mark it `done`.
+2. Mark a fault `stale` instead of `done` when every path in its `scope:`
+   was already rewritten after `observed_at` and the reason no longer
+   applies.
+3. Otherwise take the next `planned` slice.
+4. On finishing a slice: commit, set `status: complete` in the PLAN.md
+   `slices:` block, append a `retired:` entry with the full sha of the
+   last `slice(<id>): ` commit.
+5. Never wait for a verdict.
+6. **Backpressure**: while 2 or more faults are `open` or `taken`, take no
+   new slice — drain faults first. In open-loop mode this replaces the
+   two-consecutive-ITERATE drain rule (see "Scoped repairs and the
+   `.repairs` counter" above).
+
+### Evaluator loop (open-loop mode)
+
+1. For each `retired:` entry with no corresponding `## slice <id> @<sha>`
+   section in VERDICT.md, evaluate the slice's tree **at that `sha`** — via
+   `git worktree add`, never the moving working tree.
+2. Grade it against that slice's `accepts:` in the PLAN.md slices block.
+3. SHIP → append the per-slice section, record only, append no fault.
+4. ITERATE → append the per-slice section AND append one `faults:` entry
+   (`status: open`, `observed_at:` the evaluated sha, `scope:` the failing
+   paths, `reason:` one line).
+5. NEEDS_HUMAN / BLOCKED → exactly as today (STATE.md + VERDICT.md
+   first-line contract); the loop halts.
+6. The Evaluator never edits `retired:` and never sets a fault's
+   `taken`/`done`/`stale`.
+
+### Per-slice commit gate
+
+```bash
+python3 metrics/trio-shadow.py --mailbox <dir> --require-commits --slice <id>
+```
+
+must pass before the Evaluator grades slice `<id>`. Same exit semantics as
+the commit gate above: 0 = pass, 1 = fail (listing the offending slice),
+2 = the `slices:` block is missing or malformed, and 2 also for an unknown
+`--slice` id. `--slice <id>` is an optional filter that restricts the
+analysis (and the gate) to that one slice; without it, behaviour is
+unchanged from today.
+
+### Termination
+
+When all planned slices are retired AND no fault is `open` or `taken`, the
+Evaluator runs one **integration evaluation** on HEAD against GOAL.md's
+acceptance criteria. SHIP → the existing "SHIP retirement commit
+convention" applies unchanged (product commit + `loop: iteration N — SHIP`
+mailbox commit, `commit:` lines in VERDICT.md). ITERATE → faults appended
+as usual and the loop continues.
+
+### Backwards compatibility
+
+Everything above is gated on the presence of `QUEUE.md` in the mailbox. No
+`QUEUE.md` → the mailbox is a plain v1 lockstep mailbox and every role
+behaves exactly as it does today. Existing tooling (`trio-check.py`,
+`trio-metrics.py`, `trio-shadow.py`, the dashboard) must keep working
+unchanged on existing mailboxes.
+
 ## Mailbox placement standard
 
 `loop/` lives in the orchestrator session's cwd — the coordination repo.
@@ -347,3 +500,8 @@ python3 metrics/trio-check.py <path> --json  # machine-readable report
 The exit code is 0 when no v1 mailbox has violations, and non-zero when at
 least one v1 mailbox violates this schema. Legacy and unknown mailboxes never
 affect the exit code.
+
+When `QUEUE.md` is present, `trio-check.py` also validates it (block
+shape, fault statuses, `retired:` entries referencing slice ids that
+exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
+absence is never a violation.
