@@ -877,6 +877,39 @@ def parse_verdict(verdict_path: Path) -> str | None:
     return None
 
 
+SLICE_VERDICT_RE = re.compile(
+    r"^##\s+slice\s+(\S+)\s+@([0-9a-fA-F]{4,40})\s+(?:—|--|-)\s+(SHIP|ITERATE)\s*$"
+)
+"""MAILBOX-SCHEMA.md "Per-slice verdicts in VERDICT.md": a per-slice
+evaluation section heading, e.g. ``## slice foo @0f3c...40hex — SHIP``. The
+schema mandates the em dash ``—``; this also accepts ``-``/``--`` and a
+short sha prefix, matching the leniency GOAL.md asks for in derive_slices."""
+
+
+def parse_slice_verdicts(verdict_text: str) -> list[dict]:
+    """Parse every ``## slice <id> @<sha> — SHIP|ITERATE`` heading in
+    VERDICT.md into ``{"slice", "sha", "verdict"}`` dicts, in file order.
+
+    Public and reused by dashboard/serve.py (see PLAN.md's api-slices-inbox
+    slice) so the regex is defined exactly once. Does not attempt to
+    resolve short shas against a slice's latest retired sha -- that
+    matching (a short heading sha that the latest full sha startswith) is
+    derive_slices' job.
+    """
+    out: list[dict] = []
+    if not verdict_text:
+        return out
+    for raw in verdict_text.splitlines():
+        m = SLICE_VERDICT_RE.match(raw.strip())
+        if m:
+            out.append({
+                "slice": m.group(1),
+                "sha": m.group(2),
+                "verdict": m.group(3),
+            })
+    return out
+
+
 def verdict_letter(verdict: str) -> str:
     return {
         "SHIP": "S",
@@ -1520,6 +1553,173 @@ def derive_iterations(state: dict, timeline: list, slices: list | None,
             "criteria": criteria,
         })
     return iterations
+
+
+SLICE_COMMIT_PREFIX_RE_TMPL = "slice({}): "
+"""``slice(<id>): `` commit-subject prefix, per MAILBOX-SCHEMA.md's
+per-slice commit gate (trio-shadow.py --require-commits)."""
+
+
+def derive_slices(
+    slices: list[dict] | None,
+    queue: dict | None,
+    verdict_text: str = "",
+    commits: "list[str] | None" = None,
+    *,
+    open_loop: bool | None = None,
+) -> list[dict]:
+    """Derive per-slice lifecycle for one mailbox (GOAL.md "Slice lifecycle
+    (derived, stdlib, in metrics/trio-metrics.py)", PLAN.md's frozen
+    ``api:DeriveSlices`` contract).
+
+    Inputs are already-parsed structures: ``slices`` from
+    ``parse_slices_block`` (PLAN.md order; None/[] -> [] out), ``queue``
+    from ``read_queue`` (None treated as ``{"retired": [], "faults": []}``),
+    raw ``verdict_text`` (parsed here via ``parse_slice_verdicts``), and an
+    optional iterable of commit subject lines (``git log --format=%s``;
+    None means "no commit information available" -- NOT "no commits").
+
+    ``open_loop`` selects the derivation mode: True/False from the caller,
+    or inferred as ``bool(queue["retired"] or queue["faults"])`` when None
+    (a lockstep mailbox with no QUEUE.md has neither). Lockstep mailboxes
+    (``open_loop`` False) only ever produce planned/building/shipped, from
+    ``status``/commits alone, with retired_sha/retired_at/verdict left None
+    and open_faults/superseded/stale_candidates left []; this keeps
+    derive_iterations' lockstep behaviour completely untouched -- nothing
+    here reads or affects derive_iterations/_lifecycle_for.
+
+    Returns one dict per slice, in PLAN.md order, with exactly the keys:
+    id, iteration, lifecycle, retired_sha, retired_at, verdict, open_faults,
+    superseded, stale_candidates.
+
+    `retired:` is append-only and means "retired at sha" (GOAL.md's
+    "Resolving the retired: sha tension"): the LATEST entry for a slice
+    (last occurrence in QUEUE.md file order) gives retired_sha/retired_at;
+    any earlier shas for that slice are superseded (deduped, order
+    preserved, latest excluded). A live fault (status open or taken)
+    observed at a superseded sha is a stale_candidate.
+
+    Open-loop lifecycle precedence (first match wins; PLAN.md's DECISION
+    note resolves the GOAL.md faulted/repairing ordering literally, since
+    "faulted := latest verdict ITERATE" read alone would make `repairing`
+    unreachable -- a fault is created together with its ITERATE section):
+      1. planned    -- no retired entry, no `slice(<id>):` commit, and
+                       status is "planned" or absent/blank.
+      2. building   -- no retired entry, and status is "in_progress" or the
+                       slice has a `slice(<id>): ` commit. (Also the
+                       fallback for any other no-retired-entry status, e.g.
+                       "complete" with no commit/retired trace yet, so
+                       every input still resolves.)
+      3. retired    -- has a retired entry whose latest sha has no
+                       matching `## slice <id> @<sha>` verdict section.
+      4. faulted    -- any fault for this slice is `open`; OR the latest
+                       matching verdict is ITERATE and no fault is `taken`.
+      5. repairing  -- any fault for this slice is `taken` (and none open).
+      6. shipped    -- latest matching verdict is SHIP and no open/taken
+                       fault remains.
+    "Latest matching verdict" is the verdict of the LAST `## slice <id>
+    @<sha>` section (file order) whose sha the slice's latest retired sha
+    startswith (so a short sha in the heading still matches).
+    """
+    slices = slices or []
+    queue = queue or {"retired": [], "faults": []}
+    retired_all = queue.get("retired") or []
+    faults_all = queue.get("faults") or []
+    if open_loop is None:
+        open_loop = bool(retired_all or faults_all)
+
+    verdict_sections = parse_slice_verdicts(verdict_text or "")
+    commit_subjects = list(commits) if commits is not None else None
+
+    out: list[dict] = []
+    for sl in slices:
+        sid = sl.get("id")
+        status = (sl.get("status") or "").strip()
+        has_commit = commit_subjects is not None and any(
+            c.startswith(SLICE_COMMIT_PREFIX_RE_TMPL.format(sid)) for c in commit_subjects
+        )
+
+        entries_for_slice = [e for e in retired_all if e.get("slice") == sid]
+        faults_for_slice = [f for f in faults_all if f.get("slice") == sid]
+
+        if not open_loop:
+            if status == "complete":
+                lifecycle = "shipped"
+            elif status == "in_progress" or has_commit:
+                lifecycle = "building"
+            else:
+                lifecycle = "planned"
+            out.append({
+                "id": sid,
+                "iteration": sl.get("iteration"),
+                "lifecycle": lifecycle,
+                "retired_sha": None,
+                "retired_at": None,
+                "verdict": None,
+                "open_faults": [],
+                "superseded": [],
+                "stale_candidates": [],
+            })
+            continue
+
+        has_retired = bool(entries_for_slice)
+        retired_sha = None
+        retired_at = None
+        superseded: list[str] = []
+        if has_retired:
+            latest_entry = entries_for_slice[-1]
+            retired_sha = latest_entry.get("sha")
+            retired_at = latest_entry.get("at")
+            seen: list[str] = []
+            for e in entries_for_slice[:-1]:
+                sha = e.get("sha")
+                if sha and sha != retired_sha and sha not in seen:
+                    seen.append(sha)
+            superseded = seen
+
+        verdict = None
+        if retired_sha:
+            for v in verdict_sections:
+                if v["slice"] != sid:
+                    continue
+                if retired_sha.startswith(v["sha"]):
+                    verdict = v["verdict"]
+
+        live_faults = [f for f in faults_for_slice if f.get("status") in ("open", "taken")]
+        open_faults = [f.get("id") for f in live_faults]
+        open_fault_exists = any(f.get("status") == "open" for f in faults_for_slice)
+        taken_fault_exists = any(f.get("status") == "taken" for f in faults_for_slice)
+        stale_candidates = [
+            f.get("id") for f in live_faults if f.get("observed_at") in superseded
+        ]
+
+        if not has_retired and not has_commit and status in ("planned", ""):
+            lifecycle = "planned"
+        elif not has_retired and (status == "in_progress" or has_commit):
+            lifecycle = "building"
+        elif not has_retired:
+            lifecycle = "building"
+        elif verdict is None:
+            lifecycle = "retired"
+        elif open_fault_exists or (verdict == "ITERATE" and not taken_fault_exists):
+            lifecycle = "faulted"
+        elif taken_fault_exists:
+            lifecycle = "repairing"
+        else:
+            lifecycle = "shipped"
+
+        out.append({
+            "id": sid,
+            "iteration": sl.get("iteration"),
+            "lifecycle": lifecycle,
+            "retired_sha": retired_sha,
+            "retired_at": retired_at,
+            "verdict": verdict,
+            "open_faults": open_faults,
+            "superseded": superseded,
+            "stale_candidates": stale_candidates,
+        })
+    return out
 
 
 def _sections_by_iteration(text: str) -> dict[int, str]:
