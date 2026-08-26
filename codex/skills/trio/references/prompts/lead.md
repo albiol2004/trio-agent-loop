@@ -109,7 +109,10 @@ extension"), run this loop instead of waiting for a verdict:
    Evaluator grades it against.
 3. On finishing a slice: commit, set `status: complete` for it in PLAN.md's
    `slices:` block, and append a `retired:` entry to `QUEUE.md` (`slice`,
-   the full sha of the last `slice(<id>): ` commit, `at`).
+   the sha it's retired at, `at`). A post-retirement fix (step 1's
+   `fix f<N>` commit) doesn't edit that entry — it appends a **new**
+   `retired:` entry for the same slice id with the fix's sha; repeated
+   slice ids are expected, only a repeated (slice, sha) pair is invalid.
 4. Never wait for a verdict before starting the next fault or slice — the
    Evaluator grades retired slices independently, on its own schedule.
 5. **Backpressure**: while 2 or more faults are `open` or `taken`, take no

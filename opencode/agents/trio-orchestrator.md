@@ -101,8 +101,10 @@ unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
 extension"), the fixed Lead → commit gate → Evaluator sequence above is
 replaced by two independently-scheduled loops joined only by `QUEUE.md`:
 the Lead loop (faults first, then the next planned slice, committing and
-appending to `retired:` as it goes) never waits for a verdict; the
-Evaluator loop grades each `retired:` entry at its pinned sha in a `git
+appending to `retired:` as it goes — a post-retirement fix appends a new
+`retired:` entry for the same slice rather than editing the old one) never
+waits for a verdict; the Evaluator loop grades the **latest** `retired:`
+entry per slice (earlier ones are superseded) at its pinned sha in a `git
 worktree`, appending a per-slice VERDICT.md section and, on ITERATE, a
 `faults:` entry. The only back-channel between the two loops is the fault
 queue. **Backpressure** — 2 or more faults `open`/`taken` — replaces the

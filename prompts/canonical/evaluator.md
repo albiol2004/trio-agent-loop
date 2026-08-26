@@ -131,9 +131,13 @@ No `QUEUE.md` → ignore this section entirely, the lockstep protocol above
 is unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
 extension"), grade retired slices independently instead of waiting for a
 full Lead iteration:
-1. For each `retired:` entry with no corresponding `## slice <id> @<sha>`
-   section in VERDICT.md, evaluate that slice's tree **at its `sha`**, never
-   the moving working tree:
+1. Grade only the **latest** `retired:` entry per slice id (last in file
+   order) — earlier entries for that slice are `superseded` (derived, never
+   written to QUEUE.md) and are never graded on their own. A fault whose
+   `observed_at` sha is a superseded sha of its slice is a `stale`
+   candidate. For each slice whose latest entry has no corresponding
+   `## slice <id> @<sha>` section in VERDICT.md, evaluate that slice's tree
+   **at its `sha`**, never the moving working tree:
    ```bash
    git worktree add /tmp/eval-<slice>-<sha> <sha>
    # grade against that slice's accepts: in PLAN.md, then:

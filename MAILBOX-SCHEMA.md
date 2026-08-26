@@ -325,18 +325,33 @@ means an empty queue, never an error. A present block's list may be empty
 ```yaml
 retired:
   - slice: <kebab-case slice id>
-    sha: <full 40-char sha of the last slice(<id>): commit>
+    sha: <full 40-char sha the slice was retired at>
     at: <ISO-8601 timestamp>
 ```
 
 | Field | Required | Type | Meaning |
 |---|---|---|---|
 | `slice` | yes | kebab-case string | the slice id; must exist in the PLAN.md `slices:` block |
-| `sha` | yes | full 40-char sha | the last `slice(<id>): ` commit for this slice |
-| `at` | yes | ISO-8601 timestamp | when the slice was retired |
+| `sha` | yes | full 40-char sha | the sha this entry retires the slice **at** |
+| `at` | yes | ISO-8601 timestamp | when this entry was appended |
 
 `retired:` is **append-only, Lead only**: the Lead is the only role that
 appends an entry, and no role ever edits or removes an existing one.
+
+An entry means "this slice was **retired at** `sha`" — not "the slice's
+last commit". Repeated slice ids are legal and expected: a post-retirement
+fix (a `slice(<id>): fix f<N> …` commit, or any later `slice(<id>): `
+commit) is recorded by **appending a new** `retired:` entry for the same
+slice id with the new sha, never by rewriting the earlier entry. The
+uniqueness constraint is on the (`slice`, `sha`) **pair**, not on `slice`
+alone — two entries for the same slice must have distinct shas.
+
+The Evaluator grades only the **latest** `retired:` entry per slice id
+(last in file order); any earlier entry for that same slice is
+`superseded` — a status **derived** from file order, never written into
+`QUEUE.md`. A `faults:` entry whose `observed_at` sha is a superseded sha
+of its slice (i.e. an older `retired:` entry for that slice, since
+overtaken by a newer one) is a candidate for `status: stale`.
 
 ```yaml
 faults:

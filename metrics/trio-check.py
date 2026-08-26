@@ -228,6 +228,7 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
             "block does not parse; cannot validate `retired:` slice references"
         )
 
+    seen_retired_pairs: set[tuple[str, str]] = set()
     for entry in retired:
         slice_id = entry.get("slice", "")
         sha = entry.get("sha", "")
@@ -245,6 +246,17 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
                 f"QUEUE.md retired: entry references slice {slice_id!r}, not "
                 "found in PLAN.md `slices:` block"
             )
+        # A repeated slice id is legal (a post-retirement fix appends a new
+        # entry — MAILBOX-SCHEMA.md "v1 open-loop extension"); only a
+        # repeated (slice, sha) pair is a violation.
+        pair = (slice_id, sha)
+        if pair in seen_retired_pairs:
+            errors.append(
+                f"QUEUE.md retired: duplicate entry for slice {slice_id!r} "
+                f"at sha {sha!r} — each (slice, sha) pair must be unique"
+            )
+        else:
+            seen_retired_pairs.add(pair)
 
     seen_fault_ids: set[str] = set()
     for entry in faults:
