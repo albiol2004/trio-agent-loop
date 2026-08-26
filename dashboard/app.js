@@ -31,6 +31,10 @@ const state = {
   rafPending: false,
 };
 
+/* Loop name to auto-open via `#loop=<name>` once board data confirms it
+ * exists (set in init(), consumed once by refreshBoard()). */
+let pendingLoopHash = null;
+
 let currentRoot = "";
 function withRoot(url) {
   if (!currentRoot) return url;
@@ -341,6 +345,11 @@ async function refreshBoard() {
     hideBoardError();
     renderTabs();
     renderBoard();
+    if (pendingLoopHash && state.loops.some((l) => l.name === pendingLoopHash)) {
+      const target = pendingLoopHash;
+      pendingLoopHash = null;
+      openDrawer(target);
+    }
     if (state.activeLoop) refreshDetail({ quiet: true });
   } catch (err) {
     setBoardStatus("error", "offline");
@@ -640,6 +649,7 @@ async function openDrawer(name) {
   if (!el("drawer").hidden && state.activeLoop === name) return;
   closeStream();
   state.activeLoop = name;
+  history.replaceState(null, "", "#loop=" + encodeURIComponent(name));
   state.detail = null;
   state.compare = [];
   state.sessions = [];
@@ -713,7 +723,10 @@ async function refreshDetail({ quiet }) {
 
 /* --------------------- iteration lifecycle + compare --------------------- */
 
-const LIFECYCLES = ["planned", "in_flight", "pending_eval", "shipped", "abandoned"];
+const LIFECYCLES = [
+  "planned", "in_flight", "pending_eval", "shipped", "abandoned",
+  "building", "retired", "faulted", "repairing",
+];
 
 function iterMeta(n) {
   const its =
@@ -747,9 +760,15 @@ function iterLifecycle(n) {
   return count ? "in_flight" : "planned";
 }
 
+/* Chip from a lifecycle STRING directly (slice rows use this; iteration
+ * chips go through lifecycleChip(n), which delegates here). */
+function lifecycleChipFor(st) {
+  const s = String(st || "");
+  return span("lifecycle-chip lifecycle-" + s, s.replace("_", " "));
+}
+
 function lifecycleChip(n) {
-  const st = iterLifecycle(n);
-  return span("lifecycle-chip lifecycle-" + st, st.replace("_", " "));
+  return lifecycleChipFor(iterLifecycle(n));
 }
 
 function toggleCompare(n) {
@@ -811,6 +830,8 @@ function renderDetail(detail) {
     clist.appendChild(row);
   }
 
+  renderSlices(detail);
+
   renderTimeline(detail.timeline || []);
   renderTimelineView();
   renderFilesView();
@@ -824,6 +845,70 @@ function renderDetail(detail) {
         : "no sessions"
     );
   }
+}
+
+/* Slices section (Overview): one row per PLAN.md slice, merged with its
+ * derived lifecycle keys (see the /api/loop `slices` contract). */
+function renderSlices(detail) {
+  const slices = Array.isArray(detail.slices) ? detail.slices : [];
+  const ssec = el("slices-section");
+  const slist = el("slice-list");
+  slist.textContent = "";
+  ssec.hidden = slices.length === 0;
+  for (const s of slices) {
+    if (!s) continue;
+    const row = document.createElement("div");
+    row.className = "slice-row";
+    row.appendChild(span("slice-id mono", String(s.id ?? "")));
+    row.appendChild(lifecycleChipFor(s.lifecycle));
+    if (s.retired_sha) {
+      const sha = span("slice-sha mono", String(s.retired_sha).slice(0, 7));
+      sha.title = String(s.retired_sha);
+      row.appendChild(sha);
+    }
+    if (s.verdict) {
+      row.appendChild(
+        span(
+          "verdict-word verdict-" + normVerdict(s.verdict),
+          String(s.verdict).toUpperCase()
+        )
+      );
+    }
+    if (Array.isArray(s.open_faults)) {
+      for (const fid of s.open_faults) {
+        row.appendChild(span("meta-chip fault-chip", String(fid)));
+      }
+    }
+    slist.appendChild(row);
+  }
+}
+
+/* Canonical display order for the Timeline slice-count summary — also the
+ * order the accept regex `[0-9]+ (shipped|building|retired|faulted|
+ * repairing|planned)` lists them in. */
+const SLICE_LIFECYCLE_ORDER = ["shipped", "building", "retired", "faulted", "repairing", "planned"];
+
+/* "3 shipped · 1 faulted" for the slices of one iteration, open-loop only.
+ * Reads state.detail directly (same pattern as renderTimelineView etc.)
+ * since renderTimeline(entries) is only ever called with detail.timeline. */
+function sliceCountSummary(iterNum) {
+  const slices =
+    state.detail && Array.isArray(state.detail.slices) ? state.detail.slices : [];
+  const counts = new Map();
+  for (const s of slices) {
+    if (!s || s.iteration == null || Number(s.iteration) !== Number(iterNum)) continue;
+    const st = String(s.lifecycle || "");
+    counts.set(st, (counts.get(st) || 0) + 1);
+  }
+  const parts = [];
+  for (const st of SLICE_LIFECYCLE_ORDER) {
+    const n = counts.get(st);
+    if (n) parts.push(n + " " + st);
+  }
+  for (const [st, n] of counts) {
+    if (!SLICE_LIFECYCLE_ORDER.includes(st)) parts.push(n + " " + st);
+  }
+  return parts.join(" · ");
 }
 
 function renderTimeline(entries) {
@@ -855,7 +940,13 @@ function renderTimeline(entries) {
     hdr.appendChild(
       span("iter-header-label", iter == null ? "unattributed" : "Iteration " + iter)
     );
-    if (iter != null) hdr.appendChild(lifecycleChip(iter));
+    if (iter != null) {
+      hdr.appendChild(lifecycleChip(iter));
+      if (state.detail && state.detail.mode === "open-loop") {
+        const summary = sliceCountSummary(iter);
+        if (summary) hdr.appendChild(span("iter-slice-summary", summary));
+      }
+    }
     view.appendChild(hdr);
     for (const entry of groups.get(iter)) {
     const row = document.createElement("div");
@@ -2167,7 +2258,12 @@ function setOffsetHint() {
 
 function init() {
   const hash = location.hash.replace(/^#/, "");
-  if (TABS.includes(hash)) state.tab = hash;
+  const loopMatch = /^loop=(.+)$/.exec(hash);
+  if (loopMatch) {
+    pendingLoopHash = decodeURIComponent(loopMatch[1]);
+  } else if (TABS.includes(hash)) {
+    state.tab = hash;
+  }
 
   el("drawer-close").addEventListener("click", closeDrawer);
   el("drawer-scrim").addEventListener("click", closeDrawer);
