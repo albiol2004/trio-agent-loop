@@ -96,6 +96,26 @@ queue. **Backpressure** — 2 or more faults `open`/`taken` — replaces the
 verdict (SHIP/BLOCKED/NEEDS_HUMAN) exactly as today, once every slice is
 retired and no fault is `open`/`taken`.
 
+## Automated open-loop driver (`trio_loop.py`)
+The manual scheduling above is what `python3 metrics/trio_loop.py run
+--mailbox <dir> --max-iterations N` automates: it auto-selects open-loop
+whenever `loop/QUEUE.md` is present (`--open-loop` / `--lockstep` force
+either mode), launching the Lead and the Evaluator as two background
+agents running concurrently, each relaunched on its own completion — the
+Lead until every PLAN slice is retired and no fault is open/taken, the
+Evaluator polling `QUEUE.md`'s `retired:` entries every `--poll-seconds`
+(default 30). `portable/driver.sh` passes these through as
+`TRIO_MODE=open-loop|lockstep` and `POLL_SECONDS`. The commit gate runs
+per slice before each grading pass: `trio-shadow.py --mailbox <dir>
+--require-commits --slice <id>` (exit 0 pass, 1 fail/skip, 2 error). The
+Evaluator still grades only the latest `retired:` entry per slice, at its
+pinned sha, in a worktree, against that slice's `accepts:`. Verdict
+dispatch keeps reading only the final **integration verdict** —
+VERDICT.md's first-line contract stays reserved for it, and per-slice
+sections never carry a `VERDICT:` line. Without `QUEUE.md` nothing
+changes here: lockstep remains the default and its instructions above are
+unchanged.
+
 ## Rules
 Harness wrappers own the optional `loop/.session.json` sidecar: at iteration
 start, write `{driver, session, pid, started_at, phase}`; on finish set
