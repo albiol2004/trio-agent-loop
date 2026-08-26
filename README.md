@@ -175,6 +175,17 @@ carries them as standalone files plus a Ralph-style bash driver:
 mkdir -p loop && cp portable/GOAL.template.md loop/GOAL.md   # edit it
 HARNESS=cursor ./portable/driver.sh 10   # or opencode|hermes|athen|gemini|agy|claude|generic
 ```
+`driver.sh`'s `MAX_ITER` is the positional `$1` above; the mailbox comes from
+`LOOP_DIR`, not a `--mailbox` flag. A mailbox with `QUEUE.md` runs
+open-loop — two concurrent role loops (Lead, Evaluator) instead of the
+lockstep Lead→Evaluator alternation — via
+`python3 metrics/trio_loop.py run --mailbox <dir> --max-iterations N`, which
+auto-selects open-loop on `QUEUE.md` (override either way with
+`--open-loop`/`--lockstep`; tune the Evaluator's poll interval with
+`--poll-seconds`). `driver.sh`'s env equivalents are `TRIO_MODE=open-loop|lockstep`
+and `POLL_SECONDS=<n>`; `_PortableRunner` also sets `TRIO_MODE`/`TRIO_KIND`/
+`TRIO_SLICE`/`TRIO_SHA` per role invocation so `driver.sh` can render an
+OPEN-LOOP CONTEXT block ahead of the role prompt.
 Per-harness setup docs: `portable/SETUP-codex.md`, `SETUP-cursor.md`,
 `SETUP-opencode.md`, `SETUP-pi.md`, `SETUP-hermes.md`, `SETUP-athen.md`,
 `SETUP-antigravity.md` (Antigravity IDE isn't scriptable; its `agy` CLI /

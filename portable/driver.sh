@@ -19,6 +19,13 @@
 # Prereq: $LOOP_DIR/GOAL.md exists (copy portable/GOAL.template.md and fill it in).
 # Concurrency: ONE loop per mailbox dir. Run a second loop in the same repo
 # with LOOP_DIR=loop-<name>. Python owns the mailbox lock.
+#
+# Open-loop mode (mailbox has QUEUE.md): auto-selected by metrics/trio_loop.py,
+# or force it either way:
+#   TRIO_MODE=open-loop ./portable/driver.sh    # --open-loop; TRIO_MODE=lockstep -> --lockstep
+#   POLL_SECONDS=10 ./portable/driver.sh        # Evaluator poll interval -> --poll-seconds
+# _PortableRunner also sets TRIO_MODE/TRIO_KIND/TRIO_SLICE/TRIO_SHA per role
+# invocation so build_prompt can render an OPEN-LOOP CONTEXT block.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +39,17 @@ fi
 
 # build_prompt <file> — role prompts say `loop/`; when LOOP_DIR overrides it,
 # prepend a mailbox-override note so fresh-context roles resolve paths right.
+# api:OpenLoopPromptEnv: when TRIO_MODE=open-loop (set per-role by
+# _PortableRunner.run), prepend an OPEN-LOOP CONTEXT block naming the kind
+# and, when set, the slice id and sha — before the MAILBOX OVERRIDE line.
+# TRIO_MODE unset/empty must leave this byte-identical to the lockstep output.
 build_prompt() {
+  if [[ "${TRIO_MODE:-}" == "open-loop" ]]; then
+    printf 'OPEN-LOOP CONTEXT: kind=%s' "${TRIO_KIND:-}"
+    [[ -n "${TRIO_SLICE:-}" ]] && printf ' slice=%s' "$TRIO_SLICE"
+    [[ -n "${TRIO_SHA:-}" ]] && printf ' sha=%s' "$TRIO_SHA"
+    printf '\n\n'
+  fi
   if [[ "$LOOP_DIR" != "loop" ]]; then
     printf 'MAILBOX OVERRIDE: this run uses `%s/` as the loop mailbox — every `loop/` path in the instructions below resolves to `%s/`.\n\n' "$LOOP_DIR" "$LOOP_DIR"
   fi
@@ -68,7 +85,7 @@ run_role() {
     cursor)  "${CURSOR_BIN:-cursor-agent}" -p --force "$(build_prompt "$prompt_file")" ;;  # without --force, -p only PROPOSES edits; newer installs: CURSOR_BIN=agent
     generic) local cmd_var; [[ "$prompt_file" == *lead* || "$prompt_file" == *repair* ]] && cmd_var="${RUN_LEAD:?set RUN_LEAD}" || cmd_var="${RUN_EVAL:?set RUN_EVAL}"
              local pf="$prompt_file"
-             if [[ "$LOOP_DIR" != "loop" ]]; then pf="$(mktemp)"; build_prompt "$prompt_file" > "$pf"; fi
+             if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" ]]; then pf="$(mktemp)"; build_prompt "$prompt_file" > "$pf"; fi
              $cmd_var "$pf" ;;
     *) echo "unknown HARNESS=$HARNESS" >&2; exit 1 ;;
   esac
@@ -89,7 +106,15 @@ if [[ "${1:-}" == --run-role ]]; then
 fi
 
 # Python owns the lock and the complete loop state machine.
-exec python3 "$DIR/../metrics/trio_loop.py" run \
-  --mailbox "$LOOP_DIR" \
-  --max-iterations "$MAX_ITER" \
-  --runner portable
+# TRIO_MODE/POLL_SECONDS pass through to trio_loop.py's own flags; leaving
+# TRIO_MODE unset keeps auto-selection (QUEUE.md -> open-loop) in charge.
+args=(--mailbox "$LOOP_DIR" --max-iterations "$MAX_ITER" --runner portable)
+case "${TRIO_MODE:-}" in
+  "") ;;
+  open-loop) args+=(--open-loop) ;;
+  lockstep) args+=(--lockstep) ;;
+  *) echo "unknown TRIO_MODE=$TRIO_MODE (expected 'open-loop' or 'lockstep')" >&2; exit 1 ;;
+esac
+[[ -n "${POLL_SECONDS:-}" ]] && args+=(--poll-seconds "$POLL_SECONDS")
+
+exec python3 "$DIR/../metrics/trio_loop.py" run "${args[@]}"
