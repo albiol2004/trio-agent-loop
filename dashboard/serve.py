@@ -425,7 +425,8 @@ def load_metrics_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     for fn in ("discover_loops", "analyze_loop", "parse_log", "parse_timeline",
-               "parse_slices_block", "loop_name"):
+               "parse_slices_block", "loop_name", "read_queue", "derive_slices",
+               "parse_slice_verdicts"):
         if not hasattr(module, fn):
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
@@ -1017,6 +1018,96 @@ def _loop_slices(loop_dir: Path) -> list[dict] | None:
     return load_metrics_module().parse_slices_block(text)
 
 
+_DERIVED_SLICE_KEYS = (
+    "lifecycle", "retired_sha", "retired_at", "verdict",
+    "open_faults", "superseded", "stale_candidates",
+)
+"""derive_slices' output keys beyond id/iteration, which raw PLAN slices
+already carry and keep unchanged by the merge below."""
+
+
+def _loop_slices_derived(loop_dir: Path, mode: str, commits: list[dict]) -> list[dict]:
+    """Raw PLAN.md slices merged with metrics.derive_slices' lifecycle keys.
+
+    Per PLAN.md's frozen ``api:LoopDetailJSON`` DECISION note: every raw
+    PLAN.md field (writes, reads, status, id, iteration, repo, gate,
+    accepts -- existing app.js consumers read writes/reads/status) is
+    preserved, and derive_slices' seven lifecycle keys (id/iteration are
+    already present) are added on top, matched by id. Always a list --
+    ``[]`` when PLAN.md has no ``slices:`` block -- never None. All parsing
+    stays in trio-metrics.py; any failure in the derive step leaves the raw
+    slices unmerged rather than 500ing.
+    """
+    raw = _loop_slices(loop_dir) or []
+    if not raw:
+        return []
+    try:
+        metrics = load_metrics_module()
+        queue = metrics.read_queue(loop_dir)
+        try:
+            verdict_text = (loop_dir / "VERDICT.md").read_text(
+                encoding="utf-8", errors="replace")
+        except OSError:
+            verdict_text = ""
+        commit_subjects = [f"slice({c['slice']}): {c['subject']}" for c in commits]
+        derived_by_id = {
+            d["id"]: d for d in metrics.derive_slices(
+                raw, queue, verdict_text, commit_subjects,
+                open_loop=(mode == "open-loop"))
+        }
+        merged = []
+        for sl in raw:
+            entry = dict(sl)
+            d = derived_by_id.get(sl.get("id"))
+            if d:
+                for key in _DERIVED_SLICE_KEYS:
+                    entry[key] = d[key]
+            merged.append(entry)
+        return merged
+    except Exception:
+        traceback.print_exc()
+        return raw
+
+
+def _open_loop_iteration_lifecycle(iterations: list[dict], slices: list[dict]) -> list[dict]:
+    """Open-loop iteration lifecycle, derived from slice lifecycle.
+
+    GOAL.md (frozen): shipped iff all of that iteration's slices are
+    shipped; else in_flight if any is building/retired/repairing; else
+    pending_eval if any is retired and none faulted; else planned. The
+    integration VERDICT: line still wins when present -- i.e. when
+    derive_iterations already attributed a verdict to that iteration
+    (``it["verdict"]`` is not None), its lifecycle is left untouched. An
+    iteration with no slices also keeps its derive_iterations lifecycle.
+    Lockstep derivation is untouched: callers gate this on mode ==
+    "open-loop".
+    """
+    slices_by_n: dict[int, list] = {}
+    for sl in slices or []:
+        n = sl.get("iteration")
+        if n is None:
+            continue
+        slices_by_n.setdefault(n, []).append(sl)
+    out = []
+    for it in iterations:
+        entry = dict(it)
+        if it.get("verdict") is None:
+            slice_list = slices_by_n.get(it.get("n"))
+            if slice_list:
+                lifecycles = [s.get("lifecycle") for s in slice_list]
+                if all(lc == "shipped" for lc in lifecycles):
+                    entry["lifecycle"] = "shipped"
+                elif any(lc in ("building", "retired", "repairing") for lc in lifecycles):
+                    entry["lifecycle"] = "in_flight"
+                elif any(lc == "retired" for lc in lifecycles) and not any(
+                        lc == "faulted" for lc in lifecycles):
+                    entry["lifecycle"] = "pending_eval"
+                else:
+                    entry["lifecycle"] = "planned"
+        out.append(entry)
+    return out
+
+
 def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     """Shadow drift for a loop's slices, or None when not applicable.
 
@@ -1125,9 +1216,13 @@ def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
-    Kinds: needs_human / blocked (high), orphaned / drift / overlap (medium),
-    and repair (low). Anything that cannot be determined is simply absent —
-    the inbox never guesses.
+    Kinds: needs_human / blocked (high), orphaned / drift / overlap /
+    queue_fault / slice_overlap (medium), and repair (low). For open-loop
+    mailboxes (QUEUE.md present) the iteration-overlap item is suppressed
+    and replaced by queue_fault (one per open fault) and slice_overlap
+    (write-set intersection between simultaneously-building slices);
+    lockstep mailboxes keep the overlap item unchanged. Anything that
+    cannot be determined is simply absent — the inbox never guesses.
     """
     items = []
 
@@ -1192,19 +1287,75 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                     + ("…" if len(sorted_drift_files) > 4 else ""),
                     ",".join(sorted_drift_files))
 
-    try:
-        _, overlaps = _loop_iterations(loop_dir, root)
-        for ov in overlaps:
-            paths = ov["paths"]
-            shown = ", ".join(paths[:6]) + ("\u2026" if len(paths) > 6 else "")
-            verb = ("share write paths" if ov["relation"] == "write-write"
-                    else "overlap read/write paths" if ov["relation"] == "write-read"
-                    else "share write paths and read/write paths")
-            add("medium", "overlap",
-                f"Iterations {ov['a']} and {ov['b']} {verb}", shown,
-                f"{ov['a']}:{ov['b']}:{ov['relation']}")
-    except Exception:
-        traceback.print_exc()
+    is_open_loop = (loop_dir / "QUEUE.md").is_file()
+
+    if not is_open_loop:
+        try:
+            _, overlaps = _loop_iterations(loop_dir, root)
+            for ov in overlaps:
+                paths = ov["paths"]
+                shown = ", ".join(paths[:6]) + ("\u2026" if len(paths) > 6 else "")
+                verb = ("share write paths" if ov["relation"] == "write-write"
+                        else "overlap read/write paths" if ov["relation"] == "write-read"
+                        else "share write paths and read/write paths")
+                add("medium", "overlap",
+                    f"Iterations {ov['a']} and {ov['b']} {verb}", shown,
+                    f"{ov['a']}:{ov['b']}:{ov['relation']}")
+        except Exception:
+            traceback.print_exc()
+    else:
+        # Open-loop mailboxes: one item per open fault, plus a write-set
+        # overlap warning between simultaneously-building slices, replacing
+        # the iteration-overlap item above (GOAL.md, PLAN.md's frozen
+        # inbox-item contract).
+        try:
+            metrics = load_metrics_module()
+            queue = metrics.read_queue(loop_dir)
+            for fault in queue.get("faults") or []:
+                if fault.get("status") != "open":
+                    continue
+                fid = fault.get("id") or "?"
+                sid = fault.get("slice") or "?"
+                scope = ", ".join(fault.get("scope") or [])
+                reason = fault.get("reason") or ""
+                add("medium", "queue_fault",
+                    f"Open fault {fid} on slice {sid}",
+                    f"scope: {scope}; reason: {reason}",
+                    f"fault:{fid}")
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            metrics = load_metrics_module()
+            commits = _loop_commits(loop_dir, root)
+            derived = _loop_slices_derived(loop_dir, "open-loop", commits)
+            building = [sl for sl in derived if sl.get("lifecycle") == "building"]
+            seen_pairs = set()
+            for i, a in enumerate(building):
+                for b in building[i + 1:]:
+                    aw = {
+                        p for p in (
+                            metrics._norm_declared_path(x) for x in (a.get("writes") or [])
+                        ) if p
+                    }
+                    bw = {
+                        p for p in (
+                            metrics._norm_declared_path(x) for x in (b.get("writes") or [])
+                        ) if p
+                    }
+                    shared = metrics._intersect(aw, bw)
+                    if not shared:
+                        continue
+                    pair = tuple(sorted((a.get("id"), b.get("id"))))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    add("medium", "slice_overlap",
+                        f"Slices {pair[0]} and {pair[1]} share write paths",
+                        ", ".join(sorted(shared)),
+                        f"{pair[0]}:{pair[1]}")
+        except Exception:
+            traceback.print_exc()
 
     try:
         repairs = int((loop_dir / ".repairs").read_text().strip())
@@ -2893,9 +3044,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
         card["commits"] = _loop_commits(loop_dir, root)
-        card["slices"] = _loop_slices(loop_dir)
+        mode = "open-loop" if (loop_dir / "QUEUE.md").is_file() else "lockstep"
+        card["mode"] = mode
+        card["slices"] = _loop_slices_derived(loop_dir, mode, card["commits"])
+        if mode == "open-loop":
+            try:
+                card["queue"] = self.server.metrics.read_queue(loop_dir)
+            except Exception:
+                traceback.print_exc()
+                card["queue"] = {"retired": [], "faults": []}
         card["slice_activity"] = _loop_slice_activity(loop_dir, root)
         card["iterations"], card["overlaps"] = _loop_iterations(loop_dir, root)
+        if mode == "open-loop":
+            card["iterations"] = _open_loop_iteration_lifecycle(
+                card["iterations"], card["slices"])
         card["sessions"] = self._session_list(loop_dir, root)
         self._send_json(200, card)
 
