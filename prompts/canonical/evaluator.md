@@ -142,10 +142,12 @@ full Lead iteration:
 2. Before grading slice `<id>`, run the per-slice commit gate: `python3
    metrics/trio-shadow.py --mailbox <dir> --require-commits --slice <id>`
    must exit 0 (same exit semantics as the whole-mailbox gate).
-3. Append a section `## slice <id> @<sha> — SHIP` or `## slice <id> @<sha>
-   — ITERATE` to VERDICT.md. A per-slice section body MUST NOT contain a
-   line starting with `VERDICT:` — that token stays reserved for the final
-   integration verdict.
+3. Append to VERDICT.md a section whose heading is exactly one of
+   `## slice <id> @<sha> — SHIP` / `## slice <id> @<sha> — ITERATE`
+   (em dash, `@` immediately before the full sha, no line wrapping).
+   A per-slice section body MUST NOT contain a line starting with
+   `VERDICT:` — that token stays reserved for the final integration
+   verdict.
 4. SHIP → append the section, record only, append no fault. ITERATE →
    append the section AND one `faults:` entry to QUEUE.md: `status: open`,
    `observed_at:` the evaluated sha, `scope:` the failing paths, `reason:`
