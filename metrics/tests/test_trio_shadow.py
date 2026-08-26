@@ -434,6 +434,69 @@ def test_require_commits_loop_only_slice_without_commits_exits_0(
     assert "commit gate: PASS" in result.stdout
 
 
+PLAN_SLICE_FILTER = """\
+```yaml
+slices:
+  - id: good
+    writes: [a.py]
+    reads: []
+  - id: bad
+    writes: [b.py]
+    reads: []
+```
+"""
+
+
+def test_slice_filter_restricts_shadow_report_to_one_slice(git_repo: Path) -> None:
+    """--slice <id> restricts the (shadow-mode) report to that one slice, and
+    the JSON report names the filter it applied."""
+    write_plan(git_repo, PLAN_SLICE_FILTER)
+    commit(git_repo, {"loop/PLAN.md": PLAN_SLICE_FILTER}, "plan: declare slices")
+    commit(git_repo, {"a.py": "A\n"}, "slice(good): add module a")
+
+    result = run_checker(git_repo, "--json", "--slice", "good")
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["slice_filter"] == "good"
+    assert [s["id"] for s in report["slices"]] == ["good"]
+
+    unfiltered = json.loads(run_checker(git_repo, "--json").stdout)
+    assert unfiltered["slice_filter"] is None
+    assert {s["id"] for s in unfiltered["slices"]} == {"good", "bad"}
+
+
+def test_slice_filter_unknown_id_exits_2(git_repo: Path) -> None:
+    """An unknown --slice id exits 2 and names the id plus the available ids."""
+    write_plan(git_repo, PLAN_SLICE_FILTER)
+    commit(git_repo, {"loop/PLAN.md": PLAN_SLICE_FILTER}, "plan: declare slices")
+
+    result = run_checker(git_repo, "--slice", "bogus")
+    assert result.returncode == 2, result.stdout
+    assert "bogus" in result.stderr
+    assert "good" in result.stderr and "bad" in result.stderr
+
+
+def test_slice_filter_gates_only_the_named_slice(git_repo: Path) -> None:
+    """--require-commits --slice <id>: the gate only judges the named slice,
+    even though another code-changing slice in the same plan has no commit."""
+    write_plan(git_repo, PLAN_SLICE_FILTER)
+    commit(git_repo, {"loop/PLAN.md": PLAN_SLICE_FILTER}, "plan: declare slices")
+    commit(git_repo, {"a.py": "A\n"}, "slice(good): add module a")
+    commit(git_repo, {"b.py": "B\n"}, "feat: add b")  # no slice(bad): commit
+
+    good_only = run_checker(git_repo, "--require-commits", "--slice", "good")
+    assert good_only.returncode == 0, good_only.stdout
+    assert "commit gate: PASS" in good_only.stdout
+
+    bad_only = run_checker(git_repo, "--require-commits", "--slice", "bad")
+    assert bad_only.returncode == 1, bad_only.stdout
+    assert "bad" in bad_only.stdout
+    assert "commit gate: FAIL" in bad_only.stdout
+
+    unfiltered = run_checker(git_repo, "--require-commits")
+    assert unfiltered.returncode == 1, unfiltered.stdout
+
+
 def test_require_commits_mixed_committed_code_and_uncommitted_loop_only_exits_0(
     git_repo: Path,
 ) -> None:

@@ -85,7 +85,9 @@ ENTRY_RE = re.compile(r"^\s*- id:\s*(.+?)\s*$")
 KEY_RE = re.compile(r"^([a-z]+):\s*(.*)$")
 FLOW_LIST_RE = re.compile(r"^\[(.*)\]$")
 ITEM_RE = re.compile(r"^\s*- (.+)$")
-SLICE_KEYS = ("id", "repo", "writes", "reads", "gate", "status", "iteration")
+SLICE_KEYS = (
+    "id", "repo", "writes", "reads", "gate", "status", "iteration", "accepts",
+)
 STATUS_VALUES = ("planned", "in_progress", "complete")
 
 
@@ -443,6 +445,7 @@ def parse_slices(lines: list[str]) -> list[dict]:
                 "gate": False,
                 "status": "in_progress",
                 "iteration": None,
+                "accepts": [],
             }
             list_key = None
             continue
@@ -469,7 +472,7 @@ def parse_slices(lines: list[str]) -> list[dict]:
                     raise SliceParseError(f"line {i}: `repo:` needs a path value")
                 cur["repo"] = value
                 list_key = None
-            elif key in ("writes", "reads"):
+            elif key in ("writes", "reads", "accepts"):
                 if value:
                     cur[key] = _parse_flow_list(value, i)
                     list_key = None
@@ -537,6 +540,240 @@ def parse_slices_block(plan_text: str) -> list[dict] | None:
         return parse_slices(find_slices_block(plan_text))
     except SliceParseError:
         return None
+
+
+# --- QUEUE.md parsing (v1 open-loop extension) -------------------------------
+# MAILBOX-SCHEMA.md "v1 open-loop extension (optional)": QUEUE.md carries two
+# independent fenced ```yaml blocks, `retired:` (Lead-appended) and `faults:`
+# (Evaluator-appended). Mirrors the slices-block trio in style (line-based
+# state machine, 1-based line numbers, _parse_flow_list/_unquote reuse) but
+# stays permissive: enum/shape validation (status values, `f<N>` ids,
+# retired.slice existing in PLAN.md) lives in trio-check.py, not here.
+
+RETIRED_KEY_RE = re.compile(r"^\s*retired\s*:\s*(.*)$")
+FAULTS_KEY_RE = re.compile(r"^\s*faults\s*:\s*(.*)$")
+RETIRED_ENTRY_RE = re.compile(r"^\s*- slice:\s*(.*)$")
+FAULT_ENTRY_RE = re.compile(r"^\s*- id:\s*(.*)$")
+QUEUE_KEY_RE = re.compile(r"^([a-z_]+):\s*(.*)$")
+RETIRED_KEYS = ("slice", "sha", "at")
+FAULT_KEYS = ("id", "slice", "observed_at", "scope", "reason", "status")
+
+
+class QueueParseError(ValueError):
+    """QUEUE.md is present but does not match the restricted shape."""
+
+
+def find_queue_block(queue_text: str, key: str) -> list[str] | None:
+    """Return the body lines of the fenced yaml block whose only top-level
+    key is `key` ("retired" or "faults"), or None when absent.
+
+    Unlike find_slices_block, absence is not an error: a missing block means
+    an empty queue for that key (MAILBOX-SCHEMA.md: "Either block may be
+    absent ... absent always means an empty queue, never an error").
+    """
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*)$")
+    in_fence = False
+    yaml_fence = False
+    buf: list[str] = []
+    for raw in queue_text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                if yaml_fence and any(key_re.match(ln) for ln in buf):
+                    return buf
+                in_fence = False
+                yaml_fence = False
+                buf = []
+            else:
+                in_fence = True
+                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
+                buf = []
+            continue
+        if in_fence and yaml_fence:
+            buf.append(raw)
+    if in_fence and yaml_fence and any(key_re.match(ln) for ln in buf):
+        return buf
+    return None
+
+
+def _parse_queue_entries(
+    lines: list[str],
+    *,
+    top_key_re: re.Pattern,
+    top_key_name: str,
+    entry_re: re.Pattern,
+    entry_field: str,
+    required: tuple[str, ...],
+    list_fields: tuple[str, ...],
+) -> list[dict]:
+    """Shared state machine for `retired:`/`faults:` entry lists.
+
+    Each entry is a `- <entry_field>: <value>` line followed by indented
+    `key: value` lines; `list_fields` (e.g. `scope`) accept a flow list or a
+    block `- item` list, exactly like `writes:`/`reads:` in parse_slices.
+    """
+    entries: list[dict] = []
+    cur: dict | None = None
+    cur_line = 0
+    list_key: str | None = None
+    saw_key = False
+
+    def _finish(entry: dict, line: int) -> None:
+        missing = [k for k in required if not str(entry.get(k, "")).strip()]
+        if missing:
+            raise QueueParseError(
+                f"line {line}: {top_key_name} entry missing required "
+                f"key(s): {', '.join(missing)}"
+            )
+        entries.append(entry)
+
+    for i, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        m = top_key_re.match(stripped)
+        if m:
+            if cur is not None:
+                raise QueueParseError(
+                    f"line {i}: duplicate `{top_key_name}:` key inside an entry"
+                )
+            if m.group(1).strip():
+                raise QueueParseError(
+                    f"line {i}: expected `{top_key_name}:` with an empty value "
+                    f"followed by `- {entry_field}:` entries"
+                )
+            saw_key = True
+            continue
+
+        m = entry_re.match(stripped)
+        if m:
+            if cur is not None:
+                _finish(cur, cur_line)
+            cur = {entry_field: m.group(1).strip()}
+            cur_line = i
+            list_key = None
+            continue
+
+        if cur is None:
+            raise QueueParseError(
+                f"line {i}: unexpected content before any `- {entry_field}:` entry: "
+                f"{stripped!r}"
+            )
+
+        m = QUEUE_KEY_RE.match(stripped)
+        if m:
+            key, value = m.group(1), m.group(2).strip()
+            if key == entry_field:
+                raise QueueParseError(
+                    f"line {i}: `{entry_field}` is set by the `- {entry_field}:` "
+                    "entry; remove this line"
+                )
+            if key in list_fields:
+                if value:
+                    cur[key] = _parse_flow_list(value, i)
+                    list_key = None
+                else:
+                    cur[key] = []
+                    list_key = key
+            else:
+                cur[key] = value
+                list_key = None
+            continue
+
+        if list_key is not None:
+            m = ITEM_RE.match(stripped)
+            if not m:
+                raise QueueParseError(
+                    f"line {i}: expected a `- item` list entry under "
+                    f"`{list_key}:`, got {stripped!r}"
+                )
+            cur[list_key].append(_unquote(m.group(1).strip()))
+            continue
+
+        raise QueueParseError(f"line {i}: unexpected content: {stripped!r}")
+
+    if cur is not None:
+        _finish(cur, cur_line)
+    if not saw_key:
+        raise QueueParseError(
+            f"the yaml block has no top-level `{top_key_name}:` key "
+            f"(expected `{top_key_name}:` followed by `- {entry_field}:` entries)"
+        )
+    return entries
+
+
+def parse_retired(lines: list[str]) -> list[dict]:
+    """Parse a `retired:` block into `{"slice", "sha", "at"}` dicts."""
+    return _parse_queue_entries(
+        lines,
+        top_key_re=RETIRED_KEY_RE,
+        top_key_name="retired",
+        entry_re=RETIRED_ENTRY_RE,
+        entry_field="slice",
+        required=RETIRED_KEYS,
+        list_fields=(),
+    )
+
+
+def parse_faults(lines: list[str]) -> list[dict]:
+    """Parse a `faults:` block into `{"id", "slice", "observed_at", "scope",
+    "reason", "status"}` dicts. `scope:` accepts a flow list or block list,
+    same as `writes:`/`reads:`."""
+    return _parse_queue_entries(
+        lines,
+        top_key_re=FAULTS_KEY_RE,
+        top_key_name="faults",
+        entry_re=FAULT_ENTRY_RE,
+        entry_field="id",
+        required=FAULT_KEYS,
+        list_fields=("scope",),
+    )
+
+
+def parse_queue_block(queue_text: str) -> dict:
+    """Lenient: always returns {"retired": [...], "faults": [...]}.
+
+    Per-block wrapper around find_queue_block + parse_retired/parse_faults:
+    a block that fails to parse yields [] for that key (same lenient-wrapper
+    contract as parse_slices_block returning None), but unlike
+    parse_slices_block this never returns None overall — "no queue" and
+    "empty queue" must be indistinguishable to callers.
+    """
+    result: dict = {"retired": [], "faults": []}
+    retired_lines = find_queue_block(queue_text, "retired")
+    if retired_lines is not None:
+        try:
+            result["retired"] = parse_retired(retired_lines)
+        except QueueParseError:
+            result["retired"] = []
+    faults_lines = find_queue_block(queue_text, "faults")
+    if faults_lines is not None:
+        try:
+            result["faults"] = parse_faults(faults_lines)
+        except QueueParseError:
+            result["faults"] = []
+    return result
+
+
+def read_queue(loop_dir: Path) -> dict:
+    """Read and parse loop_dir/QUEUE.md; never raises.
+
+    Missing QUEUE.md, an unreadable file, or an empty file all yield
+    {"retired": [], "faults": []} — indistinguishable from a QUEUE.md with
+    two empty blocks (MAILBOX-SCHEMA.md: "absent always means an empty
+    queue, never an error").
+    """
+    queue_path = loop_dir / "QUEUE.md"
+    if not queue_path.is_file():
+        return {"retired": [], "faults": []}
+    try:
+        text = queue_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"retired": [], "faults": []}
+    if not text.strip():
+        return {"retired": [], "faults": []}
+    return parse_queue_block(text)
 
 
 def _state_value(key: str, raw: str) -> str:

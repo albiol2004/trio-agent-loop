@@ -129,6 +129,7 @@ slices:
         "gate": True,
         "status": "complete",
         "iteration": 3,
+        "accepts": [],
     }]
 
 

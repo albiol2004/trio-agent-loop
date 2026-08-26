@@ -37,6 +37,14 @@ slices block still exits 2, and a parseable block with no code-changing
 slices never fails the gate. This is the first active interlock: drivers
 run it post-Lead, pre-Evaluator, and retry the Lead once on exit 1.
 
+Per-slice gate (v1 open-loop extension, MAILBOX-SCHEMA.md):
+
+  python3 metrics/trio-shadow.py --mailbox <dir> --require-commits --slice <id>
+
+``--slice <id>`` restricts both shadow mode and the commit gate to that one
+slice (report and JSON output too). Without it, behaviour is unchanged.
+An unknown ``--slice`` id exits 2, naming the id and the available ids.
+
 Stdlib only — the restricted YAML shape is parsed line-based; there is no
 PyYAML dependency. The block parser itself (``find_slices_block`` /
 ``parse_slices`` / ``SliceParseError``) is shared from trio-metrics.py, the
@@ -187,7 +195,7 @@ def analyze_slice(sl: dict, base: Path) -> dict:
     return entry
 
 
-def analyze(mailbox: Path) -> dict:
+def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
     mailbox = mailbox.resolve()
     plan_path = mailbox / "loop" / "PLAN.md"
     if not plan_path.is_file():
@@ -203,6 +211,14 @@ def analyze(mailbox: Path) -> dict:
         raise SliceParseError(f"PLAN.md unreadable: {exc}") from exc
 
     slices = parse_slices(find_slices_block(text))
+    if slice_filter is not None:
+        available = [sl["id"] for sl in slices]
+        slices = [sl for sl in slices if sl["id"] == slice_filter]
+        if not slices:
+            raise SliceParseError(
+                f"unknown --slice id {slice_filter!r}; available slice id(s): "
+                f"{', '.join(available) if available else '(none)'}"
+            )
     entries = [analyze_slice(sl, mailbox) for sl in slices]
     summary = {
         "total_slices": len(entries),
@@ -220,6 +236,7 @@ def analyze(mailbox: Path) -> dict:
     return {
         "mailbox": str(mailbox),
         "plan": str(plan_path),
+        "slice_filter": slice_filter,
         "slices": entries,
         "summary": summary,
     }
@@ -292,12 +309,21 @@ def main(argv: list[str] | None = None) -> int:
         help="ACTIVE interlock: exit 1 when any code-changing slice (a writes "
         "entry that is neither api: nor under loop/) has no slice(<id>): "
         "commit; exit 0 when every code-changing slice has commits. "
-        "Missing/malformed slices block still exits 2.",
+        "Missing/malformed slices block still exits 2. Combine with --slice "
+        "for the per-slice open-loop gate.",
+    )
+    parser.add_argument(
+        "--slice",
+        metavar="ID",
+        default=None,
+        help="Restrict the shadow report and --require-commits gate to one "
+        "slice id (v1 open-loop per-slice gate, MAILBOX-SCHEMA.md). Without "
+        "it, behaviour is unchanged. An unknown id exits 2.",
     )
     args = parser.parse_args(argv)
 
     try:
-        report = analyze(Path(args.mailbox))
+        report = analyze(Path(args.mailbox), slice_filter=args.slice)
     except SliceParseError as exc:
         print(f"trio-shadow.py: error: {exc}", file=sys.stderr)
         return 2

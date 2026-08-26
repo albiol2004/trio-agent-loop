@@ -50,6 +50,16 @@ SCOPE_RE = re.compile(r"^scope=(design|local:[^\s]+)$", re.IGNORECASE)
 # `schema` key so the version marker is detected with the same syntax rules.
 SCHEMA_RE = re.compile(r"^\s*(?:-\s+)?schema\s*:\s*(.*)$", re.IGNORECASE)
 
+# v1 open-loop extension (MAILBOX-SCHEMA.md "Per-slice verdicts in VERDICT.md"):
+# a QUEUE.md mailbox's VERDICT.md may legitimately consist only of appended
+# per-slice sections and therefore have no `VERDICT:` first line.
+OPEN_LOOP_SLICE_VERDICT_RE = re.compile(
+    r"^## slice \S+ @[0-9a-f]{7,40} — (SHIP|ITERATE)$"
+)
+VALID_FAULT_STATUSES = ("open", "taken", "done", "stale")
+FAULT_ID_RE = re.compile(r"^f\d+$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def load_trio_metrics():
     """Load metrics/trio-metrics.py as a module.
@@ -117,6 +127,12 @@ def check_verdict(loop_dir: Path, tm) -> list[str]:
         return []
     m = tm.VERDICT_RE.match(first)
     if not m or m.group(1).upper() not in VALID_VERDICTS:
+        # v1 open-loop extension: a mailbox with QUEUE.md may have a
+        # VERDICT.md consisting only of appended per-slice sections, with no
+        # `VERDICT:` first line yet (reserved for the final integration
+        # verdict). Without QUEUE.md this relaxation does not apply.
+        if (loop_dir / "QUEUE.md").is_file() and OPEN_LOOP_SLICE_VERDICT_RE.match(first):
+            return []
         return [
             "VERDICT.md first non-empty line must be `VERDICT: SHIP|ITERATE|BLOCKED|NEEDS_HUMAN` "
             "(case-insensitive, optional `# ` prefix; ITERATE may carry a "
@@ -153,6 +169,131 @@ def check_log(loop_dir: Path) -> list[str]:
     if not any(line.strip() for line in text.splitlines()):
         return ["LOG.md is empty — expected at least a `# Trio loop log` header"]
     return []
+
+
+def _plan_slices(loop_dir: Path, tm) -> list[dict] | None:
+    """PLAN.md's parsed `slices:` block, or None when PLAN.md is missing,
+    unreadable, or its `slices:` block does not parse (tm.parse_slices_block
+    is already the lenient wrapper for the last case)."""
+    plan_path = loop_dir / "PLAN.md"
+    if not plan_path.is_file():
+        return None
+    try:
+        plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return tm.parse_slices_block(plan_text)
+
+
+def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
+    """Validate QUEUE.md (v1 open-loop extension); [] when QUEUE.md is absent.
+
+    `slices` is the loop's PLAN.md `slices:` block already parsed by the
+    caller (see `_plan_slices`) — None means PLAN.md is missing or its
+    slices block does not parse. Uses the strict find_queue_block +
+    parse_retired/parse_faults (not the lenient parse_queue_block) so a
+    malformed block is a violation, not a silent []. See
+    MAILBOX-SCHEMA.md "v1 open-loop extension (optional)".
+    """
+    queue_path = loop_dir / "QUEUE.md"
+    if not queue_path.is_file():
+        return []
+    try:
+        queue_text = queue_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"QUEUE.md unreadable: {exc}"]
+
+    errors: list[str] = []
+
+    retired: list[dict] = []
+    retired_lines = tm.find_queue_block(queue_text, "retired")
+    if retired_lines is not None:
+        try:
+            retired = tm.parse_retired(retired_lines)
+        except tm.QueueParseError as exc:
+            errors.append(f"QUEUE.md `retired:` block: {exc}")
+
+    faults: list[dict] = []
+    faults_lines = tm.find_queue_block(queue_text, "faults")
+    if faults_lines is not None:
+        try:
+            faults = tm.parse_faults(faults_lines)
+        except tm.QueueParseError as exc:
+            errors.append(f"QUEUE.md `faults:` block: {exc}")
+
+    known_ids = {sl["id"] for sl in slices} if slices is not None else None
+    if known_ids is None:
+        errors.append(
+            "QUEUE.md is present but PLAN.md is missing or its `slices:` "
+            "block does not parse; cannot validate `retired:` slice references"
+        )
+
+    for entry in retired:
+        slice_id = entry.get("slice", "")
+        sha = entry.get("sha", "")
+        if not SHA_RE.match(sha):
+            errors.append(
+                f"QUEUE.md retired: entry for slice {slice_id!r} has an "
+                f"invalid sha (must be 40 lowercase hex chars): {sha!r}"
+            )
+        if not str(entry.get("at", "")).strip():
+            errors.append(
+                f"QUEUE.md retired: entry for slice {slice_id!r} is missing `at:`"
+            )
+        if known_ids is not None and slice_id not in known_ids:
+            errors.append(
+                f"QUEUE.md retired: entry references slice {slice_id!r}, not "
+                "found in PLAN.md `slices:` block"
+            )
+
+    seen_fault_ids: set[str] = set()
+    for entry in faults:
+        fid = entry.get("id", "")
+        if not FAULT_ID_RE.match(fid):
+            errors.append(f"QUEUE.md faults: id {fid!r} must match `f<N>`")
+        elif fid in seen_fault_ids:
+            errors.append(f"QUEUE.md faults: duplicate fault id {fid!r}")
+        seen_fault_ids.add(fid)
+        status = entry.get("status", "")
+        if status not in VALID_FAULT_STATUSES:
+            errors.append(
+                f"QUEUE.md faults: {fid!r} has status {status!r}, expected "
+                f"one of {', '.join(VALID_FAULT_STATUSES)}"
+            )
+        if not entry.get("scope"):
+            errors.append(f"QUEUE.md faults: {fid!r} has an empty `scope:`")
+        if not str(entry.get("reason", "")).strip():
+            errors.append(f"QUEUE.md faults: {fid!r} is missing `reason:`")
+        # A fault's `slice` not existing in PLAN.md is advisory only — the
+        # frozen schema requires the retired: -> PLAN.md reference, not this
+        # one — so it never lands in `errors` (see queue_info_lines).
+
+    return errors
+
+
+def queue_info_lines(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
+    """Informational QUEUE.md summary for inspect_loop's `info` list.
+
+    Only emitted when QUEUE.md exists. One short counts line, plus one
+    advisory line per fault whose `slice` is not a known PLAN.md slice id
+    (informational only — see check_queue).
+    """
+    if not (loop_dir / "QUEUE.md").is_file():
+        return []
+    queue = tm.read_queue(loop_dir)
+    retired, faults = queue["retired"], queue["faults"]
+    open_faults = sum(1 for f in faults if f.get("status") == "open")
+    lines = [f"queue: {len(retired)} retired, {open_faults} open fault(s)"]
+    known_ids = {sl["id"] for sl in slices} if slices is not None else None
+    if known_ids is not None:
+        for f in faults:
+            if f.get("slice") not in known_ids:
+                lines.append(
+                    f"QUEUE.md faults: {f.get('id')!r} references slice "
+                    f"{f.get('slice')!r}, not found in PLAN.md `slices:` "
+                    "block (advisory)"
+                )
+    return lines
 
 
 def check_prompt_sync(root: Path) -> tuple[bool, list[str]]:
@@ -205,6 +346,7 @@ def check_v1(loop_dir: Path, tm) -> list[str]:
 
     errors.extend(check_verdict(loop_dir, tm))
     errors.extend(check_log(loop_dir))
+    errors.extend(check_queue(loop_dir, tm, _plan_slices(loop_dir, tm)))
     return errors
 
 
@@ -212,6 +354,7 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
     version, info = classify_version(loop_dir / "STATE.md")
     if version == "v1":
         errors = check_v1(loop_dir, tm)
+        info = info + queue_info_lines(loop_dir, tm, _plan_slices(loop_dir, tm))
     else:
         errors = []
         missing = missing_required_files(loop_dir)
