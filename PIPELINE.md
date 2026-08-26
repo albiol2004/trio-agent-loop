@@ -188,7 +188,7 @@ watcher role bound to the light model tier, worktree-per-slice renaming,
 the in-order merge queue, the rolling-SHIP predictor, `gate: true` slice
 declarations.
 
-**Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Known tension: `retired:` entries are append-only, but `sha` is defined as the slice's last commit, which breaks once a post-retirement fix lands — to be resolved before phase 2 (dashboard per-slice lifecycle) and phase 3 (driver flavors).
+**Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Phase 2 shipped: slice lifecycle in metrics (planned/building/retired/faulted/repairing/shipped), /api/loop gains mode/queue/slices fields, dashboard Slices section + Timeline slice summaries, inbox queue_fault and slice_overlap items. The sha tension resolved by "retired at sha" semantics: each entry means "retired at this sha", not "the slice's last commit", allowing post-retirement fixes to append new retired entries. Phase 3 remaining: harness drivers running the two loops (Lead and Evaluator) automatically.
 
 ## Cost model
 

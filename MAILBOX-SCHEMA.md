@@ -376,6 +376,18 @@ faults:
 transitions an existing entry's `status:` — the Lead never appends a new
 fault and never edits `slice`, `observed_at`, `scope`, or `reason`.
 
+### Slice lifecycle (derived)
+
+The six per-slice lifecycle states are derived by `metrics/trio-metrics.py
+derive_slices()` — never written to the mailbox — in this precedence order:
+
+1. **planned** — no retired entry, no `slice(<id>):` commit, and status is "planned" or absent/blank.
+2. **building** — no retired entry, and status is "in_progress" or the slice has a `slice(<id>):` commit.
+3. **retired** — has a retired entry whose latest sha has no matching `## slice <id> @<sha>` verdict section.
+4. **faulted** — any fault for this slice is `open`, or the latest matching verdict is ITERATE and no fault is `taken`.
+5. **repairing** — any fault for this slice is `taken` (and none open).
+6. **shipped** — latest matching verdict is SHIP and no open/taken fault remains.
+
 ### `accepts:` (PLAN.md slices field)
 
 The PLAN.md `slices:` block gains one **optional** field, `accepts:` (see
