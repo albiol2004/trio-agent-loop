@@ -29,7 +29,8 @@ Board:
     Each loop object:
         name, path, mission, iteration, max_iterations, status,
         final_verdict, last_activity, verdict_mtime, last_entry_summary,
-        segments, driver_phase, driver, running, running_sources
+        segments, driver_phase, driver, running, running_sources,
+        running_substate
     Each inbox item includes: loop, kind, severity, headline, detail, id,
     read, first_seen.
 
@@ -846,6 +847,30 @@ def _broker_has_running_session(session_ids: list[str]) -> bool:
     return False
 
 
+def _open_loop_substate(loop_dir: Path) -> str | None:
+    """Derive the open-loop lead/evaluator/both sub-state, or None.
+
+    Reads the raw ``.driver.json`` sidecar first; falls back to
+    ``.session.json`` when the driver sidecar is absent or is not an
+    open-loop sidecar (``open_loop: true``). Returns None for lockstep
+    mailboxes and for any mailbox with no open-loop sidecar.
+    """
+    sidecar = _read_driver_state(loop_dir)
+    if not (isinstance(sidecar, dict) and sidecar.get("open_loop") is True):
+        sidecar = _read_session_sidecar(loop_dir)
+    if not (isinstance(sidecar, dict) and sidecar.get("open_loop") is True):
+        return None
+    lead_alive = sidecar.get("lead_alive") is True
+    eval_alive = sidecar.get("eval_alive") is True
+    if lead_alive and eval_alive:
+        return "both"
+    if lead_alive:
+        return "lead"
+    if eval_alive:
+        return "evaluator"
+    return None
+
+
 def _running_detection(loop_dir: Path) -> dict:
     """Return concrete running evidence and any stale session sidecar."""
     driver_state = _driver_snapshot(loop_dir)
@@ -889,6 +914,7 @@ def _running_detection(loop_dir: Path) -> dict:
     return {
         "sources": sources,
         "orphaned_session": orphaned_session,
+        "substate": _open_loop_substate(loop_dir),
     }
 
 
@@ -2942,6 +2968,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "driver": driver_state["driver"] if driver_state else None,
             "running": bool(sources),
             "running_sources": sources,
+            "running_substate": detection["substate"],
         }
 
     def _handle_board(self, root: Path) -> None:
@@ -2972,6 +2999,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "driver": None,
                     "running": bool(sources),
                     "running_sources": sources,
+                    "running_substate": detection["substate"],
                 })
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):
