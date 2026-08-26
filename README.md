@@ -275,6 +275,7 @@ registry/                           # canonical-agent definitions + format layer
   tests/                          # 164 tests covering parsers, validation, install API
   README.md                       # architecture, model tiers, tool policies
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
+  QUEUE.md                            # v1 open-loop extension (per-slice retirement/fault queues); see MAILBOX-SCHEMA.md section `## v1 open-loop extension (optional)` and loop-open-loop/RUNBOOK.md
 PIPELINE.md                         # experimental speculative-pipeline execution spec — slice contracts, frozen interfaces, shadow measurement
 kimi/                                # Kimi Code skills, prompts, and runner
   skills/trio/SKILL.md

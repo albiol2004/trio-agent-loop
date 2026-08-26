@@ -188,6 +188,8 @@ watcher role bound to the light model tier, worktree-per-slice renaming,
 the in-order merge queue, the rolling-SHIP predictor, `gate: true` slice
 declarations.
 
+**Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Known tension: `retired:` entries are append-only, but `sha` is defined as the slice's last commit, which breaks once a post-retirement fix lands — to be resolved before phase 2 (dashboard per-slice lifecycle) and phase 3 (driver flavors).
+
 ## Cost model
 
 | Component | Model tier | When | Drives |
