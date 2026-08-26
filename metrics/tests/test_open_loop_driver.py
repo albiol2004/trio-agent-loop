@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 import sys
 import threading
 from pathlib import Path
@@ -270,6 +271,7 @@ def test_c1_happy_path_ships_after_a_fault_and_fix(tmp_path: Path) -> None:
     state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
     assert "iteration: 2" in state_text
     assert "status: shipped" in state_text
+    assert re.search(r"^verdict: SHIP$", state_text, re.MULTILINE)
 
     assert not lead.passes
     assert not evaluator.integration_actions
@@ -331,6 +333,10 @@ def test_iterate_integration_verdict_wakes_the_lead(tmp_path: Path) -> None:
     state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
     assert "iteration: 2" in state_text
     assert "status: shipped" in state_text
+    # An earlier ITERATE integration verdict wrote `verdict: ITERATE`; the
+    # later SHIP must replace it in place, not append a second line.
+    verdict_lines = re.findall(r"^verdict: (\S+)$", state_text, re.MULTILINE)
+    assert verdict_lines == ["SHIP"]
 
 
 # --- NEEDS_HUMAN halts with exit 5 --------------------------------------
@@ -361,6 +367,7 @@ def test_needs_human_integration_verdict_returns_five(tmp_path: Path) -> None:
     assert code == 5
     state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
     assert "status: needs_human" in state_text
+    assert re.search(r"^verdict: NEEDS_HUMAN$", state_text, re.MULTILINE)
 
 
 # --- per-slice gate exit 2 -> status: error -----------------------------

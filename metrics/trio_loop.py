@@ -105,6 +105,35 @@ def _update_state(path: Path, updates: dict[str, str]) -> None:
     )
 
 
+# Open-loop-only: the top-level STATE.md `verdict:` hot-summary line from
+# MAILBOX-SCHEMA.md ("STATE.md `verdict:` and `eval:` hot-summary lines").
+# Kept separate from STATE_RE/_update_state so lockstep's owned-key
+# behaviour (iteration/status/phase) stays byte-identical.
+VERDICT_LINE_RE = re.compile(r"^\s*(?:-\s+)?verdict\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def _write_state_verdict(state_path: Path, word: str) -> None:
+    """Set (or idempotently replace) the STATE.md `verdict:` line after an
+    integration verdict, preserving every other line untouched."""
+    lines = state_path.read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines()
+    result: list[str] = []
+    replaced = False
+    for line in lines:
+        if VERDICT_LINE_RE.match(line):
+            if not replaced:
+                result.append(f"verdict: {word}")
+                replaced = True
+            continue
+        result.append(line)
+    if not replaced:
+        result.append(f"verdict: {word}")
+    state_path.write_text(
+        "\n".join(result) + ("\n" if result else ""), encoding="utf-8"
+    )
+
+
 def _write_driver_state(
     mailbox: Path, runner: RoleRunner, iteration: int, phase: str
 ) -> None:
@@ -794,6 +823,7 @@ def run_open_loop(
                             "integration verdict",
                         )
                         return finish(3)
+                    _write_state_verdict(state_path, verdict)
                     code = _apply_verdict(
                         mailbox,
                         state_path,
