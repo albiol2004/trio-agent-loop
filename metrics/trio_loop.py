@@ -11,12 +11,15 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -55,7 +58,13 @@ OUTCOMES = {
 TERMINAL_CODES = {"shipped": 0, "blocked": 2, "needs_human": 5, "error": 3}
 
 class RoleRunner(Protocol):
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    def run(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict | None = None,
+    ) -> int:
         ...
 
 def _read_state(path: Path) -> dict[str, str]:
@@ -202,10 +211,36 @@ def _log_gate(mailbox: Path, iteration: int, role: str) -> tuple[bool, str]:
 run_commit_gate = _commit_gate
 run_log_gate = _log_gate
 
+def _invoke_runner(
+    runner: RoleRunner,
+    role: str,
+    iteration: int,
+    mailbox: Path,
+    context: dict,
+) -> int:
+    """Call runner.run with `context` only when its signature accepts one.
+
+    api:OpenLoopRunner: a runner whose `run` takes exactly the legacy 3
+    positional arguments (every runner at HEAD, including the fakes in
+    test_trio_loop.py/test_portable_driver.py and OmnigentRunner) is called
+    unchanged. Signature inspection is preferred over a TypeError fallback
+    so a real TypeError raised *inside* the runner is never swallowed.
+    """
+    try:
+        params = inspect.signature(runner.run).parameters
+        accepts_context = len(params) >= 4 or any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
+        )
+    except (TypeError, ValueError):
+        accepts_context = True
+    if accepts_context:
+        return runner.run(role, iteration, mailbox, context)
+    return runner.run(role, iteration, mailbox)
+
 def _run_role(mailbox, iteration, role, runner, repo, state_path) -> bool:
     """Run a Lead/repair role, retrying a failed gate once."""
     for _attempt in range(2):
-        result = runner.run(role, iteration, mailbox)
+        result = _invoke_runner(runner, role, iteration, mailbox, {})
         if result != 0:
             raise RuntimeError(f"{role} runner failed with exit {result}")
         checks = (
@@ -269,14 +304,19 @@ def _apply_verdict(
     _update_state(state_path, {"status": "running", "phase": "idle"})
     return None
 
-def run_loop(
+def _run_lockstep(
     mailbox: Path,
     max_iterations: int,
     runner: RoleRunner,
     *,
     repo: Path | None = None,
 ) -> int:
-    """Run the durable Lead/repair -> Evaluator state machine."""
+    """Run the durable Lead/repair -> Evaluator state machine.
+
+    This is the lockstep body from before open-loop mode existed, kept
+    behaviourally byte-identical: same STATE.md keys, same LOG.md lines,
+    same exit codes, same .driver.json writes (never .session.json).
+    """
     mailbox = Path(mailbox).resolve()
     lock = _acquire_lock(mailbox)
     if lock is None:
@@ -307,7 +347,7 @@ def run_loop(
             # Crash-resume: Lead+gates already landed, so do not bump
             # iteration or re-run Lead (fixes driver.sh:107-108).
             if state["phase"].strip().lower() == "lead-done":
-                result = runner.run("evaluator", iteration, mailbox)
+                result = _invoke_runner(runner, "evaluator", iteration, mailbox, {})
                 if result != 0:
                     raise RuntimeError(
                         f"evaluator runner failed with exit {result}"
@@ -378,8 +418,423 @@ def run_loop(
     finally:
         shutil.rmtree(lock, ignore_errors=True)
 
+
+def run_loop(
+    mailbox: Path,
+    max_iterations: int,
+    runner: RoleRunner,
+    *,
+    repo: Path | None = None,
+    poll_seconds: float = 30,
+    mode: str = "auto",
+) -> int:
+    """Dispatch to open-loop or lockstep (api: engine entry points).
+
+    `mode="auto"` (default) selects open-loop iff `(mailbox / "QUEUE.md")`
+    is a file; `mode="lockstep"` always takes the lockstep path (byte
+    identical to the pre-open-loop behaviour); `mode="open-loop"` forces
+    open-loop and, when QUEUE.md is missing, prints a message naming it to
+    stderr and returns 3 WITHOUT touching STATE.md. `run_loop` passes the
+    same `runner` object as both the open-loop lead_runner and eval_runner.
+    """
+    if mode not in ("auto", "open-loop", "lockstep"):
+        raise ValueError(f"unknown mode: {mode!r} (expected auto/open-loop/lockstep)")
+    mailbox_path = Path(mailbox).resolve()
+    has_queue = (mailbox_path / "QUEUE.md").is_file()
+    if mode == "lockstep" or (mode == "auto" and not has_queue):
+        return _run_lockstep(mailbox, max_iterations, runner, repo=repo)
+    if not has_queue:
+        print(
+            f"open-loop mode requires QUEUE.md in {mailbox_path}, "
+            "but it was not found.",
+            file=sys.stderr,
+        )
+        return 3
+    return run_open_loop(
+        mailbox,
+        max_iterations,
+        runner,
+        runner,
+        repo=repo,
+        poll_seconds=poll_seconds,
+    )
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_open_loop_sidecars(
+    mailbox: Path,
+    lead_runner: RoleRunner,
+    eval_runner: RoleRunner,
+    iteration: int,
+    phase: str,
+    lead_alive: bool,
+    eval_alive: bool,
+    started_at: str,
+) -> None:
+    """Write BOTH sidecars for an open-loop driver (api:OpenLoopSidecar).
+
+    `.driver.json` keeps its pre-open-loop keys (pid/iteration/phase/
+    session_ids) plus open_loop/lead_alive/eval_alive. `.session.json` is
+    open-loop only (lockstep never writes it); `phase` is exactly one of
+    "lead" | "evaluator" | "done" in both files.
+    """
+    session_ids: dict = {}
+    session_ids.update(getattr(lead_runner, "session_ids", {}) or {})
+    session_ids.update(getattr(eval_runner, "session_ids", {}) or {})
+    driver_payload = {
+        "pid": os.getpid(),
+        "iteration": iteration,
+        "phase": phase,
+        "session_ids": session_ids,
+        "open_loop": True,
+        "lead_alive": lead_alive,
+        "eval_alive": eval_alive,
+    }
+    (mailbox / ".driver.json").write_text(
+        json.dumps(driver_payload) + "\n", encoding="utf-8"
+    )
+    session_payload = {
+        "pid": os.getpid(),
+        "iteration": iteration,
+        "phase": phase,
+        "open_loop": True,
+        "lead_alive": lead_alive,
+        "eval_alive": eval_alive,
+        "started_at": started_at,
+    }
+    (mailbox / ".session.json").write_text(
+        json.dumps(session_payload) + "\n", encoding="utf-8"
+    )
+
+
+def _read_plan_slice_ids(mailbox: Path) -> list[str]:
+    """Slice ids declared in PLAN.md's `slices:` block, or [] if absent."""
+    plan_path = mailbox / "PLAN.md"
+    if not plan_path.is_file():
+        return []
+    text = plan_path.read_text(encoding="utf-8", errors="replace")
+    try:
+        slices = _METRICS.parse_slices(_METRICS.find_slices_block(text))
+    except _METRICS.SliceParseError:
+        return []
+    return [sl["id"] for sl in slices]
+
+
+def _lead_thread_body(
+    mailbox: Path,
+    state_path: Path,
+    lead_runner: RoleRunner,
+    max_iterations: int,
+    write_sidecar,
+    wake_event: threading.Event,
+    stop_event: threading.Event,
+    result_holder: dict,
+    force_first_pass: bool = False,
+) -> None:
+    """One Lead-thread lifetime: run passes until every PLAN.md slice has a
+    retired entry and no fault is open/taken, or the pass budget caps.
+
+    `result_holder` receives exactly one of `outcome` ("done"/"capped"/
+    "stopped") or `error` (the exception the runner raised), plus
+    `finished` (set in `finally`, after outcome/error, so the poll loop can
+    treat `finished` as the authoritative "thread has ended" signal instead
+    of racing `Thread.is_alive()`).
+    """
+    try:
+        first = True
+        while True:
+            if stop_event.is_set():
+                result_holder["outcome"] = "stopped"
+                return
+            if not (first and force_first_pass):
+                slice_ids = _read_plan_slice_ids(mailbox)
+                queue = _METRICS.read_queue(mailbox)
+                retired_ids = {e["slice"] for e in queue["retired"]}
+                open_or_taken = [
+                    f for f in queue["faults"] if f["status"] in ("open", "taken")
+                ]
+                if all(sid in retired_ids for sid in slice_ids) and not open_or_taken:
+                    result_holder["outcome"] = "done"
+                    return
+            first = False
+            state = _read_state(state_path)
+            iteration = _number(state["iteration"]) + 1
+            if iteration > max_iterations:
+                result_holder["outcome"] = "capped"
+                return
+            _update_state(
+                state_path, {"iteration": str(iteration), "status": "running"}
+            )
+            write_sidecar("lead", iteration, True, True)
+            context = {
+                "mode": "open-loop",
+                "slice": None,
+                "sha": None,
+                "kind": "lead-pass",
+            }
+            result = _invoke_runner(lead_runner, "lead", iteration, mailbox, context)
+            if result != 0:
+                raise RuntimeError(f"lead runner failed with exit {result}")
+    except BaseException as exc:  # noqa: BLE001 - propagated to the poll loop
+        result_holder["error"] = exc
+    finally:
+        result_holder["finished"] = True
+        wake_event.set()
+
+
+def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
+    """v1 open-loop per-slice commit gate; returns the raw trio-shadow exit
+    code (0 pass, 1 missing commits, 2 malformed/unknown-slice/error)."""
+    script = Path(__file__).resolve().with_name("trio-shadow.py")
+    target = mailbox if (mailbox / "PLAN.md").is_file() else repo or mailbox
+    command = [
+        sys.executable,
+        str(script),
+        "--mailbox",
+        str(target.resolve()),
+        "--require-commits",
+        "--slice",
+        slice_id,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError:
+        return 2
+    return result.returncode
+
+
+def run_open_loop(
+    mailbox: Path,
+    max_iterations: int,
+    lead_runner: RoleRunner,
+    eval_runner: RoleRunner,
+    *,
+    repo: Path | None = None,
+    poll_seconds: float = 30,
+) -> int:
+    """Run the open-loop Lead+Evaluator state machine against a QUEUE.md
+    mailbox: one stdlib Lead thread plus an Evaluator poll loop on the
+    calling thread, sharing the ONE mailbox lock this function acquires."""
+    mailbox = Path(mailbox).resolve()
+    lock = _acquire_lock(mailbox)
+    if lock is None:
+        return 5
+    lead_thread: threading.Thread | None = None
+    stop_event = threading.Event()
+    try:
+        state_path = mailbox / "STATE.md"
+        verdict_path = mailbox / "VERDICT.md"
+        repair_path = mailbox / ".repairs"
+        if not (mailbox / "LOG.md").is_file():
+            (mailbox / "LOG.md").write_text(
+                "# Trio loop log\n", encoding="utf-8"
+            )
+        _read_state(state_path)
+        started_at = _iso_now()
+
+        def write_sidecar(
+            phase: str, iteration: int, lead_alive: bool, eval_alive: bool
+        ) -> None:
+            _write_open_loop_sidecars(
+                mailbox,
+                lead_runner,
+                eval_runner,
+                iteration,
+                phase,
+                lead_alive,
+                eval_alive,
+                started_at,
+            )
+
+        def current_iteration() -> int:
+            return _number(_read_state(state_path)["iteration"])
+
+        def finish(code: int) -> int:
+            write_sidecar("done", current_iteration(), False, False)
+            return code
+
+        wake_event = threading.Event()
+
+        def spawn_lead(force_first_pass: bool = False) -> tuple[threading.Thread, dict]:
+            holder: dict = {}
+            thread = threading.Thread(
+                target=_lead_thread_body,
+                args=(
+                    mailbox,
+                    state_path,
+                    lead_runner,
+                    max_iterations,
+                    write_sidecar,
+                    wake_event,
+                    stop_event,
+                    holder,
+                    force_first_pass,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            return thread, holder
+
+        write_sidecar("lead", current_iteration(), True, True)
+        lead_thread, lead_result = spawn_lead()
+
+        graded: set[tuple[str, str]] = set()
+
+        while True:
+            lead_alive = not lead_result.get("finished", False)
+
+            queue = _METRICS.read_queue(mailbox)
+            latest_retired: dict[str, dict] = {}
+            for entry in queue["retired"]:
+                latest_retired[entry["slice"]] = entry
+            verdict_text = (
+                verdict_path.read_text(encoding="utf-8", errors="replace")
+                if verdict_path.is_file()
+                else ""
+            )
+            verdict_sections = _METRICS.parse_slice_verdicts(verdict_text)
+
+            for slice_id, entry in latest_retired.items():
+                sha = entry["sha"]
+                key = (slice_id, sha)
+                if key in graded:
+                    continue
+                if any(
+                    v["slice"] == slice_id and sha.startswith(v["sha"])
+                    for v in verdict_sections
+                ):
+                    graded.add(key)
+                    continue
+                write_sidecar(
+                    "evaluator", current_iteration(), lead_alive, True
+                )
+                gate_code = _per_slice_gate(mailbox, repo, slice_id)
+                if gate_code == 1:
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | commit gate "
+                        f"failed for slice {slice_id}; skipping until re-retired",
+                    )
+                    continue
+                if gate_code == 2:
+                    stop_event.set()
+                    wake_event.set()
+                    lead_thread.join(timeout=5)
+                    _update_state(state_path, {"status": "error"})
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | commit gate "
+                        f"error for slice {slice_id}",
+                    )
+                    return finish(3)
+                context = {
+                    "mode": "open-loop",
+                    "slice": slice_id,
+                    "sha": sha,
+                    "kind": "slice-eval",
+                }
+                result = _invoke_runner(
+                    eval_runner, "evaluator", current_iteration(), mailbox, context
+                )
+                if result != 0:
+                    raise RuntimeError(
+                        f"evaluator runner failed with exit {result}"
+                    )
+                graded.add(key)
+
+            lead_alive = not lead_result.get("finished", False)
+            if not lead_alive:
+                if lead_result.get("error") is not None:
+                    exc = lead_result["error"]
+                    _update_state(state_path, {"status": "error"})
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | lead thread "
+                        f"failed: {exc}",
+                    )
+                    return finish(3)
+                if lead_result.get("outcome") == "capped":
+                    return finish(4)
+                # outcome == "done": re-check with fresh data before
+                # trusting it -- a slice-eval just above may have opened a
+                # fault after the Lead thread already decided it was done.
+                slice_ids = _read_plan_slice_ids(mailbox)
+                queue = _METRICS.read_queue(mailbox)
+                retired_ids = {e["slice"] for e in queue["retired"]}
+                open_or_taken = [
+                    f for f in queue["faults"] if f["status"] in ("open", "taken")
+                ]
+                if all(sid in retired_ids for sid in slice_ids) and not open_or_taken:
+                    write_sidecar(
+                        "evaluator", current_iteration(), False, True
+                    )
+                    iteration_now = current_iteration()
+                    context = {
+                        "mode": "open-loop",
+                        "slice": None,
+                        "sha": None,
+                        "kind": "integration-eval",
+                    }
+                    result = _invoke_runner(
+                        eval_runner, "evaluator", iteration_now, mailbox, context
+                    )
+                    if result != 0:
+                        raise RuntimeError(
+                            f"evaluator runner failed with exit {result}"
+                        )
+                    verdict, scope = _first_verdict(verdict_path)
+                    if verdict is None:
+                        _update_state(state_path, {"status": "error"})
+                        _append_log(
+                            mailbox,
+                            f"- iter {iteration_now} | loop | unparseable "
+                            "integration verdict",
+                        )
+                        return finish(3)
+                    code = _apply_verdict(
+                        mailbox,
+                        state_path,
+                        repair_path,
+                        iteration_now,
+                        verdict,
+                        scope,
+                    )
+                    if code is not None:
+                        return finish(code)
+                    # ITERATE: wake the Lead for another pass, forcing at
+                    # least one even if the queue currently looks "done"
+                    # (the integration verdict is the authority here).
+                    wake_event.clear()
+                    lead_thread, lead_result = spawn_lead(force_first_pass=True)
+                    write_sidecar("lead", current_iteration(), True, True)
+                    continue
+                # Fresh open work appeared after the Lead thread stopped
+                # (e.g. a slice-eval fault) -- re-invoke it.
+                wake_event.clear()
+                lead_thread, lead_result = spawn_lead()
+                write_sidecar("lead", current_iteration(), True, True)
+                continue
+
+            wake_event.wait(timeout=poll_seconds if poll_seconds > 0 else 0.01)
+            wake_event.clear()
+    finally:
+        stop_event.set()
+        if lead_thread is not None:
+            lead_thread.join(timeout=5)
+        shutil.rmtree(lock, ignore_errors=True)
+
+
 class _PortableRunner:
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    def run(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict | None = None,
+    ) -> int:
         script = (
             Path(__file__).resolve().parent.parent
             / "portable"
@@ -387,6 +842,14 @@ class _PortableRunner:
         )
         environment = os.environ.copy()
         environment["LOOP_DIR"] = str(Path(mailbox).resolve())
+        # api:OpenLoopPromptEnv: only set the TRIO_* vars for a non-empty
+        # open-loop context, so a lockstep (context={}/None) call renders a
+        # byte-identical prompt to HEAD.
+        if context and context.get("mode") == "open-loop":
+            environment["TRIO_MODE"] = "open-loop"
+            environment["TRIO_KIND"] = context.get("kind") or ""
+            environment["TRIO_SLICE"] = context.get("slice") or ""
+            environment["TRIO_SHA"] = context.get("sha") or ""
         # The shell shim only runs one role. Gates, verdicts, repairs, and
         # resume stay in run_loop so this runner never parses VERDICT.md.
         result = subprocess.run(
@@ -425,6 +888,23 @@ def main(argv: list[str] | None = None) -> int:
         choices=("portable", "omnigent"),
         default="portable",
     )
+    run.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=30,
+        help="open-loop Evaluator poll interval in seconds (default: 30)",
+    )
+    mode_group = run.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--open-loop",
+        action="store_true",
+        help="force open-loop mode; errors if the mailbox has no QUEUE.md",
+    )
+    mode_group.add_argument(
+        "--lockstep",
+        action="store_true",
+        help="force lockstep mode even when the mailbox has QUEUE.md",
+    )
     args = parser.parse_args(argv)
     repo = Path.cwd()
     runner = (
@@ -432,11 +912,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.runner == "portable"
         else _load_omnigent_runner()(repo=repo)
     )
+    mode = "open-loop" if args.open_loop else "lockstep" if args.lockstep else "auto"
     return run_loop(
         args.mailbox,
         args.max_iterations,
         runner,
         repo=repo,
+        poll_seconds=args.poll_seconds,
+        mode=mode,
     )
 
 if __name__ == "__main__":

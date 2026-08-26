@@ -1,0 +1,44 @@
+{
+  "_purpose": "Hermetic regression guard for lockstep run_loop (api:engine entry points). Recorded from HEAD's run_loop (metrics/trio_loop.py) BEFORE the engine-open-loop slice added open-loop mode, by replaying the same scripted scenario as metrics/tests/test_trio_loop.py::test_local_repairs_are_capped_then_force_a_lead. test_lockstep_guard.py replays this scenario against the current trio_loop.py and compares the recorded values EXACTLY -- any drift in STATE.md/LOG.md/.repairs/.driver.json/calls means lockstep behaviour changed.",
+  "plan": "```yaml\nslices:\n  - id: coordination\n    writes: [loop/STATE.md, \"api:Coordination\"]\n    reads: []\n```\n",
+  "initial_state": "iteration: 0\nstatus: ready\nphase: idle\ncustom: preserve\n",
+  "verdicts": [
+    "VERDICT: ITERATE scope=local:a.py",
+    "VERDICT: ITERATE scope=local:b.py",
+    "VERDICT: ITERATE scope=local:c.py",
+    "VERDICT: SHIP"
+  ],
+  "max_iterations": 4,
+  "expected_exit_code": 0,
+  "expected_state_lines": [
+    "iteration: 4",
+    "status: shipped",
+    "phase: shipped",
+    "custom: preserve"
+  ],
+  "expected_log_lines": [
+    "# Trio loop log",
+    "- iter 1 | lead | completed",
+    "- iter 2 | repair | completed",
+    "- iter 3 | repair | completed",
+    "- iter 3 | loop | repair cap hit; forcing full Lead",
+    "- iter 4 | lead | completed"
+  ],
+  "expected_repairs": "0",
+  "expected_driver_json": {
+    "iteration": 4,
+    "phase": "shipped",
+    "session_ids": {}
+  },
+  "expected_session_json_exists": false,
+  "expected_calls": [
+    ["lead", 1],
+    ["evaluator", 1],
+    ["repair", 2],
+    ["evaluator", 2],
+    ["repair", 3],
+    ["evaluator", 3],
+    ["lead", 4],
+    ["evaluator", 4]
+  ]
+}
