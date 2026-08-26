@@ -1,6 +1,6 @@
 # PIPELINE.md — speculative pipelined execution for agent workflows
 
-Status: **experimental spec** — not yet implemented. Captures the execution
+Status: **implemented** — Phases 1–3 of speculative pipelined execution (open-loop, slice lifecycle tracking, automated concurrent drivers). Captures the execution
 semantics that sit underneath the trio loop protocol (see MAILBOX-SCHEMA.md)
 and the orchestration policy (see portable/ORCHESTRATION.md). Nothing here
 changes the existing protocol; it defines the mode the protocol grows into.
@@ -188,7 +188,7 @@ watcher role bound to the light model tier, worktree-per-slice renaming,
 the in-order merge queue, the rolling-SHIP predictor, `gate: true` slice
 declarations.
 
-**Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Phase 2 shipped: slice lifecycle in metrics (planned/building/retired/faulted/repairing/shipped), /api/loop gains mode/queue/slices fields, dashboard Slices section + Timeline slice summaries, inbox queue_fault and slice_overlap items. The sha tension resolved by "retired at sha" semantics: each entry means "retired at this sha", not "the slice's last commit", allowing post-retirement fixes to append new retired entries. Phase 3 remaining: harness drivers running the two loops (Lead and Evaluator) automatically.
+**Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Phase 2 shipped: slice lifecycle in metrics (planned/building/retired/faulted/repairing/shipped), /api/loop gains mode/queue/slices fields, dashboard Slices section + Timeline slice summaries, inbox queue_fault and slice_overlap items. The sha tension resolved by "retired at sha" semantics: each entry means "retired at this sha", not "the slice's last commit", allowing post-retirement fixes to append new retired entries. Phase 3 shipped: automated two-loop driver in `metrics/trio_loop.py`, `driver.sh` pass-through, orchestrator prompts, and dashboard running sub-state tracking; the open-loop extension is now complete end-to-end. Known follow-ups: (1) a slice whose per-slice gate exits 1 is skipped yet still satisfies the termination predicate; (2) `_read_plan_slice_ids` returning `[]` on a `SliceParseError` reads as "every slice retired".
 
 ## Cost model
 
