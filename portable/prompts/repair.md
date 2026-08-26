@@ -8,7 +8,11 @@ you need is in the `loop/` directory.
 ## Scope — fix EXACTLY this, nothing else
 1. Read `loop/VERDICT.md` first: the failure scope is the `scope=local:<paths>`
    list plus the blocking issues that name them. ONLY the listed paths are in
-   scope.
+   scope. When `loop/QUEUE.md` exists and the dispatch names a fault `f<N>`,
+   the failure scope is instead that fault's `scope:` list and its `reason:`,
+   read from `QUEUE.md`; the fault is already marked `taken`; commit
+   `slice(<id>): fix f<N> …`; do not set the fault's `status:` yourself
+   unless the dispatch says to.
 2. Read `loop/GOAL.md` (the mission; immutable) and `loop/PLAN.md` (the
    current increment's acceptance criteria).
 3. Fix exactly the failing criteria in the listed paths: smallest correct diff

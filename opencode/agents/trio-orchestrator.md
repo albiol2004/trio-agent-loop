@@ -68,7 +68,9 @@ boundaries visible in the messages and in `loop/LOG.md`:
    `api:` nor under `loop/` — that have no `slice(<id>): ` commit: retry the
    Lead once with the missing-commit note; if the gate still fails, set
    `status: error` in STATE.md, record the breach in LOG.md, and end the
-   loop.
+   loop. In open-loop mode (`loop/QUEUE.md` exists), this gate runs in its
+   per-slice form instead — `--require-commits --slice <id>` — gating each
+   `retired:` entry before the Evaluator grades it.
 
 ## Auto-chain default
 When the user asks to run, start, or continue a trio loop in any phrasing
@@ -92,6 +94,21 @@ re-planning); track the consecutive count in `loop/.repairs`
 (driver-internal; start at 1, cap at 2, reset to 0 after any full Lead pass).
 On the 3rd consecutive scoped verdict, or for any other ITERATE, run the full
 Lead pass as usual.
+
+## Open-loop mode (only when `loop/QUEUE.md` exists)
+No `QUEUE.md` → ignore this section entirely, the fixed sequence above is
+unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
+extension"), the fixed Lead → commit gate → Evaluator sequence above is
+replaced by two independently-scheduled loops joined only by `QUEUE.md`:
+the Lead loop (faults first, then the next planned slice, committing and
+appending to `retired:` as it goes) never waits for a verdict; the
+Evaluator loop grades each `retired:` entry at its pinned sha in a `git
+worktree`, appending a per-slice VERDICT.md section and, on ITERATE, a
+`faults:` entry. The only back-channel between the two loops is the fault
+queue. **Backpressure** — 2 or more faults `open`/`taken` — replaces the
+`.repairs` two-consecutive-repair cap. The loop stops on the integration
+verdict (SHIP/BLOCKED/NEEDS_HUMAN) exactly as today, once every slice is
+retired and no fault is `open`/`taken`.
 
 ## Rules
 Harness wrappers own the optional `loop/.session.json` sidecar: at iteration

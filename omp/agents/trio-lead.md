@@ -66,19 +66,20 @@ Every planned increment is a **slice** and MUST appear in PLAN.md's machine-read
 
 **Staged slices, never mega-slices.** Multi-file refactors MUST be planned as staged slices: leaf modules first, freeze their `api:` contracts (`frozen: <interface> @<sha>` in STATE.md), then dependents — never one mega-slice.
 
-The block is **cumulative** across the loop's life — it is the single machine-readable slice history. When a new iteration starts, KEEP every completed slice entry in the block: mark it `status: complete` with its `iteration: <n>` and leave its `writes:`/`reads:` as they were. Then append the new iteration's slices (default `status: in_progress`, `iteration: <n>`). NEVER delete a completed entry — scripts resolve every slice in the block, finished or not. The block's exact shape — a fenced yaml block whose only top-level key is `slices:`, entry keys limited to `id`/`repo`/`writes`/`reads`/`gate`/`status`/`iteration`:
+The block is **cumulative** across the loop's life — it is the single machine-readable slice history. When a new iteration starts, KEEP every completed slice entry in the block: mark it `status: complete` with its `iteration: <n>` and leave its `writes:`/`reads:` as they were. Then append the new iteration's slices (default `status: in_progress`, `iteration: <n>`). NEVER delete a completed entry — scripts resolve every slice in the block, finished or not. The block's exact shape — a fenced yaml block whose only top-level key is `slices:`, entry keys limited to `id`/`repo`/`writes`/`reads`/`gate`/`status`/`iteration`/`accepts`:
 
 ```yaml
 slices:
   - id: scene-bootstrap
     writes: [src/scene.ts, "api:SceneAPI"]
     reads: []
+    accepts: ["SceneAPI exposes init()/tick()"]
   - id: hud-overlay
     writes: [src/hud.ts]
     reads: ["api:SceneAPI"]
 ```
 
-`repo:`, `gate:`, `status:`, and `iteration:` are optional (defaults: `.`, `false`, `in_progress`, and the entry's iteration number). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
+`repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `.`, `false`, `in_progress`, the entry's iteration number, and `[]`). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review
@@ -94,6 +95,27 @@ After the builder pass, review the complete diff, run the relevant checks, and m
 its declared contract (its `api:` writes), append
 `frozen: <interface> @<short-sha>` to `loop/STATE.md`; the Lead is the only
 role that freezes. Consumers of that interface may then be delegated.
+
+## Open-loop mode (only when `loop/QUEUE.md` exists)
+No `QUEUE.md` → ignore this section entirely, the lockstep protocol above
+is unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
+extension"), run this loop instead of waiting for a verdict:
+1. Take `open` faults first, in order: mark the fault `taken`, fix strictly
+   within its `scope:`, commit `slice(<id>): fix f<N> …`, then mark it
+   `done`. Mark it `stale` instead of `done` when every path in its
+   `scope:` was already rewritten after `observed_at` and the reason no
+   longer applies.
+2. Otherwise take the next `planned` slice from PLAN.md's `slices:` block.
+   Give every slice you plan an `accepts:` list — that is what the
+   Evaluator grades it against.
+3. On finishing a slice: commit, set `status: complete` for it in PLAN.md's
+   `slices:` block, and append a `retired:` entry to `QUEUE.md` (`slice`,
+   the full sha of the last `slice(<id>): ` commit, `at`).
+4. Never wait for a verdict before starting the next fault or slice — the
+   Evaluator grades retired slices independently, on its own schedule.
+5. **Backpressure**: while 2 or more faults are `open` or `taken`, take no
+   new slice — drain faults first. This replaces the two-consecutive-ITERATE
+   drain rule while `QUEUE.md` exists.
 
 ## Quality bar
 - Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin.

@@ -73,4 +73,5 @@ prompt: |
     `{driver, session, pid, started_at, phase}`; on finish set `done: true` and
     `phase: "done"` (or delete the file). `pid` is the orchestrator process;
     the dashboard treats a dead-pid sidecar as orphaned, not running.
+  - Open-loop extension (optional, gated on `loop/QUEUE.md` existing; absent → unchanged lockstep behavior above) — `QUEUE.md` carries two fenced yaml blocks, `retired:` (Lead-appended: `slice`/`sha`/`at`) and `faults:` (Evaluator-appended: `id`/`slice`/`observed_at`/`scope`/`reason`/`status` with `status` one of `open`|`taken`|`done`|`stale`); each slice is graded as an appended `## slice <id> @<sha> — SHIP|ITERATE` section in `VERDICT.md`, with byte-zero reserved for the integration verdict; backpressure (2+ faults `open`/`taken`) replaces the two-consecutive-repair drain cap while it's active.
   <!-- trio-protocol:end -->

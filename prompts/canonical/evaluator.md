@@ -126,6 +126,39 @@ it honestly as a protocol breach in the verdict (non-blocking observation). On
 ITERATE, leave the uncommitted slice work alone and add 'commit slice work' to
 the next iteration's tasks. The orchestrator's pre-Evaluator gate is unchanged.
 
+## Open-loop mode (only when `loop/QUEUE.md` exists)
+No `QUEUE.md` → ignore this section entirely, the lockstep protocol above
+is unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
+extension"), grade retired slices independently instead of waiting for a
+full Lead iteration:
+1. For each `retired:` entry with no corresponding `## slice <id> @<sha>`
+   section in VERDICT.md, evaluate that slice's tree **at its `sha`**, never
+   the moving working tree:
+   ```bash
+   git worktree add /tmp/eval-<slice>-<sha> <sha>
+   # grade against that slice's accepts: in PLAN.md, then:
+   git worktree remove /tmp/eval-<slice>-<sha>
+   ```
+2. Before grading slice `<id>`, run the per-slice commit gate: `python3
+   metrics/trio-shadow.py --mailbox <dir> --require-commits --slice <id>`
+   must exit 0 (same exit semantics as the whole-mailbox gate).
+3. Append a section `## slice <id> @<sha> — SHIP` or `## slice <id> @<sha>
+   — ITERATE` to VERDICT.md. A per-slice section body MUST NOT contain a
+   line starting with `VERDICT:` — that token stays reserved for the final
+   integration verdict.
+4. SHIP → append the section, record only, append no fault. ITERATE →
+   append the section AND one `faults:` entry to QUEUE.md: `status: open`,
+   `observed_at:` the evaluated sha, `scope:` the failing paths, `reason:`
+   one line.
+5. NEEDS_HUMAN / BLOCKED are unchanged: STATE.md + the VERDICT.md
+   first-line contract, and the loop halts.
+6. Never edit `retired:`, and never set a fault's `taken`/`done`/`stale` —
+   those transitions are the Lead's job.
+7. **Termination**: once every planned slice is retired and no fault is
+   `open` or `taken`, run one integration evaluation on HEAD against
+   GOAL.md's acceptance criteria; SHIP uses the existing retirement-commit
+   convention, ITERATE appends a fault and the loop continues.
+
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied. This ends the loop.
 - **ITERATE** — progress is real but criteria fail, or criteria pass while GOAL.md still has ground to cover. Scope it:
@@ -153,7 +186,7 @@ whose failure scope is the evidence gap itself.
 - ITERATE only on **blocking** issues. Style nits and improvements go under non-blocking observations; do not manufacture reasons to iterate.
 - An issue you (or a previous verdict) classified non-blocking may never be promoted to blocking later unless the code around it changed — no nitpick ping-pong.
 - SHIP means "ready for human review", never "merged": the retirement commit captures the verified tree, but review and merge remain the human's call.
-- Two consecutive ITERATEs with the same blocking issue means the loop is stuck: escalate to BLOCKED and say what the human must decide.
+- Two consecutive ITERATEs with the same blocking issue means the loop is stuck: escalate to BLOCKED and say what the human must decide. In open-loop mode (`QUEUE.md` present), backpressure — 2 or more faults `open`/`taken` — replaces this rule.
 
 ## Context economics
 The mailbox is split into hot and cold files to keep fresh-context roles
