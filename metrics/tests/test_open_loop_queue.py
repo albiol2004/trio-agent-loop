@@ -258,6 +258,93 @@ slices:
     assert slices[1]["accepts"] == ["thing"]
 
 
+# --- _parse_flow_list: quote-aware comma splitting ---------------------------
+# accepts:/scope: hold prose/paths that routinely contain commas inside a
+# quoted item; a naive `.split(",")` shreds them. Regression coverage for
+# the fix, shared by writes:/reads:/accepts:/scope: (all four route through
+# _parse_flow_list).
+
+
+def test_accepts_quoted_comma_stays_one_item() -> None:
+    plan = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    accepts: ["trio-check exits 0, no QUEUE.md -> empty queues", "second one"]
+```
+"""
+    slices = TM.parse_slices(TM.find_slices_block(plan))
+    assert slices[0]["accepts"] == [
+        "trio-check exits 0, no QUEUE.md -> empty queues",
+        "second one",
+    ]
+
+
+def test_scope_quoted_comma_stays_one_path_item() -> None:
+    text = (
+        "```yaml\n"
+        "faults:\n"
+        "  - id: f1\n"
+        "    slice: alpha\n"
+        "    observed_at: " + "a" * 40 + "\n"
+        '    scope: [a.py, "dir with, comma/file.py"]\n'
+        "    reason: r\n"
+        "    status: open\n"
+        "```\n"
+    )
+    lines = TM.find_queue_block(text, "faults")
+    faults = TM.parse_faults(lines)
+    assert faults[0]["scope"] == ["a.py", "dir with, comma/file.py"]
+
+
+def test_unquoted_flow_lists_unchanged() -> None:
+    """Regression: plain comma-separated flow lists parse exactly as before."""
+    plan = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py, "api:Name"]
+    reads: [b.py]
+    accepts: [one, two, three]
+```
+"""
+    slices = TM.parse_slices(TM.find_slices_block(plan))
+    assert slices[0]["writes"] == ["a.py", "api:Name"]
+    assert slices[0]["reads"] == ["b.py"]
+    assert slices[0]["accepts"] == ["one", "two", "three"]
+
+
+def test_unterminated_quote_in_accepts_raises_slice_parse_error() -> None:
+    plan = """\
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    accepts: ["unterminated]
+```
+"""
+    with pytest.raises(TM.SliceParseError, match=r"unterminated"):
+        TM.parse_slices(TM.find_slices_block(plan))
+
+
+def test_unterminated_quote_in_scope_raises_queue_parse_error() -> None:
+    text = (
+        "```yaml\n"
+        "faults:\n"
+        "  - id: f1\n"
+        "    slice: alpha\n"
+        "    observed_at: " + "a" * 40 + "\n"
+        '    scope: ["unterminated]\n'
+        "    reason: r\n"
+        "    status: open\n"
+        "```\n"
+    )
+    lines = TM.find_queue_block(text, "faults")
+    with pytest.raises(TM.QueueParseError, match=r"unterminated"):
+        TM.parse_faults(lines)
+
+
 # --- trio-check.py: QUEUE.md validation ---------------------------------------
 
 SHA_A = "0123456789abcdef0123456789abcdef01234567"

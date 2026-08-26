@@ -383,14 +383,48 @@ def _unquote(item: str) -> str:
     return item
 
 
+def _split_flow_items(body: str, line: int) -> list[str]:
+    """Split a flow-list body on top-level commas, quote-aware.
+
+    A comma inside a single- or double-quoted item is part of the item, not
+    a separator -- accepts:/scope: hold prose and paths that routinely
+    contain commas, unlike the plain writes:/reads: paths this originally
+    served. A small stdlib character scan (tracking the active quote char)
+    is enough; no need for csv/ast/shlex. An unterminated quote is a
+    SliceParseError naming the line, not a silent truncation.
+    """
+    items: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    for ch in body:
+        if quote is not None:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+            continue
+        if ch == ",":
+            items.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    if quote is not None:
+        raise SliceParseError(f"line {line}: unterminated {quote!r} quote in bracketed list")
+    items.append("".join(cur))
+    return [part for part in items if part.strip()]
+
+
 def _parse_flow_list(value: str, line: int) -> list[str]:
     m = FLOW_LIST_RE.match(value)
     if not m:
         raise SliceParseError(
-            f"line {line}: `writes:`/`reads:` must be a bracketed list like "
+            f"line {line}: expected a bracketed list like "
             f'[path.py, "api:Name"], got {value!r}'
         )
-    return [_unquote(part) for part in m.group(1).split(",") if part.strip()]
+    return [_unquote(part) for part in _split_flow_items(m.group(1), line)]
 
 
 def parse_slices(lines: list[str]) -> list[dict]:
@@ -671,7 +705,14 @@ def _parse_queue_entries(
                 )
             if key in list_fields:
                 if value:
-                    cur[key] = _parse_flow_list(value, i)
+                    try:
+                        cur[key] = _parse_flow_list(value, i)
+                    except SliceParseError as exc:
+                        # _parse_flow_list is shared with parse_slices and
+                        # always raises SliceParseError; translate to this
+                        # module's own error type so callers only ever see
+                        # QueueParseError out of parse_retired/parse_faults.
+                        raise QueueParseError(str(exc)) from exc
                     list_key = None
                 else:
                     cur[key] = []
