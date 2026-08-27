@@ -49,6 +49,23 @@ Stdlib only — the restricted YAML shape is parsed line-based; there is no
 PyYAML dependency. The block parser itself (``find_slices_block`` /
 ``parse_slices`` / ``SliceParseError``) is shared from trio-metrics.py, the
 single source of truth for the format, and loaded here by file location.
+
+Cross-mailbox drift report:
+
+  python3 metrics/trio-shadow.py --report-drift [--root <repo>] [--json]
+
+Walks every ``loop*/`` directory directly under ``--root`` (default: the
+current directory) that has a PLAN.md with a parsable ``slices:`` block —
+anything without one (no PLAN.md, no yaml fence, a malformed block) is
+skipped silently, exactly the condition ``analyze()`` raises
+``SliceParseError`` for. Runs the same per-slice analysis used by
+``--mailbox`` on each and aggregates across all of them: how often a
+declared ``writes:`` list turns out wrong, and — the more actionable
+question for parallel dispatch — how often two slices in the *same*
+iteration whose declared writes looked disjoint actually collided on a
+real file (a "pairwise hazard": exactly the case where dispatching them in
+parallel by declaration alone would have raced). Always exits 0 (shadow:
+observability only, across mailboxes just like the single-mailbox report).
 """
 from __future__ import annotations
 
@@ -57,6 +74,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 TRIO_SHADOW_VERSION = "1.0.0"
@@ -165,6 +183,7 @@ def analyze_slice(sl: dict, base: Path) -> dict:
         "repo": sl["repo"],
         "repo_path": str(repo_path),
         "repo_status": "ok",
+        "iteration": sl.get("iteration"),
         "commits": [],
         "declared_writes": sl["writes"],
         "actual_touched": [],
@@ -245,6 +264,227 @@ def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
     }
 
 
+def discover_mailboxes(root: Path) -> list[Path]:
+    """Every ``loop*/`` directory directly under root, sorted by name.
+
+    Purely a name-based directory listing — whether each one has a
+    parsable PLAN.md ``slices:`` block is decided by trying to analyze it
+    (report_drift skips ``SliceParseError`` silently), not here.
+    """
+    root = root.resolve()
+    if not root.is_dir():
+        return []
+    return sorted(
+        (p for p in root.iterdir() if p.is_dir() and p.name.startswith("loop")),
+        key=lambda p: p.name,
+    )
+
+
+def _declared_paths(writes: list[str]) -> list[str]:
+    """Declared writes with ``api:`` pseudo-entries stripped — the same
+    filter analyze_slice applies before matching against git-derived
+    paths."""
+    return [w for w in writes if not w.startswith("api:")]
+
+
+def _declared_disjoint(a: list[str], b: list[str]) -> bool:
+    """Whether two declared-write lists share no path, accounting for
+    directory-prefix declarations in either direction (the same ``covers``
+    relation used to match declared writes against actual files)."""
+    return not any(covers(da, db) or covers(db, da) for da in a for db in b)
+
+
+def mailbox_pairwise_hazards(entries: list[dict]) -> list[dict]:
+    """Pairs of slices in the same mailbox and iteration whose *actual*
+    touched files intersect even though their *declared* writes were
+    disjoint — exactly the case where a Lead dispatching them in parallel
+    by declaration alone would have raced them onto the same file.
+
+    Slices are grouped by their ``iteration`` value (``None`` groups
+    together, e.g. mailboxes that never set the optional field); pairs
+    across different iterations are never compared, since they were never
+    candidates for the same parallel dispatch.
+    """
+    hazards: list[dict] = []
+    groups: dict[object, list[dict]] = {}
+    for e in entries:
+        groups.setdefault(e.get("iteration"), []).append(e)
+    for iteration, group in groups.items():
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                overlap = sorted(set(a["actual_touched"]) & set(b["actual_touched"]))
+                if not overlap:
+                    continue
+                da = _declared_paths(a["declared_writes"])
+                db = _declared_paths(b["declared_writes"])
+                if _declared_disjoint(da, db):
+                    hazards.append(
+                        {
+                            "iteration": iteration,
+                            "slice_a": a["id"],
+                            "slice_b": b["id"],
+                            "declared_a": da,
+                            "declared_b": db,
+                            "overlap": overlap,
+                        }
+                    )
+    return hazards
+
+
+def report_drift(root: Path) -> dict:
+    """Aggregate declared-vs-actual write drift across every mailbox under
+    root with a parsable PLAN.md slices block (see module docstring)."""
+    root = root.resolve()
+    mailboxes: list[dict] = []
+    undeclared_counter: Counter[str] = Counter()
+    total_slices = 0
+    slices_with_commits = 0
+    slices_with_undeclared = 0
+    total_undeclared_touches = 0
+    slices_with_declared_untouched = 0
+    pairwise_hazards_total = 0
+
+    for mb_dir in discover_mailboxes(root):
+        try:
+            mb_report = analyze(mb_dir)
+        except SliceParseError:
+            continue
+        entries = mb_report["slices"]
+        hazards = mailbox_pairwise_hazards(entries)
+
+        mb_with_commits = sum(1 for e in entries if e["commits"])
+        mb_with_undeclared = sum(1 for e in entries if e["undeclared_touches"])
+        mb_undeclared_touches = sum(len(e["undeclared_touches"]) for e in entries)
+        mb_declared_untouched = sum(1 for e in entries if e["declared_untouched"])
+        for e in entries:
+            undeclared_counter.update(e["undeclared_touches"])
+
+        total_slices += len(entries)
+        slices_with_commits += mb_with_commits
+        slices_with_undeclared += mb_with_undeclared
+        total_undeclared_touches += mb_undeclared_touches
+        slices_with_declared_untouched += mb_declared_untouched
+        pairwise_hazards_total += len(hazards)
+
+        mailboxes.append(
+            {
+                "mailbox": mb_dir.name,
+                "path": str(mb_dir),
+                "plan": mb_report["plan"],
+                "total_slices": len(entries),
+                "slices_with_commits": mb_with_commits,
+                "slices_with_undeclared_touches": mb_with_undeclared,
+                "undeclared_touch_count": mb_undeclared_touches,
+                "slices_with_declared_untouched": mb_declared_untouched,
+                "pairwise_hazards": hazards,
+            }
+        )
+
+    def pct(n: int) -> float:
+        return round(100.0 * n / total_slices, 1) if total_slices else 0.0
+
+    return {
+        "root": str(root),
+        "mailboxes_scanned": len(mailboxes),
+        "total_slices": total_slices,
+        "slices_with_commits": slices_with_commits,
+        "slices_with_commits_pct": pct(slices_with_commits),
+        "slices_with_undeclared_touches": slices_with_undeclared,
+        "slices_with_undeclared_touches_pct": pct(slices_with_undeclared),
+        "total_undeclared_touches": total_undeclared_touches,
+        "top_undeclared_paths": [
+            {"path": p, "count": c} for p, c in undeclared_counter.most_common(15)
+        ],
+        "slices_with_declared_untouched": slices_with_declared_untouched,
+        "slices_with_declared_untouched_pct": pct(slices_with_declared_untouched),
+        "pairwise_hazards_total": pairwise_hazards_total,
+        "mailboxes": mailboxes,
+    }
+
+
+def render_drift(agg: dict) -> str:
+    lines = [
+        f"Declared-write drift across mailboxes under: {agg['root']}",
+        f"Mailboxes scanned (parsable slices block): {agg['mailboxes_scanned']}",
+        "",
+    ]
+    if agg["mailboxes"]:
+        rows = [
+            (
+                m["mailbox"],
+                str(m["total_slices"]),
+                str(m["slices_with_commits"]),
+                str(m["slices_with_undeclared_touches"]),
+                str(m["undeclared_touch_count"]),
+                str(m["slices_with_declared_untouched"]),
+                str(len(m["pairwise_hazards"])),
+            )
+            for m in agg["mailboxes"]
+        ]
+        header = (
+            "mailbox",
+            "slices",
+            "w/commit",
+            "w/undeclared",
+            "undeclared",
+            "declared-untouched",
+            "hazards",
+        )
+        widths = [
+            max(len(header[i]), *(len(r[i]) for r in rows))
+            for i in range(len(header))
+        ]
+        def fmt_row(r: tuple[str, ...]) -> str:
+            return "  ".join(c.ljust(w) for c, w in zip(r, widths))
+        lines.append(fmt_row(header))
+        lines.append(fmt_row(tuple("-" * w for w in widths)))
+        lines.extend(fmt_row(r) for r in rows)
+        lines.append("")
+
+    lines.append(
+        f"Totals: {agg['total_slices']} slice(s), "
+        f"{agg['slices_with_commits']} with >=1 commit "
+        f"({agg['slices_with_commits_pct']}%), "
+        f"{agg['slices_with_undeclared_touches']} with undeclared touches "
+        f"({agg['slices_with_undeclared_touches_pct']}%), "
+        f"{agg['total_undeclared_touches']} undeclared touch(es) total, "
+        f"{agg['slices_with_declared_untouched']} with declared-but-untouched "
+        f"paths ({agg['slices_with_declared_untouched_pct']}%), "
+        f"{agg['pairwise_hazards_total']} pairwise hazard(s)"
+    )
+
+    lines.append("")
+    lines.append("Top undeclared paths (what Leads forget to declare):")
+    if agg["top_undeclared_paths"]:
+        for i, entry in enumerate(agg["top_undeclared_paths"], 1):
+            lines.append(f"  {i:2d}. {entry['path']}  ({entry['count']}x)")
+    else:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append(
+        "Pairwise hazards (same-iteration slices whose declared writes "
+        "looked disjoint but actually collided):"
+    )
+    any_hazard = False
+    for m in agg["mailboxes"]:
+        for h in m["pairwise_hazards"]:
+            any_hazard = True
+            lines.append(
+                f"  {m['mailbox']} iteration={h['iteration']}: "
+                f"{h['slice_a']} (writes: {_join(h['declared_a'])}) vs "
+                f"{h['slice_b']} (writes: {_join(h['declared_b'])}) "
+                f"both touched: {_join(h['overlap'])}"
+            )
+    if not any_hazard:
+        lines.append("  (none)")
+
+    lines.append("")
+    lines.append("Result: shadow mode — informational only, never gates (exit 0)")
+    return "\n".join(lines)
+
+
 def _join(items: list[str]) -> str:
     return ", ".join(items) if items else "(none)"
 
@@ -312,6 +552,22 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Emit a machine-readable JSON report"
     )
     parser.add_argument(
+        "--report-drift",
+        action="store_true",
+        help="Aggregate declared-vs-actual write drift across every loop*/ "
+        "mailbox under --root with a parsable PLAN.md slices block "
+        "(mailboxes without one are skipped silently). Reports totals, the "
+        "top undeclared paths, and pairwise hazards: same-iteration slices "
+        "whose declared writes looked disjoint but actually collided. "
+        "Ignores --mailbox/--slice/--require-commits; always exits 0.",
+    )
+    parser.add_argument(
+        "--root",
+        default=".",
+        help="Repo root to scan for loop*/ mailboxes with --report-drift "
+        "(default: current directory). Ignored otherwise.",
+    )
+    parser.add_argument(
         "--require-commits",
         action="store_true",
         help="ACTIVE interlock: exit 1 when any code-changing slice (a writes "
@@ -329,6 +585,15 @@ def main(argv: list[str] | None = None) -> int:
         "it, behaviour is unchanged. An unknown id exits 2.",
     )
     args = parser.parse_args(argv)
+
+    if args.report_drift:
+        agg = report_drift(Path(args.root))
+        if args.json:
+            json.dump(agg, sys.stdout, indent=2)
+            print()
+        else:
+            print(render_drift(agg))
+        return 0
 
     try:
         report = analyze(Path(args.mailbox), slice_filter=args.slice)

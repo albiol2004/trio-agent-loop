@@ -190,6 +190,61 @@ declarations.
 
 **Open-loop extension (v1, shipped):** QUEUE.md with per-slice retired/faults queues, optional `accepts:` field in slices, per-slice VERDICT.md sections, and asynchronous Lead/Evaluator coordination via fault flow-back (`metrics/trio-shadow.py --require-commits --slice <id>` gates per-slice; `metrics/trio-check.py` validates; `loop-open-loop/RUNBOOK.md` is the operational guide). Phase 2 shipped: slice lifecycle in metrics (planned/building/retired/faulted/repairing/shipped), /api/loop gains mode/queue/slices fields, dashboard Slices section + Timeline slice summaries, inbox queue_fault and slice_overlap items. The sha tension resolved by "retired at sha" semantics: each entry means "retired at this sha", not "the slice's last commit", allowing post-retirement fixes to append new retired entries. Phase 3 shipped: automated two-loop driver in `metrics/trio_loop.py`, `driver.sh` pass-through, orchestrator prompts, and dashboard running sub-state tracking; the open-loop extension is now complete end-to-end. both fixed in `cd80d7a`; first real-harness run (Omnigent, Cursor Grok/Luna) shipped end to end. New follow-ups: (a) `OmnigentRunner.run` ignores driver's open-loop context; (b) `trioctl` requires `TRIO_OMNIGENT_RUNNER_ID` with multiple runners.
 
+### Measured: declared-write drift (2026-08-27)
+
+`metrics/trio-shadow.py --report-drift` aggregates the existing per-slice
+declared-vs-actual analysis across every mailbox in this repo (14 of the
+19 `loop*/` dirs have a parsable PLAN.md `slices:` block; the rest predate
+the machine-readable format and are skipped silently). Real output:
+
+```
+mailbox                                     slices  w/commit  w/undeclared  undeclared  declared-untouched  hazards
+------------------------------------------  ------  --------  ------------  ----------  ------------------  -------
+loop                                        4       4         0             0           0                   0
+loop-archive-2026-08-23-dashboard-registry  5       5         1             1           0                   0
+loop-archive-2026-08-23-dashboard-topology  5       5         0             0           0                   0
+loop-archive-2026-08-24-agent-authoring     5       5         2             2           0                   0
+loop-archive-2026-08-24-loop-driver         5       5         1             6           0                   0
+loop-archive-2026-08-25-all-harness         6       6         0             0           0                   0
+loop-archive-2026-08-25-control-center      5       5         0             0           0                   0
+loop-iteration-model                        2       2         1             2           0                   0
+loop-omnigent-v010                          2       2         1             1           1                   0
+loop-open-loop                              3       3         0             0           1                   0
+loop-open-loop-drivers                      6       6         0             0           2                   0
+loop-openloop-smoke                         3       3         0             0           0                   0
+loop-openloop-smoke2                        3       3         0             0           0                   0
+loop-slice-lifecycle                        5       5         1             2           2                   0
+
+Totals: 59 slice(s), 59 with >=1 commit (100.0%), 7 with undeclared touches
+(11.9%), 14 undeclared touch(es) total, 6 with declared-but-untouched paths
+(10.2%), 0 pairwise hazard(s)
+
+Top undeclared paths: omnigent/entrypoints/trio-omnigent/prompts/lead.md
+(2x); then 12 singletons — registry/tests/test_serve_pages.py,
+dashboard/skills.html, metrics/tests/test_trio_loop.py,
+metrics/trio_loop.py, omnigent/broker_http.py,
+omnigent/entrypoints/trio-omnigent/prompts/evaluator.md,
+omnigent/tests/test_omnigent_loop.py, metrics/tests/test_trailing_fields.py,
+metrics/trio-shadow.py, SETUP-BY-OMNIGENT.md,
+.codex/agents/trio-evaluator.toml, .codex/agents/trio-lead.toml.
+```
+
+Interpretation: drift is small and concentrated in exactly the path
+classes the task expected a Lead to under-declare — generated prompt
+flavors (`.md`/`.toml` role prompts, hit twice), the tests that accompany
+a code change, and the tool's own module when a slice about the tool edits
+both the hyphenated CLI and the file that mirrors it (`trio_loop.py`
+alongside `trio-shadow.py`). No single path repeats more than twice, so
+this reads as "Leads forget the paired file" rather than one chronically
+mis-scoped file. **Zero pairwise hazards** turned up across all 59 slices
+in 14 mailboxes: no two same-iteration slices with declared-disjoint
+`writes:` ever actually collided on a real file historically. That is
+weak evidence *for* a static scoreboard (declared disjointness has so far
+never been wrong when it mattered for concurrency) but the sample is
+small and skewed toward single-slice-per-iteration mailboxes; it does not
+yet cover a mailbox with several genuinely parallel same-iteration
+slices, which is the actual case the scoreboard needs to be safe for.
+
 ## Cost model
 
 | Component | Model tier | When | Drives |
