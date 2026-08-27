@@ -682,7 +682,7 @@ class RoundTripTests(DashboardServerTestCase):
         self.assertEqual(developer_instructions, get_payload["body"])
 
     def test_omnigent_role_http_round_trip_keeps_nested_document(self):
-        self.assertEqual(len(self.ROLE_CONFIGS), 4)
+        self.assertEqual(len(self.ROLE_CONFIGS), 5)
         for path in self.ROLE_CONFIGS:
             with self.subTest(path=path):
                 status, get_payload = self._get(
