@@ -59,6 +59,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+TRIO_SHADOW_VERSION = "1.0.0"
+
+
 def _load_metrics_module():
     """Load metrics/trio-metrics.py via importlib by path.
 
@@ -294,6 +297,11 @@ def main(argv: list[str] | None = None) -> int:
         description="Measure declared-vs-actual writes for PLAN.md slices "
         "(shadow mode: observability only; --require-commits turns on the "
         "active commit gate).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"trio-shadow {TRIO_SHADOW_VERSION}",
     )
     parser.add_argument(
         "--mailbox",
