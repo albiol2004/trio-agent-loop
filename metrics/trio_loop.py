@@ -539,17 +539,58 @@ def _write_open_loop_sidecars(
     )
 
 
-def _read_plan_slice_ids(mailbox: Path) -> list[str]:
-    """Slice ids declared in PLAN.md's `slices:` block, or [] if absent."""
+_LOGGED_PLAN_PARSE_ERRORS: dict[str, str] = {}
+
+
+def _read_plan_slice_ids(mailbox: Path) -> list[str] | None:
+    """Slice ids declared in PLAN.md's `slices:` block.
+
+    Returns None for "unknown" -- PLAN.md is missing, has no `slices:`
+    block yet (the normal fresh-mailbox state, before the Lead has ever
+    written a plan), or the block exists but fails to parse. Callers MUST
+    treat None (and the empty list) as "not retired", never as "no slices
+    to retire" -- an unknown plan must not look done. A parse failure
+    (block found but malformed) is additionally logged once to LOG.md so
+    it doesn't get silently mistaken for a plan-not-written-yet state.
+    """
     plan_path = mailbox / "PLAN.md"
     if not plan_path.is_file():
-        return []
+        return None
     text = plan_path.read_text(encoding="utf-8", errors="replace")
     try:
-        slices = _METRICS.parse_slices(_METRICS.find_slices_block(text))
+        block = _METRICS.find_slices_block(text)
     except _METRICS.SliceParseError:
-        return []
+        return None
+    try:
+        slices = _METRICS.parse_slices(block)
+    except _METRICS.SliceParseError as exc:
+        key = str(plan_path.resolve())
+        msg = str(exc)
+        if _LOGGED_PLAN_PARSE_ERRORS.get(key) != msg:
+            _LOGGED_PLAN_PARSE_ERRORS[key] = msg
+            _append_log(
+                mailbox,
+                f"open-loop: PLAN.md slices block unreadable — {msg}",
+            )
+        return None
     return [sl["id"] for sl in slices]
+
+
+def _slices_fully_retired(
+    slice_ids: list[str] | None,
+    retired_ids: set[str],
+    open_or_taken: list,
+) -> bool:
+    """True only when the plan declares >=1 slice and every declared slice
+    has a retired QUEUE.md entry, with no fault open/taken.
+
+    `slice_ids` of None or [] (plan absent, no `slices:` block yet, or
+    unparseable) is never "fully retired" -- a fresh or broken mailbox
+    must not look done before the Lead has ever run.
+    """
+    if not slice_ids:
+        return False
+    return all(sid in retired_ids for sid in slice_ids) and not open_or_taken
 
 
 def _lead_thread_body(
@@ -585,7 +626,7 @@ def _lead_thread_body(
                 open_or_taken = [
                     f for f in queue["faults"] if f["status"] in ("open", "taken")
                 ]
-                if all(sid in retired_ids for sid in slice_ids) and not open_or_taken:
+                if _slices_fully_retired(slice_ids, retired_ids, open_or_taken):
                     result_holder["outcome"] = "done"
                     return
             first = False
@@ -708,9 +749,19 @@ def run_open_loop(
             return thread, holder
 
         write_sidecar("lead", current_iteration(), True, True)
-        lead_thread, lead_result = spawn_lead()
+        # First-ever Lead spawn of the run always runs a pass: on a fresh
+        # mailbox PLAN.md is empty/missing, so the "all slices retired"
+        # check has nothing to compare against yet, and the Lead is the
+        # one who writes the plan in the first place.
+        lead_thread, lead_result = spawn_lead(force_first_pass=True)
 
         graded: set[tuple[str, str]] = set()
+        # (slice_id, sha) pairs whose per-slice commit gate exited 1
+        # (missing commits, skipped/ungraded) -- a slice in this set
+        # counts as retired-but-not-yet-validated, so it must keep
+        # blocking the integration-eval termination check below even
+        # though QUEUE.md already shows it as retired.
+        gate_blocked: set[tuple[str, str]] = set()
 
         while True:
             lead_alive = not lead_result.get("finished", False)
@@ -742,12 +793,14 @@ def run_open_loop(
                 )
                 gate_code = _per_slice_gate(mailbox, repo, slice_id)
                 if gate_code == 1:
+                    gate_blocked.add(key)
                     _append_log(
                         mailbox,
                         f"- iter {current_iteration()} | loop | commit gate "
                         f"failed for slice {slice_id}; skipping until re-retired",
                     )
                     continue
+                gate_blocked.discard(key)
                 if gate_code == 2:
                     stop_event.set()
                     wake_event.set()
@@ -796,7 +849,28 @@ def run_open_loop(
                 open_or_taken = [
                     f for f in queue["faults"] if f["status"] in ("open", "taken")
                 ]
-                if all(sid in retired_ids for sid in slice_ids) and not open_or_taken:
+                latest_for_gate = {e["slice"]: e for e in queue["retired"]}
+                any_gate_blocked = any(
+                    (sid, latest_for_gate[sid]["sha"]) in gate_blocked
+                    for sid in (slice_ids or [])
+                    if sid in latest_for_gate
+                )
+                fully_retired = _slices_fully_retired(
+                    slice_ids, retired_ids, open_or_taken
+                )
+                if fully_retired and any_gate_blocked:
+                    # Every declared slice has a retired entry, but at
+                    # least one is still waiting on its commit gate
+                    # (missing commits, presumably transient) -- there is
+                    # nothing new for the Lead to do, so just wait for the
+                    # next poll and re-check the gate then, instead of
+                    # spinning the Lead thread up and down.
+                    wake_event.wait(
+                        timeout=poll_seconds if poll_seconds > 0 else 0.01
+                    )
+                    wake_event.clear()
+                    continue
+                if fully_retired:
                     write_sidecar(
                         "evaluator", current_iteration(), False, True
                     )

@@ -39,6 +39,14 @@ slices:
 ```
 """
 
+PLAN_MALFORMED = """\
+```yaml
+slices:
+  - id: bogus
+    bogus_key: nope
+```
+"""
+
 EMPTY_QUEUE = "```yaml\nretired:\n```\n\n```yaml\nfaults:\n```\n"
 
 
@@ -393,6 +401,130 @@ def test_per_slice_gate_error_sets_status_error(
     assert "status: error" in state_text
     # The gate rejected before any evaluator call was ever dispatched.
     assert evaluator.calls == []
+
+
+# --- fresh mailbox: empty PLAN.md must not look "already retired" -------
+
+
+def test_fresh_mailbox_runs_lead_before_any_integration_eval(
+    tmp_path: Path,
+) -> None:
+    """On a fresh open-loop mailbox (QUEUE.md present, PLAN.md empty), the
+    Lead must get a first pass -- writing the plan and retiring the slice
+    -- before the driver ever considers running the integration eval.
+    Regression for the bug where 0 declared slices + 0 retired looked like
+    "all retired" and the Lead runner was never invoked at all.
+    """
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, "")  # PLAN.md exists but empty
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-fresh")
+
+    def pass1(mb: Path) -> None:
+        # The Lead is what writes the plan in the first place.
+        (mb / "PLAN.md").write_text(PLAN_ONE_SLICE, encoding="utf-8")
+        queue.retire("solo", sha1)
+
+    lead = ScriptedLeadRunner([pass1])
+
+    def eval_solo(mb: Path) -> None:
+        verdict.append_slice_section("solo", sha1, "SHIP")
+
+    def integration_ship(mb: Path) -> None:
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo},
+        integration_actions=[integration_ship],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert len(lead.calls) == 1
+    # Exactly one slice-eval then one integration-eval -- never an
+    # integration-eval run against the empty, plan-less mailbox.
+    assert [c["context"]["kind"] for c in evaluator.calls] == [
+        "slice-eval",
+        "integration-eval",
+    ]
+
+
+# --- malformed slices: block must not look "already retired" ------------
+
+
+def test_malformed_slices_block_blocks_integration_eval_and_logs(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_MALFORMED)
+    queue = QueueModel(mailbox, lock)
+
+    # Nothing the Lead does can ever satisfy "all declared slices retired"
+    # -- the block never parses -- so the driver must cap on the iteration
+    # budget instead of mistaking the unreadable plan for "done" and
+    # running an integration eval.
+    lead = ScriptedLeadRunner([lambda mb: None, lambda mb: None])
+    evaluator = ScriptedEvalRunner()
+
+    code = trio_loop.run_open_loop(mailbox, 2, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 4
+    assert evaluator.calls == []
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "open-loop: PLAN.md slices block unreadable" in log_text
+    # Logged once, not once per re-check poll.
+    assert log_text.count("open-loop: PLAN.md slices block unreadable") == 1
+
+
+# --- gate-exit-1 slice must not satisfy the termination predicate -------
+
+
+def test_gate_exit_one_blocks_termination_until_regraded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-gate-blocked")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    gate_calls = {"n": 0}
+
+    def fake_gate(mb, repo, slice_id):
+        gate_calls["n"] += 1
+        # Missing commits (skipped/ungraded) for the first two checks,
+        # then the commits show up.
+        return 1 if gate_calls["n"] <= 2 else 0
+
+    monkeypatch.setattr(trio_loop, "_per_slice_gate", fake_gate)
+
+    def eval_solo(mb: Path) -> None:
+        verdict.append_slice_section("solo", sha1, "SHIP")
+
+    def integration_ship(mb: Path) -> None:
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo},
+        integration_actions=[integration_ship],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    # The gate rejected "solo" (retired but ungraded) at least twice --
+    # the driver must not have run the integration eval while it sat
+    # gate-blocked, even though the sole declared slice already had a
+    # retired QUEUE.md entry the whole time.
+    assert gate_calls["n"] >= 3
+    assert [c["context"]["kind"] for c in evaluator.calls] == [
+        "slice-eval",
+        "integration-eval",
+    ]
 
 
 # --- max_iterations cap -> exit 4 ---------------------------------------
