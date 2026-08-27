@@ -727,6 +727,14 @@ def _wait_for_session(
 
     A null ``runner_id`` and a type=turn row are never terminal. Failed
     statuses return at once. Timeouts stay distinct.
+
+    Right after an Omnigent restart, a session can cycle bound -> running
+    -> idle within seconds with **zero** items (the runner later shows as
+    unbound again, ``runner_id: None``): a restart blip, not a completed
+    pass. A real turn always leaves at least one item behind (the
+    ``terminal_cursor_main`` resource_event), so an idle+bound+saw_running
+    snapshot with no items at all is treated as not-yet-terminal instead
+    of starting (or continuing) the ``stable_idle`` dwell.
     """
     if timeout < 0:
         raise TrioctlError("--timeout must be non-negative")
@@ -758,9 +766,11 @@ def _wait_for_session(
         elif status == "idle" and bound and has_assistant:
             # Scout pong and any turn that records assistant items.
             return snapshot
-        elif status == "idle" and bound and saw_running:
+        elif status == "idle" and bound and saw_running and _session_items(items):
             # Lead Grok: items stay on resource_event. Require idle to
-            # stick so the post-bind blip does not finish the wait.
+            # stick so the post-bind blip does not finish the wait. Also
+            # require at least one item — a post-restart runner blip goes
+            # idle+bound+running with zero items and is never terminal.
             if idle_since is None:
                 idle_since = now
             if now - idle_since >= stable_idle:
@@ -845,6 +855,78 @@ def command_session_read(args: argparse.Namespace) -> int:
         raise TrioctlError(str(exc)) from exc
     _print_json(result)
     return 0
+
+
+# Kind-specific Open-loop procedures appended to OPEN-LOOP CONTEXT blocks.
+# Sourced from prompts/canonical/lead.md ("Open-loop mode", steps 1-5) and
+# prompts/canonical/evaluator.md ("Open-loop mode", steps 1-7) so Omnigent
+# roles — whose config.yaml files are hand-maintained and never receive
+# these canonical sections — get the same procedural rules the native Trio
+# loop gets. Without this, an Omnigent Lead can commit `slice(<id>):`
+# work every pass and never append the `retired:` entry to QUEUE.md that
+# lets the Evaluator ever grade it (observed in a real open-loop run).
+_OPEN_LOOP_LEAD_PASS_PROCEDURE = (
+    "Open-loop mode is active (loop/QUEUE.md exists) — run this procedure\n"
+    "instead of waiting for a verdict:\n"
+    "1. Take `open` faults first, in order: mark the fault `taken`, fix\n"
+    "   strictly within its `scope:`, commit `slice(<id>): fix f<N> ...`,\n"
+    "   then mark it `done` (or `stale` if every path in its `scope:` was\n"
+    "   already rewritten after `observed_at` and the reason no longer\n"
+    "   applies).\n"
+    "2. Otherwise take the next `planned` slice from PLAN.md's `slices:`\n"
+    "   block. Give every slice you plan an `accepts:` list — that is what\n"
+    "   the Evaluator grades it against.\n"
+    "3. On finishing a slice: commit it, set `status: complete` for it in\n"
+    "   PLAN.md's `slices:` block, and append a `retired:` entry to\n"
+    "   QUEUE.md (`slice`, the full sha it's retired at, `at`) — a pass\n"
+    "   that commits without appending a `retired:` entry is incomplete.\n"
+    "   A post-fix commit (step 1) does not edit that entry — it appends a\n"
+    "   NEW `retired:` entry for the same slice id at the fix's sha.\n"
+    "4. Never wait for a verdict before starting the next fault or slice —\n"
+    "   the Evaluator grades retired slices independently, on its own\n"
+    "   schedule.\n"
+    "5. Backpressure: while 2 or more faults are `open` or `taken`, take no\n"
+    "   new slice — drain faults first.\n"
+    "Append one line to loop/LOG.md: `- iter N | lead | <summary>`.\n"
+)
+
+_OPEN_LOOP_SLICE_EVAL_PROCEDURE = (
+    "Open-loop mode is active — grade only slice `{slice}` at sha `{sha}`,\n"
+    "never the moving working tree:\n"
+    "1. Run `python3 metrics/trio-shadow.py --mailbox <mailbox>\n"
+    "   --require-commits --slice {slice}`; it must exit 0 before you grade.\n"
+    "2. `git worktree add <tmp> {sha}`, then grade ONLY this slice's\n"
+    "   `accepts:` (from PLAN.md) inside that worktree; run\n"
+    "   `git worktree remove <tmp>` when done.\n"
+    "3. Append to VERDICT.md a section headed exactly\n"
+    "   `## slice {slice} @{sha} — SHIP` or\n"
+    "   `## slice {slice} @{sha} — ITERATE`, with per-accepts evidence.\n"
+    "   That section body must never contain a line starting with\n"
+    "   `VERDICT:` — that token is reserved for the integration verdict.\n"
+    "4. SHIP → append the section, record only, append no fault. ITERATE →\n"
+    "   also append one `faults:` entry to QUEUE.md: `id: f<N>`, `slice`,\n"
+    "   `observed_at: {sha}`, `scope`, `reason`, `status: open`.\n"
+    "5. Never edit `retired:` entries, and never set a fault's\n"
+    "   `taken`/`done`/`stale` status — those transitions are the Lead's\n"
+    "   job.\n"
+)
+
+_OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
+    "Open-loop mode is active — every planned slice is retired and no\n"
+    "fault is `open`/`taken`, so run one integration evaluation of HEAD\n"
+    "against GOAL.md's acceptance criteria (the Method and Output sections\n"
+    "above apply in full):\n"
+    "1. Overwrite loop/VERDICT.md; the FIRST LINE must be exactly one of\n"
+    "   `VERDICT: SHIP`, `VERDICT: ITERATE`, `VERDICT: NEEDS_HUMAN`, or\n"
+    "   `VERDICT: BLOCKED`, followed by the standard verdict body.\n"
+    "2. SHIP → follow the Retirement commit convention: commit the\n"
+    "   verified product changes as `slice(<id>): ...`, append your\n"
+    "   LOG.md line, then commit loop/ as `loop: iteration N — SHIP`,\n"
+    "   recording each `commit: <full sha>` in VERDICT.md.\n"
+    "3. ITERATE → append one `faults:` entry to QUEUE.md (`id: f<N>`,\n"
+    "   `scope`, `reason`, `status: open`) and leave the tree uncommitted\n"
+    "   for the Lead's next pass.\n"
+)
 
 
 class OmnigentRunner:
@@ -939,16 +1021,36 @@ class OmnigentRunner:
 
     @staticmethod
     def _open_loop_context_block(context: dict[str, Any]) -> str:
-        """Match portable/driver.sh's build_prompt OPEN-LOOP CONTEXT block
-        byte-for-byte: kind=<kind>[ slice=<slice>][ sha=<sha>]\n\n."""
-        block = f"OPEN-LOOP CONTEXT: kind={context.get('kind') or ''}"
+        """Build the OPEN-LOOP CONTEXT block prepended to open-loop prompts.
+
+        Line 1 matches portable/driver.sh's build_prompt byte-for-byte:
+        `kind=<kind>[ slice=<slice>][ sha=<sha>]`. Omnigent roles otherwise
+        never see the canonical Open-loop procedure (their config.yaml is
+        hand-maintained and only gets the one-paragraph description), so a
+        kind-specific rendering of it is appended before the blank line
+        that separates the block from the role's normal prompt.
+        """
+        kind = context.get("kind") or ""
+        line = f"OPEN-LOOP CONTEXT: kind={kind}"
         slice_id = context.get("slice")
         if slice_id:
-            block += f" slice={slice_id}"
+            line += f" slice={slice_id}"
         sha = context.get("sha")
         if sha:
-            block += f" sha={sha}"
-        return block + "\n\n"
+            line += f" sha={sha}"
+        if kind == "lead-pass":
+            procedure = _OPEN_LOOP_LEAD_PASS_PROCEDURE
+        elif kind == "slice-eval":
+            procedure = _OPEN_LOOP_SLICE_EVAL_PROCEDURE.format(
+                slice=slice_id or "<slice>", sha=sha or "<sha>"
+            )
+        elif kind == "integration-eval":
+            procedure = _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE
+        else:
+            procedure = ""
+        if not procedure:
+            return line + "\n\n"
+        return line + "\n" + procedure + "\n"
 
     def _prompt(
         self,
@@ -1097,6 +1199,44 @@ class OmnigentRunner:
                 title += f" {kind}"
         return title
 
+    def _create_wait_read(
+        self,
+        client: Any,
+        agent_id: str,
+        model: str,
+        prompt: str,
+        title: str,
+        role: str,
+    ) -> tuple[Any, Any]:
+        """One create+wait+read cycle. Returns (session snapshot, items)."""
+        created = self._create(
+            client,
+            agent_id,
+            model,
+            prompt,
+            title,
+            runner_id=self._runner_id,
+        )
+        session_id = self._session_id(created)
+        if session_id is None:
+            raise TrioctlError("session create response has no session id")
+        self.session_ids[role] = session_id
+        snapshot = self._wait(client, session_id)
+        items = self._read(client, session_id)
+        return snapshot, items
+
+    @staticmethod
+    def _is_restart_blip(snapshot: Any, items: Any) -> bool:
+        """A post-restart runner blip: unbound, and no items at all.
+
+        `_wait_for_session` already refuses to treat a bound+running+idle,
+        zero-item snapshot as terminal, but a session can still finish its
+        wait (e.g. an immediate idle pong) and only *afterward* show an
+        unbound runner with nothing read back -- the same restart blip
+        observed in the real run, just caught one step later.
+        """
+        return not _runner_is_bound(snapshot) and not _session_items(items)
+
     def run(
         self,
         role: str,
@@ -1104,7 +1244,16 @@ class OmnigentRunner:
         mailbox: Path,
         context: dict[str, Any] | None = None,
     ) -> int:
-        """Create, await, and read one Lead, Evaluator, or repair session."""
+        """Create, await, and read one Lead, Evaluator, or repair session.
+
+        A restart blip (unbound runner, zero items back) is retried once
+        after a short delay instead of failing outright: `metrics/
+        trio_loop.py` raises on a non-zero Lead runner exit and aborts the
+        whole poll loop, so treating a single transient blip as fatal would
+        be worse than absorbing it silently. A second miss in a row is a
+        real failure and returns 1 so the driver does not count it as a
+        completed pass.
+        """
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
         mailbox = Path(mailbox).resolve()
@@ -1115,23 +1264,21 @@ class OmnigentRunner:
         title = self._title(mailbox, iteration, role, context)
         client = self._client()
         try:
-            created = self._create(
-                client,
-                agent_id,
-                model,
-                prompt,
-                title,
-                runner_id=self._runner_id,
+            snapshot, items = self._create_wait_read(
+                client, agent_id, model, prompt, title, role
             )
-            session_id = self._session_id(created)
-            if session_id is None:
-                raise TrioctlError("session create response has no session id")
-            self.session_ids[role] = session_id
-            snapshot = self._wait(client, session_id)
-            self._read(client, session_id)
+            if _session_status(snapshot) not in SESSION_FAILURE_STATUSES and (
+                self._is_restart_blip(snapshot, items)
+            ):
+                time.sleep(10.0)
+                snapshot, items = self._create_wait_read(
+                    client, agent_id, model, prompt, title, role
+                )
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
-        if _session_status(snapshot) in {"failed", "error"}:
+        if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
+            return 1
+        if self._is_restart_blip(snapshot, items):
             return 1
         return 0
 

@@ -728,6 +728,57 @@ def test_session_wait_ignores_idle_blip_without_assistant_message(
     assert state["session_gets"] == 5
 
 
+def test_session_wait_ignores_restart_blip_with_zero_items(tmp_path):
+    """Right after an Omnigent restart, a session can cycle bound -> running
+    -> idle within seconds with **zero** items at all (no resource_event,
+    nothing) before the runner unbinds again. That must not be terminal;
+    the wait only completes once a real item shows up."""
+    trioctl = load_trioctl()
+
+    class ZeroItemBlipClient:
+        def __init__(self) -> None:
+            self.status_calls = 0
+
+        # idle(pre-run) -> running -> idle(blip, 0 items) ->
+        # idle(still blip, 0 items) -> idle(real item, terminal)
+        _statuses = ["idle", "running", "idle", "idle", "idle"]
+
+        def get_session(self, session_id: str) -> dict[str, object]:
+            index = min(self.status_calls, len(self._statuses) - 1)
+            self.status_calls += 1
+            return {
+                "id": session_id,
+                "status": self._statuses[index],
+                "runner_id": "runner-1",
+            }
+
+        def get_items(
+            self, session_id: str, *, limit: int = 100, order: str = "asc"
+        ) -> dict[str, list[dict[str, str]]]:
+            # Item reads happen in lockstep with status reads (same loop
+            # iteration): index 0/1 pre-run/running, 2/3 the zero-item
+            # blip, 4 the first real item.
+            index = self.status_calls
+            if index >= 4:
+                return {"data": [{"id": "res-1", "type": "resource_event"}]}
+            return {"data": []}
+
+    client = ZeroItemBlipClient()
+
+    snapshot = trioctl._wait_for_session(
+        client,
+        "session-1",
+        timeout=1,
+        interval=0,
+        stable_idle=0.0,
+    )
+
+    assert snapshot["status"] == "idle"
+    # Returned only once an item appeared (5th iteration), not on the
+    # zero-item blip at iteration 3.
+    assert client.status_calls == 5
+
+
 def test_session_wait_completes_when_create_already_finished(
     fake_broker, capsys
 ):

@@ -228,9 +228,13 @@ def test_prompt_no_context_and_lockstep_context_are_byte_identical(
     assert lockstep == no_context
 
 
-def test_prompt_open_loop_lead_pass_prepends_exact_context_block(
+def test_prompt_open_loop_lead_pass_includes_retired_entry_procedure(
     tmp_path: Path,
 ) -> None:
+    """Regression: an Omnigent Lead committed 3 slice(<id>): commits but
+    never appended a retired: entry to QUEUE.md, because the role never
+    received the canonical Open-loop procedure. The rendered block must
+    say so explicitly."""
     trioctl = load_trioctl()
     mailbox = make_mailbox(tmp_path)
     runner = trioctl.OmnigentRunner(repo=Path(__file__).parents[2])
@@ -240,12 +244,15 @@ def test_prompt_open_loop_lead_pass_prepends_exact_context_block(
         "sha": None,
         "kind": "lead-pass",
     }
+    base_prompt = runner._prompt("lead", 3, mailbox)
 
     prompt = runner._prompt("lead", 3, mailbox, context)
 
-    assert prompt == "OPEN-LOOP CONTEXT: kind=lead-pass\n\n" + runner._prompt(
-        "lead", 3, mailbox
-    )
+    assert prompt.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n")
+    assert "commits without appending a `retired:` entry is incomplete" in prompt
+    assert "Backpressure" in prompt
+    assert prompt.endswith(base_prompt)
+    assert prompt[: -len(base_prompt)].endswith("\n\n")
 
 
 def test_prompt_open_loop_slice_eval_includes_slice_and_sha(
@@ -260,16 +267,18 @@ def test_prompt_open_loop_slice_eval_includes_slice_and_sha(
         "sha": "abc1234",
         "kind": "slice-eval",
     }
+    base_prompt = runner._prompt("evaluator", 5, mailbox)
 
     prompt = runner._prompt("evaluator", 5, mailbox, context)
 
     assert prompt.startswith(
-        "OPEN-LOOP CONTEXT: kind=slice-eval slice=coordination sha=abc1234\n\n"
+        "OPEN-LOOP CONTEXT: kind=slice-eval slice=coordination sha=abc1234\n"
     )
-    assert prompt == (
-        "OPEN-LOOP CONTEXT: kind=slice-eval slice=coordination sha=abc1234\n\n"
-        + runner._prompt("evaluator", 5, mailbox)
-    )
+    assert "## slice coordination @abc1234 — SHIP" in prompt
+    assert "## slice coordination @abc1234 — ITERATE" in prompt
+    assert "never edit `retired:` entries" in prompt.lower()
+    assert prompt.endswith(base_prompt)
+    assert prompt[: -len(base_prompt)].endswith("\n\n")
 
 
 def test_prompt_open_loop_integration_eval_prepends_context_block(
@@ -284,10 +293,15 @@ def test_prompt_open_loop_integration_eval_prepends_context_block(
         "sha": None,
         "kind": "integration-eval",
     }
+    base_prompt = runner._prompt("evaluator", 5, mailbox)
 
     prompt = runner._prompt("evaluator", 5, mailbox, context)
 
-    assert prompt.startswith("OPEN-LOOP CONTEXT: kind=integration-eval\n\n")
+    assert prompt.startswith("OPEN-LOOP CONTEXT: kind=integration-eval\n")
+    assert "VERDICT: SHIP" in prompt
+    assert "VERDICT: BLOCKED" in prompt
+    assert prompt.endswith(base_prompt)
+    assert prompt[: -len(base_prompt)].endswith("\n\n")
 
 
 def test_title_unchanged_for_lockstep_and_no_context(tmp_path: Path) -> None:
@@ -353,6 +367,84 @@ def test_title_includes_slice_id_for_slice_eval(tmp_path: Path) -> None:
     assert title == (
         f"trioctl {mailbox.name} iteration 4 evaluator slice-eval:coordination"
     )
+
+
+def test_run_retries_once_on_restart_blip_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: right after an Omnigent restart, a session went
+    idle+bound+running for a few seconds with zero items, then the broker
+    showed the runner unbound again (runner_id: None) — three Lead passes
+    were consumed this way. run() must retry once, silently, rather than
+    counting the blip as a completed pass."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(trioctl.time, "sleep", lambda s: sleep_calls.append(s))
+
+    class RestartBlipThenGoodClient:
+        def __init__(self) -> None:
+            self.creates = 0
+
+        def create(self, agent_id, model, message, title):
+            self.creates += 1
+            return {"id": f"session-{self.creates}"}
+
+        def wait(self, session_id, timeout=None, interval=None):
+            if self.creates == 1:
+                return {"id": session_id, "status": "idle", "runner_id": None}
+            return {"id": session_id, "status": "idle", "runner_id": "runner-1"}
+
+        def get_items(self, session_id):
+            if self.creates == 1:
+                return {"items": []}
+            with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+                log.write("- iter 1 | lead | completed\n")
+            return {"items": [{"role": "assistant", "content": "lead"}]}
+
+    client = RestartBlipThenGoodClient()
+    runner = trioctl.OmnigentRunner(repo=tmp_path, broker_client=client)
+    monkeypatch.setattr(runner, "_agent_id", lambda role: "lead-agent")
+    monkeypatch.setattr(runner, "_resolve_model", lambda role: "lead-model")
+
+    result = runner.run("lead", 1, mailbox)
+
+    assert result == 0
+    assert client.creates == 2
+    assert sleep_calls == [10.0]
+
+
+def test_run_fails_after_second_consecutive_restart_blip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blip on the retry too is a real failure, not another retry."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    monkeypatch.setattr(trioctl.time, "sleep", lambda s: None)
+
+    class AlwaysBlipClient:
+        def __init__(self) -> None:
+            self.creates = 0
+
+        def create(self, agent_id, model, message, title):
+            self.creates += 1
+            return {"id": f"session-{self.creates}"}
+
+        def wait(self, session_id, timeout=None, interval=None):
+            return {"id": session_id, "status": "idle", "runner_id": None}
+
+        def get_items(self, session_id):
+            return {"items": []}
+
+    client = AlwaysBlipClient()
+    runner = trioctl.OmnigentRunner(repo=tmp_path, broker_client=client)
+    monkeypatch.setattr(runner, "_agent_id", lambda role: "lead-agent")
+    monkeypatch.setattr(runner, "_resolve_model", lambda role: "lead-model")
+
+    result = runner.run("lead", 1, mailbox)
+
+    assert result == 1
+    assert client.creates == 2  # exactly one retry, no retry loop
 
 
 def test_create_forwards_runner_id_when_client_supports_it(tmp_path: Path) -> None:
