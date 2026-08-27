@@ -292,6 +292,7 @@ class BrokerClient:
         model: str,
         message: str,
         title: str | None = None,
+        runner_id: str | None = None,
     ) -> Any:
         """Create and start one session through the live broker sequence.
 
@@ -299,6 +300,11 @@ class BrokerClient:
         follow-up message event is therefore the important dispatch step:
         it lets the server bind the session to the current runner and start
         the native Cursor turn, matching the web UI flow.
+
+        `runner_id`, when given, takes precedence over the
+        ``TRIO_OMNIGENT_RUNNER_ID`` environment variable for picking which
+        online runner to bind to. Neither ever auto-picks among several
+        online runners -- that stays an explicit, actionable error.
         """
         payload: dict[str, Any] = {
             "agent_id": agent_id,
@@ -332,19 +338,27 @@ class BrokerClient:
                 and isinstance(row.get("runner_id"), str)
                 and row["runner_id"]
             ]
-            preferred = os.environ.get("TRIO_OMNIGENT_RUNNER_ID", "")
+            preferred_source = "--runner-id"
+            preferred = runner_id or ""
+            if not preferred:
+                preferred_source = "TRIO_OMNIGENT_RUNNER_ID"
+                preferred = os.environ.get("TRIO_OMNIGENT_RUNNER_ID", "")
             if preferred:
                 online = [row for row in online if row["runner_id"] == preferred]
                 if not online:
                     raise BrokerHttpError(
-                        "cannot start session: TRIO_OMNIGENT_RUNNER_ID="
-                        f"{preferred} is not an online runner"
+                        "cannot start session: "
+                        f"{preferred_source}={preferred} is not an online runner"
                     )
             if len(online) != 1:
-                ids = ", ".join(row["runner_id"] for row in online) or "none"
+                ids = (
+                    "\n".join(f"  {row['runner_id']}" for row in online)
+                    or "  (none online)"
+                )
                 raise BrokerHttpError(
                     "cannot start session: expected exactly one online runner, "
-                    f"found {len(online)} ({ids}); set TRIO_OMNIGENT_RUNNER_ID "
+                    f"found {len(online)}:\n{ids}\n"
+                    "set TRIO_OMNIGENT_RUNNER_ID=<id> or pass --runner-id <id> "
                     "to choose one"
                 )
             bound = self.bind_session(session_id, online[0]["runner_id"])

@@ -91,6 +91,7 @@ def fake_broker():
         "session_runner_ids": None,
         "runner_gets": 0,
         "session_statuses": ["idle", "running", "idle"],
+        "online_runners": [{"runner_id": "runner-1", "online": True}],
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -183,10 +184,7 @@ def fake_broker():
                 return
             if parsed.path == "/v1/runners":
                 state["runner_gets"] += 1
-                self.send_json(
-                    200,
-                    {"data": [{"runner_id": "runner-1", "online": True}]},
-                )
+                self.send_json(200, {"data": state["online_runners"]})
                 return
             state["session_gets"] += 1
             index = min(
@@ -509,6 +507,82 @@ def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
             },
         }
     ]
+
+
+def test_create_session_runner_id_arg_takes_precedence_over_env(
+    fake_broker, monkeypatch
+):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_runners"] = [
+        {"runner_id": "runner-1", "online": True},
+        {"runner_id": "runner-2", "online": True},
+    ]
+    monkeypatch.setenv("TRIO_OMNIGENT_RUNNER_ID", "runner-1")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    created = client.create_session(
+        "agent-1", "model-1", "hi", "title", runner_id="runner-2"
+    )
+
+    assert created["runner_id"] == "runner-2"
+    assert state["patches"] == [{"runner_id": "runner-2"}]
+
+
+def test_create_session_uses_env_runner_id_when_arg_absent(fake_broker, monkeypatch):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_runners"] = [
+        {"runner_id": "runner-1", "online": True},
+        {"runner_id": "runner-2", "online": True},
+    ]
+    monkeypatch.setenv("TRIO_OMNIGENT_RUNNER_ID", "runner-2")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["runner_id"] == "runner-2"
+    assert state["patches"] == [{"runner_id": "runner-2"}]
+
+
+def test_create_session_runner_id_arg_not_online_raises(fake_broker, monkeypatch):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_runners"] = [{"runner_id": "runner-1", "online": True}]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
+        client.create_session(
+            "agent-1", "model-1", "hi", "title", runner_id="runner-9"
+        )
+
+    assert "--runner-id=runner-9 is not an online runner" in str(excinfo.value)
+
+
+def test_create_session_multi_runner_error_lists_ids_and_remedy(
+    fake_broker, monkeypatch
+):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_runners"] = [
+        {"runner_id": "runner-1", "online": True},
+        {"runner_id": "runner-2", "online": True},
+        {"runner_id": "runner-3", "online": True},
+    ]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    message = str(excinfo.value)
+    assert "expected exactly one online runner, found 3:" in message
+    assert "\n  runner-1\n" in message
+    assert "\n  runner-2\n" in message
+    assert "\n  runner-3\n" in message
+    assert "TRIO_OMNIGENT_RUNNER_ID=<id>" in message
+    assert "--runner-id <id>" in message
 
 
 def test_session_wait_polls_running_to_idle(fake_broker, capsys):

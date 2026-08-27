@@ -326,14 +326,26 @@ LOOP_DIR=loop-open-loop TRIO_MODE=open-loop POLL_SECONDS=15 \
 `TRIO_MODE=lockstep` forces lockstep the same way `--lockstep` does;
 leaving `TRIO_MODE` unset leaves auto-selection in charge.
 
-**Omnigent runner mode**: When multiple `OmnigentRunner` instances are online, use the mailbox-based runner interface with `TRIO_OMNIGENT_RUNNER_ID`:
+**Omnigent runner mode**: When multiple broker runners are online, pick one
+with `--runner-id` (takes precedence) or `TRIO_OMNIGENT_RUNNER_ID`:
 
 ```bash
-TRIO_OMNIGENT_RUNNER_ID=<runner-id> trioctl omnigent loop \
-  --mailbox loop-open-loop --max-iterations N
+trioctl omnigent loop --mailbox loop-open-loop --max-iterations N \
+  --runner-id <runner-id>
+# or: TRIO_OMNIGENT_RUNNER_ID=<runner-id> trioctl omnigent loop \
+#       --mailbox loop-open-loop --max-iterations N
 ```
 
-Note: the Omnigent runner does not yet receive the `OPEN-LOOP CONTEXT:` block from the driver, so role prompts lack early state awareness; the evaluator self-recovers by grading every ungraded entry against `accepts:`.
+`trioctl` never auto-picks among several online runners — with neither set
+and more than one online, it errors with every runner id listed plus the
+exact `TRIO_OMNIGENT_RUNNER_ID=<id>` / `--runner-id <id>` remedy.
+
+Note: `OmnigentRunner.run` now receives the driver's open-loop context and
+prepends the same `OPEN-LOOP CONTEXT:` block portable/driver.sh renders
+(kind, plus slice/sha when set) ahead of the role prompt, and titles Lead
+and Evaluator sessions with the kind (`lead-pass`, `slice-eval:<slice>`,
+`integration-eval`) so role prompts have the same early state awareness as
+the portable driver's harnesses.
 
 **When to still use §2–§4 by hand**: while debugging a stuck Lead or
 Evaluator pass step by step, when driving the two loops from separate

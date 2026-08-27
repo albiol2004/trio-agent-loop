@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -862,6 +863,7 @@ class OmnigentRunner:
         base_url: str | None = None,
         timeout: float = DEFAULT_LOOP_WAIT_TIMEOUT,
         interval: float = 1.0,
+        runner_id: str | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -874,6 +876,7 @@ class OmnigentRunner:
         self._base_url = base_url or broker_http.DEFAULT_BASE_URL
         self._timeout = timeout
         self._interval = interval
+        self._runner_id = runner_id
         self.session_ids: dict[str, str] = {}
 
     def _load_config(self) -> dict[str, Any]:
@@ -934,7 +937,26 @@ class OmnigentRunner:
                 return path
         raise TrioctlError(f"missing Omnigent prompt: {relative}")
 
-    def _prompt(self, role: str, iteration: int, mailbox: Path) -> str:
+    @staticmethod
+    def _open_loop_context_block(context: dict[str, Any]) -> str:
+        """Match portable/driver.sh's build_prompt OPEN-LOOP CONTEXT block
+        byte-for-byte: kind=<kind>[ slice=<slice>][ sha=<sha>]\n\n."""
+        block = f"OPEN-LOOP CONTEXT: kind={context.get('kind') or ''}"
+        slice_id = context.get("slice")
+        if slice_id:
+            block += f" slice={slice_id}"
+        sha = context.get("sha")
+        if sha:
+            block += f" sha={sha}"
+        return block + "\n\n"
+
+    def _prompt(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None = None,
+    ) -> str:
         """Fill a role prompt without interpreting braces in its prose."""
         prompt_role = "lead" if role == "repair" else role
         template = self._prompt_path(prompt_role).read_text(encoding="utf-8")
@@ -946,29 +968,32 @@ class OmnigentRunner:
         for placeholder, value in values.items():
             template = template.replace(placeholder, value)
         if role != "repair":
-            return template.rstrip() + "\n"
-
-        verdict_path = mailbox / "VERDICT.md"
-        try:
-            verdict = verdict_path.read_text(
-                encoding="utf-8", errors="replace"
-            ).strip()
-        except OSError as exc:
-            raise TrioctlError(
-                f"cannot read repair verdict {verdict_path}: {exc}"
-            ) from exc
-        scope_note = next(
-            (line for line in verdict.splitlines() if line.strip()),
-            "VERDICT.md has no scope line",
-        )
-        return (
-            template.rstrip()
-            + "\n\n## Scoped repair\n"
-            + f"Read `{verdict_path}` and fix only its listed scope.\n"
-            + f"Scope note: {scope_note}\n"
-            + f"Append `- iter {iteration} | repair | <one-line summary>` "
-            "to LOG.md for this repair.\n"
-        )
+            result = template.rstrip() + "\n"
+        else:
+            verdict_path = mailbox / "VERDICT.md"
+            try:
+                verdict = verdict_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
+            except OSError as exc:
+                raise TrioctlError(
+                    f"cannot read repair verdict {verdict_path}: {exc}"
+                ) from exc
+            scope_note = next(
+                (line for line in verdict.splitlines() if line.strip()),
+                "VERDICT.md has no scope line",
+            )
+            result = (
+                template.rstrip()
+                + "\n\n## Scoped repair\n"
+                + f"Read `{verdict_path}` and fix only its listed scope.\n"
+                + f"Scope note: {scope_note}\n"
+                + f"Append `- iter {iteration} | repair | <one-line summary>` "
+                "to LOG.md for this repair.\n"
+            )
+        if context and context.get("mode") == "open-loop":
+            result = self._open_loop_context_block(context) + result
+        return result
 
     def _client(self) -> Any:
         """Reuse an injected fake or build the real HTTP client once."""
@@ -983,13 +1008,30 @@ class OmnigentRunner:
         model: str,
         prompt: str,
         title: str,
+        runner_id: str | None = None,
     ) -> Any:
-        """Call the checked-in client seam or a small test double."""
+        """Call the checked-in client seam or a small test double.
+
+        `runner_id` is forwarded only when the target method declares that
+        parameter (or accepts **kwargs) — the fakes in test_omnigent_loop.py
+        and test_trioctl.py take the legacy 4-argument shape and must keep
+        working unchanged.
+        """
         method = getattr(client, "create_session", None) or getattr(
             client, "create", None
         )
         if method is None:
             raise TrioctlError("broker client has no session-create method")
+        if runner_id:
+            try:
+                params = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                params = {}
+            accepts_runner_id = "runner_id" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if accepts_runner_id:
+                return method(agent_id, model, prompt, title, runner_id=runner_id)
         return method(agent_id, model, prompt, title)
 
     def _wait(self, client: Any, session_id: str) -> Any:
@@ -1037,7 +1079,31 @@ class OmnigentRunner:
             return value if isinstance(value, str) and value else None
         return created if isinstance(created, str) and created else None
 
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    @staticmethod
+    def _title(
+        mailbox: Path,
+        iteration: int,
+        role: str,
+        context: dict[str, Any] | None,
+    ) -> str:
+        """Base title, plus the open-loop kind (and slice, for slice-eval)."""
+        title = f"trioctl {mailbox.name} iteration {iteration} {role}"
+        if context and context.get("mode") == "open-loop":
+            kind = context.get("kind")
+            slice_id = context.get("slice")
+            if kind == "slice-eval" and slice_id:
+                title += f" slice-eval:{slice_id}"
+            elif kind:
+                title += f" {kind}"
+        return title
+
+    def run(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None = None,
+    ) -> int:
         """Create, await, and read one Lead, Evaluator, or repair session."""
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
@@ -1045,8 +1111,8 @@ class OmnigentRunner:
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
-        prompt = self._prompt(role, iteration, mailbox)
-        title = f"trioctl {mailbox.name} iteration {iteration} {role}"
+        prompt = self._prompt(role, iteration, mailbox, context)
+        title = self._title(mailbox, iteration, role, context)
         client = self._client()
         try:
             created = self._create(
@@ -1055,6 +1121,7 @@ class OmnigentRunner:
                 model,
                 prompt,
                 title,
+                runner_id=self._runner_id,
             )
             session_id = self._session_id(created)
             if session_id is None:
@@ -1098,6 +1165,7 @@ def command_loop(args: argparse.Namespace) -> int:
         repo=repo,
         base_url=getattr(args, "base_url", None),
         timeout=getattr(args, "wait_timeout", DEFAULT_LOOP_WAIT_TIMEOUT),
+        runner_id=getattr(args, "runner_id", None),
     )
     return loop_core.run_loop(
         mailbox,
@@ -1422,6 +1490,14 @@ def parser() -> argparse.ArgumentParser:
     loop.add_argument(
         "--base-url",
         default=broker_http.DEFAULT_BASE_URL,
+    )
+    loop.add_argument(
+        "--runner-id",
+        default=None,
+        help=(
+            "broker runner id to bind new sessions to; takes precedence "
+            "over TRIO_OMNIGENT_RUNNER_ID"
+        ),
     )
     loop.set_defaults(func=command_loop)
 
