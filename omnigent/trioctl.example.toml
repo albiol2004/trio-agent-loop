@@ -1,9 +1,10 @@
 version = 1
 
-# Headless `trioctl omnigent loop` runs pile up broker sessions forever;
-# add `--prune-sessions` to archive each iteration's session under
-# <mailbox>/.sessions/ and delete it from the broker once the loop exits
-# (or run `trioctl omnigent sessions prune --mailbox <dir>` by hand).
+# `trioctl omnigent loop` archives (to <mailbox>/.sessions/) then deletes
+# exactly the broker sessions that run itself created, once it exits --
+# never a session from an earlier run. Pass --keep-sessions to leave them
+# in place, or run `trioctl omnigent sessions prune --mailbox <dir>` by
+# hand for the manual/bulk form that matches by title prefix instead.
 
 # Cursor exposes account-entitled model IDs through `cursor-agent models`.
 # Effort is encoded in Cursor's model ID, so no separate reasoning override is

@@ -616,6 +616,15 @@ def run_cursor_worker(
 
 
 def command_run(args: argparse.Namespace) -> int:
+    """Run one headless Cursor worker (a separate OS process from `loop`).
+
+    `run_cursor_worker` drives `cursor-agent` directly and never opens an
+    Omnigent broker session, so today there is no id to append to a
+    `loop` run's `SESSION_IDS_ENV_VAR` ids file -- that file only ever
+    gains entries through `_record_created_session_id`, which this
+    process-boundary hook exists to route a headless worker's session id
+    through if a future dispatch path ever opens a broker-tracked one.
+    """
     config = load_config(config_path(args.config))
     if args.prompt_file == "-":
         prompt = sys.stdin.read()
@@ -882,6 +891,46 @@ def command_session_read(args: argparse.Namespace) -> int:
 # deletes the broker session.
 SESSION_ARCHIVE_ITEM_LIMIT = 10000
 
+# A `trioctl omnigent loop` process exports this before running the loop,
+# pointing at `<mailbox>/.sessions/run-<pid>.ids` -- a run-scoped, one-id-
+# per-line record of every broker session this run created. `OmnigentRunner`
+# appends to it directly (belt-and-suspenders alongside its in-memory
+# `created_session_ids`); a headless `trioctl omnigent run <role>` worker
+# spawned in a separate OS process during the run cannot share that memory
+# and would append through the same env var if its dispatch path ever opens
+# a broker session of its own. Reading it back after the loop exits, unioned
+# with the in-memory ids, is what lets the default post-loop cleanup delete
+# exactly this run's sessions and nothing from an earlier run.
+SESSION_IDS_ENV_VAR = "TRIO_MAILBOX_SESSION_IDS"
+
+
+def _append_session_id_to_file(path: Path, session_id: str) -> None:
+    """Append one session id to a run's ids file, creating its directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{session_id}\n")
+
+
+def _record_created_session_id(session_id: str) -> None:
+    """Append `session_id` to this run's ids file, if one is tracked.
+
+    A no-op when `SESSION_IDS_ENV_VAR` is unset -- e.g. a bare `sessions
+    create`/`run` invocation made outside a `loop` run.
+    """
+    path_value = os.environ.get(SESSION_IDS_ENV_VAR)
+    if not path_value:
+        return
+    _append_session_id_to_file(Path(path_value), session_id)
+
+
+def _read_session_ids_file(path: Path) -> list[str]:
+    """Read one run's recorded session ids, ignoring a missing file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
 
 def _sanitise_archive_slug(value: str) -> str:
     """Collapse a title or timestamp into a filesystem-safe slug."""
@@ -910,15 +959,25 @@ def _prune_broker_sessions(
     all_scope: bool = False,
     dry_run: bool = False,
     keep_failed: bool = False,
+    session_ids: Any = None,
 ) -> dict[str, int]:
-    """Archive-then-delete broker sessions whose title matches one mailbox.
+    """Archive-then-delete broker sessions, id-scoped or title-scoped.
 
-    Only sessions whose title starts with ``trioctl <mailbox.name> ``
-    (or, with ``all_scope``, any ``trioctl `` title) are ever touched --
-    other projects share the same broker. A ``running`` session is always
-    skipped. ``keep_failed`` additionally skips ``failed``/``error``
-    sessions. Every archived transcript is written under
-    ``<mailbox>/.sessions/`` *before* its broker session is deleted.
+    Two mutually exclusive selection modes:
+
+    - ``session_ids`` given (id-scoped): only rows whose id is in that
+      iterable are touched -- the mode the default post-loop cleanup uses,
+      so a session from an earlier run (even one matching this mailbox's
+      title prefix) is never touched.
+    - ``session_ids`` omitted (title-scoped, the manual/bulk form): only
+      sessions whose title starts with ``trioctl <mailbox.name> `` (or,
+      with ``all_scope``, any ``trioctl `` title) are touched -- other
+      projects share the same broker.
+
+    In both modes a ``running`` session is always skipped, ``keep_failed``
+    additionally skips ``failed``/``error`` sessions, and every archived
+    transcript is written under ``<mailbox>/.sessions/`` *before* its
+    broker session is deleted.
     """
     list_sessions = getattr(client, "list_sessions", None)
     if list_sessions is None:
@@ -928,7 +987,20 @@ def _prune_broker_sessions(
     except broker_http.BrokerHttpError as exc:
         raise TrioctlError(str(exc)) from exc
     rows = [row for row in _session_items(payload) if isinstance(row, dict)]
-    prefix = "trioctl " if all_scope else f"trioctl {mailbox.name} "
+    if session_ids is not None:
+        wanted_ids = {sid for sid in session_ids if isinstance(sid, str) and sid}
+
+        def _matches(row: dict[str, Any]) -> bool:
+            row_id = row.get("id") or row.get("session_id")
+            return isinstance(row_id, str) and row_id in wanted_ids
+
+    else:
+        prefix = "trioctl " if all_scope else f"trioctl {mailbox.name} "
+
+        def _matches(row: dict[str, Any]) -> bool:
+            title = row.get("title")
+            return isinstance(title, str) and title.startswith(prefix)
+
     counts = {
         "archived": 0,
         "deleted": 0,
@@ -937,9 +1009,9 @@ def _prune_broker_sessions(
     }
     sessions_dir = mailbox / ".sessions"
     for row in rows:
-        title = row.get("title")
-        if not isinstance(title, str) or not title.startswith(prefix):
+        if not _matches(row):
             continue
+        title = row.get("title") or "untitled"
         session_id = row.get("id") or row.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             continue
@@ -982,7 +1054,15 @@ def _prune_broker_sessions(
 
 
 def command_sessions_prune(args: argparse.Namespace) -> int:
-    """Archive then delete this mailbox's headless-loop broker sessions."""
+    """Manual/bulk form: archive then delete broker sessions by title prefix.
+
+    Matches every session whose title starts with ``trioctl <mailbox.name>
+    `` (or, with ``--all``, any ``trioctl `` title) regardless of which run
+    created it -- unlike `loop`'s default post-loop cleanup, which is
+    scoped to only the sessions that run itself created. Use this for a
+    one-off sweep, or to clean up sessions left behind by a run that never
+    reached its own cleanup (e.g. `--keep-sessions`, or a crash).
+    """
     mailbox = Path(args.mailbox).expanduser().resolve()
     client = _session_client(getattr(args, "base_url", None))
     counts = _prune_broker_sessions(
@@ -999,18 +1079,26 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_post_loop_session_prune(mailbox: Path, base_url: str | None) -> None:
-    """Best-effort cleanup after `loop --prune-sessions` exits.
+def _run_post_loop_session_prune(
+    mailbox: Path, base_url: str | None, session_ids: Any
+) -> None:
+    """Best-effort cleanup after a headless `loop` run exits (default-on).
 
-    Runs after the loop returns regardless of its exit code. Always a real
-    archive-then-delete pass (never `--dry-run`), scoped to this mailbox
-    only (no `--all`, no `--keep-failed`) -- the same default scope as
-    `sessions prune`. A prune failure is reported but never overrides the
-    loop's own exit code.
+    Runs after the loop returns regardless of its exit code, unless the
+    run passed `--keep-sessions`. Id-scoped to exactly `session_ids` --
+    the union of the run's `OmnigentRunner.created_session_ids` and its
+    `.sessions/run-<pid>.ids` file -- never by title prefix, so a session
+    left behind by an earlier run (even one for this same mailbox) is
+    never touched. Always a real archive-then-delete pass (never
+    `--dry-run`, no `--keep-failed`). A prune failure is reported but
+    never overrides the loop's own exit code.
     """
+    ids = sorted({sid for sid in session_ids if isinstance(sid, str) and sid})
+    if not ids:
+        return
     try:
         client = _session_client(base_url)
-        counts = _prune_broker_sessions(client, mailbox)
+        counts = _prune_broker_sessions(client, mailbox, session_ids=ids)
     except TrioctlError as exc:
         print(f"trioctl: session prune failed: {exc}", file=sys.stderr)
         return
@@ -1100,6 +1188,7 @@ class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
     session_ids: dict[str, str]
+    created_session_ids: list[str]
 
     def __init__(
         self,
@@ -1127,6 +1216,7 @@ class OmnigentRunner:
         self._interval = interval
         self._runner_id = runner_id
         self.session_ids: dict[str, str] = {}
+        self.created_session_ids: list[str] = []
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -1388,6 +1478,8 @@ class OmnigentRunner:
         if session_id is None:
             raise TrioctlError("session create response has no session id")
         self.session_ids[role] = session_id
+        self.created_session_ids.append(session_id)
+        _record_created_session_id(session_id)
         snapshot = self._wait(client, session_id)
         items = self._read(client, session_id)
         return snapshot, items
@@ -1467,7 +1559,14 @@ def _load_trio_loop(repo: Path) -> Any:
 
 
 def command_loop(args: argparse.Namespace) -> int:
-    """Run loop-core with the Omnigent role runner."""
+    """Run loop-core with the Omnigent role runner.
+
+    Session cleanup is default-on and scoped to this run: unless
+    `--keep-sessions` is passed, the sessions this run itself created are
+    archived then deleted after the loop returns, regardless of its exit
+    code -- never a session from an earlier run. See
+    `_run_post_loop_session_prune`.
+    """
     repo = Path.cwd().resolve()
     mailbox = Path(args.mailbox).expanduser()
     if not mailbox.is_absolute():
@@ -1481,14 +1580,33 @@ def command_loop(args: argparse.Namespace) -> int:
         timeout=getattr(args, "wait_timeout", DEFAULT_LOOP_WAIT_TIMEOUT),
         runner_id=getattr(args, "runner_id", None),
     )
-    exit_code = loop_core.run_loop(
-        mailbox,
-        args.max_iterations,
-        runner,
-        repo=repo,
-    )
-    if getattr(args, "prune_sessions", False):
-        _run_post_loop_session_prune(mailbox, getattr(args, "base_url", None))
+    keep_sessions = getattr(args, "keep_sessions", False)
+    ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
+    previous_ids_env = os.environ.get(SESSION_IDS_ENV_VAR)
+    if keep_sessions:
+        os.environ.pop(SESSION_IDS_ENV_VAR, None)
+    else:
+        os.environ[SESSION_IDS_ENV_VAR] = str(ids_file)
+    try:
+        exit_code = loop_core.run_loop(
+            mailbox,
+            args.max_iterations,
+            runner,
+            repo=repo,
+        )
+    finally:
+        if previous_ids_env is None:
+            os.environ.pop(SESSION_IDS_ENV_VAR, None)
+        else:
+            os.environ[SESSION_IDS_ENV_VAR] = previous_ids_env
+    if not keep_sessions:
+        created = list(getattr(runner, "created_session_ids", []) or [])
+        created.extend(_read_session_ids_file(ids_file))
+        _run_post_loop_session_prune(mailbox, getattr(args, "base_url", None), created)
+        try:
+            ids_file.unlink()
+        except OSError:
+            pass
     return exit_code
 
 
@@ -1818,12 +1936,15 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     loop.add_argument(
-        "--prune-sessions",
+        "--keep-sessions",
         action="store_true",
         help=(
-            "after the loop exits (any exit code), archive then delete "
-            "this mailbox's broker sessions -- same scope as `sessions "
-            "prune` with no --all or --keep-failed, and never a dry run"
+            "skip the default post-loop cleanup: by default, after the "
+            "loop exits (any exit code), trioctl archives then deletes "
+            "exactly the broker sessions this run created (Lead/Evaluator "
+            "passes plus any tracked headless worker) -- never a session "
+            "from an earlier run. Use `omnigent sessions prune --mailbox "
+            "<dir>` for the manual/bulk form that matches by title prefix"
         ),
     )
     loop.set_defaults(func=command_loop)

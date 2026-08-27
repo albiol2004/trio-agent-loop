@@ -508,9 +508,10 @@ the loop directory itself when pointed at directly.
 session id; conformance tooling ignores it.
 
 `.sessions/` is a separate, optional driver-owned archive directory:
-`trioctl omnigent sessions prune` (and `loop --prune-sessions`) write one
-JSONL transcript per archived broker session there before deleting it from
-the broker. Conformance tooling ignores it too.
+`trioctl omnigent sessions prune` (and `loop`'s default post-loop cleanup,
+skippable with `--keep-sessions`) write one JSONL transcript per archived
+broker session there before deleting it from the broker. Conformance
+tooling ignores it too.
 
 ## Context economics
 

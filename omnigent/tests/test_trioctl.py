@@ -1283,6 +1283,129 @@ def test_prune_without_keep_failed_still_archives_failed_sessions(tmp_path: Path
     assert client.deleted == ["s1"]
 
 
+def test_prune_id_scoped_selects_only_listed_ids(tmp_path: Path):
+    """`session_ids=` scopes to exactly those ids, ignoring title prefix --
+    an older run's session for the same mailbox must survive even though
+    its title matches."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s-old", "trioctl mbx iteration 1 lead"),
+        _row("s-new", "trioctl mbx iteration 2 lead"),
+        _row("s-other", "unrelated broker session"),
+    ]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, session_ids=["s-new"])
+
+    assert counts == {
+        "archived": 1,
+        "deleted": 1,
+        "skipped_running": 0,
+        "skipped_failed": 0,
+    }
+    assert client.deleted == ["s-new"]
+
+
+def test_prune_id_scoped_skips_running_session(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s-new", "trioctl mbx iteration 1 lead", status="running")]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, session_ids=["s-new"])
+
+    assert counts["skipped_running"] == 1
+    assert counts["deleted"] == 0
+    assert client.deleted == []
+
+
+def test_prune_id_scoped_archives_before_deleting(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s-new", "trioctl mbx iteration 1 lead")]
+    client = _FakeSessionsClient(rows, mailbox=mailbox)
+
+    trioctl._prune_broker_sessions(client, mailbox, session_ids=["s-new"])
+
+    assert client.calls == [("items", "s-new"), ("delete", "s-new")]
+    assert client.archived_before_delete is not None
+    assert len(client.archived_before_delete) == 1
+
+
+def test_run_post_loop_session_prune_noop_when_no_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """No sessions created (or all filtered away) means no broker round
+    trip and no summary line."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+
+    trioctl._run_post_loop_session_prune(mailbox, None, [])
+
+    assert capsys.readouterr().out == ""
+
+
+def test_record_created_session_id_appends_when_env_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trioctl = load_trioctl()
+    ids_path = tmp_path / "run.ids"
+    monkeypatch.setenv(trioctl.SESSION_IDS_ENV_VAR, str(ids_path))
+
+    trioctl._record_created_session_id("s1")
+    trioctl._record_created_session_id("s2")
+
+    assert trioctl._read_session_ids_file(ids_path) == ["s1", "s2"]
+
+
+def test_record_created_session_id_noop_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trioctl = load_trioctl()
+    monkeypatch.delenv(trioctl.SESSION_IDS_ENV_VAR, raising=False)
+
+    trioctl._record_created_session_id("s1")  # must not raise
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_command_run_env_set_but_no_session_id_appends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`command_run` drives `cursor-agent` directly and never opens a
+    broker session, so even with the env var set there is nothing to
+    append -- the ids file is left untouched (absent)."""
+    trioctl = load_trioctl()
+    ids_path = tmp_path / "run.ids"
+    monkeypatch.setenv(trioctl.SESSION_IDS_ENV_VAR, str(ids_path))
+    monkeypatch.setattr(
+        trioctl, "run_cursor_worker", lambda *a, **k: "OK"
+    )
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("do the thing")
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "run",
+            "builder",
+            "--config",
+            str(trioctl.DEFAULT_CONFIG),
+            "--prompt-file",
+            str(prompt_file),
+            "--workspace",
+            str(tmp_path),
+        ]
+    )
+
+    assert trioctl.command_run(args) == 0
+    assert not ids_path.exists()
+
+
 def test_command_sessions_prune_cli_wiring_and_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -180,6 +181,7 @@ def test_one_headless_iteration_ships_without_cursor_agent(
         "lead": "session-1",
         "evaluator": "session-2",
     }
+    assert runner.created_session_ids == ["session-1", "session-2"]
     assert len(broker.prompts) == 2
     for prompt in broker.prompts:
         assert str(mailbox.resolve()) in prompt
@@ -189,6 +191,30 @@ def test_one_headless_iteration_ships_without_cursor_agent(
     assert broker.statuses_seen == ["idle", "running", "idle"] * 2
     assert cursor_calls == []
     assert "status: shipped" in (mailbox / "STATE.md").read_text()
+
+
+def test_create_wait_read_records_session_id_in_memory_and_ids_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`OmnigentRunner` is one of the "both" writers of the run-scoped ids
+    file: with `TRIO_MAILBOX_SESSION_IDS` set, every session it creates is
+    appended there too, not just tracked in-memory."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    ids_path = tmp_path / "run-123.ids"
+    monkeypatch.setenv(trioctl.SESSION_IDS_ENV_VAR, str(ids_path))
+    broker = FakeBrokerClient(mailbox)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path, broker_client=broker, config=profile(), interval=0
+    )
+
+    runner._create_wait_read(
+        broker, "lead-agent", "lead-model", "prompt", "title", "lead"
+    )
+
+    assert runner.created_session_ids == ["session-1"]
+    assert runner.session_ids == {"lead": "session-1"}
+    assert trioctl._read_session_ids_file(ids_path) == ["session-1"]
 
 
 def test_repair_prompt_adds_verdict_scope_and_repair_log_format(
@@ -575,22 +601,27 @@ def test_loop_wait_timeout_is_parsed_and_threaded(
     assert captured["timeout"] == 17.0
 
 
-def test_loop_prune_sessions_flag_runs_after_exit_including_nonzero(
+def test_loop_default_prunes_runners_sessions_after_exit_including_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`--prune-sessions` must clean up after the loop returns regardless
-    of its exit code, and must never run when the flag is absent."""
+    """Cleanup is default-on: it must run after the loop returns regardless
+    of exit code, passing the union of the runner's in-memory ids and the
+    run's ids file to `_run_post_loop_session_prune`."""
     trioctl = load_trioctl()
-    prune_calls: list[tuple[Path, object]] = []
+    prune_calls: list[tuple[object, object, object]] = []
 
     class CapturingRunner:
         def __init__(self, **kwargs: object) -> None:
-            pass
+            self.created_session_ids: list[str] = ["s-lead"]
 
     class FailingLoop:
         @staticmethod
-        def run_loop(*args: object, **kwargs: object) -> int:
+        def run_loop(mailbox, max_iterations, runner, *, repo):
+            # Simulate a headless `trioctl omnigent run` worker recording
+            # its own session id through the env var `command_loop` set.
+            ids_path = os.environ[trioctl.SESSION_IDS_ENV_VAR]
+            trioctl._append_session_id_to_file(Path(ids_path), "s-worker")
             return 5  # e.g. NEEDS_HUMAN/locked
 
     monkeypatch.chdir(tmp_path)
@@ -599,27 +630,25 @@ def test_loop_prune_sessions_flag_runs_after_exit_including_nonzero(
     monkeypatch.setattr(
         trioctl,
         "_run_post_loop_session_prune",
-        lambda mailbox, base_url: prune_calls.append((mailbox, base_url)),
+        lambda mailbox, base_url, session_ids: prune_calls.append(
+            (mailbox, base_url, sorted(session_ids))
+        ),
     )
     args = trioctl.parser().parse_args(
-        [
-            "omnigent",
-            "loop",
-            "--mailbox",
-            "mailbox",
-            "--max-iterations",
-            "1",
-            "--prune-sessions",
-        ]
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
     )
 
     result = args.func(args)
 
     assert result == 5  # the loop's own exit code is preserved
-    assert prune_calls == [((tmp_path / "mailbox").resolve(), args.base_url)]
+    assert prune_calls == [
+        ((tmp_path / "mailbox").resolve(), args.base_url, ["s-lead", "s-worker"])
+    ]
+    # the run-scoped ids file is removed once cleanup has read it
+    assert list((tmp_path / "mailbox" / ".sessions").glob("run-*.ids")) == []
 
 
-def test_loop_without_prune_sessions_flag_never_prunes(
+def test_loop_keep_sessions_flag_never_prunes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -628,7 +657,7 @@ def test_loop_without_prune_sessions_flag_never_prunes(
 
     class CapturingRunner:
         def __init__(self, **kwargs: object) -> None:
-            pass
+            self.created_session_ids: list[str] = ["s-lead"]
 
     class FakeLoop:
         @staticmethod
@@ -644,8 +673,69 @@ def test_loop_without_prune_sessions_flag_never_prunes(
         lambda *a, **k: prune_calls.append((a, k)),
     )
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+        [
+            "omnigent",
+            "loop",
+            "--mailbox",
+            "mailbox",
+            "--max-iterations",
+            "1",
+            "--keep-sessions",
+        ]
     )
 
     assert args.func(args) == 0
     assert prune_calls == []
+
+
+def test_loop_default_prune_deletes_only_this_runs_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through the real `_run_post_loop_session_prune`: a
+    session left behind by an earlier run -- even one matching this
+    mailbox's title prefix -- must survive; only this run's id is
+    deleted."""
+    trioctl = load_trioctl()
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-new"]
+
+    class FailingLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            return 5
+
+    class FakePruneClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.deleted: list[str] = []
+
+        def list_sessions(self):
+            return {"data": self.rows}
+
+        def get_items(self, session_id, limit=100, order="asc"):
+            return {"items": []}
+
+        def delete_session(self, session_id):
+            self.deleted.append(session_id)
+            return {"deleted": True}
+
+    client = FakePruneClient(
+        [
+            {"id": "s-old", "title": "trioctl mailbox iteration 1 lead", "status": "idle"},
+            {"id": "s-new", "title": "trioctl mailbox iteration 2 lead", "status": "idle"},
+        ]
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: FailingLoop)
+    monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    assert args.func(args) == 5
+    assert client.deleted == ["s-new"]
