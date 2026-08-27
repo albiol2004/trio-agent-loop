@@ -273,7 +273,7 @@ metrics/                            # cross-harness loop analytics
   trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
                                   #   normalization across template generations
   trio-check.py                   # MAILBOX-SCHEMA v1 checker; --version prints trio-check <version>
-  trio-shadow.py                  # shadow checker, declared-vs-actual slice writes
+  trio-shadow.py                  # shadow checker, declared-vs-actual slice writes; --version prints trio-shadow <version>
   trio_loop.py                    # mechanical loop driver: gates, verdict,
                                   #   repair, resume
 dashboard/                          # web dashboard: loops, registry management (stdlib-only server)
