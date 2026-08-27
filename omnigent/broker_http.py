@@ -417,8 +417,18 @@ class BrokerClient:
         session_id: str,
         limit: int = 100,
         order: str = "asc",
+        offset: int = 0,
     ) -> Any:
-        """Fetch committed session items in the requested order."""
-        query = urlencode({"limit": limit, "order": order})
+        """Fetch committed session items in the requested order.
+
+        ``offset`` is omitted from the query when zero, so every existing
+        (unpaged) caller sends the exact same request it always has;
+        paged callers (see trioctl's session-archive prune) pass it
+        explicitly to walk past a broker's per-request ``limit`` cap.
+        """
+        params: dict[str, Any] = {"limit": limit, "order": order}
+        if offset:
+            params["offset"] = offset
+        query = urlencode(params)
         path = f"/v1/sessions/{quote(session_id, safe='')}/items?{query}"
         return self._request("GET", path)

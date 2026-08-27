@@ -310,6 +310,71 @@ def _first_verdict(path: Path) -> tuple[str | None, str | None]:
         return None, None
     return word, scope.lower() if scope else None
 
+def _slice_verdict_blocks(text: str) -> list[dict]:
+    """Like parse_slice_verdicts but keeps each section's exact text (the
+    heading line through the line before the next heading, or EOF), so a
+    clobbered section can be re-appended byte-for-byte."""
+    if not text:
+        return []
+    lines = text.splitlines(keepends=True)
+    headings: list[tuple[int, str, str, str]] = []
+    for index, raw in enumerate(lines):
+        match = _METRICS.SLICE_VERDICT_RE.match(raw.strip())
+        if match:
+            headings.append((index, match.group(1), match.group(2), match.group(3)))
+    blocks = []
+    for position, (start, slice_id, sha, verdict) in enumerate(headings):
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        blocks.append({
+            "slice": slice_id,
+            "sha": sha,
+            "verdict": verdict,
+            "text": "".join(lines[start:end]),
+        })
+    return blocks
+
+def _restore_clobbered_verdict_sections(
+    mailbox: Path, verdict_path: Path, snapshot_text: str, kind: str, iteration: int
+) -> None:
+    """Guard against an Evaluator session rewriting VERDICT.md whole instead
+    of appending: if any ``## slice ... — SHIP|ITERATE`` section present
+    before the runner ran is missing afterwards, restore it.
+
+    Never drops anything the runner just wrote. When the new text still
+    opens with an overall ``VERDICT: ...`` line, that whole new text is
+    kept verbatim and the missing old sections are appended after it;
+    otherwise (plain per-slice appends, no overall verdict line) the
+    rebuild is the new text's own sections followed by the missing old
+    ones, both in their original relative order.
+    """
+    new_text = (
+        verdict_path.read_text(encoding="utf-8", errors="replace")
+        if verdict_path.is_file()
+        else ""
+    )
+    old_blocks = _slice_verdict_blocks(snapshot_text)
+    if not old_blocks:
+        return
+    new_blocks = _slice_verdict_blocks(new_text)
+    new_keys = {(b["slice"], b["sha"]) for b in new_blocks}
+    missing = [b for b in old_blocks if (b["slice"], b["sha"]) not in new_keys]
+    if not missing:
+        return
+    first_line = next((line.strip() for line in new_text.splitlines() if line.strip()), "")
+    if VERDICT_RE.match(first_line):
+        base = new_text
+        if base and not base.endswith("\n"):
+            base += "\n"
+    else:
+        base = "".join(b["text"] for b in new_blocks)
+    rebuilt = base + "".join(b["text"] for b in missing)
+    verdict_path.write_text(rebuilt, encoding="utf-8")
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | open-loop: restored {len(missing)} "
+        f"clobbered per-slice section(s) in VERDICT.md after {kind}",
+    )
+
 def _apply_verdict(
     mailbox, state_path, repair_path, iteration, verdict, scope
 ) -> int | None:
@@ -818,6 +883,11 @@ def run_open_loop(
                     "sha": sha,
                     "kind": "slice-eval",
                 }
+                verdict_snapshot = (
+                    verdict_path.read_text(encoding="utf-8", errors="replace")
+                    if verdict_path.is_file()
+                    else ""
+                )
                 result = _invoke_runner(
                     eval_runner, "evaluator", current_iteration(), mailbox, context
                 )
@@ -825,6 +895,10 @@ def run_open_loop(
                     raise RuntimeError(
                         f"evaluator runner failed with exit {result}"
                     )
+                _restore_clobbered_verdict_sections(
+                    mailbox, verdict_path, verdict_snapshot, "slice-eval",
+                    current_iteration(),
+                )
                 graded.add(key)
 
             lead_alive = not lead_result.get("finished", False)
@@ -881,6 +955,11 @@ def run_open_loop(
                         "sha": None,
                         "kind": "integration-eval",
                     }
+                    verdict_snapshot = (
+                        verdict_path.read_text(encoding="utf-8", errors="replace")
+                        if verdict_path.is_file()
+                        else ""
+                    )
                     result = _invoke_runner(
                         eval_runner, "evaluator", iteration_now, mailbox, context
                     )
@@ -888,6 +967,10 @@ def run_open_loop(
                         raise RuntimeError(
                             f"evaluator runner failed with exit {result}"
                         )
+                    _restore_clobbered_verdict_sections(
+                        mailbox, verdict_path, verdict_snapshot, "integration-eval",
+                        iteration_now,
+                    )
                     verdict, scope = _first_verdict(verdict_path)
                     if verdict is None:
                         _update_state(state_path, {"status": "error"})

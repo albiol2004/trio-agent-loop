@@ -1136,7 +1136,7 @@ class _FakeSessionsClient:
     def list_sessions(self):
         return {"data": self.rows}
 
-    def get_items(self, session_id, limit=100, order="asc"):
+    def get_items(self, session_id, limit=100, order="asc", offset=0):
         self.calls.append(("items", session_id))
         return {"items": [{"role": "assistant", "content": f"hi from {session_id}"}]}
 
@@ -1177,6 +1177,7 @@ def test_prune_selects_only_matching_titles(tmp_path: Path):
         "deleted": 1,
         "skipped_running": 0,
         "skipped_failed": 0,
+        "failed": 0,
     }
     assert client.deleted == ["s1"]
     archived = list((mailbox / ".sessions").glob("*.jsonl"))
@@ -1231,6 +1232,7 @@ def test_prune_dry_run_deletes_nothing(tmp_path: Path):
         "deleted": 0,
         "skipped_running": 0,
         "skipped_failed": 0,
+        "failed": 0,
     }
     assert client.calls == []
     assert client.deleted == []
@@ -1305,6 +1307,7 @@ def test_prune_id_scoped_selects_only_listed_ids(tmp_path: Path):
         "deleted": 1,
         "skipped_running": 0,
         "skipped_failed": 0,
+        "failed": 0,
     }
     assert client.deleted == ["s-new"]
 
@@ -1335,6 +1338,113 @@ def test_prune_id_scoped_archives_before_deleting(tmp_path: Path):
     assert client.calls == [("items", "s-new"), ("delete", "s-new")]
     assert client.archived_before_delete is not None
     assert len(client.archived_before_delete) == 1
+
+
+def _make_paging_sessions_client(broker_http_module):
+    """Build the offline double whose broker rejects `limit` over 1000
+    with HTTP 422 and serves items in pages, bound to one trioctl load's
+    ``broker_http`` module so the raised error type matches what the code
+    under test catches."""
+
+    class _PagingSessionsClient:
+        def __init__(self, rows, items_by_session):
+            self.rows = rows
+            self.items_by_session = items_by_session
+            self.item_calls: list[tuple[str, int, int]] = []
+            self.deleted: list[str] = []
+
+        def list_sessions(self):
+            return {"data": self.rows}
+
+        def get_items(self, session_id, limit=100, order="asc", offset=0):
+            if limit > 1000:
+                raise broker_http_module.BrokerHttpError(
+                    f"GET .../items?limit={limit} failed with HTTP 422: "
+                    "limit must be <= 1000",
+                    status_code=422,
+                )
+            self.item_calls.append((session_id, limit, offset))
+            all_items = self.items_by_session.get(session_id, [])
+            page = all_items[offset : offset + limit]
+            return {"items": page}
+
+        def delete_session(self, session_id):
+            self.deleted.append(session_id)
+            return {"deleted": True}
+
+    return _PagingSessionsClient
+
+
+def test_prune_pages_archive_reads_past_the_1000_item_broker_cap(tmp_path: Path):
+    """2500 items must come back as three 1000/1000/500 pages, not one
+    limit=2500 request the broker would reject with HTTP 422."""
+    trioctl = load_trioctl()
+    _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s1", "trioctl mbx iteration 1 lead")]
+    items = [{"id": f"item-{i}", "role": "assistant"} for i in range(2500)]
+    client = _PagingSessionsClient(rows, {"s1": items})
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert counts == {
+        "archived": 1,
+        "deleted": 1,
+        "skipped_running": 0,
+        "skipped_failed": 0,
+        "failed": 0,
+    }
+    assert client.item_calls == [
+        ("s1", 1000, 0),
+        ("s1", 1000, 1000),
+        ("s1", 1000, 2000),
+    ]
+    archived = list((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 1
+    lines = archived[0].read_text(encoding="utf-8").splitlines()
+    # One header line (the session row) plus every archived item.
+    assert len(lines) == 1 + 2500
+    assert json.loads(lines[1])["id"] == "item-0"
+    assert json.loads(lines[-1])["id"] == "item-2499"
+
+
+def test_prune_one_failing_session_read_does_not_abort_the_others(tmp_path: Path):
+    """A session whose item read errors out must not stop the run: other
+    sessions still get archived and deleted, and the failing one is
+    archived with whatever was read (nothing, here) but never deleted."""
+    trioctl = load_trioctl()
+    _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
+
+    class _OneFailsClient(_PagingSessionsClient):
+        def get_items(self, session_id, limit=100, order="asc", offset=0):
+            if session_id == "s-bad":
+                raise trioctl.broker_http.BrokerHttpError(
+                    "GET .../items failed with HTTP 500", status_code=500
+                )
+            return super().get_items(
+                session_id, limit=limit, order=order, offset=offset
+            )
+
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s-bad", "trioctl mbx iteration 1 lead"),
+        _row("s-good", "trioctl mbx iteration 2 lead"),
+    ]
+    items = {"s-good": [{"id": "item-0", "role": "assistant"}]}
+    client = _OneFailsClient(rows, items)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert counts["failed"] == 1
+    assert counts["archived"] == 1
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s-good"]
+    # The failing session is still archived (empty transcript) but never
+    # reaches delete_session.
+    archived = sorted((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 2
 
 
 def test_run_post_loop_session_prune_noop_when_no_ids(

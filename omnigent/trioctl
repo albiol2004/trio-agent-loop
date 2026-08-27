@@ -889,7 +889,11 @@ def command_session_read(args: argparse.Namespace) -> int:
 # the Omnigent UI history. Mailbox files record the outcome but not the
 # role's reasoning, so pruning archives the full transcript before it
 # deletes the broker session.
-SESSION_ARCHIVE_ITEM_LIMIT = 10000
+#
+# The broker rejects GET .../items?limit=<n> above 1000 with HTTP 422, so
+# a transcript longer than that must be paged: SESSION_ARCHIVE_PAGE_LIMIT
+# per request, advancing by `offset` until a page comes back short.
+SESSION_ARCHIVE_PAGE_LIMIT = 1000
 
 # A `trioctl omnigent loop` process exports this before running the loop,
 # pointing at `<mailbox>/.sessions/run-<pid>.ids` -- a run-scoped, one-id-
@@ -952,6 +956,38 @@ def _session_archive_filename(row: dict[str, Any]) -> str:
     )
 
 
+def _fetch_session_items_paged(
+    client: Any, session_id: str
+) -> tuple[list[Any], Any]:
+    """Page a session's full item history at SESSION_ARCHIVE_PAGE_LIMIT per
+    request (the broker rejects a larger ``limit`` with HTTP 422),
+    advancing by ``offset`` until a page returns fewer items than the page
+    limit (or none).
+
+    Returns ``(items, error)``: whatever items were read successfully,
+    plus the ``BrokerHttpError`` that stopped the read early, or ``None``
+    on a clean full read. A mid-transcript failure still yields whatever
+    was read before it, instead of losing everything.
+    """
+    items: list[Any] = []
+    offset = 0
+    while True:
+        try:
+            payload = client.get_items(
+                session_id,
+                limit=SESSION_ARCHIVE_PAGE_LIMIT,
+                order="asc",
+                offset=offset,
+            )
+        except broker_http.BrokerHttpError as exc:
+            return items, exc
+        page = _session_items(payload)
+        items.extend(page)
+        if len(page) < SESSION_ARCHIVE_PAGE_LIMIT:
+            return items, None
+        offset += SESSION_ARCHIVE_PAGE_LIMIT
+
+
 def _prune_broker_sessions(
     client: Any,
     mailbox: Path,
@@ -1006,6 +1042,7 @@ def _prune_broker_sessions(
         "deleted": 0,
         "skipped_running": 0,
         "skipped_failed": 0,
+        "failed": 0,
     }
     sessions_dir = mailbox / ".sessions"
     for row in rows:
@@ -1027,19 +1064,25 @@ def _prune_broker_sessions(
         if dry_run:
             print(f"trioctl: dry-run would archive and delete: {session_id} {title}")
             continue
-        try:
-            items_payload = client.get_items(
-                session_id, limit=SESSION_ARCHIVE_ITEM_LIMIT, order="asc"
-            )
-        except broker_http.BrokerHttpError as exc:
-            raise TrioctlError(str(exc)) from exc
-        items = _session_items(items_payload)
+        items, read_error = _fetch_session_items_paged(client, session_id)
         sessions_dir.mkdir(parents=True, exist_ok=True)
         archive_path = sessions_dir / _session_archive_filename(row)
         with archive_path.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
             for item in items:
                 handle.write(json.dumps(item, sort_keys=True) + "\n")
+        if read_error is not None:
+            # One session's unreadable transcript must never abort the
+            # whole prune run: archive whatever was read before the
+            # failure, log it, and leave this session undeleted -- only a
+            # fully-archived session is safe to delete.
+            counts["failed"] += 1
+            print(
+                f"trioctl: failed to fully read items for {session_id} "
+                f"{title}: {read_error} ({len(items)} item(s) saved to "
+                f"{archive_path}; session kept, not deleted)"
+            )
+            continue
         counts["archived"] += 1
         delete_session = getattr(client, "delete_session", None)
         if delete_session is None:
@@ -1074,7 +1117,8 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
     )
     print(
         f"trioctl: archived {counts['archived']}, deleted {counts['deleted']}, "
-        f"skipped running {counts['skipped_running']}"
+        f"skipped running {counts['skipped_running']}, "
+        f"failed {counts['failed']}"
     )
     return 0
 
@@ -1105,7 +1149,8 @@ def _run_post_loop_session_prune(
     print(
         "trioctl: session prune archived "
         f"{counts['archived']}, deleted {counts['deleted']}, "
-        f"skipped running {counts['skipped_running']}"
+        f"skipped running {counts['skipped_running']}, "
+        f"failed {counts['failed']}"
     )
 
 
@@ -1156,6 +1201,8 @@ _OPEN_LOOP_SLICE_EVAL_PROCEDURE = (
     "3. Append to VERDICT.md a section headed exactly\n"
     "   `## slice {slice} @{sha} — SHIP` or\n"
     "   `## slice {slice} @{sha} — ITERATE`, with per-accepts evidence.\n"
+    "   Do NOT rewrite or truncate VERDICT.md; open it in append mode\n"
+    "   (`>>`) — existing sections must survive byte-for-byte.\n"
     "   That section body must never contain a line starting with\n"
     "   `VERDICT:` — that token is reserved for the integration verdict.\n"
     "4. SHIP → append the section, record only, append no fault. ITERATE →\n"

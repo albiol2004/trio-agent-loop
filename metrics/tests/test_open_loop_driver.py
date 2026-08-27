@@ -299,6 +299,106 @@ def test_c1_happy_path_ships_after_a_fault_and_fix(tmp_path: Path) -> None:
     assert driver["eval_alive"] is False
 
 
+# --- VERDICT.md clobber guard -------------------------------------------
+
+
+def test_open_loop_restores_verdict_sections_clobbered_by_evaluator_rewrite(
+    tmp_path: Path,
+) -> None:
+    """Reproduces the real open-loop run's defect: an Evaluator session
+    rewrites VERDICT.md whole instead of appending, dropping earlier
+    per-slice sections -- once for a slice-eval, again for the
+    integration-eval. The driver must restore every section that went
+    missing, in both cases, and log one restore line per occurrence."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_TWO_SLICES)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha_a = fake_sha("alpha-clobber")
+    sha_b = fake_sha("beta-clobber")
+
+    lead = ScriptedLeadRunner([
+        lambda mb: (queue.retire("alpha", sha_a), queue.retire("beta", sha_b)),
+    ])
+
+    def eval_alpha(mb):
+        verdict.append_slice_section("alpha", sha_a, "SHIP")
+
+    def eval_beta_clobbers(mb):
+        # Rewrites the whole file with only its own new section, dropping
+        # alpha's section that was already there -- the observed bug.
+        (mailbox / "VERDICT.md").write_text(
+            f"## slice beta @{sha_b} -- SHIP\n", encoding="utf-8"
+        )
+
+    def integration_clobbers(mb):
+        # Rewrites the whole file again, dropping every per-slice section.
+        (mailbox / "VERDICT.md").write_text("VERDICT: SHIP\n", encoding="utf-8")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={
+            ("alpha", sha_a): eval_alpha,
+            ("beta", sha_b): eval_beta_clobbers,
+        },
+        integration_actions=[integration_clobbers],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    verdict_text = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert verdict_text.splitlines()[0] == "VERDICT: SHIP"
+    assert re.search(
+        rf"^## slice alpha @{sha_a} -- SHIP$", verdict_text, re.MULTILINE
+    )
+    assert re.search(
+        rf"^## slice beta @{sha_b} -- SHIP$", verdict_text, re.MULTILINE
+    )
+
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert (
+        "open-loop: restored 1 clobbered per-slice section(s) in "
+        "VERDICT.md after slice-eval" in log_text
+    )
+    assert (
+        "open-loop: restored 2 clobbered per-slice section(s) in "
+        "VERDICT.md after integration-eval" in log_text
+    )
+
+
+def test_open_loop_leaves_verdict_untouched_when_evaluator_appends_correctly(
+    tmp_path: Path,
+) -> None:
+    """No clobber, no rewrite: the restore guard must be a no-op (the file
+    ends up byte-identical to what plain appends would have produced)."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-clean")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    def eval_solo(mb):
+        verdict.append_slice_section("solo", sha1, "SHIP")
+
+    def integration_ship(mb):
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo},
+        integration_actions=[integration_ship],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    verdict_text = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert verdict_text == f"VERDICT: SHIP\n## slice solo @{sha1} -- SHIP\n"
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "restored" not in log_text
+
+
 # --- ITERATE wakes the Lead ---------------------------------------------
 
 

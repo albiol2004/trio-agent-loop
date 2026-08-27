@@ -847,7 +847,7 @@ def test_loop_default_prune_deletes_only_this_runs_sessions(
         def list_sessions(self):
             return {"data": self.rows}
 
-        def get_items(self, session_id, limit=100, order="asc"):
+        def get_items(self, session_id, limit=100, order="asc", offset=0):
             return {"items": []}
 
         def delete_session(self, session_id):
