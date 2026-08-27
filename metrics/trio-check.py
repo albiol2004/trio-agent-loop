@@ -29,6 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+TRIO_CHECK_VERSION = "1.0.0"
+
 REQUIRED_FILES = (
     "GOAL.md",
     "STATE.md",
@@ -430,6 +432,11 @@ def render(loops: list[dict], root: Path, summary: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check trio-agent-loop mailboxes against MAILBOX-SCHEMA.md.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"trio-check {TRIO_CHECK_VERSION}",
     )
     parser.add_argument(
         "path",
