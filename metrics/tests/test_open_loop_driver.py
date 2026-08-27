@@ -627,6 +627,222 @@ def test_gate_exit_one_blocks_termination_until_regraded(
     ]
 
 
+# --- output verification: a runner exit of 0 is not proof of a write ----
+
+
+class RetryScriptedEvalRunner:
+    """Like ScriptedEvalRunner, but slice_actions/integration_actions may
+    each script MULTIPLE actions for the same key/kind, consumed one per
+    call -- for testing the open-loop output-verification retry path
+    (a runner that returns 0 without writing anything, possibly more than
+    once in a row, e.g. a runner blip)."""
+
+    def __init__(self, slice_actions=None, integration_actions=None) -> None:
+        self.slice_actions = {
+            key: list(actions) for key, actions in (slice_actions or {}).items()
+        }
+        self.integration_actions = list(integration_actions or [])
+        self.calls: list[dict] = []
+
+    def run(self, role, iteration, mailbox, context=None):
+        assert role == "evaluator"
+        self.calls.append({"iteration": iteration, "context": dict(context)})
+        kind = context["kind"]
+        if kind == "slice-eval":
+            key = (context["slice"], context["sha"])
+            actions = self.slice_actions[key]
+            assert actions, f"slice-eval for {key} invoked more times than scripted"
+            actions.pop(0)(mailbox)
+        elif kind == "integration-eval":
+            assert self.integration_actions, (
+                "integration eval invoked more times than scripted"
+            )
+            self.integration_actions.pop(0)(mailbox)
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected kind {kind!r}")
+        return 0
+
+
+def test_slice_eval_no_write_retries_then_grades_and_ships(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-blip-once")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    evaluator = RetryScriptedEvalRunner(
+        slice_actions={
+            ("solo", sha1): [
+                lambda mb: None,  # exit 0, writes nothing -- a runner blip
+                lambda mb: verdict.append_slice_section("solo", sha1, "SHIP"),
+            ]
+        },
+        integration_actions=[
+            lambda mb: verdict.set_integration_verdict("VERDICT: SHIP")
+        ],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    slice_calls = [c for c in evaluator.calls if c["context"]["kind"] == "slice-eval"]
+    assert len(slice_calls) == 2
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert log_text.count(
+        f"open-loop: slice-eval for solo@{sha1} wrote no verdict section "
+        "(attempt 1)"
+    ) == 1
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: shipped" in state_text
+
+
+def test_slice_eval_never_writes_errors_after_three_attempts(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    sha1 = fake_sha("solo-blip-forever")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    evaluator = RetryScriptedEvalRunner(
+        slice_actions={
+            ("solo", sha1): [lambda mb: None, lambda mb: None, lambda mb: None]
+        },
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 3
+    slice_calls = [c for c in evaluator.calls if c["context"]["kind"] == "slice-eval"]
+    assert len(slice_calls) == 3
+    assert not any(c["context"]["kind"] == "integration-eval" for c in evaluator.calls)
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    for n in (1, 2, 3):
+        assert (
+            f"open-loop: slice-eval for solo@{sha1} wrote no verdict section "
+            f"(attempt {n})" in log_text
+        )
+    assert (
+        f"slice-eval for solo@{sha1} failed to write a verdict section "
+        "after 3 attempts" in log_text
+    )
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: error" in state_text
+
+
+def test_integration_eval_no_write_retries_then_ships(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-int-blip")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    evaluator = RetryScriptedEvalRunner(
+        slice_actions={
+            ("solo", sha1): [
+                lambda mb: verdict.append_slice_section("solo", sha1, "SHIP")
+            ]
+        },
+        integration_actions=[
+            lambda mb: None,  # exit 0, writes nothing -- a runner blip
+            lambda mb: verdict.set_integration_verdict("VERDICT: SHIP"),
+        ],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    integration_calls = [
+        c for c in evaluator.calls if c["context"]["kind"] == "integration-eval"
+    ]
+    assert len(integration_calls) == 2
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert log_text.count(
+        "open-loop: integration-eval wrote no verdict (attempt 1)"
+    ) == 1
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: shipped" in state_text
+
+
+def test_integration_eval_never_writes_errors_after_three_attempts(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-int-blip-forever")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    evaluator = RetryScriptedEvalRunner(
+        slice_actions={
+            ("solo", sha1): [
+                lambda mb: verdict.append_slice_section("solo", sha1, "SHIP")
+            ]
+        },
+        integration_actions=[lambda mb: None, lambda mb: None, lambda mb: None],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 3
+    integration_calls = [
+        c for c in evaluator.calls if c["context"]["kind"] == "integration-eval"
+    ]
+    assert len(integration_calls) == 3
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    for n in (1, 2, 3):
+        assert f"integration-eval wrote no verdict (attempt {n})" in log_text
+    assert (
+        "integration-eval failed to write a verdict after 3 attempts" in log_text
+    )
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: error" in state_text
+
+
+def test_integration_eval_malformed_verdict_errors_immediately(
+    tmp_path: Path,
+) -> None:
+    """A real (if malformed) VERDICT: line is a genuine unparseable-verdict
+    error -- unlike a blip that writes nothing, it must NOT be retried."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-int-banana")
+
+    lead = ScriptedLeadRunner([lambda mb: queue.retire("solo", sha1)])
+
+    evaluator = RetryScriptedEvalRunner(
+        slice_actions={
+            ("solo", sha1): [
+                lambda mb: verdict.append_slice_section("solo", sha1, "SHIP")
+            ]
+        },
+        integration_actions=[
+            lambda mb: verdict.set_integration_verdict("VERDICT: BANANA")
+        ],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 3
+    integration_calls = [
+        c for c in evaluator.calls if c["context"]["kind"] == "integration-eval"
+    ]
+    assert len(integration_calls) == 1
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "unparseable integration verdict" in log_text
+    assert "wrote no verdict" not in log_text
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: error" in state_text
+
+
 # --- max_iterations cap -> exit 4 ---------------------------------------
 
 

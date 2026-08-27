@@ -310,6 +310,19 @@ def _first_verdict(path: Path) -> tuple[str | None, str | None]:
         return None, None
     return word, scope.lower() if scope else None
 
+def _has_verdict_line(path: Path) -> bool:
+    """True when VERDICT.md's first non-empty line matches ``VERDICT: ...``
+    at all (regardless of whether the word is known) -- used to tell "the
+    runner wrote nothing" (retryable) apart from "the runner wrote a real,
+    malformed verdict" (a genuine unparseable-verdict error), per
+    open-loop's integration-eval output-verification rule."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    first = next((line.strip() for line in lines if line.strip()), "")
+    return bool(VERDICT_RE.match(first))
+
 def _slice_verdict_blocks(text: str) -> list[dict]:
     """Like parse_slice_verdicts but keeps each section's exact text (the
     heading line through the line before the next heading, or EOF), so a
@@ -827,6 +840,13 @@ def run_open_loop(
         # blocking the integration-eval termination check below even
         # though QUEUE.md already shows it as retired.
         gate_blocked: set[tuple[str, str]] = set()
+        # (slice_id, sha) -> number of slice-eval attempts made so far that
+        # returned exit 0 but did not (yet) leave a `## slice ... — SHIP|
+        # ITERATE` section on disk. A key here (not yet graded, not yet
+        # failed out) blocks the integration-eval termination check below,
+        # same as gate_blocked -- see open-loop output verification.
+        slice_eval_attempts: dict[tuple[str, str], int] = {}
+        eval_pending: set[tuple[str, str]] = set()
 
         while True:
             lead_alive = not lead_result.get("finished", False)
@@ -899,7 +919,45 @@ def run_open_loop(
                     mailbox, verdict_path, verdict_snapshot, "slice-eval",
                     current_iteration(),
                 )
-                graded.add(key)
+                # Verify against VERDICT.md on disk -- a runner exit of 0 is
+                # not proof the role did its job (a blip session can return
+                # 0 having written nothing).
+                verdict_text_after = (
+                    verdict_path.read_text(encoding="utf-8", errors="replace")
+                    if verdict_path.is_file()
+                    else ""
+                )
+                wrote_section = any(
+                    v["slice"] == slice_id and sha.startswith(v["sha"])
+                    for v in _METRICS.parse_slice_verdicts(verdict_text_after)
+                )
+                if wrote_section:
+                    graded.add(key)
+                    gate_blocked.discard(key)
+                    eval_pending.discard(key)
+                    slice_eval_attempts.pop(key, None)
+                    continue
+                attempts = slice_eval_attempts.get(key, 0) + 1
+                slice_eval_attempts[key] = attempts
+                _append_log(
+                    mailbox,
+                    f"- iter {current_iteration()} | loop | open-loop: "
+                    f"slice-eval for {slice_id}@{sha} wrote no verdict "
+                    f"section (attempt {attempts})",
+                )
+                if attempts >= 3:
+                    stop_event.set()
+                    wake_event.set()
+                    lead_thread.join(timeout=5)
+                    _update_state(state_path, {"status": "error"})
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | open-loop: "
+                        f"slice-eval for {slice_id}@{sha} failed to write a "
+                        f"verdict section after {attempts} attempts",
+                    )
+                    return finish(3)
+                eval_pending.add(key)
 
             lead_alive = not lead_result.get("finished", False)
             if not lead_alive:
@@ -929,16 +987,26 @@ def run_open_loop(
                     for sid in (slice_ids or [])
                     if sid in latest_for_gate
                 )
+                # A slice whose slice-eval returned 0 without (yet) leaving
+                # a verdict section must also keep blocking the integration
+                # check -- membership in `graded` is not proof either; see
+                # open-loop output verification.
+                any_eval_pending = any(
+                    (sid, latest_for_gate[sid]["sha"]) in eval_pending
+                    for sid in (slice_ids or [])
+                    if sid in latest_for_gate
+                )
                 fully_retired = _slices_fully_retired(
                     slice_ids, retired_ids, open_or_taken
                 )
-                if fully_retired and any_gate_blocked:
+                if fully_retired and (any_gate_blocked or any_eval_pending):
                     # Every declared slice has a retired entry, but at
                     # least one is still waiting on its commit gate
-                    # (missing commits, presumably transient) -- there is
-                    # nothing new for the Lead to do, so just wait for the
-                    # next poll and re-check the gate then, instead of
-                    # spinning the Lead thread up and down.
+                    # (missing commits, presumably transient) or a verified
+                    # slice-eval verdict section -- there is nothing new
+                    # for the Lead to do, so just wait for the next poll
+                    # and re-check then, instead of spinning the Lead
+                    # thread up and down.
                     wake_event.wait(
                         timeout=poll_seconds if poll_seconds > 0 else 0.01
                     )
@@ -955,22 +1023,52 @@ def run_open_loop(
                         "sha": None,
                         "kind": "integration-eval",
                     }
-                    verdict_snapshot = (
-                        verdict_path.read_text(encoding="utf-8", errors="replace")
-                        if verdict_path.is_file()
-                        else ""
-                    )
-                    result = _invoke_runner(
-                        eval_runner, "evaluator", iteration_now, mailbox, context
-                    )
-                    if result != 0:
-                        raise RuntimeError(
-                            f"evaluator runner failed with exit {result}"
+                    integration_attempts = 0
+                    while True:
+                        verdict_snapshot = (
+                            verdict_path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            if verdict_path.is_file()
+                            else ""
                         )
-                    _restore_clobbered_verdict_sections(
-                        mailbox, verdict_path, verdict_snapshot, "integration-eval",
-                        iteration_now,
-                    )
+                        result = _invoke_runner(
+                            eval_runner, "evaluator", iteration_now, mailbox,
+                            context,
+                        )
+                        if result != 0:
+                            raise RuntimeError(
+                                f"evaluator runner failed with exit {result}"
+                            )
+                        _restore_clobbered_verdict_sections(
+                            mailbox, verdict_path, verdict_snapshot,
+                            "integration-eval", iteration_now,
+                        )
+                        # A runner exit of 0 is not proof the role wrote a
+                        # verdict -- a blip session can return 0 having
+                        # written nothing to VERDICT.md. Only a real
+                        # `VERDICT: ...` line (however malformed) is a
+                        # genuine unparseable-verdict error; no line at all
+                        # is retried.
+                        if _has_verdict_line(verdict_path):
+                            break
+                        integration_attempts += 1
+                        _append_log(
+                            mailbox,
+                            f"- iter {iteration_now} | loop | open-loop: "
+                            "integration-eval wrote no verdict "
+                            f"(attempt {integration_attempts})",
+                        )
+                        if integration_attempts >= 3:
+                            _update_state(state_path, {"status": "error"})
+                            _append_log(
+                                mailbox,
+                                f"- iter {iteration_now} | loop | "
+                                "open-loop: integration-eval failed to "
+                                "write a verdict after "
+                                f"{integration_attempts} attempts",
+                            )
+                            return finish(3)
                     verdict, scope = _first_verdict(verdict_path)
                     if verdict is None:
                         _update_state(state_path, {"status": "error"})
