@@ -296,7 +296,11 @@ kimi/                                # Kimi Code skills, prompts, and runner
   smoke-test.sh
 ```
 `trioctl omnigent loop` uses `metrics/trio_loop.py` with fresh Omnigent Lead and Evaluator
-sessions. Wait semantics: session `wait` defaults to 3600 seconds and completes
+sessions; running it in a project other than this template requires that
+project's own working tree to carry a `metrics/` directory (`install.sh
+--omnigent` installs `trioctl` itself but does not copy `metrics/`, by design —
+it is product code the target project owns, not part of the Omnigent bundle).
+Wait semantics: session `wait` defaults to 3600 seconds and completes
 on a `running` to `idle` edge (dwell ignores bind flicker), a completed assistant message,
 or timeout; exit 0 (SHIP), 2 (BLOCKED), 3 (bad verdict), 4 (iteration cap), 5
 (NEEDS_HUMAN or locked). `trioctl omnigent session create|wait|read`

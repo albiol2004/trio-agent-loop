@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -1505,6 +1506,97 @@ def test_doctor_without_live_session_skips_session_api(
     assert args.func(args) == 0
     output = capsys.readouterr().out
     assert "omnigent:session-api" not in output
+
+
+def test_doctor_reports_resolved_prompt_directory(
+    tmp_path, monkeypatch, capsys
+):
+    """The doctor `prompts` check names the directory `_prompt_path`
+    actually resolved -- here the checked-in repo copy, since the test
+    process's cwd stays inside this repo."""
+    trioctl = load_trioctl()
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "_profile": trioctl.REGISTRY_PROFILE,
+                "trio-omnigent-lead": {},
+                "trio-omnigent-evaluator": {},
+            }
+        )
+    )
+    models = [
+        model("cursor-grok-4.6-medium"),
+        model("gpt-5.6-luna-max"),
+    ]
+    monkeypatch.setattr(trioctl, "load_config", lambda path: profile())
+    monkeypatch.setattr(trioctl.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(trioctl, "omnigent_contract", lambda: "ok")
+    monkeypatch.setattr(
+        trioctl,
+        "check_cursor_approval_mode",
+        lambda: {"check": "cursor:approval-mode", "ok": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(trioctl, "cursor_models", lambda timeout: models)
+    monkeypatch.setattr(trioctl, "omnigent_registry_path", lambda: registry)
+    args = trioctl.parser().parse_args(["omnigent", "doctor"])
+
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    expected_dir = (
+        Path(trioctl.__file__).resolve().parent.parent
+        / "omnigent" / "entrypoints" / "trio-omnigent" / "prompts"
+    )
+    assert f"PASS prompts: {expected_dir}" in output
+
+
+def test_doctor_prompts_check_fails_when_nothing_resolves(
+    tmp_path, monkeypatch, capsys
+):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("TRIO_OMNIGENT_PROMPTS", raising=False)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shutil.copy(SCRIPT, bin_dir / "trioctl")
+    shutil.copy(SCRIPT.with_name("broker_http.py"), bin_dir / "broker_http.py")
+    loader = importlib.machinery.SourceFileLoader(
+        "trioctl_installed", str(bin_dir / "trioctl")
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    trioctl = importlib.util.module_from_spec(spec)
+    loader.exec_module(trioctl)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "_profile": trioctl.REGISTRY_PROFILE,
+                "trio-omnigent-lead": {},
+                "trio-omnigent-evaluator": {},
+            }
+        )
+    )
+    monkeypatch.setattr(trioctl, "load_config", lambda path: profile())
+    monkeypatch.setattr(trioctl.shutil, "which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr(trioctl, "omnigent_contract", lambda: "ok")
+    monkeypatch.setattr(
+        trioctl,
+        "check_cursor_approval_mode",
+        lambda: {"check": "cursor:approval-mode", "ok": True, "detail": "ok"},
+    )
+    monkeypatch.setattr(trioctl, "omnigent_registry_path", lambda: registry)
+    args = trioctl.parser().parse_args(["omnigent", "doctor"])
+
+    assert args.func(args) == 1
+    output = capsys.readouterr().out
+    assert "FAIL prompts: missing Omnigent prompt: lead.md (tried:" in output
+    assert str(fake_home / ".claude" / "skills" / "trio-omnigent" / "prompts") in output
 
 
 def test_doctor_live_session_flag_is_parsed_without_running_it():

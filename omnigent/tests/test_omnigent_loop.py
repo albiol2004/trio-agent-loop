@@ -345,6 +345,138 @@ def test_title_unchanged_for_lockstep_and_no_context(tmp_path: Path) -> None:
     assert lockstep == expected
 
 
+def load_installed_trioctl(bin_dir: Path):
+    """Load trioctl as if `install.sh --omnigent` copied it to a bin dir with
+    no `omnigent/entrypoints/...` source tree beside it -- e.g.
+    `~/.local/bin/trioctl`, whose parent.parent (`~/.local`) never holds the
+    checked-in prompts. This isolates the source-root fallback candidate so
+    the env-var/skill-dir candidates can be exercised deterministically."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "trioctl"
+    shutil.copy(SCRIPT, script)
+    shutil.copy(SCRIPT.with_name("broker_http.py"), bin_dir / "broker_http.py")
+    loader = importlib.machinery.SourceFileLoader("trioctl_installed", str(script))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_prompt_path_prefers_repo_copy_over_skill_dirs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    trioctl = load_trioctl()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("TRIO_OMNIGENT_PROMPTS", raising=False)
+    repo = tmp_path / "repo"
+    prompts_dir = repo / "omnigent" / "entrypoints" / "trio-omnigent" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "lead.md").write_text("repo copy", encoding="utf-8")
+    skill_dir = fake_home / ".claude" / "skills" / "trio-omnigent" / "prompts"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "lead.md").write_text("skill copy", encoding="utf-8")
+    runner = trioctl.OmnigentRunner(repo=repo)
+
+    path = runner._prompt_path("lead")
+
+    assert path == prompts_dir / "lead.md"
+    assert path.read_text(encoding="utf-8") == "repo copy"
+
+
+def test_prompt_path_env_var_wins_over_skill_dirs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An installed trioctl with no source-tree prompts of its own and no
+    repo copy still prefers $TRIO_OMNIGENT_PROMPTS over the skill dirs."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    trioctl = load_installed_trioctl(tmp_path / "bin")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env_dir = tmp_path / "env-prompts"
+    env_dir.mkdir()
+    (env_dir / "lead.md").write_text("env copy", encoding="utf-8")
+    skill_dir = fake_home / ".claude" / "skills" / "trio-omnigent" / "prompts"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "lead.md").write_text("skill copy", encoding="utf-8")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPTS", str(env_dir))
+    runner = trioctl.OmnigentRunner(repo=repo)
+
+    path = runner._prompt_path("lead")
+
+    assert path == env_dir / "lead.md"
+
+
+def test_prompt_path_falls_back_to_claude_skill_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("TRIO_OMNIGENT_PROMPTS", raising=False)
+    trioctl = load_installed_trioctl(tmp_path / "bin")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    skill_dir = fake_home / ".claude" / "skills" / "trio-omnigent" / "prompts"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "evaluator.md").write_text("claude skill evaluator", encoding="utf-8")
+    runner = trioctl.OmnigentRunner(repo=repo)
+
+    path = runner._prompt_path("evaluator")
+
+    assert path == skill_dir / "evaluator.md"
+
+
+def test_prompt_path_falls_back_to_codex_skill_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("TRIO_OMNIGENT_PROMPTS", raising=False)
+    trioctl = load_installed_trioctl(tmp_path / "bin")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    skill_dir = fake_home / ".agents" / "skills" / "trio-omnigent" / "prompts"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "lead.md").write_text("codex skill lead", encoding="utf-8")
+    runner = trioctl.OmnigentRunner(repo=repo)
+
+    path = runner._prompt_path("lead")
+
+    assert path == skill_dir / "lead.md"
+
+
+def test_prompt_path_error_lists_every_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    env_dir = tmp_path / "missing-env-dir"
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPTS", str(env_dir))
+    trioctl = load_installed_trioctl(tmp_path / "bin")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runner = trioctl.OmnigentRunner(repo=repo)
+
+    with pytest.raises(trioctl.TrioctlError) as excinfo:
+        runner._prompt_path("lead")
+
+    message = str(excinfo.value)
+    repo_candidate = repo / "omnigent" / "entrypoints" / "trio-omnigent" / "prompts" / "lead.md"
+    claude_skill = fake_home / ".claude" / "skills" / "trio-omnigent" / "prompts" / "lead.md"
+    codex_skill = fake_home / ".agents" / "skills" / "trio-omnigent" / "prompts" / "lead.md"
+    assert str(repo_candidate) in message
+    assert str(env_dir / "lead.md") in message
+    assert str(claude_skill) in message
+    assert str(codex_skill) in message
+
+
 def test_title_includes_kind_for_lead_pass_and_integration_eval(
     tmp_path: Path,
 ) -> None:

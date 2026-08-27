@@ -1184,6 +1184,27 @@ _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
 )
 
 
+def _omnigent_prompt_dirs(repo: Path) -> list[Path]:
+    """Ordered directories to search for checked-in Omnigent role prompts.
+
+    An installed `trioctl` (see install.sh's `--omnigent` mode) has no
+    `omnigent/entrypoints/trio-omnigent/prompts` of its own next to the
+    target project or next to the installed script itself, so the search
+    falls through to `$TRIO_OMNIGENT_PROMPTS` when set, then the skill
+    directories install.sh writes the same prompts into for Claude Code
+    and Codex.
+    """
+    tail = Path("omnigent", "entrypoints", "trio-omnigent", "prompts")
+    dirs = [repo / tail, Path(__file__).resolve().parent.parent / tail]
+    env_dir = os.environ.get("TRIO_OMNIGENT_PROMPTS")
+    if env_dir:
+        dirs.append(Path(env_dir).expanduser())
+    home = Path.home()
+    dirs.append(home / ".claude" / "skills" / "trio-omnigent" / "prompts")
+    dirs.append(home / ".agents" / "skills" / "trio-omnigent" / "prompts")
+    return dirs
+
+
 class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
@@ -1261,20 +1282,21 @@ class OmnigentRunner:
         return model
 
     def _prompt_path(self, role: str) -> Path:
-        """Find the checked-in prompt, including from an installed trioctl."""
-        relative = Path(
-            "omnigent",
-            "entrypoints",
-            "trio-omnigent",
-            "prompts",
-            f"{role}.md",
-        )
-        source_root = Path(__file__).resolve().parent.parent
-        candidates = (self.repo / relative, source_root / relative)
+        """Find the checked-in prompt, including from an installed trioctl.
+
+        An installed ``trioctl`` (``~/.local/bin/trioctl``) has no source
+        tree of its own, so the first two candidates below never resolve
+        for it; install.sh instead writes the same prompts into the
+        Claude Code and Codex skill directories, which the last two
+        candidates fall back to.
+        """
+        filename = f"{role}.md"
+        candidates = [directory / filename for directory in _omnigent_prompt_dirs(self.repo)]
         for path in candidates:
             if path.is_file():
                 return path
-        raise TrioctlError(f"missing Omnigent prompt: {relative}")
+        tried = ", ".join(str(path) for path in candidates)
+        raise TrioctlError(f"missing Omnigent prompt: {filename} (tried: {tried})")
 
     @staticmethod
     def _open_loop_context_block(context: dict[str, Any]) -> str:
@@ -1772,6 +1794,20 @@ def command_doctor(args: argparse.Namespace) -> int:
         )
 
     checks.append(check_cursor_approval_mode())
+
+    prompt_repo = Path.cwd().resolve()
+    try:
+        prompt_dirs = {
+            role: OmnigentRunner(repo=prompt_repo)._prompt_path(role).parent
+            for role in ("lead", "evaluator")
+        }
+    except TrioctlError as exc:
+        checks.append({"check": "prompts", "ok": False, "detail": str(exc)})
+    else:
+        resolved = sorted({str(directory) for directory in prompt_dirs.values()})
+        checks.append(
+            {"check": "prompts", "ok": True, "detail": ", ".join(resolved)}
+        )
 
     catalogs: dict[str, list[dict[str, Any]]] = {}
     for provider, loader in (("codex", codex_models), ("cursor", cursor_models)):
