@@ -226,6 +226,15 @@ matching. Undeclared-write drift is reported, never enforced —
 shadow/instrumentation mode; commit presence, by contrast, is enforced by
 the active gate below (the first ACTIVE interlock).
 
+### Waves (declared parallelism)
+
+A **wave** is a set of same-iteration `planned` slices whose `writes:` are
+pairwise disjoint and whose `reads:` name no path/`api:` that another
+slice in the set writes. It is derived by the Lead from the existing
+`writes:`/`reads:` fields at plan time — no new schema field records it —
+and authorizes dispatching every slice in the set to a separate builder
+concurrently instead of one at a time.
+
 ### Slice commit gate (active interlock)
 
 The commit-presence check is the first **active** interlock: drivers run it

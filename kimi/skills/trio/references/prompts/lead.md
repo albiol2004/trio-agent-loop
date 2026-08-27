@@ -78,6 +78,24 @@ slices:
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review
+### Parallel dispatch (issue width)
+After writing the `slices:` block, partition this iteration's `planned`
+slices into waves: slices whose `writes:` are pairwise disjoint AND whose
+`reads:` name no path/`api:` written by another slice in the same wave
+share a wave, and are dispatched to separate builders **concurrently**
+(background agents / concurrent `trioctl omnigent run builder`
+invocations) rather than one at a time. A slice that reads another
+slice's writes waits for that slice's commit (or its `frozen:` line in
+STATE.md) before it can join a wave. At plan time put every path you
+expect a builder to touch in that slice's `writes:`, including the
+predictable companions: a canonical prompt's paired flavor/overlay
+outputs, a module's companion test file, a hyphenated CLI's mirrored
+`.py`, and docs touched — builders are NOT told to police their own
+writes. After a wave lands, run `python3 metrics/trio-shadow.py --mailbox
+<dir>` and, if two slices in the wave actually touched the same file,
+review that file's diff explicitly before committing — this is the one
+hazard check.
+
 On the initial planning pass, do not edit product code. Delegate every
 code-changing increment by writing `BUILDER_TASK.md` beginning with
 `DELEGATE: YES`; include the approach, owned files, complete instructions,

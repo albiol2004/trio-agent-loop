@@ -47,7 +47,11 @@ boundaries visible in the messages and in `loop/LOG.md`:
 3. Require the Lead to use the `trio-builder` role for one
    mandatory primary Builder implementation pass for every code-changing
    increment. The Lead must not skip this pass or replace it with its own
-   first draft.
+   first draft. When the plan's slices form a wave — pairwise-disjoint
+   `writes:` with no cross-slice `reads:` — the Lead dispatches their
+   Builders concurrently instead of serially; `trio-shadow.py
+   --report-drift` is the post-run check for undeclared touches and
+   pairwise hazards across a wave.
 4. After the Builder reports, the Lead performs Lead review/correction:
    review the complete diff, run the requested checks, and make any necessary
    corrective edits. The Lead writes `loop/REPORT.md` with implementation

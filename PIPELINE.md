@@ -245,6 +245,12 @@ small and skewed toward single-slice-per-iteration mailboxes; it does not
 yet cover a mailbox with several genuinely parallel same-iteration
 slices, which is the actual case the scoreboard needs to be safe for.
 
+**Enabled on this measurement:** issue width >1 — the Lead prompt now
+dispatches a wave of disjoint-writes slices to separate builders
+concurrently — on the strength of the 0-pairwise-hazard result above.
+Enforcement is deferred until a real hazard is observed; `--report-drift`
+remains the only post-run check.
+
 ## Cost model
 
 | Component | Model tier | When | Drives |

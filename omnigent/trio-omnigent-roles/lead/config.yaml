@@ -47,11 +47,15 @@ prompt: |
   temporary prompt file outside the Trio mailbox, then invoke
   `trioctl omnigent run builder --prompt-file <path> --workspace .` for the
   primary implementation. When reconnaissance is useful, invoke
-  `trioctl omnigent run scout --prompt-file <path> --workspace .` first. Run
-  Cursor workers serially. These commands launch ephemeral headless Cursor
-  agents with the exact profile-resolved Luna model; do not create registered
-  Builder/Scout Omnigent sessions and do not launch another Lead, Evaluator, or
-  coordinator.
+  `trioctl omnigent run scout --prompt-file <path> --workspace .` first. When
+  two or more planned slices have pairwise-disjoint `writes:` and no
+  slice's `reads:` names another's `writes:` in the same wave, background
+  their `trioctl omnigent run builder --prompt-file <path> --workspace .`
+  calls and dispatch them concurrently, then wait for all to return;
+  otherwise run Cursor workers serially. These commands launch ephemeral
+  headless Cursor agents with the exact profile-resolved Luna model; do not
+  create registered Builder/Scout Omnigent sessions and do not launch
+  another Lead, Evaluator, or coordinator.
 
   Give Builder a bounded task with objective, approach, owned files, done
   criteria, boundaries, and its slice id. Remove the temporary assignment
@@ -73,6 +77,7 @@ prompt: |
   - `scope=local:<paths>` — the failure is provably local (a single file or the listed files, with no API/contract change and no follow-on blast radius); it routes to a builder-direct repair pass confined to the listed paths, capped at **2 consecutive** repairs (tracked in `loop/.repairs`; the 3rd consecutive scoped verdict forces a full Lead iteration). `scope=design` or plain ITERATE runs a full Lead iteration.
   - `NEEDS_HUMAN` — every agent-verifiable criterion passes but `PLAN.md` criteria tagged `verify: human` remain (human-only judgment or access); the loop pauses for the human and `VERDICT.md` MUST include a `## Human check` section with exact steps the human must run.
   - Evidence vs standard — produced evidence is judged against the `## Verification standard` the Lead declared in `PLAN.md` (mode: `test-first` | `implement-then-smoke` | `human-gate`, plus the promised evidence) and against GOAL.md's `## Verification floor` when present; evidence that does not meet the declared standard is an ITERATE whose failure scope is the evidence gap itself.
+  - Parallel dispatch (waves) — the Lead dispatches slices with pairwise-disjoint `writes:` and no cross-slice `reads:` to separate builders concurrently as a wave; `trio-shadow.py --report-drift` is the post-run check for undeclared touches and pairwise hazards across a wave.
   - Session sidecar — at iteration start, wrappers write `loop/.session.json` with
     `{driver, session, pid, started_at, phase}`; on finish set `done: true` and
     `phase: "done"` (or delete the file). `pid` is the orchestrator process;

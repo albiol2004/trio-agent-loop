@@ -251,6 +251,7 @@ def test_prompt_open_loop_lead_pass_includes_retired_entry_procedure(
     assert prompt.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n")
     assert "commits without appending a `retired:` entry is incomplete" in prompt
     assert "Backpressure" in prompt
+    assert "concurrently" in prompt
     assert prompt.endswith(base_prompt)
     assert prompt[: -len(base_prompt)].endswith("\n\n")
 
