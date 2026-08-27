@@ -305,6 +305,9 @@ integration step itself when both finish:
 python3 metrics/trio_loop.py run --mailbox loop-open-loop --max-iterations N
 ```
 
+
+**Setup**: target projects must include their own `metrics/` directory copy (trioctl loads `metrics/trio_loop.py` from the target repo, not the installed skill); resync after template updates. Role prompts resolve from installed skill directories (`~/.claude/skills/trio-omnigent/prompts`, `~/.agents/…`, or `$TRIO_OMNIGENT_PROMPTS`); `trioctl doctor` reports the resolved directory. Watch LOG.md for `open-loop: <slice> @<sha> wrote no verdict section (attempt N)` (grading re-attempted) or `lead pass made no changes` (empty pass retried) — both are normal under driver retry logic.
+
 `run` auto-selects open-loop because `loop-open-loop/QUEUE.md` exists (no
 `QUEUE.md` → the plain lockstep path, unchanged). Force either mode with
 `--open-loop` / `--lockstep`; tune how often the Evaluator loop re-reads

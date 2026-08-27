@@ -452,6 +452,7 @@ parsers are unaffected.
    `git worktree add`, never the moving working tree.
 2. Grade it against that slice's `accepts:` in the PLAN.md slices block.
 3. SHIP → append the per-slice section, record only, append no fault.
+   Drivers verify each per-slice section on disk and may re-invoke the Evaluator for the same (slice, sha) if verification fails mid-flight, so identical verdicts reappearing is expected under retry logic.
 4. ITERATE → append the per-slice section AND append one `faults:` entry
    (`status: open`, `observed_at:` the evaluated sha, `scope:` the failing
    paths, `reason:` one line).
