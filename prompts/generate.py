@@ -38,6 +38,7 @@ EMBEDDED = [
     ("omnigent/trio-omnigent-roles/evaluator/config.yaml", "yaml"),
     ("omnigent/trio-omnigent-roles/builder/config.yaml", "yaml"),
     ("omnigent/trio-omnigent-roles/scout/config.yaml", "yaml"),
+    ("omnigent/trio-omnigent-roles/docs/config.yaml", "yaml"),
     (".claude/skills/trio/SKILL.md", "md"),
     (".agents/skills/trio/SKILL.md", "md"),
     ("codex/skills/trio/SKILL.md", "md"),

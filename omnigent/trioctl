@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 
 VERSION = "0.4.0"
-ROLES = ("lead", "evaluator", "builder", "scout")
+ROLES = ("lead", "evaluator", "builder", "scout", "docs")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
-CURSOR_WORKER_ROLES = ("builder", "scout")
+CURSOR_WORKER_ROLES = ("builder", "scout", "docs")
 DEFAULT_LOOP_WAIT_TIMEOUT = 3600.0
 # Registered Omnigent agents persist their bundle prompt at creation time.
 # Bump this marker whenever the Lead/Evaluator config changes materially so a
@@ -43,6 +43,16 @@ CURSOR_ROLE_PROMPTS = {
         "reconnaissance requested by the Trio Lead or Evaluator. Do not edit "
         "files, commit, push, or modify Trio mailbox files. Return concise, "
         "evidence-backed findings with relevant file paths and commands."
+    ),
+    "docs": (
+        "You are the Trio Docs worker, a coalesced background documentation "
+        "task dispatched after a SHIP verdict. Given a change summary and "
+        "rationale, update only the project's documentation and memory files "
+        "(README, docs/, CLAUDE.md, AGENTS.md, PIPELINE-style docs). Never "
+        "touch product code or tests, and never document unverified "
+        "decisions. Commit your change yourself with a `docs(<area>): ...` "
+        "message using the Co-Authored-By trailer supplied in the task, and "
+        "report the resulting commit sha."
     ),
 }
 
@@ -95,9 +105,17 @@ def load_config(path: Path) -> dict[str, Any]:
     roles = data.get("roles")
     if not isinstance(roles, dict):
         raise TrioctlError(f"{path}: missing [roles.*] tables")
+    docs_fallback = False
+    if not isinstance(roles.get("docs"), dict) and isinstance(roles.get("scout"), dict):
+        # ``docs`` is a newer role; older profiles omit it. Reuse the scout
+        # table (same provider family, ephemeral Cursor worker) so existing
+        # profiles keep working without edits.
+        roles["docs"] = dict(roles["scout"])
+        docs_fallback = True
     missing = [role for role in ROLES if not isinstance(roles.get(role), dict)]
     if missing:
         raise TrioctlError(f"{path}: missing roles: {', '.join(missing)}")
+    data["_docs_role_fallback"] = docs_fallback
     return data
 
 
@@ -1514,13 +1532,14 @@ def command_doctor(args: argparse.Namespace) -> int:
                 effort = resolved.get("reasoning_effort") or resolved.get(
                     "model_effort"
                 )
+                detail = f"{resolved['model']} / {effort} ({resolved['source']})"
+                if role == "docs" and config.get("_docs_role_fallback"):
+                    detail += "; no [roles.docs] configured, using [roles.scout]"
                 checks.append(
                     {
                         "check": f"role:{role}",
                         "ok": True,
-                        "detail": (
-                            f"{resolved['model']} / {effort} ({resolved['source']})"
-                        ),
+                        "detail": detail,
                     }
                 )
             except TrioctlError as exc:

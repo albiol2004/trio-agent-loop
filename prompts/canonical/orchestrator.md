@@ -129,4 +129,8 @@ not running.
   session ONCE (send it `continue`) before surfacing any failure to the
   user. If the wake is not applicable (no live session to wake) or the
   session fails again, surface the failure normally.
+- **Coalesced background doc task:** after a SHIP verdict, queue exactly one
+  coalesced background documentation task (cheap model) with the change
+  summary and rationale; on harnesses with `trioctl`, dispatch it as
+  `trioctl omnigent run docs --prompt-file <path> --workspace .`.
 {{orchestrator.RULES}}

@@ -131,7 +131,10 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    error` in STATE.md, record the breach in LOG.md, and end the loop. Then
    verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` entry
    for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without
-   it; if the append is missing, have the Lead add it first.
+   it; if the append is missing, have the Lead add it first. After SHIP,
+   queue exactly one coalesced background documentation task (change summary
+   + rationale) by dispatching
+   `trioctl omnigent run docs --prompt-file <path> --workspace .`.
 5. Inspect the Evaluator result. Any delegated Scout evidence must come from
    its own `trioctl omnigent run scout` invocation.
 6. Update STATE and LOG. After the verdict, set `loop/STATE.md` bookkeeping:

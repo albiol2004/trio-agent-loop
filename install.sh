@@ -197,7 +197,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     fi
     OMNIGENT_ROLES_DEST="${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles"
     mkdir -p "$OMNIGENT_ROLES_DEST"
-    for role in lead evaluator builder scout; do
+    for role in lead evaluator builder scout docs; do
       rm -rf "$OMNIGENT_ROLES_DEST/$role"
       cp -r "$ROOT/omnigent/trio-omnigent-roles/$role" "$OMNIGENT_ROLES_DEST/"
     done

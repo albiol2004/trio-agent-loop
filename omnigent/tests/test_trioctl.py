@@ -60,6 +60,13 @@ def profile(**builder):
                 "effort": "max",
                 "fast": False,
             },
+            "docs": {
+                "provider": "cursor",
+                "model_family": "gpt-5.6-luna",
+                "fallback_model": "gpt-5.6-luna-max",
+                "effort": "max",
+                "fast": False,
+            },
         },
     }
 
@@ -307,6 +314,192 @@ def test_load_config_requires_every_role(tmp_path: Path):
 
     with pytest.raises(trioctl.TrioctlError, match="missing roles"):
         trioctl.load_config(path)
+
+
+def test_load_config_docs_falls_back_to_scout_table(tmp_path: Path):
+    trioctl = load_trioctl()
+    path = tmp_path / "config.toml"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            version = 1
+            [roles.lead]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.evaluator]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.builder]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            [roles.scout]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            """
+        )
+    )
+
+    config = trioctl.load_config(path)
+
+    assert config["_docs_role_fallback"] is True
+    assert config["roles"]["docs"] == config["roles"]["scout"]
+
+    resolved = trioctl.resolve_role(
+        "docs", config, models=[model("gpt-5.6-luna-max")]
+    )
+    assert resolved["provider"] == "cursor"
+    assert resolved["model"] == "gpt-5.6-luna-max"
+
+
+def test_load_config_keeps_explicit_docs_table(tmp_path: Path):
+    trioctl = load_trioctl()
+    path = tmp_path / "config.toml"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            version = 1
+            [roles.lead]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.evaluator]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.builder]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            [roles.scout]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            [roles.docs]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            """
+        )
+    )
+
+    config = trioctl.load_config(path)
+
+    assert config["_docs_role_fallback"] is False
+    assert config["roles"]["docs"]["provider"] == "cursor"
+
+    resolved = trioctl.resolve_role(
+        "docs", config, models=[model("gpt-5.6-luna-max")]
+    )
+    assert resolved["provider"] == "cursor"
+
+
+def test_resolve_docs_role_uses_own_config():
+    trioctl = load_trioctl()
+
+    result = trioctl.resolve_role(
+        "docs",
+        profile(),
+        models=[model("gpt-5.6-luna-max")],
+    )
+
+    assert result["role"] == "docs"
+    assert result["provider"] == "cursor"
+    assert result["model"] == "gpt-5.6-luna-max"
+
+
+def test_cursor_docs_runs_headless_with_resolved_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trioctl = load_trioctl()
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, stdout="DOCS_OK\n", stderr="")
+
+    monkeypatch.setattr(trioctl.shutil, "which", lambda command: "/bin/cursor-agent")
+    monkeypatch.setattr(trioctl.subprocess, "run", fake_run)
+
+    output = trioctl.run_cursor_worker(
+        "docs",
+        profile(),
+        prompt="Document the shipped change.",
+        workspace=tmp_path,
+        models=[model("gpt-5.6-luna-max")],
+    )
+
+    assert output == "DOCS_OK"
+    assert "--mode" not in seen["command"]
+    assert "TASK FROM LEAD:\nDocument the shipped change." in seen["kwargs"]["input"]
+
+
+def test_parser_accepts_docs_role_for_resolve_and_run():
+    trioctl = load_trioctl()
+
+    resolve_args = trioctl.parser().parse_args(["omnigent", "resolve", "docs"])
+    assert resolve_args.role == "docs"
+
+    run_args = trioctl.parser().parse_args(
+        ["omnigent", "run", "docs", "--prompt-file", "-", "--workspace", "."]
+    )
+    assert run_args.role == "docs"
+
+
+def test_command_resolve_docs_json_falls_back_to_scout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    trioctl = load_trioctl()
+    path = tmp_path / "config.toml"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            version = 1
+            [roles.lead]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.evaluator]
+            provider = "cursor"
+            model_family = "grok-4.6"
+            effort = "medium"
+            [roles.builder]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            [roles.scout]
+            provider = "cursor"
+            model_family = "gpt-5.6-luna"
+            effort = "max"
+            """
+        )
+    )
+    monkeypatch.setattr(trioctl, "cursor_models", lambda timeout=None: [
+        model("gpt-5.6-luna-max")
+    ])
+
+    args = trioctl.parser().parse_args(
+        ["omnigent", "resolve", "docs", "--config", str(path), "--json"]
+    )
+    exit_code = trioctl.command_resolve(args)
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["role"] == "docs"
+    assert payload["provider"] == "cursor"
+    assert payload["model"] == "gpt-5.6-luna-max"
+
+
+def test_docs_role_config_yaml_uses_cursor_native_harness():
+    path = SCRIPT.parent / "trio-omnigent-roles" / "docs" / "config.yaml"
+    text = path.read_text()
+
+    assert "harness: cursor-native" in text
+    assert "name: trio-omnigent-docs" in text
 
 
 def test_codex_models_completes_handshake_and_paginates(
