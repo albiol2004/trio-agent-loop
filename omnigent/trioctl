@@ -875,6 +875,152 @@ def command_session_read(args: argparse.Namespace) -> int:
     return 0
 
 
+# Headless `trioctl omnigent loop` iterations each create a titled broker
+# session (see ``OmnigentRunner._title``) that otherwise lives forever in
+# the Omnigent UI history. Mailbox files record the outcome but not the
+# role's reasoning, so pruning archives the full transcript before it
+# deletes the broker session.
+SESSION_ARCHIVE_ITEM_LIMIT = 10000
+
+
+def _sanitise_archive_slug(value: str) -> str:
+    """Collapse a title or timestamp into a filesystem-safe slug."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
+    return slug or "session"
+
+
+def _session_archive_filename(row: dict[str, Any]) -> str:
+    """Name an archive file from the session's listing row.
+
+    Format: ``<created_at>-<sanitised title>-<id8>.jsonl``.
+    """
+    session_id = str(row.get("id") or row.get("session_id") or "unknown")
+    created_at = row.get("created_at") or row.get("createdAt") or "unknown"
+    title = row.get("title") or "untitled"
+    return (
+        f"{_sanitise_archive_slug(str(created_at))}-"
+        f"{_sanitise_archive_slug(str(title))}-{session_id[:8]}.jsonl"
+    )
+
+
+def _prune_broker_sessions(
+    client: Any,
+    mailbox: Path,
+    *,
+    all_scope: bool = False,
+    dry_run: bool = False,
+    keep_failed: bool = False,
+) -> dict[str, int]:
+    """Archive-then-delete broker sessions whose title matches one mailbox.
+
+    Only sessions whose title starts with ``trioctl <mailbox.name> ``
+    (or, with ``all_scope``, any ``trioctl `` title) are ever touched --
+    other projects share the same broker. A ``running`` session is always
+    skipped. ``keep_failed`` additionally skips ``failed``/``error``
+    sessions. Every archived transcript is written under
+    ``<mailbox>/.sessions/`` *before* its broker session is deleted.
+    """
+    list_sessions = getattr(client, "list_sessions", None)
+    if list_sessions is None:
+        raise TrioctlError("broker client has no session-list method")
+    try:
+        payload = list_sessions()
+    except broker_http.BrokerHttpError as exc:
+        raise TrioctlError(str(exc)) from exc
+    rows = [row for row in _session_items(payload) if isinstance(row, dict)]
+    prefix = "trioctl " if all_scope else f"trioctl {mailbox.name} "
+    counts = {
+        "archived": 0,
+        "deleted": 0,
+        "skipped_running": 0,
+        "skipped_failed": 0,
+    }
+    sessions_dir = mailbox / ".sessions"
+    for row in rows:
+        title = row.get("title")
+        if not isinstance(title, str) or not title.startswith(prefix):
+            continue
+        session_id = row.get("id") or row.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        status = _session_status(row)
+        if status == "running":
+            counts["skipped_running"] += 1
+            print(f"trioctl: skip (running): {session_id} {title}")
+            continue
+        if keep_failed and status in SESSION_FAILURE_STATUSES:
+            counts["skipped_failed"] += 1
+            print(f"trioctl: skip (failed, --keep-failed): {session_id} {title}")
+            continue
+        if dry_run:
+            print(f"trioctl: dry-run would archive and delete: {session_id} {title}")
+            continue
+        try:
+            items_payload = client.get_items(
+                session_id, limit=SESSION_ARCHIVE_ITEM_LIMIT, order="asc"
+            )
+        except broker_http.BrokerHttpError as exc:
+            raise TrioctlError(str(exc)) from exc
+        items = _session_items(items_payload)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = sessions_dir / _session_archive_filename(row)
+        with archive_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            for item in items:
+                handle.write(json.dumps(item, sort_keys=True) + "\n")
+        counts["archived"] += 1
+        delete_session = getattr(client, "delete_session", None)
+        if delete_session is None:
+            raise TrioctlError("broker client has no session-delete method")
+        try:
+            delete_session(session_id)
+        except broker_http.BrokerHttpError as exc:
+            raise TrioctlError(str(exc)) from exc
+        counts["deleted"] += 1
+        print(f"trioctl: archived and deleted {session_id} -> {archive_path}")
+    return counts
+
+
+def command_sessions_prune(args: argparse.Namespace) -> int:
+    """Archive then delete this mailbox's headless-loop broker sessions."""
+    mailbox = Path(args.mailbox).expanduser().resolve()
+    client = _session_client(getattr(args, "base_url", None))
+    counts = _prune_broker_sessions(
+        client,
+        mailbox,
+        all_scope=args.all,
+        dry_run=args.dry_run,
+        keep_failed=args.keep_failed,
+    )
+    print(
+        f"trioctl: archived {counts['archived']}, deleted {counts['deleted']}, "
+        f"skipped running {counts['skipped_running']}"
+    )
+    return 0
+
+
+def _run_post_loop_session_prune(mailbox: Path, base_url: str | None) -> None:
+    """Best-effort cleanup after `loop --prune-sessions` exits.
+
+    Runs after the loop returns regardless of its exit code. Always a real
+    archive-then-delete pass (never `--dry-run`), scoped to this mailbox
+    only (no `--all`, no `--keep-failed`) -- the same default scope as
+    `sessions prune`. A prune failure is reported but never overrides the
+    loop's own exit code.
+    """
+    try:
+        client = _session_client(base_url)
+        counts = _prune_broker_sessions(client, mailbox)
+    except TrioctlError as exc:
+        print(f"trioctl: session prune failed: {exc}", file=sys.stderr)
+        return
+    print(
+        "trioctl: session prune archived "
+        f"{counts['archived']}, deleted {counts['deleted']}, "
+        f"skipped running {counts['skipped_running']}"
+    )
+
+
 # Kind-specific Open-loop procedures appended to OPEN-LOOP CONTEXT blocks.
 # Sourced from prompts/canonical/lead.md ("Open-loop mode", steps 1-5) and
 # prompts/canonical/evaluator.md ("Open-loop mode", steps 1-7) so Omnigent
@@ -1332,12 +1478,15 @@ def command_loop(args: argparse.Namespace) -> int:
         timeout=getattr(args, "wait_timeout", DEFAULT_LOOP_WAIT_TIMEOUT),
         runner_id=getattr(args, "runner_id", None),
     )
-    return loop_core.run_loop(
+    exit_code = loop_core.run_loop(
         mailbox,
         args.max_iterations,
         runner,
         repo=repo,
     )
+    if getattr(args, "prune_sessions", False):
+        _run_post_loop_session_prune(mailbox, getattr(args, "base_url", None))
+    return exit_code
 
 
 def omnigent_registry_path() -> Path:
@@ -1665,6 +1814,15 @@ def parser() -> argparse.ArgumentParser:
             "over TRIO_OMNIGENT_RUNNER_ID"
         ),
     )
+    loop.add_argument(
+        "--prune-sessions",
+        action="store_true",
+        help=(
+            "after the loop exits (any exit code), archive then delete "
+            "this mailbox's broker sessions -- same scope as `sessions "
+            "prune` with no --all or --keep-failed, and never a dry run"
+        ),
+    )
     loop.set_defaults(func=command_loop)
 
     session = commands.add_parser(
@@ -1715,6 +1873,43 @@ def parser() -> argparse.ArgumentParser:
         default=broker_http.DEFAULT_BASE_URL,
     )
     session_read.set_defaults(func=command_session_read)
+
+    sessions = commands.add_parser(
+        "sessions", help="manage broker sessions created by trioctl loops"
+    )
+    sessions_commands = sessions.add_subparsers(
+        dest="sessions_command", required=True
+    )
+    sessions_prune = sessions_commands.add_parser(
+        "prune",
+        help=(
+            "archive and delete headless loop sessions from the broker "
+            "for one mailbox"
+        ),
+    )
+    sessions_prune.add_argument(
+        "--mailbox", required=True, help="mailbox directory the sessions belong to"
+    )
+    sessions_prune.add_argument(
+        "--all",
+        action="store_true",
+        help="match any `trioctl ` session title, not just this mailbox's",
+    )
+    sessions_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be archived and deleted without doing it",
+    )
+    sessions_prune.add_argument(
+        "--keep-failed",
+        action="store_true",
+        help="skip sessions with status failed or error",
+    )
+    sessions_prune.add_argument(
+        "--base-url",
+        default=broker_http.DEFAULT_BASE_URL,
+    )
+    sessions_prune.set_defaults(func=command_sessions_prune)
 
     doctor = commands.add_parser(
         "doctor", help="validate commands, models, and registry"

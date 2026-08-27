@@ -340,6 +340,11 @@ trioctl omnigent loop --mailbox loop-open-loop --max-iterations N \
 and more than one online, it errors with every runner id listed plus the
 exact `TRIO_OMNIGENT_RUNNER_ID=<id>` / `--runner-id <id>` remedy.
 
+Add `--prune-sessions` to archive (to `<mailbox>/.sessions/`) and delete
+this mailbox's broker sessions once the loop exits, so they stop piling up
+in the Omnigent UI history — or run `trioctl omnigent sessions prune
+--mailbox <dir>` by hand at any time.
+
 Note: `OmnigentRunner.run` now receives the driver's open-loop context and
 prepends the same `OPEN-LOOP CONTEXT:` block portable/driver.sh renders
 (kind, plus slice/sha when set) ahead of the role prompt, and titles Lead

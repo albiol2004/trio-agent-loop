@@ -572,3 +572,79 @@ def test_loop_wait_timeout_is_parsed_and_threaded(
 
     assert args.func(args) == 0
     assert captured["timeout"] == 17.0
+
+
+def test_loop_prune_sessions_flag_runs_after_exit_including_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--prune-sessions` must clean up after the loop returns regardless
+    of its exit code, and must never run when the flag is absent."""
+    trioctl = load_trioctl()
+    prune_calls: list[tuple[Path, object]] = []
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+    class FailingLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            return 5  # e.g. NEEDS_HUMAN/locked
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: FailingLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda mailbox, base_url: prune_calls.append((mailbox, base_url)),
+    )
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "loop",
+            "--mailbox",
+            "mailbox",
+            "--max-iterations",
+            "1",
+            "--prune-sessions",
+        ]
+    )
+
+    result = args.func(args)
+
+    assert result == 5  # the loop's own exit code is preserved
+    assert prune_calls == [((tmp_path / "mailbox").resolve(), args.base_url)]
+
+
+def test_loop_without_prune_sessions_flag_never_prunes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trioctl = load_trioctl()
+    prune_calls: list[object] = []
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+    class FakeLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: FakeLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda *a, **k: prune_calls.append((a, k)),
+    )
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    assert args.func(args) == 0
+    assert prune_calls == []

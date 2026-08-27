@@ -492,6 +492,17 @@ to the coordination repo. Tooling resolves `repo:` relative to the mailbox
 root: the project directory passed to it (the one containing `loop/`), or
 the loop directory itself when pointed at directly.
 
+## Session sidecar
+
+`loop/.session.json` is the harness-owned session sidecar (see
+`prompts/protocol-essentials.md`) recording the live orchestrator pid and
+session id; conformance tooling ignores it.
+
+`.sessions/` is a separate, optional driver-owned archive directory:
+`trioctl omnigent sessions prune` (and `loop --prune-sessions`) write one
+JSONL transcript per archived broker session there before deleting it from
+the broker. Conformance tooling ignores it too.
+
 ## Context economics
 
 Mailbox files are split into hot and cold files so fresh-context roles stay

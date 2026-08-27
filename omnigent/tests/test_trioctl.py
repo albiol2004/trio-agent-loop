@@ -99,6 +99,8 @@ def fake_broker():
         "runner_gets": 0,
         "session_statuses": ["idle", "running", "idle"],
         "online_runners": [{"runner_id": "runner-1", "online": True}],
+        "session_rows": [],
+        "deletes": [],
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -193,6 +195,9 @@ def fake_broker():
                 state["runner_gets"] += 1
                 self.send_json(200, {"data": state["online_runners"]})
                 return
+            if parsed.path == "/v1/sessions":
+                self.send_json(200, {"data": state["session_rows"]})
+                return
             state["session_gets"] += 1
             index = min(
                 state["session_gets"] - 1,
@@ -209,6 +214,11 @@ def fake_broker():
                 runner_index = min(index, len(runner_ids) - 1)
                 payload["runner_id"] = runner_ids[runner_index]
             self.send_json(200, payload)
+
+        def do_DELETE(self):
+            state["authorization"].append(self.headers.get("Authorization"))
+            state["deletes"].append(urlparse(self.path).path)
+            self.send_json(200, {"deleted": True})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1092,6 +1102,207 @@ def test_session_read_returns_items_and_query(fake_broker, capsys):
 
     assert json.loads(capsys.readouterr().out)["items"]
     assert state["item_queries"] == [{"limit": ["7"], "order": ["desc"]}]
+
+
+def test_list_and_delete_sessions_over_http(fake_broker):
+    """`BrokerClient.list_sessions`/`delete_session` speak the same wire
+    protocol as the rest of the client (plain GET/DELETE, JSON body)."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["session_rows"] = [
+        {"id": "session-9", "title": "trioctl mbx iteration 1 lead"}
+    ]
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    listed = client.list_sessions()
+    assert listed == {"data": state["session_rows"]}
+
+    deleted = client.delete_session("session-9")
+    assert deleted == {"deleted": True}
+    assert state["deletes"] == ["/v1/sessions/session-9"]
+
+
+class _FakeSessionsClient:
+    """Offline double for `_prune_broker_sessions`: list/read/delete only."""
+
+    def __init__(self, rows, mailbox: Path | None = None):
+        self.rows = rows
+        self.mailbox = mailbox
+        self.calls: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+        self.archived_before_delete: list[Path] | None = None
+
+    def list_sessions(self):
+        return {"data": self.rows}
+
+    def get_items(self, session_id, limit=100, order="asc"):
+        self.calls.append(("items", session_id))
+        return {"items": [{"role": "assistant", "content": f"hi from {session_id}"}]}
+
+    def delete_session(self, session_id):
+        if self.mailbox is not None:
+            self.archived_before_delete = sorted(
+                (self.mailbox / ".sessions").glob("*.jsonl")
+            )
+        self.calls.append(("delete", session_id))
+        self.deleted.append(session_id)
+        return {"deleted": True}
+
+
+def _row(session_id, title, status="idle", created_at="2026-01-01T00:00:00Z"):
+    return {
+        "id": session_id,
+        "title": title,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def test_prune_selects_only_matching_titles(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl mbx iteration 1 lead"),
+        _row("s2", "trioctl other-mailbox iteration 1 lead"),
+        _row("s3", "unrelated broker session"),
+    ]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert counts == {
+        "archived": 1,
+        "deleted": 1,
+        "skipped_running": 0,
+        "skipped_failed": 0,
+    }
+    assert client.deleted == ["s1"]
+    archived = list((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 1
+    lines = archived[0].read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0])["id"] == "s1"
+    assert json.loads(lines[1])["content"] == "hi from s1"
+
+
+def test_prune_skips_running_sessions(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s1", "trioctl mbx iteration 1 lead", status="running")]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert counts["skipped_running"] == 1
+    assert counts["archived"] == 0
+    assert counts["deleted"] == 0
+    assert client.deleted == []
+    assert not (mailbox / ".sessions").exists()
+
+
+def test_prune_archives_before_deleting(tmp_path: Path):
+    """The archive file must exist on disk before the session is deleted."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s1", "trioctl mbx iteration 1 lead")]
+    client = _FakeSessionsClient(rows, mailbox=mailbox)
+
+    trioctl._prune_broker_sessions(client, mailbox)
+
+    assert client.calls == [("items", "s1"), ("delete", "s1")]
+    assert client.archived_before_delete is not None
+    assert len(client.archived_before_delete) == 1
+
+
+def test_prune_dry_run_deletes_nothing(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s1", "trioctl mbx iteration 1 lead")]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, dry_run=True)
+
+    assert counts == {
+        "archived": 0,
+        "deleted": 0,
+        "skipped_running": 0,
+        "skipped_failed": 0,
+    }
+    assert client.calls == []
+    assert client.deleted == []
+    assert not (mailbox / ".sessions").exists()
+
+
+def test_prune_all_scope_matches_every_trioctl_title(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl mbx iteration 1 lead"),
+        _row("s2", "trioctl other-mailbox iteration 1 lead"),
+        _row("s3", "not a trioctl session"),
+    ]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, all_scope=True)
+
+    assert counts["deleted"] == 2
+    assert set(client.deleted) == {"s1", "s2"}
+
+
+def test_prune_keep_failed_skips_failed_and_error_sessions(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl mbx iteration 1 lead", status="failed"),
+        _row("s2", "trioctl mbx iteration 2 lead", status="error"),
+    ]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, keep_failed=True)
+
+    assert counts["skipped_failed"] == 2
+    assert counts["deleted"] == 0
+    assert client.deleted == []
+
+
+def test_prune_without_keep_failed_still_archives_failed_sessions(tmp_path: Path):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [_row("s1", "trioctl mbx iteration 1 lead", status="failed")]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, keep_failed=False)
+
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+
+
+def test_command_sessions_prune_cli_wiring_and_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl mbx iteration 1 lead"),
+        _row("s2", "trioctl mbx iteration 2 evaluator", status="running"),
+    ]
+    client = _FakeSessionsClient(rows)
+    monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "sessions", "prune", "--mailbox", str(mailbox)]
+    )
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "archived 1, deleted 1, skipped running 1" in out
+    assert client.deleted == ["s1"]
 
 
 def test_session_auth_uses_home_token(fake_broker, tmp_path, monkeypatch, capsys):

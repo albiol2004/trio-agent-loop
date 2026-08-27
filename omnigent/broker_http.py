@@ -398,6 +398,15 @@ class BrokerClient:
         """List broker agents so live doctor can pick a probe target."""
         return self._request("GET", "/v1/agents")
 
+    def list_sessions(self) -> Any:
+        """List sessions registered on this broker, across all callers."""
+        return self._request("GET", "/v1/sessions")
+
+    def delete_session(self, session_id: str) -> Any:
+        """Permanently delete one broker session."""
+        path = f"/v1/sessions/{quote(session_id, safe='')}"
+        return self._request("DELETE", path, expected_status=200)
+
     def get_session(self, session_id: str) -> Any:
         """Fetch one session snapshot."""
         path = f"/v1/sessions/{quote(session_id, safe='')}"

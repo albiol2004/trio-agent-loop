@@ -27,6 +27,8 @@ def _tree(root: Path) -> None:
     (root / "loop" / "evidence-1" / "STATE.md").write_text("ignored\n")
     (root / "loop" / ".hidden").mkdir()
     (root / "loop" / ".hidden" / "PLAN.md").write_text("ignored\n")
+    (root / "loop" / ".sessions").mkdir()
+    (root / "loop" / ".sessions" / "STATE.md").write_text("ignored\n")
     (root / "loop" / "empty").mkdir()
     (root / "loop-b").mkdir()
     (root / "loop-b" / "STATE.md").write_text("status: running\n")
@@ -43,8 +45,24 @@ def test_discover_nested_and_logless_mailboxes(tmp_path: Path) -> None:
 def test_ignored_dirs_never_appear(tmp_path: Path) -> None:
     _tree(tmp_path)
     names = {TM.loop_name(tmp_path, p) for p in TM.discover_loops(tmp_path)}
-    for bad in ("loop/briefs", "loop/evidence-1", "loop/.hidden", "loop/empty", "src"):
+    for bad in (
+        "loop/briefs",
+        "loop/evidence-1",
+        "loop/.hidden",
+        "loop/.sessions",
+        "loop/empty",
+        "src",
+    ):
         assert bad not in names
+
+
+def test_sessions_archive_dir_is_ignored(tmp_path: Path) -> None:
+    """`.sessions/` is the driver-owned broker-session archive dir (see
+    MAILBOX-SCHEMA.md's "Session sidecar" section) and must never be
+    treated as a nested mailbox even though it contains a mailbox file."""
+    _tree(tmp_path)
+    names = {TM.loop_name(tmp_path, p) for p in TM.discover_loops(tmp_path)}
+    assert "loop/.sessions" not in names
 
 
 def test_analyze_loop_uses_relative_name(tmp_path: Path) -> None:

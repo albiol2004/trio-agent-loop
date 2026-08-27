@@ -306,6 +306,10 @@ uses the local broker at
 `~/.omnigent/auth_tokens.json` record when it is not expired.
 `trioctl omnigent doctor --live-session` is the only path that creates a
 real scout session; default doctor and tests stay offline.
+`trioctl omnigent loop --prune-sessions` (or `trioctl omnigent sessions
+prune --mailbox <dir>` by hand) archives each headless session's full
+transcript to `<mailbox>/.sessions/` before deleting it from the broker,
+so completed loop runs stop piling up in the Omnigent UI history.
 
 ## Setting it up with an AI agent
 Point an agent session at this repo and tell it to follow the setup doc for
