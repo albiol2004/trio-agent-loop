@@ -272,7 +272,7 @@ omp/                                  # native Oh My Pi agents + commands
 metrics/                            # cross-harness loop analytics
   trio-metrics.py                 # iterations-to-SHIP, verdict sequences, format
                                   #   normalization across template generations
-  trio-check.py                   # conformance checker for MAILBOX-SCHEMA v1
+  trio-check.py                   # MAILBOX-SCHEMA v1 checker; --version prints trio-check <version>
   trio-shadow.py                  # shadow checker, declared-vs-actual slice writes
   trio_loop.py                    # mechanical loop driver: gates, verdict,
                                   #   repair, resume
