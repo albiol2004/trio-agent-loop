@@ -228,6 +228,87 @@ class RaisingLeadRunner:
         raise RuntimeError("lead runner exploded")
 
 
+# --- Lead-pass output verification --------------------------------------
+# A runner exit of 0 is not proof the Lead pass wrote anything: mirrors the
+# existing Evaluator output-verification rule for the Lead side.
+
+
+def test_empty_lead_pass_then_productive_pass_counts_as_one_iteration(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("solo-empty-then-real")
+
+    def empty_pass(mb):
+        pass  # exit 0, writes nothing at all -- a runner blip
+
+    def real_pass(mb):
+        queue.retire("solo", sha1)
+
+    lead = ScriptedLeadRunner([empty_pass, real_pass])
+
+    def eval_solo(mb):
+        verdict.append_slice_section("solo", sha1, "SHIP")
+
+    def integration_ship(mb):
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo},
+        integration_actions=[integration_ship],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert not lead.passes
+    # Both calls happened, but only the productive one bumped iteration.
+    assert len(lead.calls) == 2
+    assert lead.calls[0]["iteration"] == 1
+    assert lead.calls[1]["iteration"] == 1
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "iteration: 1" in state_text
+    assert "status: shipped" in state_text
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert log_text.count("open-loop: lead pass made no changes") == 1
+    assert "open-loop: lead pass made no changes (attempt 1)" in log_text
+
+
+def test_lead_pass_never_changing_anything_errors_after_three_attempts(
+    tmp_path: Path,
+) -> None:
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    evaluator = ScriptedEvalRunner()
+
+    class NeverWritesLeadRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def run(self, role, iteration, mailbox, context=None):
+            assert role == "lead"
+            self.calls.append({"iteration": iteration, "context": dict(context)})
+            return 0
+
+    lead = NeverWritesLeadRunner()
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 3
+    assert len(lead.calls) == 3
+    assert evaluator.calls == []
+    state_text = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: error" in state_text
+    assert "iteration: 0" in state_text
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    for n in (1, 2, 3):
+        assert f"open-loop: lead pass made no changes (attempt {n})" in log_text
+    assert "open-loop: lead pass made no changes after 3 attempts" in log_text
+
+
 # --- C1 happy path -----------------------------------------------------
 
 
@@ -413,7 +494,14 @@ def test_iterate_integration_verdict_wakes_the_lead(tmp_path: Path) -> None:
         queue.retire("solo", sha1)
 
     def pass2(mb):
-        pass  # a forced full Lead pass with nothing new to retire
+        # A forced full Lead pass with nothing new to retire -- still a
+        # real on-disk write (a PLAN.md note), so it counts as productive
+        # under the Lead-pass output-verification snapshot.
+        path = mb / "PLAN.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n<!-- reviewed -->\n",
+            encoding="utf-8",
+        )
 
     lead = ScriptedLeadRunner([pass1, pass2])
 
@@ -557,15 +645,23 @@ def test_fresh_mailbox_runs_lead_before_any_integration_eval(
 def test_malformed_slices_block_blocks_integration_eval_and_logs(
     tmp_path: Path,
 ) -> None:
-    lock = threading.Lock()
     mailbox = make_open_loop_mailbox(tmp_path, PLAN_MALFORMED)
-    queue = QueueModel(mailbox, lock)
 
     # Nothing the Lead does can ever satisfy "all declared slices retired"
     # -- the block never parses -- so the driver must cap on the iteration
     # budget instead of mistaking the unreadable plan for "done" and
-    # running an integration eval.
-    lead = ScriptedLeadRunner([lambda mb: None, lambda mb: None])
+    # running an integration eval. Each pass does write something real (a
+    # PLAN.md note, still unparseable as a slices block) so it counts as
+    # productive under the Lead-pass output-verification snapshot and
+    # actually consumes the budget, without retiring anything that would
+    # send the grading loop looking for a scripted evaluator action.
+    def make_pass(note: str):
+        def _pass(mb):
+            (mb / "PLAN.md").write_text(PLAN_MALFORMED + f"<!-- {note} -->\n")
+
+        return _pass
+
+    lead = ScriptedLeadRunner([make_pass("pass-1"), make_pass("pass-2")])
     evaluator = ScriptedEvalRunner()
 
     code = trio_loop.run_open_loop(mailbox, 2, lead, evaluator, poll_seconds=0.01)

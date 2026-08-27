@@ -671,6 +671,70 @@ def _slices_fully_retired(
     return all(sid in retired_ids for sid in slice_ids) and not open_or_taken
 
 
+def _git_head_sha(repo_dir: Path) -> str | None:
+    """HEAD commit sha, or None when `repo_dir` is not a git repo (or git
+    itself is unavailable) -- part of the open-loop Lead-pass snapshot, see
+    `_lead_pass_snapshot`."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _git_slice_commit_shas(repo_dir: Path) -> frozenset[str]:
+    """Shas of every commit whose message starts with ``slice(`` -- see
+    `_git_head_sha`."""
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%H", "--grep=^slice("],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    return frozenset(
+        line.strip() for line in result.stdout.splitlines() if line.strip()
+    )
+
+
+def _lead_pass_snapshot(mailbox: Path, repo: Path | None) -> tuple:
+    """Everything one Lead pass could plausibly change: PLAN.md bytes,
+    QUEUE.md `retired:` entries and fault statuses, the repo's HEAD sha, and
+    its set of `slice(...)` commits. Two equal snapshots taken before and
+    after a runner call mean the pass wrote nothing at all -- an exit-0
+    return is not on its own proof the role did its job (open-loop
+    Lead-pass output verification, mirroring the existing Evaluator
+    verification below)."""
+    target = mailbox if (mailbox / "PLAN.md").is_file() else repo or mailbox
+    plan_path = mailbox / "PLAN.md"
+    plan_bytes = plan_path.read_bytes() if plan_path.is_file() else None
+    queue = _METRICS.read_queue(mailbox)
+    retired = frozenset(
+        (entry["slice"], entry["sha"]) for entry in queue["retired"]
+    )
+    fault_status = frozenset(
+        (fault["id"], fault["status"]) for fault in queue["faults"]
+    )
+    return (
+        plan_bytes,
+        retired,
+        fault_status,
+        _git_head_sha(target),
+        _git_slice_commit_shas(target),
+    )
+
+
 def _lead_thread_body(
     mailbox: Path,
     state_path: Path,
@@ -681,18 +745,28 @@ def _lead_thread_body(
     stop_event: threading.Event,
     result_holder: dict,
     force_first_pass: bool = False,
+    repo: Path | None = None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
 
+    A pass only bumps `iteration` (and only then counts against
+    `max_iterations`) when it actually changed something -- see
+    `_lead_pass_snapshot`. A pass that changed nothing is logged and
+    retried in place (same candidate iteration, `iteration` left
+    uncommitted); after 3 consecutive empty passes the thread sets
+    STATE.md `status: error`, logs the failure, and ends with
+    `outcome: "stalled"` instead of retrying forever.
+
     `result_holder` receives exactly one of `outcome` ("done"/"capped"/
-    "stopped") or `error` (the exception the runner raised), plus
+    "stopped"/"stalled") or `error` (the exception the runner raised), plus
     `finished` (set in `finally`, after outcome/error, so the poll loop can
     treat `finished` as the authoritative "thread has ended" signal instead
     of racing `Thread.is_alive()`).
     """
     try:
         first = True
+        empty_attempts = 0
         while True:
             if stop_event.is_set():
                 result_holder["outcome"] = "stopped"
@@ -713,9 +787,7 @@ def _lead_thread_body(
             if iteration > max_iterations:
                 result_holder["outcome"] = "capped"
                 return
-            _update_state(
-                state_path, {"iteration": str(iteration), "status": "running"}
-            )
+            _update_state(state_path, {"status": "running"})
             write_sidecar("lead", iteration, True, True)
             context = {
                 "mode": "open-loop",
@@ -723,9 +795,31 @@ def _lead_thread_body(
                 "sha": None,
                 "kind": "lead-pass",
             }
+            snapshot_before = _lead_pass_snapshot(mailbox, repo)
             result = _invoke_runner(lead_runner, "lead", iteration, mailbox, context)
             if result != 0:
                 raise RuntimeError(f"lead runner failed with exit {result}")
+            if _lead_pass_snapshot(mailbox, repo) == snapshot_before:
+                empty_attempts += 1
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | open-loop: lead pass made "
+                    f"no changes (attempt {empty_attempts})",
+                )
+                if empty_attempts >= 3:
+                    _update_state(state_path, {"status": "error"})
+                    _append_log(
+                        mailbox,
+                        f"- iter {iteration} | loop | open-loop: lead pass "
+                        f"made no changes after {empty_attempts} attempts",
+                    )
+                    result_holder["outcome"] = "stalled"
+                    return
+                continue
+            empty_attempts = 0
+            _update_state(
+                state_path, {"iteration": str(iteration), "status": "running"}
+            )
     except BaseException as exc:  # noqa: BLE001 - propagated to the poll loop
         result_holder["error"] = exc
     finally:
@@ -820,6 +914,7 @@ def run_open_loop(
                     stop_event,
                     holder,
                     force_first_pass,
+                    repo,
                 ),
                 daemon=True,
             )
@@ -972,6 +1067,11 @@ def run_open_loop(
                     return finish(3)
                 if lead_result.get("outcome") == "capped":
                     return finish(4)
+                if lead_result.get("outcome") == "stalled":
+                    # The Lead thread already set status: error and logged
+                    # the failure itself (open-loop Lead-pass output
+                    # verification) after 3 consecutive no-op passes.
+                    return finish(3)
                 # outcome == "done": re-check with fresh data before
                 # trusting it -- a slice-eval just above may have opened a
                 # fault after the Lead thread already decided it was done.
