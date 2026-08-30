@@ -137,7 +137,11 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    `trioctl omnigent run docs --prompt-file <path> --workspace .`.
 5. Inspect the Evaluator result. Any delegated Scout evidence must come from
    its own `trioctl omnigent run scout` invocation.
-6. Update STATE and LOG. After the verdict, set `loop/STATE.md` bookkeeping:
+6. Track every `conversation_id` returned by `sys_session_create` in this
+   loop — every Lead and Evaluator child (steps 2 and 4) and any worker
+   session created directly from this coordinator — in a running list kept
+   for the life of the loop.
+7. Update STATE and LOG. After the verdict, set `loop/STATE.md` bookkeeping:
    `status: <verdict>`, `verdict: <outcome>`, `eval: <one-line compressed
    evidence>` (key metrics + evidence dir path, e.g.
    `loop/evidence/iter<N>/`; schema: MAILBOX-SCHEMA.md), and `last_run:
@@ -153,6 +157,14 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    consecutive scoped verdict, or for any other ITERATE, run the full Lead
    pass as usual. On `VERDICT: NEEDS_HUMAN`, stop and surface the mandatory
    `## Human check` section from VERDICT.md.
+8. When the loop reaches a terminal state — `SHIP`, `BLOCKED`,
+   `NEEDS_HUMAN`, or an error abort (e.g. the commit-gate failure in step
+   4) — call `sys_session_close` on every id tracked in step 6, **excluding
+   the two registration-anchor sessions from Preflight step 3, which must
+   never be closed**. Do this after the terminal verdict (and, on SHIP, the
+   retirement commit) is written, before ending the turn. If a close fails
+   (session busy, already closed, etc.), report it and continue closing the
+   rest — cleanup is best-effort and must never change the loop's verdict.
 
 `sys_session_create` is asynchronous. Use inbox/session history tools and end
 the turn while a role is running; Omnigent wakes this session on completion.
