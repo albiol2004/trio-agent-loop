@@ -398,9 +398,21 @@ class BrokerClient:
         """List broker agents so live doctor can pick a probe target."""
         return self._request("GET", "/v1/agents")
 
-    def list_sessions(self) -> Any:
-        """List sessions registered on this broker, across all callers."""
-        return self._request("GET", "/v1/sessions")
+    def list_sessions(self, limit: int = 20, after: str | None = None) -> Any:
+        """List sessions registered on this broker, across all callers.
+
+        ``limit`` defaults to the server's own default (20) so every
+        existing (unpaged) caller sends the exact same request it always
+        has; paged callers (see trioctl's session-archive prune) pass a
+        larger ``limit`` and chase ``after`` -- a session-id cursor -- to
+        see past the server's default newest-20 window. The route has no
+        ``offset`` param, only cursor pagination.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if after:
+            params["after"] = after
+        query = urlencode(params)
+        return self._request("GET", f"/v1/sessions?{query}")
 
     def delete_session(self, session_id: str) -> Any:
         """Permanently delete one broker session."""
@@ -417,18 +429,20 @@ class BrokerClient:
         session_id: str,
         limit: int = 100,
         order: str = "asc",
-        offset: int = 0,
+        after: str | None = None,
     ) -> Any:
         """Fetch committed session items in the requested order.
 
-        ``offset`` is omitted from the query when zero, so every existing
-        (unpaged) caller sends the exact same request it always has;
-        paged callers (see trioctl's session-archive prune) pass it
+        The items route only supports cursor pagination -- there is no
+        ``offset`` -- so ``after`` is omitted from the query when unset,
+        meaning every existing (unpaged) caller sends the exact same
+        request it always has; paged callers (see trioctl's
+        session-archive prune) pass the previous page's last item id
         explicitly to walk past a broker's per-request ``limit`` cap.
         """
         params: dict[str, Any] = {"limit": limit, "order": order}
-        if offset:
-            params["offset"] = offset
+        if after:
+            params["after"] = after
         query = urlencode(params)
         path = f"/v1/sessions/{quote(session_id, safe='')}/items?{query}"
         return self._request("GET", path)

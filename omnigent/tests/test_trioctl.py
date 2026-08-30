@@ -1133,10 +1133,10 @@ class _FakeSessionsClient:
         self.deleted: list[str] = []
         self.archived_before_delete: list[Path] | None = None
 
-    def list_sessions(self):
+    def list_sessions(self, limit=20, after=None):
         return {"data": self.rows}
 
-    def get_items(self, session_id, limit=100, order="asc", offset=0):
+    def get_items(self, session_id, limit=100, order="asc", after=None):
         self.calls.append(("items", session_id))
         return {"items": [{"role": "assistant", "content": f"hi from {session_id}"}]}
 
@@ -1350,22 +1350,29 @@ def _make_paging_sessions_client(broker_http_module):
         def __init__(self, rows, items_by_session):
             self.rows = rows
             self.items_by_session = items_by_session
-            self.item_calls: list[tuple[str, int, int]] = []
+            self.item_calls: list[tuple[str, int, str | None]] = []
             self.deleted: list[str] = []
 
-        def list_sessions(self):
+        def list_sessions(self, limit=20, after=None):
             return {"data": self.rows}
 
-        def get_items(self, session_id, limit=100, order="asc", offset=0):
+        def get_items(self, session_id, limit=100, order="asc", after=None):
             if limit > 1000:
                 raise broker_http_module.BrokerHttpError(
                     f"GET .../items?limit={limit} failed with HTTP 422: "
                     "limit must be <= 1000",
                     status_code=422,
                 )
-            self.item_calls.append((session_id, limit, offset))
+            self.item_calls.append((session_id, limit, after))
             all_items = self.items_by_session.get(session_id, [])
-            page = all_items[offset : offset + limit]
+            # Mirrors the server's cursor contract: `after` is the id of the
+            # last item of the previous page, not a numeric offset.
+            if after is None:
+                start = 0
+            else:
+                ids = [item["id"] for item in all_items]
+                start = ids.index(after) + 1 if after in ids else len(all_items)
+            page = all_items[start : start + limit]
             return {"items": page}
 
         def delete_session(self, session_id):
@@ -1396,9 +1403,9 @@ def test_prune_pages_archive_reads_past_the_1000_item_broker_cap(tmp_path: Path)
         "failed": 0,
     }
     assert client.item_calls == [
-        ("s1", 1000, 0),
-        ("s1", 1000, 1000),
-        ("s1", 1000, 2000),
+        ("s1", 1000, None),
+        ("s1", 1000, "item-999"),
+        ("s1", 1000, "item-1999"),
     ]
     archived = list((mailbox / ".sessions").glob("*.jsonl"))
     assert len(archived) == 1
@@ -1409,6 +1416,90 @@ def test_prune_pages_archive_reads_past_the_1000_item_broker_cap(tmp_path: Path)
     assert json.loads(lines[-1])["id"] == "item-2499"
 
 
+def test_fetch_session_items_paged_stops_on_non_advancing_cursor():
+    """A broker bug that returns a full page whose last item id never
+    changes, no matter what cursor was requested, would spin
+    ``_fetch_session_items_paged`` forever chasing the same page. The
+    guard must stop it with an error after the second stuck page instead
+    of looping forever."""
+    trioctl = load_trioctl()
+
+    class _StuckCursorClient:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            self.calls.append(after)
+            # Always a full page ending in the same id, regardless of the
+            # cursor requested -- a pathological, never-advancing response.
+            page = [
+                {"id": f"item-{i}"}
+                for i in range(trioctl.SESSION_ARCHIVE_PAGE_LIMIT - 1)
+            ]
+            page.append({"id": "item-stuck"})
+            return {"items": page}
+
+    client = _StuckCursorClient()
+
+    items, error = trioctl._fetch_session_items_paged(client, "s1")
+
+    assert error is not None
+    assert "cursor did not advance" in str(error)
+    # Stopped after the second (stuck) page, not spun forever.
+    assert client.calls == [None, "item-stuck"]
+    assert len(items) == 2 * trioctl.SESSION_ARCHIVE_PAGE_LIMIT
+
+
+def test_prune_pages_through_more_sessions_than_the_default_list_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`_prune_broker_sessions` must page an `after` session-id cursor past
+    the broker's list page size to see every session, not just the first
+    page -- otherwise a target session outside the first page is invisible
+    to the prune, exactly like the server's default newest-20 window used
+    to hide everything past the first 20 sessions."""
+    trioctl = load_trioctl()
+    monkeypatch.setattr(trioctl, "SESSION_LIST_PAGE_LIMIT", 2)
+
+    class _PagedListClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.list_calls: list[tuple[int, str | None]] = []
+            self.deleted: list[str] = []
+
+        def list_sessions(self, limit=20, after=None):
+            self.list_calls.append((limit, after))
+            ids = [row["id"] for row in self.rows]
+            start = (
+                0
+                if after is None
+                else (ids.index(after) + 1 if after in ids else len(self.rows))
+            )
+            return {"data": self.rows[start : start + limit]}
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            return {"items": []}
+
+        def delete_session(self, session_id):
+            self.deleted.append(session_id)
+            return {"deleted": True}
+
+    rows = [
+        _row("s-1", "not a trioctl session"),
+        _row("s-2", "not a trioctl session"),
+        _row("s-target", "trioctl mbx iteration 5 lead"),
+    ]
+    client = _PagedListClient(rows)
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert client.list_calls == [(2, None), (2, "s-2")]
+    assert client.deleted == ["s-target"]
+    assert counts["deleted"] == 1
+
+
 def test_prune_one_failing_session_read_does_not_abort_the_others(tmp_path: Path):
     """A session whose item read errors out must not stop the run: other
     sessions still get archived and deleted, and the failing one is
@@ -1417,13 +1508,13 @@ def test_prune_one_failing_session_read_does_not_abort_the_others(tmp_path: Path
     _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
 
     class _OneFailsClient(_PagingSessionsClient):
-        def get_items(self, session_id, limit=100, order="asc", offset=0):
+        def get_items(self, session_id, limit=100, order="asc", after=None):
             if session_id == "s-bad":
                 raise trioctl.broker_http.BrokerHttpError(
                     "GET .../items failed with HTTP 500", status_code=500
                 )
             return super().get_items(
-                session_id, limit=limit, order=order, offset=offset
+                session_id, limit=limit, order=order, after=after
             )
 
     mailbox = tmp_path / "mbx"

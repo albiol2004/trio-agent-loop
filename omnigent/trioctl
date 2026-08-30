@@ -892,8 +892,15 @@ def command_session_read(args: argparse.Namespace) -> int:
 #
 # The broker rejects GET .../items?limit=<n> above 1000 with HTTP 422, so
 # a transcript longer than that must be paged: SESSION_ARCHIVE_PAGE_LIMIT
-# per request, advancing by `offset` until a page comes back short.
+# per request, advancing an `after` item-id cursor until a page comes back
+# short. The items route has no `offset` -- only cursor pagination.
 SESSION_ARCHIVE_PAGE_LIMIT = 1000
+
+# GET /v1/sessions defaults to the newest 20 sessions and caps `limit` at
+# 1000 (also cursor-paginated, no `offset`), so the prune must page through
+# SESSION_LIST_PAGE_LIMIT-sized windows to see every session it might need
+# to match, not just the newest handful.
+SESSION_LIST_PAGE_LIMIT = 1000
 
 # A `trioctl omnigent loop` process exports this before running the loop,
 # pointing at `<mailbox>/.sessions/run-<pid>.ids` -- a run-scoped, one-id-
@@ -956,36 +963,90 @@ def _session_archive_filename(row: dict[str, Any]) -> str:
     )
 
 
+def _item_cursor_id(item: Any) -> str | None:
+    """Read an item row's id for cursor paging, or ``None`` if unusable."""
+    if isinstance(item, dict):
+        value = item.get("id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _fetch_session_items_paged(
     client: Any, session_id: str
 ) -> tuple[list[Any], Any]:
     """Page a session's full item history at SESSION_ARCHIVE_PAGE_LIMIT per
     request (the broker rejects a larger ``limit`` with HTTP 422),
-    advancing by ``offset`` until a page returns fewer items than the page
-    limit (or none).
+    advancing an ``after`` item-id cursor to the previous page's last item
+    until a page returns fewer items than the page limit (or none). The
+    items route only supports cursor pagination -- there is no ``offset``.
 
     Returns ``(items, error)``: whatever items were read successfully,
     plus the ``BrokerHttpError`` that stopped the read early, or ``None``
     on a clean full read. A mid-transcript failure still yields whatever
-    was read before it, instead of losing everything.
+    was read before it, instead of losing everything. A cursor that fails
+    to advance between two pages (an unusable or repeated last-item id)
+    also stops the read with an error, rather than looping forever on the
+    same page.
     """
     items: list[Any] = []
-    offset = 0
+    after: str | None = None
     while True:
         try:
             payload = client.get_items(
                 session_id,
                 limit=SESSION_ARCHIVE_PAGE_LIMIT,
                 order="asc",
-                offset=offset,
+                after=after,
             )
         except broker_http.BrokerHttpError as exc:
             return items, exc
         page = _session_items(payload)
+        if not page:
+            return items, None
         items.extend(page)
         if len(page) < SESSION_ARCHIVE_PAGE_LIMIT:
             return items, None
-        offset += SESSION_ARCHIVE_PAGE_LIMIT
+        next_after = _item_cursor_id(page[-1])
+        if not next_after or next_after == after:
+            return items, broker_http.BrokerHttpError(
+                f"GET .../{session_id}/items cursor did not advance past "
+                f"{after!r}; aborting to avoid an infinite loop"
+            )
+        after = next_after
+
+
+def _fetch_all_broker_sessions(client: Any) -> list[dict[str, Any]]:
+    """Page ``client.list_sessions()`` at SESSION_LIST_PAGE_LIMIT per
+    request until a page returns fewer rows than the limit (or none), so
+    the prune can see every session on the broker instead of just the
+    server's default newest-20 window. Advances an ``after`` session-id
+    cursor to the previous page's last row; a cursor that fails to
+    advance between two pages raises instead of looping forever.
+    """
+    list_sessions = getattr(client, "list_sessions", None)
+    if list_sessions is None:
+        raise TrioctlError("broker client has no session-list method")
+    rows: list[dict[str, Any]] = []
+    after: str | None = None
+    while True:
+        try:
+            payload = list_sessions(limit=SESSION_LIST_PAGE_LIMIT, after=after)
+        except broker_http.BrokerHttpError as exc:
+            raise TrioctlError(str(exc)) from exc
+        page = [row for row in _session_items(payload) if isinstance(row, dict)]
+        if not page:
+            return rows
+        rows.extend(page)
+        if len(page) < SESSION_LIST_PAGE_LIMIT:
+            return rows
+        last_row_id = page[-1].get("id") or page[-1].get("session_id")
+        if not isinstance(last_row_id, str) or not last_row_id or last_row_id == after:
+            raise TrioctlError(
+                "GET /v1/sessions cursor did not advance past "
+                f"{after!r}; aborting to avoid an infinite loop"
+            )
+        after = last_row_id
 
 
 def _prune_broker_sessions(
@@ -1015,14 +1076,7 @@ def _prune_broker_sessions(
     transcript is written under ``<mailbox>/.sessions/`` *before* its
     broker session is deleted.
     """
-    list_sessions = getattr(client, "list_sessions", None)
-    if list_sessions is None:
-        raise TrioctlError("broker client has no session-list method")
-    try:
-        payload = list_sessions()
-    except broker_http.BrokerHttpError as exc:
-        raise TrioctlError(str(exc)) from exc
-    rows = [row for row in _session_items(payload) if isinstance(row, dict)]
+    rows = _fetch_all_broker_sessions(client)
     if session_ids is not None:
         wanted_ids = {sid for sid in session_ids if isinstance(sid, str) and sid}
 
