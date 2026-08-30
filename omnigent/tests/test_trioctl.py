@@ -12,6 +12,7 @@ import threading
 import textwrap
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -102,6 +103,7 @@ def fake_broker():
         "online_runners": [{"runner_id": "runner-1", "online": True}],
         "session_rows": [],
         "deletes": [],
+        "session_list_queries": [],
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -197,6 +199,7 @@ def fake_broker():
                 self.send_json(200, {"data": state["online_runners"]})
                 return
             if parsed.path == "/v1/sessions":
+                state["session_list_queries"].append(parse_qs(parsed.query))
                 self.send_json(200, {"data": state["session_rows"]})
                 return
             state["session_gets"] += 1
@@ -1117,6 +1120,11 @@ def test_list_and_delete_sessions_over_http(fake_broker):
 
     listed = client.list_sessions()
     assert listed == {"data": state["session_rows"]}
+    assert "kind" not in state["session_list_queries"][-1]
+
+    listed_any = client.list_sessions(kind="any")
+    assert listed_any == {"data": state["session_rows"]}
+    assert state["session_list_queries"][-1]["kind"] == ["any"]
 
     deleted = client.delete_session("session-9")
     assert deleted == {"deleted": True}
@@ -1338,6 +1346,111 @@ def test_prune_id_scoped_archives_before_deleting(tmp_path: Path):
     assert client.calls == [("items", "s-new"), ("delete", "s-new")]
     assert client.archived_before_delete is not None
     assert len(client.archived_before_delete) == 1
+
+
+class _KindAwareSessionsClient:
+    """Offline double whose `list_sessions` filters by `kind` the way the
+    real broker route does: `kind=None`/`"default"` returns only rows
+    whose own `kind` is `"default"` (the field is absent on plain `_row()`
+    fixtures, which default to `"default"`); `kind="any"` returns every
+    row regardless of its own kind. Used to prove `--include-sub-agents`
+    actually widens what the listing call requests and sees."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.list_calls: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
+
+    def list_sessions(self, limit=20, after=None, kind=None):
+        self.list_calls.append({"limit": limit, "after": after, "kind": kind})
+        if kind == "any":
+            selected = list(self.rows)
+        else:
+            selected = [r for r in self.rows if r.get("kind", "default") == "default"]
+        return {"data": selected}
+
+    def get_items(self, session_id, limit=100, order="asc", after=None):
+        return {"items": [{"role": "assistant", "content": f"hi from {session_id}"}]}
+
+    def delete_session(self, session_id):
+        self.deleted.append(session_id)
+        return {"deleted": True}
+
+
+def test_prune_flag_off_lists_default_kind_and_never_sees_sub_agent_rows(
+    tmp_path: Path,
+):
+    """With `include_sub_agents` unset, the listing call must not widen
+    `kind` (so the server's own `kind=default` stays in effect) and a
+    sub_agent-kind row -- even one whose title matches -- never becomes
+    visible to select."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl mbx iteration 1 lead"),
+        {**_row("s2", "trioctl mbx iteration 2 evaluator"), "kind": "sub_agent"},
+    ]
+    client = _KindAwareSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert client.list_calls[0]["kind"] is None
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+
+
+def test_prune_include_sub_agents_widens_kind_and_matches_sub_agent_row(
+    tmp_path: Path,
+):
+    """With `include_sub_agents=True`, the listing call requests
+    `kind="any"` and a sub_agent-kind row whose title matches the same
+    `trioctl <mailbox> ` prefix is archived and deleted -- selection
+    itself is unchanged, only the listing's visibility is widened."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        {**_row("s1", "trioctl mbx iteration 1 lead"), "kind": "sub_agent"},
+        _row("s2", "unrelated broker session"),
+    ]
+    client = _KindAwareSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, include_sub_agents=True)
+
+    assert client.list_calls[0]["kind"] == "any"
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+    archived = list((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 1
+
+
+def test_command_sessions_prune_cli_include_sub_agents_flag_widens_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """The `--include-sub-agents` CLI flag reaches `_prune_broker_sessions`
+    and widens the listing's `kind`, without changing title matching."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [{**_row("s1", "trioctl mbx iteration 1 lead"), "kind": "sub_agent"}]
+    client = _KindAwareSessionsClient(rows)
+    monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "sessions",
+            "prune",
+            "--mailbox",
+            str(mailbox),
+            "--include-sub-agents",
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert client.list_calls[0]["kind"] == "any"
+    assert client.deleted == ["s1"]
+    assert "archived 1, deleted 1" in capsys.readouterr().out
 
 
 def _make_paging_sessions_client(broker_http_module):

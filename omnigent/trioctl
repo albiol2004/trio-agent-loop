@@ -1016,13 +1016,20 @@ def _fetch_session_items_paged(
         after = next_after
 
 
-def _fetch_all_broker_sessions(client: Any) -> list[dict[str, Any]]:
+def _fetch_all_broker_sessions(
+    client: Any, *, kind: str | None = None
+) -> list[dict[str, Any]]:
     """Page ``client.list_sessions()`` at SESSION_LIST_PAGE_LIMIT per
     request until a page returns fewer rows than the limit (or none), so
     the prune can see every session on the broker instead of just the
     server's default newest-20 window. Advances an ``after`` session-id
     cursor to the previous page's last row; a cursor that fails to
     advance between two pages raises instead of looping forever.
+
+    ``kind`` is forwarded to ``list_sessions`` as-is; omitted (``None``)
+    it leaves the server on its own default, which excludes the
+    ``sub_agent``-kind sessions the Omnigent UI creates via
+    ``sys_session_create``.
     """
     list_sessions = getattr(client, "list_sessions", None)
     if list_sessions is None:
@@ -1030,8 +1037,11 @@ def _fetch_all_broker_sessions(client: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     after: str | None = None
     while True:
+        list_kwargs: dict[str, Any] = {"limit": SESSION_LIST_PAGE_LIMIT, "after": after}
+        if kind is not None:
+            list_kwargs["kind"] = kind
         try:
-            payload = list_sessions(limit=SESSION_LIST_PAGE_LIMIT, after=after)
+            payload = list_sessions(**list_kwargs)
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         page = [row for row in _session_items(payload) if isinstance(row, dict)]
@@ -1057,6 +1067,7 @@ def _prune_broker_sessions(
     dry_run: bool = False,
     keep_failed: bool = False,
     session_ids: Any = None,
+    include_sub_agents: bool = False,
 ) -> dict[str, int]:
     """Archive-then-delete broker sessions, id-scoped or title-scoped.
 
@@ -1075,8 +1086,18 @@ def _prune_broker_sessions(
     additionally skips ``failed``/``error`` sessions, and every archived
     transcript is written under ``<mailbox>/.sessions/`` *before* its
     broker session is deleted.
+
+    ``include_sub_agents`` widens the *listing* only: it passes
+    ``kind="any"`` to the broker so ``sub_agent``-kind sessions -- e.g.
+    ones the Omnigent UI's trio-omnigent skill creates via
+    ``sys_session_create``, invisible under the server's ``kind=default``
+    listing -- are among the rows considered. Title matching above is
+    unchanged either way; a session is still only touched if its title
+    actually matches.
     """
-    rows = _fetch_all_broker_sessions(client)
+    rows = _fetch_all_broker_sessions(
+        client, kind="any" if include_sub_agents else None
+    )
     if session_ids is not None:
         wanted_ids = {sid for sid in session_ids if isinstance(sid, str) and sid}
 
@@ -1159,6 +1180,13 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
     scoped to only the sessions that run itself created. Use this for a
     one-off sweep, or to clean up sessions left behind by a run that never
     reached its own cleanup (e.g. `--keep-sessions`, or a crash).
+
+    ``--include-sub-agents`` additionally lists ``kind=sub_agent`` broker
+    sessions -- e.g. ones the Omnigent UI's trio-omnigent skill creates via
+    ``sys_session_create`` -- which the default listing hides. Matching
+    still requires the same ``trioctl <mailbox.name> `` title prefix, so
+    the flag only helps when a sub-agent session actually carries that
+    title.
     """
     mailbox = Path(args.mailbox).expanduser().resolve()
     client = _session_client(getattr(args, "base_url", None))
@@ -1168,6 +1196,7 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
         all_scope=args.all,
         dry_run=args.dry_run,
         keep_failed=args.keep_failed,
+        include_sub_agents=args.include_sub_agents,
     )
     print(
         f"trioctl: archived {counts['archived']}, deleted {counts['deleted']}, "
@@ -2165,6 +2194,15 @@ def parser() -> argparse.ArgumentParser:
         "--keep-failed",
         action="store_true",
         help="skip sessions with status failed or error",
+    )
+    sessions_prune.add_argument(
+        "--include-sub-agents",
+        action="store_true",
+        help=(
+            "also list kind=sub_agent broker sessions (e.g. ones the "
+            "Omnigent UI's trio-omnigent skill creates), so they're "
+            "considered against the same trioctl title-prefix match"
+        ),
     )
     sessions_prune.add_argument(
         "--base-url",

@@ -398,7 +398,12 @@ class BrokerClient:
         """List broker agents so live doctor can pick a probe target."""
         return self._request("GET", "/v1/agents")
 
-    def list_sessions(self, limit: int = 20, after: str | None = None) -> Any:
+    def list_sessions(
+        self,
+        limit: int = 20,
+        after: str | None = None,
+        kind: str | None = None,
+    ) -> Any:
         """List sessions registered on this broker, across all callers.
 
         ``limit`` defaults to the server's own default (20) so every
@@ -407,10 +412,18 @@ class BrokerClient:
         larger ``limit`` and chase ``after`` -- a session-id cursor -- to
         see past the server's default newest-20 window. The route has no
         ``offset`` param, only cursor pagination.
+
+        ``kind`` is omitted by default, which leaves the server on its own
+        default (``kind=default``) -- the route also accepts ``sub_agent``
+        and ``any``. A caller that needs sessions the Omnigent UI created
+        via ``sys_session_create`` (``kind=sub_agent``, invisible under the
+        server default) passes ``kind="any"`` explicitly.
         """
         params: dict[str, Any] = {"limit": limit}
         if after:
             params["after"] = after
+        if kind:
+            params["kind"] = kind
         query = urlencode(params)
         return self._request("GET", f"/v1/sessions?{query}")
 
