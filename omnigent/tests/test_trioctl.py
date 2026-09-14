@@ -257,7 +257,7 @@ def test_cursor_lead_resolves_grok_medium():
 def test_registry_profile_tracks_stored_role_prompt_revision():
     trioctl = load_trioctl()
 
-    assert trioctl.REGISTRY_PROFILE == "cursor-grok-4.6-medium+luna-max-v2"
+    assert trioctl.REGISTRY_PROFILE == "cursor-grok-4.6-medium+glm-5.2-max-v3"
 
 
 def test_codex_family_chooses_newest_available_model():
@@ -1929,3 +1929,15 @@ def test_broker_loader_does_not_import_real_omnigent():
     load_trioctl()
 
     assert sys.modules.get("omnigent") is prior
+
+
+def test_shipped_cursor_profile_uses_glm_workers_and_grok_judges():
+    import tomllib
+
+    trioctl = load_trioctl()
+    config = tomllib.loads((SCRIPT.parent / "trioctl.example.toml").read_text())
+    models = [model("glm-5.2-max"), model("gpt-5.6-luna-max"), model("cursor-grok-4.6-medium")]
+    for role in ("builder", "scout", "docs", "lead", "evaluator"):
+        resolved = trioctl.resolve_role(role, config, models=models)
+        assert resolved["model"] == ("glm-5.2-max" if role in ("builder", "scout", "docs") else "cursor-grok-4.6-medium")
+        assert resolved["reasoning_effort"] is None

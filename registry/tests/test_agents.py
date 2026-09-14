@@ -447,6 +447,22 @@ class SpawnRendering(unittest.TestCase):
 
 
 class AllCombinations(unittest.TestCase):
+    def test_cursor_cheap_workers_use_glm_without_changing_native_models(self):
+        expected = {"cursor": "glm-5.2-max", "omnigent": "glm-5.2-max", "codex": "gpt-5.6-luna", "claude": "haiku"}
+        for name in ("trio-builder", "trio-scout", "trio-docs"):
+            agent = _make_agent(name=name, model_tier="cheap")
+            for harness, model in expected.items():
+                with self.subTest(name=name, harness=harness):
+                    rendered = agents.render_agent(agent, harness)
+                    if harness == "codex":
+                        fields = scan.parse_toml(rendered.text)
+                    elif harness == "omnigent":
+                        fields = scan.parse_yaml(rendered.text)["executor"]
+                    else:
+                        fields, _ = scan.parse_frontmatter(rendered.text)
+                    self.assertEqual(fields["model"], model)
+
+
     def test_every_combination_renders_without_raising(self):
         for tier in agents.MODEL_TIERS:
             for policy in agents.TOOL_POLICIES:

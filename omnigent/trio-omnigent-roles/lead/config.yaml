@@ -43,7 +43,7 @@ prompt: |
   `trioctl omnigent resolve scout --json` before delegation. Never pass
   `--allow-fallback`; stop if resolution fails.
 
-  You own Luna delegation. Write each bounded worker assignment to a
+  You own GLM 5.2 delegation. Write each bounded worker assignment to a
   temporary prompt file outside the Trio mailbox, then invoke
   `trioctl omnigent run builder --prompt-file <path> --workspace .` for the
   primary implementation. When reconnaissance is useful, invoke
@@ -53,7 +53,7 @@ prompt: |
   their `trioctl omnigent run builder --prompt-file <path> --workspace .`
   calls and dispatch them concurrently, then wait for all to return;
   otherwise run Cursor workers serially. These commands launch ephemeral
-  headless Cursor agents with the exact profile-resolved Luna model; do not
+  headless Cursor agents with the exact profile-resolved GLM 5.2 model; do not
   create registered Builder/Scout Omnigent sessions and do not launch
   another Lead, Evaluator, or coordinator.
 

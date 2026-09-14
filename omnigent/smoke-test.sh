@@ -49,7 +49,7 @@ EOF
 #!/usr/bin/env bash
 if [[ "${1:-}" == "models" ]]; then
   echo 'cursor-grok-4.6-medium - Cursor Grok 4.6 Medium'
-  echo 'gpt-5.6-luna-max - GPT-5.6 Luna 1M Max'
+  echo 'glm-5.2-max - GLM 5.2 Max'
 fi
 exit 0
 EOF
@@ -104,7 +104,7 @@ installer_replacement_contract() {
     "$ROOT/install.sh" --omnigent >/dev/null
   [[ ! -e "$claude_skill/stale.txt" ]] || return 1
   [[ "$(<"$roles/registry.json")" == '{"preserve":true}' ]] || return 1
-  [[ "$(find "$roles" -type f -name config.yaml | wc -l)" -eq 4 ]] || return 1
+  [[ "$(find "$roles" -type f -name config.yaml | wc -l)" -eq 5 ]] || return 1
   [[ -f "$claude_skill/SKILL.md" && -f "$codex_skill/SKILL.md" ]] || return 1
   [[ -f "$claude_pz_skill/SKILL.md" && -f "$codex_pz_skill/SKILL.md" ]] || return 1
   [[ -x "$trioctl" && -f "$trioctl_config" ]] || return 1
@@ -128,8 +128,9 @@ root = pathlib.Path(sys.argv[1])
 expected = {
     "lead": ("trio-omnigent-lead", "cursor-native", "cursor-grok-4.6-medium"),
     "evaluator": ("trio-omnigent-evaluator", "cursor-native", "cursor-grok-4.6-medium"),
-    "builder": ("trio-omnigent-builder", "cursor-native", "gpt-5.6-luna-max"),
-    "scout": ("trio-omnigent-scout", "cursor-native", "gpt-5.6-luna-max"),
+    "builder": ("trio-omnigent-builder", "cursor-native", "glm-5.2-max"),
+    "scout": ("trio-omnigent-scout", "cursor-native", "glm-5.2-max"),
+    "docs": ("trio-omnigent-docs", "cursor-native", "glm-5.2-max"),
 }
 for role, (name, harness, model) in expected.items():
     data = yaml.safe_load((root / "omnigent/trio-omnigent-roles" / role / "config.yaml").read_text())
@@ -146,8 +147,8 @@ PY
 }
 
 protocol_contract() {
-  assert grep -Fq 'cursor-grok-4.6-medium+luna-max-v2' "$ROOT/omnigent/trioctl"
-  assert grep -Fq 'cursor-grok-4.6-medium+luna-max-v2' \
+  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v3' "$ROOT/omnigent/trioctl"
+  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v3' \
     "$ROOT/omnigent/entrypoints/trio-omnigent/SKILL.md"
   assert grep -Fq 'Before any deep reconnaissance' \
     "$ROOT/omnigent/trio-omnigent-roles/lead/config.yaml"

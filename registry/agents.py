@@ -66,10 +66,10 @@ MODEL_TIERS: dict[str, dict[str, dict]] = {
     "cheap": {
         "claude": {"model": "haiku"},
         "codex": {"model": "gpt-5.6-luna", "model_reasoning_effort": "low"},
-        "cursor": {"model": "gpt-5.6-luna-max"},
+        "cursor": {"model": "glm-5.2-max"},
         "omp": {"model": "deepseek/deepseek-v4-flash"},
         "opencode": {},
-        "omnigent": {"model": "gpt-5.6-luna-max"},
+        "omnigent": {"model": "glm-5.2-max"},
     },
 }
 

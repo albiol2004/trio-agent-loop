@@ -16,8 +16,8 @@ of this session:
 - `trio-omnigent-evaluator`: Cursor Grok 4.6, normally `cursor-grok-4.6-medium`
 
 The Grok roles own delegation. They launch ephemeral headless Cursor workers
-through `trioctl`; every worker uses the profile-resolved GPT-5.6 Luna model,
-normally `gpt-5.6-luna-max`. Never launch a Luna worker directly from this
+through `trioctl`; every worker uses the profile-resolved GLM 5.2 model,
+normally `glm-5.2-max`. Never launch a GLM 5.2 worker directly from this
 coordinator.
 
 ## Preflight and one-time registration
@@ -28,7 +28,7 @@ coordinator.
 2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
    It maps the two exact judgment-role names to persisted `agent_id` values.
    Its `_profile` must be exactly
-   `cursor-grok-4.6-medium+luna-max-v2`. A missing or different marker means
+   `cursor-grok-4.6-medium+glm-5.2-max-v3`. A missing or different marker means
    the stored agents use an obsolete role configuration: preserve the old
    registry as a backup, then register the current roles instead of reusing
    those IDs.
@@ -49,7 +49,7 @@ coordinator.
 5. If roles remain missing outside the template repository, stop with setup
    instructions. Never fall back to native Trio or another model.
 6. Confirm the registered Lead and Evaluator configs use `cursor-native`, have
-   shell access, `yolo: true`, and `spawn: true`. Grok owns Luna delegation by
+   shell access, `yolo: true`, and `spawn: true`. Grok owns GLM 5.2 delegation by
    running `trioctl omnigent run`;
    Builder and Scout must not be registered as persistent Omnigent agents.
 7. Run `trioctl omnigent doctor`. Stop on any failed check. Then run
@@ -103,7 +103,7 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    `sys_session_create(agent_id=..., model=<resolved model>, message=...)`.
    Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
-   perform its own Luna delegation through `trioctl omnigent run`,
+   perform its own GLM 5.2 delegation through `trioctl omnigent run`,
    review/correct, verify, and write REPORT. The headless Lead prompt
    enforces a clean working tree on start and mandates per-slice commits
    (`slice(<id>): …`) before finishing — no uncommitted changes or amends to
@@ -112,10 +112,10 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    large file; first-turn full-file ingest of the 2.1 MB monolith crashed the
    provider transport twice. Use a title containing mailbox and iteration.
 3. Inspect the Lead result and actual diff. Its report must identify the
-   profile-resolved Luna worker and include the captured `trioctl` result.
+   profile-resolved GLM 5.2 worker and include the captured `trioctl` result.
 4. Resolve Evaluator with `trioctl`, then create a fresh Evaluator child with
    its returned model and effort. Require it to independently verify, decide
-   whether it needs a Luna Scout, and write VERDICT with one of SHIP, ITERATE
+   whether it needs a GLM 5.2 Scout, and write VERDICT with one of SHIP, ITERATE
    (optionally `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or
    BLOCKED on the first line. On a SHIP verdict, the Evaluator child performs
    the retirement commit as part of writing it: product changes as

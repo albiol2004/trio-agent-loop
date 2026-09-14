@@ -24,19 +24,19 @@ or `~/.codex/AGENTS.md` (via `./install.sh --codex`). `./install.sh
 |---|---|---|---|
 | Lead | `cursor-native` | `cursor-grok-4.6-medium` | `medium` in model ID |
 | Evaluator | `cursor-native` | `cursor-grok-4.6-medium` | `medium` in model ID |
-| Builder | headless `cursor-agent` | `gpt-5.6-luna-max` | `max` in model ID |
-| Scout | headless `cursor-agent --mode ask` | `gpt-5.6-luna-max` | `max` in model ID |
+| Builder | headless `cursor-agent` | `glm-5.2-max` | `max` in model ID |
+| Scout | headless `cursor-agent --mode ask` | `glm-5.2-max` | `max` in model ID |
 
 The Claude or Codex session already open in Omnigent schedules iterations. It
 creates only Lead and Evaluator as direct Grok 4.6 Medium children. Lead decides
-when to run a Cursor GPT-5.6 Luna Max Builder or Scout through `trioctl`;
-Evaluator decides when it needs a read-only Luna Scout. There is no additional
+when to run a Cursor GLM 5.2 Max Builder or Scout through `trioctl`;
+Evaluator decides when it needs a read-only GLM 5.2 Scout. There is no additional
 coordinator model, and the root session never delegates implementation directly
-to Luna.
+to GLM 5.2.
 
 `trioctl` owns this runtime mapping. Cursor exposes account-entitled model IDs
 through `cursor-agent models`, so `trioctl` requires the non-fast Grok 4.6
-Medium and GPT-5.6 Luna Max variants before launching.
+Medium and GLM 5.2 Max variants before launching.
 Cursor encodes effort in the model ID. `trioctl` invokes Cursor's supported
 headless print mode and captures the worker result for Grok. It never silently
 substitutes Auto, Composer, another provider, or native Trio.
@@ -95,7 +95,7 @@ Edit the TOML profile to change a role's alias, model family, exact model, or
 effort. The next child uses the new values; role re-registration is unnecessary
 for model-only changes.
 
-To migrate an existing profile to Grok 4.6 Medium and Luna Max, replace it with
+To migrate an existing profile to Grok 4.6 Medium and GLM 5.2 Max, replace it with
 the repository default and review the resulting TOML:
 
 ```bash
@@ -104,12 +104,12 @@ trioctl omnigent configure --force
 
 If an earlier Cursor-native Trio build registered persistent Builder or Scout
 anchors, remove those two entries from `registry.json` and restart Omnigent
-once. The restart terminates their old Cursor TUI processes; future Luna
+once. The restart terminates their old Cursor TUI processes; future GLM 5.2
 workers are ephemeral headless commands and need no registration or restart.
 `trioctl omnigent doctor` fails while either obsolete entry remains.
 
 Resolution is intentionally strict. A missing Cursor catalog, missing Grok 4.6
-Medium or Luna Max entitlement, or unsupported selection exits non-zero. `--allow-fallback` opts into
+Medium or GLM 5.2 Max entitlement, or unsupported selection exits non-zero. `--allow-fallback` opts into
 the profile's exact fallback slug for diagnostics or recovery, but the
 `trio-omnigent` skill never uses it automatically.
 
@@ -166,15 +166,15 @@ The agent should:
    `reasoning_effort` and registered-agent native permission propagation.
 3. Run `./install.sh --omnigent`.
 4. Run `trioctl omnigent models` and resolve all four roles. Stop if Grok 4.6
-   Medium, Luna Max, or a configured effort is unavailable.
+   Medium, GLM 5.2 Max, or a configured effort is unavailable.
 5. Discover Omnigent's deferred `sys_session_create`, `sys_session_close`, and
    `sys_agent_list` tools.
 6. Back up a registry whose `_profile` is not
-   `cursor-grok-4.6-medium+luna-max-v2`, then register only the two judgment
+   `cursor-grok-4.6-medium+glm-5.2-max-v3`, then register only the two judgment
    roles by creating an idle child from:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-7. Write `_profile: cursor-grok-4.6-medium+luna-max-v2` plus the exact returned
+7. Write `_profile: cursor-grok-4.6-medium+glm-5.2-max-v3` plus the exact returned
    `agent_id` and `bootstrap_conversation_id` values to
    `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`, keyed by
    `trio-omnigent-{lead,evaluator}`. Leave the idle bootstrap
@@ -206,7 +206,7 @@ now say:
 The `trio-omnigent` skill keeps that already-open session as the iteration
 scheduler. It resolves the profile at runtime and launches Grok 4.6 Medium Lead
 and Evaluator; those roles independently resolve and run ephemeral headless
-Cursor GPT-5.6 Luna Max workers. It runs until
+Cursor GLM 5.2 Max workers. It runs until
 SHIP/BLOCKED/NEEDS_HUMAN by default. Say “one supervised iteration” to stop
 after one verdict.
 
@@ -261,13 +261,13 @@ python3 -m pytest -q omnigent/tests/test_trioctl.py
 
 Do a short real smoke run. Lead/Evaluator must show the profile-resolved Cursor
 Grok 4.6 Medium pair. Their captured `trioctl` output must identify the
-profile-resolved Cursor GPT-5.6 Luna Max worker.
+profile-resolved Cursor GLM 5.2 Max worker.
 
 For a real smoke run, inspect the UI session tree: the current session must
 remain the root, with Lead/Evaluator as direct Grok 4.6 Medium children. Builder
 and Scout do not appear as persistent Omnigent children; the Grok role's command
 history and report must show its own `trioctl omnigent run` invocation. A
-root-launched Luna process or any extra coordinator is a failure.
+root-launched GLM 5.2 process or any extra coordinator is a failure.
 
 ## Remove
 
@@ -280,7 +280,7 @@ installations remain intact.
 
 Omnigent exposes the `trio-productionize-omnigent` entrypoint skill. `--productionize`
 (or the Omnigent install flag) installs the shared assets. Productionize uses
-the same registered Grok judgment roles and ephemeral Luna probe workers as
+the same registered Grok judgment roles and ephemeral GLM 5.2 probe workers as
 Trio; the canonical productionize driver remains the source of batch state.
 Invoke it from the current Claude or Codex session with the explicit phrase
 “Productionize Omnigent” or `/trio-productionize-omnigent`. The ordinary

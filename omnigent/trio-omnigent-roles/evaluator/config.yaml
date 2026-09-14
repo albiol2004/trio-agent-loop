@@ -32,7 +32,7 @@ prompt: |
   When independent reconnaissance would improve the audit, write a bounded
   read-only assignment to a temporary file outside the Trio mailbox and invoke
   `trioctl omnigent run scout --prompt-file <path> --workspace .`. Remove the
-  temporary file afterward. This launches an ephemeral headless Cursor Luna
+  temporary file afterward. This launches an ephemeral headless Cursor GLM 5.2
   Scout in read-only ask mode. Never pass `--allow-fallback`, create a
   registered Builder/Scout Omnigent session, or create another Lead, Evaluator,
   or coordinator.

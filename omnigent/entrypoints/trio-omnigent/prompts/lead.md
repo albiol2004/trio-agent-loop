@@ -10,7 +10,7 @@ mailbox `{mailbox}` at iteration {iteration}.
    out-of-scope fence. Preserve completed slices.
 3. Choose the smallest independently verifiable increment. Use the repository's
    existing patterns and delegate bounded implementation or reconnaissance to
-   Luna through `trioctl omnigent run`. Inspect the actual diff after workers
+   GLM 5.2 through `trioctl omnigent run`. Inspect the actual diff after workers
    return and correct integration or correctness issues yourself.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
