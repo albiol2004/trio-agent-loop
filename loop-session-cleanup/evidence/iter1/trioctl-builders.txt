@@ -1,0 +1,24 @@
+GLM worker: glm-5.2-max (trioctl omnigent resolve builder --json)
+
+All invocations:
+python3 omnigent/trioctl omnigent run builder \
+  --prompt-file loop-session-cleanup/briefs/<slice>.md \
+  --workspace . --timeout 900
+(docs slice timeout 600)
+
+1) skill-titles-and-backstop  exit 0  ~107s
+   SKILL.md + prompts/lead.md + prompts/evaluator.md
+   Lead fixed slice(<id>): typo after review.
+
+2) headless-signals  exit 0  ~173s
+   command_loop SIGINT/SIGTERM + finally prune; 4 new tests.
+
+3) archive-policy  exit 0  ~310s
+   retry then DELETE; --keep-unarchived; tests updated.
+
+4) prune-scheme  exit 0  ~243s
+   OmnigentRunner._title locked scheme; anchor tests.
+   Lead fixed prune mocks for keep_unarchived=.
+
+5) docs  exit 0  ~76s
+   SETUP-BY-OMNIGENT.md hygiene section; VERSION 0.5.0.

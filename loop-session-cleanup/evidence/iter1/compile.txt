@@ -1,0 +1,4 @@
+python3 -W error -m py_compile omnigent/trioctl \
+  omnigent/tests/test_trioctl.py \
+  omnigent/tests/test_omnigent_loop.py
+exit 0 (no output)

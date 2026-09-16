@@ -1,0 +1,6 @@
+trioctl: dry-run would archive and delete: s-lead trioctl loop-session-cleanup lead:iteration 1
+trioctl: dry-run would archive and delete: s-eval trioctl loop-session-cleanup evaluator:iteration 1
+list_kind: [{'kind': 'any'}]
+deleted: []
+counts: {'archived': 0, 'deleted': 0, 'skipped_running': 0, 'skipped_failed': 0, 'failed': 0}
+expected: would archive/delete s-lead and s-eval; skip anchors

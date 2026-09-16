@@ -1,0 +1,29 @@
+8. Cleanup runs on every terminal state — `SHIP`, `BLOCKED`,
+   `NEEDS_HUMAN`, or any error abort (the commit-gate failure in step 4, an
+   interrupt, or any abnormal end of this coordinator's turn) — and runs
+   BOTH:
+   a) `sys_session_close` on every id tracked in step 6, **excluding the
+      two registration-anchor bootstrap conversation ids from Preflight
+      step 3, which must never be closed or pruned**. Close is a
+      tombstone+interrupt; it does not free RAM.
+   b) as a guaranteed backstop,
+      `trioctl omnigent sessions prune --include-sub-agents --mailbox <dir>`.
+      The broker DELETE prune performs is the only path that kills the
+      dedicated tmux terminals; the `trioctl <mailbox.name> ` title prefix
+      from step 2 is what prune matches, and the anchor sessions keep
+      titles WITHOUT that prefix so prune leaves them alone. Run (b) after
+      (a), regardless of whether the closes succeeded.
+   Do this after the terminal verdict (and, on SHIP, the retirement commit)
+   is written, before ending the turn. If a close or prune step fails
+   (session busy, already closed, etc.), report it and continue the rest —
+   cleanup is best-effort and must never change the loop's verdict.
+
+   Abort/orphan path: if a Lead or Evaluator role session ends `failed` —
+   including a `failed` status with "connection to runner lost" after the
+   coordinator Omnigent runner's 1h idle timeout — do NOT re-implement the
+   iteration. Treat it as an abort: run the prune backstop above, then
+   re-create that role session with a fresh title under the same locked
+   scheme (step 2) so it can finish the iteration from the committed tree.
+   The provider-transport auto-wake path (`resource_exhausted` /
+   `NGHTTP2_INTERNAL_ERROR` / `stream refused`, below) is a separate,
+   retry-once path and is NOT this abort path.
