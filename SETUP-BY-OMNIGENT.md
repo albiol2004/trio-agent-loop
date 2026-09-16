@@ -222,6 +222,18 @@ configs.
 Use a different mailbox such as `loop-auth` for a concurrent mission. Never
 point two live runs at one mailbox.
 
+## Session and anchor hygiene
+
+Each iteration's skill role runs under the title
+`trioctl <mailbox.name> <role>:iteration <N>`. `sys_session_close` does not
+kill that tmux process; the backstop is
+`trioctl omnigent sessions prune --include-sub-agents --mailbox <dir>`, which
+archives each sub-agent session then DELETEs it. On archive failure prune
+retries once then deletes unless `--keep-unarchived`.
+
+Registration anchors (the idle Lead/Evaluator bootstrap sessions) must never
+use that title prefix and must never be pruned or closed.
+
 ## Why the Omnigent patch is required
 
 Omnigent v0.10.0 already handles Kimi Code's current 0.x release line and
