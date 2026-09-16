@@ -11,7 +11,10 @@ mailbox `{mailbox}` at iteration {iteration}.
 3. Choose the smallest independently verifiable increment. Use the repository's
    existing patterns and delegate bounded implementation or reconnaissance to
    GLM 5.2 through `trioctl omnigent run`. Inspect the actual diff after workers
-   return and correct integration or correctness issues yourself.
+   return and correct integration or correctness issues yourself. If you ever
+   create a `sys_session_create` child directly (you usually use `trioctl`
+   instead), title it `trioctl <mailbox.name> <role>:iteration <iteration>`
+   so the coordinator's prune backstop matches it.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
 5. Commit every code-changing slice as its own commit

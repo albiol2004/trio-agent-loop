@@ -42,7 +42,9 @@ coordinator.
    name, and write the exact `_profile` marker above. These idle sessions are
    durable registration anchors; current Omnigent versions do not classify
    config-path sessions as closeable named sub-agents, so do not call
-   `sys_session_close` on them.
+   `sys_session_close` on them. They MUST keep titles WITHOUT the
+   `trioctl <mailbox.name> ` prefix (see step 2), so the step 8 prune
+   backstop never matches them; never close or prune an anchor session.
 4. Require both exact names in the registry. Never choose by partial name.
    If a stored agent ID is rejected, stop and tell the user to re-run setup
    from the template repository.
@@ -100,8 +102,8 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
 
 1. Read GOAL, STATE, and the previous verdict. Enforce the iteration cap.
 2. Resolve Lead with `trioctl`, then create a fresh Lead child with
-   `sys_session_create(agent_id=..., model=<resolved model>, message=...)`.
-   Give it the
+   `sys_session_create(agent_id=..., model=<resolved model>,
+   title=<locked title>, message=...)`. Give it the
    mailbox and iteration and require one complete Lead pass: plan, decide and
    perform its own GLM 5.2 delegation through `trioctl omnigent run`,
    review/correct, verify, and write REPORT. The headless Lead prompt
@@ -110,14 +112,26 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    existing commits. Hand it **diagnosed line ranges** (from cheap grep/symbol
    search) for every product file it must touch — never "read the file" for a
    large file; first-turn full-file ingest of the 2.1 MB monolith crashed the
-   provider transport twice. Use a title containing mailbox and iteration.
+   provider transport twice. Use the locked title scheme: every role/worker
+   `sys_session_create` title MUST be exactly
+   `trioctl <mailbox.name> <role>:iteration <N>` — e.g.
+   `trioctl loop-session-cleanup lead:iteration 1`. The
+   `trioctl <mailbox.name> ` prefix is what
+   `trioctl omnigent sessions prune --include-sub-agents --mailbox <dir>`
+   matches (the step 8 backstop), and the `:` after that prefix satisfies
+   Omnigent's `_parse_session_title` (colon required; without it
+   agent/title are None and `sys_session_close` returns
+   `session_not_a_sub_agent`). Pass it as the `title=` argument above.
 3. Inspect the Lead result and actual diff. Its report must identify the
    profile-resolved GLM 5.2 worker and include the captured `trioctl` result.
 4. Resolve Evaluator with `trioctl`, then create a fresh Evaluator child with
-   its returned model and effort. Require it to independently verify, decide
-   whether it needs a GLM 5.2 Scout, and write VERDICT with one of SHIP, ITERATE
-   (optionally `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or
-   BLOCKED on the first line. On a SHIP verdict, the Evaluator child performs
+   its returned model and effort, using the same locked title scheme from
+   step 2 with the `evaluator` role — e.g.
+   `trioctl loop-session-cleanup evaluator:iteration 1` — as the `title=`
+   argument. Require it to independently verify, decide whether it needs a
+   GLM 5.2 Scout, and write VERDICT with one of SHIP, ITERATE (optionally
+   `scope=design` or `scope=local:<paths>`), NEEDS_HUMAN, or BLOCKED on the
+   first line. On a SHIP verdict, the Evaluator child performs
    the retirement commit as part of writing it: product changes as
    `slice(<id>): …`, then the mailbox as `loop: iteration N — SHIP`, with
    the `commit:` shas appended to VERDICT.md before the mailbox commit.
@@ -157,14 +171,35 @@ Preserve an existing matching mission. Refuse to repurpose an active mailbox.
    consecutive scoped verdict, or for any other ITERATE, run the full Lead
    pass as usual. On `VERDICT: NEEDS_HUMAN`, stop and surface the mandatory
    `## Human check` section from VERDICT.md.
-8. When the loop reaches a terminal state — `SHIP`, `BLOCKED`,
-   `NEEDS_HUMAN`, or an error abort (e.g. the commit-gate failure in step
-   4) — call `sys_session_close` on every id tracked in step 6, **excluding
-   the two registration-anchor sessions from Preflight step 3, which must
-   never be closed**. Do this after the terminal verdict (and, on SHIP, the
-   retirement commit) is written, before ending the turn. If a close fails
-   (session busy, already closed, etc.), report it and continue closing the
-   rest — cleanup is best-effort and must never change the loop's verdict.
+8. Cleanup runs on every terminal state — `SHIP`, `BLOCKED`,
+   `NEEDS_HUMAN`, or any error abort (the commit-gate failure in step 4, an
+   interrupt, or any abnormal end of this coordinator's turn) — and runs
+   BOTH:
+   a) `sys_session_close` on every id tracked in step 6, **excluding the
+      two registration-anchor bootstrap conversation ids from Preflight
+      step 3, which must never be closed or pruned**. Close is a
+      tombstone+interrupt; it does not free RAM.
+   b) as a guaranteed backstop,
+      `trioctl omnigent sessions prune --include-sub-agents --mailbox <dir>`.
+      The broker DELETE prune performs is the only path that kills the
+      dedicated tmux terminals; the `trioctl <mailbox.name> ` title prefix
+      from step 2 is what prune matches, and the anchor sessions keep
+      titles WITHOUT that prefix so prune leaves them alone. Run (b) after
+      (a), regardless of whether the closes succeeded.
+   Do this after the terminal verdict (and, on SHIP, the retirement commit)
+   is written, before ending the turn. If a close or prune step fails
+   (session busy, already closed, etc.), report it and continue the rest —
+   cleanup is best-effort and must never change the loop's verdict.
+
+   Abort/orphan path: if a Lead or Evaluator role session ends `failed` —
+   including a `failed` status with "connection to runner lost" after the
+   coordinator Omnigent runner's 1h idle timeout — do NOT re-implement the
+   iteration. Treat it as an abort: run the prune backstop above, then
+   re-create that role session with a fresh title under the same locked
+   scheme (step 2) so it can finish the iteration from the committed tree.
+   The provider-transport auto-wake path (`resource_exhausted` /
+   `NGHTTP2_INTERNAL_ERROR` / `stream refused`, below) is a separate,
+   retry-once path and is NOT this abort path.
 
 `sys_session_create` is asynchronous. Use inbox/session history tools and end
 the turn while a role is running; Omnigent wakes this session on completion.
