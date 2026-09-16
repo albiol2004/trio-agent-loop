@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 from pathlib import Path
 
 import pytest
@@ -871,3 +872,187 @@ def test_loop_default_prune_deletes_only_this_runs_sessions(
 
     assert args.func(args) == 5
     assert client.deleted == ["s-new"]
+
+
+def test_loop_keyboard_interrupt_still_prunes_created_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A KeyboardInterrupt out of run_loop (as SIGINT/SIGTERM handlers raise)
+    must still prune this run's created session ids, and return 130."""
+    trioctl = load_trioctl()
+    prune_calls: list[tuple[object, object, object]] = []
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-lead"]
+
+    class InterruptingLoop:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo):
+            # A worker records its own id via the env var command_loop set,
+            # then the loop is interrupted (as a real SIGINT would cause).
+            ids_path = os.environ[trioctl.SESSION_IDS_ENV_VAR]
+            trioctl._append_session_id_to_file(Path(ids_path), "s-worker")
+            raise KeyboardInterrupt
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: InterruptingLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda mailbox, base_url, session_ids: prune_calls.append(
+            (mailbox, base_url, sorted(session_ids))
+        ),
+    )
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    result = args.func(args)
+
+    # 130 is the conventional exit code for SIGINT (128 + 2).
+    assert result == 130
+    assert prune_calls == [
+        ((tmp_path / "mailbox").resolve(), args.base_url, ["s-lead", "s-worker"])
+    ]
+    assert list((tmp_path / "mailbox" / ".sessions").glob("run-*.ids")) == []
+
+
+def test_loop_keyboard_interrupt_keep_sessions_still_skips_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--keep-sessions` must skip prune even when the loop is interrupted."""
+    trioctl = load_trioctl()
+    prune_calls: list[object] = []
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-lead"]
+
+    class InterruptingLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            raise KeyboardInterrupt
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: InterruptingLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda *a, **k: prune_calls.append((a, k)),
+    )
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "loop",
+            "--mailbox",
+            "mailbox",
+            "--max-iterations",
+            "1",
+            "--keep-sessions",
+        ]
+    )
+
+    assert args.func(args) == 130
+    assert prune_calls == []
+
+
+def test_loop_generic_exception_still_prunes_and_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic exception out of run_loop must still prune this run's
+    created session ids, then re-raise (prune never swallows it)."""
+    trioctl = load_trioctl()
+    prune_calls: list[tuple[object, object, object]] = []
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-lead"]
+
+    class ExplodingLoop:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo):
+            ids_path = os.environ[trioctl.SESSION_IDS_ENV_VAR]
+            trioctl._append_session_id_to_file(Path(ids_path), "s-worker")
+            raise RuntimeError("boom")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: ExplodingLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda mailbox, base_url, session_ids: prune_calls.append(
+            (mailbox, base_url, sorted(session_ids))
+        ),
+    )
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        args.func(args)
+
+    assert prune_calls == [
+        ((tmp_path / "mailbox").resolve(), args.base_url, ["s-lead", "s-worker"])
+    ]
+    assert list((tmp_path / "mailbox" / ".sessions").glob("run-*.ids")) == []
+
+
+def test_loop_sigterm_handler_runs_prune(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SIGTERM uses the same handler as SIGINT (both raise KeyboardInterrupt).
+    Here run_loop grabs the handler command_loop installed for SIGTERM and
+    invokes it as the kernel would on a real SIGTERM -- proving the signal
+    path still prunes this run's created ids and returns 130, without
+    risking real process termination if the handler were missing."""
+    trioctl = load_trioctl()
+    prune_calls: list[tuple[object, object, object]] = []
+    captured: dict[str, object] = {}
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-lead"]
+
+    class SigTermLoop:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo):
+            ids_path = os.environ[trioctl.SESSION_IDS_ENV_VAR]
+            trioctl._append_session_id_to_file(Path(ids_path), "s-worker")
+            # Grab the SIGTERM handler command_loop installed, then fire it
+            # exactly as the kernel would deliver a real SIGTERM.
+            captured["handler"] = signal.getsignal(signal.SIGTERM)
+            handler = captured["handler"]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: SigTermLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda mailbox, base_url, session_ids: prune_calls.append(
+            (mailbox, base_url, sorted(session_ids))
+        ),
+    )
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    result = args.func(args)
+
+    assert result == 130
+    # The handler command_loop installed is the shared SIGINT/SIGTERM one.
+    assert captured["handler"] is trioctl._loop_signal_handler
+    assert prune_calls == [
+        ((tmp_path / "mailbox").resolve(), args.base_url, ["s-lead", "s-worker"])
+    ]
+    assert list((tmp_path / "mailbox" / ".sessions").glob("run-*.ids")) == []

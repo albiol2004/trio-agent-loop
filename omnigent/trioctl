@@ -12,6 +12,7 @@ import os
 import re
 import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1739,6 +1740,14 @@ def command_loop(args: argparse.Namespace) -> int:
         os.environ.pop(SESSION_IDS_ENV_VAR, None)
     else:
         os.environ[SESSION_IDS_ENV_VAR] = str(ids_file)
+
+    # Install SIGINT/SIGTERM handlers that raise KeyboardInterrupt so the
+    # `finally` below always runs. Without this, a signal during run_loop
+    # would unwind straight through `finally` (env restore only) and skip
+    # prune, leaking this run's role tmux sessions (200-600 MB each) --
+    # terminals only die on broker DELETE, never on process exit.
+    previous_sigint = signal.signal(signal.SIGINT, _loop_signal_handler)
+    previous_sigterm = signal.signal(signal.SIGTERM, _loop_signal_handler)
     try:
         exit_code = loop_core.run_loop(
             mailbox,
@@ -1746,20 +1755,41 @@ def command_loop(args: argparse.Namespace) -> int:
             runner,
             repo=repo,
         )
+        return exit_code
+    except KeyboardInterrupt:
+        # SIGINT/SIGTERM arrived: prune first (in finally), then exit 130.
+        return 130
     finally:
+        # Restore the prior handlers and env, then prune this run's created
+        # sessions. Prune lives in `finally` (not after the try) so a
+        # signal or any exception still cleans up -- role tmux sessions
+        # only die on broker DELETE, never on process exit.
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
         if previous_ids_env is None:
             os.environ.pop(SESSION_IDS_ENV_VAR, None)
         else:
             os.environ[SESSION_IDS_ENV_VAR] = previous_ids_env
-    if not keep_sessions:
-        created = list(getattr(runner, "created_session_ids", []) or [])
-        created.extend(_read_session_ids_file(ids_file))
-        _run_post_loop_session_prune(mailbox, getattr(args, "base_url", None), created)
-        try:
-            ids_file.unlink()
-        except OSError:
-            pass
-    return exit_code
+        if not keep_sessions:
+            created = list(getattr(runner, "created_session_ids", []) or [])
+            created.extend(_read_session_ids_file(ids_file))
+            _run_post_loop_session_prune(
+                mailbox, getattr(args, "base_url", None), created
+            )
+            try:
+                ids_file.unlink()
+            except OSError:
+                pass
+
+
+def _loop_signal_handler(signum: int, frame: object) -> None:
+    """SIGINT/SIGTERM handler installed by `command_loop`.
+
+    Raises KeyboardInterrupt so the loop's `finally` runs prune. Kept at
+    module scope so tests can invoke it directly; SIGINT and SIGTERM share
+    this one handler.
+    """
+    raise KeyboardInterrupt
 
 
 def omnigent_registry_path() -> Path:
