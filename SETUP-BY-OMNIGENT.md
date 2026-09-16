@@ -231,6 +231,15 @@ kill that tmux process; the backstop is
 archives each sub-agent session then DELETEs it. On archive failure prune
 retries once then deletes unless `--keep-unarchived`.
 
+The skill runs that close+prune on every terminal verdict
+(SHIP/BLOCKED/NEEDS_HUMAN) and on every abort or orphan path -- a
+commit-gate abort, an interrupt, an abnormal coordinator end, and the
+failed/orphan recreate path after a runner idle-timeout orphan -- not
+only on SHIP. The headless `trioctl omnigent loop` prunes its own
+created sessions on normal exit and on SIGINT, SIGTERM, and exception,
+so an idle role TUI cannot outlive its loop (the leak that OOM-killed
+the workspace cgroup).
+
 Registration anchors (the idle Lead/Evaluator bootstrap sessions) must never
 use that title prefix and must never be pruned or closed.
 
