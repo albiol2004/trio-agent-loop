@@ -1069,6 +1069,7 @@ def _prune_broker_sessions(
     keep_failed: bool = False,
     session_ids: Any = None,
     include_sub_agents: bool = False,
+    keep_unarchived: bool = False,
 ) -> dict[str, int]:
     """Archive-then-delete broker sessions, id-scoped or title-scoped.
 
@@ -1095,6 +1096,14 @@ def _prune_broker_sessions(
     listing -- are among the rows considered. Title matching above is
     unchanged either way; a session is still only touched if its title
     actually matches.
+
+    ``keep_unarchived`` only affects sessions whose item read fails even
+    after one retry: by default such a session is still deleted with a
+    partial archive and a stderr warning (delete is the only path that
+    kills the broker's tmux terminal; keeping it leaks 200-600 MB of
+    RAM per role). With ``keep_unarchived`` the old keep-and-skip
+    behavior is restored for callers that would rather leak than lose
+    an incomplete transcript.
     """
     rows = _fetch_all_broker_sessions(
         client, kind="any" if include_sub_agents else None
@@ -1141,6 +1150,14 @@ def _prune_broker_sessions(
             print(f"trioctl: dry-run would archive and delete: {session_id} {title}")
             continue
         items, read_error = _fetch_session_items_paged(client, session_id)
+        if read_error is not None:
+            # Retry the item read once: a transient broker hiccup should
+            # not strand a terminal. If the retry still fails we keep
+            # the best items read so far and apply the partial-archive
+            # policy below.
+            items, read_error = _fetch_session_items_paged(
+                client, session_id
+            )
         sessions_dir.mkdir(parents=True, exist_ok=True)
         archive_path = sessions_dir / _session_archive_filename(row)
         with archive_path.open("w", encoding="utf-8") as handle:
@@ -1148,18 +1165,33 @@ def _prune_broker_sessions(
             for item in items:
                 handle.write(json.dumps(item, sort_keys=True) + "\n")
         if read_error is not None:
-            # One session's unreadable transcript must never abort the
-            # whole prune run: archive whatever was read before the
-            # failure, log it, and leave this session undeleted -- only a
-            # fully-archived session is safe to delete.
+            # The transcript could not be fully read even after one
+            # retry. Delete is the only path that kills the broker's
+            # tmux terminal; keeping an unarchived session leaks RAM
+            # (200-600 MB per role terminal). Default: warn on stderr
+            # and delete anyway with a partial archive (counts as both
+            # `failed` and `deleted`). --keep-unarchived opts back into
+            # the old keep-and-skip behavior for callers that would
+            # rather leak than lose an incomplete transcript.
             counts["failed"] += 1
+            if keep_unarchived:
+                print(
+                    f"trioctl: failed to fully read items for "
+                    f"{session_id} {title}: {read_error} "
+                    f"({len(items)} item(s) saved to {archive_path}; "
+                    f"session kept, not deleted)",
+                    file=sys.stderr,
+                )
+                continue
             print(
                 f"trioctl: failed to fully read items for {session_id} "
                 f"{title}: {read_error} ({len(items)} item(s) saved to "
-                f"{archive_path}; session kept, not deleted)"
+                f"{archive_path}; deleting anyway -- transcript was "
+                f"not fully archived)",
+                file=sys.stderr,
             )
-            continue
-        counts["archived"] += 1
+        else:
+            counts["archived"] += 1
         delete_session = getattr(client, "delete_session", None)
         if delete_session is None:
             raise TrioctlError("broker client has no session-delete method")
@@ -1168,7 +1200,16 @@ def _prune_broker_sessions(
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         counts["deleted"] += 1
-        print(f"trioctl: archived and deleted {session_id} -> {archive_path}")
+        if read_error is None:
+            print(
+                f"trioctl: archived and deleted {session_id} -> "
+                f"{archive_path}"
+            )
+        else:
+            print(
+                f"trioctl: deleted with partial archive {session_id} "
+                f"-> {archive_path}"
+            )
     return counts
 
 
@@ -1198,6 +1239,7 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         keep_failed=args.keep_failed,
         include_sub_agents=args.include_sub_agents,
+        keep_unarchived=args.keep_unarchived,
     )
     print(
         f"trioctl: archived {counts['archived']}, deleted {counts['deleted']}, "
@@ -1208,7 +1250,11 @@ def command_sessions_prune(args: argparse.Namespace) -> int:
 
 
 def _run_post_loop_session_prune(
-    mailbox: Path, base_url: str | None, session_ids: Any
+    mailbox: Path,
+    base_url: str | None,
+    session_ids: Any,
+    *,
+    keep_unarchived: bool = False,
 ) -> None:
     """Best-effort cleanup after a headless `loop` run exits (default-on).
 
@@ -1220,13 +1266,22 @@ def _run_post_loop_session_prune(
     never touched. Always a real archive-then-delete pass (never
     `--dry-run`, no `--keep-failed`). A prune failure is reported but
     never overrides the loop's own exit code.
+
+    ``keep_unarchived`` defaults off so the loop always deletes a
+    session whose transcript could not be fully archived even after one
+    retry -- terminals only die on broker DELETE, never on process
+    exit, so keeping them leaks 200-600 MB of RAM per role. The matching
+    `loop --keep-unarchived` flag opts back into keep-and-skip.
     """
     ids = sorted({sid for sid in session_ids if isinstance(sid, str) and sid})
     if not ids:
         return
     try:
         client = _session_client(base_url)
-        counts = _prune_broker_sessions(client, mailbox, session_ids=ids)
+        counts = _prune_broker_sessions(
+            client, mailbox, session_ids=ids,
+            keep_unarchived=keep_unarchived,
+        )
     except TrioctlError as exc:
         print(f"trioctl: session prune failed: {exc}", file=sys.stderr)
         return
@@ -1774,7 +1829,8 @@ def command_loop(args: argparse.Namespace) -> int:
             created = list(getattr(runner, "created_session_ids", []) or [])
             created.extend(_read_session_ids_file(ids_file))
             _run_post_loop_session_prune(
-                mailbox, getattr(args, "base_url", None), created
+                mailbox, getattr(args, "base_url", None), created,
+                keep_unarchived=getattr(args, "keep_unarchived", False),
             )
             try:
                 ids_file.unlink()
@@ -2143,6 +2199,16 @@ def parser() -> argparse.ArgumentParser:
             "<dir>` for the manual/bulk form that matches by title prefix"
         ),
     )
+    loop.add_argument(
+        "--keep-unarchived",
+        action="store_true",
+        help=(
+            "keep a session whose transcript could not be fully archived "
+            "even after one retry, instead of deleting it with a partial "
+            "archive; default deletes after retry (terminals only die on "
+            "broker DELETE, never on process exit, so keeping leaks RAM)"
+        ),
+    )
     loop.set_defaults(func=command_loop)
 
     session = commands.add_parser(
@@ -2232,6 +2298,16 @@ def parser() -> argparse.ArgumentParser:
             "also list kind=sub_agent broker sessions (e.g. ones the "
             "Omnigent UI's trio-omnigent skill creates), so they're "
             "considered against the same trioctl title-prefix match"
+        ),
+    )
+    sessions_prune.add_argument(
+        "--keep-unarchived",
+        action="store_true",
+        help=(
+            "keep a session whose transcript could not be fully archived "
+            "even after one retry, instead of deleting it with a partial "
+            "archive; default deletes after retry (terminals only die on "
+            "broker DELETE, never on process exit, so keeping leaks RAM)"
         ),
     )
     sessions_prune.add_argument(

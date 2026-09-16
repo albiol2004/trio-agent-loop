@@ -1613,10 +1613,129 @@ def test_prune_pages_through_more_sessions_than_the_default_list_window(
     assert counts["deleted"] == 1
 
 
-def test_prune_one_failing_session_read_does_not_abort_the_others(tmp_path: Path):
+def test_prune_one_failing_session_read_does_not_abort_the_others(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
     """A session whose item read errors out must not stop the run: other
-    sessions still get archived and deleted, and the failing one is
-    archived with whatever was read (nothing, here) but never deleted."""
+    sessions still get archived and deleted. The default now retries the
+    bad read once, then DELETES the failing session anyway with a
+    partial archive and a stderr warning -- delete is the only path
+    that kills the broker's tmux terminal, so keeping it would leak RAM.
+    The good session still archives and deletes normally."""
+    trioctl = load_trioctl()
+    _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
+
+    class _OneFailsClient(_PagingSessionsClient):
+        def __init__(self, rows, items_by_session):
+            super().__init__(rows, items_by_session)
+            # Counts get_items calls per session so the test can prove
+            # the bad id was attempted twice (initial read + one retry).
+            self.calls_per_session: dict[str, int] = {}
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            self.calls_per_session[session_id] = (
+                self.calls_per_session.get(session_id, 0) + 1
+            )
+            if session_id == "s-bad":
+                raise trioctl.broker_http.BrokerHttpError(
+                    "GET .../items failed with HTTP 500", status_code=500
+                )
+            return super().get_items(
+                session_id, limit=limit, order=order, after=after
+            )
+
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s-bad", "trioctl mbx iteration 1 lead"),
+        _row("s-good", "trioctl mbx iteration 2 lead"),
+    ]
+    items = {"s-good": [{"id": "item-0", "role": "assistant"}]}
+    client = _OneFailsClient(rows, items)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    # The bad session is a partial archive (counts as `failed`) but is
+    # still deleted; the good session archives and deletes normally.
+    assert counts["failed"] == 1
+    assert counts["archived"] == 1
+    assert counts["deleted"] == 2
+    assert client.deleted == ["s-bad", "s-good"]
+    # The bad id was read twice: initial attempt plus exactly one retry.
+    assert client.calls_per_session["s-bad"] == 2
+    # The partial-archive warning goes to stderr, not stdout.
+    err = capsys.readouterr().err
+    assert "transcript was not fully archived" in err
+    assert "s-bad" in err
+    # Both sessions are archived (the bad one with an empty transcript).
+    archived = sorted((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 2
+
+
+def test_prune_retry_succeeds_on_second_read_archives_and_deletes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """When the first item read fails but the retry succeeds, the session
+    is fully archived and deleted with `failed` == 0 -- a transient
+    broker hiccup must not strand a terminal or taint the counts."""
+    trioctl = load_trioctl()
+    _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
+
+    class _TransientFailClient(_PagingSessionsClient):
+        def __init__(self, rows, items_by_session):
+            super().__init__(rows, items_by_session)
+            self.calls_per_session: dict[str, int] = {}
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            self.calls_per_session[session_id] = (
+                self.calls_per_session.get(session_id, 0) + 1
+            )
+            # First attempt fails; the retry (second attempt) succeeds.
+            if (
+                session_id == "s-flaky"
+                and self.calls_per_session["s-flaky"] == 1
+            ):
+                raise trioctl.broker_http.BrokerHttpError(
+                    "GET .../items failed with HTTP 500", status_code=500
+                )
+            return super().get_items(
+                session_id, limit=limit, order=order, after=after
+            )
+
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s-flaky", "trioctl mbx iteration 1 lead"),
+        _row("s-good", "trioctl mbx iteration 2 lead"),
+    ]
+    items = {
+        "s-flaky": [{"id": "item-0", "role": "assistant"}],
+        "s-good": [{"id": "item-1", "role": "assistant"}],
+    }
+    client = _TransientFailClient(rows, items)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    # Retry succeeded: no partial archive, no `failed`, both deleted.
+    assert counts["failed"] == 0
+    assert counts["archived"] == 2
+    assert counts["deleted"] == 2
+    assert client.deleted == ["s-flaky", "s-good"]
+    # The flaky id was read exactly twice (fail then success).
+    assert client.calls_per_session["s-flaky"] == 2
+    # No partial-archive warning on a successful retry.
+    assert capsys.readouterr().err == ""
+    archived = sorted((mailbox / ".sessions").glob("*.jsonl"))
+    assert len(archived) == 2
+
+
+def test_prune_keep_unarchived_keeps_failing_session_after_retry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """With `keep_unarchived=True`, a session whose item read fails even
+    after one retry is kept (old behavior) while the good session still
+    archives and deletes -- opting back into leak-rather-than-lose for
+    callers that would rather keep an incomplete transcript."""
     trioctl = load_trioctl()
     _PagingSessionsClient = _make_paging_sessions_client(trioctl.broker_http)
 
@@ -1639,16 +1758,110 @@ def test_prune_one_failing_session_read_does_not_abort_the_others(tmp_path: Path
     items = {"s-good": [{"id": "item-0", "role": "assistant"}]}
     client = _OneFailsClient(rows, items)
 
-    counts = trioctl._prune_broker_sessions(client, mailbox)
+    counts = trioctl._prune_broker_sessions(
+        client, mailbox, keep_unarchived=True
+    )
 
+    # The bad session is kept after retry (old behavior); the good one
+    # still archives and deletes.
     assert counts["failed"] == 1
     assert counts["archived"] == 1
     assert counts["deleted"] == 1
     assert client.deleted == ["s-good"]
-    # The failing session is still archived (empty transcript) but never
-    # reaches delete_session.
+    err = capsys.readouterr().err
+    assert "session kept, not deleted" in err
+    assert "s-bad" in err
+    # Both transcripts are on disk, but only the good one was deleted.
     archived = sorted((mailbox / ".sessions").glob("*.jsonl"))
     assert len(archived) == 2
+
+
+def test_command_sessions_prune_cli_keep_unarchived_flag_reaches_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """The `--keep-unarchived` CLI flag is parsed by argparse and reaches
+    `_prune_broker_sessions` as `keep_unarchived=True`, keeping a session
+    whose transcript could not be fully archived after one retry."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        _row("s-bad", "trioctl mbx iteration 1 lead"),
+        _row("s-good", "trioctl mbx iteration 2 lead"),
+    ]
+
+    captured: dict[str, object] = {}
+
+    class _CapturingClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.deleted: list[str] = []
+
+        def list_sessions(self, limit=20, after=None, kind=None):
+            return {"data": self.rows}
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            if session_id == "s-bad":
+                raise trioctl.broker_http.BrokerHttpError(
+                    "GET .../items failed with HTTP 500", status_code=500
+                )
+            return {"items": [{"id": "item-0", "role": "assistant"}]}
+
+        def delete_session(self, session_id):
+            self.deleted.append(session_id)
+            return {"deleted": True}
+
+    client = _CapturingClient(rows)
+    monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
+    real_prune = trioctl._prune_broker_sessions
+
+    def _capture_prune(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(trioctl, "_prune_broker_sessions", _capture_prune)
+
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "sessions",
+            "prune",
+            "--mailbox",
+            str(mailbox),
+            "--keep-unarchived",
+        ]
+    )
+
+    assert args.func(args) == 0
+    # The flag reached _prune_broker_sessions as keep_unarchived=True.
+    assert captured["kwargs"].get("keep_unarchived") is True
+    # The bad session was kept after retry; the good one was deleted.
+    assert client.deleted == ["s-good"]
+    out = capsys.readouterr().out
+    assert "archived 1, deleted 1" in out
+
+
+def test_command_loop_cli_keep_unarchived_flag_is_parsed():
+    """The `loop` subcommand accepts `--keep-unarchived` and parses it to
+    a truthy `keep_unarchived` attribute, so the flag threads through to
+    `_run_post_loop_session_prune` (default-off)."""
+    trioctl = load_trioctl()
+
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "loop", "--keep-unarchived"]
+    )
+
+    assert args.keep_unarchived is True
+
+
+def test_command_loop_cli_keep_unarchived_defaults_off():
+    """Without `--keep-unarchived`, the loop subcommand leaves the flag
+    falsy so the post-loop prune deletes partial archives after retry."""
+    trioctl = load_trioctl()
+
+    args = trioctl.parser().parse_args(["omnigent", "loop", "--mailbox", "loop"])
+
+    assert args.keep_unarchived is False
 
 
 def test_run_post_loop_session_prune_noop_when_no_ids(
