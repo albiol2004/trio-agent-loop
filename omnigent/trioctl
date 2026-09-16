@@ -1060,6 +1060,23 @@ def _fetch_all_broker_sessions(
         after = last_row_id
 
 
+def _session_title_matches_mailbox(title: str, mailbox: Path) -> bool:
+    """True iff `title` is a trioctl loop session title scoped to `mailbox`.
+
+    Loop session titles use the locked scheme
+    ``trioctl <mailbox.name> <role>:iteration <N>`` (plus an optional
+    open-loop suffix like `` lead-pass`` / `` integration-eval`` /
+    `` slice-eval:<id>``), so a title matches `mailbox` iff it starts with
+    the ``trioctl <mailbox.name> `` prefix. Registration-anchor titles --
+    e.g. ``trio-omnigent-lead``, ``trio-omnigent-evaluator``,
+    ``lead:omnigent/trio-omnigent-roles/lead``, config-path idle sessions,
+    and untitled/empty rows -- never carry that prefix, so prune never
+    deletes them; sessions for another mailbox carry their own
+    ``trioctl <other-mailbox> `` prefix and are likewise left alone.
+    """
+    return title.startswith(f"trioctl {mailbox.name} ")
+
+
 def _prune_broker_sessions(
     client: Any,
     mailbox: Path,
@@ -1116,11 +1133,26 @@ def _prune_broker_sessions(
             return isinstance(row_id, str) and row_id in wanted_ids
 
     else:
-        prefix = "trioctl " if all_scope else f"trioctl {mailbox.name} "
+        all_prefix = "trioctl "
 
         def _matches(row: dict[str, Any]) -> bool:
+            # Loop session titles use the locked scheme
+            # ``trioctl <mailbox.name> <role>:iteration <N>`` (plus an
+            # optional open-loop suffix), so a mailbox-scoped prune matches
+            # iff the title starts with ``trioctl <mailbox.name> ``. Skill /
+            # worker titles use ``<role>:iteration <N>`` right after that
+            # prefix. Registration-anchor titles -- e.g.
+            # ``trio-omnigent-lead``, ``trio-omnigent-evaluator``,
+            # ``lead:omnigent/trio-omnigent-roles/lead``, config-path idle
+            # sessions, and untitled/empty rows -- never carry that prefix,
+            # so prune never deletes them. With ``all_scope`` any
+            # ``trioctl `` title matches regardless of mailbox.
             title = row.get("title")
-            return isinstance(title, str) and title.startswith(prefix)
+            if not isinstance(title, str):
+                return False
+            if all_scope:
+                return title.startswith(all_prefix)
+            return _session_title_matches_mailbox(title, mailbox)
 
     counts = {
         "archived": 0,
@@ -1653,8 +1685,21 @@ class OmnigentRunner:
         role: str,
         context: dict[str, Any] | None,
     ) -> str:
-        """Base title, plus the open-loop kind (and slice, for slice-eval)."""
-        title = f"trioctl {mailbox.name} iteration {iteration} {role}"
+        """Base title, plus the open-loop kind (and slice, for slice-eval).
+
+        Locked scheme: ``trioctl <mailbox.name> <role>:iteration <N>`` plus
+        an optional open-loop suffix (`` lead-pass`` / `` integration-eval`` /
+        `` slice-eval:<id>``). The ``trioctl <mailbox.name> `` prefix is what
+        `sessions prune` matches (see ``_session_title_matches_mailbox``),
+        and the ``:`` right after that prefix satisfies Omnigent's
+        ``_parse_session_title`` -- a colon is required there, otherwise
+        agent/title parse to None and ``sys_session_close`` rejects the
+        session as ``session_not_a_sub_agent``.
+        """
+        # NOTE: the colon sits AFTER ``trioctl <mailbox.name> `` so the
+        # prefix-scoped prune match (``title.startswith(...)``) and the
+        # colon-aware ``_parse_session_title`` both keep working.
+        title = f"trioctl {mailbox.name} {role}:iteration {iteration}"
         if context and context.get("mode") == "open-loop":
             kind = context.get("kind")
             slice_id = context.get("slice")

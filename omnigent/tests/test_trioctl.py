@@ -1425,6 +1425,133 @@ def test_prune_include_sub_agents_widens_kind_and_matches_sub_agent_row(
     assert len(archived) == 1
 
 
+def test_prune_include_sub_agents_matches_new_scheme_lead_title(
+    tmp_path: Path,
+):
+    """The locked title scheme ``trioctl <mailbox> <role>:iteration <N>``
+    still carries the ``trioctl <mailbox> `` prefix, so a sub_agent-kind
+    Lead worker session is archived and deleted with --include-sub-agents."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        {**_row("s1", "trioctl mbx lead:iteration 1"), "kind": "sub_agent"},
+        _row("s2", "unrelated broker session"),
+    ]
+    client = _KindAwareSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, include_sub_agents=True)
+
+    assert client.list_calls[0]["kind"] == "any"
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+
+
+def test_prune_include_sub_agents_matches_new_scheme_evaluator_title(
+    tmp_path: Path,
+):
+    """Same prefix match for an Evaluator worker session under the locked
+    ``trioctl <mailbox> evaluator:iteration <N>`` scheme."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        {
+            **_row("s1", "trioctl mbx evaluator:iteration 1"),
+            "kind": "sub_agent",
+        },
+    ]
+    client = _KindAwareSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, include_sub_agents=True)
+
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+
+
+def test_prune_never_matches_registration_anchor_titles(tmp_path: Path):
+    """Registration-anchor and other non-loop titles must never be pruned
+    even with --include-sub-agents: they are listed (kind=any) but fail the
+    ``trioctl <mailbox> `` prefix match. Covers the trio-omnigent skill's
+    own anchor titles, the colon-bearing role-config path title, untitled
+    and empty rows, and another mailbox's loop session."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "mbx"
+    mailbox.mkdir()
+    rows = [
+        {**_row("s1", "trio-omnigent-lead"), "kind": "sub_agent"},
+        {**_row("s2", "trio-omnigent-evaluator"), "kind": "sub_agent"},
+        {
+            **_row("s3", "lead:omnigent/trio-omnigent-roles/lead"),
+            "kind": "sub_agent",
+        },
+        {**_row("s4", ""), "kind": "sub_agent"},
+        {
+            **_row("s5", "trioctl other-mailbox lead:iteration 1"),
+            "kind": "sub_agent",
+        },
+    ]
+    client = _KindAwareSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox, include_sub_agents=True)
+
+    assert client.list_calls[0]["kind"] == "any"
+    assert counts["deleted"] == 0
+    assert client.deleted == []
+
+
+def test_prune_loop_session_cleanup_mailbox_matches_only_its_prefix(
+    tmp_path: Path,
+):
+    """A mailbox literally named ``loop-session-cleanup`` matches only its
+    own ``trioctl loop-session-cleanup `` prefix; a look-alike title for a
+    different mailbox and an unrelated title are left alone."""
+    trioctl = load_trioctl()
+    mailbox = tmp_path / "loop-session-cleanup"
+    mailbox.mkdir()
+    rows = [
+        _row("s1", "trioctl loop-session-cleanup lead:iteration 1"),
+        _row("s2", "trioctl other-mailbox lead:iteration 1"),
+        _row("s3", "loop-session-cleanup idle session"),
+    ]
+    client = _FakeSessionsClient(rows)
+
+    counts = trioctl._prune_broker_sessions(client, mailbox)
+
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s1"]
+
+
+def test_session_title_matches_mailbox_helper_prefix_rules():
+    """Direct unit test for the prefix helper backing mailbox-scoped prune
+    matching: new scheme, old scheme, and the registration-anchor titles
+    that must never match."""
+    trioctl = load_trioctl()
+    mailbox = Path("mbx")
+
+    # New locked scheme still carries the ``trioctl mbx `` prefix.
+    assert trioctl._session_title_matches_mailbox(
+        "trioctl mbx lead:iteration 1", mailbox
+    )
+    assert trioctl._session_title_matches_mailbox(
+        "trioctl mbx evaluator:iteration 2 integration-eval", mailbox
+    )
+    # Old-style titles still carry the prefix, so they still match.
+    assert trioctl._session_title_matches_mailbox(
+        "trioctl mbx iteration 1 lead", mailbox
+    )
+    # Registration-anchor, role-config path, other-mailbox, and empty
+    # titles never carry the prefix, so prune never deletes them.
+    assert not trioctl._session_title_matches_mailbox("trio-omnigent-lead", mailbox)
+    assert not trioctl._session_title_matches_mailbox(
+        "lead:omnigent/trio-omnigent-roles/lead", mailbox
+    )
+    assert not trioctl._session_title_matches_mailbox(
+        "trioctl other-mailbox lead:iteration 1", mailbox
+    )
+    assert not trioctl._session_title_matches_mailbox("", mailbox)
+
+
 def test_command_sessions_prune_cli_include_sub_agents_flag_widens_kind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):

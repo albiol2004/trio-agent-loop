@@ -341,7 +341,7 @@ def test_title_unchanged_for_lockstep_and_no_context(tmp_path: Path) -> None:
         mailbox, 4, "lead", {"mode": "lockstep", "kind": "lead-pass"}
     )
 
-    expected = f"trioctl {mailbox.name} iteration 4 lead"
+    expected = f"trioctl {mailbox.name} lead:iteration 4"
     assert no_context == expected
     assert lockstep == expected
 
@@ -502,9 +502,9 @@ def test_title_includes_kind_for_lead_pass_and_integration_eval(
         },
     )
 
-    assert lead_pass == f"trioctl {mailbox.name} iteration 4 lead lead-pass"
+    assert lead_pass == f"trioctl {mailbox.name} lead:iteration 4 lead-pass"
     assert integration == (
-        f"trioctl {mailbox.name} iteration 4 evaluator integration-eval"
+        f"trioctl {mailbox.name} evaluator:iteration 4 integration-eval"
     )
 
 
@@ -525,7 +525,7 @@ def test_title_includes_slice_id_for_slice_eval(tmp_path: Path) -> None:
     )
 
     assert title == (
-        f"trioctl {mailbox.name} iteration 4 evaluator slice-eval:coordination"
+        f"trioctl {mailbox.name} evaluator:iteration 4 slice-eval:coordination"
     )
 
 
@@ -763,7 +763,7 @@ def test_loop_default_prunes_runners_sessions_after_exit_including_nonzero(
     monkeypatch.setattr(
         trioctl,
         "_run_post_loop_session_prune",
-        lambda mailbox, base_url, session_ids: prune_calls.append(
+        lambda mailbox, base_url, session_ids, **_kw: prune_calls.append(
             (mailbox, base_url, sorted(session_ids))
         ),
     )
@@ -902,7 +902,7 @@ def test_loop_keyboard_interrupt_still_prunes_created_sessions(
     monkeypatch.setattr(
         trioctl,
         "_run_post_loop_session_prune",
-        lambda mailbox, base_url, session_ids: prune_calls.append(
+        lambda mailbox, base_url, session_ids, **_kw: prune_calls.append(
             (mailbox, base_url, sorted(session_ids))
         ),
     )
@@ -987,7 +987,7 @@ def test_loop_generic_exception_still_prunes_and_propagates(
     monkeypatch.setattr(
         trioctl,
         "_run_post_loop_session_prune",
-        lambda mailbox, base_url, session_ids: prune_calls.append(
+        lambda mailbox, base_url, session_ids, **_kw: prune_calls.append(
             (mailbox, base_url, sorted(session_ids))
         ),
     )
@@ -1039,7 +1039,7 @@ def test_loop_sigterm_handler_runs_prune(
     monkeypatch.setattr(
         trioctl,
         "_run_post_loop_session_prune",
-        lambda mailbox, base_url, session_ids: prune_calls.append(
+        lambda mailbox, base_url, session_ids, **_kw: prune_calls.append(
             (mailbox, base_url, sorted(session_ids))
         ),
     )
