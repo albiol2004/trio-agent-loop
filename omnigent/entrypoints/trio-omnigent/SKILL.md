@@ -92,6 +92,19 @@ Without a runner-id override, do not share one runner across Lead and
 Evaluator: that collides cursor-native transcript mirroring and
 orphans sessions when the shared runner's idle timeout fires.
 
+Headless `trioctl omnigent loop` (Omnigent 0.14 and 0.12): session
+create POSTs `host_id` + `workspace` (host from GET `/v1/hosts`). If
+the server ignores that, it falls back to
+`POST /v1/hosts/{id}/runners`. A session that fails to start is
+DELETEd. The first prompt is retried on the same session
+(`TRIO_OMNIGENT_PROMPT_WAIT`, default 20s); a restart blip reuses it
+instead of spawning a second Lead/Evaluator. A pass returns only after
+an idle dwell (`TRIO_OMNIGENT_IDLE_DWELL`, default 30s) **and** the
+role artifact exists (Lead Format-A `LOG.md` line / Evaluator
+`VERDICT.md`). Post-loop prune DELETEs this run's sessions even if
+still running (`--keep-sessions` skips). Doctor imports
+`_resolve_subagent_spec`, then `_resolve_agent_spec` on ImportError.
+
 For offline verification, run `omnigent/smoke-test.sh`. The focused validation
 command is:
 `uv run pytest -q tests/tools/builtins/test_sys_session.py tests/runner/test_runner_dispatch.py tests/server/integration/test_sessions_child_sessions.py -k 'reasoning_effort or session_create_spawns_child_under_caller'`
@@ -242,15 +255,20 @@ verdict.
 
 `trioctl omnigent loop` runs unattended iterations over the broker's HTTP API:
 ```bash
-trioctl omnigent loop --mailbox loop/ [--max-iterations N] [--wait-timeout S]
+trioctl omnigent loop --mailbox loop/ [--max-iterations N] [--wait-timeout S] \
+  [--host-id ID] [--runner-id ID]
 ```
 
 The command owns the mailbox lock and manages verdict parsing, repairs (max 2
 consecutive scoped repairs), resume state, and exit codes. `--wait-timeout`
-defaults to 3600 seconds; session `wait` completes on a `running` to `idle`
-edge (with idle dwell to ignore bind flicker), a completed assistant message,
-or `--wait-timeout` expiry. Distinct outcomes: exit 0 (SHIP), 2 (BLOCKED), 3
-(bad verdict), 4 (iteration cap), 5 (NEEDS_HUMAN or mailbox lock held).
+defaults to 3600 seconds. Session `wait` is not role completion: a pass
+finishes only after a `running`→`idle` edge held for
+`TRIO_OMNIGENT_IDLE_DWELL` (default 30s; skip with interval `0` in tests)
+and the mailbox artifact above exists, or `--wait-timeout` expiry.
+Distinct outcomes: exit 0 (SHIP), 2 (BLOCKED), 3 (bad verdict), 4
+(iteration cap), 5 (NEEDS_HUMAN or mailbox lock held). Env/flag
+precedence: `--host-id` over `TRIO_OMNIGENT_HOST_ID`, `--runner-id`
+over `TRIO_OMNIGENT_RUNNER_ID`.
 
 `trioctl omnigent loop` writes `loop/.driver.json` with the PID, iteration
 count, phase (`idle` / `lead-done` / `eval-done`), and Lead/Evaluator session
