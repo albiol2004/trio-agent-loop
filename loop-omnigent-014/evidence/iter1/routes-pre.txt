@@ -1,0 +1,3 @@
+GET /v1/hosts -> 200 (pre-loop, one online host, runners empty on host)
+GET /v1/runners -> 200
+{"data":[]}

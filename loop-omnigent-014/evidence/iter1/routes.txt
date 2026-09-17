@@ -1,0 +1,9 @@
+GET  /v1/hosts -> 200  (one online host 7761495813014886bdc996337f46f28b)
+GET  /v1/runners -> 200  pre-loop {"data":[]}  post-create dedicated runner(s)
+POST /v1/sessions -> 201  body includes host_id + workspace=/tmp/omnigent-dev-data/smoke-repo
+     session lead f51ccdaa77d04e68a799fcf32c37fa2a runner_id runner_token_b40559114f1a2400cdc132459c918760
+     session eval 326df3ceeaca4001a3ed38762c7e7557 runner_id runner_token_6c1da0aaa00f150ccce219ee2b1076b2
+POST /v1/hosts/{host_id}/runners -> not required on this 0.14 trial (create returned runner_id / host launched)
+POST /v1/sessions/{id}/events -> 202  (first prompt + one retry ~20s later on lead)
+GET  /v1/sessions/{id} -> 200
+GET  /v1/sessions/{id}/items -> 200

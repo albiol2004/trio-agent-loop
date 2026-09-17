@@ -1,0 +1,41 @@
+eval log: /tmp/omnigent-dev-data/logs/runner/runner-326df3ceeaca4001a3ed38762c7e7557-20260917-131849-741694.log
+INFO  09-17 13:19:19.031 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:29.753 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:29.784 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:36.923 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:46.862 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:53.252 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:13.883 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:14.753 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:14.770 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+--- tail ---
+INFO  09-17 13:18:50.977 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557 "HTTP/1.1 200 OK"
+INFO  09-17 13:18:51.104 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_6c1da0aaa00f150ccce219ee2b1076b2/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:18:51.140 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_6c1da0aaa00f150ccce219ee2b1076b2/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:18:52.146 runner.app                       ...cursor_terminal | Auto-created cursor terminal + forwarder/approval-mirror for session 326df3ceeaca4001a3ed38762c7e7557; task=cursor-bridges-326df3ceeaca4001a3ed38762c7e7557
+INFO  09-17 13:18:52.276 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/items?limit=1&order=desc "HTTP/1.1 200 OK"
+INFO  09-17 13:18:52.338 runner.app                       ...native_terminal | Cursor terminal ensure returning existing resource: session=326df3ceeaca4001a3ed38762c7e7557 terminal_id=terminal_cursor_main
+INFO  09-17 13:18:52.361 runner.app                       ..._session_events | post_session_events: conv=326df3ceeaca4001a3ed38762c7e7557 type=message active=False buffer_len=0 content_types=['input_text'] model_override=None
+INFO  09-17 13:18:52.379 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/items?limit=100&order=asc "HTTP/1.1 200 OK"
+WARN  09-17 13:18:52.382 runner.app                       ..._items_to_input | _convert_raw_items_to_input: skipped 1 items with types: ['resource_event']
+INFO  09-17 13:18:52.382 runner.app                       ..._items_to_input | _convert_raw_items_to_input: 1 raw items → 0 converted (compaction_idx=None)
+INFO  09-17 13:18:52.383 runner.app                       ..._session_events | post_session_events: starting background turn conv=326df3ceeaca4001a3ed38762c7e7557
+WARN  09-17 13:18:52.383 runner.app                       ...etup_and_stream | agent instructions not delivered for session=326df3ceeaca4001a3ed38762c7e7557 harness=cursor-native delivery=not-delivered — authored instructions accepted but have no delivery channel on this harness.
+INFO  09-17 13:18:52.383 runner.app                       ...etup_and_stream | _run_turn_bg: conv=326df3ceeaca4001a3ed38762c7e7557 history_msgs=1 content_summary=["msg(user, blocks=['input_text'])"]
+INFO  09-17 13:18:52.428 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 200 OK"
+INFO  09-17 13:19:12.516 runner.app                       ...native_terminal | Cursor terminal ensure returning existing resource: session=326df3ceeaca4001a3ed38762c7e7557 terminal_id=terminal_cursor_main
+INFO  09-17 13:19:12.541 runner.app                       ..._session_events | post_session_events: conv=326df3ceeaca4001a3ed38762c7e7557 type=message active=False buffer_len=0 content_types=['input_text'] model_override=None
+INFO  09-17 13:19:12.541 runner.app                       ..._session_events | post_session_events: starting background turn conv=326df3ceeaca4001a3ed38762c7e7557
+INFO  09-17 13:19:12.542 runner.app                       ...etup_and_stream | _run_turn_bg: conv=326df3ceeaca4001a3ed38762c7e7557 history_msgs=2 content_summary=["msg(user, blocks=['input_text'])", "msg(user, blocks=['input_text'])"]
+INFO  09-17 13:19:12.553 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 200 OK"
+INFO  09-17 13:19:18.988 httpx                            ..._single_request | HTTP Request: PATCH http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557 "HTTP/1.1 200 OK"
+INFO  09-17 13:19:19.031 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:29.753 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:29.784 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:36.923 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:46.862 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:19:53.252 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:13.883 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:14.741 runner.app                       ..._session_events | post_session_events: conv=326df3ceeaca4001a3ed38762c7e7557 type=external_session_status active=False buffer_len=0 content_types=[] model_override=None
+INFO  09-17 13:20:14.753 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:20:14.770 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/326df3ceeaca4001a3ed38762c7e7557/events "HTTP/1.1 202 Accepted"

@@ -1,0 +1,3 @@
+trioctl: skip (running): 326df3ceeaca4001a3ed38762c7e7557 trioctl loop-smoke evaluator:iteration 1
+trioctl: skip (running): f51ccdaa77d04e68a799fcf32c37fa2a trioctl loop-smoke lead:iteration 1
+trioctl: session prune archived 0, deleted 0, skipped running 2, failed 0

@@ -1,0 +1,1 @@
+retry: lead runner logged a second user event at 13:16:03 (~20s after 13:15:42), matching TRIO_OMNIGENT_PROMPT_WAIT=20; one create, two events, same session id.
