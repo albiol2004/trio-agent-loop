@@ -1,6 +1,6 @@
 iteration: 1
-status: iterate
-phase: eval-done
-verdict: ITERATE scope=local:omnigent/trioctl
-eval: 114 pytest; doctor contract PASS live+0.14; isolated loop exit 3 unparseable verdict; wait early-ack; evidence loop-omnigent-014/evidence/iter1/
+status: shipped
+phase: done
+verdict: SHIP
+eval: 118 pytest; isolated 0.14 loop exit 0 SHIP; dedicated runners; prune archived 2 deleted 2; evidence loop-omnigent-014/evidence/iter1/eval2-*
 last_run: 2026-09-17

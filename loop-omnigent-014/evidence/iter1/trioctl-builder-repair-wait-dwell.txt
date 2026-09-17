@@ -1,0 +1,31 @@
+🤖 The Evaluator pass was ending on Cursor’s first completed assistant ack because `_wait_for_session` treated `idle + bound + has_assistant` as terminal with no dwell. Dedicated runners made that ack visible while the role was still working, so the driver moved on, saw an empty `VERDICT.md`, and prune deleted the live Evaluator.
+
+The fix is two gates on the same session: idle must hold for `stable_idle` (including the assistant-ack branch; `running` still resets the timer), and Lead/Evaluator are not done until `LOG.md` / `VERDICT.md` show a post-dispatch artifact. Live dwell is 30s via `TRIO_OMNIGENT_IDLE_DWELL`; tests with `interval=0` still skip it.
+
+## Files changed
+- `omnigent/trioctl`
+- `omnigent/tests/test_trioctl.py`
+- `omnigent/tests/test_omnigent_loop.py`
+- `loop-omnigent-014/LOG.md`
+- `loop-omnigent-014/PLAN.md`
+
+`README.md` left unstaged.
+
+## Summary
+- `_wait_for_session`: `idle + bound + assistant` now uses the same `stable_idle` dwell as the resource_event branch; restart-blip (zero items) and failure early-return unchanged.
+- `OmnigentRunner._wait`: `stable_idle = float(os.environ.get("TRIO_OMNIGENT_IDLE_DWELL", "30"))` when `interval != 0`, else `0.0`. Documented on `omnigent loop --help` epilog.
+- After wait, Lead requires a new `- iter <N> | lead |` line in `LOG.md`; Evaluator requires a post-dispatch first non-empty `VERDICT.md` line matching `VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED` (optional `scope=`). Missing artifact re-enters wait on the **same** session with remaining `--wait-timeout`.
+- Commits: `9cac3e0` `slice(wait-dwell): require idle dwell and role artifact before a pass completes`; `63ebd6f` `loop-omnigent-014: repair bookkeeping`. Not pushed.
+
+## Verification
+```
+uv run --with pytest --no-project python3 -m pytest -q omnigent/tests
+118 passed in 13.93s
+```
+`git status`: only ` M README.md`.
+
+## Concerns
+- `omnigent session wait` still defaults `stable_idle=0`; only the loop runner uses the 30s dwell.
+- Each artifact-miss re-entry restarts the dwell, so a stuck-idle Evaluator can sit in 30s chunks until `--wait-timeout`.
+- No live Omnigent contact (offline only); the original exit-3 smoke is unreplayed here.
+- Repair passes are not artifact-gated (Lead/Evaluator only, per brief).

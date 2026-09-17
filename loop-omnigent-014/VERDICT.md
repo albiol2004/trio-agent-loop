@@ -1,56 +1,59 @@
-VERDICT: ITERATE scope=local:omnigent/trioctl
+VERDICT: SHIP
 
-Independent evaluation of iteration 1 at pinned `722dc50`.
-Lead REPORT treated as a claim, not as evidence.
+Independent re-evaluation of iteration 1 after scoped repair
+`9cac3e0` `slice(wait-dwell)`, pinned review HEAD `63ebd6f`.
+Lead REPORT and the builder capture are claims, not evidence.
 
 ## Scout
 
-`python3 omnigent/trioctl omnigent run scout --prompt-file loop-omnigent-014/briefs/eval-skill-k.md --workspace .` (exit 0). Captured in `evidence/iter1/eval-scout.txt`.
+Not required. Failure was local to `omnigent/trioctl` wait/artifact
+gates; the repair diff and offline tests cover that path. Prior
+SKILL.md `-k` scout still holds (0.14 test names exist; obsolete
+selector remains dropped).
 
-- The three SKILL.md files exist under `/home/coder/omnigent-dev/tests`.
-- `-k` name `session_create_spawns_child_under_caller` exists:
-  `tests/runner/test_runner_dispatch.py:7804`
-  `test_sys_session_create_spawns_child_under_caller`.
-- `-k` name `reasoning_effort` is not a `def test_` name in those three
-  files; it does exist as many test names elsewhere under
-  `/home/coder/omnigent-dev/tests`.
-- `registered_native_agent_create_derives_launch_args_from_root_spec`
-  is absent (correctly dropped).
+## Repair vs previous ITERATE
 
-## What passed (slices vs GOAL)
+Previous blocking failure: `_wait_for_session` returned on the first
+cursor-native assistant ack (`idle + bound + has_assistant`, no
+dwell). Driver treated the Evaluator as done, smoke `VERDICT.md` was
+empty, loop exit 3, prune deleted the still-working Evaluator.
 
-- `395ccaa` `create_session` POSTs `host_id` + `workspace`; fallback
-  `POST /v1/hosts/{id}/runners`; records id; DELETE on failed start.
-- `05c2e22` first-prompt / restart-blip retries the **same** session
-  (`ensure_first_prompt`, `_repost_wait_read`). No second create.
-- `981f91b` doctor probe prefers `_resolve_subagent_spec`; SKILL.md
-  host-selection text.
-- `ed81328` offline fake-broker: host launch, prompt retry, no
-  duplicate, orphan DELETE.
-- `eb73283` id-scoped prune DELETEs `running` this-run sessions.
-- Offline: `uv run --with pytest --no-project python3 -m pytest -q
-  omnigent/tests` → **114 passed**.
-- Doctor (read-only): live PATH and
-  `PATH=/home/coder/omnigent-dev/.venv/bin:$PATH` both PASS
-  `omnigent:session-contract`.
+`git show 9cac3e0` matches that scope only (`omnigent/trioctl` plus
+`omnigent/tests/test_trioctl.py` and `test_omnigent_loop.py`):
+
+- Assistant-ack idle now shares `stable_idle` with the items branch;
+  `running` still clears `idle_since`; failure statuses still return
+  immediately; zero-item restart blips still do not start the dwell.
+- Live `OmnigentRunner._wait` uses
+  `TRIO_OMNIGENT_IDLE_DWELL` default **30**; `interval=0` stays 0.0.
+  Documented on `omnigent loop --help` epilog. README.md untouched.
+- After wait, Lead is complete only when LOG has
+  `- iter <N> | lead |` written after dispatch; Evaluator only when
+  the first non-empty `VERDICT.md` line matches the grammar. Missing
+  artifact re-enters wait on the **same** session with remaining
+  `--wait-timeout`. No second create.
+- Tests: assistant idle holds for dwell; running resets dwell;
+  empty VERDICT / missing Lead LOG keeps polling one session.
+
+Earlier acceptance is intact: `create_session` still sends `host_id`
++ workspace; first-prompt retry still same-session; doctor probe and
+id-scoped prune unchanged.
+
+## Offline / gates
+
+- `uv run --with pytest --no-project python3 -m pytest -q omnigent/tests`
+  → **118 passed** (`evidence/iter1/eval2-pytest.txt`).
 - Commit gate: `python3 metrics/trio-shadow.py --mailbox
-  loop-omnigent-014 --require-commits` exit 0.
+  loop-omnigent-014 --require-commits` exit 0
+  (`eval2-commit-gate.txt`). Slice `wait-dwell` writes match.
 - README.md user hunk never staged.
-- Isolated 0.14 stack (`free -g` available 8 GB): dedicated runners
-  (lead `runner_token_188a769df877014f2c5b2910e418cb08`, evaluator
-  `runner_token_6c3d41507955934b5bdc87d407bb66bc`); one session per
-  role; lead first prompt retried on the same id (~20s, two
-  harness events, one POST /v1/sessions); no `already mirrored`;
-  post-loop prune **archived 2, deleted 2, skipped running 0**;
-  no `loop-smoke` row left on 7767; tmux sockets from the archives
-  gone. Teardown: no
-  `OMNIGENT_DATA_DIR=/tmp/omnigent-dev-data` pids; 7767 down;
-  `127.0.0.1:6767/health` ok; pids 765 and 691 alive.
 
-## Blocking failure
+## Isolated 0.14 live proof (eval2)
 
-GOAL live proof requires loop **exit 0**. Independent re-run at
-HEAD (command from `/tmp/omnigent-dev-data/smoke-repo`):
+`free -g` available 7–8 GB. Fresh `/tmp/omnigent-dev-data` with
+`chat.db*` + `artifacts`. Server/host on **7767** only.
+Command from `/tmp/omnigent-dev-data/smoke-repo` (metrics copied so
+loop-core loads):
 
 ```
 python3 /home/coder/personal/trio-agent-loop/omnigent/trioctl omnigent loop \
@@ -58,26 +61,46 @@ python3 /home/coder/personal/trio-agent-loop/omnigent/trioctl omnigent loop \
   --base-url http://127.0.0.1:7767
 ```
 
-**exit 3**, `.driver.json` `phase: error`, smoke `VERDICT.md` empty,
-LOG `unparseable verdict`. Lead *did* write `hello.txt` / `slice(hello)`
-and REPORT. Evaluator archive
-(`evidence/iter1/eval-eval-archive.jsonl`) has the user prompt plus
-two short assistant acks (“I'll act as…”, “I'll read the goal…”)
-and status still `running` at prune. Wait returned in ~20s.
+**exit 0**. `.driver.json` `phase: shipped`. Smoke `VERDICT.md`
+first line `VERDICT: SHIP`. `hello.txt` is `hello\n`; product commit
+`slice(hello): add hello.txt`.
 
-Cause: `_wait_for_session` in `omnigent/trioctl` returns immediately
-on `idle` + bound runner + `_has_completed_assistant_message`, with
-**no** `stable_idle` dwell (that dwell only applies to the
-idle+items-without-assistant branch). Cursor-native emits an early
-completed assistant ack, the session can look idle, wait ends, prune
-DELETEs the still-working evaluator. Lead's earlier smoke SHIP was
-not reproduced.
+| role | session | dedicated runner |
+| --- | --- | --- |
+| lead | `d7f2112a3288430f8ba65e310e7b0971` | `runner_token_37748524eb21eace0d5535cfdc7184a5` |
+| evaluator | `eee59ac5d06e420ebb6eeb5cfc6931fd` | `runner_token_248e54d672cef5bdeb5ad4f48a949c11` |
 
-## Scope
+One session per role. Evaluator archive has the first-ack **and**
+later “VERDICT.md is written” item; prune ran only after loop SHIP.
+Post-loop prune **archived 2, deleted 2, skipped running 0**. No
+`loop-smoke` row left on 7767. This-run tmux sockets
+`/tmp/omnigent-terminal-1hnit1pt` and `...-l8orfxjz` gone after
+teardown.
 
-`omnigent/trioctl` symbols `_wait_for_session` (~745–820) and
-`_has_completed_assistant_message` (~704). Do not treat first
-assistant ack as role completion for cursor-native loop roles.
-No product fix in this evaluator pass.
+Routes: `GET /v1/hosts` 200 (one online host
+`7761495813014886bdc996337f46f28b`); pre-loop `GET /v1/runners`
+`{"data":[]}`; create launched the runner (no fallback POST
+required).
 
-Evidence: `loop-omnigent-014/evidence/iter1/eval-*`.
+Residual: evaluator runner logged `store.db already mirrored by
+another session; pausing` (same workspace, dedicated runners).
+Items still grew; completion used the artifact gate, not the first
+ack. Does not reopen the wait-dwell failure.
+
+Teardown: killed only recorded 7767 server/host pids and processes
+with `OMNIGENT_DATA_DIR=/tmp/omnigent-dev-data`. 7767 down; no
+isolated pids. `127.0.0.1:6767/health` ok; pids **765** and **691**
+alive.
+
+Evidence: `loop-omnigent-014/evidence/iter1/eval2-*`.
+
+## Blocking issues
+
+None.
+
+## Guidance for next iteration
+
+None. Product slice already committed as `9cac3e0`. No further
+product or test edits in this evaluator pass.
+
+commit: 9cac3e0

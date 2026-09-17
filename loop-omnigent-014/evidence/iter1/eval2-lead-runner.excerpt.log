@@ -1,0 +1,41 @@
+INFO  09-17 13:52:40.803 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:40.830 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:40.858 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:40.884 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:40.965 runtime.filesystem_registry      ...ache_is_enabled | git untracked-cache config checked: git_root=/tmp/omnigent-dev-data/smoke-repo elapsed_ms=13.1 enabled=False
+INFO  09-17 13:52:41.057 ...ime.harnesses.process_manager start              | HarnessProcessManager started; instance_dir=/tmp/omnigent-1000/ap-18a9cf7b008a403a8ba0711102f82a99
+INFO  09-17 13:52:41.057 terminals.pane_reaper            start              | native pane reaper started (idle_timeout=3600.0s, interval=60.0s)
+INFO  09-17 13:52:41.088 runner.direct_attach             ...attach_listener | direct-attach listener on 127.0.0.1:37569
+INFO  09-17 13:52:41.102 ...er.transports.ws_tunnel.serve _serve_tunnel_once | runner runner_token_37748524eb21eace0d5535cfdc7184a5 connected to ws://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/tunnel
+INFO  09-17 13:52:41.145 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/agent/contents "HTTP/1.1 200 OK"
+INFO  09-17 13:52:41.324 ...ime.harnesses.process_manager _spawn_entry       | harness started for conversation d7f2112a3288430f8ba65e310e7b0971 (harness=cursor-native)
+INFO  09-17 13:52:41.351 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/child_sessions?limit=1000 "HTTP/1.1 200 OK"
+INFO  09-17 13:52:41.400 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971 "HTTP/1.1 200 OK"
+INFO  09-17 13:52:41.493 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:41.534 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_37748524eb21eace0d5535cfdc7184a5/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:52:42.430 runner.app                       ...cursor_terminal | Auto-created cursor terminal + forwarder/approval-mirror for session d7f2112a3288430f8ba65e310e7b0971; task=cursor-bridges-d7f2112a3288430f8ba65e310e7b0971
+INFO  09-17 13:52:42.549 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/items?limit=1&order=desc "HTTP/1.1 200 OK"
+INFO  09-17 13:52:42.610 runner.app                       ...native_terminal | Cursor terminal ensure returning existing resource: session=d7f2112a3288430f8ba65e310e7b0971 terminal_id=terminal_cursor_main
+INFO  09-17 13:52:42.624 runner.app                       ..._session_events | post_session_events: conv=d7f2112a3288430f8ba65e310e7b0971 type=message active=False buffer_len=0 content_types=['input_text'] model_override=None
+INFO  09-17 13:52:42.642 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/items?limit=100&order=asc "HTTP/1.1 200 OK"
+WARN  09-17 13:52:42.643 runner.app                       ..._items_to_input | _convert_raw_items_to_input: skipped 1 items with types: ['resource_event']
+INFO  09-17 13:52:42.643 runner.app                       ..._items_to_input | _convert_raw_items_to_input: 1 raw items → 0 converted (compaction_idx=None)
+INFO  09-17 13:52:42.643 runner.app                       ..._session_events | post_session_events: starting background turn conv=d7f2112a3288430f8ba65e310e7b0971
+WARN  09-17 13:52:42.644 runner.app                       ...etup_and_stream | agent instructions not delivered for session=d7f2112a3288430f8ba65e310e7b0971 harness=cursor-native delivery=not-delivered — authored instructions accepted but have no delivery channel on this harness.
+INFO  09-17 13:52:42.644 runner.app                       ...etup_and_stream | _run_turn_bg: conv=d7f2112a3288430f8ba65e310e7b0971 history_msgs=1 content_summary=["msg(user, blocks=['input_text'])"]
+INFO  09-17 13:52:42.679 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 200 OK"
+INFO  09-17 13:52:46.973 runtime.filesystem_registry      ...untracked_cache | git untracked-cache probe completed: git_root=/tmp/omnigent-dev-data/smoke-repo elapsed_ms=6007.5 returncode=0
+INFO  09-17 13:52:46.982 runtime.filesystem_registry      ...untracked_cache | git untracked-cache config completed: git_root=/tmp/omnigent-dev-data/smoke-repo elapsed_ms=6.9 returncode=0
+INFO  09-17 13:52:49.964 httpx                            ..._single_request | HTTP Request: PATCH http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971 "HTTP/1.1 200 OK"
+INFO  09-17 13:52:49.987 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:52:54.964 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:52:55.694 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:53:05.630 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:53:38.273 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:54:21.650 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:55:07.720 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:55:08.484 runner.app                       ..._session_events | post_session_events: conv=d7f2112a3288430f8ba65e310e7b0971 type=external_session_status active=False buffer_len=0 content_types=[] model_override=None
+INFO  09-17 13:55:08.488 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:55:08.598 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:57:10.718 runner.app                       _evict             | Transcript forwarder task cursor-bridges-d7f2112a3288430f8ba65e310e7b0971 cancelled; session=d7f2112a3288430f8ba65e310e7b0971
+INFO  09-17 13:57:11.003 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/d7f2112a3288430f8ba65e310e7b0971/labels "HTTP/1.1 200 OK"

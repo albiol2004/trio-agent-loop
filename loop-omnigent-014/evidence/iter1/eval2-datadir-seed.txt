@@ -1,0 +1,9 @@
+total 210348
+drwxr-xr-x  3 coder coder      4096 Sep 17 13:51 .
+drwxrwxrwt  1 root  root      36864 Sep 17 13:51 ..
+drwxr-xr-x 23 coder coder      4096 Sep 17 07:34 artifacts
+-rw-r--r--  1 coder coder 142688256 Sep 17 13:48 chat.db
+-rw-r--r--  1 coder coder     32768 Sep 17 13:51 chat.db-shm
+-rw-r--r--  1 coder coder  11943912 Sep 17 13:51 chat.db-wal
+-rw-r--r--  1 coder coder  11943912 Sep 15 08:00 chat.db-wal.bak-20260915
+-rw-r--r--  1 coder coder  48734208 Sep 15 08:00 chat.db.bak-20260915

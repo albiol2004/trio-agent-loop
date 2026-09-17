@@ -1,0 +1,4 @@
+Starting omnigent server on 127.0.0.1:7767
+  database:  sqlite:////tmp/omnigent-dev-data/chat.db
+  artifacts: /tmp/omnigent-dev-data/artifacts
+  log:       ~/.omnigent/logs/runner/runner-3441e9605f3942e1b9b0fe5eb59163c7-20260917-060434-569659.log

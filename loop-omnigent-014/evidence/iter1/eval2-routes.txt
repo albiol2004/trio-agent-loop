@@ -1,0 +1,12 @@
+GET  /v1/hosts -> 200  one online host 7761495813014886bdc996337f46f28b
+GET  /v1/runners -> 200  pre-loop {"data":[]}
+POST /v1/sessions -> 201  host_id + workspace=/tmp/omnigent-dev-data/smoke-repo
+     lead d7f2112a3288430f8ba65e310e7b0971 runner_token_37748524eb21eace0d5535cfdc7184a5
+     eval eee59ac5d06e420ebb6eeb5cfc6931fd runner_token_248e54d672cef5bdeb5ad4f48a949c11
+POST /v1/hosts/{id}/runners -> not required (create launched runner)
+DELETE /v1/sessions/{id} -> prune archived 2 deleted 2 skipped running 0
+loop exit 0; smoke VERDICT.md SHIP; evaluator archive contains full SHIP text
+
+LEAD_LOG=/tmp/omnigent-dev-data/logs/runner/runner-d7f2112a3288430f8ba65e310e7b0971-20260917-135240-588620.log
+EVAL_LOG=/tmp/omnigent-dev-data/logs/runner/runner-eee59ac5d06e420ebb6eeb5cfc6931fd-20260917-135540-598251.log
+=== server session/runner lines ===

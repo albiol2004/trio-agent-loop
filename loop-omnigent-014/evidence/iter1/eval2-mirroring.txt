@@ -1,0 +1,2 @@
+=== mirroring ===
+/tmp/omnigent-dev-data/logs/runner/runner-eee59ac5d06e420ebb6eeb5cfc6931fd-20260917-135540-598251.log:29:WARN  09-17 13:55:47.762 cursor_native.forwarder          ...tore_to_session | cursor chat /home/coder/.cursor/chats/e82903d84f3832c2949dce95d86e0eb6/74a87d1f-bf65-41fe-8ed2-4f3415c56593/store.db already mirrored by another session; pausing mirror for session=eee59ac5d06e420ebb6eeb5cfc6931fd

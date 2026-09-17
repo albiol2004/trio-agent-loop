@@ -1,0 +1,41 @@
+INFO  09-17 13:55:40.989 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:41.028 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:41.071 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:41.111 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:41.201 runtime.filesystem_registry      ...ache_is_enabled | git untracked-cache config checked: git_root=/tmp/omnigent-dev-data/smoke-repo elapsed_ms=9.8 enabled=True
+INFO  09-17 13:55:41.311 ...ime.harnesses.process_manager start              | HarnessProcessManager started; instance_dir=/tmp/omnigent-1000/ap-1857e18022964f92a9b404f41edf057d
+INFO  09-17 13:55:41.312 terminals.pane_reaper            start              | native pane reaper started (idle_timeout=3600.0s, interval=60.0s)
+INFO  09-17 13:55:41.343 runner.direct_attach             ...attach_listener | direct-attach listener on 127.0.0.1:44735
+INFO  09-17 13:55:41.362 ...er.transports.ws_tunnel.serve _serve_tunnel_once | runner runner_token_248e54d672cef5bdeb5ad4f48a949c11 connected to ws://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/tunnel
+INFO  09-17 13:55:41.417 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/agent/contents "HTTP/1.1 200 OK"
+INFO  09-17 13:55:41.591 ...ime.harnesses.process_manager _spawn_entry       | harness started for conversation eee59ac5d06e420ebb6eeb5cfc6931fd (harness=cursor-native)
+INFO  09-17 13:55:41.647 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/child_sessions?limit=1000 "HTTP/1.1 200 OK"
+INFO  09-17 13:55:41.692 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd "HTTP/1.1 200 OK"
+INFO  09-17 13:55:41.776 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:41.817 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/runners/runner_token_248e54d672cef5bdeb5ad4f48a949c11/token "HTTP/1.1 400 Bad Request"
+INFO  09-17 13:55:43.046 runner.app                       ...cursor_terminal | Auto-created cursor terminal + forwarder/approval-mirror for session eee59ac5d06e420ebb6eeb5cfc6931fd; task=cursor-bridges-eee59ac5d06e420ebb6eeb5cfc6931fd
+INFO  09-17 13:55:43.205 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/items?limit=1&order=desc "HTTP/1.1 200 OK"
+INFO  09-17 13:55:43.287 runner.app                       ...native_terminal | Cursor terminal ensure returning existing resource: session=eee59ac5d06e420ebb6eeb5cfc6931fd terminal_id=terminal_cursor_main
+INFO  09-17 13:55:43.307 runner.app                       ..._session_events | post_session_events: conv=eee59ac5d06e420ebb6eeb5cfc6931fd type=message active=False buffer_len=0 content_types=['input_text'] model_override=None
+INFO  09-17 13:55:43.342 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/items?limit=100&order=asc "HTTP/1.1 200 OK"
+WARN  09-17 13:55:43.344 runner.app                       ..._items_to_input | _convert_raw_items_to_input: skipped 1 items with types: ['resource_event']
+INFO  09-17 13:55:43.344 runner.app                       ..._items_to_input | _convert_raw_items_to_input: 1 raw items → 0 converted (compaction_idx=None)
+INFO  09-17 13:55:43.344 runner.app                       ..._session_events | post_session_events: starting background turn conv=eee59ac5d06e420ebb6eeb5cfc6931fd
+WARN  09-17 13:55:43.344 runner.app                       ...etup_and_stream | agent instructions not delivered for session=eee59ac5d06e420ebb6eeb5cfc6931fd harness=cursor-native delivery=not-delivered — authored instructions accepted but have no delivery channel on this harness.
+INFO  09-17 13:55:43.345 runner.app                       ...etup_and_stream | _run_turn_bg: conv=eee59ac5d06e420ebb6eeb5cfc6931fd history_msgs=1 content_summary=["msg(user, blocks=['input_text'])"]
+INFO  09-17 13:55:43.405 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 200 OK"
+INFO  09-17 13:55:47.018 httpx                            ..._single_request | HTTP Request: PATCH http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd "HTTP/1.1 200 OK"
+INFO  09-17 13:55:47.056 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+WARN  09-17 13:55:47.762 cursor_native.forwarder          ...tore_to_session | cursor chat /home/coder/.cursor/chats/e82903d84f3832c2949dce95d86e0eb6/74a87d1f-bf65-41fe-8ed2-4f3415c56593/store.db already mirrored by another session; pausing mirror for session=eee59ac5d06e420ebb6eeb5cfc6931fd
+INFO  09-17 13:55:51.419 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:55:57.081 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:55:57.100 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:05.665 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:15.606 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:33.334 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:39.710 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:39.735 runner.app                       ..._session_events | post_session_events: conv=eee59ac5d06e420ebb6eeb5cfc6931fd type=external_session_status active=False buffer_len=0 content_types=[] model_override=None
+INFO  09-17 13:56:39.738 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:56:40.229 httpx                            ..._single_request | HTTP Request: POST http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/events "HTTP/1.1 202 Accepted"
+INFO  09-17 13:57:10.325 runner.app                       _evict             | Transcript forwarder task cursor-bridges-eee59ac5d06e420ebb6eeb5cfc6931fd cancelled; session=eee59ac5d06e420ebb6eeb5cfc6931fd
+INFO  09-17 13:57:10.560 httpx                            ..._single_request | HTTP Request: GET http://127.0.0.1:7767/v1/sessions/eee59ac5d06e420ebb6eeb5cfc6931fd/labels "HTTP/1.1 200 OK"

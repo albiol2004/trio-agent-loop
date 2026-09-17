@@ -1,0 +1,6 @@
+=== isolated pids before teardown ===
+3606089 /home/coder/omnigent-dev/.venv/bin/python /home/coder/omnigent-dev/.venv/bin/omni server --host 127.0.0.1 --port 7767 
+3607371 /home/coder/omnigent-dev/.venv/bin/python /home/coder/omnigent-dev/.venv/bin/omni host --server http://127.0.0.1:7767 --non-interactive 
+3607960 /home/coder/omnigent-dev/.venv/bin/python -P -m omnigent.runner._zygote 
+3609435 /home/coder/omnigent-dev/.venv/bin/python -P -m omnigent.runner._zygote 
+3630876 /home/coder/omnigent-dev/.venv/bin/python -P -m omnigent.runner._zygote 
