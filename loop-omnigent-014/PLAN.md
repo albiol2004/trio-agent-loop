@@ -101,4 +101,11 @@ slices:
     gate: true
     status: complete
     iteration: 1
+  - id: wait-dwell
+    repo: .
+    writes: [omnigent/trioctl, omnigent/tests/test_trioctl.py, omnigent/tests/test_omnigent_loop.py]
+    reads: []
+    gate: true
+    status: complete
+    iteration: 1
 ```
