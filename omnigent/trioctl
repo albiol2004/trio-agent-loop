@@ -866,8 +866,14 @@ def _role_artifact_ready(
     iteration: int,
     before_text: str,
     before_mtime: float,
+    context: dict[str, Any] | None = None,
 ) -> bool:
-    """True when this role wrote its mailbox artifact after dispatch."""
+    """True when this role wrote its mailbox artifact after dispatch.
+
+    Open-loop slice-eval APPENDS a ``## slice <id> @<sha> — …`` section
+    and never a ``VERDICT:`` first line. That kind only needs VERDICT.md
+    to change; the driver later checks the section itself.
+    """
     if role == "lead":
         path = mailbox / "LOG.md"
         text = _mailbox_text(path)
@@ -877,7 +883,10 @@ def _role_artifact_ready(
     if role == "evaluator":
         path = mailbox / "VERDICT.md"
         text = _mailbox_text(path)
-        if not _verdict_line_ready(text):
+        slice_eval = bool(
+            context and context.get("kind") == "slice-eval"
+        )
+        if not slice_eval and not _verdict_line_ready(text):
             return False
         return text != before_text or _mailbox_mtime(path) > before_mtime
     return True
@@ -1767,7 +1776,9 @@ class OmnigentRunner:
             stable_idle=(
                 0.0
                 if self._interval == 0
-                else float(os.environ.get("TRIO_OMNIGENT_IDLE_DWELL", "30"))
+                else broker_http._env_float(
+                    "TRIO_OMNIGENT_IDLE_DWELL", 30.0
+                )
             ),
         )
 
@@ -1919,6 +1930,7 @@ class OmnigentRunner:
                 started,
                 before_text,
                 before_mtime,
+                context,
             )
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
@@ -1935,6 +1947,7 @@ class OmnigentRunner:
         started: float,
         before_text: str,
         before_mtime: float,
+        context: dict[str, Any] | None = None,
     ) -> Any:
         """Re-enter wait on this session until the role artifact exists."""
         session_id = self.session_ids.get(role)
@@ -1942,7 +1955,7 @@ class OmnigentRunner:
             raise TrioctlError(f"role {role} has no session id")
         snapshot: Any = {"id": session_id, "status": "idle"}
         while not _role_artifact_ready(
-            mailbox, role, iteration, before_text, before_mtime
+            mailbox, role, iteration, before_text, before_mtime, context
         ):
             remaining = self._timeout - (time.monotonic() - started)
             if remaining <= 0:
@@ -1954,6 +1967,14 @@ class OmnigentRunner:
             if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
                 return snapshot
             self._read(client, session_id)
+            # Bound GET /items + GET /session when idle dwell is 0.
+            # interval=0 stays sleep-free so fake-broker tests stay fast.
+            if self._interval > 0:
+                remaining = self._timeout - (
+                    time.monotonic() - started
+                )
+                if remaining > 0:
+                    time.sleep(min(self._interval, remaining))
         return snapshot
 
     def _repost_wait_read(

@@ -71,6 +71,9 @@ class FakeBrokerClient:
         *,
         lead_log_after_reads: int = 1,
         verdict_after_reads: int = 1,
+        # None writes a lockstep ``VERDICT: SHIP`` line. A string is
+        # appended instead (slice-eval sections have no VERDICT: line).
+        verdict_append: str | None = None,
     ) -> None:
         self.mailbox = mailbox
         self.sessions: dict[str, str] = {}
@@ -85,6 +88,7 @@ class FakeBrokerClient:
         # them to prove the driver keeps waiting on the same session.
         self.lead_log_after_reads = lead_log_after_reads
         self.verdict_after_reads = verdict_after_reads
+        self.verdict_append = verdict_append
 
     def create(
         self,
@@ -145,10 +149,15 @@ class FakeBrokerClient:
                     log.write("- iter 1 | lead | completed\n")
         else:
             if count >= self.verdict_after_reads:
-                (self.mailbox / "VERDICT.md").write_text(
-                    "VERDICT: SHIP\n",
-                    encoding="utf-8",
-                )
+                verdict = self.mailbox / "VERDICT.md"
+                if self.verdict_append is not None:
+                    with verdict.open("a", encoding="utf-8") as handle:
+                        handle.write(self.verdict_append)
+                else:
+                    verdict.write_text(
+                        "VERDICT: SHIP\n",
+                        encoding="utf-8",
+                    )
         return {"items": [{"role": "assistant", "content": role}]}
 
 
@@ -255,6 +264,67 @@ def test_evaluator_keeps_waiting_until_verdict_artifact(
         if line.strip()
     )
     assert first.startswith("VERDICT: SHIP")
+
+
+def test_slice_eval_artifact_gate_accepts_appended_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """slice-eval only appends a section; skip the VERDICT: first-line gate."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text("# Verdicts\n", encoding="utf-8")
+    _install_role_registry(tmp_path, monkeypatch)
+    section = "## slice coordination @abc1234 — SHIP\n"
+    broker = FakeBrokerClient(mailbox, verdict_append=section)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+        timeout=1,
+    )
+    context = {
+        "mode": "open-loop",
+        "slice": "coordination",
+        "sha": "abc1234",
+        "kind": "slice-eval",
+    }
+
+    result = runner.run("evaluator", 1, mailbox, context)
+
+    assert result == 0
+    text = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert text.startswith("# Verdicts\n")
+    assert section.strip() in text
+    first = next(line.strip() for line in text.splitlines() if line.strip())
+    assert not first.startswith("VERDICT:")
+
+
+def test_artifact_wait_bounds_by_timeout_with_interval_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """interval=0 must not sleep, but still raise when wait-timeout elapses."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    _install_role_registry(tmp_path, monkeypatch)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        trioctl.time, "sleep", lambda s: sleep_calls.append(s)
+    )
+    # Never write VERDICT.md so the artifact loop cannot succeed.
+    broker = FakeBrokerClient(mailbox, verdict_after_reads=10_000)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+        timeout=0.05,
+    )
+
+    with pytest.raises(trioctl.TrioctlError, match="timed out"):
+        runner.run("evaluator", 1, mailbox)
+
+    assert all(s == 0 for s in sleep_calls)
 
 
 def test_lead_keeps_waiting_until_log_line(

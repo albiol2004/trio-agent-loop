@@ -943,8 +943,10 @@ def test_pending_inputs_drain_counts_as_miss_then_repost(
     client = trioctl.broker_http.BrokerClient(base_url)
 
     # After the first poll sees pending, clear it so the helper
-    # treats the drain as a miss and re-posts.
+    # treats the drain as a miss (even after the extra grace items
+    # poll) and re-posts. Land the user row only after that retry.
     original_get = client.get_session
+    original_items = client.get_items
     polls = {"n": 0}
 
     def get_session_then_clear(session_id: str):
@@ -952,19 +954,65 @@ def test_pending_inputs_drain_counts_as_miss_then_repost(
         snap = original_get(session_id)
         if polls["n"] >= 2:
             state["pending_inputs"] = []
-        if polls["n"] >= 3:
-            # Next attempt should see the user item.
+        return snap
+
+    def get_items_until_repost(session_id: str, **kwargs):
+        if len(state["events"]) >= 2:
             state["item_rows"] = [
                 {"id": "item-1", "role": "user", "text": "hi"}
             ]
-        return snap
+        return original_items(session_id, **kwargs)
 
     client.get_session = get_session_then_clear  # type: ignore[method-assign]
+    client.get_items = get_items_until_repost  # type: ignore[method-assign]
     created = client.create_session("agent-1", "model-1", "hi", "title")
 
     assert created["id"] == "session-1"
     assert len(state["posts"]) == 1
     assert len(state["events"]) >= 2
+
+
+def test_pending_drain_grace_poll_skips_repost_when_item_lands(
+    fake_broker, monkeypatch
+):
+    """Pending clears then the next items poll shows the user row: no re-post."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["item_rows"] = []
+    state["pending_inputs"] = [{"id": "p1"}]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.4")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.01")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    client = trioctl.broker_http.BrokerClient(base_url)
+    original_items = client.get_items
+    original_session = client.get_session
+    item_polls = {"n": 0}
+    session_polls = {"n": 0}
+
+    def get_items_then_land(session_id: str, **kwargs):
+        item_polls["n"] += 1
+        # 1: first loop empty. 2: drain-loop empty. 3: grace poll lands.
+        if item_polls["n"] >= 3:
+            state["item_rows"] = [
+                {"id": "item-1", "role": "user", "text": "hello"}
+            ]
+        return original_items(session_id, **kwargs)
+
+    def get_session_then_clear(session_id: str):
+        session_polls["n"] += 1
+        snap = original_session(session_id)
+        if session_polls["n"] >= 2:
+            state["pending_inputs"] = []
+        return snap
+
+    client.get_items = get_items_then_land  # type: ignore[method-assign]
+    client.get_session = get_session_then_clear  # type: ignore[method-assign]
+    created = client.create_session("agent-1", "model-1", "hello", "title")
+
+    assert created["id"] == "session-1"
+    assert len(state["posts"]) == 1
+    assert len(state["events"]) == 1
 
 
 def test_orphan_deleted_when_runner_launch_fails(

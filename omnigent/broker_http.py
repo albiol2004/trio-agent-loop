@@ -96,8 +96,13 @@ def _item_role(item: Any) -> str:
 
 
 def _items_contain_user_text(items: list[Any], message: str) -> bool:
-    """True when a user row exists (text match when content is present)."""
-    needle = message.strip()
+    """True when a user row matches the prompt, or any empty user row.
+
+    Match the first 200 chars of the prompt against item text. A user
+    row with no body still counts as landed (cold TUI ACK with no
+    content yet). A user row with a different body is not a hit.
+    """
+    needle = message.strip()[:200]
     for item in items:
         if _item_role(item) != "user":
             continue
@@ -106,7 +111,6 @@ def _items_contain_user_text(items: list[Any], message: str) -> bool:
             return True
         if needle and (needle in text or text in needle):
             return True
-        return True
     return False
 
 
@@ -644,8 +648,14 @@ class BrokerClient:
             if pending:
                 saw_pending = True
             elif saw_pending:
-                # Pending cleared without an item: the TUI swallowed the
-                # prompt. Treat as miss so the caller re-posts.
+                # Pending drained with no item yet. One more items poll
+                # after `interval` covers store-write lag before re-post.
+                now = time.monotonic()
+                if now < deadline:
+                    time.sleep(min(interval, max(deadline - now, 0.0)))
+                items = _session_item_rows(self.get_items(session_id))
+                if _items_contain_user_text(items, message):
+                    return True
                 return False
             now = time.monotonic()
             if now >= deadline:

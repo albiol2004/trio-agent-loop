@@ -108,4 +108,15 @@ slices:
     gate: true
     status: complete
     iteration: 1
+  - id: review-fixes
+    repo: .
+    writes:
+      - omnigent/trioctl
+      - omnigent/broker_http.py
+      - omnigent/tests/test_omnigent_loop.py
+      - omnigent/tests/test_trioctl.py
+    reads: []
+    gate: true
+    status: complete
+    iteration: 1
 ```
