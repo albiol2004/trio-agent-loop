@@ -1,0 +1,3 @@
+    PID CMD
+    691 /home/coder/.local/share/uv/tools/omnigent/bin/python /home/coder/.local/bin/omni host --server http://127.0.0.1:6767 --non-interactive
+    765 /home/coder/.local/share/uv/tools/omnigent/bin/python /home/coder/.local/bin/omni server

@@ -1,0 +1,11 @@
+Connecting to http://127.0.0.1:7767 as 'alejandro-netcup-81fba25e-ws' (7761495813014886bdc996337f46f28b)
+Session logs: /tmp/omnigent-dev-data/logs/runner/
+This host's log: ~/.omnigent/logs/runner/runner-3441e9605f3942e1b9b0fe5eb59163c7-20260917-060434-569659.log
+CLI diagnostics: /tmp/omnigent-dev-data/logs/cli/cli-20260917-133200-3477445-ae668c.log
+✓ Connected as 'alejandro-netcup-81fba25e-ws' (7761495813014886bdc996337f46f28b), 0 live runner(s). Listening for sessions — Ctrl-C to disconnect.
+  ↑ Runner started: runner_token_188a769df877014f2c5b2910e418cb08 (pid=3481245)
+    log: /tmp/omnigent-dev-data/logs/runner/runner-a1cfab50fd864275a409259f353eb680-20260917-133236-023670.log
+    session: a1cfab50fd864275a409259f353eb680
+  ↑ Runner started: runner_token_6c3d41507955934b5bdc87d407bb66bc (pid=3501749)
+    log: /tmp/omnigent-dev-data/logs/runner/runner-49ab466d1323434e96ebfc1fd80c0922-20260917-133532-478655.log
+    session: 49ab466d1323434e96ebfc1fd80c0922

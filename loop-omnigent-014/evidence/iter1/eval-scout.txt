@@ -1,0 +1,19 @@
+Captured from: python3 omnigent/trioctl omnigent run scout --prompt-file loop-omnigent-014/briefs/eval-skill-k.md --workspace .
+
+exit 0
+
+🤖 Trio Scout findings (read-only; no files edited; no servers run)
+
+1. The three SKILL.md files exist
+- /home/coder/omnigent-dev/tests/tools/builtins/test_sys_session.py — exists
+- /home/coder/omnigent-dev/tests/runner/test_runner_dispatch.py — exists
+- /home/coder/omnigent-dev/tests/server/integration/test_sessions_child_sessions.py — exists
+
+2. -k names in those three files
+In the three files, one match:
+- tests/runner/test_runner_dispatch.py:7804 — test_sys_session_create_spawns_child_under_caller
+None in test_sys_session.py or test_sessions_child_sessions.py as def test_ names.
+reasoning_effort exists as many test names elsewhere under /home/coder/omnigent-dev/tests.
+
+3. registered_native_agent_create_derives_launch_args_from_root_spec
+Not present anywhere under /home/coder/omnigent-dev/tests.

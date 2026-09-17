@@ -1,0 +1,4 @@
+INFO  09-17 13:32:38.030 runner.app                       ...etup_and_stream | _run_turn_bg: conv=a1cfab50fd864275a409259f353eb680 history_msgs=1 content_summary=["msg(user, blocks=['input_text'])"]
+INFO  09-17 13:32:38.059 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/a1cfab50fd864275a409259f353eb680/events "HTTP/1.1 200 OK"
+INFO  09-17 13:32:58.151 runner.app                       ...etup_and_stream | _run_turn_bg: conv=a1cfab50fd864275a409259f353eb680 history_msgs=2 content_summary=["msg(user, blocks=['input_text'])", "msg(user, blocks=['input_text'])"]
+INFO  09-17 13:32:58.166 httpx                            ..._single_request | HTTP Request: POST http://harness.local/v1/sessions/a1cfab50fd864275a409259f353eb680/events "HTTP/1.1 200 OK"

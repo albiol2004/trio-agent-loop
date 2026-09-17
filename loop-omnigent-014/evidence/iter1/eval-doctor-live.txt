@@ -1,0 +1,13 @@
+PASS config: /home/coder/.config/trio-agent-loop/omnigent.toml
+PASS command:cursor-agent: /home/coder/.local/bin/cursor-agent
+PASS command:omnigent: /home/coder/.local/bin/omnigent
+PASS omnigent:session-contract: session-create effort and registered native launch propagation available
+PASS cursor:approval-mode: /home/coder/.cursor/cli-config.json: approvalMode="unrestricted"
+PASS prompts: /home/coder/personal/trio-agent-loop/omnigent/entrypoints/trio-omnigent/prompts
+PASS cursor:model/list: 223 available models
+PASS role:lead: cursor-grok-4.6-medium / medium (cursor-model-list)
+PASS role:evaluator: cursor-grok-4.6-medium / medium (cursor-model-list)
+PASS role:builder: cursor-grok-4.6-medium / medium (cursor-model-list)
+PASS role:scout: cursor-grok-4.6-medium / medium (cursor-model-list)
+PASS role:docs: cursor-grok-4.6-medium / medium (cursor-model-list)
+PASS registry: /home/coder/.omnigent/agents/trio-omnigent-roles/registry.json
