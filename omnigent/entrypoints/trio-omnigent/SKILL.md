@@ -83,14 +83,18 @@ with Cursor `--force --trust` and Scout with those flags plus read-only
 requires re-registration because the stored `agent_id` was created from the
 config as it read at registration time.
 
-When multiple brokers are online, set `TRIO_OMNIGENT_RUNNER_ID=<runner_id>` to
-select the broker runner for this loop; without it, exactly one online runner is
-required. The error message lists available runners if several are online and the
-variable is unset.
+When several hosts are online, set `TRIO_OMNIGENT_HOST_ID=<host_id>`
+(or pass `--host-id`) so each role session gets a dedicated runner on
+that host. `TRIO_OMNIGENT_RUNNER_ID` / `--runner-id` remains an
+explicit override that binds an already-online runner instead of
+launching one. Without a host id, exactly one online host is required.
+Without a runner-id override, do not share one runner across Lead and
+Evaluator: that collides cursor-native transcript mirroring and
+orphans sessions when the shared runner's idle timeout fires.
 
 For offline verification, run `omnigent/smoke-test.sh`. The focused validation
 command is:
-`uv run pytest -q tests/tools/builtins/test_spawn.py tests/runner/test_runner_dispatch.py tests/server/integration/test_sessions_child_sessions.py -k 'reasoning_effort or session_create_spawns_child_under_caller or registered_native_agent_create_derives_launch_args_from_root_spec'`
+`uv run pytest -q tests/tools/builtins/test_sys_session.py tests/runner/test_runner_dispatch.py tests/server/integration/test_sessions_child_sessions.py -k 'reasoning_effort or session_create_spawns_child_under_caller'`
 
 ## Mailbox
 
