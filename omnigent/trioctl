@@ -393,11 +393,17 @@ def omnigent_contract() -> str:
     interpreter = first_line[2:]
     probe = """
 from omnigent.tools.builtins.spawn import SysSessionCreateTool
-from omnigent.server.routes.sessions import _resolve_agent_spec
+
+# 0.14 renamed the helper; 0.12 (and the 0.14 fork alias) still
+# export _resolve_agent_spec. Prefer the new name, fall back.
+try:
+    from omnigent.server.routes.sessions import _resolve_subagent_spec as _resolve
+except ImportError:
+    from omnigent.server.routes.sessions import _resolve_agent_spec as _resolve
 
 create_props = SysSessionCreateTool().get_schema()["function"]["parameters"]["properties"]
 assert "reasoning_effort" in create_props
-assert callable(_resolve_agent_spec)
+assert callable(_resolve)
 """
     try:
         result = subprocess.run(
@@ -835,6 +841,9 @@ def command_session_create(args: argparse.Namespace) -> int:
             args.model,
             args.message,
             getattr(args, "title", None),
+            runner_id=getattr(args, "runner_id", None),
+            host_id=getattr(args, "host_id", None),
+            workspace=getattr(args, "workspace", None),
         )
     except broker_http.BrokerHttpError as exc:
         raise TrioctlError(str(exc)) from exc
@@ -1441,6 +1450,8 @@ class OmnigentRunner:
         timeout: float = DEFAULT_LOOP_WAIT_TIMEOUT,
         interval: float = 1.0,
         runner_id: str | None = None,
+        host_id: str | None = None,
+        workspace: str | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -1454,6 +1465,10 @@ class OmnigentRunner:
         self._timeout = timeout
         self._interval = interval
         self._runner_id = runner_id
+        # Dedicated host launch (default). runner_id remains an override
+        # that binds an already-online runner instead of spawning one.
+        self._host_id = host_id
+        self._workspace = workspace or str(self.repo)
         self.session_ids: dict[str, str] = {}
         self.created_session_ids: list[str] = []
 
@@ -1608,29 +1623,46 @@ class OmnigentRunner:
         prompt: str,
         title: str,
         runner_id: str | None = None,
+        host_id: str | None = None,
+        workspace: str | None = None,
     ) -> Any:
         """Call the checked-in client seam or a small test double.
 
-        `runner_id` is forwarded only when the target method declares that
-        parameter (or accepts **kwargs) — the fakes in test_omnigent_loop.py
-        and test_trioctl.py take the legacy 4-argument shape and must keep
-        working unchanged.
+        Extra kwargs (`runner_id`, `host_id`, `workspace`) are forwarded
+        only when the target method declares them (or accepts **kwargs).
+        The fakes in test_omnigent_loop.py take the legacy 4-argument
+        shape and must keep working unchanged.
         """
         method = getattr(client, "create_session", None) or getattr(
             client, "create", None
         )
         if method is None:
             raise TrioctlError("broker client has no session-create method")
+        extra: dict[str, Any] = {}
         if runner_id:
+            extra["runner_id"] = runner_id
+        if host_id:
+            extra["host_id"] = host_id
+        if workspace:
+            extra["workspace"] = workspace
+        if extra:
             try:
                 params = inspect.signature(method).parameters
             except (TypeError, ValueError):
                 params = {}
-            accepts_runner_id = "runner_id" in params or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
             )
-            if accepts_runner_id:
-                return method(agent_id, model, prompt, title, runner_id=runner_id)
+            forwarded = {
+                key: value
+                for key, value in extra.items()
+                if key in params or accepts_kwargs
+            }
+            if forwarded:
+                return method(
+                    agent_id, model, prompt, title, **forwarded
+                )
         return method(agent_id, model, prompt, title)
 
     def _wait(self, client: Any, session_id: str) -> Any:
@@ -1726,6 +1758,8 @@ class OmnigentRunner:
             prompt,
             title,
             runner_id=self._runner_id,
+            host_id=self._host_id,
+            workspace=self._workspace,
         )
         session_id = self._session_id(created)
         if session_id is None:
@@ -1759,12 +1793,10 @@ class OmnigentRunner:
         """Create, await, and read one Lead, Evaluator, or repair session.
 
         A restart blip (unbound runner, zero items back) is retried once
-        after a short delay instead of failing outright: `metrics/
-        trio_loop.py` raises on a non-zero Lead runner exit and aborts the
-        whole poll loop, so treating a single transient blip as fatal would
-        be worse than absorbing it silently. A second miss in a row is a
-        real failure and returns 1 so the driver does not count it as a
-        completed pass.
+        on the **same** session: re-post the prompt after a short delay.
+        Creating a second session for the same role/iteration is what
+        left duplicate Leads and `phase: error` in the 0.14 trial.
+        A second miss in a row is a real failure and returns 1.
         """
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
@@ -1783,8 +1815,8 @@ class OmnigentRunner:
                 self._is_restart_blip(snapshot, items)
             ):
                 time.sleep(10.0)
-                snapshot, items = self._create_wait_read(
-                    client, agent_id, model, prompt, title, role
+                snapshot, items = self._repost_wait_read(
+                    client, role, prompt
                 )
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
@@ -1793,6 +1825,25 @@ class OmnigentRunner:
         if self._is_restart_blip(snapshot, items):
             return 1
         return 0
+
+    def _repost_wait_read(
+        self, client: Any, role: str, prompt: str
+    ) -> tuple[Any, Any]:
+        """Re-post the first prompt on the existing session, then wait."""
+        session_id = self.session_ids.get(role)
+        if not session_id:
+            raise TrioctlError(
+                f"restart-blip retry has no session id for role {role}"
+            )
+        send = getattr(client, "send_message", None)
+        if send is not None:
+            send(session_id, prompt)
+        ensure = getattr(client, "ensure_first_prompt", None)
+        if ensure is not None:
+            ensure(session_id, prompt)
+        snapshot = self._wait(client, session_id)
+        items = self._read(client, session_id)
+        return snapshot, items
 
 
 def _load_trio_loop(repo: Path) -> Any:
@@ -1832,6 +1883,8 @@ def command_loop(args: argparse.Namespace) -> int:
         base_url=getattr(args, "base_url", None),
         timeout=getattr(args, "wait_timeout", DEFAULT_LOOP_WAIT_TIMEOUT),
         runner_id=getattr(args, "runner_id", None),
+        host_id=getattr(args, "host_id", None),
+        workspace=str(repo),
     )
     keep_sessions = getattr(args, "keep_sessions", False)
     ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
@@ -2228,8 +2281,18 @@ def parser() -> argparse.ArgumentParser:
         "--runner-id",
         default=None,
         help=(
-            "broker runner id to bind new sessions to; takes precedence "
-            "over TRIO_OMNIGENT_RUNNER_ID"
+            "bind new sessions to this already-online runner; takes "
+            "precedence over TRIO_OMNIGENT_RUNNER_ID. Default is a "
+            "dedicated runner launched on --host-id / "
+            "TRIO_OMNIGENT_HOST_ID (or the single online host)"
+        ),
+    )
+    loop.add_argument(
+        "--host-id",
+        default=None,
+        help=(
+            "host that should launch a dedicated runner per role "
+            "session; takes precedence over TRIO_OMNIGENT_HOST_ID"
         ),
     )
     loop.add_argument(
@@ -2273,6 +2336,21 @@ def parser() -> argparse.ArgumentParser:
     session_create.add_argument("--model", required=True)
     session_create.add_argument("--message", required=True)
     session_create.add_argument("--title")
+    session_create.add_argument(
+        "--runner-id",
+        default=None,
+        help="bind to this online runner instead of launching one",
+    )
+    session_create.add_argument(
+        "--host-id",
+        default=None,
+        help="host that launches a dedicated runner for this session",
+    )
+    session_create.add_argument(
+        "--workspace",
+        default=None,
+        help="workspace path sent with host_id (default: cwd)",
+    )
     session_create.add_argument(
         "--base-url",
         default=broker_http.DEFAULT_BASE_URL,
