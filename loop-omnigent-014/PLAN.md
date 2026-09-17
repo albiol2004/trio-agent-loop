@@ -71,34 +71,34 @@ slices:
     writes: [omnigent/broker_http.py]
     reads: []
     gate: true
-    status: done
+    status: complete
     iteration: 1
   - id: loop-reuse
     repo: .
     writes: [omnigent/trioctl]
     reads: [omnigent/broker_http.py]
     gate: true
-    status: done
+    status: complete
     iteration: 1
   - id: doctor-skill
     repo: .
     writes: [omnigent/entrypoints/trio-omnigent/SKILL.md]
     reads: [omnigent/trioctl]
     gate: true
-    status: done
+    status: complete
     iteration: 1
   - id: tests-offline
     repo: .
     writes: [omnigent/tests/test_trioctl.py, omnigent/tests/test_omnigent_loop.py]
     reads: [omnigent/broker_http.py, omnigent/trioctl]
     gate: true
-    status: done
+    status: complete
     iteration: 1
   - id: prune-running
     repo: .
     writes: [omnigent/trioctl, omnigent/tests/test_trioctl.py, omnigent/tests/test_omnigent_loop.py]
     reads: []
     gate: true
-    status: done
+    status: complete
     iteration: 1
 ```
