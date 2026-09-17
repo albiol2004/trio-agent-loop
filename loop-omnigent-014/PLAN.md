@@ -12,13 +12,15 @@ mode: implement-then-smoke
 
 evidence:
 
-- `python3 -m pytest -q omnigent/tests` green.
+- `python3 -m pytest -q omnigent/tests` green
+  (this box: `uv run --with pytest --no-project python3 -m pytest
+  -q omnigent/tests`, 114 passed).
 - Isolated 0.14 live proof on 127.0.0.1:7767 as GOAL.md
   describes: smoke mailbox `loop-smoke/` creates `hello.txt`,
   `slice(hello): add hello.txt`, Evaluator SHIPs, loop exit 0.
 - Evidence under `loop-omnigent-014/evidence/iter1/`
   (stdout/stderr, `.driver.json`, log excerpts, routes).
-- Isolated stack torn down: no process with
+- Isolated stack torn down: no leftover daemon with
   `OMNIGENT_DATA_DIR=/tmp/omnigent-dev-data`.
 - Live 0.12 host untouched: `curl -s 127.0.0.1:6767/health`
   ok; pids 765 and 691 still exist.
@@ -44,6 +46,9 @@ evidence:
 4. Offline fake-broker coverage for host/runner launch,
    prompt retry, no-duplicate, orphan delete.
 5. Isolated 0.14 smoke loop + cleanup.
+6. Id-scoped post-loop prune deletes even `running` sessions
+   (cursor-native stayed running after wait; title-scoped
+   prune still skips live sessions).
 
 ## Acceptance
 
@@ -66,27 +71,34 @@ slices:
     writes: [omnigent/broker_http.py]
     reads: []
     gate: true
-    status: planned
+    status: done
     iteration: 1
   - id: loop-reuse
     repo: .
     writes: [omnigent/trioctl]
     reads: [omnigent/broker_http.py]
     gate: true
-    status: planned
+    status: done
     iteration: 1
   - id: doctor-skill
     repo: .
     writes: [omnigent/entrypoints/trio-omnigent/SKILL.md]
     reads: [omnigent/trioctl]
     gate: true
-    status: planned
+    status: done
     iteration: 1
   - id: tests-offline
     repo: .
     writes: [omnigent/tests/test_trioctl.py, omnigent/tests/test_omnigent_loop.py]
     reads: [omnigent/broker_http.py, omnigent/trioctl]
     gate: true
-    status: planned
+    status: done
+    iteration: 1
+  - id: prune-running
+    repo: .
+    writes: [omnigent/trioctl, omnigent/tests/test_trioctl.py, omnigent/tests/test_omnigent_loop.py]
+    reads: []
+    gate: true
+    status: done
     iteration: 1
 ```
