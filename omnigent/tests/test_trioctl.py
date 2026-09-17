@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import shutil
 import subprocess
@@ -104,6 +105,18 @@ def fake_broker():
         "session_rows": [],
         "deletes": [],
         "session_list_queries": [],
+        # Host-launch path (0.14 / fresh host with zero runners).
+        "online_hosts": [{"host_id": "host-1", "status": "online"}],
+        "runner_launches": [],
+        # None = POST /v1/sessions leaves runner_id unset so the
+        # client falls back to POST /v1/hosts/{id}/runners.
+        "create_runner_id": None,
+        # Override GET .../items when limit is not the wait poll.
+        "item_rows": None,
+        "pending_inputs": [],
+        "fail_launch": False,
+        # After this many POST /events, items include the user text.
+        "items_after_event_count": None,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -130,13 +143,24 @@ def fake_broker():
                     {
                         "id": "session-1",
                         "status": "idle",
-                        "runner_id": None,
+                        "runner_id": state["create_runner_id"],
                     },
                 )
                 return
             if path == "/v1/sessions/session-1/events":
                 state["events"].append(body)
                 self.send_json(202, {"queued": True})
+                return
+            # Fallback when POST /v1/sessions ignored host_id.
+            if "/hosts/" in path and path.endswith("/runners"):
+                state["runner_launches"].append(body)
+                if state["fail_launch"]:
+                    self.send_json(500, {"detail": "launch failed"})
+                    return
+                self.send_json(
+                    200,
+                    {"runner_id": "spawned-1", "status": "launching"},
+                )
                 return
             self.send_json(404, {"detail": "unknown POST"})
 
@@ -189,10 +213,10 @@ def fake_broker():
                             }
                     self.send_json(200, {"data": [item]})
                 else:
-                    self.send_json(
-                        200,
-                        {"items": [{"id": "item-1", "role": "user"}]},
-                    )
+                    self.send_json(200, {"items": _item_list_payload(state)})
+                return
+            if parsed.path == "/v1/hosts":
+                self.send_json(200, {"hosts": state["online_hosts"]})
                 return
             if parsed.path == "/v1/runners":
                 state["runner_gets"] += 1
@@ -212,7 +236,11 @@ def fake_broker():
                 if state["session_statuses"]
                 else "idle"
             )
-            payload = {"id": "session-1", "status": status}
+            payload = {
+                "id": "session-1",
+                "status": status,
+                "pending_inputs": list(state["pending_inputs"]),
+            }
             runner_ids = state["session_runner_ids"]
             if runner_ids:
                 runner_index = min(index, len(runner_ids) - 1)
@@ -233,6 +261,29 @@ def fake_broker():
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+def _item_list_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows for GET /items when this is not a wait-style poll.
+
+    Default: a user item with no text (ensure_first_prompt treats that
+    as landed). Tests override via item_rows or items_after_event_count
+    to exercise pending-prompt retry.
+    """
+    if state["item_rows"] is not None:
+        return list(state["item_rows"])
+    needed = state["items_after_event_count"]
+    if needed is not None:
+        if len(state["events"]) < needed:
+            return []
+        text = "landed"
+        if state["events"]:
+            try:
+                text = state["events"][-1]["data"]["content"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                pass
+        return [{"id": "item-1", "role": "user", "text": text}]
+    return [{"id": "item-1", "role": "user"}]
 
 
 def test_cursor_lead_resolves_grok_medium():
@@ -693,18 +744,21 @@ def test_session_create_posts_goal_fields_and_extras(fake_broker, capsys):
 
     assert args.func(args) == 0
     assert json.loads(capsys.readouterr().out)["id"] == "session-1"
-    assert state["posts"] == [
-        {
-            "agent_id": "agent-1",
-            "model": "model-1",
-            "message": "Do the task.",
-            "title": "A task",
-            "model_override": "model-1",
-            "initial_items": [],
-        }
+    posted = state["posts"][0]
+    assert posted["agent_id"] == "agent-1"
+    assert posted["model"] == "model-1"
+    assert posted["message"] == "Do the task."
+    assert posted["title"] == "A task"
+    assert posted["model_override"] == "model-1"
+    assert posted["initial_items"] == []
+    # Dedicated runner: host_id + workspace, not a PATCH onto a runner.
+    assert posted["host_id"] == "host-1"
+    assert posted["workspace"]
+    assert state["runner_gets"] == 0
+    assert state["patches"] == []
+    assert state["runner_launches"] == [
+        {"session_id": "session-1", "workspace": posted["workspace"]}
     ]
-    assert state["runner_gets"] == 1
-    assert state["patches"] == [{"runner_id": "runner-1"}]
     assert state["events"] == [
         {
             "type": "message",
@@ -767,29 +821,209 @@ def test_create_session_runner_id_arg_not_online_raises(fake_broker, monkeypatch
     assert "--runner-id=runner-9 is not an online runner" in str(excinfo.value)
 
 
-def test_create_session_multi_runner_error_lists_ids_and_remedy(
+def test_create_session_multi_host_error_lists_ids_and_remedy(
     fake_broker, monkeypatch
 ):
     trioctl = load_trioctl()
     base_url, state = fake_broker
-    state["online_runners"] = [
-        {"runner_id": "runner-1", "online": True},
-        {"runner_id": "runner-2", "online": True},
-        {"runner_id": "runner-3", "online": True},
+    state["online_hosts"] = [
+        {"host_id": "host-1", "status": "online"},
+        {"host_id": "host-2", "status": "online"},
+        {"host_id": "host-3", "status": "online"},
     ]
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.delenv("TRIO_OMNIGENT_HOST_ID", raising=False)
     client = trioctl.broker_http.BrokerClient(base_url)
 
     with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
         client.create_session("agent-1", "model-1", "hi", "title")
 
     message = str(excinfo.value)
-    assert "expected exactly one online runner, found 3:" in message
-    assert "\n  runner-1\n" in message
-    assert "\n  runner-2\n" in message
-    assert "\n  runner-3\n" in message
-    assert "TRIO_OMNIGENT_RUNNER_ID=<id>" in message
-    assert "--runner-id <id>" in message
+    assert "expected exactly one online host, found 3:" in message
+    assert "\n  host-1\n" in message
+    assert "\n  host-2\n" in message
+    assert "\n  host-3\n" in message
+    assert "TRIO_OMNIGENT_HOST_ID=<id>" in message
+    assert "--host-id <id>" in message
+    # Failed before POST /v1/sessions, so nothing to orphan-delete.
+    assert state["posts"] == []
+    assert state["deletes"] == []
+
+
+def test_create_session_zero_hosts_errors(fake_broker, monkeypatch):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_hosts"] = []
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.delenv("TRIO_OMNIGENT_HOST_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert "expected exactly one online host, found 0" in str(excinfo.value)
+
+
+def test_create_session_skips_launch_when_create_returns_runner(
+    fake_broker, monkeypatch
+):
+    """If POST /v1/sessions honours host_id, do not POST /runners."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["create_runner_id"] = "from-create"
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["id"] == "session-1"
+    assert created["runner_id"] == "from-create"
+    assert state["runner_launches"] == []
+    assert state["patches"] == []
+
+
+def test_create_session_host_id_env_selects_among_many(fake_broker, monkeypatch):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["online_hosts"] = [
+        {"host_id": "host-1", "status": "online"},
+        {"host_id": "host-2", "status": "online"},
+    ]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_HOST_ID", "host-2")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["id"] == "session-1"
+    assert state["posts"][0]["host_id"] == "host-2"
+    assert state["runner_launches"][0]["session_id"] == "session-1"
+
+
+def test_first_prompt_retries_on_same_session_never_duplicates(
+    fake_broker, monkeypatch
+):
+    """Cold TUI: first event ACKs but no item; re-POST the same id."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    # Land only after the second /events POST (create + one retry).
+    state["items_after_event_count"] = 2
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.05")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.01")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    created = client.create_session(
+        "agent-1", "model-1", "Please land", "title"
+    )
+
+    assert created["id"] == "session-1"
+    assert len(state["posts"]) == 1
+    assert len(state["events"]) == 2
+    assert state["events"][0]["data"]["content"][0]["text"] == "Please land"
+    assert state["events"][1]["data"]["content"][0]["text"] == "Please land"
+    assert state["deletes"] == []
+
+
+def test_pending_inputs_drain_counts_as_miss_then_repost(
+    fake_broker, monkeypatch
+):
+    """Pending composer that clears without an item is a miss."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["item_rows"] = []
+    state["pending_inputs"] = [{"id": "p1"}]
+    state["items_after_event_count"] = None
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.02")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    # After the first poll sees pending, clear it so the helper
+    # treats the drain as a miss and re-posts.
+    original_get = client.get_session
+    polls = {"n": 0}
+
+    def get_session_then_clear(session_id: str):
+        polls["n"] += 1
+        snap = original_get(session_id)
+        if polls["n"] >= 2:
+            state["pending_inputs"] = []
+        if polls["n"] >= 3:
+            # Next attempt should see the user item.
+            state["item_rows"] = [
+                {"id": "item-1", "role": "user", "text": "hi"}
+            ]
+        return snap
+
+    client.get_session = get_session_then_clear  # type: ignore[method-assign]
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["id"] == "session-1"
+    assert len(state["posts"]) == 1
+    assert len(state["events"]) >= 2
+
+
+def test_orphan_deleted_when_runner_launch_fails(
+    fake_broker, tmp_path, monkeypatch
+):
+    """Failed start after POST /v1/sessions must DELETE the session."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["fail_launch"] = True
+    ids_path = tmp_path / "session.ids"
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_MAILBOX_SESSION_IDS", str(ids_path))
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError):
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert state["posts"]  # create happened
+    assert state["deletes"] == ["/v1/sessions/session-1"]
+    assert "session-1" in ids_path.read_text(encoding="utf-8")
+    # Never a second create for the failed start.
+    assert len(state["posts"]) == 1
+
+
+def test_orphan_deleted_when_first_prompt_never_lands(
+    fake_broker, tmp_path, monkeypatch
+):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["item_rows"] = []
+    ids_path = tmp_path / "session.ids"
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_MAILBOX_SESSION_IDS", str(ids_path))
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "1")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert "first prompt did not land" in str(excinfo.value)
+    assert state["deletes"] == ["/v1/sessions/session-1"]
+    assert "session-1" in ids_path.read_text(encoding="utf-8")
+    assert len(state["posts"]) == 1
+
+
+def test_omnigent_contract_probe_prefers_subagent_spec():
+    """Doctor must import 0.14 `_resolve_subagent_spec`, then 0.12 alias."""
+    trioctl = load_trioctl()
+    src = inspect.getsource(trioctl.omnigent_contract)
+    # The executed probe (not the comment) tries 0.14 then 0.12.
+    probe_start = src.index("probe = ")
+    probe = src[probe_start:]
+    assert "from omnigent.server.routes.sessions import _resolve_subagent_spec" in probe
+    assert "from omnigent.server.routes.sessions import _resolve_agent_spec" in probe
+    assert "except ImportError" in probe
+    assert probe.index("_resolve_subagent_spec") < probe.index(
+        "from omnigent.server.routes.sessions import _resolve_agent_spec"
+    )
 
 
 def test_session_wait_polls_running_to_idle(fake_broker, capsys):

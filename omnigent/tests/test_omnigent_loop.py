@@ -545,18 +545,25 @@ def test_run_retries_once_on_restart_blip_then_succeeds(
     class RestartBlipThenGoodClient:
         def __init__(self) -> None:
             self.creates = 0
+            self.sends = 0
+            self.waits = 0
 
         def create(self, agent_id, model, message, title):
             self.creates += 1
-            return {"id": f"session-{self.creates}"}
+            return {"id": "session-1"}
+
+        def send_message(self, session_id, prompt):
+            self.sends += 1
 
         def wait(self, session_id, timeout=None, interval=None):
-            if self.creates == 1:
+            self.waits += 1
+            # First wait is the restart blip; reuse the same session.
+            if self.waits == 1:
                 return {"id": session_id, "status": "idle", "runner_id": None}
             return {"id": session_id, "status": "idle", "runner_id": "runner-1"}
 
         def get_items(self, session_id):
-            if self.creates == 1:
+            if self.waits <= 1:
                 return {"items": []}
             with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
                 log.write("- iter 1 | lead | completed\n")
@@ -570,7 +577,9 @@ def test_run_retries_once_on_restart_blip_then_succeeds(
     result = runner.run("lead", 1, mailbox)
 
     assert result == 0
-    assert client.creates == 2
+    assert client.creates == 1  # same session, never a duplicate
+    assert client.sends == 1
+    assert client.waits == 2
     assert sleep_calls == [10.0]
 
 
@@ -585,10 +594,14 @@ def test_run_fails_after_second_consecutive_restart_blip(
     class AlwaysBlipClient:
         def __init__(self) -> None:
             self.creates = 0
+            self.sends = 0
 
         def create(self, agent_id, model, message, title):
             self.creates += 1
-            return {"id": f"session-{self.creates}"}
+            return {"id": "session-1"}
+
+        def send_message(self, session_id, prompt):
+            self.sends += 1
 
         def wait(self, session_id, timeout=None, interval=None):
             return {"id": session_id, "status": "idle", "runner_id": None}
@@ -604,7 +617,8 @@ def test_run_fails_after_second_consecutive_restart_blip(
     result = runner.run("lead", 1, mailbox)
 
     assert result == 1
-    assert client.creates == 2  # exactly one retry, no retry loop
+    assert client.creates == 1  # no duplicate session
+    assert client.sends == 1  # one same-session repost, then stop
 
 
 def test_create_forwards_runner_id_when_client_supports_it(tmp_path: Path) -> None:
@@ -696,6 +710,73 @@ def test_loop_runner_id_flag_is_parsed_and_threaded(
 
     assert args.func(args) == 0
     assert captured["runner_id"] == "runner-9"
+
+
+def test_loop_host_id_flag_is_parsed_and_threaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trioctl = load_trioctl()
+    captured: dict[str, object] = {}
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    class FakeLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: FakeLoop)
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "loop",
+            "--mailbox",
+            "mailbox",
+            "--max-iterations",
+            "1",
+            "--host-id",
+            "host-9",
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert captured["host_id"] == "host-9"
+
+
+def test_create_forwards_host_id_when_client_supports_it(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    calls: list[str | None] = []
+
+    class HostAwareClient:
+        def create_session(
+            self,
+            agent_id: str,
+            model: str,
+            message: str,
+            title: str,
+            host_id: str | None = None,
+            workspace: str | None = None,
+        ) -> dict[str, str]:
+            calls.append(host_id)
+            return {"id": "session-1"}
+
+    created = trioctl.OmnigentRunner._create(
+        HostAwareClient(),
+        "agent-1",
+        "model-1",
+        "prompt",
+        "title",
+        host_id="host-7",
+        workspace="/tmp/ws",
+    )
+
+    assert created == {"id": "session-1"}
+    assert calls == ["host-7"]
 
 
 def test_loop_wait_timeout_is_parsed_and_threaded(
