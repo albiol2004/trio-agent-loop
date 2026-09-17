@@ -1554,7 +1554,8 @@ def test_prune_id_scoped_selects_only_listed_ids(tmp_path: Path):
     assert client.deleted == ["s-new"]
 
 
-def test_prune_id_scoped_skips_running_session(tmp_path: Path):
+def test_prune_id_scoped_deletes_running_session(tmp_path: Path):
+    """Post-loop id list must DELETE even if status is still running."""
     trioctl = load_trioctl()
     mailbox = tmp_path / "mbx"
     mailbox.mkdir()
@@ -1563,9 +1564,9 @@ def test_prune_id_scoped_skips_running_session(tmp_path: Path):
 
     counts = trioctl._prune_broker_sessions(client, mailbox, session_ids=["s-new"])
 
-    assert counts["skipped_running"] == 1
-    assert counts["deleted"] == 0
-    assert client.deleted == []
+    assert counts["skipped_running"] == 0
+    assert counts["deleted"] == 1
+    assert client.deleted == ["s-new"]
 
 
 def test_prune_id_scoped_archives_before_deleting(tmp_path: Path):

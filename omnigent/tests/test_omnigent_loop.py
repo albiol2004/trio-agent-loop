@@ -955,6 +955,59 @@ def test_loop_default_prune_deletes_only_this_runs_sessions(
     assert client.deleted == ["s-new"]
 
 
+def test_loop_default_prune_deletes_running_this_run_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cursor-native often stays running after wait; post-loop must still DELETE."""
+    trioctl = load_trioctl()
+
+    class CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.created_session_ids: list[str] = ["s-new"]
+
+    class OkLoop:
+        @staticmethod
+        def run_loop(*args: object, **kwargs: object) -> int:
+            return 0
+
+    class FakePruneClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.deleted: list[str] = []
+
+        def list_sessions(self, limit=20, after=None):
+            return {"data": self.rows}
+
+        def get_items(self, session_id, limit=100, order="asc", after=None):
+            return {"items": []}
+
+        def delete_session(self, session_id):
+            self.deleted.append(session_id)
+            return {"deleted": True}
+
+    client = FakePruneClient(
+        [
+            {
+                "id": "s-new",
+                "title": "trioctl mailbox lead:iteration 1",
+                "status": "running",
+            },
+        ]
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", CapturingRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: OkLoop)
+    monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", "mailbox", "--max-iterations", "1"]
+    )
+
+    assert args.func(args) == 0
+    assert client.deleted == ["s-new"]
+
+
 def test_loop_keyboard_interrupt_still_prunes_created_sessions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

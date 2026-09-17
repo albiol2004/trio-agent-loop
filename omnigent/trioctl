@@ -1110,7 +1110,11 @@ def _prune_broker_sessions(
       with ``all_scope``, any ``trioctl `` title) are touched -- other
       projects share the same broker.
 
-    In both modes a ``running`` session is always skipped, ``keep_failed``
+    Title-scoped prune still skips ``running`` so a bulk sweep cannot
+    kill a live session. Id-scoped post-loop prune does **not**: the
+    loop has already finished, and cursor-native often stays ``running``
+    after wait returns (0.14 smoke left tmux panes until DELETE).
+    ``keep_failed``
     additionally skips ``failed``/``error`` sessions, and every archived
     transcript is written under ``<mailbox>/.sessions/`` *before* its
     broker session is deleted.
@@ -1179,7 +1183,9 @@ def _prune_broker_sessions(
         if not isinstance(session_id, str) or not session_id:
             continue
         status = _session_status(row)
-        if status == "running":
+        # Bulk title prune: never interrupt a live session.
+        # Post-loop id list: delete anyway so the tmux pane dies.
+        if status == "running" and session_ids is None:
             counts["skipped_running"] += 1
             print(f"trioctl: skip (running): {session_id} {title}")
             continue
