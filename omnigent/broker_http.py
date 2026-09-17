@@ -18,6 +18,129 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "http://127.0.0.1:6767"
 
+# Ids file used by `trioctl omnigent loop` so a session that dies
+# during start is still pruned. Same env var as trioctl.
+SESSION_IDS_ENV_VAR = "TRIO_MAILBOX_SESSION_IDS"
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env override, ignoring invalid values."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env override, ignoring invalid values."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _prompt_wait() -> float:
+    """Seconds to wait for the first user item per attempt."""
+    return _env_float("TRIO_OMNIGENT_PROMPT_WAIT", 20.0)
+
+
+def _prompt_interval() -> float:
+    """Poll interval while waiting for the first prompt."""
+    return _env_float("TRIO_OMNIGENT_PROMPT_INTERVAL", 0.4)
+
+
+def _prompt_attempts() -> int:
+    """How many times to POST the first prompt on one session."""
+    return max(1, _env_int("TRIO_OMNIGENT_PROMPT_ATTEMPTS", 3))
+
+
+def _record_created_session_id(session_id: str) -> None:
+    """Append the id so loop prune can DELETE even if start fails."""
+    path_value = os.environ.get(SESSION_IDS_ENV_VAR)
+    if not path_value:
+        return
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{session_id}\n")
+
+
+def _session_item_rows(payload: Any) -> list[Any]:
+    """Item rows from a list or ``items``/``data`` envelope."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _item_role(item: Any) -> str:
+    """Role on a conversation item or nested ``data``."""
+    if not isinstance(item, dict):
+        return ""
+    role = item.get("role")
+    if isinstance(role, str):
+        return role.lower()
+    data = item.get("data")
+    nested = data.get("role") if isinstance(data, dict) else None
+    return nested.lower() if isinstance(nested, str) else ""
+
+
+def _items_contain_user_text(items: list[Any], message: str) -> bool:
+    """True when a user row exists (text match when content is present)."""
+    needle = message.strip()
+    for item in items:
+        if _item_role(item) != "user":
+            continue
+        text = _item_text(item).strip()
+        if not text:
+            return True
+        if needle and (needle in text or text in needle):
+            return True
+        return True
+    return False
+
+
+def _item_text(item: Any) -> str:
+    """Flatten item content/text fields into one string."""
+    if not isinstance(item, dict):
+        return ""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(
+                    str(part.get("text") or part.get("input_text") or "")
+                )
+            elif part is not None:
+                parts.append(str(part))
+        return "".join(parts)
+    data = item.get("data")
+    if isinstance(data, dict):
+        return _item_text(data)
+    value = item.get("text")
+    return value if isinstance(value, str) else ""
+
+
+def _pending_inputs(snapshot: Any) -> list[Any]:
+    """Pending composer inputs from a session snapshot."""
+    if not isinstance(snapshot, dict):
+        return []
+    pending = snapshot.get("pending_inputs")
+    return pending if isinstance(pending, list) else []
+
 
 class BrokerHttpError(RuntimeError):
     """An actionable failure while talking to the broker."""
@@ -293,81 +416,241 @@ class BrokerClient:
         message: str,
         title: str | None = None,
         runner_id: str | None = None,
+        host_id: str | None = None,
+        workspace: str | None = None,
     ) -> Any:
-        """Create and start one session through the live broker sequence.
+        """Create one session on a dedicated host runner.
 
-        ``initial_items`` only seeds history when no runner is bound. The
-        follow-up message event is therefore the important dispatch step:
-        it lets the server bind the session to the current runner and start
-        the native Cursor turn, matching the web UI flow.
+        Default path: POST ``host_id`` + ``workspace`` so the server
+        launches a runner for this session (0.12 and 0.14). If the
+        create response has no ``runner_id``, fall back to
+        ``POST /v1/hosts/{host_id}/runners``.
 
-        `runner_id`, when given, takes precedence over the
-        ``TRIO_OMNIGENT_RUNNER_ID`` environment variable for picking which
-        online runner to bind to. Neither ever auto-picks among several
-        online runners -- that stays an explicit, actionable error.
+        Explicit ``runner_id`` / ``TRIO_OMNIGENT_RUNNER_ID`` still
+        PATCHes an already-online runner (shared-runner override).
+
+        After POST, the session id is written to
+        ``TRIO_MAILBOX_SESSION_IDS`` before bind/dispatch. Any later
+        failure deletes the session so the loop does not leave orphans.
+        The first user prompt is re-posted to the same session if it
+        does not appear in items (cold cursor-native race).
         """
+        workdir = workspace or os.getcwd()
+        preferred_source = "--runner-id"
+        preferred = runner_id or ""
+        if not preferred:
+            preferred_source = "TRIO_OMNIGENT_RUNNER_ID"
+            preferred = os.environ.get("TRIO_OMNIGENT_RUNNER_ID", "")
+
         payload: dict[str, Any] = {
             "agent_id": agent_id,
             "model": model,
             "message": message,
             "model_override": model,
-            # Keep creation metadata-only. A history seed plus the dispatch
-            # event below would duplicate the user's message in native
-            # terminal transcripts.
+            # Keep creation metadata-only. A history seed plus the
+            # dispatch event would duplicate the user message.
             "initial_items": [],
         }
         if title:
             payload["title"] = title
-        created = self._request("POST", "/v1/sessions", payload, 201)
-        if not isinstance(created, dict):
-            raise BrokerHttpError("POST /v1/sessions returned a non-object response")
-        session_id = created.get("id") or created.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise BrokerHttpError("POST /v1/sessions returned no session id")
 
-        # JSON session creation has no runner_id field. Match the UI's
-        # unambiguous-runner binding so the first event can reach Cursor.
-        if not created.get("runner_id"):
-            runners = self.list_runners()
-            rows = runners.get("data") if isinstance(runners, dict) else runners
-            online = [
-                row
-                for row in (rows if isinstance(rows, list) else [])
-                if isinstance(row, dict)
-                and row.get("online") is True
-                and isinstance(row.get("runner_id"), str)
-                and row["runner_id"]
-            ]
-            preferred_source = "--runner-id"
-            preferred = runner_id or ""
-            if not preferred:
-                preferred_source = "TRIO_OMNIGENT_RUNNER_ID"
-                preferred = os.environ.get("TRIO_OMNIGENT_RUNNER_ID", "")
-            if preferred:
-                online = [row for row in online if row["runner_id"] == preferred]
-                if not online:
-                    raise BrokerHttpError(
-                        "cannot start session: "
-                        f"{preferred_source}={preferred} is not an online runner"
-                    )
-            if len(online) != 1:
-                ids = (
-                    "\n".join(f"  {row['runner_id']}" for row in online)
-                    or "  (none online)"
-                )
+        # Dedicated runner unless the caller named an existing one.
+        if not preferred:
+            resolved_host = self._resolve_host_id(host_id)
+            payload["host_id"] = resolved_host
+            payload["workspace"] = workdir
+
+        session_id: str | None = None
+        try:
+            created = self._request("POST", "/v1/sessions", payload, 201)
+            if not isinstance(created, dict):
                 raise BrokerHttpError(
-                    "cannot start session: expected exactly one online runner, "
-                    f"found {len(online)}:\n{ids}\n"
-                    "set TRIO_OMNIGENT_RUNNER_ID=<id> or pass --runner-id <id> "
-                    "to choose one"
+                    "POST /v1/sessions returned a non-object response"
                 )
-            bound = self.bind_session(session_id, online[0]["runner_id"])
-            if isinstance(bound, dict):
-                created = {**created, **bound}
-                created.setdefault("id", session_id)
+            session_id = created.get("id") or created.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise BrokerHttpError(
+                    "POST /v1/sessions returned no session id"
+                )
+            _record_created_session_id(session_id)
+            created.setdefault("id", session_id)
 
-        self.send_message(session_id, message)
+            if preferred:
+                created = self._bind_named_runner(
+                    created, session_id, preferred, preferred_source
+                )
+            elif not created.get("runner_id"):
+                launched = self.launch_runner(
+                    payload["host_id"], session_id, workdir
+                )
+                if isinstance(launched, dict):
+                    created = {**created, **launched}
+                    created.setdefault("id", session_id)
+
+            self.send_message(session_id, message)
+            self.ensure_first_prompt(session_id, message)
+            return created
+        except Exception:
+            if session_id:
+                self._delete_started_session(session_id)
+            raise
+
+    def _resolve_host_id(self, host_id: str | None) -> str:
+        """Pick the online host: flag/env, else exactly one live host."""
+        source = "--host-id"
+        preferred = host_id or ""
+        if not preferred:
+            source = "TRIO_OMNIGENT_HOST_ID"
+            preferred = os.environ.get("TRIO_OMNIGENT_HOST_ID", "")
+        hosts = self._online_hosts()
+        if preferred:
+            match = [row for row in hosts if row["host_id"] == preferred]
+            if not match:
+                raise BrokerHttpError(
+                    "cannot start session: "
+                    f"{source}={preferred} is not an online host"
+                )
+            return preferred
+        if len(hosts) != 1:
+            ids = (
+                "\n".join(f"  {row['host_id']}" for row in hosts)
+                or "  (none online)"
+            )
+            raise BrokerHttpError(
+                "cannot start session: expected exactly one online host, "
+                f"found {len(hosts)}:\n{ids}\n"
+                "set TRIO_OMNIGENT_HOST_ID=<id> or pass --host-id <id> "
+                "to choose one"
+            )
+        return hosts[0]["host_id"]
+
+    def _online_hosts(self) -> list[dict[str, Any]]:
+        """Online rows from GET /v1/hosts (``hosts`` or ``data``)."""
+        payload = self.list_hosts()
+        rows = payload.get("hosts") if isinstance(payload, dict) else payload
+        if rows is None and isinstance(payload, dict):
+            rows = payload.get("data")
+        online: list[dict[str, Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            hid = row.get("host_id") or row.get("id")
+            status = str(row.get("status") or "").lower()
+            is_online = row.get("online") is True or status == "online"
+            if is_online and isinstance(hid, str) and hid:
+                online.append({**row, "host_id": hid})
+        return online
+
+    def _bind_named_runner(
+        self,
+        created: dict[str, Any],
+        session_id: str,
+        preferred: str,
+        preferred_source: str,
+    ) -> dict[str, Any]:
+        """PATCH an already-online runner chosen by id."""
+        runners = self.list_runners()
+        rows = runners.get("data") if isinstance(runners, dict) else runners
+        online = [
+            row
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict)
+            and row.get("online") is True
+            and isinstance(row.get("runner_id"), str)
+            and row["runner_id"]
+        ]
+        online = [row for row in online if row["runner_id"] == preferred]
+        if not online:
+            raise BrokerHttpError(
+                "cannot start session: "
+                f"{preferred_source}={preferred} is not an online runner"
+            )
+        bound = self.bind_session(session_id, online[0]["runner_id"])
+        if isinstance(bound, dict):
+            created = {**created, **bound}
+            created.setdefault("id", session_id)
         return created
+
+    def _delete_started_session(self, session_id: str) -> None:
+        """Best-effort DELETE so a failed start does not orphan."""
+        try:
+            self.delete_session(session_id)
+        except BrokerHttpError:
+            pass
+
+    def list_hosts(self) -> Any:
+        """List hosts so create can pick a dedicated launch target."""
+        return self._request("GET", "/v1/hosts")
+
+    def launch_runner(
+        self, host_id: str, session_id: str, workspace: str
+    ) -> Any:
+        """Launch a runner when POST /v1/sessions ignored host_id."""
+        path = f"/v1/hosts/{quote(host_id, safe='')}/runners"
+        return self._request(
+            "POST",
+            path,
+            {"session_id": session_id, "workspace": workspace},
+            200,
+        )
+
+    def ensure_first_prompt(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        attempts: int | None = None,
+        wait_seconds: float | None = None,
+        interval: float | None = None,
+    ) -> None:
+        """Re-post the first prompt on the same session if it is missing.
+
+        Cold cursor-native sessions often ACK the event while the TUI
+        is still on the welcome screen. Creating a second session makes
+        the race worse; retry the same id instead.
+        """
+        tries = attempts if attempts is not None else _prompt_attempts()
+        window = (
+            wait_seconds if wait_seconds is not None else _prompt_wait()
+        )
+        poll = interval if interval is not None else _prompt_interval()
+        for attempt in range(tries):
+            if self._first_prompt_visible(session_id, message, window, poll):
+                return
+            if attempt + 1 >= tries:
+                break
+            self.send_message(session_id, message)
+        raise BrokerHttpError(
+            f"cannot start session: first prompt did not land on "
+            f"{session_id} after {tries} attempt(s)"
+        )
+
+    def _first_prompt_visible(
+        self,
+        session_id: str,
+        message: str,
+        wait_seconds: float,
+        interval: float,
+    ) -> bool:
+        """True when items show the user text, or pending inputs drain."""
+        deadline = time.monotonic() + max(wait_seconds, 0.0)
+        saw_pending = False
+        while True:
+            items = _session_item_rows(self.get_items(session_id))
+            if _items_contain_user_text(items, message):
+                return True
+            snapshot = self.get_session(session_id)
+            pending = _pending_inputs(snapshot)
+            if pending:
+                saw_pending = True
+            elif saw_pending:
+                # Pending cleared without an item: the TUI swallowed the
+                # prompt. Treat as miss so the caller re-posts.
+                return False
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            time.sleep(min(interval, max(deadline - now, 0.0)))
 
     def list_runners(self) -> Any:
         """List runners available for binding a newly created session."""
