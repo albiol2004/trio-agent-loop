@@ -25,6 +25,12 @@ ROLES = ("lead", "evaluator", "builder", "scout", "docs")
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
 CURSOR_WORKER_ROLES = ("builder", "scout", "docs")
 DEFAULT_LOOP_WAIT_TIMEOUT = 3600.0
+# First non-empty VERDICT.md line the Evaluator pass must write.
+_ROLE_VERDICT_RE = re.compile(
+    r"^VERDICT:\s*(?:SHIP|ITERATE|NEEDS_HUMAN|BLOCKED)"
+    r"(?:\s+scope=\S+)?\s*$",
+    re.IGNORECASE,
+)
 # Registered Omnigent agents persist their bundle prompt at creation time.
 # Bump this marker whenever the Lead/Evaluator config changes materially so a
 # stale anchor is backed up and recreated by the entrypoint preflight.
@@ -750,17 +756,20 @@ def _wait_for_session(
     interval: float,
     stable_idle: float = 0.0,
 ) -> Any:
-    """Wait until Cursor has run a turn, then returned to idle.
+    """Wait until Cursor has run a turn, then stayed idle.
 
     Live Grok Lead sessions often omit assistant rows from GET /items
-    (only a resource_event remains). Completion is therefore:
+    (only a resource_event remains). Cursor-native instead emits an
+    early completed assistant ack while the role is still working.
+    Completion is therefore idle + bound runner, held for
+    ``stable_idle`` seconds, when either:
 
-    - idle + bound runner + a completed assistant message, or
-    - idle + bound runner after ``running``, held for ``stable_idle``
-      seconds so the post-bind idle blip is not treated as done.
+    - a completed assistant message is present, or
+    - the session has been ``running`` and at least one item exists.
 
-    A null ``runner_id`` and a type=turn row are never terminal. Failed
-    statuses return at once. Timeouts stay distinct.
+    ``running`` resets the dwell. A null ``runner_id`` and a type=turn
+    row are never terminal. Failed statuses return at once. Timeouts
+    stay distinct.
 
     Right after an Omnigent restart, a session can cycle bound -> running
     -> idle within seconds with **zero** items (the runner later shows as
@@ -797,14 +806,13 @@ def _wait_for_session(
         if status == "running":
             saw_running = True
             idle_since = None
-        elif status == "idle" and bound and has_assistant:
-            # Scout pong and any turn that records assistant items.
-            return snapshot
-        elif status == "idle" and bound and saw_running and _session_items(items):
-            # Lead Grok: items stay on resource_event. Require idle to
-            # stick so the post-bind blip does not finish the wait. Also
-            # require at least one item — a post-restart runner blip goes
-            # idle+bound+running with zero items and is never terminal.
+        elif status == "idle" and bound and (
+            has_assistant
+            or (saw_running and _session_items(items))
+        ):
+            # Assistant acks and resource_event-only Grok turns both
+            # need idle to stick. A post-restart blip is idle+bound
+            # after running with zero items and never starts the dwell.
             if idle_since is None:
                 idle_since = now
             if now - idle_since >= stable_idle:
@@ -818,6 +826,61 @@ def _wait_for_session(
             )
         remaining = deadline - now
         time.sleep(min(interval, remaining))
+
+
+def _mailbox_text(path: Path) -> str:
+    """Read a mailbox file; missing files count as empty."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _mailbox_mtime(path: Path) -> float:
+    """Return mtime, or 0 when the file is missing."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _lead_log_line_present(text: str, iteration: int) -> bool:
+    """True when LOG.md has this iteration's Lead Format-A line."""
+    prefix = f"- iter {iteration} | lead |"
+    return any(line.startswith(prefix) for line in text.splitlines())
+
+
+def _verdict_line_ready(text: str) -> bool:
+    """True when the first non-empty VERDICT.md line matches grammar."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        return bool(_ROLE_VERDICT_RE.match(line))
+    return False
+
+
+def _role_artifact_ready(
+    mailbox: Path,
+    role: str,
+    iteration: int,
+    before_text: str,
+    before_mtime: float,
+) -> bool:
+    """True when this role wrote its mailbox artifact after dispatch."""
+    if role == "lead":
+        path = mailbox / "LOG.md"
+        text = _mailbox_text(path)
+        if not _lead_log_line_present(text, iteration):
+            return False
+        return text != before_text or _mailbox_mtime(path) > before_mtime
+    if role == "evaluator":
+        path = mailbox / "VERDICT.md"
+        text = _mailbox_text(path)
+        if not _verdict_line_ready(text):
+            return False
+        return text != before_text or _mailbox_mtime(path) > before_mtime
+    return True
 
 
 def _session_client(base_url: str | None = None) -> Any:
@@ -1671,8 +1734,14 @@ class OmnigentRunner:
                 )
         return method(agent_id, model, prompt, title)
 
-    def _wait(self, client: Any, session_id: str) -> Any:
+    def _wait(
+        self,
+        client: Any,
+        session_id: str,
+        timeout: float | None = None,
+    ) -> Any:
         """Wait through a fake seam or poll the real broker session."""
+        wait_timeout = self._timeout if timeout is None else timeout
         method = getattr(client, "wait_session", None) or getattr(
             client, "wait", None
         )
@@ -1680,21 +1749,26 @@ class OmnigentRunner:
             try:
                 return method(
                     session_id,
-                    timeout=self._timeout,
+                    timeout=wait_timeout,
                     interval=self._interval,
                 )
             except TypeError:
                 return method(session_id)
 
+        # Live Cursor turns have think/tool gaps that look idle. Hold
+        # idle after running (or after an early assistant ack) so those
+        # gaps are not terminal. Tests use interval=0 and skip the dwell.
+        # TRIO_OMNIGENT_IDLE_DWELL overrides the live default (30s).
         return _wait_for_session(
             client,
             session_id,
-            timeout=self._timeout,
+            timeout=wait_timeout,
             interval=self._interval,
-            # Live Grok Lead items often lack assistant rows. Hold idle
-            # after running so the post-bind blip is not terminal. Tests
-            # use interval=0 and skip the dwell.
-            stable_idle=0.0 if self._interval == 0 else 5.0,
+            stable_idle=(
+                0.0
+                if self._interval == 0
+                else float(os.environ.get("TRIO_OMNIGENT_IDLE_DWELL", "30"))
+            ),
         )
 
     @staticmethod
@@ -1813,6 +1887,13 @@ class OmnigentRunner:
         prompt = self._prompt(role, iteration, mailbox, context)
         title = self._title(mailbox, iteration, role, context)
         client = self._client()
+        started = time.monotonic()
+        if role == "lead":
+            before_text = _mailbox_text(mailbox / "LOG.md")
+            before_mtime = _mailbox_mtime(mailbox / "LOG.md")
+        else:
+            before_text = _mailbox_text(mailbox / "VERDICT.md")
+            before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
         try:
             snapshot, items = self._create_wait_read(
                 client, agent_id, model, prompt, title, role
@@ -1824,13 +1905,56 @@ class OmnigentRunner:
                 snapshot, items = self._repost_wait_read(
                     client, role, prompt
                 )
+            if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
+                return 1
+            if self._is_restart_blip(snapshot, items):
+                return 1
+            # Same session: wait is not role completion. Keep polling
+            # until LOG.md / VERDICT.md shows this pass's artifact.
+            snapshot = self._wait_for_role_artifact(
+                client,
+                role,
+                iteration,
+                mailbox,
+                started,
+                before_text,
+                before_mtime,
+            )
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
             return 1
-        if self._is_restart_blip(snapshot, items):
-            return 1
         return 0
+
+    def _wait_for_role_artifact(
+        self,
+        client: Any,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        started: float,
+        before_text: str,
+        before_mtime: float,
+    ) -> Any:
+        """Re-enter wait on this session until the role artifact exists."""
+        session_id = self.session_ids.get(role)
+        if session_id is None:
+            raise TrioctlError(f"role {role} has no session id")
+        snapshot: Any = {"id": session_id, "status": "idle"}
+        while not _role_artifact_ready(
+            mailbox, role, iteration, before_text, before_mtime
+        ):
+            remaining = self._timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TrioctlError(
+                    f"session {session_id} timed out after "
+                    f"{self._timeout:g} seconds"
+                )
+            snapshot = self._wait(client, session_id, timeout=remaining)
+            if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
+                return snapshot
+            self._read(client, session_id)
+        return snapshot
 
     def _repost_wait_read(
         self, client: Any, role: str, prompt: str
@@ -2270,6 +2394,13 @@ def parser() -> argparse.ArgumentParser:
     loop = commands.add_parser(
         "loop",
         help="run loop-core with Omnigent Lead and Evaluator sessions",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "environment variables:\n"
+            "  TRIO_OMNIGENT_IDLE_DWELL  seconds a session must stay idle\n"
+            "                            before a live role wait returns\n"
+            "                            (default 30). interval=0 skips it."
+        ),
     )
     loop.add_argument("--mailbox", type=Path, default=Path("loop"))
     loop.add_argument("--max-iterations", type=int, default=10)

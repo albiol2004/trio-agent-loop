@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import textwrap
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1166,7 +1167,8 @@ def test_session_wait_ignores_idle_blip_without_assistant_message(
         stable_idle=0.05,
     )
     assert snapshot["status"] == "idle"
-    assert state["session_gets"] == 5
+    # Assistant on the last status still needs the idle dwell.
+    assert state["session_gets"] >= 5
 
 
 def test_session_wait_ignores_restart_blip_with_zero_items(tmp_path):
@@ -1218,6 +1220,102 @@ def test_session_wait_ignores_restart_blip_with_zero_items(tmp_path):
     # Returned only once an item appeared (5th iteration), not on the
     # zero-item blip at iteration 3.
     assert client.status_calls == 5
+
+
+def test_session_wait_assistant_idle_holds_for_dwell():
+    """Idle + completed assistant must not return before stable_idle."""
+    trioctl = load_trioctl()
+
+    class IdleAckClient:
+        def __init__(self) -> None:
+            self.status_calls = 0
+
+        def get_session(self, session_id: str) -> dict[str, object]:
+            self.status_calls += 1
+            return {
+                "id": session_id,
+                "status": "idle",
+                "runner_id": "runner-1",
+            }
+
+        def get_items(
+            self, session_id: str, *, limit: int = 100, order: str = "asc"
+        ) -> dict[str, list[dict[str, str]]]:
+            return {
+                "data": [
+                    {
+                        "id": "ack",
+                        "role": "assistant",
+                        "type": "message",
+                        "status": "completed",
+                    }
+                ]
+            }
+
+    client = IdleAckClient()
+    started = time.monotonic()
+    snapshot = trioctl._wait_for_session(
+        client,
+        "session-1",
+        timeout=1,
+        interval=0.01,
+        stable_idle=0.05,
+    )
+    elapsed = time.monotonic() - started
+    assert snapshot["status"] == "idle"
+    assert elapsed >= 0.05
+    assert client.status_calls > 1
+
+
+def test_session_wait_running_resets_assistant_idle_dwell():
+    """A running snapshot clears idle_since so the dwell starts again."""
+    trioctl = load_trioctl()
+
+    class ResetDwellClient:
+        def __init__(self) -> None:
+            self.status_calls = 0
+            self.running_at: float | None = None
+
+        def get_session(self, session_id: str) -> dict[str, object]:
+            self.status_calls += 1
+            # Two idle polls, one running blip, then idle for the dwell.
+            if self.status_calls == 3:
+                self.running_at = time.monotonic()
+                status = "running"
+            else:
+                status = "idle"
+            return {
+                "id": session_id,
+                "status": status,
+                "runner_id": "runner-1",
+            }
+
+        def get_items(
+            self, session_id: str, *, limit: int = 100, order: str = "asc"
+        ) -> dict[str, list[dict[str, str]]]:
+            return {
+                "data": [
+                    {
+                        "id": "ack",
+                        "role": "assistant",
+                        "type": "message",
+                        "status": "completed",
+                    }
+                ]
+            }
+
+    client = ResetDwellClient()
+    snapshot = trioctl._wait_for_session(
+        client,
+        "session-1",
+        timeout=1,
+        interval=0.02,
+        stable_idle=0.08,
+    )
+    assert snapshot["status"] == "idle"
+    assert client.running_at is not None
+    assert time.monotonic() - client.running_at >= 0.08
+    assert client.status_calls > 4
 
 
 def test_session_wait_completes_when_create_already_finished(

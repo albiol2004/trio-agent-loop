@@ -65,15 +65,26 @@ def make_mailbox(parent: Path) -> Path:
 class FakeBrokerClient:
     """Broker double exposing create, lifecycle polling, and read operations."""
 
-    def __init__(self, mailbox: Path) -> None:
+    def __init__(
+        self,
+        mailbox: Path,
+        *,
+        lead_log_after_reads: int = 1,
+        verdict_after_reads: int = 1,
+    ) -> None:
         self.mailbox = mailbox
         self.sessions: dict[str, str] = {}
         self.status_indexes: dict[str, int] = {}
         self.item_polls: dict[str, int] = {}
+        self.read_counts: dict[str, int] = {}
         self.statuses_seen: list[str] = []
         self.prompts: list[str] = []
         self.titles: list[str] = []
         self.calls: list[str] = []
+        # Artifact writes happen on full reads (not wait polls). Delay
+        # them to prove the driver keeps waiting on the same session.
+        self.lead_log_after_reads = lead_log_after_reads
+        self.verdict_after_reads = verdict_after_reads
 
     def create(
         self,
@@ -125,15 +136,19 @@ class FakeBrokerClient:
             return {"data": [item]}
 
         role = self.sessions[session_id]
+        count = self.read_counts.get(session_id, 0) + 1
+        self.read_counts[session_id] = count
         self.calls.append(f"read:{session_id}")
         if role == "lead":
-            with (self.mailbox / "LOG.md").open("a", encoding="utf-8") as log:
-                log.write("- iter 1 | lead | completed\n")
+            if count >= self.lead_log_after_reads:
+                with (self.mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+                    log.write("- iter 1 | lead | completed\n")
         else:
-            (self.mailbox / "VERDICT.md").write_text(
-                "VERDICT: SHIP\n",
-                encoding="utf-8",
-            )
+            if count >= self.verdict_after_reads:
+                (self.mailbox / "VERDICT.md").write_text(
+                    "VERDICT: SHIP\n",
+                    encoding="utf-8",
+                )
         return {"items": [{"role": "assistant", "content": role}]}
 
 
@@ -192,6 +207,79 @@ def test_one_headless_iteration_ships_without_cursor_agent(
     assert broker.statuses_seen == ["idle", "running", "idle"] * 2
     assert cursor_calls == []
     assert "status: shipped" in (mailbox / "STATE.md").read_text()
+
+
+def _install_role_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point OmnigentRunner at a fake Lead/Evaluator registry."""
+    home = tmp_path / "home"
+    registry = home / ".omnigent" / "agents" / "trio-omnigent-roles"
+    registry.mkdir(parents=True)
+    (registry / "registry.json").write_text(
+        json.dumps(
+            {
+                "trio-omnigent-lead": {"agent_id": "lead-agent"},
+                "trio-omnigent-evaluator": {"agent_id": "evaluator-agent"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv("OMNIGENT_HOME", raising=False)
+
+
+def test_evaluator_keeps_waiting_until_verdict_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idle + ack with empty VERDICT.md is not a finished Evaluator pass."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    _install_role_registry(tmp_path, monkeypatch)
+    broker = FakeBrokerClient(mailbox, verdict_after_reads=2)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+        timeout=1,
+    )
+
+    result = runner.run("evaluator", 1, mailbox)
+
+    assert result == 0
+    assert runner.created_session_ids == ["session-1"]
+    assert runner.session_ids == {"evaluator": "session-1"}
+    assert broker.read_counts["session-1"] >= 2
+    first = next(
+        line.strip()
+        for line in (mailbox / "VERDICT.md").read_text().splitlines()
+        if line.strip()
+    )
+    assert first.startswith("VERDICT: SHIP")
+
+
+def test_lead_keeps_waiting_until_log_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idle Lead ack without a Format-A LOG line is not a finished pass."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    _install_role_registry(tmp_path, monkeypatch)
+    broker = FakeBrokerClient(mailbox, lead_log_after_reads=2)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+        timeout=1,
+    )
+
+    result = runner.run("lead", 1, mailbox)
+
+    assert result == 0
+    assert runner.created_session_ids == ["session-1"]
+    assert runner.session_ids == {"lead": "session-1"}
+    assert broker.read_counts["session-1"] >= 2
+    assert "- iter 1 | lead |" in (mailbox / "LOG.md").read_text()
 
 
 def test_create_wait_read_records_session_id_in_memory_and_ids_file(
