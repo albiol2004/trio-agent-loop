@@ -55,7 +55,13 @@ OUTCOMES = {
     "BLOCKED": ("blocked", "blocked", 2),
     "NEEDS_HUMAN": ("needs_human", "needs_human", 5),
 }
-TERMINAL_CODES = {"shipped": 0, "blocked": 2, "needs_human": 5, "error": 3}
+TERMINAL_CODES = {
+    "shipped": 0,
+    "blocked": 2,
+    "needs_human": 5,
+    "error": 3,
+    "needs_retirement": 6,
+}
 
 class RoleRunner(Protocol):
     def run(
@@ -388,10 +394,122 @@ def _restore_clobbered_verdict_sections(
         f"clobbered per-slice section(s) in VERDICT.md after {kind}",
     )
 
+def _verdict_commit_shas(text: str) -> list[str]:
+    """Return ``commit: <sha>`` values recorded in VERDICT.md."""
+    shas: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("commit:"):
+            got = line.split(":", 1)[1].strip().lower()
+            if re.fullmatch(r"[0-9a-f]{7,40}", got):
+                shas.append(got)
+    return shas
+
+
+def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
+    """True when the verdict body names this lockstep iteration."""
+    return f"iteration {iteration}".lower() in text.lower()
+
+
+def _git_root(repo: Path | None) -> Path | None:
+    """Return ``repo`` only when it is a git directory we may inspect."""
+    if repo is None:
+        return None
+    if (repo / ".git").exists():
+        return repo
+    return None
+
+
+def _mailbox_retirement_commit_present(repo: Path, iteration: int) -> bool:
+    """True when git log has this iteration's mailbox SHIP commit."""
+    needle = f"loop: iteration {iteration} — SHIP"
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "log",
+                "-20",
+                "--grep",
+                needle,
+                "--format=%H",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _ship_retirement_complete(
+    mailbox: Path, iteration: int, repo: Path | None
+) -> bool:
+    """SHIP is finished only with commit lines or a retirement commit.
+
+    When ``repo`` is not a git tree, skip the gate so existing no-repo
+    fakes keep shipping. Never infer completion from a timeout.
+    """
+    git_root = _git_root(repo)
+    if git_root is None:
+        return True
+    try:
+        text = (mailbox / "VERDICT.md").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        text = ""
+    if _verdict_commit_shas(text):
+        return True
+    return _mailbox_retirement_commit_present(git_root, iteration)
+
+
+def _fresh_evaluator_artifact(mailbox: Path, iteration: int) -> bool:
+    """True when VERDICT.md already grades this iteration (no re-dispatch)."""
+    path = mailbox / "VERDICT.md"
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    word, _scope = _first_verdict(path)
+    if word is None:
+        return False
+    return _verdict_mentions_iteration(text, iteration)
+
+
 def _apply_verdict(
-    mailbox, state_path, repair_path, iteration, verdict, scope
+    mailbox, state_path, repair_path, iteration, verdict, scope,
+    repo: Path | None = None,
 ) -> int | None:
-    """Persist a terminal verdict or queue the next ITERATE role."""
+    """Persist a terminal verdict or queue the next ITERATE role.
+
+    A SHIP without retirement bookkeeping is not ``shipped`` when the
+    driver can inspect a git repo: status becomes ``needs_retirement``
+    (exit 6) so a missing mailbox retirement cannot look finished.
+    Mailboxes used in tests without a git ``repo`` keep the historical
+    shipped/exit-0 path.
+    """
+    if verdict == "SHIP":
+        if not _ship_retirement_complete(mailbox, iteration, repo):
+            _update_state(
+                state_path,
+                {
+                    "status": "needs_retirement",
+                    "phase": "ship-pending-retirement",
+                },
+            )
+            _append_log(
+                mailbox,
+                f"- iter {iteration} | loop | SHIP missing retirement "
+                "bookkeeping",
+            )
+            return 6
+        _update_state(state_path, {"status": "shipped", "phase": "shipped"})
+        return 0
     if verdict in OUTCOMES:
         status, phase, code = OUTCOMES[verdict]
         _update_state(state_path, {"status": status, "phase": phase})
@@ -454,11 +572,16 @@ def _run_lockstep(
             # Crash-resume: Lead+gates already landed, so do not bump
             # iteration or re-run Lead (fixes driver.sh:107-108).
             if state["phase"].strip().lower() == "lead-done":
-                result = _invoke_runner(runner, "evaluator", iteration, mailbox, {})
-                if result != 0:
-                    raise RuntimeError(
-                        f"evaluator runner failed with exit {result}"
+                # A fresh iteration-marked verdict is already this attempt;
+                # do not dispatch Evaluator again on resumable completion.
+                if not _fresh_evaluator_artifact(mailbox, iteration):
+                    result = _invoke_runner(
+                        runner, "evaluator", iteration, mailbox, {}
                     )
+                    if result != 0:
+                        raise RuntimeError(
+                            f"evaluator runner failed with exit {result}"
+                        )
                 verdict, scope = _first_verdict(mailbox / "VERDICT.md")
                 if verdict is None:
                     _update_state(
@@ -477,6 +600,7 @@ def _run_lockstep(
                     iteration,
                     verdict,
                     scope,
+                    repo=repo,
                 )
                 state = _read_state(state_path)
                 _write_driver_state(
@@ -1186,6 +1310,7 @@ def run_open_loop(
                         iteration_now,
                         verdict,
                         scope,
+                        repo=repo,
                     )
                     if code is not None:
                         return finish(code)

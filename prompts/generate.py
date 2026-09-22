@@ -45,6 +45,8 @@ EMBEDDED = [
     ("kimi/skills/trio/SKILL.md", "md"),
     ("zcode/skills/trio/SKILL.md", "md"),
     ("omnigent/entrypoints/trio-omnigent/SKILL.md", "md"),
+    ("omnigent/entrypoints/trio-omnigent/prompts/lead.md", "md"),
+    ("omnigent/entrypoints/trio-omnigent/prompts/evaluator.md", "md"),
 ]
 
 # Generated standalone documents: one canonical body in prompts/documents/,

@@ -155,7 +155,8 @@ class FakeBrokerClient:
                         handle.write(self.verdict_append)
                 else:
                     verdict.write_text(
-                        "VERDICT: SHIP\n",
+                        "VERDICT: SHIP\n"
+                        "# Verdict — iteration 1\n",
                         encoding="utf-8",
                     )
         return {"items": [{"role": "assistant", "content": role}]}
@@ -1348,3 +1349,81 @@ def test_loop_sigterm_handler_runs_prune(
         ((tmp_path / "mailbox").resolve(), args.base_url, ["s-lead", "s-worker"])
     ]
     assert list((tmp_path / "mailbox" / ".sessions").glob("run-*.ids")) == []
+
+
+def test_stale_verdict_mtime_bump_is_not_ready(tmp_path: Path) -> None:
+    """A persisted SHIP that already existed is not this attempt."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    stale = "VERDICT: SHIP\n# Verdict — iteration 1\n"
+    path = mailbox / "VERDICT.md"
+    path.write_text(stale, encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+    path.write_text(stale, encoding="utf-8")
+    assert not trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, before, 0.0, None
+    )
+
+
+def test_wrong_iteration_verdict_is_not_ready(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n",
+        encoding="utf-8",
+    )
+    assert not trioctl._role_artifact_ready(
+        mailbox, "evaluator", 2, "", 0.0, None
+    )
+
+
+def test_wrong_pinned_revision_is_not_ready(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n"
+        "commit: " + ("b" * 40) + "\n",
+        encoding="utf-8",
+    )
+    context = {"pinned_sha": "a" * 40}
+    assert not trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, "", 0.0, context
+    )
+
+
+def test_matching_pinned_revision_is_ready(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    sha = "a" * 40
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n"
+        f"commit: {sha}\n",
+        encoding="utf-8",
+    )
+    context = {"pinned_sha": sha}
+    assert trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, "", 0.0, context
+    )
+
+
+def test_stale_persisted_verdict_times_out_instead_of_shipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Broker idle + leftover SHIP must timeout, not treat exit as SHIP."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n",
+        encoding="utf-8",
+    )
+    _install_role_registry(tmp_path, monkeypatch)
+    broker = FakeBrokerClient(mailbox, verdict_after_reads=10_000)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+        timeout=0.05,
+    )
+    with pytest.raises(trioctl.TrioctlError, match="timed out"):
+        runner.run("evaluator", 1, mailbox)

@@ -380,3 +380,86 @@ def test_missing_state_is_initialized_and_unknown_lines_survive(
     assert "iteration: 1" in text
     assert "status: shipped" in text
     assert "phase: shipped" in text
+
+
+def git_identity_env() -> dict[str, str]:
+    """Local git identity for test commits only (not git config)."""
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = "trio-test"
+    env["GIT_AUTHOR_EMAIL"] = "trio-test@example.test"
+    env["GIT_COMMITTER_NAME"] = "trio-test"
+    env["GIT_COMMITTER_EMAIL"] = "trio-test@example.test"
+    return env
+
+
+def test_git_repo_ship_without_retirement_is_not_finished(
+    tmp_path: Path,
+) -> None:
+    """Observed SHIP-without-mailbox-retirement must not look shipped."""
+    init_git(tmp_path)
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    text = state_text(mailbox)
+    assert "status: needs_retirement" in text
+    assert "phase: ship-pending-retirement" in text
+    assert "status: shipped" not in text
+
+
+def test_git_repo_ship_with_commit_line_is_shipped(tmp_path: Path) -> None:
+    init_git(tmp_path)
+    mailbox = make_mailbox(tmp_path)
+    sha = "a" * 40
+    runner = FakeRunner(
+        [f"VERDICT: SHIP\n# Verdict — iteration 1\ncommit: {sha}\n"]
+    )
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert "status: shipped" in state_text(mailbox)
+
+
+def test_git_repo_ship_with_retirement_commit_is_shipped(
+    tmp_path: Path,
+) -> None:
+    init_git(tmp_path)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "loop: iteration 1 — SHIP",
+        ],
+        check=True,
+        env=git_identity_env(),
+    )
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert "status: shipped" in state_text(mailbox)
+
+
+def test_fresh_persisted_verdict_skips_evaluator_redispatch(
+    tmp_path: Path,
+) -> None:
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "STATE.md").write_text(
+        "iteration: 1\nstatus: running\nphase: lead-done\n",
+        encoding="utf-8",
+    )
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n",
+        encoding="utf-8",
+    )
+    with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+        log.write("- iter 1 | lead | completed\n")
+    runner = FakeRunner([], expected_roles=[])
+
+    assert trio_loop.run_loop(mailbox, 1, runner) == 0
+    assert runner.calls == []
+    assert "status: shipped" in state_text(mailbox)

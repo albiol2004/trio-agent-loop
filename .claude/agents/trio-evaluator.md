@@ -34,6 +34,15 @@ When GOAL.md declares `profile: data` (or the diff touches pipelines, SQL, noteb
 Cite actual query/command output for each. A pipeline whose output "looks plausible" but doesn't reconcile is FAIL.
 
 ## Method
+- Independently check original GOAL.md against PLAN.md completeness
+  before trusting the Lead's increment: remaining GOAL scope is not
+  closed by a slice that only passes its own `accepts:`. Name the
+  pinned candidate revision you actually exercised. For each
+  criterion record PASS, FAIL, or **unverified** (a check you did
+  not run is unverified, never a silent FAIL). Implementer-authored
+  tests are evidence, not the sole oracle — reproduce behavior
+  yourself. UI/screen-frame or data-reconciliation work is
+  proportionate and only where the criterion is about those surfaces.
 - Run the acceptance checks yourself, from scratch. Then go beyond them: edge cases, error paths, anything the criteria imply but weren't tested.
 - **Screen-frame verification (mandatory):** any acceptance criterion
   about user-visible behavior (controls, direction, visibility, layout) is

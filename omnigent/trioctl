@@ -860,6 +860,26 @@ def _verdict_line_ready(text: str) -> bool:
     return False
 
 
+def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
+    """True when this attempt's iteration is named in the verdict body."""
+    needle = f"iteration {iteration}"
+    return needle.lower() in text.lower()
+
+
+def _verdict_records_sha(text: str, sha: str) -> bool:
+    """True when a ``commit:`` line records the expected pinned revision."""
+    want = sha.strip().lower()
+    if not want:
+        return False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("commit:"):
+            got = line.split(":", 1)[1].strip().lower()
+            if got == want or want.startswith(got) or got.startswith(want):
+                return True
+    return False
+
+
 def _role_artifact_ready(
     mailbox: Path,
     role: str,
@@ -868,27 +888,41 @@ def _role_artifact_ready(
     before_mtime: float,
     context: dict[str, Any] | None = None,
 ) -> bool:
-    """True when this role wrote its mailbox artifact after dispatch.
+    """True when this role wrote a fresh mailbox artifact for this attempt.
 
     Open-loop slice-eval APPENDS a ``## slice <id> @<sha> — …`` section
-    and never a ``VERDICT:`` first line. That kind only needs VERDICT.md
-    to change; the driver later checks the section itself.
+    and never a ``VERDICT:`` first line. That kind still needs VERDICT.md
+    *content* to change; a stale file that merely exists (or is touched)
+    is not this attempt. ``before_mtime`` is kept for callers but is not
+    a freshness signal — mtime-only bumps must not accept stale text.
     """
+    del before_mtime
     if role == "lead":
         path = mailbox / "LOG.md"
         text = _mailbox_text(path)
         if not _lead_log_line_present(text, iteration):
             return False
-        return text != before_text or _mailbox_mtime(path) > before_mtime
+        return text != before_text
     if role == "evaluator":
         path = mailbox / "VERDICT.md"
         text = _mailbox_text(path)
+        if text == before_text:
+            return False
         slice_eval = bool(
             context and context.get("kind") == "slice-eval"
         )
-        if not slice_eval and not _verdict_line_ready(text):
+        if slice_eval:
+            return True
+        if not _verdict_line_ready(text):
             return False
-        return text != before_text or _mailbox_mtime(path) > before_mtime
+        if not _verdict_mentions_iteration(text, iteration):
+            return False
+        pinned = None
+        if context:
+            pinned = context.get("pinned_sha") or context.get("expected_sha")
+        if pinned:
+            return _verdict_records_sha(text, str(pinned))
+        return True
     return True
 
 
