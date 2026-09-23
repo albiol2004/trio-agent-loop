@@ -483,13 +483,28 @@ def test_cursor_docs_runs_headless_with_resolved_model(
     trioctl = load_trioctl()
     seen = {}
 
-    def fake_run(command, **kwargs):
-        seen["command"] = command
-        seen["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="DOCS_OK\n", stderr="")
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            self.pid = 4242
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            seen["kwargs"]["input"] = input
+            return "DOCS_OK\n", ""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
 
     monkeypatch.setattr(trioctl.shutil, "which", lambda command: "/bin/cursor-agent")
-    monkeypatch.setattr(trioctl.subprocess, "run", fake_run)
+    monkeypatch.setattr(trioctl.subprocess, "Popen", FakePopen)
 
     output = trioctl.run_cursor_worker(
         "docs",
@@ -665,13 +680,28 @@ def test_cursor_builder_runs_headless_with_resolved_model(
     trioctl = load_trioctl()
     seen = {}
 
-    def fake_run(command, **kwargs):
-        seen["command"] = command
-        seen["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="WORKER_OK\n", stderr="")
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            self.pid = 4242
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            seen["kwargs"]["input"] = input
+            return "WORKER_OK\n", ""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
 
     monkeypatch.setattr(trioctl.shutil, "which", lambda command: "/bin/cursor-agent")
-    monkeypatch.setattr(trioctl.subprocess, "run", fake_run)
+    monkeypatch.setattr(trioctl.subprocess, "Popen", FakePopen)
 
     output = trioctl.run_cursor_worker(
         "builder",
@@ -704,12 +734,26 @@ def test_cursor_scout_is_forced_read_only(
     trioctl = load_trioctl()
     seen = {}
 
-    def fake_run(command, **kwargs):
-        seen["command"] = command
-        return subprocess.CompletedProcess(command, 0, stdout="SCOUT_OK", stderr="")
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            seen["command"] = command
+            self.pid = 7
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return "SCOUT_OK", ""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
 
     monkeypatch.setattr(trioctl.shutil, "which", lambda command: "/bin/cursor-agent")
-    monkeypatch.setattr(trioctl.subprocess, "run", fake_run)
+    monkeypatch.setattr(trioctl.subprocess, "Popen", FakePopen)
 
     trioctl.run_cursor_worker(
         "scout",

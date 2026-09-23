@@ -89,6 +89,34 @@ def _load_broker_http() -> Any:
 broker_http = _load_broker_http()
 
 
+def _load_worker_events() -> Any:
+    """Load sibling lifecycle telemetry without a package import."""
+    path = Path(__file__).with_name("worker_events.py")
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader(
+        "trioctl_worker_events",
+        str(path),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"cannot load worker events: {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+worker_events = _load_worker_events()
+
+# Opt-in worker subprocess telemetry. Never derived from session ids.
+WORKER_EVENTS_FILE_ENV = "TRIO_WORKER_EVENTS_FILE"
+WORKER_RUN_ID_ENV = "TRIO_WORKER_RUN_ID"
+WORKER_ITERATION_ENV = "TRIO_WORKER_ITERATION"
+WORKER_SLICE_ENV = "TRIO_WORKER_SLICE"
+WORKER_INVOCATION_ENV = "TRIO_WORKER_INVOCATION_ID"
+WORKER_MAILBOX_ENV = "TRIO_WORKER_EVENTS_MAILBOX"
+
+
 def config_path(value: str | None = None) -> Path:
     if value:
         return Path(value).expanduser()
@@ -569,6 +597,61 @@ def command_resolve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_event_ctx(
+    args: argparse.Namespace | None = None,
+) -> dict[str, Any]:
+    """Build opt-in telemetry context from CLI, else env. Default off."""
+    def _pick(attr: str, env_name: str) -> str | None:
+        if args is not None:
+            value = getattr(args, attr, None)
+            if value not in (None, ""):
+                return str(value)
+        env = os.environ.get(env_name, "").strip()
+        return env or None
+
+    if worker_events is None:
+        return {}
+    mailbox = _pick("worker_events_mailbox", WORKER_MAILBOX_ENV)
+    raw_file = _pick("worker_events_file", WORKER_EVENTS_FILE_ENV)
+    events_path = worker_events.resolve_events_path(raw_file, mailbox)
+    if events_path is None:
+        return {}
+    return {
+        "events_path": events_path,
+        "run_id": _pick("worker_run_id", WORKER_RUN_ID_ENV),
+        "iteration": _pick("worker_iteration", WORKER_ITERATION_ENV),
+        "slice_id": _pick("worker_slice", WORKER_SLICE_ENV),
+        "invocation_id": worker_events.new_invocation_id(
+            _pick("worker_invocation_id", WORKER_INVOCATION_ENV)
+        ),
+    }
+
+
+def _emit_worker_event(
+    ctx: dict[str, Any] | None,
+    kind: str,
+    role: str,
+    **fields: Any,
+) -> None:
+    """Write one lifecycle event; swallow telemetry errors."""
+    if not ctx or worker_events is None:
+        return
+    path = ctx.get("events_path")
+    invocation_id = ctx.get("invocation_id")
+    if path is None or not invocation_id:
+        return
+    rec = worker_events.base_record(
+        invocation_id=str(invocation_id),
+        kind=kind,
+        role=role,
+        run_id=ctx.get("run_id"),
+        iteration=ctx.get("iteration"),
+        slice_id=ctx.get("slice_id"),
+        **fields,
+    )
+    worker_events.emit(path, rec)
+
+
 def run_cursor_worker(
     role: str,
     config: dict[str, Any],
@@ -577,8 +660,14 @@ def run_cursor_worker(
     workspace: Path,
     models: list[dict[str, Any]] | None = None,
     timeout: float | None = None,
+    events: dict[str, Any] | None = None,
 ) -> str:
-    """Run one ephemeral Cursor worker with the live profile-resolved model."""
+    """Run one ephemeral Cursor worker with the live profile-resolved model.
+
+    Optional ``events`` is opt-in subprocess telemetry. Missing/empty
+    preserves historical behavior and writes no files. Telemetry must
+    not change exit codes, exceptions, or process cleanup.
+    """
     if role not in CURSOR_WORKER_ROLES:
         raise TrioctlError(
             f"Cursor worker role must be one of: {', '.join(CURSOR_WORKER_ROLES)}"
@@ -607,26 +696,94 @@ def run_cursor_worker(
     if role == "scout":
         command.extend(["--mode", "ask"])
     full_prompt = f"{CURSOR_ROLE_PROMPTS[role]}\n\nTASK FROM LEAD:\n{prompt.strip()}\n"
+    started = time.monotonic_ns()
+    proc: subprocess.Popen[str] | None = None
     try:
-        result = subprocess.run(
-            command,
-            input=full_prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            _emit_worker_event(events, "spawn_failed", role, pid=None)
+            raise TrioctlError(f"Cursor {role} failed to run: {exc}") from exc
+        _emit_worker_event(events, "spawned", role, pid=proc.pid)
+        try:
+            stdout, stderr = proc.communicate(
+                input=full_prompt, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            try:
+                proc.communicate()
+            except OSError:
+                pass
+            duration = time.monotonic_ns() - started
+            _emit_worker_event(
+                events,
+                "timeout",
+                role,
+                pid=proc.pid,
+                duration_ns=duration,
+            )
+            raise TrioctlError(
+                f"Cursor {role} failed to run: {exc}"
+            ) from exc
+        except KeyboardInterrupt:
+            proc.kill()
+            try:
+                proc.communicate()
+            except OSError:
+                pass
+            duration = time.monotonic_ns() - started
+            _emit_worker_event(
+                events,
+                "interrupted",
+                role,
+                pid=proc.pid,
+                duration_ns=duration,
+            )
+            raise
+        except Exception:
+            duration = time.monotonic_ns() - started
+            _emit_worker_event(
+                events,
+                "unknown",
+                role,
+                pid=proc.pid,
+                duration_ns=duration,
+            )
+            raise
+        duration = time.monotonic_ns() - started
+        code = proc.returncode
+        kind = "nonzero_exit" if code else "exited"
+        _emit_worker_event(
+            events,
+            kind,
+            role,
+            pid=proc.pid,
+            returncode=code,
+            duration_ns=duration,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise TrioctlError(f"Cursor {role} failed to run: {exc}") from exc
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise TrioctlError(
-            f"Cursor {role} exited {result.returncode}: {detail or 'no output'}"
-        )
-    output = result.stdout.strip()
-    if not output:
-        raise TrioctlError(f"Cursor {role} completed without output")
-    return output
+        if code:
+            detail = (stderr or "").strip() or (stdout or "").strip()
+            raise TrioctlError(
+                f"Cursor {role} exited {code}: {detail or 'no output'}"
+            )
+        output = (stdout or "").strip()
+        if not output:
+            raise TrioctlError(f"Cursor {role} completed without output")
+        return output
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -655,8 +812,22 @@ def command_run(args: argparse.Namespace) -> int:
         prompt=prompt,
         workspace=Path(args.workspace),
         timeout=args.timeout,
+        events=_worker_event_ctx(args) or None,
     )
     print(output)
+    return 0
+
+
+def command_worker_events_report(args: argparse.Namespace) -> int:
+    """Offline report of builder subprocess intervals. No live models."""
+    if worker_events is None:
+        raise TrioctlError("worker_events.py is not installed next to trioctl")
+    mailbox = getattr(args, "mailbox", None)
+    path = worker_events.resolve_events_path(args.events_file, mailbox)
+    if path is None:
+        raise TrioctlError("worker events file path is missing or malformed")
+    payload = worker_events.report(path, run_id=args.run_id)
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
@@ -2502,7 +2673,31 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--workspace", default=".")
     run.add_argument("--timeout", type=float)
+    run.add_argument(
+        "--worker-events-file",
+        default=None,
+        help="opt-in JSONL path; relative paths require --mailbox",
+    )
+    run.add_argument(
+        "--mailbox",
+        dest="worker_events_mailbox",
+        default=None,
+        help="mailbox root; events file must resolve under it",
+    )
+    run.add_argument("--worker-run-id", default=None)
+    run.add_argument("--worker-iteration", default=None)
+    run.add_argument("--worker-slice", default=None)
+    run.add_argument("--worker-invocation-id", default=None)
     run.set_defaults(func=command_run)
+
+    events_report = commands.add_parser(
+        "worker-events-report",
+        help="offline builder overlap report from worker JSONL",
+    )
+    events_report.add_argument("--events-file", required=True)
+    events_report.add_argument("--mailbox", default=None)
+    events_report.add_argument("--run-id", default=None)
+    events_report.set_defaults(func=command_worker_events_report)
 
     loop = commands.add_parser(
         "loop",
