@@ -4,7 +4,10 @@
 # State lives entirely in the mailbox dir (default loop/; override with
 # LOOP_DIR=loop-<name> to run concurrent loops) — safe to kill and re-run.
 # Exit codes: 0 SHIP, 2 BLOCKED, 3 bad verdict, 4 cap,
-# 5 NEEDS_HUMAN (or mailbox locked by another driver).
+# 5 NEEDS_HUMAN (or mailbox locked by another driver),
+# 6 needs_retirement (SHIP seen but mailbox/product retirement
+# is missing or not a real git object). Python returns 6
+# unchanged through this exec wrapper.
 #
 # Usage:
 #   HARNESS=claude ./portable/driver.sh

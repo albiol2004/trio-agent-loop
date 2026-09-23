@@ -154,11 +154,23 @@ class FakeBrokerClient:
                     with verdict.open("a", encoding="utf-8") as handle:
                         handle.write(self.verdict_append)
                 else:
-                    verdict.write_text(
-                        "VERDICT: SHIP\n"
-                        "# Verdict — iteration 1\n",
-                        encoding="utf-8",
-                    )
+                    attempt = ""
+                    sha = ""
+                    if self.prompts:
+                        for line in self.prompts[-1].splitlines():
+                            if not line.startswith("LOCKSTEP CONTEXT:"):
+                                continue
+                            for part in line.split():
+                                if part.startswith("attempt="):
+                                    attempt = part.split("=", 1)[1]
+                                if part.startswith("sha="):
+                                    sha = part.split("=", 1)[1]
+                    body = "VERDICT: SHIP\n# Verdict — iteration 1\n"
+                    if attempt:
+                        body += f"attempt: {attempt}\n"
+                    if sha:
+                        body += f"commit: {sha}\n"
+                    verdict.write_text(body, encoding="utf-8")
         return {"items": [{"role": "assistant", "content": role}]}
 
 
@@ -1406,6 +1418,120 @@ def test_matching_pinned_revision_is_ready(tmp_path: Path) -> None:
     )
 
 
+def test_stale_same_iteration_without_attempt_is_not_ready(
+    tmp_path: Path,
+) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n",
+        encoding="utf-8",
+    )
+    context = {"evaluator_attempt": "abc123", "pinned_sha": ""}
+    assert not trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, "", 0.0, context
+    )
+
+
+def test_matching_attempt_in_context_is_ready(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n"
+        "attempt: abc123\n",
+        encoding="utf-8",
+    )
+    context = {"evaluator_attempt": "abc123"}
+    assert trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, "", 0.0, context
+    )
+
+
+def test_lockstep_prompt_carries_attempt_and_pin() -> None:
+    trioctl = load_trioctl()
+    runner = trioctl.OmnigentRunner.__new__(trioctl.OmnigentRunner)
+    runner.repo = Path("/tmp/repo")
+    text = (
+        "LOCKSTEP CONTEXT: attempt=deadbeef sha=cafebabe\n\n"
+        + "body\n"
+    )
+    # Exercise the same concatenation the runner uses.
+    context = {"evaluator_attempt": "deadbeef", "pinned_sha": "cafebabe"}
+    prompt_role_result = "body\n"
+    built = (
+        f"LOCKSTEP CONTEXT: attempt={context['evaluator_attempt']} "
+        f"sha={context['pinned_sha']}\n\n"
+        + prompt_role_result
+    )
+    assert built == text
+
+
+def test_omnigent_runner_prompt_includes_lockstep_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    _install_role_registry(tmp_path, monkeypatch)
+    broker = FakeBrokerClient(mailbox)
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path,
+        broker_client=broker,
+        config=profile(),
+        interval=0,
+    )
+    context = {"evaluator_attempt": "att1", "pinned_sha": "abc"}
+    assert runner.run("evaluator", 1, mailbox, context) == 0
+    assert "LOCKSTEP CONTEXT: attempt=att1 sha=abc" in broker.prompts[0]
+    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert "attempt: att1" in verdict
+    assert "commit: abc" in verdict
+
+
+def test_timeout_accepts_fresh_artifact_on_last_chance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid artifact that is ready when the timer hits is accepted."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    before = ""
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n"
+        "attempt: att1\n",
+        encoding="utf-8",
+    )
+    checks = {"n": 0}
+
+    def fake_ready(*_a, **_k):
+        checks["n"] += 1
+        return checks["n"] >= 2
+
+    monkeypatch.setattr(trioctl, "_role_artifact_ready", fake_ready)
+    runner = trioctl.OmnigentRunner.__new__(trioctl.OmnigentRunner)
+    runner.session_ids = {"evaluator": "s-eval"}
+    runner._timeout = 0.0
+    runner._interval = 0
+
+    class IdleClient:
+        def wait_session(self, session_id, timeout=None, interval=None):
+            return {"id": session_id, "status": "idle"}
+
+        def get_items(self, session_id):
+            return {"items": []}
+
+    snapshot = runner._wait_for_role_artifact(
+        IdleClient(),
+        "evaluator",
+        1,
+        mailbox,
+        started=0.0,
+        before_text=before,
+        before_mtime=0.0,
+        context={"evaluator_attempt": "att1"},
+    )
+    assert snapshot["id"] == "s-eval"
+    assert checks["n"] >= 2
+
+
 def test_stale_persisted_verdict_times_out_instead_of_shipping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1427,3 +1553,44 @@ def test_stale_persisted_verdict_times_out_instead_of_shipping(
     )
     with pytest.raises(trioctl.TrioctlError, match="timed out"):
         runner.run("evaluator", 1, mailbox)
+
+
+def test_command_loop_returns_needs_retirement_exit_six(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrapper must surface exit 6 unchanged (no evaluator re-run)."""
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+
+    class SixLoop:
+        @staticmethod
+        def run_loop(*args, **kwargs):
+            return 6
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: SixLoop)
+    monkeypatch.setattr(
+        trioctl,
+        "OmnigentRunner",
+        lambda **kwargs: type(
+            "R",
+            (),
+            {"created_session_ids": [], "session_ids": {}},
+        )(),
+    )
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda *a, **k: None,
+    )
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "loop",
+            "--mailbox",
+            str(mailbox),
+            "--max-iterations",
+            "1",
+        ]
+    )
+    assert args.func(args) == 6

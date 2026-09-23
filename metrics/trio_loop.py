@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -42,8 +43,13 @@ A_LEAD_RE = _METRICS.A_LEAD_RE
 SCOPE_RE = re.compile(r"^scope=(design|local:[^\s]+)$", re.IGNORECASE)
 # iteration/status are MAILBOX-SCHEMA.md fields. phase is the resume
 # cursor this driver owns (trio-metrics parse_state ignores unknown keys).
+# evaluated_sha / evaluator_attempt are lockstep pin keys: they bind a
+# resume to the revision and attempt that were dispatched, not merely
+# the iteration number leftover in VERDICT.md.
 STATE_RE = re.compile(
-    r"^\s*(?:-\s+)?(iteration|status|phase)\s*:\s*(.*)$", re.IGNORECASE
+    r"^\s*(?:-\s+)?(iteration|status|phase|evaluated_sha|"
+    r"evaluator_attempt)\s*:\s*(.*)$",
+    re.IGNORECASE,
 )
 ROLE_LOG_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*"
@@ -79,7 +85,13 @@ def _read_state(path: Path) -> dict[str, str]:
         path.write_text(
             "iteration: 0\nstatus: ready\nphase: idle\n", encoding="utf-8"
         )
-    state = {"iteration": "0", "status": "ready", "phase": "idle"}
+    state = {
+        "iteration": "0",
+        "status": "ready",
+        "phase": "idle",
+        "evaluated_sha": "",
+        "evaluator_attempt": "",
+    }
     lines = path.read_text(
         encoding="utf-8", errors="replace"
     ).splitlines()
@@ -103,7 +115,13 @@ def _update_state(path: Path, updates: dict[str, str]) -> None:
             line = f"{key}: {updates[key]}"
             found.add(key)
         result.append(line)
-    for key in ("iteration", "status", "phase"):
+    for key in (
+        "iteration",
+        "status",
+        "phase",
+        "evaluated_sha",
+        "evaluator_attempt",
+    ):
         if key in updates and key not in found:
             result.append(f"{key}: {updates[key]}")
     path.write_text(
@@ -411,6 +429,34 @@ def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     return f"iteration {iteration}".lower() in text.lower()
 
 
+def _verdict_records_attempt(text: str, attempt: str) -> bool:
+    """True when VERDICT.md names this unique evaluator attempt."""
+    want = attempt.strip().lower()
+    if not want:
+        return False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("attempt:"):
+            got = line.split(":", 1)[1].strip().lower()
+            if got == want:
+                return True
+    return False
+
+
+def _verdict_records_sha(text: str, sha: str) -> bool:
+    """True when a ``commit:`` line records the expected pinned revision."""
+    want = sha.strip().lower()
+    if not want:
+        return False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("commit:"):
+            got = line.split(":", 1)[1].strip().lower()
+            if got == want or want.startswith(got) or got.startswith(want):
+                return True
+    return False
+
+
 def _git_root(repo: Path | None) -> Path | None:
     """Return ``repo`` only when it is a git directory we may inspect."""
     if repo is None:
@@ -420,37 +466,145 @@ def _git_root(repo: Path | None) -> Path | None:
     return None
 
 
-def _mailbox_retirement_commit_present(repo: Path, iteration: int) -> bool:
-    """True when git log has this iteration's mailbox SHIP commit."""
-    needle = f"loop: iteration {iteration} — SHIP"
+def _git(
+    repo: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run git in ``repo``; never raise on a missing binary or bad rev."""
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "log",
-                "-20",
-                "--grep",
-                needle,
-                "--format=%H",
-            ],
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
             capture_output=True,
             text=True,
             check=False,
         )
     except OSError:
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=1, stdout="", stderr=""
+        )
+
+
+def _git_commit_sha(repo: Path, rev: str) -> str | None:
+    """Resolve ``rev`` to a real commit object, or None if it is fake."""
+    if not rev.strip():
+        return None
+    result = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
+    sha = result.stdout.strip()
+    if result.returncode != 0 or not sha:
+        return None
+    return sha
+
+
+def _git_head(repo: Path) -> str | None:
+    """HEAD commit, or None on an empty or unusable repository."""
+    return _git_commit_sha(repo, "HEAD")
+
+
+def _git_is_ancestor(repo: Path, maybe_ancestor: str, rev: str) -> bool:
+    """True when ``maybe_ancestor`` is an ancestor of ``rev`` (or equal)."""
+    result = _git(
+        repo, "merge-base", "--is-ancestor", maybe_ancestor, rev
+    )
+    return result.returncode == 0
+
+
+def _commit_paths(repo: Path, sha: str) -> list[str]:
+    """Paths changed by ``sha``. Empty commits yield an empty list."""
+    result = _git(
+        repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
+    )
+    if result.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def _mailbox_rel(repo: Path, mailbox: Path) -> str | None:
+    """Mailbox path relative to the git root, when it lives inside."""
+    try:
+        rel = mailbox.resolve().relative_to(repo.resolve())
+    except ValueError:
+        return None
+    return rel.as_posix()
+
+
+def _path_in_mailbox(path: str, mailbox_rel: str | None) -> bool:
+    """True when ``path`` is the mailbox dir or a file under it."""
+    if not mailbox_rel:
         return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    prefix = mailbox_rel.rstrip("/")
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _mailbox_retirement_commit_present(
+    repo: Path, mailbox: Path, iteration: int
+) -> bool:
+    """True when a SHIP mailbox commit exists, touches mailbox files,
+    and is an ancestor of HEAD. A message-only empty commit is not
+    enough.
+    """
+    needle = f"loop: iteration {iteration} — SHIP"
+    result = _git(repo, "log", "--grep", needle, "--format=%H")
+    if result.returncode != 0:
+        return False
+    mailbox_rel = _mailbox_rel(repo, mailbox)
+    head = _git_head(repo)
+    if head is None:
+        return False
+    for sha in result.stdout.split():
+        resolved = _git_commit_sha(repo, sha)
+        if resolved is None:
+            continue
+        if not _git_is_ancestor(repo, resolved, head):
+            continue
+        paths = _commit_paths(repo, resolved)
+        if any(_path_in_mailbox(p, mailbox_rel) for p in paths):
+            return True
+    return False
+
+
+def _verified_verdict_commit_shas(repo: Path, text: str) -> list[str]:
+    """``commit:`` values that exist as git objects (not invented hex)."""
+    found: list[str] = []
+    head = _git_head(repo)
+    if head is None:
+        return found
+    for raw in _verdict_commit_shas(text):
+        sha = _git_commit_sha(repo, raw)
+        if sha is None:
+            continue
+        if _git_is_ancestor(repo, sha, head):
+            found.append(sha)
+    return found
+
+
+def _evaluated_product_intact(
+    repo: Path, mailbox: Path, evaluated_sha: str
+) -> bool:
+    """True when HEAD still descends from the graded revision.
+
+    Dirty foreign files are ignored: this is ancestry, not status.
+    """
+    del mailbox
+    if not evaluated_sha.strip():
+        return True
+    resolved = _git_commit_sha(repo, evaluated_sha)
+    head = _git_head(repo)
+    if resolved is None or head is None:
+        return False
+    return _git_is_ancestor(repo, resolved, head)
 
 
 def _ship_retirement_complete(
     mailbox: Path, iteration: int, repo: Path | None
 ) -> bool:
-    """SHIP is finished only with commit lines or a retirement commit.
+    """SHIP is finished only with real git objects and mailbox identity.
 
-    When ``repo`` is not a git tree, skip the gate so existing no-repo
-    fakes keep shipping. Never infer completion from a timeout.
+    Hex-shaped ``commit:`` lines and empty message-only retirement
+    commits are not enough. When ``repo`` is not a git tree, skip the
+    gate so existing no-repo fakes keep shipping.
     """
     git_root = _git_root(repo)
     if git_root is None:
@@ -461,13 +615,35 @@ def _ship_retirement_complete(
         )
     except OSError:
         text = ""
-    if _verdict_commit_shas(text):
+    state = _read_state(mailbox / "STATE.md")
+    evaluated = state.get("evaluated_sha", "").strip()
+    if not _evaluated_product_intact(git_root, mailbox, evaluated):
+        return False
+    verified = _verified_verdict_commit_shas(git_root, text)
+    mailbox_ok = _mailbox_retirement_commit_present(
+        git_root, mailbox, iteration
+    )
+    # Fabricated hex in commit: lines must not satisfy the gate.
+    claimed = _verdict_commit_shas(text)
+    if claimed and not verified:
+        return False
+    if verified and mailbox_ok:
         return True
-    return _mailbox_retirement_commit_present(git_root, iteration)
+    if mailbox_ok and evaluated and not claimed:
+        return True
+    return False
 
 
-def _fresh_evaluator_artifact(mailbox: Path, iteration: int) -> bool:
-    """True when VERDICT.md already grades this iteration (no re-dispatch)."""
+def _fresh_evaluator_artifact(
+    mailbox: Path,
+    iteration: int,
+    context: dict | None = None,
+) -> bool:
+    """True when VERDICT.md is this attempt's artifact (no re-dispatch).
+
+    Same-iteration leftover text is not enough: the unique attempt id
+    (and pin, when one was dispatched) must match.
+    """
     path = mailbox / "VERDICT.md"
     if not path.is_file():
         return False
@@ -478,7 +654,18 @@ def _fresh_evaluator_artifact(mailbox: Path, iteration: int) -> bool:
     word, _scope = _first_verdict(path)
     if word is None:
         return False
-    return _verdict_mentions_iteration(text, iteration)
+    if not _verdict_mentions_iteration(text, iteration):
+        return False
+    context = context or {}
+    attempt = str(context.get("evaluator_attempt") or "").strip()
+    if attempt and not _verdict_records_attempt(text, attempt):
+        return False
+    pinned = str(
+        context.get("pinned_sha") or context.get("expected_sha") or ""
+    ).strip()
+    if pinned and not _verdict_records_sha(text, pinned):
+        return False
+    return bool(attempt)
 
 
 def _apply_verdict(
@@ -529,6 +716,42 @@ def _apply_verdict(
     _update_state(state_path, {"status": "running", "phase": "idle"})
     return None
 
+
+def _lockstep_eval_context(
+    mailbox: Path,
+    repo: Path | None,
+    iteration: int,
+    state: dict[str, str],
+    state_path: Path,
+) -> dict[str, str]:
+    """Capture pin + unique attempt before Evaluator dispatch.
+
+    Resume reuses the already-persisted attempt so a crash mid-wait
+    still matches the same evidence. A new Lead pass must mint a new
+    attempt after this helper is called with empty state keys.
+    """
+    del iteration
+    attempt = state.get("evaluator_attempt", "").strip()
+    pinned = state.get("evaluated_sha", "").strip()
+    git_root = _git_root(repo)
+    if not pinned and git_root is not None:
+        pinned = _git_head(git_root) or ""
+    if not attempt:
+        attempt = uuid.uuid4().hex
+    _update_state(
+        state_path,
+        {
+            "evaluated_sha": pinned,
+            "evaluator_attempt": attempt,
+        },
+    )
+    return {
+        "pinned_sha": pinned,
+        "expected_sha": pinned,
+        "evaluator_attempt": attempt,
+    }
+
+
 def _run_lockstep(
     mailbox: Path,
     max_iterations: int,
@@ -562,9 +785,31 @@ def _run_lockstep(
         )
         while True:
             status = state["status"].strip().lower()
-            terminal = TERMINAL_CODES.get(status.split()[0] if status else "")
+            status_word = status.split()[0] if status else ""
+            terminal = TERMINAL_CODES.get(status_word)
             iteration = _number(state["iteration"])
             if terminal is not None:
+                # needs_retirement is resumable: a later real mailbox
+                # retirement must finish without re-running Evaluator.
+                if status_word == "needs_retirement":
+                    if _ship_retirement_complete(
+                        mailbox, iteration, repo
+                    ):
+                        _update_state(
+                            state_path,
+                            {"status": "shipped", "phase": "shipped"},
+                        )
+                        _write_driver_state(
+                            mailbox, runner, iteration, "shipped"
+                        )
+                        return 0
+                    _write_driver_state(
+                        mailbox,
+                        runner,
+                        iteration,
+                        state["phase"].strip(),
+                    )
+                    return 6
                 _write_driver_state(
                     mailbox, runner, iteration, state["phase"].strip()
                 )
@@ -572,11 +817,20 @@ def _run_lockstep(
             # Crash-resume: Lead+gates already landed, so do not bump
             # iteration or re-run Lead (fixes driver.sh:107-108).
             if state["phase"].strip().lower() == "lead-done":
-                # A fresh iteration-marked verdict is already this attempt;
-                # do not dispatch Evaluator again on resumable completion.
-                if not _fresh_evaluator_artifact(mailbox, iteration):
+                context = _lockstep_eval_context(
+                    mailbox, repo, iteration, state, state_path
+                )
+                # Skip Evaluator only when the artifact names this
+                # attempt and pin; leftover same-iteration SHIP is not.
+                if not _fresh_evaluator_artifact(
+                    mailbox, iteration, context
+                ):
                     result = _invoke_runner(
-                        runner, "evaluator", iteration, mailbox, {}
+                        runner,
+                        "evaluator",
+                        iteration,
+                        mailbox,
+                        context,
                     )
                     if result != 0:
                         raise RuntimeError(
@@ -627,6 +881,8 @@ def _run_lockstep(
                     "iteration": str(iteration),
                     "status": "running",
                     "phase": f"{role}-running",
+                    "evaluator_attempt": "",
+                    "evaluated_sha": "",
                 },
             )
             _write_driver_state(mailbox, runner, iteration, f"{role}-running")

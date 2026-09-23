@@ -193,8 +193,10 @@ Gemini CLI are), `SETUP-zai.md` (Z.ai's ZCode is a GUI — not scriptable; the G
 endpoint runs the NATIVE template via Claude Code env vars instead),
 `SETUP-generic.md`. `portable/driver.sh` execs `metrics/trio_loop.py` for
 gates, verdicts, repairs, and resume; HARNESS role dispatch stays in Bash.
-Exit codes are 0=SHIP, 2=BLOCKED, 3=bad verdict, 4=iteration cap, and
-5=NEEDS_HUMAN (or mailbox locked by another driver)
+Exit codes are 0=SHIP, 2=BLOCKED, 3=bad verdict, 4=iteration cap,
+5=NEEDS_HUMAN (or mailbox locked by another driver), and
+6=needs_retirement (SHIP without verified git retirement; the
+wrapper `exec`s Python so 6 is the actual process status)
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
 agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.

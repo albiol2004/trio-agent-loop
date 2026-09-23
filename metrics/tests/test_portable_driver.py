@@ -64,9 +64,14 @@ def write_script(path: Path, body: str) -> Path:
 def run_driver(
     mailbox: Path,
     *args: str,
+    cwd: Path | None = None,
     **variables: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the driver from the repository root with an isolated mailbox."""
+    """Run the driver with an isolated mailbox.
+
+    Default cwd is the repository (a git tree). Pass a git-less cwd
+    when the test needs the no-repo SHIP/exit-0 path.
+    """
     environment = os.environ.copy()
     environment.update(
         {
@@ -77,7 +82,7 @@ def run_driver(
     )
     return subprocess.run(
         [str(DRIVER), *args],
-        cwd=ROOT,
+        cwd=str(cwd or ROOT),
         env=environment,
         capture_output=True,
         text=True,
@@ -132,6 +137,7 @@ def test_driver_executes_python_loop_and_ships(
     result = run_driver(
         mailbox,
         "2",
+        cwd=tmp_path,
         RUN_LEAD=str(lead),
         RUN_EVAL=str(evaluator),
     )
@@ -187,3 +193,27 @@ def test_run_role_does_not_recurse_into_python(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
     assert not (mailbox / ".lock").exists()
+
+
+def test_driver_header_documents_exit_six() -> None:
+    text = DRIVER.read_text(encoding="utf-8")
+    assert "6 needs_retirement" in text
+
+
+def test_driver_git_repo_ship_without_retirement_exits_six(
+    tmp_path: Path,
+    successful_harnesses: tuple[Path, Path],
+) -> None:
+    """Actual wrapper status is 6 when cwd is a git repo without retirement."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    mailbox = make_mailbox(tmp_path)
+    lead, evaluator = successful_harnesses
+    result = run_driver(
+        mailbox,
+        "1",
+        cwd=tmp_path,
+        RUN_LEAD=str(lead),
+        RUN_EVAL=str(evaluator),
+    )
+    assert result.returncode == 6, result.stderr
+    assert "status: needs_retirement" in (mailbox / "STATE.md").read_text()

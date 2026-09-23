@@ -866,6 +866,20 @@ def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     return needle.lower() in text.lower()
 
 
+def _verdict_records_attempt(text: str, attempt: str) -> bool:
+    """True when VERDICT.md names this unique evaluator attempt."""
+    want = attempt.strip().lower()
+    if not want:
+        return False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("attempt:"):
+            got = line.split(":", 1)[1].strip().lower()
+            if got == want:
+                return True
+    return False
+
+
 def _verdict_records_sha(text: str, sha: str) -> bool:
     """True when a ``commit:`` line records the expected pinned revision."""
     want = sha.strip().lower()
@@ -918,8 +932,12 @@ def _role_artifact_ready(
         if not _verdict_mentions_iteration(text, iteration):
             return False
         pinned = None
+        attempt = None
         if context:
             pinned = context.get("pinned_sha") or context.get("expected_sha")
+            attempt = context.get("evaluator_attempt")
+        if attempt and not _verdict_records_attempt(text, str(attempt)):
+            return False
         if pinned:
             return _verdict_records_sha(text, str(pinned))
         return True
@@ -1719,6 +1737,20 @@ class OmnigentRunner:
             )
         if context and context.get("mode") == "open-loop":
             result = self._open_loop_context_block(context) + result
+        elif context and (
+            context.get("evaluator_attempt") or context.get("pinned_sha")
+        ):
+            # Default lockstep: pass the persisted pin and unique attempt
+            # through the actual Omnigent prompt so artifact wait can
+            # match this dispatch, not leftover same-iteration text.
+            attempt = str(context.get("evaluator_attempt") or "")
+            sha = str(
+                context.get("pinned_sha") or context.get("expected_sha") or ""
+            )
+            result = (
+                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}\n\n"
+                + result
+            )
         return result
 
     def _client(self) -> Any:
@@ -1993,6 +2025,18 @@ class OmnigentRunner:
         ):
             remaining = self._timeout - (time.monotonic() - started)
             if remaining <= 0:
+                # Last-chance accept: a valid fresh artifact that landed
+                # as the timer expired is this attempt. Stale/partial
+                # files stay uncertain (timeout), never SHIP.
+                if _role_artifact_ready(
+                    mailbox,
+                    role,
+                    iteration,
+                    before_text,
+                    before_mtime,
+                    context,
+                ):
+                    break
                 raise TrioctlError(
                     f"session {session_id} timed out after "
                     f"{self._timeout:g} seconds"

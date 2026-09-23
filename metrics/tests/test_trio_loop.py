@@ -54,10 +54,18 @@ class FakeRunner:
         self.expected_roles = expected_roles
         self.add_log = add_log
         self.calls: list[tuple[str, int]] = []
+        self.contexts: list[object] = []
 
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    def run(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict | None = None,
+    ) -> int:
         """Record a role and emulate its mailbox writes."""
         self.calls.append((role, iteration))
+        self.contexts.append(context)
         if self.expected_roles is not None:
             expected = self.expected_roles.pop(0)
             assert role == expected
@@ -66,8 +74,19 @@ class FakeRunner:
                 log.write(f"- iter {iteration} | {role} | completed\n")
         if role == "evaluator":
             assert self.verdicts
+            text = self.verdicts.pop(0)
+            extras: list[str] = []
+            if context:
+                attempt = str(context.get("evaluator_attempt") or "")
+                if attempt and "attempt:" not in text.lower():
+                    extras.append(f"attempt: {attempt}")
+                pinned = str(context.get("pinned_sha") or "")
+                if pinned and "commit:" not in text.lower():
+                    extras.append(f"commit: {pinned}")
+            if extras:
+                text = text.rstrip("\n") + "\n" + "\n".join(extras) + "\n"
             (mailbox / "VERDICT.md").write_text(
-                self.verdicts.pop(0) + "\n",
+                text if text.endswith("\n") else text + "\n",
                 encoding="utf-8",
             )
         return 0
@@ -76,21 +95,25 @@ class FakeRunner:
 class EvaluatorCrashRunner(FakeRunner):
     """Fake runner that dies after the Lead transition is persisted."""
 
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    def run(
+        self, role: str, iteration: int, mailbox: Path, context=None
+    ) -> int:
         if role == "evaluator":
             self.calls.append((role, iteration))
             raise RuntimeError("evaluator crashed")
-        return super().run(role, iteration, mailbox)
+        return super().run(role, iteration, mailbox, context)
 
 
 class LeadCrashRunner(FakeRunner):
     """Fake runner that dies while the Lead phase is in flight."""
 
-    def run(self, role: str, iteration: int, mailbox: Path) -> int:
+    def run(
+        self, role: str, iteration: int, mailbox: Path, context=None
+    ) -> int:
         if role == "lead":
             self.calls.append((role, iteration))
             raise RuntimeError("lead crashed")
-        return super().run(role, iteration, mailbox)
+        return super().run(role, iteration, mailbox, context)
 
 
 def state_text(mailbox: Path) -> str:
@@ -407,7 +430,31 @@ def test_git_repo_ship_without_retirement_is_not_finished(
     assert "status: shipped" not in text
 
 
-def test_git_repo_ship_with_commit_line_is_shipped(tmp_path: Path) -> None:
+def test_lockstep_passes_attempt_context_to_evaluator(
+    tmp_path: Path,
+) -> None:
+    """Default lockstep mints and persists a unique attempt before dispatch."""
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"])
+
+    assert trio_loop.run_loop(mailbox, 1, runner) == 0
+    eval_contexts = [
+        ctx for (role, _i), ctx in zip(runner.calls, runner.contexts)
+        if role == "evaluator"
+    ]
+    assert eval_contexts and eval_contexts[0]
+    attempt = str(eval_contexts[0].get("evaluator_attempt") or "")
+    assert attempt
+    text = state_text(mailbox)
+    assert f"evaluator_attempt: {attempt}" in text
+    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert f"attempt: {attempt}" in verdict
+
+
+def test_git_repo_ship_with_fake_commit_line_is_not_shipped(
+    tmp_path: Path,
+) -> None:
+    """Invented hex is not a git object, so SHIP cannot finish."""
     init_git(tmp_path)
     mailbox = make_mailbox(tmp_path)
     sha = "a" * 40
@@ -415,13 +462,15 @@ def test_git_repo_ship_with_commit_line_is_shipped(tmp_path: Path) -> None:
         [f"VERDICT: SHIP\n# Verdict — iteration 1\ncommit: {sha}\n"]
     )
 
-    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
-    assert "status: shipped" in state_text(mailbox)
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: needs_retirement" in state_text(mailbox)
+    assert "status: shipped" not in state_text(mailbox)
 
 
-def test_git_repo_ship_with_retirement_commit_is_shipped(
+def test_git_repo_ship_with_empty_retirement_commit_is_not_shipped(
     tmp_path: Path,
 ) -> None:
+    """A message-only empty SHIP commit is not mailbox identity."""
     init_git(tmp_path)
     subprocess.run(
         [
@@ -440,13 +489,78 @@ def test_git_repo_ship_with_retirement_commit_is_shipped(
     mailbox = make_mailbox(tmp_path)
     runner = FakeRunner(["VERDICT: SHIP"])
 
-    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
-    assert "status: shipped" in state_text(mailbox)
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: needs_retirement" in state_text(mailbox)
 
 
-def test_fresh_persisted_verdict_skips_evaluator_redispatch(
+def _git_head(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _commit_relative(
+    repo: Path, relative: str, content: str, message: str
+) -> str:
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "--", relative],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", message],
+        check=True,
+        env=git_identity_env(),
+    )
+    return _git_head(repo)
+
+
+def test_git_repo_real_retirement_ships_and_keeps_foreign_dirty(
     tmp_path: Path,
 ) -> None:
+    """Verified objects + mailbox paths ship; dirty extras stay unstaged."""
+    init_git(tmp_path)
+    foreign = tmp_path / "foreign-dirty.txt"
+    foreign.write_text("leave me", encoding="utf-8")
+    mailbox = make_mailbox(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    _commit_relative(
+        tmp_path,
+        "mailbox/VERDICT.md",
+        "placeholder\n",
+        "loop: iteration 1 — SHIP",
+    )
+    runner = FakeRunner(
+        [
+            "VERDICT: SHIP\n# Verdict — iteration 1\n"
+            f"commit: {product}\n"
+        ]
+    )
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert "status: shipped" in state_text(mailbox)
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "foreign-dirty.txt" in status
+    assert not status.split("foreign-dirty.txt")[0].endswith("M ")
+
+
+def test_stale_same_iteration_verdict_redispatches_evaluator(
+    tmp_path: Path,
+) -> None:
+    """Leftover iteration-N SHIP is not this attempt."""
     mailbox = make_mailbox(tmp_path)
     (mailbox / "STATE.md").write_text(
         "iteration: 1\nstatus: running\nphase: lead-done\n",
@@ -458,8 +572,101 @@ def test_fresh_persisted_verdict_skips_evaluator_redispatch(
     )
     with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
         log.write("- iter 1 | lead | completed\n")
+    runner = FakeRunner(["VERDICT: SHIP"], expected_roles=["evaluator"])
+
+    assert trio_loop.run_loop(mailbox, 1, runner) == 0
+    assert runner.calls == [("evaluator", 1)]
+    assert "status: shipped" in state_text(mailbox)
+
+
+def test_matching_attempt_skips_evaluator_redispatch(
+    tmp_path: Path,
+) -> None:
+    """Crash-resume accepts only evidence for the persisted attempt."""
+    mailbox = make_mailbox(tmp_path)
+    attempt = "cafef00d" + "ab" * 12
+    (mailbox / "STATE.md").write_text(
+        "iteration: 1\nstatus: running\nphase: lead-done\n"
+        f"evaluator_attempt: {attempt}\n",
+        encoding="utf-8",
+    )
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n"
+        f"attempt: {attempt}\n",
+        encoding="utf-8",
+    )
+    with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+        log.write("- iter 1 | lead | completed\n")
     runner = FakeRunner([], expected_roles=[])
 
     assert trio_loop.run_loop(mailbox, 1, runner) == 0
     assert runner.calls == []
     assert "status: shipped" in state_text(mailbox)
+
+
+def test_needs_retirement_resumes_after_real_finalization(
+    tmp_path: Path,
+) -> None:
+    """Later verified retirement finishes without a second Evaluator."""
+    init_git(tmp_path)
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    evaluated = None
+    for line in state_text(mailbox).splitlines():
+        if line.startswith("evaluated_sha:"):
+            evaluated = line.split(":", 1)[1].strip()
+    assert "status: needs_retirement" in state_text(mailbox)
+
+    if not evaluated:
+        _commit_relative(tmp_path, "app.py", "x\n", "slice(demo): product")
+        evaluated = _git_head(tmp_path)
+        trio_loop._update_state(
+            mailbox / "STATE.md", {"evaluated_sha": evaluated}
+        )
+    else:
+        _commit_relative(tmp_path, "app.py", "x\n", "slice(demo): product")
+    _commit_relative(
+        tmp_path,
+        "mailbox/VERDICT.md",
+        (mailbox / "VERDICT.md").read_text(encoding="utf-8"),
+        "loop: iteration 1 — SHIP",
+    )
+    resumed = FakeRunner([], expected_roles=[])
+    assert trio_loop.run_loop(mailbox, 1, resumed, repo=tmp_path) == 0
+    assert resumed.calls == []
+    assert "status: shipped" in state_text(mailbox)
+
+
+def test_changed_product_is_not_accepted_on_retirement_resume(
+    tmp_path: Path,
+) -> None:
+    """HEAD that dropped the graded revision must not ship."""
+    init_git(tmp_path)
+    first = _commit_relative(tmp_path, "app.py", "one\n", "first")
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "STATE.md").write_text(
+        "iteration: 1\nstatus: needs_retirement\n"
+        "phase: ship-pending-retirement\n"
+        f"evaluated_sha: {first}\n",
+        encoding="utf-8",
+    )
+    (mailbox / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "checkout", "--orphan", "other", "-q"],
+        check=True,
+    )
+    _commit_relative(tmp_path, "other.py", "two\n", "unrelated history")
+    _commit_relative(
+        tmp_path,
+        "mailbox/VERDICT.md",
+        "VERDICT: SHIP\n",
+        "loop: iteration 1 — SHIP",
+    )
+    runner = FakeRunner([], expected_roles=[])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert runner.calls == []
+    assert "status: needs_retirement" in state_text(mailbox)
