@@ -26,7 +26,7 @@ Both `outcome`/`returncode` success. **~109 s** is the
 Lead latency and not the total loop cycle. Product slice
 commits landed later (`19:58:10Z`).
 
-Subprocess lifetime overlap is **not** useful concurrent work.
+Subprocess lifetime overlap is **not proof of** useful concurrent work.
 
 ## Gate and product
 
