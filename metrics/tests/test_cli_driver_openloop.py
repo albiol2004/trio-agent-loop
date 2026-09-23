@@ -299,17 +299,22 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
     and creates a mailbox-path commit with the SHIP message. No invented
     hex and no empty message-only commit.
     """
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    # Git cwd is the product tree. Helper scripts are test harness, not
+    # product: keep them outside so the untracked-product guard does not
+    # treat lead.sh/evaluator.sh as leftover untracked files.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
     subprocess.run(
-        ["git", "-C", str(tmp_path), "add", "--", "seed.txt"],
+        ["git", "-C", str(repo), "add", "--", "seed.txt"],
         check=True,
     )
     subprocess.run(
         [
             "git",
             "-C",
-            str(tmp_path),
+            str(repo),
             "commit",
             "-q",
             "-m",
@@ -318,11 +323,13 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
         check=True,
         env=git_identity_env(),
     )
-    mailbox = make_lockstep_mailbox(tmp_path)
+    mailbox = make_lockstep_mailbox(repo)
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
     # Evaluator reads attempt/pin from STATE after lockstep mints them,
     # writes a matching verdict, then commits mailbox files for real.
     evaluator = write_script(
-        tmp_path / "evaluator.sh",
+        helpers / "evaluator.sh",
         (
             'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
             '"$LOOP_DIR/STATE.md")"\n'
@@ -348,7 +355,7 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
         ),
     )
     result = run_lockstep_cli(
-        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+        mailbox, repo, lockstep_lead_script(helpers), evaluator
     )
     assert result.returncode == 0, result.stderr + result.stdout
     state = (mailbox / "STATE.md").read_text(encoding="utf-8")
@@ -358,7 +365,7 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
         [
             "git",
             "-C",
-            str(tmp_path),
+            str(repo),
             "log",
             "--grep",
             needle,
@@ -425,17 +432,21 @@ def test_portable_dispatch_ships_when_prompt_fields_copied(
     tmp_path: Path,
 ) -> None:
     """Real _PortableRunner lockstep: copy LOCKSTEP CONTEXT into VERDICT."""
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    # Same isolation as genuine-retirement: scripts live next to, not
+    # inside, the fixture git tree so leftover-untracked SHIP stays 6.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
     subprocess.run(
-        ["git", "-C", str(tmp_path), "add", "--", "seed.txt"],
+        ["git", "-C", str(repo), "add", "--", "seed.txt"],
         check=True,
     )
     subprocess.run(
         [
             "git",
             "-C",
-            str(tmp_path),
+            str(repo),
             "commit",
             "-q",
             "-m",
@@ -444,9 +455,11 @@ def test_portable_dispatch_ships_when_prompt_fields_copied(
         check=True,
         env=git_identity_env(),
     )
-    mailbox = make_lockstep_mailbox(tmp_path)
+    mailbox = make_lockstep_mailbox(repo)
+    helpers = tmp_path / "helpers"
+    helpers.mkdir()
     evaluator = write_script(
-        tmp_path / "eval_from_prompt.sh",
+        helpers / "eval_from_prompt.sh",
         (
             "prompt_file=\"$1\"\n"
             "ctx=\"$(grep -m1 '^LOCKSTEP CONTEXT:' \"$prompt_file\" || true)\"\n"
@@ -472,7 +485,7 @@ def test_portable_dispatch_ships_when_prompt_fields_copied(
         ),
     )
     result = run_lockstep_cli(
-        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+        mailbox, repo, lockstep_lead_script(helpers), evaluator
     )
     assert result.returncode == 0, result.stderr + result.stdout
     state = (mailbox / "STATE.md").read_text(encoding="utf-8")
