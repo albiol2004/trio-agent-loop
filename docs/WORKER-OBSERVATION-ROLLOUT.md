@@ -42,7 +42,7 @@ and event fields. The Lead fills **task/slice only**.
 - Stale model labels removed from role prompts.
 - Effective evaluator prompt: SHIP retirement is mailbox-only; do
   not edit product, tests, or driver-owned `STATE.md`.
-- Structured iteration `N` (do not confuse `1` with `10`).
+- Structured `iteration: N` fields accepted without confusing `1` with `10`.
 - Pre/post snapshots reject a withdrawn SHIP or changed inputs
   during finalization, with bounded retry. Snapshot uses
   `git --no-optional-locks` and raw bytes.
@@ -78,8 +78,9 @@ Live doctor JSON: `ok: true`, **13** checks pass
 
 - `upgrade-observe-workers/test-e07075c.log`: `ALL_PASS` (upgrade,
   rollback, default OFF, worker recipe, withdrawn-SHIP).
-- `observe-review-58dc42a` and `observe-review-1d716d4`: ITERATE,
-  superseded. Broad 58dc42a run: **782 passed**, 434 subtests,
+- `observe-review-58dc42a`: SHIP for the prompt/parser changes.
+  `observe-review-1d716d4`: ITERATE for two snapshot regressions,
+  subsequently fixed in e07075c. Broad 58dc42a run: **782 passed**, 434 subtests,
   **1 failed**
   `test_derive_iterations_byte_identical_live_repo_scan`
   (known pre-existing live-mailbox scan). 1d716d4 focused: 33

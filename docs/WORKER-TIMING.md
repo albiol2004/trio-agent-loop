@@ -4,8 +4,9 @@ This candidate measures **OS lifetimes of `cursor` subprocesses** that
 `trioctl omnigent run` already starts on parallel waves. It does **not**
 time the Trio scheduler, model tokens, or product quality. Default is
 **off**: omit `--worker-events-file` / `TRIO_WORKER_EVENTS_FILE` and
-`omnigent/worker_events.py` writes nothing. This tree is **not** the live
-install at `d435704`; do not treat it as deployed.
+`omnigent/worker_events.py` writes nothing. This note describes the original
+worker-timing increment; it was subsequently included in the installed
+`e07075c` release. See the rollout note below for current deployment status.
 
 Installed loop observation (`--observe-workers`) is documented in
 [WORKER-OBSERVATION-ROLLOUT.md](WORKER-OBSERVATION-ROLLOUT.md).
