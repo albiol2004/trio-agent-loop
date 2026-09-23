@@ -7,6 +7,9 @@ time the Trio scheduler, model tokens, or product quality. Default is
 `omnigent/worker_events.py` writes nothing. This tree is **not** the live
 install at `d435704`; do not treat it as deployed.
 
+Installed loop observation (`--observe-workers`) is documented in
+[WORKER-OBSERVATION-ROLLOUT.md](WORKER-OBSERVATION-ROLLOUT.md).
+
 **Not in this increment:** Jev integration, secrets access, live prompt
 or loop changes, profile/install edits. Broker env is **not** guaranteed
 to reach the worker; the Lead must pass explicit CLI/env fields.
