@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run worker-events tests inside bwrap with no network.
+# Run worker-events and --observe-workers tests inside bwrap with no network.
 # Isolation is OS unshare-net plus RO binds; not path checks.
 set -euo pipefail
 
@@ -41,4 +41,6 @@ exec "$BWRAP" \
     -o cache_dir="$WORKDIR" \
     omnigent/tests/test_worker_events.py \
     omnigent/tests/test_trioctl.py \
+    omnigent/tests/test_omnigent_loop.py \
+    omnigent/tests/test_observe_workers.py \
     -q --tb=short

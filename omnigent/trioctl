@@ -11,6 +11,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1764,6 +1765,7 @@ class OmnigentRunner:
         runner_id: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
+        observe: dict[str, Any] | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -1781,6 +1783,9 @@ class OmnigentRunner:
         # that binds an already-online runner instead of spawning one.
         self._host_id = host_id
         self._workspace = workspace or str(self.repo)
+        # Opt-in `--observe-workers` run: {run_id, workers, phases,
+        # trioctl}. None keeps prompts and mailbox writes unchanged.
+        self._observe = observe
         self.session_ids: dict[str, str] = {}
         self.created_session_ids: list[str] = []
 
@@ -1917,6 +1922,8 @@ class OmnigentRunner:
                 + f"Append `- iter {iteration} | repair | <one-line summary>` "
                 "to LOG.md for this repair.\n"
             )
+        if self._observe and role in ("lead", "repair"):
+            result += self._observe_block(iteration, mailbox)
         if context and context.get("mode") == "open-loop":
             result = self._open_loop_context_block(context) + result
         elif context and (
@@ -1934,6 +1941,80 @@ class OmnigentRunner:
                 + result
             )
         return result
+
+    def _observe_block(self, iteration: int, mailbox: Path) -> str:
+        """Explicit worker-dispatch CLI for an observed Lead/repair pass.
+
+        The broker-hosted Lead does not inherit this process's env, and a
+        bare `trioctl` on its PATH may be an older release without the
+        worker-events flags, so every field is spelled out here.
+        """
+        obs = self._observe or {}
+        q = shlex.quote
+        command = (
+            f"{q(sys.executable)} {q(str(obs['trioctl']))} omnigent run "
+            "<builder|scout|docs> \\\n"
+            f"    --worker-events-file {q(str(obs['workers']))} \\\n"
+            f"    --mailbox {q(str(Path(mailbox).resolve()))} \\\n"
+            f"    --worker-run-id {q(str(obs['run_id']))} \\\n"
+            f"    --worker-iteration {iteration} \\\n"
+            "    --worker-slice <slice-id> \\\n"
+            f"    --workspace {q(str(self.repo))} --prompt-file <task-file>"
+        )
+        return (
+            "\n## Worker observability (opt-in for this loop run)\n"
+            "This loop was launched with `--observe-workers`. Your shell "
+            "does not inherit the loop's environment, so dispatch every "
+            "worker for this pass with exactly this command (not a bare "
+            "`trioctl` from PATH), replacing only `<builder|scout|docs>`, "
+            "`<slice-id>` (the PLAN.md slice id), and `<task-file>`:\n\n"
+            f"```\n{command}\n```\n\n"
+            "Worker event logging is best-effort; never fail, retry, or "
+            "delay a slice because of it. This does not change how you "
+            "plan: run slices concurrently only when they are ready and "
+            "disjoint, and serially otherwise. In `REPORT.md` add a "
+            "`## Wave decisions` section listing (1) the slices that were "
+            "ready this pass, (2) the wave(s) you dispatched, i.e. which "
+            "slices ran concurrently, and (3) for each ready slice you ran "
+            "serially, the reason. Mark it agent-reported; it is not "
+            "measured causality.\n"
+        )
+
+    def _observe_phase(
+        self,
+        kind: str,
+        invocation_id: str,
+        role: str,
+        iteration: int,
+        **fields: Any,
+    ) -> None:
+        """Best-effort Lead/Evaluator/repair phase record. Never raises."""
+        if not self._observe or worker_events is None:
+            return
+        try:
+            rec = worker_events.phase_record(
+                invocation_id=invocation_id,
+                kind=kind,
+                role=role,
+                run_id=str(self._observe["run_id"]),
+                iteration=iteration,
+                **fields,
+            )
+            worker_events.emit(self._observe["phases"], rec)
+        except Exception:  # noqa: BLE001 - telemetry must not fail a pass
+            print(worker_events.TELEMETRY_WARN, file=sys.stderr)
+
+    def _observed_wave_report(self, mailbox: Path, since: float) -> str | None:
+        """Copy this pass's REPORT.md wave section; stale reports are None."""
+        path = mailbox / "REPORT.md"
+        try:
+            if path.stat().st_mtime < since:
+                return None
+            return worker_events.wave_section(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+        except (OSError, AttributeError):
+            return None
 
     def _client(self) -> Any:
         """Reuse an injected fake or build the real HTTP client once."""
@@ -2140,6 +2221,47 @@ class OmnigentRunner:
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
         mailbox = Path(mailbox).resolve()
+        if not self._observe or worker_events is None:
+            return self._run(role, iteration, mailbox, context)
+        phase_id = worker_events.new_invocation_id()
+        kind = None
+        if context and context.get("mode") == "open-loop":
+            kind = context.get("kind") or None
+        self._observe_phase(
+            "start", phase_id, role, iteration, open_loop_kind=kind
+        )
+        wall_start = time.time()
+        outcome = "error"
+        try:
+            code = self._run(role, iteration, mailbox, context)
+            outcome = "ok" if code == 0 else "failed"
+            return code
+        except KeyboardInterrupt:
+            outcome = "interrupted"
+            raise
+        finally:
+            extra: dict[str, Any] = {}
+            if role in ("lead", "repair"):
+                extra["wave_report"] = self._observed_wave_report(
+                    mailbox, wall_start
+                )
+            self._observe_phase(
+                "end",
+                phase_id,
+                role,
+                iteration,
+                outcome=outcome,
+                open_loop_kind=kind,
+                **extra,
+            )
+
+    def _run(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+    ) -> int:
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
@@ -2273,6 +2395,78 @@ def _load_trio_loop(repo: Path) -> Any:
     return module
 
 
+def _start_observation(mailbox: Path) -> dict[str, Any] | None:
+    """Mint a fresh run id and directory under the mailbox, or None.
+
+    Each `loop` invocation (including a resume) is its own observation
+    run; iteration labels join runs. Failure only disables observation.
+    """
+    if worker_events is None:
+        print(
+            "trioctl: --observe-workers unavailable (worker_events.py "
+            "missing); continuing without observation",
+            file=sys.stderr,
+        )
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    run_id = f"obs-{stamp}-{worker_events.new_invocation_id()[:8]}"
+    directory = mailbox / ".observe" / run_id
+    try:
+        directory.mkdir(parents=True, exist_ok=False)
+    except OSError:
+        print(
+            "trioctl: --observe-workers could not create its run "
+            "directory; continuing without observation",
+            file=sys.stderr,
+        )
+        return None
+    paths = worker_events.observe_paths(directory)
+    return {
+        "run_id": run_id,
+        "dir": directory,
+        "workers": paths["workers"],
+        "phases": paths["phases"],
+        "summary": paths["summary"],
+        "trioctl": Path(__file__).resolve(),
+    }
+
+
+def _finish_observation(observe: dict[str, Any]) -> None:
+    """Write summary.json and print short lines. Never raises."""
+    try:
+        summary = worker_events.summarize(observe["dir"], observe["run_id"])
+        observe["summary"].write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        for line in worker_events.summary_lines(summary):
+            print(f"trioctl: {line}", file=sys.stderr)
+        print(f"trioctl: observe summary: {observe['summary']}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - never change the loop exit code
+        print(
+            "trioctl: observe summary failed; raw events kept in "
+            f"{observe.get('dir')}",
+            file=sys.stderr,
+        )
+
+
+def command_observe_summary(args: argparse.Namespace) -> int:
+    """Recompute one observed run's summary offline (e.g. after SIGKILL)."""
+    if worker_events is None:
+        raise TrioctlError("worker_events.py is not installed next to trioctl")
+    directory = Path(args.mailbox).expanduser().resolve() / ".observe" / args.run_id
+    if not directory.is_dir():
+        raise TrioctlError(f"no observe run directory: {directory}")
+    print(
+        json.dumps(
+            worker_events.summarize(directory, args.run_id),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def command_loop(args: argparse.Namespace) -> int:
     """Run loop-core with the Omnigent role runner.
 
@@ -2289,6 +2483,19 @@ def command_loop(args: argparse.Namespace) -> int:
     mailbox = mailbox.resolve()
     mailbox.mkdir(parents=True, exist_ok=True)
     loop_core = _load_trio_loop(repo)
+    observe = (
+        _start_observation(mailbox)
+        if getattr(args, "observe_workers", False)
+        else None
+    )
+    runner_kwargs: dict[str, Any] = {}
+    if observe:
+        runner_kwargs["observe"] = observe
+        print(
+            f"trioctl: observing workers as run {observe['run_id']} "
+            f"in {observe['dir']}",
+            file=sys.stderr,
+        )
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
@@ -2296,6 +2503,7 @@ def command_loop(args: argparse.Namespace) -> int:
         runner_id=getattr(args, "runner_id", None),
         host_id=getattr(args, "host_id", None),
         workspace=str(repo),
+        **runner_kwargs,
     )
     keep_sessions = getattr(args, "keep_sessions", False)
     ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
@@ -2345,6 +2553,8 @@ def command_loop(args: argparse.Namespace) -> int:
                 ids_file.unlink()
             except OSError:
                 pass
+        if observe:
+            _finish_observation(observe)
 
 
 def _loop_signal_handler(signum: int, frame: object) -> None:
@@ -2758,7 +2968,26 @@ def parser() -> argparse.ArgumentParser:
             "broker DELETE, never on process exit, so keeping leaks RAM)"
         ),
     )
+    loop.add_argument(
+        "--observe-workers",
+        action="store_true",
+        help=(
+            "opt-in: pass Lead/repair passes an explicit worker command "
+            "(this trioctl path, run id, iteration, events file under "
+            "<mailbox>/.observe/<run-id>/) and ask for a REPORT.md "
+            "'## Wave decisions' section; record Lead/Evaluator phase "
+            "timing and write summary.json at exit. Never fails the loop"
+        ),
+    )
     loop.set_defaults(func=command_loop)
+
+    observe_summary = commands.add_parser(
+        "observe-summary",
+        help="recompute an --observe-workers run summary offline",
+    )
+    observe_summary.add_argument("--mailbox", type=Path, default=Path("loop"))
+    observe_summary.add_argument("--run-id", required=True)
+    observe_summary.set_defaults(func=command_observe_summary)
 
     session = commands.add_parser(
         "session",
