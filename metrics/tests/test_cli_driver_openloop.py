@@ -182,6 +182,16 @@ def test_open_loop_context_block_precedes_prompt(tmp_path: Path) -> None:
     )
 
 
+def git_identity_env() -> dict[str, str]:
+    """Local git identity for test commits (env only, not git config)."""
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = "trio-test"
+    env["GIT_AUTHOR_EMAIL"] = "trio-test@example.test"
+    env["GIT_COMMITTER_NAME"] = "trio-test"
+    env["GIT_COMMITTER_EMAIL"] = "trio-test@example.test"
+    return env
+
+
 def make_lockstep_mailbox(tmp_path: Path) -> Path:
     """A throwaway mailbox with an empty (but parseable) slices block."""
     mailbox = tmp_path / "mailbox"
@@ -199,10 +209,9 @@ def make_lockstep_mailbox(tmp_path: Path) -> Path:
     return mailbox
 
 
-def test_lockstep_cli_end_to_end_still_ships(tmp_path: Path) -> None:
-    """trio_loop.py run --lockstep still runs the CLI path end to end."""
-    mailbox = make_lockstep_mailbox(tmp_path)
-    lead = write_script(
+def lockstep_lead_script(tmp_path: Path) -> Path:
+    """Lead that only appends the usual LOG.md completion line."""
+    return write_script(
         tmp_path / "lead.sh",
         (
             'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
@@ -211,18 +220,28 @@ def test_lockstep_cli_end_to_end_still_ships(tmp_path: Path) -> None:
             '>> "$LOOP_DIR/LOG.md"\n'
         ),
     )
-    evaluator = write_script(
-        tmp_path / "evaluator.sh",
-        (
-            'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
-            '"$LOOP_DIR/STATE.md")"\n'
-            'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
-            '>> "$LOOP_DIR/LOG.md"\n'
-            'printf "%s\\n" "VERDICT: SHIP" > "$LOOP_DIR/VERDICT.md"\n'
-        ),
-    )
 
-    result = subprocess.run(
+
+def run_lockstep_cli(
+    mailbox: Path,
+    cwd: Path,
+    lead: Path,
+    evaluator: Path,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """CLI lockstep: repo is Path.cwd() of this subprocess."""
+    env = git_identity_env()
+    env.update(
+        {
+            "LOOP_DIR": str(mailbox),
+            "HARNESS": "generic",
+            "RUN_LEAD": str(lead),
+            "RUN_EVAL": str(evaluator),
+        }
+    )
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
         [
             sys.executable,
             str(TRIO_LOOP),
@@ -233,21 +252,122 @@ def test_lockstep_cli_end_to_end_still_ships(tmp_path: Path) -> None:
             "1",
             "--lockstep",
         ],
-        cwd=ROOT,
-        env={
-            **os.environ,
-            "LOOP_DIR": str(mailbox),
-            "HARNESS": "generic",
-            "RUN_LEAD": str(lead),
-            "RUN_EVAL": str(evaluator),
-        },
+        cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 0, result.stderr
+
+def test_lockstep_cli_end_to_end_missing_retirement_exits_six(
+    tmp_path: Path,
+) -> None:
+    """Git cwd + SHIP with no mailbox retirement is exit 6, not shipped.
+
+    Pre-repair this path asserted exit 0. CLI `repo=Path.cwd()`, so a
+    git working tree without a mailbox-touching
+    `loop: iteration N — SHIP` ancestor must not look finished.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    mailbox = make_lockstep_mailbox(tmp_path)
+    evaluator = write_script(
+        tmp_path / "evaluator.sh",
+        (
+            'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
+            '>> "$LOOP_DIR/LOG.md"\n'
+            'printf "%s\\n" "VERDICT: SHIP" > "$LOOP_DIR/VERDICT.md"\n'
+        ),
+    )
+    result = run_lockstep_cli(
+        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+    )
+    assert result.returncode == 6, result.stderr
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: needs_retirement" in state
+    assert "status: shipped" not in state
+    assert not (mailbox / ".session.json").exists()
+
+
+def test_lockstep_cli_end_to_end_genuine_retirement_ships(
+    tmp_path: Path,
+) -> None:
+    """Pinned CLI lockstep can still exit 0 after real mailbox retirement.
+
+    The evaluator records the dispatched pin as a real `commit:` object
+    and creates a mailbox-path commit with the SHIP message. No invented
+    hex and no empty message-only commit.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "--", "seed.txt"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        check=True,
+        env=git_identity_env(),
+    )
+    mailbox = make_lockstep_mailbox(tmp_path)
+    # Evaluator reads attempt/pin from STATE after lockstep mints them,
+    # writes a matching verdict, then commits mailbox files for real.
+    evaluator = write_script(
+        tmp_path / "evaluator.sh",
+        (
+            'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'attempt="$(awk -F": " \'/^evaluator_attempt:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'pin="$(awk -F": " \'/^evaluated_sha:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'test -n "$attempt"\n'
+            'test -n "$pin"\n'
+            'git cat-file -e "${pin}^{commit}"\n'
+            'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
+            '>> "$LOOP_DIR/LOG.md"\n'
+            "{\n"
+            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
+            '  printf "%s\\n" "attempt: ${attempt}"\n'
+            '  printf "%s\\n" "commit: ${pin}"\n'
+            '} > "$LOOP_DIR/VERDICT.md"\n'
+            'git add -- "$LOOP_DIR/VERDICT.md"\n'
+            'git commit -q -m '
+            '"loop: iteration ${iteration} — SHIP"\n'
+        ),
+    )
+    result = run_lockstep_cli(
+        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
     state = (mailbox / "STATE.md").read_text(encoding="utf-8")
     assert "status: shipped" in state
+    needle = "loop: iteration 1 — SHIP"
+    log = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "log",
+            "--grep",
+            needle,
+            "--format=%H",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert log.stdout.strip(), "expected a real SHIP mailbox commit"
     assert not (mailbox / ".session.json").exists()
 
 

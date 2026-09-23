@@ -196,7 +196,13 @@ gates, verdicts, repairs, and resume; HARNESS role dispatch stays in Bash.
 Exit codes are 0=SHIP, 2=BLOCKED, 3=bad verdict, 4=iteration cap,
 5=NEEDS_HUMAN (or mailbox locked by another driver), and
 6=needs_retirement (SHIP without verified git retirement; the
-wrapper `exec`s Python so 6 is the actual process status)
+wrapper `exec`s Python so 6 is the actual process status).
+CLI `run --lockstep` uses `repo=Path.cwd()`: a git cwd without a
+mailbox-touching `loop: iteration N — SHIP` ancestor exits 6; a
+pinned attempt that records a real `commit:` object and that
+retirement can still exit 0. No-repo fakes keep exit 0. Open-loop
+`slice-eval` ready-gates still accept any `VERDICT.md` byte change
+and are not claimed qualified by lockstep CLI coverage.
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom
 agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.

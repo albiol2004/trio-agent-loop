@@ -491,6 +491,13 @@ behaves exactly as it does today. Existing tooling (`trio-check.py`,
 `trio-metrics.py`, `trio-shadow.py`, the dashboard) must keep working
 unchanged on existing mailboxes.
 
+Open-loop `slice-eval` ready-gates in Omnigent treat **any** `VERDICT.md`
+byte change versus the snapshot as ready. That is not a proof that the
+new text names the dispatched slice or sha. Lockstep freshness is the
+dispatched `attempt:` (and pin on `commit:` when a git repo is visible),
+not an iteration-only leftover SHIP. Passing lockstep CLI tests does not
+mean open-loop artifact matching is qualified.
+
 ## Mailbox placement standard
 
 `loop/` lives in the orchestrator session's cwd — the coordination repo.
