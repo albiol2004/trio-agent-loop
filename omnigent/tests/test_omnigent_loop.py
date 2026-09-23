@@ -1595,3 +1595,95 @@ def test_command_loop_returns_needs_retirement_exit_six(
         ]
     )
     assert args.func(args) == 6
+
+
+def test_effective_evaluator_prompt_retirement_satisfies_driver_gate(
+    tmp_path: Path,
+) -> None:
+    """The headless Evaluator's own commands must complete SHIP retirement.
+
+    Regression: the prompt said "Never ... commit", so a bound SHIP landed
+    with no `loop: iteration N — SHIP` commit. Run the git commands the
+    effective prompt prescribes against a pinned repo and ask the driver.
+    """
+    import re
+    import shlex
+    import subprocess
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git("init", "-q")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    # Ignored mailbox (like this template's `loop-*/`) plus a sidecar dir.
+    (repo / ".gitignore").write_text("loop-*/\n", encoding="utf-8")
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "slice(app): add app")
+    pin = git("rev-parse", "HEAD")
+    mailbox = repo / "loop-trial"
+    mailbox.mkdir()
+    (mailbox / "LOG.md").write_text("# Log\n", encoding="utf-8")
+    (mailbox / ".observe").mkdir()
+    (mailbox / ".observe" / "raw.jsonl").write_text("{}\n", encoding="utf-8")
+    attempt = "a" * 32
+    (mailbox / "STATE.md").write_text(
+        "iteration: 1\nstatus: running\nphase: lead-done\n"
+        f"evaluated_sha: {pin}\nevaluator_attempt: {attempt}\n",
+        encoding="utf-8",
+    )
+
+    trioctl = load_trioctl()
+    runner = trioctl.OmnigentRunner(repo=repo)
+    prompt = runner._prompt(
+        "evaluator", 1, mailbox,
+        {"evaluator_attempt": attempt, "pinned_sha": pin},
+    )
+    assert "Never edit product files or tests, commit, or push" not in prompt
+    assert "loop: iteration 1 — SHIP" in prompt
+    assert "Evaluator owns SHIP mailbox retirement" in prompt
+    commands = [
+        c for c in re.findall(r"`([^`]+)`", prompt) if c.startswith("git ")
+    ]
+    assert len(commands) == 3, commands
+
+    # Acting as the Evaluator: bound SHIP verdict, then the prompt's commands.
+    (mailbox / "VERDICT.md").write_text(
+        f"VERDICT: SHIP\nattempt: {attempt}\nevaluated: {pin}\n"
+        f"commit: {pin}\n",
+        encoding="utf-8",
+    )
+    with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+        log.write("- iter 1 | evaluator | VERDICT: SHIP — ok\n")
+    # A stray staged product edit must not be swept into the SHIP commit.
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+    git("add", "app.py")
+    for command in commands:
+        subprocess.run(shlex.split(command), cwd=repo, check=True,
+                       capture_output=True)
+    assert git("diff", "--cached", "--name-only") == "app.py"
+    git("reset", "-q", "--", "app.py")
+    git("checkout", "--", "app.py")
+
+    assert trio_loop._ship_retirement_problem(mailbox, 1, repo) is None
+    committed = [
+        line
+        for line in git(
+            "show", "--name-only", "--format=%s", "HEAD"
+        ).splitlines()
+        if line
+    ]
+    assert committed[0] == "loop: iteration 1 — SHIP"
+    assert sorted(committed[1:]) == sorted(
+        ["loop-trial/LOG.md", "loop-trial/VERDICT.md"]
+    )
+    assert git("rev-parse", "HEAD~1") == pin
+
+    # Non-SHIP verdicts get no commit instruction to act on.
+    assert "only on a `VERDICT: SHIP` first line" in prompt
