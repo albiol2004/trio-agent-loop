@@ -59,8 +59,15 @@ From `metrics/trio_loop.py` (not invented flags):
 - First-pass SHIP accept (`_apply_verdict`) uses the same
   attempt + `evaluated:` gate as resume. Missing fields stay
   `needs_retirement` (exit 6), not shipped.
-- Graded product tree must match the pin except mailbox paths.
+-   Graded product tree must match the pin except mailbox paths.
   Later product commits and tracked product edits fail closed.
+  Any nonignored untracked product file outside the active
+  mailbox fails closed, including files that existed before
+  the pin. The driver reports those paths and never stages or
+  deletes them. Mailbox files and gitignored outputs do not
+  block. The user can track or gitignore leftovers; SHIP does
+  not claim the full tree is verified while they remain
+  untracked. No-repo fakes still skip this git check.
 - CLI `run` always uses `repo=Path.cwd()`. If cwd is a git tree,
   SHIP without verified retirement is `needs_retirement` (**exit 6**).
 - Retirement requires real git objects (`rev-parse`), ancestry

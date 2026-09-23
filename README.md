@@ -200,7 +200,14 @@ wrapper `exec`s Python so 6 is the actual process status).
 CLI `run --lockstep` uses `repo=Path.cwd()`: a git cwd without a
 mailbox-touching `loop: iteration N — SHIP` ancestor exits 6; a
 pinned attempt that records a real `commit:` object and that
-retirement can still exit 0. No-repo fakes keep exit 0. Open-loop
+retirement can still exit 0. After evaluation, a new nonignored
+untracked product file (for example `extra.py`) also stays at
+exit 6, even if that file already existed before the pin. The
+driver names the path in LOG.md and never stages or deletes it.
+Mailbox files and gitignored outputs do not block. Track or
+exclude leftover files deliberately; a git-backed SHIP does not
+claim the full tree is verified while they remain untracked.
+No-repo fakes keep exit 0. Open-loop
 `slice-eval` ready-gates still accept any `VERDICT.md` byte change
 and are not claimed qualified by lockstep CLI coverage.
 (`LOOP_DIR=loop-<name>` runs concurrent loops). Codex prefers native custom

@@ -528,7 +528,7 @@ def _commit_relative(
 def test_git_repo_real_retirement_ships_and_keeps_foreign_dirty(
     tmp_path: Path,
 ) -> None:
-    """Verified objects + mailbox paths ship; dirty extras stay unstaged."""
+    """Untracked product blocks SHIP; the file stays unstaged."""
     init_git(tmp_path)
     foreign = tmp_path / "foreign-dirty.txt"
     foreign.write_text("leave me", encoding="utf-8")
@@ -546,19 +546,23 @@ def test_git_repo_real_retirement_ships_and_keeps_foreign_dirty(
         [
             "VERDICT: SHIP\n# Verdict — iteration 1\n"
             f"commit: {product}\n"
-        ]
+        ],
+        inject_lockstep=True,
     )
 
-    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
-    assert "status: shipped" in state_text(mailbox)
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
     status = subprocess.run(
         ["git", "-C", str(tmp_path), "status", "--porcelain"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    assert "foreign-dirty.txt" in status
-    assert not status.split("foreign-dirty.txt")[0].endswith("M ")
+    assert "?? foreign-dirty.txt" in status
+    assert foreign.is_file()
+    log = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "foreign-dirty.txt" in log
+    assert "not fully verified" in log
 
 
 def test_stale_same_iteration_verdict_redispatches_evaluator(
@@ -845,3 +849,196 @@ def test_resume_does_not_rerun_bound_evaluator(tmp_path: Path) -> None:
     assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
     assert runner.calls == []
     assert "status: shipped" in state_text(mailbox)
+
+
+class _BindAndMutate(FakeRunner):
+    """Non-injecting runner that binds lockstep fields then mutates."""
+
+    def __init__(self, repo: Path, product: str, mutate, *a, **k) -> None:
+        super().__init__(*a, inject_lockstep=False, **k)
+        self.repo = repo
+        self.product = product
+        self.mutate = mutate
+
+    def run(self, role, iteration, mailbox, context=None):
+        if role == "evaluator" and context:
+            attempt = str(context.get("evaluator_attempt") or "")
+            pinned = str(context.get("pinned_sha") or "")
+            self.verdicts[0] = (
+                "VERDICT: SHIP\n# Verdict — iteration 1\n"
+                f"attempt: {attempt}\n"
+                f"evaluated: {pinned}\n"
+                f"commit: {self.product}\n"
+            )
+        rc = super().run(role, iteration, mailbox, context)
+        if role == "evaluator":
+            self.mutate(self.repo)
+        return rc
+
+
+def test_untracked_extra_py_after_eval_does_not_ship(tmp_path: Path) -> None:
+    """Post-pin extra.py is a product change and must not SHIP."""
+    init_git(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    mailbox = make_mailbox(tmp_path)
+    _precommit_mailbox_ship(tmp_path, mailbox)
+
+    def drop_extra(repo: Path) -> None:
+        (repo / "extra.py").write_text("print(2)\n", encoding="utf-8")
+
+    runner = _BindAndMutate(
+        tmp_path, product, drop_extra, ["unused"]
+    )
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
+    assert (tmp_path / "extra.py").is_file()
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "?? extra.py" in status
+    log = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "extra.py" in log
+    assert "untracked_pin:" not in state_text(mailbox)
+
+
+def test_untracked_extra_py_before_eval_does_not_ship(tmp_path: Path) -> None:
+    """Preexisting extra.py still blocks SHIP; it is not a pin baseline."""
+    init_git(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    mailbox = make_mailbox(tmp_path)
+    _precommit_mailbox_ship(tmp_path, mailbox)
+    (tmp_path / "extra.py").write_text("print(2)\n", encoding="utf-8")
+
+    class BindOnly(FakeRunner):
+        def run(self, role, iteration, mailbox, context=None):
+            if role == "evaluator" and context:
+                attempt = str(context.get("evaluator_attempt") or "")
+                pinned = str(context.get("pinned_sha") or "")
+                self.verdicts[0] = (
+                    "VERDICT: SHIP\n# Verdict — iteration 1\n"
+                    f"attempt: {attempt}\n"
+                    f"evaluated: {pinned}\n"
+                    f"commit: {product}\n"
+                )
+            return super().run(role, iteration, mailbox, context)
+
+    runner = BindOnly(["unused"], inject_lockstep=False)
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
+    assert (tmp_path / "extra.py").is_file()
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "?? extra.py" in status
+    assert "untracked_pin:" not in state_text(mailbox)
+
+
+def test_resume_never_rebaselines_untracked_source(tmp_path: Path) -> None:
+    """Resume keeps the same pin; leftover extra.py still blocks."""
+    init_git(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    mailbox = make_mailbox(tmp_path)
+    _precommit_mailbox_ship(tmp_path, mailbox)
+    (tmp_path / "extra.py").write_text("print(2)\n", encoding="utf-8")
+
+    class BindOnly(FakeRunner):
+        def run(self, role, iteration, mailbox, context=None):
+            if role == "evaluator" and context:
+                attempt = str(context.get("evaluator_attempt") or "")
+                pinned = str(context.get("pinned_sha") or "")
+                self.verdicts[0] = (
+                    "VERDICT: SHIP\n# Verdict — iteration 1\n"
+                    f"attempt: {attempt}\n"
+                    f"evaluated: {pinned}\n"
+                    f"commit: {product}\n"
+                )
+            return super().run(role, iteration, mailbox, context)
+
+    first = BindOnly(["unused"], inject_lockstep=False)
+    assert trio_loop.run_loop(mailbox, 1, first, repo=tmp_path) == 6
+    pin_lines = [
+        line for line in state_text(mailbox).splitlines()
+        if line.startswith("evaluated_sha:")
+    ]
+    assert pin_lines
+    first_pin = pin_lines[0]
+    resumed = FakeRunner([], expected_roles=[], inject_lockstep=False)
+    assert trio_loop.run_loop(mailbox, 1, resumed, repo=tmp_path) == 6
+    assert resumed.calls == []
+    assert first_pin in state_text(mailbox)
+    assert "untracked_pin:" not in state_text(mailbox)
+    assert (tmp_path / "extra.py").is_file()
+    log = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "extra.py" in log
+
+
+def test_tracked_product_edit_after_eval_does_not_ship(
+    tmp_path: Path,
+) -> None:
+    """Uncommitted tracked product edits still fail intact."""
+    init_git(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    mailbox = make_mailbox(tmp_path)
+    _precommit_mailbox_ship(tmp_path, mailbox)
+
+    def dirty_app(repo: Path) -> None:
+        (repo / "app.py").write_text("print(9)\n", encoding="utf-8")
+
+    runner = _BindAndMutate(
+        tmp_path, product, dirty_app, ["unused"]
+    )
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
+
+
+def test_mailbox_and_ignored_artifacts_do_not_block_ship(
+    tmp_path: Path,
+) -> None:
+    """Active mailbox files and ignored outputs are not product dirt."""
+    init_git(tmp_path)
+    product = _commit_relative(
+        tmp_path, "app.py", "print(1)\n", "slice(demo): product"
+    )
+    _commit_relative(
+        tmp_path, ".gitignore", "build/\n", "ignore build outputs"
+    )
+    mailbox = make_mailbox(tmp_path)
+    _precommit_mailbox_ship(tmp_path, mailbox)
+
+    def drop_ignored(repo: Path) -> None:
+        out = repo / "build"
+        out.mkdir(exist_ok=True)
+        (out / "out.bin").write_text("cache\n", encoding="utf-8")
+
+    runner = _BindAndMutate(
+        tmp_path, product, drop_ignored, ["unused"]
+    )
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert "status: shipped" in state_text(mailbox)
+    assert (tmp_path / "build" / "out.bin").is_file()
+
+
+def test_no_git_ship_without_attempt_still_exits_zero(
+    tmp_path: Path,
+) -> None:
+    """No-repo fakes keep historical SHIP without attempt: or pin."""
+    mailbox = make_mailbox(tmp_path)
+    runner = FakeRunner(["VERDICT: SHIP"], inject_lockstep=False)
+    assert trio_loop.run_loop(mailbox, 1, runner) == 0
+    assert "status: shipped" in state_text(mailbox)
+    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert "attempt:" not in verdict.lower()

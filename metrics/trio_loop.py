@@ -623,14 +623,64 @@ def _product_paths_changed(
     return any(not _path_in_mailbox(p, mailbox_rel) for p in paths)
 
 
+def _product_untracked_paths(
+    repo: Path, mailbox_rel: str | None
+) -> list[str] | None:
+    """Nonignored untracked paths outside the mailbox, or None on git error.
+
+    Uses ``ls-files -o --exclude-standard`` so ignored build/runtime
+    outputs are omitted. Does not stage or delete anything.
+    """
+    result = _git(
+        repo, "ls-files", "-o", "--exclude-standard"
+    )
+    if result.returncode != 0:
+        return None
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and not _path_in_mailbox(line.strip(), mailbox_rel)
+    ]
+
+
+def _log_untracked_product_blockers(
+    mailbox: Path, iteration: int, repo: Path | None
+) -> None:
+    """Name leftover untracked product files; never stage or delete them.
+
+    Gitignored outputs and the active mailbox are omitted. The user
+    can track or exclude those files on purpose; this driver does
+    not treat the rest of the tree as fully verified.
+    """
+    git_root = _git_root(repo)
+    if git_root is None:
+        return
+    mailbox_rel = _mailbox_rel(git_root, mailbox)
+    paths = _product_untracked_paths(git_root, mailbox_rel)
+    if not paths:
+        return
+    listed = ", ".join(paths)
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | untracked product files "
+        f"block SHIP (not staged or deleted): {listed}. "
+        "Track or gitignore them deliberately; the tree is "
+        "not fully verified while they remain untracked.",
+    )
+
+
 def _evaluated_product_intact(
-    repo: Path, mailbox: Path, evaluated_sha: str
+    repo: Path,
+    mailbox: Path,
+    evaluated_sha: str,
 ) -> bool:
     """True when the graded product tree is unchanged except mailbox files.
 
     HEAD must still descend from the pin. Later product commits,
     staged/unstaged product edits, and a missing pin object fail.
-    Untracked foreign files are not a product-tree change.
+    Any nonignored untracked product file (even if it existed
+    before the pin) fails closed. Mailbox files and ignored
+    outputs do not block. No-repo callers skip this helper.
     """
     if not evaluated_sha.strip():
         return True
@@ -652,7 +702,11 @@ def _evaluated_product_intact(
         return False
     if _product_paths_changed(index, mailbox_rel):
         return False
-    return True
+    untracked = _product_untracked_paths(repo, mailbox_rel)
+    if untracked is None:
+        return False
+    # Preexisting extra.py is still product, not a verified pin.
+    return not untracked
 
 
 def _verdict_binds_lockstep(
@@ -775,6 +829,7 @@ def _apply_verdict(
                 "(attempt/evaluated binding, product tree, or "
                 "retirement bookkeeping)",
             )
+            _log_untracked_product_blockers(mailbox, iteration, repo)
             return 6
         _update_state(state_path, {"status": "shipped", "phase": "shipped"})
         return 0
@@ -815,17 +870,17 @@ def _lockstep_eval_context(
     attempt = state.get("evaluator_attempt", "").strip()
     pinned = state.get("evaluated_sha", "").strip()
     git_root = _git_root(repo)
+    # Resume reuses evaluated_sha; never recapture HEAD as a
+    # new product baseline (untracked files are not a pin).
     if not pinned and git_root is not None:
         pinned = _git_head(git_root) or ""
     if not attempt:
         attempt = uuid.uuid4().hex
-    _update_state(
-        state_path,
-        {
-            "evaluated_sha": pinned,
-            "evaluator_attempt": attempt,
-        },
-    )
+    updates = {
+        "evaluated_sha": pinned,
+        "evaluator_attempt": attempt,
+    }
+    _update_state(state_path, updates)
     return {
         "pinned_sha": pinned,
         "expected_sha": pinned,
@@ -884,6 +939,9 @@ def _run_lockstep(
                             mailbox, runner, iteration, "shipped"
                         )
                         return 0
+                    _log_untracked_product_blockers(
+                        mailbox, iteration, repo
+                    )
                     _write_driver_state(
                         mailbox,
                         runner,
