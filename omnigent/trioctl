@@ -113,7 +113,6 @@ WORKER_EVENTS_FILE_ENV = "TRIO_WORKER_EVENTS_FILE"
 WORKER_RUN_ID_ENV = "TRIO_WORKER_RUN_ID"
 WORKER_ITERATION_ENV = "TRIO_WORKER_ITERATION"
 WORKER_SLICE_ENV = "TRIO_WORKER_SLICE"
-WORKER_INVOCATION_ENV = "TRIO_WORKER_INVOCATION_ID"
 WORKER_MAILBOX_ENV = "TRIO_WORKER_EVENTS_MAILBOX"
 
 
@@ -621,9 +620,7 @@ def _worker_event_ctx(
         "run_id": _pick("worker_run_id", WORKER_RUN_ID_ENV),
         "iteration": _pick("worker_iteration", WORKER_ITERATION_ENV),
         "slice_id": _pick("worker_slice", WORKER_SLICE_ENV),
-        "invocation_id": worker_events.new_invocation_id(
-            _pick("worker_invocation_id", WORKER_INVOCATION_ENV)
-        ),
+        "invocation_id": worker_events.new_invocation_id(),
     }
 
 
@@ -2687,7 +2684,6 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--worker-run-id", default=None)
     run.add_argument("--worker-iteration", default=None)
     run.add_argument("--worker-slice", default=None)
-    run.add_argument("--worker-invocation-id", default=None)
     run.set_defaults(func=command_run)
 
     events_report = commands.add_parser(

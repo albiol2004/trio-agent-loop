@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import socket
+import stat
 import sys
 import time
 import uuid
@@ -43,21 +44,32 @@ CAUTION = (
 )
 
 
-def new_invocation_id(raw: str | None) -> str:
-    """Return a UUID4 string. PID is not unique across hosts or wrap."""
-    text = (raw or "").strip()
-    if text:
-        try:
-            return str(uuid.UUID(text))
-        except ValueError:
-            pass
+def new_invocation_id() -> str:
+    """Always a fresh UUID4. Callers cannot reuse a supplied id."""
     return str(uuid.uuid4())
 
 
+def boot_id() -> str:
+    """Linux boot identity so monotonic values are not mixed across boots."""
+    try:
+        text = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii", errors="replace"
+        )
+        ident = text.strip()
+        if ident:
+            return ident
+    except OSError:
+        pass
+    return "unknown"
+
+
 def clock_domain() -> str:
-    """Identify host plus UTC wall and monotonic clocks."""
+    """Host, boot, UTC wall, and monotonic elapsed clocks."""
     host = socket.gethostname()
-    return f"host={host};wall=utc;elapsed=monotonic_ns"
+    return (
+        f"host={host};boot={boot_id()};wall=utc;"
+        "elapsed=monotonic_ns"
+    )
 
 
 def wall_utc() -> str:
@@ -105,23 +117,138 @@ def resolve_events_path(
         return None
 
 
+def shard_dir(path: Path) -> Path:
+    """Per-invocation files live next to the named path, not inside FIFOs."""
+    return Path(str(path) + ".d")
+
+
+def _safe_shard_name(invocation_id: str) -> str | None:
+    try:
+        return str(uuid.UUID(invocation_id)) + ".jsonl"
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _append_regular(path: Path, payload: bytes) -> None:
+    """Nonblocking append to a regular file, or raise OSError."""
+    flags = (
+        os.O_WRONLY
+        | os.O_APPEND
+        | os.O_CREAT
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(path, flags, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def emit(path: Path | None, record: dict[str, Any]) -> None:
-    """Append one complete JSON line with flock. Never raise."""
+    """Append one complete JSON line without blocking the worker.
+
+    Writes ``{path}.d/{invocation}.jsonl`` so concurrent workers do not
+    share a lock. Nonblocking open + LOCK_NB; drop with TELEMETRY_WARN
+    on FIFO, lock contention, or IO errors. Never raises.
+    """
     if path is None:
         return
     try:
-        line = json.dumps(record, separators=(",", ":"), sort_keys=True)
+        inv = record.get("invocation_id")
+        name = _safe_shard_name(inv) if isinstance(inv, str) else None
+        if name is None:
+            print(TELEMETRY_WARN, file=sys.stderr)
+            return
+        # allow_nan=False: NaN/Inf must not become JSON numbers.
+        line = json.dumps(
+            record,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
         if "\n" in line:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = (line + "\n").encode("utf-8")
-        with path.open("ab") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
+        dest_dir = shard_dir(path)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        _append_regular(dest_dir / name, payload)
+    except (OSError, TypeError, ValueError) as exc:
+        # Child-process TimeoutExpired / TimeoutError are not telemetry.
+        if type(exc) is TimeoutError:
+            raise
         print(TELEMETRY_WARN, file=sys.stderr)
+
+
+def _read_regular_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return b""
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            piece = os.read(fd, 65536)
+            if not piece:
+                break
+            chunks.append(piece)
+            total += len(piece)
+            if total > 32 * 1024 * 1024:
+                break
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _parse_jsonl(raw: bytes) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    text = raw.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        piece = line.strip()
+        if not piece:
+            continue
+        try:
+            item = json.loads(piece)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("schema") != SCHEMA:
+            continue
+        if item.get("source") != "cursor_worker":
+            continue
+        inv = item.get("invocation_id")
+        kind = item.get("kind")
+        if not isinstance(inv, str) or not inv:
+            continue
+        if not isinstance(kind, str):
+            continue
+        rows.append(item)
+    return rows
+
+
+def read_records(path: Path) -> list[dict[str, Any]]:
+    """Parse JSONL shards; skip malformed bytes/types. Never raise."""
+    rows: list[dict[str, Any]] = []
+    files: list[Path] = []
+    try:
+        files.append(path)
+        extra = shard_dir(path)
+        if extra.is_dir():
+            files.extend(sorted(extra.glob("*.jsonl")))
+    except OSError:
+        return rows
+    for file in files:
+        try:
+            rows.extend(_parse_jsonl(_read_regular_bytes(file)))
+        except OSError:
+            continue
+    return rows
 
 
 def base_record(
@@ -165,44 +292,21 @@ def base_record(
     return rec
 
 
-def read_records(path: Path) -> list[dict[str, Any]]:
-    """Parse JSONL; skip malformed lines. Incomplete last line is dropped."""
-    rows: list[dict[str, Any]] = []
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return rows
-    for line in raw.splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            item = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(item, dict):
-            continue
-        if item.get("schema") != SCHEMA:
-            continue
-        if item.get("source") != "cursor_worker":
-            continue
-        inv = item.get("invocation_id")
-        kind = item.get("kind")
-        if not isinstance(inv, str) or not inv:
-            continue
-        if not isinstance(kind, str):
-            continue
-        rows.append(item)
-    return rows
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _duration(start: dict[str, Any], end: dict[str, Any]) -> int | None:
-    if "duration_ns" in end and isinstance(end["duration_ns"], int):
-        return end["duration_ns"]
-    try:
-        return int(end["monotonic_ns"]) - int(start["monotonic_ns"])
-    except (KeyError, TypeError, ValueError):
+    direct = _as_int(end.get("duration_ns"))
+    if direct is not None:
+        return direct
+    end_m = _as_int(end.get("monotonic_ns"))
+    start_m = _as_int(start.get("monotonic_ns"))
+    if end_m is None or start_m is None:
         return None
+    return end_m - start_m
 
 
 def pair_builder_runs(
@@ -238,8 +342,9 @@ def pair_builder_runs(
         if spawned is None or terminal is None:
             row["outcome"] = "unknown"
             row["duration_ns"] = None
-            if spawned and "monotonic_ns" in spawned:
-                row["start_monotonic_ns"] = spawned["monotonic_ns"]
+            start_m = _as_int((spawned or {}).get("monotonic_ns"))
+            if start_m is not None:
+                row["start_monotonic_ns"] = start_m
             paired.append(row)
             continue
         kind = terminal["kind"]
@@ -251,54 +356,71 @@ def pair_builder_runs(
         else:
             row["outcome"] = kind
         row["duration_ns"] = _duration(spawned, terminal)
-        row["start_monotonic_ns"] = spawned["monotonic_ns"]
-        end_mono = terminal.get("monotonic_ns")
-        if isinstance(end_mono, int):
+        start_m = _as_int(spawned.get("monotonic_ns"))
+        if start_m is not None:
+            row["start_monotonic_ns"] = start_m
+        domain = spawned.get("clock_domain")
+        if isinstance(domain, str) and domain:
+            row["clock_domain"] = domain
+        end_mono = _as_int(terminal.get("monotonic_ns"))
+        if end_mono is not None:
             row["end_monotonic_ns"] = end_mono
-        elif isinstance(row["duration_ns"], int):
-            row["end_monotonic_ns"] = (
-                int(spawned["monotonic_ns"]) + row["duration_ns"]
-            )
+        elif row["duration_ns"] is not None and start_m is not None:
+            row["end_monotonic_ns"] = start_m + row["duration_ns"]
         paired.append(row)
     return paired
 
 
 def overlap_ns(a: dict[str, Any], b: dict[str, Any]) -> int | None:
-    """Positive overlap of known intervals, else None. No causal claims."""
-    try:
-        a0 = int(a["start_monotonic_ns"])
-        a1 = int(a["end_monotonic_ns"])
-        b0 = int(b["start_monotonic_ns"])
-        b1 = int(b["end_monotonic_ns"])
-    except (KeyError, TypeError, ValueError):
+    """Positive overlap of known same-boot intervals, else None."""
+    domain_a = a.get("clock_domain")
+    domain_b = b.get("clock_domain")
+    if not isinstance(domain_a, str) or not domain_a:
+        return None
+    if domain_a != domain_b:
+        return None
+    a0 = _as_int(a.get("start_monotonic_ns"))
+    a1 = _as_int(a.get("end_monotonic_ns"))
+    b0 = _as_int(b.get("start_monotonic_ns"))
+    b1 = _as_int(b.get("end_monotonic_ns"))
+    if None in (a0, a1, b0, b1):
         return None
     if a.get("duration_ns") is None or b.get("duration_ns") is None:
         return None
     lo = max(a0, b0)
     hi = min(a1, b1)
+    # Disjoint or touching intervals are not overlap. Never emit 0.
     if hi > lo:
         return hi - lo
-    return 0
+    return None
 
 
 def report(path: Path, run_id: str | None = None) -> dict[str, Any]:
-    records = read_records(path)
-    builders = pair_builder_runs(records, run_id=run_id)
-    overlaps: list[dict[str, Any]] = []
-    for i, left in enumerate(builders):
-        for right in builders[i + 1 :]:
-            ns = overlap_ns(left, right)
-            if ns is None:
-                continue
-            overlaps.append(
-                {
-                    "a": left["invocation_id"],
-                    "b": right["invocation_id"],
-                    "overlap_ns": ns,
-                }
-            )
-    return {
-        "builders": builders,
-        "overlaps": overlaps,
+    empty = {
+        "builders": [],
+        "overlaps": [],
         "caution": CAUTION,
     }
+    try:
+        records = read_records(path)
+        builders = pair_builder_runs(records, run_id=run_id)
+        overlaps: list[dict[str, Any]] = []
+        for i, left in enumerate(builders):
+            for right in builders[i + 1 :]:
+                ns = overlap_ns(left, right)
+                if ns is None or ns <= 0:
+                    continue
+                overlaps.append(
+                    {
+                        "a": left["invocation_id"],
+                        "b": right["invocation_id"],
+                        "overlap_ns": ns,
+                    }
+                )
+        return {
+            "builders": builders,
+            "overlaps": overlaps,
+            "caution": CAUTION,
+        }
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return empty
