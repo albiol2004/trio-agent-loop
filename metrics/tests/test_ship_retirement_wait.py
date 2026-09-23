@@ -5,6 +5,7 @@ commit lands. The driver rechecks on a fake clock here (no real sleeps).
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -77,6 +78,9 @@ def _retire(repo: Path, mailbox: Path) -> str:
         (mailbox / "VERDICT.md").read_text(encoding="utf-8"),
         "loop: iteration 1 — SHIP",
     )
+
+
+SHIP_TEXT = "VERDICT: SHIP\n# Verdict — iteration 1\n"
 
 
 def _log(mailbox: Path) -> str:
@@ -289,3 +293,143 @@ def test_wait_settings_default_and_invalid_env(
         trio_loop.DEFAULT_RETIREMENT_WAIT_SECONDS,
         trio_loop.DEFAULT_RETIREMENT_POLL_SECONDS,
     )
+
+
+def _rewrite_verdict_first_line(mailbox: Path, first: str) -> None:
+    """Replace the verdict line, keeping attempt/evaluated metadata."""
+    lines = (mailbox / "VERDICT.md").read_text(encoding="utf-8").splitlines()
+    lines[0] = first
+    (mailbox / "VERDICT.md").write_text("\n".join(lines) + "\n", "utf-8")
+
+
+@pytest.mark.parametrize(
+    ("first", "found"),
+    [
+        ("VERDICT: ITERATE", "(VERDICT: ITERATE)"),
+        ("VERDICT: ITERATE scope=local:app.py", "(VERDICT: ITERATE scope=local:app.py)"),
+        ("VERDICT: BLOCKED", "(VERDICT: BLOCKED)"),
+        ("VERDICT: SHIPPED maybe", "(missing or unparseable verdict)"),
+        ("", "(missing or unparseable verdict)"),
+    ],
+)
+def test_retracted_verdict_during_wait_never_ships(
+    tmp_path: Path, waiting, first: str, found: str
+) -> None:
+    """Retraction + SHIP-titled mailbox commit stops at once, no ship."""
+    mailbox = _repo_with_mailbox(tmp_path)
+    fake = waiting(mailbox)
+
+    def retract_and_retire() -> None:
+        if first:
+            _rewrite_verdict_first_line(mailbox, first)
+        else:
+            (mailbox / "VERDICT.md").write_text("", encoding="utf-8")
+        _retire(tmp_path, mailbox)
+
+    fake.hooks[1] = retract_and_retire
+    runner = FakeRunner([SHIP_TEXT])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert len(fake.sleeps) == 1
+    assert runner.calls == [("lead", 1), ("evaluator", 1)]
+    text = state_text(mailbox)
+    assert "status: needs_retirement" in text
+    assert "status: shipped" not in text
+    assert (
+        "SHIP not accepted (retirement cannot complete): VERDICT.md first "
+        f"line is no longer VERDICT: SHIP {found}"
+    ) in _log(mailbox)
+
+
+def test_retraction_without_commit_stops_immediately(
+    tmp_path: Path, waiting
+) -> None:
+    mailbox = _repo_with_mailbox(tmp_path)
+    fake = waiting(mailbox)
+    fake.hooks[1] = lambda: _rewrite_verdict_first_line(
+        mailbox, "VERDICT: ITERATE"
+    )
+    runner = FakeRunner([SHIP_TEXT])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert fake.sleeps == [2.0]
+
+
+def test_resume_after_retraction_rejects_without_dispatch(
+    tmp_path: Path, waiting
+) -> None:
+    """needs_retirement resume re-parses VERDICT.md before shipping."""
+    mailbox = _repo_with_mailbox(tmp_path)
+    waiting(mailbox)
+    runner = FakeRunner([SHIP_TEXT])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    _rewrite_verdict_first_line(mailbox, "VERDICT: ITERATE")
+    _retire(tmp_path, mailbox)  # commit carries ITERATE under SHIP title
+
+    fake = waiting(mailbox)
+    resumed = FakeRunner([], expected_roles=[])
+    assert trio_loop.run_loop(mailbox, 1, resumed, repo=tmp_path) == 6
+    assert resumed.calls == []
+    assert fake.sleeps == []
+    assert "status: needs_retirement" in state_text(mailbox)
+    assert "resume: SHIP not accepted (retirement cannot complete)" in (
+        _log(mailbox)
+    )
+
+
+@pytest.mark.parametrize(
+    "raw", ["inf", "Infinity", "+inf", "1e309", "nan", "-inf", "-1", "x"]
+)
+def test_non_finite_or_negative_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv(trio_loop.RETIREMENT_WAIT_ENV, raw)
+    monkeypatch.setenv(trio_loop.RETIREMENT_POLL_ENV, raw)
+    assert trio_loop._retirement_wait_settings() == (
+        trio_loop.DEFAULT_RETIREMENT_WAIT_SECONDS,
+        trio_loop.DEFAULT_RETIREMENT_POLL_SECONDS,
+    )
+
+
+def test_huge_finite_wait_is_capped(
+    tmp_path: Path, waiting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(trio_loop.RETIREMENT_WAIT_ENV, "1e300")
+    monkeypatch.setenv(trio_loop.RETIREMENT_POLL_ENV, "1e300")
+    wait, _poll = trio_loop._retirement_wait_settings()
+    assert wait == trio_loop.MAX_RETIREMENT_WAIT_SECONDS
+    mailbox = _repo_with_mailbox(tmp_path)
+    fake = waiting(mailbox)
+    # waiting() reset the env; restore the huge values for the run.
+    monkeypatch.setenv(trio_loop.RETIREMENT_WAIT_ENV, "1e300")
+    monkeypatch.setenv(trio_loop.RETIREMENT_POLL_ENV, "1e300")
+    runner = FakeRunner([SHIP_TEXT])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert sum(fake.sleeps) == trio_loop.MAX_RETIREMENT_WAIT_SECONDS
+    assert len(fake.sleeps) == 1
+
+
+def test_driver_json_phase_matches_state_during_wait(
+    tmp_path: Path, waiting
+) -> None:
+    mailbox = _repo_with_mailbox(tmp_path)
+    fake = waiting(mailbox)
+    seen: dict[str, str] = {}
+
+    def observe() -> None:
+        driver = json.loads(
+            (mailbox / ".driver.json").read_text(encoding="utf-8")
+        )
+        seen["driver"] = driver["phase"]
+        seen["state"] = trio_loop._read_state(mailbox / "STATE.md")["phase"]
+        _retire(tmp_path, mailbox)
+
+    fake.hooks[1] = observe
+    runner = FakeRunner([SHIP_TEXT])
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert seen == {
+        "driver": "ship-awaiting-retirement",
+        "state": "ship-awaiting-retirement",
+    }
+    assert runner.calls == [("lead", 1), ("evaluator", 1)]
+    final = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
+    assert final["phase"] == "shipped"

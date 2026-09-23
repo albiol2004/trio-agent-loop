@@ -13,6 +13,7 @@ import importlib.machinery
 import importlib.util
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -78,6 +79,8 @@ RETIREMENT_WAIT_ENV = "TRIO_RETIREMENT_WAIT_SECONDS"
 RETIREMENT_POLL_ENV = "TRIO_RETIREMENT_POLL_SECONDS"
 DEFAULT_RETIREMENT_WAIT_SECONDS = 180.0
 DEFAULT_RETIREMENT_POLL_SECONDS = 3.0
+# Upper bound for an env-configured wait so a typo cannot pin the loop.
+MAX_RETIREMENT_WAIT_SECONDS = 3600.0
 # Seams so tests can advance a fake clock without real sleeps.
 _retirement_clock = time.monotonic
 _retirement_sleep = time.sleep
@@ -782,6 +785,17 @@ def _ship_retirement_problem(
         )
     except OSError:
         text = ""
+    # Re-parse every time: a verdict retracted to ITERATE (or broken)
+    # while metadata and a SHIP-titled commit remain must never ship.
+    verdict, scope = _first_verdict(mailbox / "VERDICT.md")
+    if verdict != "SHIP" or scope is not None:
+        if verdict is None:
+            found = "missing or unparseable verdict"
+        else:
+            found = f"VERDICT: {verdict}" + (f" scope={scope}" if scope else "")
+        return RETIREMENT_FINAL, (
+            f"VERDICT.md first line is no longer VERDICT: SHIP ({found})"
+        )
     state = _read_state(mailbox / "STATE.md")
     git_root = _git_root(repo)
     if not _verdict_binds_lockstep(text, state, git_root):
@@ -840,6 +854,7 @@ def _ship_retirement_complete(
 
 
 def _env_seconds(name: str, default: float) -> float:
+    """Finite nonnegative seconds from ``name``, capped; else ``default``."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -847,7 +862,9 @@ def _env_seconds(name: str, default: float) -> float:
         value = float(raw)
     except ValueError:
         return default
-    return value if value >= 0 else default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return min(value, MAX_RETIREMENT_WAIT_SECONDS)
 
 
 def _retirement_wait_settings() -> tuple[float, float]:
@@ -865,6 +882,7 @@ def _finalize_ship(
     repo: Path | None,
     *,
     context: str,
+    runner: RoleRunner | None = None,
 ) -> int:
     """Accept a SHIP once retirement is verified, waiting a bounded time.
 
@@ -888,6 +906,10 @@ def _finalize_ship(
                     "phase": "ship-awaiting-retirement",
                 },
             )
+            if runner is not None:
+                _write_driver_state(
+                    mailbox, runner, iteration, "ship-awaiting-retirement"
+                )
             _append_log(
                 mailbox,
                 f"- iter {iteration} | loop | {context}: SHIP awaiting "
@@ -973,6 +995,7 @@ def _fresh_evaluator_artifact(
 def _apply_verdict(
     mailbox, state_path, repair_path, iteration, verdict, scope,
     repo: Path | None = None,
+    runner: RoleRunner | None = None,
 ) -> int | None:
     """Persist a terminal verdict or queue the next ITERATE role.
 
@@ -986,7 +1009,8 @@ def _apply_verdict(
     """
     if verdict == "SHIP":
         return _finalize_ship(
-            mailbox, state_path, iteration, repo, context="verdict"
+            mailbox, state_path, iteration, repo,
+            context="verdict", runner=runner,
         )
     if verdict in OUTCOMES:
         status, phase, code = OUTCOMES[verdict]
@@ -1090,7 +1114,7 @@ def _run_lockstep(
                     )
                     code = _finalize_ship(
                         mailbox, state_path, iteration, repo,
-                        context="resume",
+                        context="resume", runner=runner,
                     )
                     _write_driver_state(
                         mailbox,
@@ -1144,6 +1168,7 @@ def _run_lockstep(
                     verdict,
                     scope,
                     repo=repo,
+                    runner=runner,
                 )
                 state = _read_state(state_path)
                 _write_driver_state(
