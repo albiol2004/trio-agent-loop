@@ -52,6 +52,10 @@ build_prompt() {
     [[ -n "${TRIO_SLICE:-}" ]] && printf ' slice=%s' "$TRIO_SLICE"
     [[ -n "${TRIO_SHA:-}" ]] && printf ' sha=%s' "$TRIO_SHA"
     printf '\n\n'
+  elif [[ -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
+    # Lockstep: same LOCKSTEP CONTEXT prefix as OmnigentRunner._prompt.
+    printf 'LOCKSTEP CONTEXT: attempt=%s sha=%s\n\n' \
+      "${TRIO_ATTEMPT:-}" "${TRIO_PINNED_SHA:-}"
   fi
   if [[ "$LOOP_DIR" != "loop" ]]; then
     printf 'MAILBOX OVERRIDE: this run uses `%s/` as the loop mailbox — every `loop/` path in the instructions below resolves to `%s/`.\n\n' "$LOOP_DIR" "$LOOP_DIR"
@@ -88,7 +92,11 @@ run_role() {
     cursor)  "${CURSOR_BIN:-cursor-agent}" -p --force "$(build_prompt "$prompt_file")" ;;  # without --force, -p only PROPOSES edits; newer installs: CURSOR_BIN=agent
     generic) local cmd_var; [[ "$prompt_file" == *lead* || "$prompt_file" == *repair* ]] && cmd_var="${RUN_LEAD:?set RUN_LEAD}" || cmd_var="${RUN_EVAL:?set RUN_EVAL}"
              local pf="$prompt_file"
-             if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" ]]; then pf="$(mktemp)"; build_prompt "$prompt_file" > "$pf"; fi
+             if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" \
+                   || -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
+               pf="$(mktemp)"
+               build_prompt "$prompt_file" > "$pf"
+             fi
              $cmd_var "$pf" ;;
     *) echo "unknown HARNESS=$HARNESS" >&2; exit 1 ;;
   esac

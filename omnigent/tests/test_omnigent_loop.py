@@ -169,6 +169,7 @@ class FakeBrokerClient:
                     if attempt:
                         body += f"attempt: {attempt}\n"
                     if sha:
+                        body += f"evaluated: {sha}\n"
                         body += f"commit: {sha}\n"
                     verdict.write_text(body, encoding="utf-8")
         return {"items": [{"role": "assistant", "content": role}]}
@@ -1394,7 +1395,7 @@ def test_wrong_pinned_revision_is_not_ready(tmp_path: Path) -> None:
     mailbox = make_mailbox(tmp_path)
     (mailbox / "VERDICT.md").write_text(
         "VERDICT: SHIP\n# Verdict — iteration 1\n"
-        "commit: " + ("b" * 40) + "\n",
+        "evaluated: " + ("b" * 40) + "\n",
         encoding="utf-8",
     )
     context = {"pinned_sha": "a" * 40}
@@ -1409,7 +1410,7 @@ def test_matching_pinned_revision_is_ready(tmp_path: Path) -> None:
     sha = "a" * 40
     (mailbox / "VERDICT.md").write_text(
         "VERDICT: SHIP\n# Verdict — iteration 1\n"
-        f"commit: {sha}\n",
+        f"evaluated: {sha}\n",
         encoding="utf-8",
     )
     context = {"pinned_sha": sha}
@@ -1484,7 +1485,7 @@ def test_omnigent_runner_prompt_includes_lockstep_context(
     assert "LOCKSTEP CONTEXT: attempt=att1 sha=abc" in broker.prompts[0]
     verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
     assert "attempt: att1" in verdict
-    assert "commit: abc" in verdict
+    assert "evaluated: abc" in verdict
 
 
 def test_timeout_accepts_fresh_artifact_on_last_chance(

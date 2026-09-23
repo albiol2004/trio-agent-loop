@@ -74,6 +74,8 @@ precede it: the verdict line is byte-zero of the file.
 ```markdown
 VERDICT: SHIP|ITERATE|NEEDS_HUMAN|BLOCKED
 # Verdict — iteration N
+attempt: <exact evaluator_attempt from LOCKSTEP CONTEXT>
+evaluated: <exact pinned sha from LOCKSTEP CONTEXT>
 ## What changed since last verdict
 One paragraph. If the same checks are failing as last iteration, say so
 explicitly — that triggers the stuck-loop escalation.
@@ -91,6 +93,10 @@ from the human.
 MANDATORY for NEEDS_HUMAN: name each remaining `verify: human` criterion and
 the exact steps/commands the human must run to confirm it.
 ```
+Lockstep SHIP **requires** `attempt:` (STATE.md `evaluator_attempt`) and
+`evaluated:` (STATE.md `evaluated_sha` / LOCKSTEP CONTEXT `sha`).
+Product `commit:` lines stay product refs and are **not** a substitute
+for `evaluated:`.
 
 ## Retirement commit (SHIP only)
 A SHIP verdict ends the loop, and it ends committed: after writing
@@ -121,7 +127,9 @@ Sequence:
    committed before you arrived) skips this step and uses `commit: <HEAD sha>`
    in step 5 instead.
 5. Append one `commit: <full sha>` line per product commit to
-   `loop/VERDICT.md`.
+   `loop/VERDICT.md`. Also append `evaluated: <full sha>` for the
+   revision you actually graded (LOCKSTEP CONTEXT sha). Do not put
+   the pin only on `commit:`.
 6. Append your `- iter N | evaluator | VERDICT: SHIP — <one-liner>` line to
    `loop/LOG.md` (per Write before exiting) — before step 7, so the mailbox
    commit captures it.

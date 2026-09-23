@@ -18,6 +18,7 @@ OBLIGATIONS = (
     "must-preserve",
     "unverified",
     "knowledge.yaml",
+    "evaluated:",
 )
 
 

@@ -866,31 +866,44 @@ def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     return needle.lower() in text.lower()
 
 
+def _verdict_field_values(text: str, key: str) -> list[str]:
+    """Values for exact ``key:`` lines (not a prefix of a longer key)."""
+    want_key = key.strip().lower()
+    found: list[str] = []
+    if not want_key:
+        return found
+    for raw in text.splitlines():
+        line = raw.strip()
+        if ":" not in line:
+            continue
+        name, rest = line.split(":", 1)
+        if name.strip().lower() != want_key:
+            continue
+        got = rest.strip()
+        if got:
+            found.append(got)
+    return found
+
+
 def _verdict_records_attempt(text: str, attempt: str) -> bool:
     """True when VERDICT.md names this unique evaluator attempt."""
     want = attempt.strip().lower()
     if not want:
         return False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.lower().startswith("attempt:"):
-            got = line.split(":", 1)[1].strip().lower()
-            if got == want:
-                return True
-    return False
+    return any(
+        got.lower() == want for got in _verdict_field_values(text, "attempt")
+    )
 
 
 def _verdict_records_sha(text: str, sha: str) -> bool:
-    """True when a ``commit:`` line records the expected pinned revision."""
+    """True when ``evaluated:`` records the expected pinned revision."""
     want = sha.strip().lower()
     if not want:
         return False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.lower().startswith("commit:"):
-            got = line.split(":", 1)[1].strip().lower()
-            if got == want or want.startswith(got) or got.startswith(want):
-                return True
+    for got in _verdict_field_values(text, "evaluated"):
+        value = got.strip().lower()
+        if value == want or want.startswith(value) or value.startswith(want):
+            return True
     return False
 
 

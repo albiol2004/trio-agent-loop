@@ -429,32 +429,56 @@ def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     return f"iteration {iteration}".lower() in text.lower()
 
 
+def _verdict_field_values(text: str, key: str) -> list[str]:
+    """Values for exact ``key:`` lines (not a prefix of a longer key)."""
+    want_key = key.strip().lower()
+    found: list[str] = []
+    if not want_key:
+        return found
+    for raw in text.splitlines():
+        line = raw.strip()
+        if ":" not in line:
+            continue
+        name, rest = line.split(":", 1)
+        if name.strip().lower() != want_key:
+            continue
+        got = rest.strip()
+        if got:
+            found.append(got)
+    return found
+
+
 def _verdict_records_attempt(text: str, attempt: str) -> bool:
     """True when VERDICT.md names this unique evaluator attempt."""
     want = attempt.strip().lower()
     if not want:
         return False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.lower().startswith("attempt:"):
-            got = line.split(":", 1)[1].strip().lower()
-            if got == want:
-                return True
-    return False
+    return any(got.lower() == want for got in _verdict_field_values(text, "attempt"))
+
+
+def _sha_matches(got: str, want: str) -> bool:
+    """True when hex shas are equal or one is a unique prefix of the other."""
+    a = got.strip().lower()
+    b = want.strip().lower()
+    if not a or not b:
+        return False
+    return a == b or b.startswith(a) or a.startswith(b)
+
+
+def _verdict_records_evaluated(text: str, sha: str) -> bool:
+    """True when ``evaluated:`` records the graded revision (not ``commit:``)."""
+    want = sha.strip()
+    if not want:
+        return False
+    return any(_sha_matches(got, want) for got in _verdict_field_values(text, "evaluated"))
 
 
 def _verdict_records_sha(text: str, sha: str) -> bool:
-    """True when a ``commit:`` line records the expected pinned revision."""
-    want = sha.strip().lower()
-    if not want:
-        return False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.lower().startswith("commit:"):
-            got = line.split(":", 1)[1].strip().lower()
-            if got == want or want.startswith(got) or got.startswith(want):
-                return True
-    return False
+    """True when ``evaluated:`` records the expected pinned revision.
+
+    Product ``commit:`` lines are not a substitute for the graded pin.
+    """
+    return _verdict_records_evaluated(text, sha)
 
 
 def _git_root(repo: Path | None) -> Path | None:
@@ -580,35 +604,86 @@ def _verified_verdict_commit_shas(repo: Path, text: str) -> list[str]:
     return found
 
 
+def _diff_paths(repo: Path, *args: str) -> list[str] | None:
+    """``git diff --name-only`` paths, or None when git itself fails."""
+    result = _git(repo, "diff", "--name-only", *args)
+    if result.returncode != 0:
+        return None
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def _product_paths_changed(
+    paths: list[str], mailbox_rel: str | None
+) -> bool:
+    """True when any path is outside mailbox bookkeeping."""
+    return any(not _path_in_mailbox(p, mailbox_rel) for p in paths)
+
+
 def _evaluated_product_intact(
     repo: Path, mailbox: Path, evaluated_sha: str
 ) -> bool:
-    """True when HEAD still descends from the graded revision.
+    """True when the graded product tree is unchanged except mailbox files.
 
-    Dirty foreign files are ignored: this is ancestry, not status.
+    HEAD must still descend from the pin. Later product commits,
+    staged/unstaged product edits, and a missing pin object fail.
+    Untracked foreign files are not a product-tree change.
     """
-    del mailbox
     if not evaluated_sha.strip():
         return True
     resolved = _git_commit_sha(repo, evaluated_sha)
     head = _git_head(repo)
     if resolved is None or head is None:
         return False
-    return _git_is_ancestor(repo, resolved, head)
+    if not _git_is_ancestor(repo, resolved, head):
+        return False
+    mailbox_rel = _mailbox_rel(repo, mailbox)
+    committed = _diff_paths(repo, resolved, head)
+    worktree = _diff_paths(repo, resolved)
+    index = _diff_paths(repo, "--cached", resolved)
+    if committed is None or worktree is None or index is None:
+        return False
+    if _product_paths_changed(committed, mailbox_rel):
+        return False
+    if _product_paths_changed(worktree, mailbox_rel):
+        return False
+    if _product_paths_changed(index, mailbox_rel):
+        return False
+    return True
+
+
+def _verdict_binds_lockstep(
+    text: str, state: dict[str, str], git_root: Path | None
+) -> bool:
+    """True when a git-visible SHIP names this attempt and graded pin.
+
+    No-repo fakes skip object and field gates (historical exit 0).
+    """
+    if git_root is None:
+        return True
+    attempt = state.get("evaluator_attempt", "").strip()
+    evaluated = state.get("evaluated_sha", "").strip()
+    if not attempt or not _verdict_records_attempt(text, attempt):
+        return False
+    if evaluated and not _verdict_records_evaluated(text, evaluated):
+        return False
+    return True
 
 
 def _ship_retirement_complete(
     mailbox: Path, iteration: int, repo: Path | None
 ) -> bool:
-    """SHIP is finished only with real git objects and mailbox identity.
+    """SHIP is finished only with bound evidence and mailbox identity.
 
-    Hex-shaped ``commit:`` lines and empty message-only retirement
-    commits are not enough. When ``repo`` is not a git tree, skip the
-    gate so existing no-repo fakes keep shipping.
+    First-pass and resume share this gate. Missing ``attempt:`` or
+    ``evaluated:`` (when a pin exists) cannot look shipped. Product
+    ``commit:`` ancestry is not the graded pin. When ``repo`` is not a
+    git tree, skip object checks so no-repo fakes keep shipping after
+    the attempt binds.
     """
-    git_root = _git_root(repo)
-    if git_root is None:
-        return True
     try:
         text = (mailbox / "VERDICT.md").read_text(
             encoding="utf-8", errors="replace"
@@ -616,6 +691,11 @@ def _ship_retirement_complete(
     except OSError:
         text = ""
     state = _read_state(mailbox / "STATE.md")
+    git_root = _git_root(repo)
+    if not _verdict_binds_lockstep(text, state, git_root):
+        return False
+    if git_root is None:
+        return True
     evaluated = state.get("evaluated_sha", "").strip()
     if not _evaluated_product_intact(git_root, mailbox, evaluated):
         return False
@@ -691,8 +771,9 @@ def _apply_verdict(
             )
             _append_log(
                 mailbox,
-                f"- iter {iteration} | loop | SHIP missing retirement "
-                "bookkeeping",
+                f"- iter {iteration} | loop | SHIP not accepted "
+                "(attempt/evaluated binding, product tree, or "
+                "retirement bookkeeping)",
             )
             return 6
         _update_state(state_path, {"status": "shipped", "phase": "shipped"})
@@ -1616,6 +1697,17 @@ class _PortableRunner:
             environment["TRIO_KIND"] = context.get("kind") or ""
             environment["TRIO_SLICE"] = context.get("slice") or ""
             environment["TRIO_SHA"] = context.get("sha") or ""
+        elif context:
+            # Lockstep pin/attempt: same LOCKSTEP CONTEXT as Omnigent.
+            attempt = str(context.get("evaluator_attempt") or "")
+            sha = str(
+                context.get("pinned_sha")
+                or context.get("expected_sha")
+                or ""
+            )
+            if attempt or sha:
+                environment["TRIO_ATTEMPT"] = attempt
+                environment["TRIO_PINNED_SHA"] = sha
         # The shell shim only runs one role. Gates, verdicts, repairs, and
         # resume stay in run_loop so this runner never parses VERDICT.md.
         result = subprocess.run(

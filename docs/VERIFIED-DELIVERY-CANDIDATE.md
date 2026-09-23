@@ -54,7 +54,13 @@ From `metrics/trio_loop.py` (not invented flags):
   (`pinned_sha` into the runner / Omnigent `LOCKSTEP CONTEXT:`).
 - `_fresh_evaluator_artifact` requires matching `attempt:` in
   `VERDICT.md`. Leftover same-iteration SHIP is not this attempt.
-  When a pin is set, the verdict must also record that sha.
+  When a pin is set, the verdict must also record that sha on
+  `evaluated:` (product `commit:` is not the pin).
+- First-pass SHIP accept (`_apply_verdict`) uses the same
+  attempt + `evaluated:` gate as resume. Missing fields stay
+  `needs_retirement` (exit 6), not shipped.
+- Graded product tree must match the pin except mailbox paths.
+  Later product commits and tracked product edits fail closed.
 - CLI `run` always uses `repo=Path.cwd()`. If cwd is a git tree,
   SHIP without verified retirement is `needs_retirement` (**exit 6**).
 - Retirement requires real git objects (`rev-parse`), ancestry

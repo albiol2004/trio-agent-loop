@@ -339,6 +339,7 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
             '  printf "%s\\n" "VERDICT: SHIP"\n'
             '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
             '  printf "%s\\n" "attempt: ${attempt}"\n'
+            '  printf "%s\\n" "evaluated: ${pin}"\n'
             '  printf "%s\\n" "commit: ${pin}"\n'
             '} > "$LOOP_DIR/VERDICT.md"\n'
             'git add -- "$LOOP_DIR/VERDICT.md"\n'
@@ -394,3 +395,138 @@ def test_open_loop_without_queue_exits_3(tmp_path: Path) -> None:
 
     assert result.returncode == 3, result.stdout + result.stderr
     assert "QUEUE.md" in result.stderr
+
+
+def test_lockstep_prompt_carries_attempt_and_pin(tmp_path: Path) -> None:
+    """Portable build_prompt matches Omnigent LOCKSTEP CONTEXT."""
+    mailbox = make_mailbox_with_goal(tmp_path)
+    result = subprocess.run(
+        [str(DRIVER), "--run-role", "evaluator"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "LOOP_DIR": str(mailbox),
+            "HARNESS": "generic",
+            "RUN_EVAL": "cat",
+            "TRIO_ATTEMPT": "att1",
+            "TRIO_PINNED_SHA": "abc",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("LOCKSTEP CONTEXT: attempt=att1 sha=abc")
+    assert EVALUATOR_PROMPT.read_text(encoding="utf-8").rstrip("\n") in (
+        result.stdout.rstrip("\n")
+    )
+
+
+def test_portable_dispatch_ships_when_prompt_fields_copied(
+    tmp_path: Path,
+) -> None:
+    """Real _PortableRunner lockstep: copy LOCKSTEP CONTEXT into VERDICT."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "--", "seed.txt"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        check=True,
+        env=git_identity_env(),
+    )
+    mailbox = make_lockstep_mailbox(tmp_path)
+    evaluator = write_script(
+        tmp_path / "eval_from_prompt.sh",
+        (
+            "prompt_file=\"$1\"\n"
+            "ctx=\"$(grep -m1 '^LOCKSTEP CONTEXT:' \"$prompt_file\" || true)\"\n"
+            "test -n \"$ctx\"\n"
+            "attempt=\"${ctx#*attempt=}\"\n"
+            "attempt=\"${attempt%% *}\"\n"
+            "sha=\"${ctx#*sha=}\"\n"
+            "sha=\"${sha%% *}\"\n"
+            'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
+            '>> "$LOOP_DIR/LOG.md"\n'
+            "{\n"
+            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
+            '  printf "%s\\n" "attempt: ${attempt}"\n'
+            '  printf "%s\\n" "evaluated: ${sha}"\n'
+            '  printf "%s\\n" "commit: ${sha}"\n'
+            '} > "$LOOP_DIR/VERDICT.md"\n'
+            'git add -- "$LOOP_DIR"\n'
+            'git commit -q -m '
+            '"loop: iteration ${iteration} — SHIP"\n'
+        ),
+    )
+    result = run_lockstep_cli(
+        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: shipped" in state
+    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert "attempt:" in verdict
+    assert "evaluated:" in verdict
+
+
+def test_portable_dispatch_without_fields_does_not_ship(
+    tmp_path: Path,
+) -> None:
+    """Real portable Evaluator that omits attempt/evaluated cannot SHIP."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "--", "seed.txt"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        check=True,
+        env=git_identity_env(),
+    )
+    mailbox = make_lockstep_mailbox(tmp_path)
+    evaluator = write_script(
+        tmp_path / "eval_omit.sh",
+        (
+            'iteration="$(awk -F": " \'/^iteration:/{print $2}\' '
+            '"$LOOP_DIR/STATE.md")"\n'
+            'pin="$(git rev-parse HEAD)"\n'
+            'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
+            '>> "$LOOP_DIR/LOG.md"\n'
+            "{\n"
+            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
+            '  printf "%s\\n" "commit: ${pin}"\n'
+            '} > "$LOOP_DIR/VERDICT.md"\n'
+            'git add -- "$LOOP_DIR"\n'
+            'git commit -q -m '
+            '"loop: iteration ${iteration} — SHIP"\n'
+        ),
+    )
+    result = run_lockstep_cli(
+        mailbox, tmp_path, lockstep_lead_script(tmp_path), evaluator
+    )
+    assert result.returncode == 6, result.stderr + result.stdout
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert "status: needs_retirement" in state
