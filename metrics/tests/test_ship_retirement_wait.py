@@ -552,3 +552,38 @@ def test_inputs_that_never_settle_are_pending_not_shipped(
     assert problem is not None
     assert problem[0] == trio_loop.RETIREMENT_PENDING
     assert "changed during every retirement check" in problem[1]
+
+
+def test_snapshot_does_not_rewrite_stale_index(tmp_path: Path) -> None:
+    """The snapshot's status must not take index.lock to refresh the index.
+
+    A plain `git status` rewrites a stat-stale index, taking index.lock
+    and racing the Evaluator's own `git add`/`commit`.
+    """
+    mailbox = _repo_with_mailbox(tmp_path)
+    seed = tmp_path / "seed.txt"
+    stat = seed.stat()
+    os.utime(seed, (stat.st_atime + 100, stat.st_mtime + 100))
+    index = tmp_path / ".git" / "index"
+    before = index.read_bytes()
+
+    trio_loop._retirement_snapshot(mailbox, tmp_path)
+
+    assert index.read_bytes() == before
+    assert not (tmp_path / ".git" / "index.lock").exists()
+
+
+def test_snapshot_handles_non_utf8_filenames(tmp_path: Path) -> None:
+    """-z status bytes are compared raw; a non-UTF-8 name must not crash."""
+    mailbox = _repo_with_mailbox(tmp_path)
+    for parent in (tmp_path, mailbox):
+        name = os.path.join(os.fsencode(str(parent)), b"bad\xff.txt")
+        with open(name, "wb") as handle:
+            handle.write(b"x")
+
+    snapshot = trio_loop._retirement_snapshot(mailbox, tmp_path)
+    assert b"bad\xff.txt" in snapshot[3]
+    problem = trio_loop._ship_retirement_problem(mailbox, 1, tmp_path)
+    assert problem == trio_loop._ship_retirement_problem_once(
+        mailbox, 1, tmp_path
+    )

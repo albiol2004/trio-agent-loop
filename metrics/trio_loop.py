@@ -807,14 +807,27 @@ def _retirement_snapshot(mailbox: Path, repo: Path | None) -> tuple:
     head = status = None
     if git_root is not None:
         head = _git_head(git_root)
-        result = _git(
-            git_root,
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        )
-        status = result.stdout if result.returncode == 0 else None
+        # --no-optional-locks: a status index refresh must not take
+        # index.lock and race the Evaluator's own git add/commit.
+        # Raw bytes: only compared, and -z names may not be UTF-8.
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "--no-optional-locks",
+                    "-C",
+                    str(git_root),
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            status = result.stdout if result.returncode == 0 else None
+        except OSError:
+            status = None
     return raw("VERDICT.md"), raw("STATE.md"), head, status
 
 
