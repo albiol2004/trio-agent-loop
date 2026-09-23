@@ -786,7 +786,64 @@ RETIREMENT_PENDING = "pending"
 RETIREMENT_FINAL = "final"
 
 
+# Full retirement checks run on one stable snapshot of their inputs.
+RETIREMENT_SNAPSHOT_TRIES = 3
+
+
+def _retirement_snapshot(mailbox: Path, repo: Path | None) -> tuple:
+    """Identity of every input the retirement decision reads.
+
+    VERDICT.md and STATE.md bytes (verdict, attempt, pin), plus HEAD and
+    ``git status`` (product tree, retirement commit) when in a git tree.
+    Read-only: never creates STATE.md.
+    """
+    def raw(name: str) -> bytes | None:
+        try:
+            return (mailbox / name).read_bytes()
+        except OSError:
+            return None
+
+    git_root = _git_root(repo)
+    head = status = None
+    if git_root is not None:
+        head = _git_head(git_root)
+        result = _git(
+            git_root,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        )
+        status = result.stdout if result.returncode == 0 else None
+    return raw("VERDICT.md"), raw("STATE.md"), head, status
+
+
 def _ship_retirement_problem(
+    mailbox: Path, iteration: int, repo: Path | None
+) -> tuple[str, str] | None:
+    """Stable-snapshot wrapper around ``_ship_retirement_problem_once``.
+
+    The full check reads VERDICT.md, then runs several git calls. A
+    retraction plus a SHIP-titled commit landing in between must not
+    ship from the stale read, so a result counts only when the inputs
+    are identical before and after the whole check. Otherwise the full
+    check reruns on the new state; inputs that never settle are
+    ``pending`` (the bounded wait rechecks; no wait means exit 6).
+    """
+    before = _retirement_snapshot(mailbox, repo)
+    for _try in range(RETIREMENT_SNAPSHOT_TRIES):
+        problem = _ship_retirement_problem_once(mailbox, iteration, repo)
+        after = _retirement_snapshot(mailbox, repo)
+        if after == before:
+            return problem
+        before = after
+    return RETIREMENT_PENDING, (
+        "VERDICT.md, STATE.md or the git tree changed during every "
+        f"retirement check ({RETIREMENT_SNAPSHOT_TRIES} tries)"
+    )
+
+
+def _ship_retirement_problem_once(
     mailbox: Path, iteration: int, repo: Path | None
 ) -> tuple[str, str] | None:
     """``None`` when SHIP retirement is complete, else ``(kind, detail)``.

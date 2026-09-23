@@ -433,3 +433,122 @@ def test_driver_json_phase_matches_state_during_wait(
     assert runner.calls == [("lead", 1), ("evaluator", 1)]
     final = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
     assert final["phase"] == "shipped"
+
+
+def _inject_inside_product_check(
+    monkeypatch: pytest.MonkeyPatch, mutate: Callable[[], None]
+) -> list[int]:
+    """Run ``mutate`` once, inside the first full retirement check.
+
+    The check has already read VERDICT.md/STATE.md at this point and is
+    about to look up the retirement commit: the TOCTOU window.
+    """
+    fired: list[int] = []
+    real = trio_loop._evaluated_product_problem
+
+    def racing(*args, **kwargs):
+        out = real(*args, **kwargs)
+        if not fired:
+            fired.append(1)
+            mutate()
+        return out
+
+    monkeypatch.setattr(trio_loop, "_evaluated_product_problem", racing)
+    return fired
+
+
+def test_retraction_inside_check_with_ship_commit_never_ships(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Installer repro: stale SHIP read + retraction + SHIP-titled commit."""
+    mailbox = _repo_with_mailbox(tmp_path)
+
+    def retract_and_retire() -> None:
+        _rewrite_verdict_first_line(mailbox, "VERDICT: ITERATE")
+        _retire(tmp_path, mailbox)
+
+    fired = _inject_inside_product_check(monkeypatch, retract_and_retire)
+    runner = FakeRunner([SHIP_TEXT])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert fired == [1]
+    text = state_text(mailbox)
+    assert "status: needs_retirement" in text
+    assert "status: shipped" not in text
+    assert (
+        "VERDICT.md first line is no longer VERDICT: SHIP (VERDICT: ITERATE)"
+    ) in _log(mailbox)
+
+
+def test_attempt_or_pin_change_inside_check_never_ships(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox = _repo_with_mailbox(tmp_path)
+
+    def swap_attempt_and_retire() -> None:
+        state = mailbox / "STATE.md"
+        text = state.read_text(encoding="utf-8")
+        lines = [
+            "evaluator_attempt: " + "f" * 32
+            if line.startswith("evaluator_attempt:")
+            else line
+            for line in text.splitlines()
+        ]
+        state.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _retire(tmp_path, mailbox)
+
+    _inject_inside_product_check(monkeypatch, swap_attempt_and_retire)
+    runner = FakeRunner([SHIP_TEXT])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
+    assert f"does not record attempt: {'f' * 32}" in _log(mailbox)
+
+
+def test_product_commit_inside_check_never_ships(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox = _repo_with_mailbox(tmp_path)
+
+    def merge_and_retire() -> None:
+        _commit_relative(tmp_path, "app.py", "x\n", "later merge")
+        _retire(tmp_path, mailbox)
+
+    _inject_inside_product_check(monkeypatch, merge_and_retire)
+    runner = FakeRunner([SHIP_TEXT])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 6
+    assert "status: shipped" not in state_text(mailbox)
+    assert "product paths committed after pin" in _log(mailbox)
+
+
+def test_valid_retirement_landing_inside_check_still_ships(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changed inputs trigger a full recheck, not a blind rejection."""
+    mailbox = _repo_with_mailbox(tmp_path)
+    fired = _inject_inside_product_check(
+        monkeypatch, lambda: _retire(tmp_path, mailbox)
+    )
+    runner = FakeRunner([SHIP_TEXT])
+
+    assert trio_loop.run_loop(mailbox, 1, runner, repo=tmp_path) == 0
+    assert fired == [1]
+    assert "status: shipped" in state_text(mailbox)
+
+
+def test_inputs_that_never_settle_are_pending_not_shipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox = _repo_with_mailbox(tmp_path)
+    ticks = iter(range(10_000))
+    monkeypatch.setattr(
+        trio_loop, "_retirement_snapshot", lambda mb, repo: next(ticks)
+    )
+    monkeypatch.setattr(
+        trio_loop, "_ship_retirement_problem_once", lambda *a: None
+    )
+    problem = trio_loop._ship_retirement_problem(mailbox, 1, tmp_path)
+    assert problem is not None
+    assert problem[0] == trio_loop.RETIREMENT_PENDING
+    assert "changed during every retirement check" in problem[1]
