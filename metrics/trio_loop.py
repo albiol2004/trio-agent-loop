@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,18 @@ TERMINAL_CODES = {
     "error": 3,
     "needs_retirement": 6,
 }
+
+# A valid SHIP can land in VERDICT.md seconds before the Evaluator's
+# retirement commit (observed live: verdict 16:39:12Z, commit 16:39:27Z).
+# The driver rechecks for a bounded time instead of rejecting at once.
+# Env overrides let operators (and tests) tune or disable the wait.
+RETIREMENT_WAIT_ENV = "TRIO_RETIREMENT_WAIT_SECONDS"
+RETIREMENT_POLL_ENV = "TRIO_RETIREMENT_POLL_SECONDS"
+DEFAULT_RETIREMENT_WAIT_SECONDS = 180.0
+DEFAULT_RETIREMENT_POLL_SECONDS = 3.0
+# Seams so tests can advance a fake clock without real sleeps.
+_retirement_clock = time.monotonic
+_retirement_sleep = time.sleep
 
 class RoleRunner(Protocol):
     def run(
@@ -669,12 +682,12 @@ def _log_untracked_product_blockers(
     )
 
 
-def _evaluated_product_intact(
+def _evaluated_product_problem(
     repo: Path,
     mailbox: Path,
     evaluated_sha: str,
-) -> bool:
-    """True when the graded product tree is unchanged except mailbox files.
+) -> str | None:
+    """Why the graded product tree is no longer intact, or None if it is.
 
     HEAD must still descend from the pin. Later product commits,
     staged/unstaged product edits, and a missing pin object fail.
@@ -683,30 +696,48 @@ def _evaluated_product_intact(
     outputs do not block. No-repo callers skip this helper.
     """
     if not evaluated_sha.strip():
-        return True
+        return None
     resolved = _git_commit_sha(repo, evaluated_sha)
     head = _git_head(repo)
-    if resolved is None or head is None:
-        return False
+    if resolved is None:
+        return f"evaluated pin {evaluated_sha} is not a commit in {repo}"
+    if head is None:
+        return f"repository {repo} has no HEAD commit"
     if not _git_is_ancestor(repo, resolved, head):
-        return False
+        return (
+            f"evaluated pin {resolved[:12]} is not an ancestor of "
+            f"HEAD {head[:12]}"
+        )
     mailbox_rel = _mailbox_rel(repo, mailbox)
     committed = _diff_paths(repo, resolved, head)
     worktree = _diff_paths(repo, resolved)
     index = _diff_paths(repo, "--cached", resolved)
     if committed is None or worktree is None or index is None:
-        return False
-    if _product_paths_changed(committed, mailbox_rel):
-        return False
-    if _product_paths_changed(worktree, mailbox_rel):
-        return False
-    if _product_paths_changed(index, mailbox_rel):
-        return False
+        return "git diff against the evaluated pin failed"
+    for label, paths in (
+        (f"committed after pin {resolved[:12]}", committed),
+        ("staged", index),
+        ("modified in worktree", worktree),
+    ):
+        product = [p for p in paths if not _path_in_mailbox(p, mailbox_rel)]
+        if product:
+            return f"product paths {label}: {', '.join(product)}"
     untracked = _product_untracked_paths(repo, mailbox_rel)
     if untracked is None:
-        return False
+        return "git ls-files for untracked product paths failed"
     # Preexisting extra.py is still product, not a verified pin.
-    return not untracked
+    if untracked:
+        return f"untracked product paths: {', '.join(untracked)}"
+    return None
+
+
+def _evaluated_product_intact(
+    repo: Path,
+    mailbox: Path,
+    evaluated_sha: str,
+) -> bool:
+    """True when the graded product tree is unchanged except mailbox files."""
+    return _evaluated_product_problem(repo, mailbox, evaluated_sha) is None
 
 
 def _verdict_binds_lockstep(
@@ -727,16 +758,23 @@ def _verdict_binds_lockstep(
     return True
 
 
-def _ship_retirement_complete(
-    mailbox: Path, iteration: int, repo: Path | None
-) -> bool:
-    """SHIP is finished only with bound evidence and mailbox identity.
+# Retirement problem kinds. "pending" may still resolve when the
+# Evaluator's retirement commit lands; "final" never will by waiting
+# (stale/unbound attempt, or the graded product tree changed).
+RETIREMENT_PENDING = "pending"
+RETIREMENT_FINAL = "final"
 
-    First-pass and resume share this gate. Missing ``attempt:`` or
-    ``evaluated:`` (when a pin exists) cannot look shipped. Product
-    ``commit:`` ancestry is not the graded pin. When ``repo`` is not a
-    git tree, skip object checks so no-repo fakes keep shipping after
-    the attempt binds.
+
+def _ship_retirement_problem(
+    mailbox: Path, iteration: int, repo: Path | None
+) -> tuple[str, str] | None:
+    """``None`` when SHIP retirement is complete, else ``(kind, detail)``.
+
+    First-pass, the bounded wait, and resume share this gate. Missing
+    ``attempt:`` or ``evaluated:`` (when a pin exists) cannot look
+    shipped. Product ``commit:`` ancestry is not the graded pin. When
+    ``repo`` is not a git tree, skip object checks so no-repo fakes
+    keep shipping after the attempt binds.
     """
     try:
         text = (mailbox / "VERDICT.md").read_text(
@@ -747,12 +785,26 @@ def _ship_retirement_complete(
     state = _read_state(mailbox / "STATE.md")
     git_root = _git_root(repo)
     if not _verdict_binds_lockstep(text, state, git_root):
-        return False
+        attempt = state.get("evaluator_attempt", "").strip()
+        evaluated = state.get("evaluated_sha", "").strip()
+        if not attempt:
+            detail = "STATE.md has no evaluator_attempt to bind the SHIP"
+        elif not _verdict_records_attempt(text, attempt):
+            detail = (
+                f"VERDICT.md does not record attempt: {attempt} "
+                "(stale or unbound evaluator artifact)"
+            )
+        else:
+            detail = (
+                f"VERDICT.md does not record evaluated: {evaluated}"
+            )
+        return RETIREMENT_FINAL, detail
     if git_root is None:
-        return True
+        return None
     evaluated = state.get("evaluated_sha", "").strip()
-    if not _evaluated_product_intact(git_root, mailbox, evaluated):
-        return False
+    product = _evaluated_product_problem(git_root, mailbox, evaluated)
+    if product is not None:
+        return RETIREMENT_FINAL, f"product tree changed: {product}"
     verified = _verified_verdict_commit_shas(git_root, text)
     mailbox_ok = _mailbox_retirement_commit_present(
         git_root, mailbox, iteration
@@ -760,12 +812,128 @@ def _ship_retirement_complete(
     # Fabricated hex in commit: lines must not satisfy the gate.
     claimed = _verdict_commit_shas(text)
     if claimed and not verified:
-        return False
+        return RETIREMENT_PENDING, (
+            "VERDICT.md commit: lines are not commits reachable from "
+            f"HEAD: {', '.join(claimed)}"
+        )
     if verified and mailbox_ok:
-        return True
+        return None
     if mailbox_ok and evaluated and not claimed:
-        return True
-    return False
+        return None
+    if not mailbox_ok:
+        mailbox_rel = _mailbox_rel(git_root, mailbox) or str(mailbox)
+        return RETIREMENT_PENDING, (
+            f"no 'loop: iteration {iteration} — SHIP' commit touching "
+            f"{mailbox_rel}/ is an ancestor of HEAD"
+        )
+    return RETIREMENT_PENDING, (
+        "mailbox retirement commit present but VERDICT.md records no "
+        "commit: lines and no evaluated pin"
+    )
+
+
+def _ship_retirement_complete(
+    mailbox: Path, iteration: int, repo: Path | None
+) -> bool:
+    """SHIP is finished only with bound evidence and mailbox identity."""
+    return _ship_retirement_problem(mailbox, iteration, repo) is None
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _retirement_wait_settings() -> tuple[float, float]:
+    """(wait, poll) seconds for the post-SHIP retirement recheck."""
+    return (
+        _env_seconds(RETIREMENT_WAIT_ENV, DEFAULT_RETIREMENT_WAIT_SECONDS),
+        _env_seconds(RETIREMENT_POLL_ENV, DEFAULT_RETIREMENT_POLL_SECONDS),
+    )
+
+
+def _finalize_ship(
+    mailbox: Path,
+    state_path: Path,
+    iteration: int,
+    repo: Path | None,
+    *,
+    context: str,
+) -> int:
+    """Accept a SHIP once retirement is verified, waiting a bounded time.
+
+    Only rechecks the mailbox and git: no role is dispatched, and the
+    caller keeps holding the loop lock. Before any wait the state is
+    persisted as resumable ``needs_retirement`` so an interrupted
+    driver resumes here (finalization recheck) instead of re-running
+    the Lead or Evaluator. Final problems (stale attempt, product
+    changes) stop at once; pending ones are polled until the deadline.
+    Returns 0 (shipped) or 6 (needs_retirement).
+    """
+    problem = _ship_retirement_problem(mailbox, iteration, repo)
+    waited = 0.0
+    if problem is not None and problem[0] == RETIREMENT_PENDING:
+        wait, poll = _retirement_wait_settings()
+        if wait > 0:
+            _update_state(
+                state_path,
+                {
+                    "status": "needs_retirement",
+                    "phase": "ship-awaiting-retirement",
+                },
+            )
+            _append_log(
+                mailbox,
+                f"- iter {iteration} | loop | {context}: SHIP awaiting "
+                f"retirement (up to {wait:g}s): {problem[1]}",
+            )
+            started = _retirement_clock()
+            deadline = started + wait
+            while problem is not None and problem[0] == RETIREMENT_PENDING:
+                remaining = deadline - _retirement_clock()
+                if remaining <= 0:
+                    break
+                _retirement_sleep(
+                    min(poll, remaining) if poll > 0 else remaining
+                )
+                problem = _ship_retirement_problem(mailbox, iteration, repo)
+            waited = max(0.0, _retirement_clock() - started)
+    if problem is None:
+        _update_state(state_path, {"status": "shipped", "phase": "shipped"})
+        if waited:
+            _append_log(
+                mailbox,
+                f"- iter {iteration} | loop | {context}: SHIP retirement "
+                f"verified after {waited:.1f}s",
+            )
+        return 0
+    kind, detail = problem
+    _update_state(
+        state_path,
+        {"status": "needs_retirement", "phase": "ship-pending-retirement"},
+    )
+    if kind == RETIREMENT_PENDING:
+        reason = f"retirement not found after waiting {waited:.1f}s"
+    else:
+        reason = "retirement cannot complete"
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | {context}: SHIP not accepted "
+        f"({reason}): {detail}",
+    )
+    print(
+        f"trio_loop: iteration {iteration} SHIP not accepted "
+        f"({reason}): {detail}",
+        file=sys.stderr,
+    )
+    _log_untracked_product_blockers(mailbox, iteration, repo)
+    return 6
 
 
 def _fresh_evaluator_artifact(
@@ -809,30 +977,17 @@ def _apply_verdict(
     """Persist a terminal verdict or queue the next ITERATE role.
 
     A SHIP without retirement bookkeeping is not ``shipped`` when the
-    driver can inspect a git repo: status becomes ``needs_retirement``
-    (exit 6) so a missing mailbox retirement cannot look finished.
+    driver can inspect a git repo. A bound SHIP whose retirement commit
+    is still landing is rechecked for a bounded time (``_finalize_ship``);
+    otherwise status becomes ``needs_retirement`` (exit 6) so a missing
+    mailbox retirement cannot look finished.
     Mailboxes used in tests without a git ``repo`` keep the historical
     shipped/exit-0 path.
     """
     if verdict == "SHIP":
-        if not _ship_retirement_complete(mailbox, iteration, repo):
-            _update_state(
-                state_path,
-                {
-                    "status": "needs_retirement",
-                    "phase": "ship-pending-retirement",
-                },
-            )
-            _append_log(
-                mailbox,
-                f"- iter {iteration} | loop | SHIP not accepted "
-                "(attempt/evaluated binding, product tree, or "
-                "retirement bookkeeping)",
-            )
-            _log_untracked_product_blockers(mailbox, iteration, repo)
-            return 6
-        _update_state(state_path, {"status": "shipped", "phase": "shipped"})
-        return 0
+        return _finalize_ship(
+            mailbox, state_path, iteration, repo, context="verdict"
+        )
     if verdict in OUTCOMES:
         status, phase, code = OUTCOMES[verdict]
         _update_state(state_path, {"status": status, "phase": phase})
@@ -927,28 +1082,23 @@ def _run_lockstep(
             if terminal is not None:
                 # needs_retirement is resumable: a later real mailbox
                 # retirement must finish without re-running Evaluator.
+                # Recheck finalization first (bounded wait included);
+                # never re-dispatch a role from here.
                 if status_word == "needs_retirement":
-                    if _ship_retirement_complete(
-                        mailbox, iteration, repo
-                    ):
-                        _update_state(
-                            state_path,
-                            {"status": "shipped", "phase": "shipped"},
-                        )
-                        _write_driver_state(
-                            mailbox, runner, iteration, "shipped"
-                        )
-                        return 0
-                    _log_untracked_product_blockers(
-                        mailbox, iteration, repo
+                    _write_driver_state(
+                        mailbox, runner, iteration, state["phase"].strip()
+                    )
+                    code = _finalize_ship(
+                        mailbox, state_path, iteration, repo,
+                        context="resume",
                     )
                     _write_driver_state(
                         mailbox,
                         runner,
                         iteration,
-                        state["phase"].strip(),
+                        _read_state(state_path)["phase"].strip(),
                     )
-                    return 6
+                    return code
                 _write_driver_state(
                     mailbox, runner, iteration, state["phase"].strip()
                 )
