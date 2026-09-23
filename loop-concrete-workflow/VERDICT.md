@@ -1,10 +1,11 @@
 VERDICT: SHIP
 
-Scope: candidate lockstep planning/evaluation/completion increment only.
+Scope: Git-backed lockstep candidate safeguards, not deployment or overall coding-quality superiority.
 
-Independent Grok Low review accepted product ed4db6dcb4cf3ca41f92335ff3db3d301b788f75; reproduced 85 focused tests and generator check. Report retained in workflow-lab/.runtime/overnight-repair-independent-eval.out. Adjacent CLI compatibility tests then corrected without controller changes: builder reports 32 adjacent tests passing, 68 driver tests passing, and 85 controller/prompt tests passing (overlapping suites, not additive). Coordinator reviewed test diff.
+Independent review of a0591a8 verified attempt/evaluated revision/tracked product checks with104tests. Independent review of71e5787 verified untracked guard and11adversarial probes but requested CLI fixture correction. Coordinator reviewed that tests-only correction: helper scripts moved outside fixture product repos, assertions unchanged. Final integrated six-suite run:132passed, prompt generator check51files passed, reported by execution worker. Production code unchanged after independent guard review.
 
-Open-loop slice-eval freshness remains unqualified. No live installation or measured coding-quality benefit claimed.
+Limits: open-loop slice evaluation and no-git fallback not qualified. Final candidate not rerun on live broker. Pilot prior version required one glue intervention and exposed the defects now regression-tested; no first-shot autonomy claim.
 
-commit: ed4db6dcb4cf3ca41f92335ff3db3d301b788f75
-commit: c67c31d5c0341296467b4db845d47c1de341aa03
+commit: a0591a894b546239c845b3b357b56ed7fd777b49
+commit: 71e57872e802479a248cf5019cce59cd09a6c7e9
+commit: cdb6926824f7ea321ab8f7bbeaef7aac33ebcd51
