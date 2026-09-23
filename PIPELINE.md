@@ -274,6 +274,12 @@ in
 Phases 1–3 remain implemented; later increments and the open questions
 below stay **incomplete**. No live promotion procedure.
 
+Task-specific PLAN/Evaluator checklist wording is a **prompt and
+example** increment
+([docs/TASK-VERIFICATION-CANDIDATE.md](docs/TASK-VERIFICATION-CANDIDATE.md)).
+It does not change the pipeline driver, open-loop `slice-eval`, or
+controller. No new rollout experiment.
+
 ## Open questions
 
 1. Symbol-level read/write sets (not just paths) — worth it, or are paths +

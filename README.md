@@ -255,6 +255,16 @@ in [docs/VERIFIED-DELIVERY-CANDIDATE.md](docs/VERIFIED-DELIVERY-CANDIDATE.md).
 It is candidate-ready only: overlapping test counts, no live install,
 no measured semantic quality, open-loop `slice-eval` not qualified.
 
+## Task-verification candidate
+
+GOAL-based PLAN checklist, optional Markdown verification defaults,
+and synthetic UI/data examples: see
+[docs/TASK-VERIFICATION-CANDIDATE.md](docs/TASK-VERIFICATION-CANDIDATE.md)
+and [examples/task-verification/](examples/task-verification/).
+Prompt presence only; not installed; not live quality proof.
+Keeps accepted reliability tag `trio-verified-delivery-candidate-v0.1`
+on baseline `0a8914a`.
+
 ## Files
 ```
 .claude/agents/trio-{lead,evaluator,scout,builder}.md
@@ -308,6 +318,7 @@ registry/                           # canonical-agent definitions + format layer
   tests/                          # 164 tests covering parsers, validation, install API
   README.md                       # architecture, model tiers, tool policies
 docs/VERIFIED-DELIVERY-CANDIDATE.md # candidate lockstep SHIP record (not live)
+docs/TASK-VERIFICATION-CANDIDATE.md # GOAL checklist / examples SHIP (not live)
 examples/task-verification/         # synthetic UI/data PLAN checklist examples
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
   QUEUE.md                            # v1 open-loop extension (per-slice retirement/fault queues); run via `python3 metrics/trio_loop.py --open-loop` or `TRIO_MODE=open-loop ./portable/driver.sh`, see MAILBOX-SCHEMA.md section `## v1 open-loop extension (optional)` and loop-open-loop/RUNBOOK.md §5
