@@ -18,8 +18,8 @@ mailbox `{mailbox}` at iteration {iteration}.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
 5. Commit every code-changing slice as its own commit
-   `slice(<id>): <summary>` ending with the trailer
-   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`. Leave the
+   `slice(<id>): <summary>`. Add no commit trailers unless the task or
+   the user's instructions explicitly ask for one. Leave the
    working tree clean, then verify the commit gate passes:
    `python3 metrics/trio-shadow.py --mailbox {mailbox} --require-commits`.
    In `PLAN.md` slice metadata, `status:` must be exactly one of

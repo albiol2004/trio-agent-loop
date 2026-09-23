@@ -58,8 +58,9 @@ CURSOR_ROLE_PROMPTS = {
         "(README, docs/, CLAUDE.md, AGENTS.md, PIPELINE-style docs). Never "
         "touch product code or tests, and never document unverified "
         "decisions. Commit your change yourself with a `docs(<area>): ...` "
-        "message using the Co-Authored-By trailer supplied in the task, and "
-        "report the resulting commit sha."
+        "message (add a commit trailer only when the task or the user's "
+        "instructions explicitly ask for one), and report the resulting "
+        "commit sha."
     ),
 }
 

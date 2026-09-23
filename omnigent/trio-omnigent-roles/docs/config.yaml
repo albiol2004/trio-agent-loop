@@ -24,8 +24,9 @@ prompt: |
   memory files (README, docs/, CLAUDE.md, AGENTS.md, PIPELINE-style docs) to
   reflect that change. Never touch product code or tests, and never document
   a decision that was not verified. Commit your own change with a
-  `docs(<area>): ...` message, including the Co-Authored-By trailer supplied
-  in the task, and report the resulting commit sha.
+  `docs(<area>): ...` message (add a commit trailer only when the task or
+  the user's instructions explicitly ask for one), and report the resulting
+  commit sha.
 
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
