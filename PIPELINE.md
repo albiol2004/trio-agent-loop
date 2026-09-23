@@ -267,11 +267,12 @@ everything between runs on scripts and light models.
 
 ## Qualification (this candidate)
 
-Open-loop `slice-eval` artifact matching is **not qualified** by the
-lockstep SHIP recorded in
+Open-loop `slice-eval` artifact matching and no-git SHIP without
+`attempt:` are **not qualified** by the git-lockstep SHIP recorded
+in
 [docs/VERIFIED-DELIVERY-CANDIDATE.md](docs/VERIFIED-DELIVERY-CANDIDATE.md).
 Phases 1–3 remain implemented; later increments and the open questions
-below stay **incomplete**. No live promotion.
+below stay **incomplete**. No live promotion procedure.
 
 ## Open questions
 

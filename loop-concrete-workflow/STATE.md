@@ -1,4 +1,4 @@
 status: shipped
-iteration: 1
+iteration: 2
 verdict: SHIP
-scope: lockstep candidate only; not deployed
+scope: git-backed lockstep candidate only; not deployed
