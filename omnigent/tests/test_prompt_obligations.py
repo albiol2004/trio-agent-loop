@@ -15,10 +15,12 @@ OBLIGATIONS = (
     "Original-goal planning",
     "Independent evaluation",
     "Commit ownership (driver)",
+    "Task-specific checklist",
     "must-preserve",
     "unverified",
     "knowledge.yaml",
     "evaluated:",
+    "unavailable environment",
 )
 
 
@@ -57,6 +59,9 @@ def test_generated_native_roles_carry_obligations() -> None:
         assert phrase in lead or phrase in evaluator, phrase
     assert "must-preserve" in lead
     assert "unverified" in evaluator
+    assert "task-specific checklist" in lead
+    assert "unavailable environment" in evaluator
+    assert "whole-goal SHIP" in evaluator
 
 
 def test_omnigent_dispatch_prompt_carries_shared_essentials(
@@ -80,3 +85,29 @@ def test_omnigent_dispatch_prompt_carries_shared_essentials(
     for phrase in OBLIGATIONS:
         assert phrase in lead, phrase
         assert phrase in evaluator, phrase
+
+
+def test_examples_keep_goal_rows_and_incomplete_omits() -> None:
+    """Structural: complete PLAN lists GOAL refs; incomplete omits one."""
+    base = ROOT / "examples" / "task-verification"
+    ui_goal = (base / "ui" / "GOAL.md").read_text(encoding="utf-8")
+    ui_plan = (base / "ui" / "PLAN.md").read_text(encoding="utf-8")
+    ui_inc = (base / "ui" / "incomplete-PLAN.md").read_text(encoding="utf-8")
+    assert "GOAL empty-error" in ui_plan
+    assert "GOAL empty-error" not in ui_inc
+    assert "Title is required" in ui_goal
+    assert "VERDICT: ITERATE" in (
+        base / "ui" / "incomplete-VERDICT.md"
+    ).read_text(encoding="utf-8")
+    data_plan = (base / "data" / "PLAN.md").read_text(encoding="utf-8")
+    data_inc = (base / "data" / "incomplete-PLAN.md").read_text(
+        encoding="utf-8"
+    )
+    assert "GOAL reconcile" in data_plan
+    assert "GOAL rerun" in data_plan
+    assert "GOAL reconcile" not in data_inc
+    assert "independent" in data_plan.lower()
+    agents = (ROOT / "portable" / "AGENTS.template.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## Verification defaults" in agents

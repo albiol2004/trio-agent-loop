@@ -308,6 +308,7 @@ registry/                           # canonical-agent definitions + format layer
   tests/                          # 164 tests covering parsers, validation, install API
   README.md                       # architecture, model tiers, tool policies
 docs/VERIFIED-DELIVERY-CANDIDATE.md # candidate lockstep SHIP record (not live)
+examples/task-verification/         # synthetic UI/data PLAN checklist examples
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
   QUEUE.md                            # v1 open-loop extension (per-slice retirement/fault queues); run via `python3 metrics/trio_loop.py --open-loop` or `TRIO_MODE=open-loop ./portable/driver.sh`, see MAILBOX-SCHEMA.md section `## v1 open-loop extension (optional)` and loop-open-loop/RUNBOOK.md §5
 PIPELINE.md                         # experimental speculative-pipeline execution spec — slice contracts, frozen interfaces, shadow measurement

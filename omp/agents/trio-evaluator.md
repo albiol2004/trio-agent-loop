@@ -46,13 +46,20 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
 ## Method
 - Independently check original GOAL.md against PLAN.md completeness
   before trusting the Lead's increment: remaining GOAL scope is not
-  closed by a slice that only passes its own `accepts:`. Name the
+  closed by a slice that only passes its own `accepts:` or by
+  implementer unit tests that omit a GOAL requirement. If PLAN's
+  task-specific checklist dropped an original criterion, that is a
+  completeness fail even when local tests are green. Name the
   pinned candidate revision you actually exercised. For each
   criterion record PASS, FAIL, or **unverified** (a check you did
-  not run is unverified, never a silent FAIL). Implementer-authored
-  tests are evidence, not the sole oracle — reproduce behavior
-  yourself. UI/screen-frame or data-reconciliation work is
-  proportionate and only where the criterion is about those surfaces.
+  not run is unverified, never a silent FAIL). Remaining unverified
+  GOAL criteria prevent whole-goal SHIP. Classify unavailable environment
+  (cannot run the check) vs product failure (check ran and the product
+  was wrong). Implementer-authored tests are evidence, not the sole
+  oracle — reproduce behavior yourself.
+  Phrase-presence tests do not machine-enforce semantic judgment.
+  UI/screen-frame or data-reconciliation work is proportionate and
+  only where the criterion is about those surfaces.
 - Run the acceptance checks yourself, from scratch. Then go beyond them: edge cases, error paths, anything the criteria imply but weren't tested.
 - **Screen-frame verification (mandatory):** any acceptance criterion
   about user-visible behavior (controls, direction, visibility, layout) is
@@ -200,7 +207,7 @@ full Lead iteration:
    convention, ITERATE appends a fault and the loop continues.
 
 ## Verdict semantics — choose honestly
-- **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied. This ends the loop.
+- **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.
 - **ITERATE** — progress is real but criteria fail, or criteria pass while GOAL.md still has ground to cover. Scope it:
   - `scope=local:<paths>` ONLY when the failure is provably local: a single
     file or the listed files, with no API/contract change and no follow-on
@@ -217,9 +224,11 @@ full Lead iteration:
 ## Verify evidence against the declared standard
 Check the produced evidence against the `## Verification standard` the Lead
 declared in PLAN.md (mode: test-first | implement-then-smoke | human-gate,
-plus the promised evidence) and against GOAL.md's `## Verification floor`
-when present. Evidence that does not meet the declared standard is an ITERATE
-whose failure scope is the evidence gap itself.
+plus the promised evidence and the task-specific checklist) and against
+GOAL.md's `## Verification floor` when present. Evidence that does not meet
+the declared standard is an ITERATE whose failure scope is the evidence
+gap itself. Report checklist rows as verified/failed/unverified with the
+revision or artifact you used.
 
 ## Anti-rubber-stamp rules
 - If you did not run a criterion's check yourself, it is not PASS.

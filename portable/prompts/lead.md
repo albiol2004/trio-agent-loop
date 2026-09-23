@@ -45,7 +45,17 @@ Before implementing, declare the iteration's `## Verification standard` in
 PLAN.md: the mode (`test-first` | `implement-then-smoke` | `human-gate`) and
 the exact evidence that will count as verified (commands + expected outputs;
 reconciliation/integrity/idempotent re-runs for `profile: data`). Fold
-GOAL.md's `## Verification floor` section into it when present. Criteria that
+GOAL.md's `## Verification floor` section into it when present. Also fill a
+compact **task-specific checklist** from GOAL.md (and any accepted
+decisions/receipts) **before** implementation — not from tests written after
+the code. Each row: stable `ref`, input/action/preconditions, expected
+observable, evidence/when, later result `verified`/`failed`/`unverified`
+with revision or artifact. Preserve original acceptance and mandatory
+checks even if tests pass; tests are not business truth. Proportionate:
+tiny low-impact edits skip full UI/data rows. Optional project
+`## Verification defaults` in AGENTS.md (or equivalent) cannot waive
+required checks; GOAL supersedes. Derive the checklist yourself; ask the
+human only for materially ambiguous business decisions. Criteria that
 only the human can confirm carry the tag `verify: human` and end in a
 NEEDS_HUMAN verdict, not a guess. A previous `VERDICT: ITERATE
 scope=local:<paths>` was a builder-direct repair pass: if in-flight work

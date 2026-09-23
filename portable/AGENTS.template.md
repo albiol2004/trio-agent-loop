@@ -23,3 +23,14 @@ that another session may own):
   follow that prompt exactly. If you are a human-driven session, don't edit
   `loop/` files casually — the loop depends on them.
 - Never commit; the loop always ends at an uncommitted tree for human review.
+
+## Verification defaults (optional)
+
+Copy this heading into the project AGENTS.md (or CLAUDE.md / GEMINI.md)
+when the repo has standing checks. Keep it Markdown — no new parser,
+database, or `knowledge.yaml` fields.
+
+- Default commands the Lead should name in PLAN evidence (build/test/lint).
+- When a UI or data row is expected vs a tiny low-impact change.
+- These defaults cannot waive GOAL.md acceptance or mandatory Trio
+  checks. The current GOAL supersedes this section.

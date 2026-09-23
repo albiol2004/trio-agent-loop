@@ -147,11 +147,40 @@ for the iteration:
 - **Evidence**: what will count as verified — exact commands, the outputs
   they must produce, and the data/ground-truth checks (reconciliation,
   integrity, idempotent re-runs for `profile: data`).
+- **Task-specific checklist** (compact table under the same heading, filled
+  from GOAL.md / accepted source **before** code exists — not from tests
+  derived after the fact):
+
+| ref | input / action / preconditions | expected observable | evidence / when | result |
+|---|---|---|---|---|
+| GOAL §… or A# | concrete input and action | what a reviewer can see | command, screenshot, query; skip if proportionate | `verified` / `failed` / `unverified` + revision or artifact |
+
+`ref` is a stable pointer at original GOAL acceptance (or an accepted
+decision/receipt id). Original acceptance and mandatory checks remain even
+when implementer tests pass; tests are not an automatic source of business
+truth. Keep the table proportionate: a tiny low-impact change (comment,
+typo, generated-file regen) does not need a full browser or data
+reconciliation row.
+
+Optional **project verification defaults** live in version-controlled
+project instructions (`AGENTS.md` / equivalent `## Verification defaults`
+section). They are not a new config engine and must not extend
+`knowledge.yaml`. Current GOAL supersedes defaults; defaults cannot waive
+required checks. Accepted decisions/receipts are provenance; proposals stay
+proposals. Missing knowledge does not fabricate a blocker. The Lead derives
+the checklist; the human is asked only for materially ambiguous business
+decisions.
+
+Worked synthetic examples (illustrative, not executed product runs):
+`examples/task-verification/`.
 
 The Evaluator checks the produced evidence against this declared standard
 (and against GOAL.md's verification floor, when present). Evidence that does
 not meet the declared standard is an ITERATE whose failure scope is the
-evidence gap itself.
+evidence gap itself. Remaining GOAL criteria left `unverified` block
+whole-goal `VERDICT: SHIP`. Distinguish unavailable environment from a
+product failure. Human-only checks keep existing `NEEDS_HUMAN` semantics.
+Do not invent new first-line verdict tokens.
 
 ### `verify: human` acceptance criteria
 
