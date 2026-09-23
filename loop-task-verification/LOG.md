@@ -1,1 +1,2 @@
 - iter 1 | lead | task-specific verification implemented; generator check51files and4focused tests passed; independent evaluation pending
+- iter 1 | evaluator | SHIP: original-goal criteria reviewed, generator51files and4tests pass, actual Omnigent prompt inspected; no outcome-quality claim
