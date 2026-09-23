@@ -345,6 +345,17 @@ interrupted run) — is recovered manually with the `/trio-ship` command (omp),
 which performs the same two-commit pattern from the verdict's suggested commit
 message.
 
+### Bounded retirement wait
+
+A valid SHIP verdict can reach `VERDICT.md` seconds before the Evaluator's
+retirement commit (observed: verdict 16:39:12Z, commit 16:39:27Z). The driver
+does not reject immediately; instead it monitors for the retirement commit
+within a bounded time window, polling every few seconds by default. See
+`docs/FINALIZATION-REPAIR.md` for full semantics, environment variables
+(`TRIO_RETIREMENT_WAIT_SECONDS`, `TRIO_RETIREMENT_POLL_SECONDS`), state
+transitions (`ship-awaiting-retirement`, `ship-pending-retirement`,
+`needs_retirement` status), and recovery procedures.
+
 ## v1 open-loop extension (optional)
 
 This is an **optional** extension to schema version 1: a mailbox without

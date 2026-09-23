@@ -265,6 +265,20 @@ The design's economic claim: expensive tokens concentrate at the two
 points with irreducible global view — planning and retirement — and
 everything between runs on scripts and light models.
 
+## Finalization: bounded retirement wait
+
+Post-SHIP finalization implements a bounded-time recheck for the Evaluator's
+retirement commit. A valid SHIP verdict can land in `VERDICT.md` seconds
+before the mailbox retirement commit (`loop: iteration N — SHIP`), observed
+live (verdict 16:39:12Z, commit 16:39:27Z). The driver waits up to 180s by
+default, polling every 3s, for the retirement commit to appear. Environment
+variables `TRIO_RETIREMENT_WAIT_SECONDS` and `TRIO_RETIREMENT_POLL_SECONDS`
+configure the wait; resume starts a fresh deadline, not the original.
+State transitions (`ship-awaiting-retirement` during wait,
+`ship-pending-retirement` after timeout) and strict product/verdict guards
+discriminate pending (resumable, exit 6) from final (reject immediately)
+problems. Full semantics in `docs/FINALIZATION-REPAIR.md`.
+
 ## Qualification (this candidate)
 
 Open-loop `slice-eval` artifact matching and no-git SHIP without
@@ -279,6 +293,16 @@ example** increment
 ([docs/TASK-VERIFICATION-CANDIDATE.md](docs/TASK-VERIFICATION-CANDIDATE.md)).
 It does not change the pipeline driver, open-loop `slice-eval`, or
 controller. No new rollout experiment.
+
+Finalization retirement wait (this increment) is backwards compatible: the
+bounded recheck for the retirement commit is transparent to the protocol.
+No schema changes; exit code 6 for `needs_retirement` is resumable. Existing
+mailboxes and tools continue to work unchanged. Tested: 744 total passes
+(1 preexisting fixture failure), 71 focused on finalization behavior, 77
+external adversarial probes. Original base commit (d435704) unchanged;
+installed version 2d0d996. No live deployment, no default-180s real-clock
+test, no coding quality or speed claim. Documentation only (no code edits,
+no trailers added).
 
 ## Open questions
 
