@@ -265,6 +265,14 @@ The design's economic claim: expensive tokens concentrate at the two
 points with irreducible global view — planning and retirement — and
 everything between runs on scripts and light models.
 
+## Qualification (this candidate)
+
+Open-loop `slice-eval` artifact matching is **not qualified** by the
+lockstep SHIP recorded in
+[docs/VERIFIED-DELIVERY-CANDIDATE.md](docs/VERIFIED-DELIVERY-CANDIDATE.md).
+Phases 1–3 remain implemented; later increments and the open questions
+below stay **incomplete**. No live promotion.
+
 ## Open questions
 
 1. Symbol-level read/write sets (not just paths) — worth it, or are paths +

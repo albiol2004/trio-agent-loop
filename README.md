@@ -241,6 +241,13 @@ skill directories. Say “Run a Trio Omnigent loop to …” for the loop, or
 Cursor-backed production-readiness audit; ordinary “Run a Trio loop” and
 `/trio-productionize` remain native.
 
+## Verified delivery candidate
+
+Lockstep planning/evaluation/completion SHIP on this clone is recorded
+in [docs/VERIFIED-DELIVERY-CANDIDATE.md](docs/VERIFIED-DELIVERY-CANDIDATE.md).
+It is candidate-ready only: overlapping test counts, no live install,
+no measured semantic quality, open-loop `slice-eval` not qualified.
+
 ## Files
 ```
 .claude/agents/trio-{lead,evaluator,scout,builder}.md
@@ -293,6 +300,7 @@ registry/                           # canonical-agent definitions + format layer
   canonical-agents/               # harness-neutral agent definitions
   tests/                          # 164 tests covering parsers, validation, install API
   README.md                       # architecture, model tiers, tool policies
+docs/VERIFIED-DELIVERY-CANDIDATE.md # candidate lockstep SHIP record (not live)
 MAILBOX-SCHEMA.md                   # versioned mailbox protocol spec (schema: 1)
   QUEUE.md                            # v1 open-loop extension (per-slice retirement/fault queues); run via `python3 metrics/trio_loop.py --open-loop` or `TRIO_MODE=open-loop ./portable/driver.sh`, see MAILBOX-SCHEMA.md section `## v1 open-loop extension (optional)` and loop-open-loop/RUNBOOK.md §5
 PIPELINE.md                         # experimental speculative-pipeline execution spec — slice contracts, frozen interfaces, shadow measurement
