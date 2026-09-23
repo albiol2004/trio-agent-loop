@@ -441,8 +441,26 @@ def _verdict_commit_shas(text: str) -> list[str]:
 
 
 def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
-    """True when the verdict body names this lockstep iteration."""
-    return f"iteration {iteration}".lower() in text.lower()
+    """True when the verdict names this iteration and no other one.
+
+    Canonical form is an exact ``iteration: N`` field line; the legacy
+    ``iteration N`` heading/prose form is still accepted. Numbers are
+    whole-word (``iteration 1`` never matches ``iteration 10``). Any
+    ``iteration:`` field, or ``#`` heading naming an iteration, that
+    disagrees with N rejects the artifact as mismatched.
+    """
+    want = str(iteration)
+    fields = _verdict_field_values(text, "iteration")
+    if any(value != want for value in fields):
+        return False
+    heading_re = re.compile(r"\biteration\s+(\d+)\b", re.IGNORECASE)
+    for raw in text.splitlines():
+        if raw.lstrip().startswith("#"):
+            if any(n != want for n in heading_re.findall(raw)):
+                return False
+    if fields:
+        return True
+    return any(n == want for n in heading_re.findall(text))
 
 
 def _verdict_field_values(text: str, key: str) -> list[str]:

@@ -1687,3 +1687,81 @@ def test_effective_evaluator_prompt_retirement_satisfies_driver_gate(
 
     # Non-SHIP verdicts get no commit instruction to act on.
     assert "only on a `VERDICT: SHIP` first line" in prompt
+
+
+# Shape of the natural-trial evaluator artifact the driver ignored until
+# timeout: structured `iteration: 1` field, no "iteration 1" heading.
+_PIN = "ab1f0d76ac30ba946cbecf378a48554b45e27335"
+_ATTEMPT = "f4748ccf8fea4f36a2a076fa9f3f155f"
+_TRIAL_VERDICT = (
+    "VERDICT: SHIP\n\n"
+    f"attempt: {_ATTEMPT}\n"
+    f"evaluated: {_PIN}\n"
+    "mailbox: loop-natural-trial\n"
+    "iteration: 1\n\n"
+    f"Pinned product revision `{_PIN}`\n(HEAD).\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("body", "ready"),
+    [
+        (_TRIAL_VERDICT, True),
+        # Legacy heading form stays compatible.
+        (
+            "VERDICT: SHIP\n# Verdict — iteration 1\n"
+            f"attempt: {_ATTEMPT}\nevaluated: {_PIN}\n",
+            True,
+        ),
+        (_TRIAL_VERDICT.replace("iteration: 1", "iteration: 2"), False),
+        (_TRIAL_VERDICT.replace("iteration: 1", "iteration: 10"), False),
+        (_TRIAL_VERDICT.replace("iteration: 1", "iteration: 1a"), False),
+        # Structured field and heading disagree: mismatched, reject.
+        (_TRIAL_VERDICT + "# Verdict — iteration 2\n", False),
+        # Two structured fields that disagree.
+        (_TRIAL_VERDICT + "iteration: 3\n", False),
+        # Substring: "iteration 10" does not name iteration 1.
+        (
+            "VERDICT: SHIP\n# Verdict — iteration 10\n"
+            f"attempt: {_ATTEMPT}\nevaluated: {_PIN}\n",
+            False,
+        ),
+        # Not an anchored field line.
+        (
+            "VERDICT: SHIP\nthe iteration: 1 note\n"
+            f"attempt: {_ATTEMPT}\nevaluated: {_PIN}\n",
+            False,
+        ),
+        # Right iteration, stale attempt / wrong pin still rejected.
+        (_TRIAL_VERDICT.replace(_ATTEMPT, "0" * 32), False),
+        (_TRIAL_VERDICT.replace(_PIN, "c" * 40), False),
+    ],
+)
+def test_evaluator_artifact_iteration_field_and_heading(
+    tmp_path: Path, body: str, ready: bool
+) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(body, encoding="utf-8")
+    context = {"evaluator_attempt": _ATTEMPT, "pinned_sha": _PIN}
+    assert (
+        trioctl._role_artifact_ready(
+            mailbox, "evaluator", 1, "", 0.0, context
+        )
+        is ready
+    )
+    # Resume skip in loop-core uses the same iteration rule.
+    assert trio_loop._fresh_evaluator_artifact(mailbox, 1, context) is ready
+
+
+def test_effective_evaluator_prompt_names_canonical_iteration_field(
+    tmp_path: Path,
+) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    prompt = trioctl.OmnigentRunner(repo=tmp_path)._prompt(
+        "evaluator", 7, mailbox,
+        {"evaluator_attempt": _ATTEMPT, "pinned_sha": _PIN},
+    )
+    assert "`iteration: 7`" in prompt
+    assert f"LOCKSTEP CONTEXT: attempt={_ATTEMPT} sha={_PIN}" in prompt
