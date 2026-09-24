@@ -473,6 +473,7 @@ class BrokerClient:
         host_id: str | None = None,
         workspace: str | None = None,
         prompt_timeout: float | None = None,
+        labels: dict[str, str] | None = None,
     ) -> Any:
         """Create one session on a dedicated host runner.
 
@@ -510,6 +511,9 @@ class BrokerClient:
         }
         if title:
             payload["title"] = title
+        if labels:
+            # Creation-time opt-in labels (e.g. completion receipts v1).
+            payload["labels"] = dict(labels)
 
         # Dedicated runner unless the caller named an existing one.
         if not preferred:
@@ -750,8 +754,9 @@ class BrokerClient:
         queued). Any other failure may have queued it, so it counts as a
         posted copy that must be accounted for by a user row.
         """
+        response = None
         try:
-            self.send_message(session_id, message)
+            response = self.send_message(session_id, message)
         except BrokerHttpError as exc:
             if _definite_rejection(exc):
                 raise PromptDeliveryFailed(
@@ -759,6 +764,21 @@ class BrokerClient:
                     f"{session_id}: {exc}",
                     status_code=exc.status_code,
                 ) from exc
+        self._count_prompt_post(session_id, response)
+
+    def _count_prompt_post(self, session_id: str, response: Any = None) -> None:
+        """Count one first-prompt copy that may be queued (held record).
+
+        ``prompt_posts`` counts every copy that may have been queued; an
+        ``inject_seq`` in the POST response (completion-receipt servers)
+        is kept in ``prompt_inject_seqs``. Never inferred.
+        """
+        posts = self.__dict__.setdefault("prompt_posts", {})
+        posts[session_id] = posts.get(session_id, 0) + 1
+        seq = response.get("inject_seq") if isinstance(response, dict) else None
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            seqs = self.__dict__.setdefault("prompt_inject_seqs", {})
+            seqs.setdefault(session_id, []).append(seq)
 
     def list_runners(self) -> Any:
         """List runners available for binding a newly created session."""
@@ -817,6 +837,29 @@ class BrokerClient:
             params["kind"] = kind
         query = urlencode(params)
         return self._request("GET", f"/v1/sessions?{query}")
+
+    def input_fence(
+        self,
+        session_id: str,
+        action: str,
+        fence_id: str,
+        expect: dict[str, Any] | None = None,
+    ) -> Any:
+        """POST one ``input_fence`` event (completion-receipt servers only).
+
+        Proposed contract v1 (`.runtime/reconcile-completion-audit/
+        PROPOSED-CONTRACT.md` §3): ``close`` with the receipt values the
+        caller expects, or ``open`` with the same ``fence_id``. An old
+        server answers 400 and a session without the opt-in label 409.
+        """
+        data: dict[str, Any] = {"action": action, "fence_id": fence_id}
+        if expect is not None:
+            data["expect"] = expect
+        path = f"/v1/sessions/{quote(session_id, safe='')}/events"
+        return self._request(
+            "POST", path, {"type": "input_fence", "data": data},
+            expected_status=200,
+        )
 
     def delete_session(self, session_id: str) -> Any:
         """Permanently delete one broker session."""

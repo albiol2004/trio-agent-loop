@@ -757,6 +757,9 @@ def _runner(tmp_path: Path, broker, monkeypatch, timeout: float = 3000.0):
     monkeypatch.setattr(runner, "_agent_id", lambda role: "evaluator-agent")
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
     monkeypatch.setattr(runner, "_prompt", lambda *a, **k: PROMPT)
+    # These fakes compare delivered text to PROMPT exactly; the dispatch
+    # nonce is covered by test_reconcile_held.py.
+    monkeypatch.setattr(runner, "_new_dispatch_nonce", lambda: None)
     return runner
 
 

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -108,6 +109,38 @@ def _load_worker_events() -> Any:
 
 
 worker_events = _load_worker_events()
+
+
+def _load_reconcile() -> Any:
+    """Load the sibling held-dispatch reconciler, or None when absent.
+
+    Absent means no provenance is saved and `reconcile` refuses: every
+    hold stays for a person, exactly as before.
+    """
+    path = Path(__file__).with_name("reconcile.py")
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader(
+        "trioctl_reconcile", str(path)
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"cannot load reconciler: {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+reconcile = _load_reconcile()
+
+# Creation label that opts a new role session in to cursor-native
+# completion receipts (proposed contract v1, §0). Servers without the
+# capability ignore it; nothing reads it except `omnigent reconcile`.
+COMPLETION_RECEIPT_LABELS = (
+    {reconcile.CONTRACT["optin_label"]: reconcile.CONTRACT["optin_value"]}
+    if reconcile is not None
+    else None
+)
 
 # Opt-in worker subprocess telemetry. Never derived from session ids.
 WORKER_EVENTS_FILE_ENV = "TRIO_WORKER_EVENTS_FILE"
@@ -1290,6 +1323,107 @@ HELD_REASONS = {
 }
 
 
+def _optional_str(obj: Any, key: str) -> str | None:
+    value = obj.get(key) if isinstance(obj, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _posted_copies(client: Any, session_id: str, extra: int) -> dict[str, Any]:
+    """Copies of the first prompt that may be queued, as the client counted.
+
+    ``posted_copies`` is None when the client does not count (a test
+    double): the hold then lacks provenance and stays for a person.
+    """
+    posts = getattr(client, "prompt_posts", None)
+    seqs = getattr(client, "prompt_inject_seqs", None)
+    counted = posts.get(session_id) if isinstance(posts, dict) else None
+    return {
+        "posted_copies": (counted + extra) if isinstance(counted, int) else None,
+        "inject_seqs": list(seqs.get(session_id, []))
+        if isinstance(seqs, dict)
+        else [],
+    }
+
+
+def _create_sends_labels(client: Any) -> bool:
+    """True when `_create` forwards the opt-in label to this client."""
+    if not COMPLETION_RECEIPT_LABELS:
+        return False
+    method = getattr(client, "create_session", None) or getattr(
+        client, "create", None
+    )
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return "labels" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _git_read(repo: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "--no-optional-locks", *args],
+            capture_output=True, text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _dispatch_provenance(
+    mailbox: Path,
+    repo: Path,
+    role: str,
+    iteration: int,
+    prompt: str,
+    before_text: str,
+    context: dict[str, Any] | None,
+    *,
+    agent_id: str,
+    model: str,
+    title: str,
+    nonce: str | None,
+) -> dict[str, Any]:
+    """Facts known before create: role, phase, prompt hash, baseline."""
+    state = {}
+    for line in _mailbox_text(mailbox / "STATE.md").splitlines():
+        match = re.match(r"^\s*([A-Za-z_]+)\s*:(.*)$", line)
+        if match:
+            state.setdefault(match.group(1).lower(), match.group(2).strip())
+    context = context or {}
+    artifact = "LOG.md" if role in ("lead", "repair") else "VERDICT.md"
+    return {
+        "role": role,
+        "iteration": iteration,
+        "mode": "open-loop" if context.get("mode") == "open-loop"
+        else "lockstep",
+        "kind": context.get("kind"),
+        "slice": context.get("slice"),
+        "attempt": context.get("evaluator_attempt"),
+        "pinned_sha": context.get("pinned_sha") or context.get("expected_sha"),
+        "agent_id": agent_id,
+        "model": model,
+        "title": title,
+        "prior_status": state.get("status"),
+        "prior_phase": state.get("phase"),
+        "prompt_sha256": reconcile.sha256_text(prompt) if reconcile else None,
+        "prompt_bytes": len(prompt.encode("utf-8")),
+        "prompt_nonce": nonce,
+        "product_head": _git_read(repo, "rev-parse", "HEAD"),
+        "artifact_baseline": {
+            "path": artifact,
+            "sha256": reconcile.sha256_text(before_text) if reconcile else None,
+            "size": len(before_text.encode("utf-8")),
+            "mtime": _mailbox_mtime(mailbox / artifact),
+        },
+        "terminal_epoch": None,
+        "turn_seq_at_dispatch": 0,
+        "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
 def _held_record_path(mailbox: Path, session_id: str) -> Path:
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", session_id).strip("-") or "session"
     return mailbox / ".sessions" / f"held-{slug}.json"
@@ -1933,6 +2067,9 @@ class OmnigentRunner:
         self.created_session_ids: list[str] = []
         # First-prompt delivery uncertain: kept out of post-loop prune.
         self.held_session_ids: list[str] = []
+        # Per-role dispatch provenance for the held record (never inferred).
+        self._delivery: dict[str, dict[str, Any]] = {}
+        self._dispatch_nonce: str | None = None
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -2201,6 +2338,8 @@ class OmnigentRunner:
             extra["workspace"] = workspace
         if prompt_timeout is not None:
             extra["prompt_timeout"] = prompt_timeout
+        if COMPLETION_RECEIPT_LABELS:
+            extra["labels"] = dict(COMPLETION_RECEIPT_LABELS)
         if extra:
             try:
                 params = inspect.signature(method).parameters
@@ -2342,6 +2481,7 @@ class OmnigentRunner:
         self.session_ids[role] = session_id
         self.created_session_ids.append(session_id)
         _record_created_session_id(session_id)
+        self._record_dispatch(role, client, session_id, created)
         remaining = (
             None
             if started is None
@@ -2362,6 +2502,75 @@ class OmnigentRunner:
         observed in the real run, just caught one step later.
         """
         return not _runner_is_bound(snapshot) and not _session_items(items)
+
+    @staticmethod
+    def _new_dispatch_nonce() -> str | None:
+        """A fresh nonce per dispatch (None: no receipt binding possible)."""
+        return uuid.uuid4().hex if COMPLETION_RECEIPT_LABELS else None
+
+    def _record_dispatch(
+        self, role: str, client: Any, session_id: str, created: Any
+    ) -> None:
+        """Save dispatch provenance right after create, before the wait.
+
+        Identity comes only from the create response (null when absent);
+        a failed write leaves the dispatch unreconcilable, never broken.
+        """
+        delivery = self._delivery.get(role)
+        if not delivery or reconcile is None:
+            return
+        delivery.update(client=client, session_id=session_id, extra_sends=0)
+        prov = dict(delivery["base"])
+        prov.update(
+            session_id=session_id,
+            runner_id=_optional_str(created, "runner_id"),
+            external_session_id=_optional_str(created, "external_session_id"),
+            capabilities_at_dispatch={
+                "completion_receipts": _create_sends_labels(client),
+                "echoed": reconcile.capabilities(created)[
+                    "completion_receipts"
+                ],
+            },
+            delivered_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        prov.update(_posted_copies(client, session_id, 0))
+        delivery["provenance"] = prov
+        try:
+            delivery["provenance"] = reconcile.write_provenance(
+                delivery["mailbox"], session_id, prov, delivery["prompt"],
+                delivery["baseline_text"],
+            )
+        except OSError as exc:
+            delivery["provenance"] = None
+            print(
+                f"trioctl: could not save dispatch provenance for "
+                f"{session_id} ({exc}); a hold will need a person",
+                file=sys.stderr,
+            )
+
+    def _final_provenance(
+        self, role: str, session_id: str
+    ) -> dict[str, Any] | None:
+        """The saved provenance with the final copy count, or None."""
+        delivery = self._delivery.get(role) or {}
+        prov = delivery.get("provenance")
+        if not prov or delivery.get("session_id") != session_id:
+            return None
+        prov = dict(prov)
+        prov.update(_posted_copies(
+            delivery.get("client"), session_id,
+            int(delivery.get("extra_sends") or 0),
+        ))
+        try:
+            reconcile.durable_write_json(
+                reconcile.provenance_paths(delivery["mailbox"], session_id)[
+                    "provenance"
+                ],
+                prov,
+            )
+        except OSError:
+            pass
+        return prov
 
     def run(
         self,
@@ -2429,6 +2638,11 @@ class OmnigentRunner:
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
         prompt = self._prompt(role, iteration, mailbox, context)
+        # Per-dispatch nonce: no two dispatches share a prompt hash, so a
+        # completion receipt's injection sha256 binds to exactly this one.
+        self._dispatch_nonce = self._new_dispatch_nonce()
+        if self._dispatch_nonce:
+            prompt += f"\nDispatch nonce: {self._dispatch_nonce}\n"
         title = self._title(mailbox, iteration, role, context)
         client = self._client()
         started = time.monotonic()
@@ -2438,6 +2652,16 @@ class OmnigentRunner:
         else:
             before_text = _mailbox_text(mailbox / "VERDICT.md")
             before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
+        self._delivery[role] = {
+            "mailbox": mailbox,
+            "prompt": prompt,
+            "baseline_text": before_text,
+            "base": _dispatch_provenance(
+                mailbox, self.repo, role, iteration, prompt, before_text,
+                context, agent_id=agent_id, model=model, title=title,
+                nonce=self._dispatch_nonce,
+            ),
+        }
         created_before = len(self.created_session_ids)
         try:
             snapshot, items = self._create_wait_read(
@@ -2515,7 +2739,12 @@ class OmnigentRunner:
         exc: Exception,
         hold: str,
     ) -> NoReturn:
-        """Record a dispatch that may still run, mark STATE, and raise."""
+        """Record a dispatch that may still run, mark STATE, and raise.
+
+        A dispatch whose provenance was saved at create also embeds it
+        (``provenance``), which `omnigent reconcile` needs; a record
+        without it stays held for a person.
+        """
         self.held_session_ids.append(session_id)
         record = {
             "session_id": session_id,
@@ -2536,6 +2765,9 @@ class OmnigentRunner:
         ):
             if context and context.get(key):
                 record[field] = context[key]
+        provenance = self._final_provenance(role, session_id)
+        if provenance is not None:
+            record["provenance"] = provenance
         try:
             path = _write_held_record(mailbox, record)
         except OSError as write_exc:
@@ -2625,6 +2857,8 @@ class OmnigentRunner:
             )
         send = getattr(client, "send_message", None)
         if send is not None:
+            delivery = self._delivery.setdefault(role, {})
+            delivery["extra_sends"] = int(delivery.get("extra_sends") or 0) + 1
             send(session_id, prompt)
         ensure = getattr(client, "ensure_first_prompt", None)
         if ensure is not None:
@@ -2737,6 +2971,27 @@ def command_loop(args: argparse.Namespace) -> int:
         mailbox = repo / mailbox
     mailbox = mailbox.resolve()
     mailbox.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "reconcile_held", False) and _held_records(mailbox):
+        # Opt-in (default OFF): one bounded reconcile before the refusal.
+        # Only an applied late-valid completion continues; anything else
+        # keeps the hold and the exit-7 refusal below.
+        if reconcile is None:
+            print("trioctl: --reconcile-held: reconcile.py missing; "
+                  "hold kept", file=sys.stderr)
+        else:
+            decision, _obs = _reconcile_bounded(
+                mailbox, repo,
+                _session_client(getattr(args, "base_url", None)),
+                apply=True,
+                max_wait=getattr(args, "reconcile_wait", 0.0),
+                interval=getattr(args, "reconcile_interval", 15.0),
+            )
+            print(
+                f"trioctl: reconcile held dispatch: {decision['action']} "
+                f"({decision['code']}): "
+                + "; ".join(decision.get("reasons", [])),
+                file=sys.stderr,
+            )
     refusal = _held_dispatch_message(mailbox)
     if refusal:
         print(f"trioctl: {refusal}", file=sys.stderr)
@@ -2837,6 +3092,107 @@ def command_loop(args: argparse.Namespace) -> int:
                 pass
         if observe:
             _finish_observation(observe)
+
+
+def _resolve_mailbox(value: Any, repo: Path) -> Path:
+    mailbox = Path(value).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = repo / mailbox
+    return mailbox.resolve()
+
+
+def _reconcile_decision(
+    mailbox: Path, repo: Path, client: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read-only observe + pure decide (GETs only; no file writes)."""
+    obs = reconcile.observe(
+        mailbox, repo=repo, client=client,
+        artifact_ready=_role_artifact_ready, broker_http=broker_http,
+    )
+    if not obs["holds"]:
+        decision = {"action": "none", "code": "nothing_held",
+                    "reasons": ["no held record"]}
+    else:
+        decision = reconcile.decide(obs.get("record"), obs)
+    return decision, obs
+
+
+def _reconcile_bounded(
+    mailbox: Path,
+    repo: Path,
+    client: Any,
+    *,
+    apply: bool,
+    max_wait: float,
+    interval: float,
+    loop_core: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Poll `decide` while it says waiting (bounded), then maybe apply.
+
+    The same decision function drives dry-run, `reconcile --apply` and
+    `loop --reconcile-held`; apply re-decides under the mailbox lock.
+    """
+    deadline = time.monotonic() + max(max_wait, 0.0)
+    while True:
+        decision, obs = _reconcile_decision(mailbox, repo, client)
+        if decision["action"] != "waiting" or time.monotonic() >= deadline:
+            break
+        time.sleep(max(min(interval, deadline - time.monotonic()), 0.0))
+    journal = obs.get("journal") or {}
+    resumable = journal.get("step") in ("applying", "done")
+    if apply and (decision["action"] == "ready" or resumable):
+        decision = reconcile.apply_once(
+            mailbox, repo=repo, client=client,
+            loop_core=loop_core or _load_trio_loop(repo),
+            artifact_ready=_role_artifact_ready, broker_http=broker_http,
+        )
+    return decision, obs
+
+
+RECONCILE_OK_ACTIONS = ("ready", "applied", "none")
+
+
+def command_reconcile(args: argparse.Namespace) -> int:
+    """Decide (and with --apply, perform) one held-dispatch reconcile.
+
+    Default is a dry run: GET session/items and read files only -- no
+    lock, no journal, no POST/DELETE, no mailbox or git writes.
+    """
+    if reconcile is None:
+        raise TrioctlError("reconcile.py is not installed next to trioctl")
+    repo = Path.cwd().resolve()
+    mailbox = _resolve_mailbox(args.mailbox_pos or args.mailbox, repo)
+    if not mailbox.is_dir():
+        raise TrioctlError(f"mailbox {mailbox} does not exist")
+    if args.apply and args.dry_run:
+        raise TrioctlError("--apply and --dry-run are exclusive")
+    client = None if args.offline else _session_client(args.base_url)
+    if args.apply and client is None:
+        raise TrioctlError("--apply needs the broker (drop --offline)")
+    decision, obs = _reconcile_bounded(
+        mailbox, repo, client,
+        apply=args.apply,
+        max_wait=args.max_wait if args.watch else 0.0,
+        interval=args.interval,
+    )
+    payload = {
+        "mailbox": str(mailbox),
+        "dry_run": not args.apply,
+        "decision": decision,
+        "observation": reconcile.evidence(obs),
+        "would_apply": decision["action"] == "ready" and not args.apply,
+        "contract": {k: v for k, v in reconcile.CONTRACT.items()
+                     if k.endswith("label")},
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"{decision['action']}: {decision['code']}")
+        for reason in decision.get("reasons", []):
+            print(f"  - {reason}")
+    return 0 if decision["action"] in RECONCILE_OK_ACTIONS else (
+        HELD_DISPATCH_EXIT
+    )
 
 
 def _loop_signal_handler(signum: int, frame: object) -> None:
@@ -3261,7 +3617,47 @@ def parser() -> argparse.ArgumentParser:
             "timing and write summary.json at exit. Never fails the loop"
         ),
     )
+    loop.add_argument(
+        "--reconcile-held",
+        action="store_true",
+        help=(
+            "opt-in (default off): before refusing a held mailbox, run "
+            "`omnigent reconcile --apply` once; only a receipt-proven late "
+            "valid Lead/Evaluator completion is resumed at its interrupted "
+            "phase, every other hold keeps exit 7"
+        ),
+    )
+    loop.add_argument(
+        "--reconcile-wait",
+        type=float,
+        default=0.0,
+        help="with --reconcile-held: poll up to this many seconds while "
+        "the decision is `waiting` (default 0: decide once)",
+    )
+    loop.add_argument("--reconcile-interval", type=float, default=15.0,
+                      help=argparse.SUPPRESS)
     loop.set_defaults(func=command_loop)
+
+    recon = commands.add_parser(
+        "reconcile",
+        help="decide (dry run) or apply a held-dispatch late completion",
+    )
+    recon.add_argument("mailbox_pos", nargs="?", type=Path, default=None,
+                       metavar="MAILBOX")
+    recon.add_argument("--mailbox", type=Path, default=Path("loop"))
+    recon.add_argument("--json", action="store_true")
+    recon.add_argument("--dry-run", action="store_true",
+                       help="the default; never writes (explicit form)")
+    recon.add_argument("--apply", action="store_true",
+                       help="opt-in: apply a ready decision under the lock")
+    recon.add_argument("--watch", action="store_true",
+                       help="poll while waiting, bounded by --max-wait")
+    recon.add_argument("--max-wait", type=float, default=300.0)
+    recon.add_argument("--interval", type=float, default=15.0)
+    recon.add_argument("--offline", action="store_true",
+                       help="no broker calls at all (decision: not observed)")
+    recon.add_argument("--base-url", default=broker_http.DEFAULT_BASE_URL)
+    recon.set_defaults(func=command_reconcile)
 
     observe_summary = commands.add_parser(
         "observe-summary",
