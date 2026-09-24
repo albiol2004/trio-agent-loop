@@ -1277,6 +1277,122 @@ def _read_session_ids_file(path: Path) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+# An uncertain first-prompt dispatch (broker_http.PromptDeliveryUncertain)
+# is recorded as `<mailbox>/.sessions/held-<session id>.json` before the run
+# exits. Cleanup never removes it; while one exists no role is dispatched
+# for the mailbox (`loop` exits HELD_DISPATCH_EXIT). A person resolves it.
+HELD_DISPATCH_EXIT = 7
+
+
+def _held_record_path(mailbox: Path, session_id: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", session_id).strip("-") or "session"
+    return mailbox / ".sessions" / f"held-{slug}.json"
+
+
+def _write_held_record(mailbox: Path, record: dict[str, Any]) -> Path:
+    """Durably write one held-dispatch record (temp file, fsync, rename)."""
+    path = _held_record_path(mailbox, str(record["session_id"]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    return path
+
+
+def _mark_mailbox_held(mailbox: Path, record: dict[str, Any], path: Path) -> None:
+    """Append a LOG.md line and set STATE.md to needs_human (not running).
+
+    Mirrors the loop core's `_append_log`/`_update_state`: other state
+    lines are kept. Lockstep `run_loop` returns 5 on needs_human without
+    dispatching; the held record also blocks every role dispatch.
+    """
+    log = mailbox / "LOG.md"
+    text = (
+        log.read_text(encoding="utf-8", errors="replace")
+        if log.is_file()
+        else "# Trio loop log\n"
+    )
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += (
+        f"- iter {record.get('iteration', '?')} | loop | held "
+        f"{record.get('role', '?')} session {record['session_id']}: "
+        f"first-prompt delivery uncertain; see {path.name}\n"
+    )
+    log.write_text(text, encoding="utf-8")
+    state = mailbox / "STATE.md"
+    lines = (
+        state.read_text(encoding="utf-8", errors="replace").splitlines()
+        if state.is_file()
+        else []
+    )
+    updates = {"status": "needs_human", "phase": "needs_human"}
+    result = []
+    for line in lines:
+        match = re.match(r"^\s*([A-Za-z_]+)\s*:", line)
+        key = match.group(1).lower() if match else None
+        if key in updates:
+            line = f"{key}: {updates.pop(key)}"
+        result.append(line)
+    result.extend(f"{key}: {value}" for key, value in updates.items())
+    state.write_text("\n".join(result) + "\n", encoding="utf-8")
+
+
+def _held_records(mailbox: Path) -> list[tuple[Path, dict[str, Any]]]:
+    """Every held-dispatch record; an unreadable one still counts."""
+    held = []
+    for path in sorted((mailbox / ".sessions").glob("held-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            record = {}
+        held.append((path, record if isinstance(record, dict) else {}))
+    return held
+
+
+def _held_dispatch_message(mailbox: Path) -> str | None:
+    """Actionable refusal text while a held record exists, else None."""
+    held = _held_records(mailbox)
+    if not held:
+        return None
+    lines = [
+        f"{mailbox.name}: a role prompt was dispatched but its delivery is "
+        "uncertain; it may still be running. Not dispatching another role."
+    ]
+    for path, record in held:
+        detail = ", ".join(
+            f"{key} {record[key]}"
+            for key in ("role", "iteration", "attempt", "pinned_sha")
+            if record.get(key) not in (None, "")
+        )
+        lines.append(
+            f"  session {record.get('session_id', '?')}"
+            + (f" ({detail})" if detail else "")
+            + f": {path}"
+        )
+    lines.append(
+        "  resolve: `trioctl omnigent session read <session>` and check the "
+        "mailbox and git state; once that session has finished or is gone "
+        "and its output is reconciled by hand, delete the held-*.json record, "
+        "set STATE.md status/phase for the step to run next (it was set to "
+        "needs_human), and re-run. `trioctl omnigent sessions prune` can then "
+        "remove the session."
+    )
+    return "\n".join(lines)
+
+
 def _sanitise_archive_slug(value: str) -> str:
     """Collapse a title or timestamp into a filesystem-safe slug."""
     slug = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
@@ -2192,8 +2308,13 @@ class OmnigentRunner:
         prompt: str,
         title: str,
         role: str,
+        started: float | None = None,
     ) -> tuple[Any, Any]:
-        """One create+wait+read cycle. Returns (session snapshot, items)."""
+        """One create+wait+read cycle. Returns (session snapshot, items).
+
+        With ``started``, the prompt phase inside create counts against
+        the role timeout: the wait only gets what is left of it.
+        """
         created = self._create(
             client,
             agent_id,
@@ -2211,7 +2332,12 @@ class OmnigentRunner:
         self.session_ids[role] = session_id
         self.created_session_ids.append(session_id)
         _record_created_session_id(session_id)
-        snapshot = self._wait(client, session_id)
+        remaining = (
+            None
+            if started is None
+            else max(self._timeout - (time.monotonic() - started), 0.0)
+        )
+        snapshot = self._wait(client, session_id, timeout=remaining)
         items = self._read(client, session_id)
         return snapshot, items
 
@@ -2286,6 +2412,9 @@ class OmnigentRunner:
         mailbox: Path,
         context: dict[str, Any] | None,
     ) -> int:
+        refusal = _held_dispatch_message(mailbox)
+        if refusal:
+            raise TrioctlError(refusal)
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
@@ -2301,7 +2430,7 @@ class OmnigentRunner:
             before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
         try:
             snapshot, items = self._create_wait_read(
-                client, agent_id, model, prompt, title, role
+                client, agent_id, model, prompt, title, role, started
             )
             if _session_status(snapshot) not in SESSION_FAILURE_STATUSES and (
                 self._is_restart_blip(snapshot, items)
@@ -2328,9 +2457,43 @@ class OmnigentRunner:
             )
         except broker_http.PromptDeliveryUncertain as exc:
             # A copy may still be queued or running: never re-dispatch
-            # or prune it; stop and surface the session for a human.
+            # or prune it; record it durably and stop for a human.
             self.held_session_ids.append(exc.session_id)
-            raise TrioctlError(str(exc)) from exc
+            record = {
+                "session_id": exc.session_id,
+                "role": role,
+                "iteration": iteration,
+                "title": title,
+                "reason": str(exc),
+                "recorded_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                ),
+            }
+            for key, field in (
+                ("evaluator_attempt", "attempt"),
+                ("pinned_sha", "pinned_sha"),
+                ("kind", "kind"),
+                ("slice", "slice"),
+            ):
+                if context and context.get(key):
+                    record[field] = context[key]
+            try:
+                path = _write_held_record(mailbox, record)
+            except OSError as write_exc:
+                raise TrioctlError(
+                    f"{exc}; could NOT record the held dispatch "
+                    f"({write_exc}): do not resume {mailbox.name} until "
+                    f"session {exc.session_id} is resolved"
+                ) from exc
+            try:
+                _mark_mailbox_held(mailbox, record, path)
+            except OSError as mark_exc:
+                print(
+                    f"trioctl: could not update LOG.md/STATE.md for the "
+                    f"held dispatch ({mark_exc}); {path} still blocks resume",
+                    file=sys.stderr,
+                )
+            raise TrioctlError(f"{exc}; held dispatch recorded at {path}") from exc
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
@@ -2511,6 +2674,10 @@ def command_loop(args: argparse.Namespace) -> int:
         mailbox = repo / mailbox
     mailbox = mailbox.resolve()
     mailbox.mkdir(parents=True, exist_ok=True)
+    refusal = _held_dispatch_message(mailbox)
+    if refusal:
+        print(f"trioctl: {refusal}", file=sys.stderr)
+        return HELD_DISPATCH_EXIT
     loop_core = _load_trio_loop(repo)
     observe = (
         _start_observation(mailbox)
@@ -2575,13 +2742,28 @@ def command_loop(args: argparse.Namespace) -> int:
             created = list(getattr(runner, "created_session_ids", []) or [])
             created.extend(_read_session_ids_file(ids_file))
             held = set(getattr(runner, "held_session_ids", []) or [])
+            records = _held_records(mailbox)
+            held.update(
+                str(record.get("session_id"))
+                for _path, record in records
+                if record.get("session_id")
+            )
             for session_id in sorted(held):
                 print(
                     f"trioctl: kept session {session_id}: first-prompt "
-                    "delivery uncertain; inspect before deleting",
+                    "delivery uncertain; held record "
+                    f"{_held_record_path(mailbox, session_id)}",
                     file=sys.stderr,
                 )
             created = [sid for sid in created if sid not in held]
+            if any(not record.get("session_id") for _path, record in records):
+                # An unreadable hold could name any of them: keep all.
+                print(
+                    "trioctl: unreadable held record under "
+                    f"{mailbox / '.sessions'}; skipping session prune",
+                    file=sys.stderr,
+                )
+                created = []
             _run_post_loop_session_prune(
                 mailbox, getattr(args, "base_url", None), created,
                 keep_unarchived=getattr(args, "keep_unarchived", False),

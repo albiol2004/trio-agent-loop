@@ -118,6 +118,10 @@ def fake_broker():
         "fail_launch": False,
         # After this many POST /events, items include the user text.
         "items_after_event_count": None,
+        # POST /events outcome: None = 202; "slow" = queue, then answer
+        # after the client timed out; "drop" = queue, close unanswered;
+        # an int = that HTTP error status, nothing queued.
+        "event_outcome": None,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -149,7 +153,16 @@ def fake_broker():
                 )
                 return
             if path == "/v1/sessions/session-1/events":
+                outcome = state["event_outcome"]
+                if isinstance(outcome, int):
+                    self.send_json(outcome, {"detail": "forward failed"})
+                    return
                 state["events"].append(body)
+                if outcome == "slow":
+                    time.sleep(0.6)
+                elif outcome == "drop":
+                    self.close_connection = True
+                    return
                 self.send_json(202, {"queued": True})
                 return
             # Fallback when POST /v1/sessions ignored host_id.
@@ -1095,6 +1108,62 @@ def test_first_prompt_never_lands_keeps_session_for_prune_hold(
     assert state["deletes"] == []
     assert "session-1" in ids_path.read_text(encoding="utf-8")
     assert len(state["posts"]) == 1
+
+
+@pytest.mark.parametrize("outcome", ["slow", "drop"])
+def test_ambiguous_prompt_post_counts_as_a_copy_never_deleted(
+    fake_broker, monkeypatch, outcome
+):
+    """Timeout/disconnect after the broker queued it: no DELETE, no
+    re-POST; the mirrored user row then proves this copy landed."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["event_outcome"] = outcome
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url, timeout=0.2)
+
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["id"] == "session-1"
+    assert len(state["events"]) == 1
+    assert state["deletes"] == []
+
+
+def test_ambiguous_prompt_post_without_row_is_held(fake_broker, monkeypatch):
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["event_outcome"] = "drop"
+    state["item_rows"] = []
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.3")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.05")
+    client = trioctl.broker_http.BrokerClient(base_url, timeout=0.2)
+
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as exc:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert exc.value.session_id == "session-1"
+    assert len(state["events"]) == 1
+    assert state["deletes"] == []
+
+
+def test_http_error_on_prompt_post_is_definite_and_deletes(
+    fake_broker, monkeypatch
+):
+    """An HTTP error status is the broker refusing it: nothing queued."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["event_outcome"] = 502
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.BrokerHttpError) as exc:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert isinstance(exc.value, trioctl.broker_http.PromptDeliveryFailed)
+    assert exc.value.status_code == 502
+    assert state["events"] == []
+    assert state["deletes"] == ["/v1/sessions/session-1"]
 
 
 def test_omnigent_contract_probe_prefers_subagent_spec():

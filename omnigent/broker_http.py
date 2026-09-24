@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import math
 import os
 import tarfile
 import time
@@ -24,14 +25,15 @@ SESSION_IDS_ENV_VAR = "TRIO_MAILBOX_SESSION_IDS"
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a float env override, ignoring invalid values."""
+    """Read a finite float env override, ignoring invalid values."""
     raw = os.environ.get(name, "")
     if not raw.strip():
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return default
+    return value if math.isfinite(value) else default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -51,12 +53,26 @@ def _prompt_wait() -> float:
     Default is Omnigent 0.14's pending-input TTL; archived user rows
     arrived up to 573 s after create.
     """
-    return _env_float("TRIO_OMNIGENT_PROMPT_WAIT", 600.0)
+    return max(_env_float("TRIO_OMNIGENT_PROMPT_WAIT", 600.0), 0.0)
 
 
 def _prompt_interval() -> float:
-    """Poll interval while waiting for the first prompt."""
-    return _env_float("TRIO_OMNIGENT_PROMPT_INTERVAL", 0.4)
+    """Poll interval while waiting for the first prompt (always > 0)."""
+    value = _env_float("TRIO_OMNIGENT_PROMPT_INTERVAL", 0.4)
+    return value if value > 0 else 0.4
+
+
+def _definite_rejection(exc: BaseException) -> bool:
+    """True when POST /events was refused and nothing was queued.
+
+    Omnigent 0.14 answers 4xx before recording a pending entry, and 502
+    when the runner forward fails, after rolling the entry back
+    (routes/_sessions/orchestration.py ~6156, _forward_native_terminal_
+    message). Any other status (e.g. 500 from post-forward routing
+    bookkeeping) or a transport failure may follow an accepted forward.
+    """
+    code = getattr(exc, "status_code", None)
+    return isinstance(code, int) and (400 <= code < 500 or code == 502)
 
 
 def _prompt_attempts() -> int:
@@ -146,6 +162,22 @@ class BrokerHttpError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class BrokerRequestAmbiguous(BrokerHttpError):
+    """A non-GET request whose outcome is unknown.
+
+    The transport failed (timeout, reset, refused mid-exchange) or the
+    server answered an unexpected 2xx, so the broker may have acted on
+    it. An HTTP error status is a definite answer and is not this.
+    """
+
+
+class PromptDeliveryFailed(BrokerHttpError):
+    """Every first-prompt copy was refused or arrived mangled.
+
+    Nothing intact is queued or running, so the session may be deleted.
+    """
 
 
 class PromptDeliveryUncertain(BrokerHttpError):
@@ -398,9 +430,14 @@ class BrokerClient:
                 detail = exc.read().decode("utf-8", "replace").strip()
                 suffix = f": {detail}" if detail else ""
                 raise BrokerHttpError(
-                    f"{method} {url} failed with HTTP {exc.code}{suffix}"
+                    f"{method} {url} failed with HTTP {exc.code}{suffix}",
+                    status_code=exc.code,
                 ) from exc
             except (OSError, URLError, TimeoutError) as exc:
+                if method != "GET":
+                    raise BrokerRequestAmbiguous(
+                        f"{method} {url} outcome unknown: {exc}"
+                    ) from exc
                 if attempt + 1 >= attempts:
                     raise BrokerHttpError(
                         f"{method} {url} failed: {exc}"
@@ -408,7 +445,12 @@ class BrokerClient:
                 time.sleep(2.0 * (attempt + 1))
 
         if status != expected_status:
-            raise BrokerHttpError(
+            error = (
+                BrokerRequestAmbiguous
+                if method != "GET" and status is not None and 200 <= status < 300
+                else BrokerHttpError
+            )
+            raise error(
                 f"{method} {url} returned HTTP {status}, expected "
                 f"{expected_status}"
             )
@@ -474,6 +516,7 @@ class BrokerClient:
             payload["workspace"] = workdir
 
         session_id: str | None = None
+        posting = False
         try:
             created = self._request("POST", "/v1/sessions", payload, 201)
             if not isinstance(created, dict):
@@ -500,15 +543,25 @@ class BrokerClient:
                     created = {**created, **launched}
                     created.setdefault("id", session_id)
 
-            self.send_message(session_id, message)
+            # From here a copy may be queued: only a definite refusal or
+            # a proven miss (PromptDeliveryFailed) may delete the session.
+            posting = True
+            self._post_prompt(session_id, message)
             wait = _prompt_wait()
-            if prompt_timeout is not None:
-                wait = min(wait, prompt_timeout)
+            if prompt_timeout is not None and math.isfinite(prompt_timeout):
+                wait = min(wait, max(prompt_timeout, 0.0))
             self.ensure_first_prompt(session_id, message, wait_seconds=wait)
             return created
         except PromptDeliveryUncertain:
             raise
-        except Exception:
+        except Exception as exc:
+            if posting and not isinstance(exc, PromptDeliveryFailed):
+                raise PromptDeliveryUncertain(
+                    f"first prompt on {session_id}: outcome unknown after "
+                    f"{type(exc).__name__}: {exc}; not re-posting, session "
+                    "kept",
+                    session_id,
+                ) from exc
             if session_id:
                 self._delete_started_session(session_id)
             raise
@@ -632,46 +685,78 @@ class BrokerClient:
         whole extra turn (canary 6f173b9d; live s2 POST #3).
 
         Landed: a user row equal to the prompt, normalized as the cursor
-        paste encoder does. Known miss: every accepted POST has produced a
-        user row and none matches (e.g. a head-truncated paste) -- re-post,
-        up to ``attempts`` copies, then raise :class:`BrokerHttpError`.
-        Otherwise a copy is unaccounted for: wait up to ``wait_seconds``
-        from the last POST, then raise :class:`PromptDeliveryUncertain`
-        without re-posting. A runner restart or a welcome-screen drop
-        that leaves no row cannot be told apart from a slow turn here, so
-        it ends as uncertain rather than being retried.
+        paste encoder does. Known miss: every POSTed copy (a refused one
+        excepted, an unanswered one included) has produced a user row and
+        none matches (e.g. a head-truncated paste) -- re-post, up to
+        ``attempts`` copies, then raise :class:`PromptDeliveryFailed`.
+        A refused re-post also raises it. Otherwise a copy is unaccounted
+        for: keep polling (failed reads included) until ``wait_seconds``
+        after the first POST -- one budget, not per copy -- then raise
+        :class:`PromptDeliveryUncertain` without re-posting. A runner
+        restart or a welcome-screen drop that leaves no row cannot be
+        told apart from a slow turn here, so it ends as uncertain rather
+        than being retried.
         """
         tries = attempts if attempts is not None else _prompt_attempts()
-        ceiling = max(
-            wait_seconds if wait_seconds is not None else _prompt_wait(), 0.0
-        )
+        ceiling = wait_seconds if wait_seconds is not None else _prompt_wait()
+        if not math.isfinite(ceiling):
+            ceiling = _prompt_wait()
+        ceiling = max(ceiling, 0.0)
         poll = interval if interval is not None else _prompt_interval()
+        if not (math.isfinite(poll) and poll > 0):
+            poll = _prompt_interval()
         want = _prompt_text(message)
         posts = 1
+        rows: list[str] = []
+        # One budget for the whole prompt phase, from the first POST.
         deadline = time.monotonic() + ceiling
         while True:
-            rows = _user_row_texts(_session_item_rows(self.get_items(session_id)))
-            if want and want in rows:
-                return
-            if len(rows) >= posts:
-                if posts >= tries:
-                    raise BrokerHttpError(
-                        f"cannot start session: first prompt did not land "
-                        f"intact on {session_id} after {posts} attempt(s)"
-                    )
-                self.send_message(session_id, message)
-                posts += 1
-                deadline = time.monotonic() + ceiling
-                continue
+            try:
+                rows = _user_row_texts(
+                    _session_item_rows(self.get_items(session_id))
+                )
+            except BrokerHttpError:
+                pass  # transient read failure: keep polling to the deadline
+            else:
+                if want and want in rows:
+                    return
+                if len(rows) >= posts:
+                    if posts >= tries:
+                        raise PromptDeliveryFailed(
+                            f"cannot start session: first prompt did not "
+                            f"land intact on {session_id} after {posts} "
+                            "attempt(s)"
+                        )
+                    self._post_prompt(session_id, message)
+                    posts += 1
+                    continue
             now = time.monotonic()
             if now >= deadline:
                 raise PromptDeliveryUncertain(
-                    f"first prompt on {session_id}: {posts - len(rows)} of "
-                    f"{posts} posted copies unaccounted for after "
-                    f"{ceiling:g}s; not re-posting, session kept",
+                    f"first prompt on {session_id}: "
+                    f"{max(posts - len(rows), 1)} of {posts} posted copies "
+                    f"unaccounted for after {ceiling:g}s; not re-posting, "
+                    "session kept",
                     session_id,
                 )
             time.sleep(min(poll, deadline - now))
+
+    def _post_prompt(self, session_id: str, message: str) -> None:
+        """POST one prompt copy; only a definite refusal raises.
+
+        A refused copy raises :class:`PromptDeliveryFailed` (nothing was
+        queued). Any other failure may have queued it, so it counts as a
+        posted copy that must be accounted for by a user row.
+        """
+        try:
+            self.send_message(session_id, message)
+        except BrokerHttpError as exc:
+            if _definite_rejection(exc):
+                raise PromptDeliveryFailed(
+                    f"cannot start session: first prompt refused on "
+                    f"{session_id}: {exc}",
+                    status_code=exc.status_code,
+                ) from exc
 
     def list_runners(self) -> Any:
         """List runners available for binding a newly created session."""
