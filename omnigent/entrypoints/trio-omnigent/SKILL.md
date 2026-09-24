@@ -96,14 +96,29 @@ Headless `trioctl omnigent loop` (Omnigent 0.14 and 0.12): session
 create POSTs `host_id` + `workspace` (host from GET `/v1/hosts`). If
 the server ignores that, it falls back to
 `POST /v1/hosts/{id}/runners`. A session that fails to start is
-DELETEd. The first prompt is retried on the same session
-(`TRIO_OMNIGENT_PROMPT_WAIT`, default 20s); a restart blip reuses it
-instead of spawning a second Lead/Evaluator. A pass returns only after
-an idle dwell (`TRIO_OMNIGENT_IDLE_DWELL`, default 30s) **and** the
-role artifact exists (Lead Format-A `LOG.md` line / Evaluator
-`VERDICT.md`). Post-loop prune DELETEs this run's sessions even if
-still running (`--keep-sessions` skips). Doctor imports
-`_resolve_subagent_spec`, then `_resolve_agent_spec` on ImportError.
+DELETEd unless first-prompt delivery is uncertain (session kept).
+Landed means a user row equals the prompt after paste-style
+normalization. Re-post the same session only on a **known corrupt
+miss** (every posted copy produced a non-matching user row), up to
+`TRIO_OMNIGENT_PROMPT_ATTEMPTS` (default 3). Otherwise poll one
+deadline (`TRIO_OMNIGENT_PROMPT_WAIT`, default **600s**, capped by
+the role wait). Do not treat a missing row (welcome-screen drop vs
+slow turn) as a miss. Ambiguous 5xx/timeout after POST is held, not
+a definite refusal (only 4xx is). Held work writes
+`{mailbox}/.sessions/held-<session-id>.json` and sets STATE
+`needs_human`; that record **blocks resume** until a human
+reconciles the pane, deletes the file, and resets STATE. This is
+**not** automatic retry and **not** exactly-once. A pass returns
+only after an idle dwell (`TRIO_OMNIGENT_IDLE_DWELL`, default 30s)
+**and** the role artifact exists (Lead Format-A `LOG.md` line /
+Evaluator `VERDICT.md`). Post-loop prune DELETEs this run's
+sessions even if still running (`--keep-sessions` skips), except
+held uncertain sessions. Doctor imports `_resolve_subagent_spec`,
+then `_resolve_agent_spec` on ImportError. Operator note:
+[docs/FIRST-PROMPT-DELIVERY-ROLLOUT.md](../../../docs/FIRST-PROMPT-DELIVERY-ROLLOUT.md).
+An installed copy of this skill may still describe the old 20s
+retry until that release is re-copied; the loop uses release
+`broker_http`, not this file.
 
 For offline verification, run `omnigent/smoke-test.sh`. The focused validation
 command is:

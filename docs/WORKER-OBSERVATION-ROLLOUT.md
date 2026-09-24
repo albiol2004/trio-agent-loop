@@ -9,7 +9,9 @@ repo. Read-only `CURRENT` at
 Related notes (do not replace this rollout):
 [WORKER-TIMING.md](WORKER-TIMING.md) (opt-in process-lifetime
 shards), [WORKER-TIMING-TRIAL.md](WORKER-TIMING-TRIAL.md)
-(historical induced two-builder trial).
+(historical induced two-builder trial),
+[FIRST-PROMPT-DELIVERY-ROLLOUT.md](FIRST-PROMPT-DELIVERY-ROLLOUT.md)
+(installed pin `44238aa`; first-prompt receipt, not a restart blip).
 
 **Not in this release:** Jev integration. Session lifetime and
 builder overlap are **not** useful-computation time and **not**
@@ -119,8 +121,11 @@ Final snapshot corrections were tested/reviewed separately.
 
 ## Known follow-up (not a ship blocker)
 
-A broker false restart-blip re-posted the evaluator prompt once
-in the same session after retirement (duplicate turn, **no**
-duplicate commit). Same logic on previous install `d435704` and
-this release. Unresolved, separate. Do not claim perfect loop
-reliability.
+Earlier notes called a duplicate first-prompt POST a broker
+**false restart-blip**. That was the wrong cause. The loop treated
+a missing or truncated user row as a miss inside a **20s** window
+and re-posted; an intact receipt is a matching normalized user
+row, not an idle/restart edge. Pin `44238aa` changes that
+contract. See
+[FIRST-PROMPT-DELIVERY-ROLLOUT.md](FIRST-PROMPT-DELIVERY-ROLLOUT.md).
+Do not claim perfect loop reliability.
