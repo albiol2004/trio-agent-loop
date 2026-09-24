@@ -818,27 +818,43 @@ def _transition_position(mailbox: Path, plan: dict) -> str:
     return "external"
 
 
+def _check_transition(mailbox: Path, hold_path: Path,
+                      journal: dict[str, Any]) -> None:
+    """Raise ExternalChange unless the hold is still exactly the journaled
+    record and LOG/STATE are a position of the plan; writes nothing."""
+    try:
+        hold = hold_path.read_bytes()
+    except OSError:
+        raise ExternalChange(f"{hold_path.name} was removed since the "
+                             "journaled plan") from None
+    if _sha256_bytes(hold) != journal.get("hold_sha256"):
+        raise ExternalChange(f"{hold_path.name} changed since the "
+                             "journaled plan")
+    if _transition_position(mailbox, journal["plan"]) == "external":
+        raise ExternalChange("STATE.md/LOG.md changed since the journaled "
+                             "plan")
+
+
 def _finish(mailbox: Path, hold_path: Path, record: dict[str, Any],
             journal: dict[str, Any]) -> None:
     """The tail: LOG, STATE, retire the hold, journal done.
 
-    Writes only when a file is exactly the journaled ``plan`` before
-    state (skips it when it is exactly the after state); anything else
-    raises ExternalChange and leaves the file as it is.
+    First checks the hold and both files (``_check_transition``); any
+    external change raises ExternalChange before a single write, so the
+    external bytes are kept. Then writes a file only when it is exactly
+    the journaled ``plan`` before state (skips it when it is the after
+    state).
     """
     plan = journal["plan"]
+    _check_transition(mailbox, hold_path, journal)
     log_path, state_path = mailbox / "LOG.md", mailbox / "STATE.md"
     log = _read_text(log_path) or "# Trio loop log\n"
     if sha256_text(log) == plan["log_before"]:
         durable_write(log_path, _log_text_after(log, _log_line(record,
                                                                journal)))
-    elif sha256_text(log) != plan["log_after"]:
-        raise ExternalChange("LOG.md changed since the journaled plan")
     state = _read_text(state_path) or ""
     if sha256_text(state) == plan["state_before"]:
         durable_write(state_path, _state_text_after(state, journal["target"]))
-    elif sha256_text(state) != plan["state_after"]:
-        raise ExternalChange("STATE.md changed since the journaled plan")
     if hold_path.exists():
         resolved = dict(record)
         resolved["reconciled"] = {
@@ -1030,6 +1046,10 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     journal["step"] = "fence_closed"
     durable_write_json(jpath, journal)
 
+    # The transition's `before` is the mailbox that the re-decision below
+    # validates, read ahead of it and ahead of the gates: an edit by a
+    # person or pane from here on is external, never a new baseline.
+    plan = _transition_plan(mailbox, record, journal, repo)
     # Re-observe after the fence: identical receipt, still ready.
     obs2 = observe(mailbox, repo=repo, client=client,
                    artifact_ready=artifact_ready, broker_http=broker_http)
@@ -1057,7 +1077,11 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     if failures:
         return _blocked("gate_failed", *failures)
 
-    journal["plan"] = _transition_plan(mailbox, record, journal, repo)
+    journal["plan"] = plan
+    try:
+        _check_transition(mailbox, hold_path, journal)
+    except ExternalChange as exc:
+        return _blocked("journal_state_conflict", str(exc))
     journal["step"] = "applying"
     durable_write_json(jpath, journal)
     try:

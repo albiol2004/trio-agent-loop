@@ -915,6 +915,173 @@ def test_receipt_change_after_fence_keeps_hold(tmp_path, monkeypatch):
     assert list((mailbox / ".sessions").glob("held-*.json"))
 
 
+# -- external change while the first apply's gates run ----------------------
+
+def _during_gates(monkeypatch, core, role, action):
+    """Run `action` inside the role's gate (the commit-gate subprocess for
+    the Lead, the VERDICT freshness check for the Evaluator)."""
+    if role == "lead":
+        monkeypatch.setattr(core, "run_commit_gate",
+                            lambda m, r: (action(), (True, "ok"))[1])
+    else:
+        real = core._fresh_evaluator_artifact
+        monkeypatch.setattr(core, "_fresh_evaluator_artifact",
+                            lambda m, i, c: (action(), real(m, i, c))[1])
+
+
+def _mailbox_bytes(mailbox):
+    return {p.name: p.read_bytes() for p in (
+        mailbox / "STATE.md", mailbox / "LOG.md", mailbox / "VERDICT.md",
+        *(mailbox / ".sessions").glob("held-*.json"),
+        *(mailbox / ".sessions").glob("reconciled-*.json"))}
+
+
+@pytest.mark.parametrize("role", ["lead", "evaluator"])
+@pytest.mark.parametrize("change", [
+    "state_blocked", "hold_removed_phase_changed", "hold_removed",
+    "hold_rewritten", "log_appended"])
+def test_external_change_during_first_apply_gates_is_preserved(
+    tmp_path, monkeypatch, role, change
+):
+    """A person or pane (neither takes the mailbox lock) edits the mailbox
+    while the gates run. The before-state is the one the re-decision
+    validated, so the edit is external: nothing is written, nothing is
+    retired, and the external bytes stay exactly as left."""
+    mailbox, prompt = make_held(tmp_path, role)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    state, log = mailbox / "STATE.md", mailbox / "LOG.md"
+    held = mailbox / ".sessions" / f"held-{SID}.json"
+    resume = "lead-running"  # the person's choice, not the continuation
+
+    def external():
+        if change == "state_blocked":
+            state.write_text(state.read_text().replace(
+                "status: needs_human", "status: blocked"), "utf-8")
+        elif change == "hold_removed_phase_changed":
+            # The documented manual resolution: edit STATE, delete the hold.
+            state.write_text(state.read_text().replace(
+                "status: needs_human", "status: running").replace(
+                "phase: needs_human", f"phase: {resume}"), "utf-8")
+            held.unlink()
+        elif change == "hold_removed":
+            held.unlink()
+        elif change == "hold_rewritten":
+            record = json.loads(held.read_text())
+            record["reason"] = "person: do not resume"
+            held.write_text(json.dumps(record), "utf-8")
+        else:
+            with log.open("a", encoding="utf-8") as f:
+                f.write("- iter 1 | human | stop, do not continue\n")
+        seen.update(_mailbox_bytes(mailbox), done=True)
+
+    seen: dict = {}
+    _during_gates(monkeypatch, core, role, external)
+    result = apply(mailbox, broker, core)
+    assert seen.pop("done")
+    assert (result["action"], result["code"]) == (
+        "blocked", "journal_state_conflict"), result
+    assert _mailbox_bytes(mailbox) == seen
+    assert not list((mailbox / ".sessions").glob("reconciled-*.json"))
+    assert "reconciled held" not in log.read_text()
+    assert rc.read_journal(mailbox, SID)["step"] == "fence_closed"
+    if change == "hold_removed_phase_changed":
+        assert rc.read_state(mailbox)["phase"] == resume
+    # A retry is a fresh re-decision of the mailbox as the person left it.
+    monkeypatch.undo()
+    again = apply(mailbox, broker, core_ok(monkeypatch))
+    if change == "log_appended":
+        # A LOG note is not a decision: the retry may apply, after it.
+        assert again["action"] == "applied", again
+        text = log.read_text()
+        assert seen["LOG.md"].decode() in text
+        assert text.index("stop, do not continue") < text.index(
+            "reconciled held")
+    else:
+        assert again["action"] != "applied", again
+        assert _mailbox_bytes(mailbox) == seen
+
+
+@pytest.mark.parametrize("role", ["lead", "evaluator"])
+def test_first_apply_without_external_change_applies_once(
+    tmp_path, monkeypatch, role
+):
+    mailbox, prompt = make_held(tmp_path, role)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    before = {n: rc.sha256_text((mailbox / n).read_text())
+              for n in ("STATE.md", "LOG.md")}
+    result = apply(mailbox, broker, core)
+    assert (result["action"], result["code"]) == (
+        "applied", "late_valid_completion"), result
+    plan = rc.read_journal(mailbox, SID)["plan"]
+    assert (plan["state_before"], plan["log_before"]) == (
+        before["STATE.md"], before["LOG.md"])
+    assert rc.read_state(mailbox)["phase"] == "lead-done"
+    assert (mailbox / "LOG.md").read_text().count("reconciled held") == 1
+    assert not list((mailbox / ".sessions").glob("held-*.json"))
+    assert rc.read_journal(mailbox, SID)["step"] == "done"
+    assert len(broker.writes()) == 1
+
+
+@pytest.mark.parametrize("role", ["lead", "evaluator"])
+@pytest.mark.parametrize("point", ["after_log", "after_state"])
+def test_own_partial_writes_are_recovered(tmp_path, monkeypatch, role,
+                                          point):
+    """Crash after this reconciler's own LOG (or LOG+STATE) write: the
+    replay recognizes exactly its own bytes and finishes once."""
+    mailbox, prompt = make_held(tmp_path, role)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    target = "LOG.md" if point == "after_log" else "STATE.md"
+    real = rc.durable_write
+
+    def crash_after(path, text):
+        real(path, text)
+        if Path(path).name == target:
+            raise Crash(f"crash {point}")
+    monkeypatch.setattr(rc, "durable_write", crash_after)
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    monkeypatch.setattr(rc, "durable_write", real)
+    assert rc.read_journal(mailbox, SID)["step"] == "applying"
+    assert list((mailbox / ".sessions").glob("held-*.json"))
+    result = apply(mailbox, broker, core)
+    assert (result["action"], result["code"]) == (
+        "applied", "resumed_interrupted_apply"), result
+    assert (mailbox / "LOG.md").read_text().count("reconciled held") == 1
+    assert not list((mailbox / ".sessions").glob("held-*.json"))
+    assert len(broker.writes()) == 1
+
+
+@pytest.mark.parametrize("role", ["lead", "evaluator"])
+def test_external_change_during_replay_gates_is_preserved(
+    tmp_path, monkeypatch, role
+):
+    """Interrupted before any write; the replay's gates race a person who
+    blocks the loop. The replay refuses and keeps the person's bytes."""
+    mailbox, prompt = make_held(tmp_path, role)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    _crash_first(monkeypatch, "_finish")
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    state = mailbox / "STATE.md"
+    seen: dict = {}
+
+    def external():
+        state.write_text(state.read_text().replace(
+            "status: needs_human", "status: blocked"), "utf-8")
+        seen.update(_mailbox_bytes(mailbox))
+    _during_gates(monkeypatch, core, role, external)
+    result = apply(mailbox, broker, core)
+    assert (result["action"], result["code"]) == (
+        "blocked", "journal_state_conflict"), result
+    assert _mailbox_bytes(mailbox) == seen
+    assert rc.read_state(mailbox)["status"] == "blocked"
+    assert rc.read_journal(mailbox, SID)["step"] == "applying"
+
+
 # -- loop integration -------------------------------------------------------
 
 class FakeLoopRunner:
