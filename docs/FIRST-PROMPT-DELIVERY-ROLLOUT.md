@@ -79,7 +79,7 @@ bash /home/coder/.local/share/trio-agent-loop/upgrades/e07075c-to-44238aa/rollba
 Gates **v3** (`qualify-44238aa.log`): `status=QUALIFIED`,
 `gates_version=3`, native014 probe **38** scenarios,
 `gated_failures=none`. Pin pytest in that qualify pass: **148**
-passed (not the reviewer’s full 254-file count).
+passed (the reviewer separately ran 254 tests across eight files).
 `test-44238aa.log`: **ALL_PASS** (upgrade/rollback, held two-run,
 installed probe, **profile + registry unchanged**).
 
