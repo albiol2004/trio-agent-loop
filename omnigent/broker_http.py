@@ -36,17 +36,6 @@ def _env_float(name: str, default: float) -> float:
     return value if math.isfinite(value) else default
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read an int env override, ignoring invalid values."""
-    raw = os.environ.get(name, "")
-    if not raw.strip():
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
 def _prompt_wait() -> float:
     """Longest wait for an unaccounted first-prompt copy.
 
@@ -75,11 +64,6 @@ def _definite_rejection(exc: BaseException) -> bool:
     """
     code = getattr(exc, "status_code", None)
     return isinstance(code, int) and 400 <= code < 500
-
-
-def _prompt_attempts() -> int:
-    """How many times to POST the first prompt on one session."""
-    return max(1, _env_int("TRIO_OMNIGENT_PROMPT_ATTEMPTS", 3))
 
 
 def _record_created_session_id(session_id: str) -> None:
@@ -176,9 +160,11 @@ class BrokerRequestAmbiguous(BrokerHttpError):
 
 
 class PromptDeliveryFailed(BrokerHttpError):
-    """Every first-prompt copy was refused or arrived mangled.
+    """The first-prompt POST was refused (4xx) before anything was queued.
 
-    Nothing intact is queued or running, so the session may be deleted.
+    Nothing is queued or running, so the session may be deleted. A saved
+    user row that does not match the prompt is never this: that turn may
+    have run (see :meth:`BrokerClient.ensure_first_prompt`).
     """
 
 
@@ -489,9 +475,9 @@ class BrokerClient:
         ``TRIO_MAILBOX_SESSION_IDS`` before bind/dispatch. Any later
         failure deletes the session so the loop does not leave orphans,
         except :class:`PromptDeliveryUncertain`, which keeps it. The
-        first prompt is re-posted to the same session only on a known
-        miss (see :meth:`ensure_first_prompt`); ``prompt_timeout`` caps
-        its wait (the caller's role timeout).
+        first prompt is POSTed once and never re-posted (see
+        :meth:`ensure_first_prompt`); ``prompt_timeout`` caps its wait
+        (the caller's role timeout).
         """
         workdir = workspace or os.getcwd()
         preferred_source = "--runner-id"
@@ -549,8 +535,8 @@ class BrokerClient:
                     created = {**created, **launched}
                     created.setdefault("id", session_id)
 
-            # From here a copy may be queued: only a definite refusal or
-            # a proven miss (PromptDeliveryFailed) may delete the session.
+            # From here a copy may be queued: only a definite refusal
+            # (PromptDeliveryFailed) may delete the session.
             posting = True
             self._post_prompt(session_id, message)
             wait = _prompt_wait()
@@ -680,7 +666,7 @@ class BrokerClient:
         wait_seconds: float | None = None,
         interval: float | None = None,
     ) -> None:
-        """Return once a user row equals the prompt; re-post only a known miss.
+        """Return once a user row equals the prompt; never re-post.
 
         The caller already POSTed once. On Omnigent 0.14 a 2xx POST only
         queues the copy for injection; the user row, mirrored from
@@ -691,19 +677,21 @@ class BrokerClient:
         whole extra turn (canary 6f173b9d; live s2 POST #3).
 
         Landed: a user row equal to the prompt, normalized as the cursor
-        paste encoder does. Known miss: every POSTed copy (a refused one
-        excepted, an unanswered one included) has produced a user row and
-        none matches (e.g. a head-truncated paste) -- re-post, up to
-        ``attempts`` copies, then raise :class:`PromptDeliveryFailed`.
-        A refused re-post also raises it. Otherwise a copy is unaccounted
-        for: keep polling (failed reads included) until ``wait_seconds``
-        after the first POST -- one budget, not per copy -- then raise
-        :class:`PromptDeliveryUncertain` without re-posting. A runner
-        restart or a welcome-screen drop that leaves no row cannot be
-        told apart from a slow turn here, so it ends as uncertain rather
-        than being retried.
+        paste encoder does. Anything else polls (failed reads included)
+        until ``wait_seconds`` after the first POST, then raises
+        :class:`PromptDeliveryUncertain` without re-posting.
+
+        A saved user row that is not the prompt is not a miss. Cursor
+        saves the row it submitted, so that turn may have run: in live2
+        session 17c9642c the row was 200 DEL bytes plus the intact
+        prompt, the Lead ran it to the end, and the old re-post ran the
+        Lead a second time. A head-truncated row or a row from another
+        source (a follow-up hook) cannot be told apart from that. The
+        only proven non-delivery is a refused POST (:meth:`_post_prompt`
+        raises :class:`PromptDeliveryFailed`). ``attempts`` is ignored;
+        it stays for old callers.
         """
-        tries = attempts if attempts is not None else _prompt_attempts()
+        del attempts  # no row authorizes a re-post
         ceiling = wait_seconds if wait_seconds is not None else _prompt_wait()
         if not math.isfinite(ceiling):
             ceiling = _prompt_wait()
@@ -712,9 +700,8 @@ class BrokerClient:
         if not (math.isfinite(poll) and poll > 0):
             poll = _prompt_interval()
         want = _prompt_text(message)
-        posts = 1
         rows: list[str] = []
-        # One budget for the whole prompt phase, from the first POST.
+        # One budget for the prompt phase, from the first POST.
         deadline = time.monotonic() + ceiling
         while True:
             try:
@@ -726,23 +713,18 @@ class BrokerClient:
             else:
                 if want and want in rows:
                     return
-                if len(rows) >= posts:
-                    if posts >= tries:
-                        raise PromptDeliveryFailed(
-                            f"cannot start session: first prompt did not "
-                            f"land intact on {session_id} after {posts} "
-                            "attempt(s)"
-                        )
-                    self._post_prompt(session_id, message)
-                    posts += 1
-                    continue
             now = time.monotonic()
             if now >= deadline:
+                if rows:
+                    detail = (
+                        f"{len(rows)} saved user row(s), none equal to the "
+                        "prompt (a mismatched copy may have run)"
+                    )
+                else:
+                    detail = "the posted copy is unaccounted for"
                 raise PromptDeliveryUncertain(
-                    f"first prompt on {session_id}: "
-                    f"{max(posts - len(rows), 1)} of {posts} posted copies "
-                    f"unaccounted for after {ceiling:g}s; not re-posting, "
-                    "session kept",
+                    f"first prompt on {session_id}: {detail} after "
+                    f"{ceiling:g}s; not re-posting, session kept",
                     session_id,
                 )
             time.sleep(min(poll, deadline - now))

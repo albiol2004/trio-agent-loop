@@ -1,4 +1,4 @@
-"""Offline regression: re-post a first prompt only on a known miss.
+"""Offline regression: post a first prompt once, never re-post it.
 
 Canary eval-canary-retirement/run-1d716d4, session 6f173b9d: the
 Evaluator prompt was POSTed at create (21:28:18Z); cursor-native wrote
@@ -29,9 +29,12 @@ a leaked ``[201~`` and got an assistant reply; POSTs at 0/21.4/41.5 s,
 the third ran as a duplicate turn. Intact rows equal the posted text.
 
 Contract (eval-c19913b-opus/DELIVERY-CONTRACT.md, coordinator rulings):
-landed = a user row equal to the prompt; known miss = every accepted
-POST has a user row and none matches -> bounded re-post; otherwise
-uncertain -> no re-post, no delete, session held from prune.
+landed = a user row equal to the prompt; otherwise uncertain -> no
+re-post, no delete, session held from prune. The old known-miss re-post
+(every POST has a user row, none matches) is gone: a saved row that is
+not the prompt may be a turn that ran (live2 17c9642c, 200 DEL bytes
+before the whole Lead prompt; the re-post ran the Lead twice). Only a
+refused (4xx) POST is a proven non-delivery.
 """
 from __future__ import annotations
 
@@ -118,6 +121,7 @@ class Native014Broker(BrokerClient):
         ambiguous_posts: tuple[str | None, ...] = (),
         writes_rows: bool = True,
         mailbox: Path | None = None,
+        history: tuple[str, ...] = (),
     ) -> None:
         super().__init__("http://fake.invalid")
         self.clock = clock
@@ -154,6 +158,8 @@ class Native014Broker(BrokerClient):
             {"id": "r0", "type": "resource_event", "status": "completed"}
         ]
         self.deletes: list[str] = []
+        for text in history:  # user rows saved before this dispatch
+            self._row("user", text)
 
     # -- HTTP seams --------------------------------------------------
     def _request(self, method, path, payload=None, expected_status=200):
@@ -289,6 +295,7 @@ class Native014Broker(BrokerClient):
                     "tail": text[: len(text) // 2],
                     "prefix": text[:16],  # "LOCKSTEP CONTEXT"
                     "empty": "",
+                    "del": "\x7f" * 200 + text,  # live2 17c9642c
                 }[mode],
                 row_lag=self.corrupt_row_lag,
                 assistant_lag=self.corrupt_row_lag + 1.0,
@@ -405,58 +412,202 @@ def test_intact_prompt_runs_exactly_once(clock, shape):
     assert broker.pi.snapshot_for(SID) == []
 
 
-# -- known miss: every copy has a row, none intact -> bounded re-post ---
+# -- a saved row that is not the prompt: hold, never re-post ------------
 
-def test_live_s2_head_loss_reposts_once_and_lands_at_43s(clock):
-    """Row 1 lost 3,885 head chars and got a reply; copy 2 lands ~+43 s.
+# Default (unset) and the canary's TRIO_OMNIGENT_PROMPT_ATTEMPTS=2: the
+# setting no longer allows a second POST.
+ATTEMPT_SETTINGS = pytest.mark.parametrize(
+    "attempts", [None, "1", "2", "3"],
+    ids=["default", "attempts1", "attempts2", "attempts3"],
+)
+FOREIGN = (
+    "CANARY FOLLOW-UP: reply with exactly one line FOLLOWUP-ACK and do "
+    "nothing else."
+)  # live2 17c9642c row 6, written by a foreign stop hook
 
-    The re-post is needed. A third POST while copy 2 waits behind the
-    reply to the garbage would run later as a duplicate turn (live POST
-    #3 at 41.5 s).
+
+def _set_attempts(monkeypatch: pytest.MonkeyPatch, attempts) -> None:
+    if attempts is not None:
+        monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", attempts)
+
+
+def test_del_prefix_is_not_normalized_away():
+    """Receipt identity stays strict: DEL is kept, so no match."""
+    norm = trioctl.broker_http._prompt_text
+    assert norm("\x7f" * 200 + PROMPT) != norm(PROMPT)
+    assert norm("\x7f" * 200 + PROMPT).startswith("\x7f" * 200)
+
+
+@ATTEMPT_SETTINGS
+@pytest.mark.parametrize("mode", ["del", "head", "tail", "prefix", "empty"])
+def test_mismatched_saved_row_holds_without_reposting(
+    clock, monkeypatch, attempts, mode
+):
+    """A saved row that is not the prompt may be a turn that ran.
+
+    del: live2 17c9642c, 200 DEL bytes then the whole prompt; the old
+    known-miss re-post ran the Lead a second time. head: live s2. The
+    mangled row lands at +5 s and gets a reply.
     """
-    broker = Native014Broker(
-        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0
-    )
-
-    assert _create(broker, PADDED) is None
-    assert broker.turns[0].endswith("[201~")
-    # Live POST #2 went out at +21.4 s, on the mangled row.
-    assert broker.posts[0] == 0.0 and 20.5 < broker.posts[1] < 22.0
-    assert len(broker.posts) == 2
-    assert broker.turns[1:] == [PADDED], "duplicate intact turn"
-    assert broker.rows[-2]["role"] == "user"  # intact row ~ +43 s
-    assert broker.deletes == []
-
-
-@pytest.mark.parametrize("mode", ["head", "tail", "prefix", "empty"])
-def test_mangled_row_is_a_known_miss_even_with_a_reply(clock, mode):
-    """No row shortcut: an assistant reply to a mangled row is not landed.
-
-    The mangled row lands at +5 s, inside the old 20 s window, so an
-    old prefix/substring/empty-row match or row shortcut accepts it.
-    """
+    _set_attempts(monkeypatch, attempts)
     broker = Native014Broker(
         clock, corrupt=(mode,), corrupt_row_lag=5.0, row_lag=5.0
     )
 
-    assert _create(broker, PADDED) is None
-    assert len(broker.posts) == 2
-    assert broker.turns[1:] == [PADDED]
+    error = _create(broker, PADDED)
+
+    assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert error.session_id == SID
+    assert "1 saved user row(s), none equal to the prompt" in str(error)
+    assert broker.posts == [0.0], "a saved mismatched row authorized a re-post"
+    assert len(broker.turns) == 1 and broker.turns[0] != PADDED
+    assert broker.deletes == []
 
 
-def test_every_copy_mangled_fails_closed_after_attempts(clock):
+def test_live_s2_head_loss_is_held_not_reposted(clock):
+    """Live s2: row 1 lost 3,885 head chars and still got a reply, so
+    that turn ran. The old +21.4 s re-post is gone."""
     broker = Native014Broker(
-        clock, corrupt=("head", "tail", "prefix"), row_lag=5.0
+        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0
     )
 
     error = _create(broker, PADDED)
 
-    assert isinstance(error, BrokerHttpError)
-    assert not isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
-    assert "did not land intact" in str(error)
-    assert len(broker.posts) == 3
-    assert PADDED not in broker.turns
-    assert broker.deletes == [f"/v1/sessions/{SID}"]
+    assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert broker.posts == [0.0]
+    assert broker.turns == [PADDED[3885:] + "\n[201~"]
+    assert broker.deletes == []
+
+
+@ATTEMPT_SETTINGS
+def test_exact_saved_row_lands_with_one_post(clock, monkeypatch, attempts):
+    _set_attempts(monkeypatch, attempts)
+    broker = Native014Broker(clock, row_lag=5.0)
+
+    assert _create(broker) is None
+    assert broker.posts == [0.0]
+    assert broker.turns == [PROMPT]
+    assert broker.deletes == []
+
+
+@ATTEMPT_SETTINGS
+def test_foreign_historical_row_does_not_trigger_a_repost(
+    clock, monkeypatch, attempts
+):
+    """A user row already saved before the POST is not this copy: the
+    old count (rows >= posts) re-posted at once and the copy ran twice."""
+    _set_attempts(monkeypatch, attempts)
+    broker = Native014Broker(clock, row_lag=35.0, history=(FOREIGN,))
+
+    assert _create(broker) is None
+    assert broker.posts == [0.0]
+    assert broker.turns == [PROMPT]
+    assert broker.deletes == []
+
+
+def test_foreign_historical_row_alone_is_held(clock):
+    broker = Native014Broker(clock, ready_at=None, history=(FOREIGN,))
+
+    error = _create(broker)
+
+    assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert "1 saved user row(s)" in str(error)
+    assert broker.posts == [0.0]
+    assert broker.deletes == []
+
+
+# -- live2 17c9642c replay: the saved rows as the broker served them ----
+
+LIVE2 = json.loads(
+    (HERE / "fixtures" / "live2_17c9642c_rows.json").read_text("utf-8")
+)
+LIVE2_ROWS = {row["position"]: row for row in LIVE2["items"]}
+LIVE2_PROMPT = LIVE2_ROWS[4]["content"][0]["text"]
+
+
+class Live2Replay(BrokerClient):
+    """Serves live2 17c9642c's saved rows on the old timeline.
+
+    Rows 1-3 (DEL + prompt, then CANARY-LEAD-DONE) appear from the
+    first POST. Rows 4-5, the intact copy and its duplicate DONE, exist
+    only if a second copy is POSTed. Rows 6-7 are the foreign stop
+    hook's follow-up and its reply.
+    """
+
+    def __init__(self, clock: VirtualClock, *, saved: tuple[int, ...]):
+        super().__init__("http://fake.invalid")
+        self.clock = clock
+        self.saved = saved
+        self.events: list[float] = []
+        self.deletes: list[str] = []
+
+    def _request(self, method, path, payload=None, expected_status=200):
+        if method == "POST" and path == "/v1/sessions":
+            return {"id": SID, "status": "idle", "runner_id": "runner-1"}
+        if method == "DELETE":
+            self.deletes.append(path)
+            return {}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def list_hosts(self):
+        return {"hosts": [{"host_id": "h1", "status": "online"}]}
+
+    def send_message(self, session_id, message):
+        assert message == LIVE2_PROMPT
+        self.events.append(self.clock.now)
+        return {"queued": True}
+
+    def get_items(self, session_id, limit=100, order="asc", after=None):
+        if not self.events:
+            return {"data": []}
+        elapsed = self.clock.now - self.events[0]
+        shown = [p for p in self.saved if elapsed >= 3.0]
+        if len(self.events) > 1:
+            shown += [4, 5]
+        if elapsed >= 12.0:
+            shown += [6, 7]
+        return {"data": [LIVE2_ROWS[p] for p in sorted(set(shown))]}
+
+
+def test_live2_fixture_is_the_del_prefixed_full_prompt():
+    row1 = LIVE2_ROWS[1]["content"][0]["text"]
+    assert row1 == "\x7f" * 200 + LIVE2_PROMPT
+    assert [LIVE2_ROWS[p]["role"] for p in sorted(LIVE2_ROWS)] == [
+        "user", "assistant", "assistant", "user", "assistant", "user",
+        "assistant",
+    ]
+    assert LIVE2_ROWS[6]["content"][0]["text"] == FOREIGN
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [{}, {"TRIO_OMNIGENT_PROMPT_ATTEMPTS": "2",
+          "TRIO_OMNIGENT_PROMPT_WAIT": "20"}],
+    ids=["default", "canary-attempts2-wait20"],
+)
+def test_live2_del_row_is_held_with_one_post(clock, monkeypatch, knobs):
+    """Regression for the duplicate Lead: the saved DEL row (and the
+    later foreign follow-up row) never authorize a second POST."""
+    for name, value in knobs.items():
+        monkeypatch.setenv(name, value)
+    broker = Live2Replay(clock, saved=(1, 2, 3))
+
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as exc:
+        broker.create_session("agent", "model", LIVE2_PROMPT, "title")
+
+    assert exc.value.session_id == SID
+    assert len(broker.events) == 1, "re-posted after a saved DEL row"
+    assert "2 saved user row(s), none equal to the prompt" in str(exc.value)
+    assert broker.deletes == []
+
+
+def test_live2_exact_row_alone_lands(clock):
+    broker = Live2Replay(clock, saved=(4, 5))
+
+    broker.create_session("agent", "model", LIVE2_PROMPT, "title")
+
+    assert len(broker.events) == 1
+    assert broker.deletes == []
 
 
 def _accept_then_502(broker: Native014Broker, *which: int) -> None:
@@ -506,21 +657,6 @@ def test_initial_post_502_after_runner_accepted_is_not_deleted(clock):
         error, trioctl.broker_http.PromptDeliveryUncertain
     )
     assert len(broker.posts) == 1
-    assert broker.deletes == []
-
-
-def test_corrective_post_502_after_runner_accepted_is_not_deleted(clock):
-    """G1b: same for the corrective re-post after a known miss."""
-    broker = Native014Broker(
-        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0
-    )
-    _accept_then_502(broker, 2)
-
-    error = _create(broker, PADDED)
-
-    assert broker.turns.count(PADDED) == 1
-    assert len(broker.posts) == 2
-    assert not isinstance(error, trioctl.broker_http.PromptDeliveryFailed)
     assert broker.deletes == []
 
 
@@ -588,40 +724,19 @@ def test_ambiguous_first_post_that_never_arrived_is_held(clock):
     assert broker.deletes == []
 
 
-@pytest.mark.parametrize("fate", ["queued", "lost"])
-def test_ambiguous_corrective_post_never_deletes(clock, fate):
-    """F1c: the corrective copy's outcome is unknown: count it, no DELETE."""
-    broker = Native014Broker(
-        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0,
-        ambiguous_posts=(None, fate),
-    )
-
-    error = _create(broker, PADDED)
-
-    assert len(broker.posts) == 2
-    assert broker.deletes == []
-    if fate == "queued":
-        assert error is None and broker.turns[1:] == [PADDED]
-    else:
-        assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
-
-
 @pytest.mark.parametrize("status", [409, 502])
-def test_corrective_rejection_only_4xx_fails_and_deletes(clock, status):
-    """Every earlier copy is accounted for (mangled) and the corrective
-    POST is refused with nothing forwarded. Only a 4xx is definite (0.14
-    raises none after the forward); a 502 is held, not deleted."""
-    broker = Native014Broker(clock, corrupt=("head",), row_lag=5.0)
-    original = Native014Broker.send_message
+def test_only_a_refused_first_post_fails_and_deletes(clock, status):
+    """The one proven non-delivery: 0.14 answers 4xx before it records a
+    pending entry, so nothing was queued. A 502 may follow a forward the
+    runner accepted: held, not deleted. Neither is re-posted."""
+    broker = Native014Broker(clock)
 
-    def refuse_second(self, session_id, message):
-        if self.posts:
-            self.posts.append(round(self.clock.now, 1))
-            raise BrokerHttpError(f"HTTP {status}", status_code=status)
-        return original(self, session_id, message)
+    def refuse(self, session_id, message):
+        self.posts.append(round(self.clock.now, 1))
+        raise BrokerHttpError(f"HTTP {status}", status_code=status)
 
-    broker.send_message = refuse_second.__get__(broker)
-    error = _create(broker, PADDED)
+    broker.send_message = refuse.__get__(broker)
+    error = _create(broker)
 
     if status < 500:
         assert isinstance(error, trioctl.broker_http.PromptDeliveryFailed)
@@ -630,8 +745,8 @@ def test_corrective_rejection_only_4xx_fails_and_deletes(clock, status):
     else:
         assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
         assert broker.deletes == []
-    assert len(broker.posts) == 2
-
+    assert broker.posts == [0.0]
+    assert broker.turns == []
 
 @pytest.mark.parametrize("status", [500, 502, 503, None])
 def test_transient_get_errors_keep_polling(clock, status):
@@ -723,10 +838,10 @@ def test_bad_prompt_timeout_is_ignored_or_clamped(clock, cap):
 
 
 def test_prompt_phase_has_one_total_deadline(clock):
-    """F4: corrective POSTs do not restart the prompt budget."""
+    """F4: one budget from the first POST, a saved mismatched row too."""
     broker = Native014Broker(
-        clock, corrupt=("head", "head"), corrupt_row_lag=110.0,
-        row_lag=110.0, corrupt_turn_len=200.0, turn_len=5000.0,
+        clock, corrupt=("head",), corrupt_row_lag=110.0,
+        corrupt_turn_len=5000.0,
     )
 
     with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain):
@@ -735,9 +850,8 @@ def test_prompt_phase_has_one_total_deadline(clock):
         )
 
     assert clock.now <= 121.0
-    assert len(broker.posts) == 2
+    assert len(broker.posts) == 1
     assert broker.deletes == []
-
 
 # -- end to end through OmnigentRunner and the loop wrapper ------------
 
@@ -1049,6 +1163,51 @@ def test_resume_after_accepted_502_does_not_dispatch_second_lead(
     resume = _runner(tmp_path, second, monkeypatch, timeout=60.0)
     assert core.run_loop(mailbox, 3, resume, repo=None) == 5  # needs_human
     assert creates == []
+
+
+@pytest.mark.parametrize("attempts", [None, "2"], ids=["default", "attempts2"])
+def test_del_row_lead_is_held_and_a_fresh_driver_dispatches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock, attempts
+) -> None:
+    """live2 17c9642c end to end: the Lead's saved row is 200 DEL bytes
+    plus the prompt and the turn runs. One POST, a durable hold, and a
+    fresh driver on the same mailbox creates no session (no second
+    Lead, no Evaluator)."""
+    if attempts is not None:
+        monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", attempts)
+    core = trioctl._load_trio_loop(HERE.parents[1])
+    mailbox = tmp_path / "loop"
+    mailbox.mkdir()
+    (mailbox / "LOG.md").write_text("# Trio loop log\n", encoding="utf-8")
+    (mailbox / "VERDICT.md").write_text("VERDICT: none\n", encoding="utf-8")
+    (mailbox / "STATE.md").write_text(
+        "iteration: 0\nstatus: ready\nphase: idle\n", encoding="utf-8"
+    )
+    first = Native014Broker(
+        clock, corrupt=("del",), corrupt_row_lag=5.0, corrupt_turn_len=60.0
+    )
+    runner = _runner(tmp_path, first, monkeypatch, timeout=120.0)
+    with pytest.raises(trioctl.TrioctlError, match="held dispatch") as exc:
+        core.run_loop(mailbox, 3, runner, repo=None)
+    first.run_until(clock.now + 2000.0)
+
+    assert "none equal to the prompt" in str(exc.value)
+    assert first.posts == [0.0]
+    assert first.turns == ["\x7f" * 200 + PROMPT]  # ran once, never again
+    assert first.deletes == []
+    record = json.loads(
+        (mailbox / ".sessions" / f"held-{SID}.json").read_text("utf-8")
+    )
+    assert (record["hold"], record["role"]) == ("first_prompt_uncertain", "lead")
+    assert "status: needs_human" in (mailbox / "STATE.md").read_text("utf-8")
+
+    second = Native014Broker(clock, row_lag=5.0)
+    creates: list[str] = []
+    original = second.create_session
+    second.create_session = lambda *a, **k: (creates.append(a[0]), original(*a, **k))[1]
+    fresh = _runner(tmp_path, second, monkeypatch, timeout=60.0)
+    assert core.run_loop(mailbox, 3, fresh, repo=None) == 5  # needs_human
+    assert creates == [] and second.posts == []
 
 
 def test_held_record_write_failure_still_marks_needs_human(

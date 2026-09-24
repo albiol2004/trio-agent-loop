@@ -98,9 +98,10 @@ the server ignores that, it falls back to
 `POST /v1/hosts/{id}/runners`. A session that fails to start is
 DELETEd unless first-prompt delivery is uncertain (session kept).
 Landed means a user row equals the prompt after paste-style
-normalization. Re-post the same session only on a **known corrupt
-miss** (every posted copy produced a non-matching user row), up to
-`TRIO_OMNIGENT_PROMPT_ATTEMPTS` (default 3). Otherwise poll one
+normalization. The prompt is POSTed once and **never re-posted**: a
+saved user row that does not match (DEL-prefixed, truncated, foreign)
+may be a turn that ran, so it holds like a missing row.
+`TRIO_OMNIGENT_PROMPT_ATTEMPTS` is no longer read. Poll one
 deadline (`TRIO_OMNIGENT_PROMPT_WAIT`, default **600s**, capped by
 the role wait). Do not treat a missing row (welcome-screen drop vs
 slow turn) as a miss. Ambiguous 5xx/timeout after POST is held, not

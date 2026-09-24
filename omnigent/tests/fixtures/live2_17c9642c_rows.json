@@ -1,0 +1,84 @@
+{
+ "source": "reconcile-live-canary/runs/live2/data/chat.db, session 17c9642c374244f497e24aeb56bf9540 (scenario B Lead), conversation_items type=1, read from a copy",
+ "redaction": "workspace path replaced by <ws-B>; the 'agent' key and resource rows dropped; nothing else changed",
+ "original_sha256": {
+  "1": "ab2203707abc862dbc0937279555e626682265870f16411d2440638b7b6f55f8",
+  "4": "c8f66b50660f97104f1e0b833f0b8f5571c55c52cc1df5920a1f6fde0b96c639"
+ },
+ "knobs": {
+  "TRIO_OMNIGENT_PROMPT_ATTEMPTS": "2",
+  "TRIO_OMNIGENT_PROMPT_WAIT": "20"
+ },
+ "items": [
+  {
+   "position": 1,
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007f\u007fCANARY LEAD, iteration 1. This is an automated integration test. Follow these steps exactly and do nothing else.\n\n1. Run exactly this one shell command from <ws-B> and wait until it exits (it takes about a minute; do not background it, do not cancel it):\n\n   python3 .canary/role_work.py lead <ws-B>/loop <ws-B> --delay 50\n\n2. Do not read, edit or create any other file and do not run any other command.\n3. When the command has exited, reply with exactly one line: CANARY-LEAD-DONE\n\nDispatch nonce: 79244f11e71e45af87646f2cf085130d"
+    }
+   ]
+  },
+  {
+   "position": 2,
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "Running the specified canary command and waiting for it to finish."
+    }
+   ]
+  },
+  {
+   "position": 3,
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "CANARY-LEAD-DONE"
+    }
+   ]
+  },
+  {
+   "position": 4,
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "CANARY LEAD, iteration 1. This is an automated integration test. Follow these steps exactly and do nothing else.\n\n1. Run exactly this one shell command from <ws-B> and wait until it exits (it takes about a minute; do not background it, do not cancel it):\n\n   python3 .canary/role_work.py lead <ws-B>/loop <ws-B> --delay 50\n\n2. Do not read, edit or create any other file and do not run any other command.\n3. When the command has exited, reply with exactly one line: CANARY-LEAD-DONE\n\nDispatch nonce: 79244f11e71e45af87646f2cf085130d"
+    }
+   ]
+  },
+  {
+   "position": 5,
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "CANARY-LEAD-DONE"
+    }
+   ]
+  },
+  {
+   "position": 6,
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "CANARY FOLLOW-UP: reply with exactly one line FOLLOWUP-ACK and do nothing else."
+    }
+   ]
+  },
+  {
+   "position": 7,
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "FOLLOWUP-ACK"
+    }
+   ]
+  }
+ ]
+}

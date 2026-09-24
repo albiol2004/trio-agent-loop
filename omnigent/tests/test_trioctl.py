@@ -985,37 +985,30 @@ def test_first_prompt_without_row_is_uncertain_not_reposted(
     assert state["deletes"] == []
 
 
-def test_mismatched_first_row_is_reposted_on_same_session(
-    fake_broker, monkeypatch
+@pytest.mark.parametrize("attempts", [None, "2", "3"])
+def test_mismatched_first_row_is_held_not_reposted(
+    fake_broker, monkeypatch, attempts
 ):
-    """A user row that is not the prompt (mangled paste): re-POST once."""
+    """A saved user row that is not the prompt may be a turn that ran:
+    hold, one POST, no DELETE (was: re-POST on the same session)."""
     trioctl = load_trioctl()
     base_url, state = fake_broker
     state["item_rows"] = [{"id": "item-1", "role": "user", "text": "land"}]
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.delenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", raising=False)
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.01")
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    if attempts is not None:
+        monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", attempts)
     client = trioctl.broker_http.BrokerClient(base_url)
-    original_items = client.get_items
 
-    def items_after_repost(session_id: str, **kwargs):
-        if len(state["events"]) >= 2:
-            state["item_rows"] = [
-                {"id": "item-1", "role": "user", "text": "land"},
-                {"id": "item-2", "role": "user", "text": "Please land"},
-            ]
-        return original_items(session_id, **kwargs)
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as exc:
+        client.create_session("agent-1", "model-1", "Please land", "title")
 
-    client.get_items = items_after_repost  # type: ignore[method-assign]
-    created = client.create_session(
-        "agent-1", "model-1", "Please land", "title"
-    )
-
-    assert created["id"] == "session-1"
+    assert exc.value.session_id == "session-1"
+    assert "none equal to the prompt" in str(exc.value)
     assert len(state["posts"]) == 1
     assert [e["data"]["content"][0]["text"] for e in state["events"]] == [
-        "Please land",
         "Please land",
     ]
     assert state["deletes"] == []
