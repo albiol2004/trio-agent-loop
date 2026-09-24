@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -455,3 +456,82 @@ def test_record_write_failure_falls_back_to_state(
     state = (mailbox / "STATE.md").read_text("utf-8")
     assert "status: needs_human" in state and "running" not in state
     _assert_resume_refused(tmp_path, mailbox, monkeypatch, clock, core)
+
+
+# -- open-loop slice-eval: a partial append is not a finished section ---
+
+def _open_loop_helpers():
+    sys.path.insert(0, str(TREE / "metrics" / "tests"))
+    import test_open_loop_driver as ol  # noqa: E402
+    return ol
+
+
+def test_slice_eval_still_running_at_deadline_holds_not_redispatches(
+    tmp_path, monkeypatch, clock
+):
+    """Eval e060f61 P3: the slice-eval pane is still running at the role
+    deadline and has only started its VERDICT.md append (no complete
+    ``## slice`` section). Its artifact check is only "VERDICT.md
+    changed", so the last-chance accept must not take it: the open loop
+    would see no section and dispatch a second Evaluator for the same
+    slice/sha while the first still runs. It is held instead."""
+    ol = _open_loop_helpers()
+    trio_loop = ol.trio_loop
+    mailbox = ol.make_open_loop_mailbox(tmp_path, ol.PLAN_ONE_SLICE)
+    queue = ol.QueueModel(mailbox, threading.Lock())
+    sha = ol.fake_sha("solo")
+    lead = ol.ScriptedLeadRunner([lambda mb: queue.retire("solo", sha)])
+    monkeypatch.setattr(trio_loop, "_per_slice_gate", lambda *a, **k: 0)
+    broker = RoleBroker(
+        clock, mailbox=mailbox, row_lag=35.0, turn_len=400.0,
+        artifact=("VERDICT.md", f"\n<!-- grading solo @{sha}: tests -->\n"),
+        artifact_at=200.0,
+    )
+    runner = h._runner(tmp_path, broker, monkeypatch, timeout=300.0)
+    creates: list[str] = []
+    original = broker.create_session
+
+    class SecondDispatch(BaseException):
+        pass
+
+    def create(*a, **k):
+        creates.append(a[3])
+        if len(creates) > 1:
+            raise SecondDispatch(a[3])
+        return original(*a, **k)
+
+    broker.create_session = create
+
+    with pytest.raises(trioctl.TrioctlError, match="held dispatch recorded"):
+        trio_loop.run_open_loop(mailbox, 5, lead, runner, poll_seconds=0.01)
+
+    assert len(creates) == 1 and "slice-eval:solo" in creates[0]
+    assert broker._status() == "running"  # first pane still working
+    assert broker.deletes == [] and runner.held_session_ids == [SID]
+    record = _record(mailbox)
+    assert (record["role"], record["hold"], record["session_id"]) == (
+        "evaluator", "role_completion_uncertain", SID
+    )
+
+
+def test_completed_slice_eval_is_not_held(tmp_path, monkeypatch, clock):
+    """A slice-eval pane that appends its section and finishes before
+    the deadline is accepted as before: no hold."""
+    ol = _open_loop_helpers()
+    mailbox = ol.make_open_loop_mailbox(tmp_path, ol.PLAN_ONE_SLICE)
+    sha = ol.fake_sha("solo")
+    broker = RoleBroker(
+        clock, mailbox=mailbox, row_lag=35.0, turn_len=100.0,
+        artifact=("VERDICT.md", f"## slice solo @{sha} -- SHIP\n"),
+        artifact_at=80.0,
+    )
+    runner = h._runner(tmp_path, broker, monkeypatch, timeout=300.0)
+    context = {"mode": "open-loop", "slice": "solo", "sha": sha,
+               "kind": "slice-eval"}
+
+    assert runner.run("evaluator", 1, mailbox, context) == 0
+    assert trioctl._held_records(mailbox) == []
+    assert runner.held_session_ids == [] and broker.deletes == []
+    assert f"## slice solo @{sha} -- SHIP" in (
+        mailbox / "VERDICT.md"
+    ).read_text("utf-8")

@@ -2487,8 +2487,11 @@ class OmnigentRunner:
             # Delivered is not completed. Last-chance accept: a fresh,
             # valid artifact for this attempt/pin is this role's result
             # even when a wait raised at the deadline. Repair has no
-            # artifact check (only session idle), so it is never accepted.
-            if role != "repair" and _role_artifact_ready(
+            # artifact check (only session idle), so it is never accepted;
+            # nor is open-loop slice-eval, whose check is only "VERDICT.md
+            # changed" and cannot tell a finished section from a partial one.
+            slice_eval = bool(context and context.get("kind") == "slice-eval")
+            if role != "repair" and not slice_eval and _role_artifact_ready(
                 mailbox, role, iteration, before_text, before_mtime, context
             ):
                 return 0
