@@ -1361,6 +1361,19 @@ def _create_sends_labels(client: Any) -> bool:
     )
 
 
+def _sent_prompt_shas(prov: dict[str, Any]) -> list[str] | None:
+    """Contract R0: the sha256 of every message sent, in order.
+
+    Trio only ever sends this dispatch's prompt (create, corrective and
+    restart-blip copies are the same text), so it is one hash per copy.
+    """
+    copies = prov.get("posted_copies")
+    sha = prov.get("prompt_sha256")
+    if not isinstance(copies, int) or not sha:
+        return None
+    return [sha] * copies
+
+
 def _git_read(repo: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
@@ -2534,6 +2547,7 @@ class OmnigentRunner:
             delivered_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
         prov.update(_posted_copies(client, session_id, 0))
+        prov["sent_prompt_shas"] = _sent_prompt_shas(prov)
         delivery["provenance"] = prov
         try:
             delivery["provenance"] = reconcile.write_provenance(
@@ -2561,6 +2575,7 @@ class OmnigentRunner:
             delivery.get("client"), session_id,
             int(delivery.get("extra_sends") or 0),
         ))
+        prov["sent_prompt_shas"] = _sent_prompt_shas(prov)
         try:
             reconcile.durable_write_json(
                 reconcile.provenance_paths(delivery["mailbox"], session_id)[

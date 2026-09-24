@@ -59,6 +59,7 @@ class ContractBroker:
         self.gone = False
         self.unreachable = False
         self.after_fence = None  # callable(broker) run after a close
+        self.chat = CHAT
 
     def get_session(self, sid):
         self.requests.append(("GET", f"/v1/sessions/{sid}"))
@@ -70,11 +71,15 @@ class ContractBroker:
         if self.optin:
             labels[OPTIN] = "v1"
         if self.receipt is not None:
-            labels[RECEIPT] = json.dumps(self.receipt)
+            core = {k: v for k, v in self.receipt.items() if k != "detail"}
+            labels[RECEIPT] = json.dumps(core)
+            if "detail" in self.receipt:
+                labels[RECEIPT + ".detail"] = json.dumps(
+                    self.receipt["detail"])
         if self.fence is not None:
             labels[FENCE] = json.dumps(self.fence)
         return {"id": sid, "status": self.status, "runner_id": self.runner_id,
-                "labels": labels}
+                "external_session_id": self.chat, "labels": labels}
 
     def get_items(self, sid, *a, **k):
         self.requests.append(("GET", f"/v1/sessions/{sid}/items"))
@@ -107,24 +112,24 @@ class ContractBroker:
         return [r for r in self.requests if r[0] != "GET"]
 
 
-def good_receipt(prompt: str, copies: int = 1, **over):
+def good_receipt(prompt: str, copies: int = 1, *, detail=None, **over):
+    """A stored rev-2 receipt: core fields plus ``detail`` (split on GET)."""
     sha = rc.sha256_text(prompt)
     receipt = {
         "v": 1, "epoch": EPOCH, "turn_seq": copies,
         "turn_end_count": copies, "inject_count_at_end": copies,
-        "inject_count": copies,
-        "injections": [
-            {"seq": n, "message_seq": n, "sha256": sha, "kind": "message"}
-            for n in range(1, copies + 1)
-        ],
-        "injections_truncated": False, "stop_reason": "completed",
-        "stop_status_raw": "completed", "chat_id": CHAT,
-        "transcript": {"store_max_rowid": 40, "acked_through_rowid": 40,
-                       "unacked_rowids": [], "observed_max_acked": True},
-        "rev": 1, "runner_id": RUNNER, "external_session_id": CHAT,
-        "received_seq": 7,
+        "inject_count": copies, "rev": 1, "stop_reason": "completed",
+        "chat_id": CHAT, "received_seq": 7,
     }
     receipt.update(over)
+    receipt["detail"] = {
+        "msg_digest": rc.message_digest([sha] * receipt["inject_count"]),
+        "msg_listed": receipt["inject_count"], "truncated": False,
+        "model_cmds": 0, "stop_raw": "completed",
+        "observed_max_acked": True, "store_max": 40, "acked_through": 40,
+        "unacked": 0,
+    }
+    receipt["detail"].update(detail or {})
     return receipt
 
 
@@ -164,6 +169,7 @@ def make_held(tmp_path: Path, role: str = "lead", *, legacy=False,
             "prompt_sha256": rc.sha256_text(prompt),
             "prompt_bytes": len(prompt.encode()), "prompt_nonce": "c" * 32,
             "posted_copies": copies, "inject_seqs": [],
+            "sent_prompt_shas": [rc.sha256_text(prompt)] * copies,
             "runner_id": RUNNER, "external_session_id": None,
             "terminal_epoch": None, "turn_seq_at_dispatch": 0,
             "product_head": None,
@@ -272,6 +278,7 @@ def test_new_dispatch_saves_provenance_label_and_nonce(
     assert prov["prompt_sha256"] == rc.sha256_text(delivered)
     assert prov["prompt_nonce"] in delivered
     assert prov["posted_copies"] == 1
+    assert prov["sent_prompt_shas"] == [rc.sha256_text(delivered)]
     assert prov["runner_id"] == "runner-1"
     assert prov["prior_phase"] == "lead-running" and prov["mode"] == "lockstep"
     assert prov["capabilities_at_dispatch"]["completion_receipts"] is True
@@ -312,7 +319,7 @@ def test_ready_lead_late_valid_dry_run_has_zero_effects(tmp_path, capsys,
 def test_stop_reason_is_informational(tmp_path, stop_reason):
     mailbox, prompt = make_held(tmp_path)
     broker = ContractBroker(receipt=good_receipt(
-        prompt, stop_reason=stop_reason, stop_status_raw=None))
+        prompt, stop_reason=stop_reason, detail={"stop_raw": None}))
     decision = decide(mailbox, broker)
     assert decision["action"] == "ready"
     assert decision["evidence"]["stop_reason"] == stop_reason
@@ -351,18 +358,24 @@ def test_turn_end_count_behind_inject_count_waits(tmp_path):
 
 def test_unacked_transcript_waits(tmp_path):
     mailbox, prompt = make_held(tmp_path)
-    receipt = good_receipt(prompt)
-    receipt["transcript"] = {"store_max_rowid": 41, "acked_through_rowid": 40,
-                             "unacked_rowids": [], "observed_max_acked": False}
+    receipt = good_receipt(prompt, detail={
+        "store_max": 41, "acked_through": 40, "observed_max_acked": False})
     assert decide(mailbox, ContractBroker(receipt=receipt))["code"] == (
         "transcript_not_flushed")
 
 
 def test_more_turn_ends_than_injections_blocks(tmp_path):
     mailbox, prompt = make_held(tmp_path)
-    receipt = good_receipt(prompt, turn_end_count=2)
+    receipt = good_receipt(prompt, turn_end_count=2, turn_seq=2)
     decision = decide(mailbox, ContractBroker(receipt=receipt))
     assert decision["action"] == "blocked"
+
+
+def test_turn_seq_not_latest_blocks(tmp_path):
+    mailbox, prompt = make_held(tmp_path)
+    receipt = good_receipt(prompt, turn_seq=3)
+    assert decide(mailbox, ContractBroker(receipt=receipt))["action"] == (
+        "blocked")
 
 
 def test_ended_without_valid_artifact_is_never_retried(tmp_path):
@@ -417,16 +430,27 @@ def test_evaluator_verdict_for_other_attempt_blocks(tmp_path):
     assert decision["code"] == "ended_without_valid_artifact"
 
 
-@pytest.mark.parametrize("over,code", [
-    ({"runner_id": "runner-B"}, "identity_mismatch"),
-    ({"external_session_id": "chat-B"}, "identity_mismatch"),
-    ({"chat_id": None}, "completion_unprovable_no_receipt"),
+@pytest.mark.parametrize("attr,value,code", [
+    ("runner_id", "runner-B", "identity_mismatch"),
+    ("chat", "chat-B", "identity_mismatch"),
+    ("receipt_chat", None, "completion_unprovable_no_receipt"),
 ])
-def test_identity_mismatch_blocks(tmp_path, over, code):
+def test_identity_mismatch_blocks(tmp_path, attr, value, code):
     mailbox, prompt = make_held(tmp_path)
-    decision = decide(mailbox, ContractBroker(receipt=good_receipt(prompt,
-                                                                   **over)))
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    if attr == "receipt_chat":
+        broker.receipt["chat_id"] = value
+    else:
+        setattr(broker, attr, value)
+    decision = decide(mailbox, broker)
     assert (decision["action"], decision["code"]) == ("blocked", code)
+
+
+def test_chat_differs_from_recorded_external_session_blocks(tmp_path):
+    mailbox, prompt = make_held(
+        tmp_path, prov_over={"external_session_id": "chat-Z"})
+    decision = decide(mailbox, ContractBroker(receipt=good_receipt(prompt)))
+    assert decision["code"] == "identity_mismatch"
 
 
 def test_epoch_mismatch_blocks_when_recorded(tmp_path):
@@ -436,13 +460,26 @@ def test_epoch_mismatch_blocks_when_recorded(tmp_path):
 
 
 def test_new_input_after_our_copy_blocks(tmp_path):
-    mailbox, prompt = make_held(tmp_path)
-    receipt = good_receipt(prompt, inject_count=2, turn_end_count=2,
-                           inject_count_at_end=2)
-    receipt["injections"].append(
-        {"seq": 2, "message_seq": 2, "sha256": "0" * 64, "kind": "message"})
+    """R2: a message Trio did not send changes the digest (same count)."""
+    mailbox, prompt = make_held(tmp_path, copies=2)
+    receipt = good_receipt(prompt, copies=2)
+    receipt["detail"]["msg_digest"] = rc.message_digest(
+        [rc.sha256_text(prompt), "0" * 64])
     decision = decide(mailbox, ContractBroker(receipt=receipt))
     assert decision["code"] == "new_input_after_dispatch"
+
+
+def test_extra_injection_beyond_sent_blocks(tmp_path):
+    mailbox, prompt = make_held(tmp_path)
+    receipt = good_receipt(prompt, copies=2)
+    decision = decide(mailbox, ContractBroker(receipt=receipt))
+    assert decision["code"] == "new_input_after_dispatch"
+
+
+def test_digest_is_contract_formula():
+    sha = "ab" * 32
+    assert rc.message_digest([sha]) == hashlib.sha256(
+        sha.encode()).hexdigest()
 
 
 def test_foreign_user_row_blocks(tmp_path):
@@ -453,10 +490,14 @@ def test_foreign_user_row_blocks(tmp_path):
 
 def test_truncated_or_malformed_receipt_blocks(tmp_path):
     mailbox, prompt = make_held(tmp_path)
-    for receipt in (good_receipt(prompt, injections_truncated=True),
+    lone_core = good_receipt(prompt)
+    del lone_core["detail"]
+    for receipt in (good_receipt(prompt, detail={"truncated": True}),
                     {**good_receipt(prompt), "v": 2},
                     {k: v for k, v in good_receipt(prompt).items()
-                     if k != "rev"}):
+                     if k != "rev"},
+                    good_receipt(prompt, detail={"msg_digest": None}),
+                    lone_core):
         decision = decide(mailbox, ContractBroker(receipt=receipt))
         assert (decision["action"], decision["code"]) == (
             "blocked", "completion_unprovable_no_receipt"), receipt
@@ -494,7 +535,7 @@ def test_legacy_record_without_provenance_stays_held(tmp_path):
 
 
 @pytest.mark.parametrize("missing", ["runner_id", "posted_copies",
-                                     "prompt_sha256"])
+                                     "prompt_sha256", "sent_prompt_shas"])
 def test_provenance_missing_a_required_field_stays_held(tmp_path, missing):
     mailbox, prompt = make_held(tmp_path, prov_over={missing: None})
     decision = decide(mailbox, ContractBroker(receipt=good_receipt(prompt)))

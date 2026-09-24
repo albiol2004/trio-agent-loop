@@ -847,9 +847,10 @@ class BrokerClient:
     ) -> Any:
         """POST one ``input_fence`` event (completion-receipt servers only).
 
-        Proposed contract v1 (`.runtime/reconcile-completion-audit/
+        Proposed contract v1 rev 2 (`.runtime/reconcile-completion-audit/
         PROPOSED-CONTRACT.md` §3): ``close`` with the receipt values the
-        caller expects, or ``open`` with the same ``fence_id``. An old
+        caller expects, or ``open`` with the same ``fence_id``; the events
+        route answers 202 ``{"fenced": true, "fence": {...}}``. An old
         server answers 400 and a session without the opt-in label 409.
         """
         data: dict[str, Any] = {"action": action, "fence_id": fence_id}
@@ -858,7 +859,7 @@ class BrokerClient:
         path = f"/v1/sessions/{quote(session_id, safe='')}/events"
         return self._request(
             "POST", path, {"type": "input_fence", "data": data},
-            expected_status=200,
+            expected_status=202,
         )
 
     def delete_session(self, session_id: str) -> Any:

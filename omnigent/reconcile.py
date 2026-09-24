@@ -46,24 +46,24 @@ CONTRACT: dict[str, Any] = {
     "receipt_label": "omnigent.cursor_native.turn_receipt",
     "fence_label": "omnigent.input_fence",
     "receipt_version": 1,
+    # Revision 2 stored form: a compact core label + a detail label, both
+    # JSON strings on GET /v1/sessions/{id} -> labels (256-char limit).
+    "receipt_detail_label": "omnigent.cursor_native.turn_receipt.detail",
     "receipt_required": (
-        "v", "epoch", "turn_seq", "turn_end_count", "inject_count_at_end",
-        "inject_count", "injections", "injections_truncated",
-        "stop_reason", "transcript", "rev",
+        "v", "epoch", "turn_seq", "turn_end_count", "inject_count",
+        "inject_count_at_end", "rev", "stop_reason", "chat_id",
+        "received_seq",
     ),
-    "transcript_required": (
-        "store_max_rowid", "acked_through_rowid", "unacked_rowids",
-        "observed_max_acked",
+    "detail_required": (
+        "msg_digest", "msg_listed", "truncated", "model_cmds", "stop_raw",
+        "observed_max_acked", "store_max", "acked_through", "unacked",
     ),
-    # Server-stamped identity on the stored receipt.
-    "receipt_identity": ("runner_id", "external_session_id"),
-    "message_kind": "message",
 }
 
 # Provenance a record needs before any receipt can be bound to it.
 REQUIRED_PROVENANCE = (
     "role", "iteration", "mode", "prior_phase", "prompt_sha256",
-    "posted_copies", "session_id", "runner_id", "artifact_baseline",
+    "posted_copies", "sent_prompt_shas", "session_id", "runner_id", "artifact_baseline",
     "capabilities_at_dispatch",
 )
 
@@ -202,30 +202,49 @@ def _is_int(value: Any) -> bool:
 
 
 def parse_receipt(snapshot: Any) -> tuple[dict[str, Any] | None, str | None]:
-    """(receipt, None), (None, None) when absent, (None, problem) if bad."""
-    receipt, problem = _label_json(snapshot, CONTRACT["receipt_label"])
-    if problem or receipt is None:
+    """(receipt, None), (None, None) when absent, (None, problem) if bad.
+
+    The receipt is the core label with the detail label under ``detail``;
+    either one missing or malformed is a problem (the pair is written in
+    one atomic upsert, so a lone core is not a receipt).
+    """
+    core, problem = _label_json(snapshot, CONTRACT["receipt_label"])
+    if problem:
         return None, problem
-    if receipt.get("v") != CONTRACT["receipt_version"]:
-        return None, f"receipt.v is {receipt.get('v')!r}, not 1"
-    missing = [k for k in CONTRACT["receipt_required"] if k not in receipt]
-    transcript = receipt.get("transcript")
-    if not isinstance(transcript, dict):
-        missing.append("transcript")
-    else:
-        missing += [
-            f"transcript.{k}" for k in CONTRACT["transcript_required"]
-            if k not in transcript
-        ]
+    detail, detail_problem = _label_json(
+        snapshot, CONTRACT["receipt_detail_label"]
+    )
+    if core is None and detail is None:
+        return None, None
+    if detail_problem or core is None or detail is None:
+        return None, detail_problem or "receipt core/detail label missing"
+    if core.get("v") != CONTRACT["receipt_version"]:
+        return None, f"receipt.v is {core.get('v')!r}, not 1"
+    missing = [k for k in CONTRACT["receipt_required"] if k not in core]
+    missing += [
+        f"detail.{k}" for k in CONTRACT["detail_required"] if k not in detail
+    ]
     if missing:
         return None, "receipt missing " + ",".join(sorted(set(missing)))
     for key in ("epoch", "turn_seq", "turn_end_count", "inject_count_at_end",
-                "inject_count", "rev"):
-        if not _is_int(receipt.get(key)):
+                "inject_count", "rev", "received_seq"):
+        if not _is_int(core.get(key)):
             return None, f"receipt.{key} is not an integer"
-    if not isinstance(receipt.get("injections"), list):
-        return None, "receipt.injections is not a list"
-    return receipt, None
+    for key in ("msg_listed", "store_max", "acked_through", "unacked",
+                "model_cmds"):
+        if not _is_int(detail.get(key)):
+            return None, f"receipt detail.{key} is not an integer"
+    for key in ("truncated", "observed_max_acked"):
+        if not isinstance(detail.get(key), bool):
+            return None, f"receipt detail.{key} is not a boolean"
+    if not isinstance(detail.get("msg_digest"), str):
+        return None, "receipt detail.msg_digest is not a string"
+    return dict(core, detail=detail), None
+
+
+def message_digest(shas: list[str]) -> str:
+    """Contract R2: sha256 of the newline-joined message sha256 hex list."""
+    return hashlib.sha256("\n".join(shas).encode("utf-8")).hexdigest()
 
 
 def parse_fence(snapshot: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -273,6 +292,11 @@ def _provenance_problem(prov: Any) -> str | None:
         ]
     if not _is_int(prov.get("posted_copies")) or prov.get("posted_copies", 0) < 1:
         missing.append("posted_copies>=1")
+    sent = prov.get("sent_prompt_shas")
+    if not isinstance(sent, list) or len(sent) != prov.get("posted_copies") or (
+        any(sha != prov.get("prompt_sha256") for sha in sent)
+    ):
+        missing.append("sent_prompt_shas (one per posted copy)")
     if missing:
         return "provenance missing " + ",".join(sorted(set(missing)))
     return None
@@ -396,81 +420,57 @@ def decide(record: Any, obs: dict[str, Any]) -> dict[str, Any]:
         return _waiting("turn_not_ended", "no turn-end receipt yet "
                         "(idle status is not completion)")
 
-    # Rule 5: identity.
-    for key in CONTRACT["receipt_identity"]:
-        if receipt.get(key) in (None, ""):
-            return _blocked("completion_unprovable_no_receipt",
-                            f"receipt has no server-stamped {key}")
-    if receipt.get("chat_id") in (None, ""):
+    # Contract R1: identity from the snapshot's own fields + core chat_id.
+    chat = receipt.get("chat_id")
+    if chat in (None, ""):
         return _blocked("completion_unprovable_no_receipt",
                         "receipt chat_id is null (store not bound)")
-    if receipt.get("runner_id") != prov.get("runner_id"):
-        return _blocked("identity_mismatch", "receipt runner_id differs "
+    if snapshot.get("runner_id") in (None, "") or snapshot.get(
+        "runner_id"
+    ) != prov.get("runner_id"):
+        return _blocked("identity_mismatch", "session runner_id differs "
                         "from dispatch (relaunch or another writer)")
-    for key, rkey in (("external_session_id", "external_session_id"),
-                      ("external_session_id", "chat_id")):
-        want = prov.get(key)
-        if want not in (None, "") and receipt.get(rkey) != want:
-            return _blocked("identity_mismatch",
-                            f"receipt {rkey} differs from dispatch {key}")
-    if receipt.get("external_session_id") != receipt.get("chat_id"):
+    if snapshot.get("external_session_id") != chat:
+        return _blocked("identity_mismatch", "session external_session_id "
+                        "differs from the receipt chat_id")
+    if prov.get("external_session_id") not in (None, "") and chat != prov[
+        "external_session_id"
+    ]:
         return _blocked("identity_mismatch", "receipt chat_id differs from "
-                        "the server-stamped external_session_id")
+                        "dispatch external_session_id")
     if prov.get("terminal_epoch") is not None and receipt.get(
         "epoch"
     ) != prov.get("terminal_epoch"):
         return _blocked("identity_mismatch", "receipt epoch differs from "
                         "dispatch (terminal relaunched)")
-    if snapshot.get("runner_id") not in (None, receipt.get("runner_id")):
-        return _blocked("identity_mismatch", "session runner_id differs "
-                        "from the receipt runner_id")
 
-    # Contract R2: copies accounted; nothing after our first copy differs.
-    if receipt.get("injections_truncated") is not False:
+    # Contract R2: every message in the epoch is one Trio sent, in order.
+    detail = receipt["detail"]
+    if detail["truncated"] is not False:
         return _blocked("completion_unprovable_no_receipt",
                         "receipt injections list is truncated")
-    entries = receipt["injections"]
-    if not all(isinstance(i, dict) for i in entries):
-        return _blocked("completion_unprovable_no_receipt",
-                        "receipt injections has a non-object entry")
-    ours = prov["prompt_sha256"]
-    copies = prov["posted_copies"]
-    first = next(
-        (n for n, i in enumerate(entries) if i.get("sha256") == ours), None
-    )
-    if first is not None and any(
-        i.get("sha256") != ours for i in entries[first:]
-    ):
-        return _blocked("new_input_after_dispatch",
-                        "an injection after our first copy is not our prompt")
     if obs.get("foreign_user_rows"):
         return _blocked("new_input_after_dispatch",
                         f"{obs['foreign_user_rows']} user row(s) that are "
                         "not our prompt")
-    messages = [i for i in entries if i.get("kind") == CONTRACT["message_kind"]]
-    message_seqs = [i.get("message_seq") for i in messages]
-    if message_seqs != list(range(1, len(messages) + 1)):
+    sent = list(prov["sent_prompt_shas"])
+    count = receipt["inject_count"]
+    if detail["msg_listed"] != count:
         return _blocked("completion_unprovable_no_receipt",
-                        f"message_seq {message_seqs} is not 1..n in this epoch")
-    if receipt["inject_count"] != len(messages):
-        return _blocked("completion_unprovable_no_receipt",
-                        "receipt inject_count disagrees with injections")
-    our_copies = sum(1 for i in messages if i.get("sha256") == ours)
-    want_seqs = prov.get("inject_seqs") or []
-    ours_seqs = [i.get("seq") for i in entries if i.get("sha256") == ours]
-    if want_seqs and sorted(want_seqs) != ours_seqs[: len(want_seqs)]:
-        return _blocked("identity_mismatch", "injection seqs differ from "
-                        "the seqs returned at dispatch")
-    if our_copies > copies:
+                        f"detail.msg_listed {detail['msg_listed']} != "
+                        f"inject_count {count}")
+    if count > len(sent):
         return _blocked("new_input_after_dispatch",
-                        f"{our_copies} injections of our prompt for {copies} "
-                        "posted copies")
-    if our_copies < copies:
+                        f"{count} message injections for {len(sent)} sent")
+    if detail["msg_digest"] != message_digest(sent[:count]):
+        return _blocked("new_input_after_dispatch",
+                        "message injection digest is not the prompts Trio "
+                        "sent")
+    if count < len(sent):
         return _waiting("turn_not_ended",
-                        f"{our_copies} of {copies} posted copies injected")
+                        f"{count} of {len(sent)} sent copies injected")
 
     # Contract R3: every message injection ended (message units only).
-    count = receipt["inject_count"]
     if receipt["turn_end_count"] < count or receipt["inject_count_at_end"] < count:
         return _waiting("turn_not_ended",
                         f"turn_end_count {receipt['turn_end_count']} / "
@@ -479,15 +479,16 @@ def decide(record: Any, obs: dict[str, Any]) -> dict[str, Any]:
     if receipt["turn_end_count"] > count or receipt["inject_count_at_end"] > count:
         return _blocked("completion_unprovable_no_receipt",
                         "more turn-ends than injections (typed into pane?)")
+    if receipt["turn_seq"] != receipt["turn_end_count"]:
+        # The fence verifies `expect.turn_seq == expect.turn_end_count`.
+        return _blocked("completion_unprovable_no_receipt",
+                        "receipt turn_seq is not the latest turn end")
 
     # Contract R4: every observed row ACKed (necessary, never success).
-    transcript = receipt["transcript"]
     if not (
-        transcript.get("observed_max_acked") is True
-        and not transcript.get("unacked_rowids")
-        and _is_int(transcript.get("acked_through_rowid"))
-        and _is_int(transcript.get("store_max_rowid"))
-        and transcript["acked_through_rowid"] >= transcript["store_max_rowid"]
+        detail["observed_max_acked"] is True
+        and detail["unacked"] == 0
+        and detail["acked_through"] >= detail["store_max"]
     ):
         return _waiting("transcript_not_flushed",
                         "observed transcript rows not all ACKed")
@@ -501,7 +502,9 @@ def decide(record: Any, obs: dict[str, Any]) -> dict[str, Any]:
         "receipt": receipt_key(receipt),
         "rev": receipt.get("rev"),
         "stop_reason": receipt.get("stop_reason"),
-        "stop_status_raw": receipt.get("stop_status_raw"),
+        "stop_raw": receipt["detail"].get("stop_raw"),
+        "binding": "recorded_epoch" if prov.get("terminal_epoch") is not None
+        else "fresh_session",
     }
 
     # Rule 8: the artifact against the recorded baseline, attempt and pin.
@@ -989,7 +992,9 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     ):
         return _blocked("fence_unverified", "fence label not closed+verified "
                         "on re-read")
-    if receipt_key(receipt2) != key or receipt2["rev"] < receipt["rev"]:
+    if receipt_key(receipt2) != key or receipt2["rev"] < receipt["rev"] or (
+        receipt2["detail"]["observed_max_acked"] is not True
+    ):
         return _blocked("receipt_changed_after_fence",
                         f"{key} -> {receipt_key(receipt2)}")
 
