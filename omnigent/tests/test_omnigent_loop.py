@@ -701,24 +701,23 @@ def test_title_includes_slice_id_for_slice_eval(tmp_path: Path) -> None:
     )
 
 
-def test_run_retries_once_on_restart_blip_then_succeeds(
+def test_run_holds_restart_blip_instead_of_resending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: right after an Omnigent restart, a session went
-    idle+bound+running for a few seconds with zero items, then the broker
-    showed the runner unbound again (runner_id: None) — three Lead passes
-    were consumed this way. run() must retry once, silently, rather than
-    counting the blip as a completed pass."""
+    """Right after an Omnigent restart a session can show an unbound
+    runner (runner_id: None) and read back zero items even though the
+    submitted turn ran. run() must not re-send the prompt or open a
+    second session: it keeps the original session and holds it."""
     trioctl = load_trioctl()
     mailbox = make_mailbox(tmp_path)
-    sleep_calls: list[float] = []
-    monkeypatch.setattr(trioctl.time, "sleep", lambda s: sleep_calls.append(s))
+    monkeypatch.setattr(trioctl.time, "sleep", lambda s: None)
 
     class RestartBlipThenGoodClient:
         def __init__(self) -> None:
             self.creates = 0
             self.sends = 0
             self.waits = 0
+            self.deletes: list[str] = []
 
         def create(self, agent_id, model, message, title):
             self.creates += 1
@@ -727,9 +726,15 @@ def test_run_retries_once_on_restart_blip_then_succeeds(
         def send_message(self, session_id, prompt):
             self.sends += 1
 
+        def ensure_first_prompt(self, session_id, prompt):
+            self.sends += 1
+
+        def delete_session(self, session_id):
+            self.deletes.append(session_id)
+
         def wait(self, session_id, timeout=None, interval=None):
             self.waits += 1
-            # First wait is the restart blip; reuse the same session.
+            # First wait is the restart blip; a later one would be good.
             if self.waits == 1:
                 return {"id": session_id, "status": "idle", "runner_id": None}
             return {"id": session_id, "status": "idle", "runner_id": "runner-1"}
@@ -737,8 +742,6 @@ def test_run_retries_once_on_restart_blip_then_succeeds(
         def get_items(self, session_id):
             if self.waits <= 1:
                 return {"items": []}
-            with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
-                log.write("- iter 1 | lead | completed\n")
             return {"items": [{"role": "assistant", "content": "lead"}]}
 
     client = RestartBlipThenGoodClient()
@@ -746,24 +749,36 @@ def test_run_retries_once_on_restart_blip_then_succeeds(
     monkeypatch.setattr(runner, "_agent_id", lambda role: "lead-agent")
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "lead-model")
 
-    result = runner.run("lead", 1, mailbox)
+    with pytest.raises(trioctl.TrioctlError, match="held dispatch"):
+        runner.run("lead", 1, mailbox)
 
-    assert result == 0
     assert client.creates == 1  # same session, never a duplicate
-    assert client.sends == 1
-    assert client.waits == 2
-    assert sleep_calls == [10.0]
+    assert client.sends == 0  # the create carried the only copy
+    assert client.waits == 1
+    assert client.deletes == []
+    assert runner.held_session_ids == ["session-1"]
+    held = json.loads(
+        (mailbox / ".sessions" / "held-session-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert held["hold"] == "role_completion_uncertain"
+    assert held["session_id"] == "session-1"
+    assert "status: needs_human" in (mailbox / "STATE.md").read_text(
+        encoding="utf-8"
+    )
 
 
-def test_run_fails_after_second_consecutive_restart_blip(
+def test_run_restart_blip_accepts_a_fresh_role_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A blip on the retry too is a real failure, not another retry."""
+    """A blip read after the role already wrote its artifact is that
+    role's result: no re-send, no hold, no second session."""
     trioctl = load_trioctl()
     mailbox = make_mailbox(tmp_path)
     monkeypatch.setattr(trioctl.time, "sleep", lambda s: None)
 
-    class AlwaysBlipClient:
+    class BlipAfterArtifactClient:
         def __init__(self) -> None:
             self.creates = 0
             self.sends = 0
@@ -776,21 +791,22 @@ def test_run_fails_after_second_consecutive_restart_blip(
             self.sends += 1
 
         def wait(self, session_id, timeout=None, interval=None):
+            with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
+                log.write("- iter 1 | lead | completed\n")
             return {"id": session_id, "status": "idle", "runner_id": None}
 
         def get_items(self, session_id):
             return {"items": []}
 
-    client = AlwaysBlipClient()
+    client = BlipAfterArtifactClient()
     runner = trioctl.OmnigentRunner(repo=tmp_path, broker_client=client)
     monkeypatch.setattr(runner, "_agent_id", lambda role: "lead-agent")
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "lead-model")
 
-    result = runner.run("lead", 1, mailbox)
-
-    assert result == 1
-    assert client.creates == 1  # no duplicate session
-    assert client.sends == 1  # one same-session repost, then stop
+    assert runner.run("lead", 1, mailbox) == 0
+    assert client.creates == 1
+    assert client.sends == 0
+    assert runner.held_session_ids == []
 
 
 def test_create_forwards_runner_id_when_client_supports_it(tmp_path: Path) -> None:

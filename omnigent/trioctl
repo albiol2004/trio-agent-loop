@@ -2610,11 +2610,10 @@ class OmnigentRunner:
     ) -> int:
         """Create, await, and read one Lead, Evaluator, or repair session.
 
-        A restart blip (unbound runner, zero items back) is retried once
-        on the **same** session: re-post the prompt after a short delay.
-        Creating a second session for the same role/iteration is what
-        left duplicate Leads and `phase: error` in the 0.14 trial.
-        A second miss in a row is a real failure and returns 1.
+        The prompt is POSTed once and never re-sent. A restart blip
+        (unbound runner, zero items back) after the wait does not prove
+        the turn never ran, so the session is kept and held as
+        ``role_completion_uncertain``; no second session is created.
         """
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
@@ -2698,17 +2697,16 @@ class OmnigentRunner:
             snapshot, items = self._create_wait_read(
                 client, agent_id, model, prompt, title, role, started
             )
-            if _session_status(snapshot) not in SESSION_FAILURE_STATUSES and (
-                self._is_restart_blip(snapshot, items)
-            ):
-                time.sleep(10.0)
-                snapshot, items = self._repost_wait_read(
-                    client, role, prompt
-                )
             if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
                 return 1
             if self._is_restart_blip(snapshot, items):
-                return 1
+                # Empty items on an unbound runner do not prove the turn
+                # never ran: hold the session below, never re-send.
+                raise TrioctlError(
+                    f"session {self.session_ids.get(role)}: runner "
+                    "unbound and no items after the wait; the prompt "
+                    "was already submitted and is not re-sent"
+                )
             # Same session: wait is not role completion. Keep polling
             # until LOG.md / VERDICT.md shows this pass's artifact.
             snapshot = self._wait_for_role_artifact(
@@ -2876,30 +2874,6 @@ class OmnigentRunner:
                 if remaining > 0:
                     time.sleep(min(self._interval, remaining))
         return snapshot
-
-    def _repost_wait_read(
-        self, client: Any, role: str, prompt: str
-    ) -> tuple[Any, Any]:
-        """Re-post the first prompt on the existing session, then wait."""
-        session_id = self.session_ids.get(role)
-        if not session_id:
-            raise TrioctlError(
-                f"restart-blip retry has no session id for role {role}"
-            )
-        send = getattr(client, "send_message", None)
-        if send is not None:
-            delivery = self._delivery.get(role)
-            if delivery is not None:
-                delivery["extra_sends"] = (
-                    int(delivery.get("extra_sends") or 0) + 1
-                )
-            send(session_id, prompt)
-        ensure = getattr(client, "ensure_first_prompt", None)
-        if ensure is not None:
-            ensure(session_id, prompt)
-        snapshot = self._wait(client, session_id)
-        items = self._read(client, session_id)
-        return snapshot, items
 
 
 def _load_trio_loop(repo: Path) -> Any:

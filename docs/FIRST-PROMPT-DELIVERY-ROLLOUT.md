@@ -30,9 +30,12 @@ on apply; already-running loops keep their loaded pin.
 2. **Landed:** a user row equals the prompt after paste-style
    normalize (CRLF→LF, drop controls except tab, strip). Presence
    of any user row or an assistant row is not enough.
-3. **Known miss (may re-post):** every posted copy produced a
-   user row and none matches (truncated paste, paste-end marker).
-   Cap: `TRIO_OMNIGENT_PROMPT_ATTEMPTS` (default 3).
+3. **No re-post, ever:** a saved user row that does not match
+   (DEL-prefixed, truncated, foreign) may be a turn that ran, so
+   it holds like a missing row. After the wait, an unbound runner
+   with no items (restart blip) holds the same session as
+   `role_completion_uncertain`; it is not re-sent.
+   `TRIO_OMNIGENT_PROMPT_ATTEMPTS` is deprecated and not read.
 4. **Uncertain (never re-post, never DELETE):** no matching row
    yet when the **single** deadline ends. Default wait
    `TRIO_OMNIGENT_PROMPT_WAIT` **600s**, also capped by the
