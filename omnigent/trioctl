@@ -19,7 +19,7 @@ import sys
 import time
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 VERSION = "0.5.0"
 ROLES = ("lead", "evaluator", "builder", "scout", "docs")
@@ -1277,11 +1277,17 @@ def _read_session_ids_file(path: Path) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-# An uncertain first-prompt dispatch (broker_http.PromptDeliveryUncertain)
-# is recorded as `<mailbox>/.sessions/held-<session id>.json` before the run
-# exits. Cleanup never removes it; while one exists no role is dispatched
-# for the mailbox (`loop` exits HELD_DISPATCH_EXIT). A person resolves it.
+# An uncertain first-prompt dispatch (broker_http.PromptDeliveryUncertain),
+# or a delivered prompt whose role did not finish within the run (timeout,
+# broker loss), is recorded as `<mailbox>/.sessions/held-<session id>.json`
+# before the run exits. Cleanup never removes it; while one exists no role
+# is dispatched for the mailbox (`loop` exits HELD_DISPATCH_EXIT). A person
+# resolves it.
 HELD_DISPATCH_EXIT = 7
+HELD_REASONS = {
+    "first_prompt_uncertain": "first-prompt delivery uncertain",
+    "role_completion_uncertain": "prompt delivered, role completion uncertain",
+}
 
 
 def _held_record_path(mailbox: Path, session_id: str) -> Path:
@@ -1326,10 +1332,13 @@ def _mark_mailbox_held(mailbox: Path, record: dict[str, Any], path: Path) -> Non
     )
     if text and not text.endswith("\n"):
         text += "\n"
+    reason = HELD_REASONS.get(
+        record.get("hold"), HELD_REASONS["first_prompt_uncertain"]
+    )
     text += (
         f"- iter {record.get('iteration', '?')} | loop | held "
         f"{record.get('role', '?')} session {record['session_id']}: "
-        f"first-prompt delivery uncertain; see {path.name}\n"
+        f"{reason}; see {path.name}\n"
     )
     log.write_text(text, encoding="utf-8")
     state = mailbox / "STATE.md"
@@ -1368,8 +1377,9 @@ def _held_dispatch_message(mailbox: Path) -> str | None:
     if not held:
         return None
     lines = [
-        f"{mailbox.name}: a role prompt was dispatched but its delivery is "
-        "uncertain; it may still be running. Not dispatching another role."
+        f"{mailbox.name}: a role prompt was dispatched but its delivery or "
+        "completion is uncertain; it may still be running. Not dispatching "
+        "another role."
     ]
     for path, record in held:
         detail = ", ".join(
@@ -2428,6 +2438,7 @@ class OmnigentRunner:
         else:
             before_text = _mailbox_text(mailbox / "VERDICT.md")
             before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
+        created_before = len(self.created_session_ids)
         try:
             snapshot, items = self._create_wait_read(
                 client, agent_id, model, prompt, title, role, started
@@ -2458,56 +2469,96 @@ class OmnigentRunner:
         except broker_http.PromptDeliveryUncertain as exc:
             # A copy may still be queued or running: never re-dispatch
             # or prune it; record it durably and stop for a human.
-            self.held_session_ids.append(exc.session_id)
-            record = {
-                "session_id": exc.session_id,
-                "role": role,
-                "iteration": iteration,
-                "title": title,
-                "reason": str(exc),
-                "recorded_at": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                ),
-            }
-            for key, field in (
-                ("evaluator_attempt", "attempt"),
-                ("pinned_sha", "pinned_sha"),
-                ("kind", "kind"),
-                ("slice", "slice"),
+            self._hold_dispatch(
+                mailbox, exc.session_id, role, iteration, title, context,
+                exc, "first_prompt_uncertain",
+            )
+        except (TrioctlError, broker_http.BrokerHttpError) as exc:
+            session_id = (
+                self.created_session_ids[-1]
+                if len(self.created_session_ids) > created_before
+                else None
+            )
+            if session_id is None:
+                # Nothing was delivered (or create said so definitely).
+                if isinstance(exc, TrioctlError):
+                    raise
+                raise TrioctlError(str(exc)) from exc
+            # Delivered is not completed. Last-chance accept: a fresh,
+            # valid artifact for this attempt/pin is this role's result
+            # even when a wait raised at the deadline. Repair has no
+            # artifact check (only session idle), so it is never accepted.
+            if role != "repair" and _role_artifact_ready(
+                mailbox, role, iteration, before_text, before_mtime, context
             ):
-                if context and context.get(key):
-                    record[field] = context[key]
-            try:
-                path = _write_held_record(mailbox, record)
-            except OSError as write_exc:
-                # No durable record: still try to stop a resume via STATE.
-                try:
-                    _mark_mailbox_held(
-                        mailbox,
-                        record,
-                        _held_record_path(mailbox, exc.session_id),
-                    )
-                except OSError:
-                    pass
-                raise TrioctlError(
-                    f"{exc}; could NOT record the held dispatch "
-                    f"({write_exc}): do not resume {mailbox.name} until "
-                    f"session {exc.session_id} is resolved"
-                ) from exc
-            try:
-                _mark_mailbox_held(mailbox, record, path)
-            except OSError as mark_exc:
-                print(
-                    f"trioctl: could not update LOG.md/STATE.md for the "
-                    f"held dispatch ({mark_exc}); {path} still blocks resume",
-                    file=sys.stderr,
-                )
-            raise TrioctlError(f"{exc}; held dispatch recorded at {path}") from exc
-        except broker_http.BrokerHttpError as exc:
-            raise TrioctlError(str(exc)) from exc
+                return 0
+            # The pane may still be working: no DELETE, no new dispatch.
+            self._hold_dispatch(
+                mailbox, session_id, role, iteration, title, context,
+                exc, "role_completion_uncertain",
+            )
         if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
             return 1
         return 0
+
+    def _hold_dispatch(
+        self,
+        mailbox: Path,
+        session_id: str,
+        role: str,
+        iteration: int,
+        title: str,
+        context: dict[str, Any] | None,
+        exc: Exception,
+        hold: str,
+    ) -> NoReturn:
+        """Record a dispatch that may still run, mark STATE, and raise."""
+        self.held_session_ids.append(session_id)
+        record = {
+            "session_id": session_id,
+            "role": role,
+            "iteration": iteration,
+            "title": title,
+            "hold": hold,
+            "reason": str(exc),
+            "recorded_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+        }
+        for key, field in (
+            ("evaluator_attempt", "attempt"),
+            ("pinned_sha", "pinned_sha"),
+            ("kind", "kind"),
+            ("slice", "slice"),
+        ):
+            if context and context.get(key):
+                record[field] = context[key]
+        try:
+            path = _write_held_record(mailbox, record)
+        except OSError as write_exc:
+            # No durable record: still try to stop a resume via STATE.
+            try:
+                _mark_mailbox_held(
+                    mailbox,
+                    record,
+                    _held_record_path(mailbox, session_id),
+                )
+            except OSError:
+                pass
+            raise TrioctlError(
+                f"{exc}; could NOT record the held dispatch "
+                f"({write_exc}): do not resume {mailbox.name} until "
+                f"session {session_id} is resolved"
+            ) from exc
+        try:
+            _mark_mailbox_held(mailbox, record, path)
+        except OSError as mark_exc:
+            print(
+                f"trioctl: could not update LOG.md/STATE.md for the "
+                f"held dispatch ({mark_exc}); {path} still blocks resume",
+                file=sys.stderr,
+            )
+        raise TrioctlError(f"{exc}; held dispatch recorded at {path}") from exc
 
     def _wait_for_role_artifact(
         self,
@@ -2759,8 +2810,8 @@ def command_loop(args: argparse.Namespace) -> int:
             )
             for session_id in sorted(held):
                 print(
-                    f"trioctl: kept session {session_id}: first-prompt "
-                    "delivery uncertain; held record "
+                    f"trioctl: kept session {session_id}: delivery or role "
+                    "completion uncertain; held record "
                     f"{_held_record_path(mailbox, session_id)}",
                     file=sys.stderr,
                 )
