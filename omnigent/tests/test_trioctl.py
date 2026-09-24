@@ -1147,13 +1147,13 @@ def test_ambiguous_prompt_post_without_row_is_held(fake_broker, monkeypatch):
     assert state["deletes"] == []
 
 
-def test_http_error_on_prompt_post_is_definite_and_deletes(
+def test_4xx_on_prompt_post_is_definite_and_deletes(
     fake_broker, monkeypatch
 ):
-    """An HTTP error status is the broker refusing it: nothing queued."""
+    """A 4xx is the broker refusing it before queueing: nothing queued."""
     trioctl = load_trioctl()
     base_url, state = fake_broker
-    state["event_outcome"] = 502
+    state["event_outcome"] = 409
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
     client = trioctl.broker_http.BrokerClient(base_url)
 
@@ -1161,9 +1161,27 @@ def test_http_error_on_prompt_post_is_definite_and_deletes(
         client.create_session("agent-1", "model-1", "hi", "title")
 
     assert isinstance(exc.value, trioctl.broker_http.PromptDeliveryFailed)
-    assert exc.value.status_code == 502
+    assert exc.value.status_code == 409
     assert state["events"] == []
     assert state["deletes"] == ["/v1/sessions/session-1"]
+
+
+def test_502_on_prompt_post_is_ambiguous_and_held(fake_broker, monkeypatch):
+    """A 502 may follow a forward the runner accepted: held, no DELETE."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["event_outcome"] = 502
+    state["item_rows"] = []
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.3")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.05")
+    client = trioctl.broker_http.BrokerClient(base_url)
+
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as exc:
+        client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert exc.value.session_id == "session-1"
+    assert state["deletes"] == []
 
 
 def test_omnigent_contract_probe_prefers_subagent_spec():

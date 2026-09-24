@@ -65,14 +65,16 @@ def _prompt_interval() -> float:
 def _definite_rejection(exc: BaseException) -> bool:
     """True when POST /events was refused and nothing was queued.
 
-    Omnigent 0.14 answers 4xx before recording a pending entry, and 502
-    when the runner forward fails, after rolling the entry back
-    (routes/_sessions/orchestration.py ~6156, _forward_native_terminal_
-    message). Any other status (e.g. 500 from post-forward routing
-    bookkeeping) or a transport failure may follow an accepted forward.
+    Omnigent 0.14 answers 4xx only before recording a pending entry. A
+    502 is not definite: _forward_native_terminal_message maps httpx
+    ReadTimeout (30 s) and a tunnel drop after delivery to 502, and its
+    rollback clears only the server queue entry, while the runner has
+    already started the turn (runner/app.py post_session_events). A
+    proxy 502 can also follow an accepted forward. So 502, any other
+    status and a transport failure may follow an accepted forward.
     """
     code = getattr(exc, "status_code", None)
-    return isinstance(code, int) and (400 <= code < 500 or code == 502)
+    return isinstance(code, int) and 400 <= code < 500
 
 
 def _prompt_attempts() -> int:

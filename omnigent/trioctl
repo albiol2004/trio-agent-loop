@@ -2480,6 +2480,15 @@ class OmnigentRunner:
             try:
                 path = _write_held_record(mailbox, record)
             except OSError as write_exc:
+                # No durable record: still try to stop a resume via STATE.
+                try:
+                    _mark_mailbox_held(
+                        mailbox,
+                        record,
+                        _held_record_path(mailbox, exc.session_id),
+                    )
+                except OSError:
+                    pass
                 raise TrioctlError(
                     f"{exc}; could NOT record the held dispatch "
                     f"({write_exc}): do not resume {mailbox.name} until "

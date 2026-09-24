@@ -459,15 +459,69 @@ def test_every_copy_mangled_fails_closed_after_attempts(clock):
     assert broker.deletes == [f"/v1/sessions/{SID}"]
 
 
-def test_failed_post_rolls_back_and_deletes(clock):
-    """HTTP error from the forward: pending rolled back, nothing queued."""
+def _accept_then_502(broker: Native014Broker, *which: int) -> None:
+    """POST #n in ``which``: the runner accepted the copy (the turn will
+    run), but the server's forward saw ReadTimeout / a tunnel drop ->
+    502 and rolled its pending entry back (0.14 orchestration.py
+    _forward_native_terminal_message; the rollback never reaches the
+    runner)."""
+    original = Native014Broker.send_message
+
+    def send(self, session_id, message):
+        n = len(self.posts) + 1
+        original(self, session_id, message)
+        if n in which:
+            self.pi.resolve_oldest(SID)
+            raise BrokerHttpError(
+                "POST events failed with HTTP 502", status_code=502
+            )
+
+    broker.send_message = send.__get__(broker)
+
+
+def test_never_forwarded_502_is_held_not_deleted(clock):
+    """A 502 cannot be told apart from accepted-then-502 (G1d): even a
+    copy that never reached the runner ends held after the wait."""
     broker = Native014Broker(clock, forward_fails=True)
 
     error = _create(broker)
 
-    assert error is not None and "502" in str(error)
+    assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert error.session_id == SID
     assert broker.pi.snapshot_for(SID) == []
-    assert broker.deletes == [f"/v1/sessions/{SID}"]
+    assert broker.turns == []
+    assert broker.posts == [0.0]
+    assert broker.deletes == []
+
+
+def test_initial_post_502_after_runner_accepted_is_not_deleted(clock):
+    """G1a: the copy ran although the POST answered 502."""
+    broker = Native014Broker(clock, row_lag=35.0)
+    _accept_then_502(broker, 1)
+
+    error = _create(broker)
+
+    assert broker.turns == [PROMPT]
+    assert error is None or isinstance(
+        error, trioctl.broker_http.PromptDeliveryUncertain
+    )
+    assert len(broker.posts) == 1
+    assert broker.deletes == []
+
+
+def test_corrective_post_502_after_runner_accepted_is_not_deleted(clock):
+    """G1b: same for the corrective re-post after a known miss."""
+    broker = Native014Broker(
+        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0
+    )
+    _accept_then_502(broker, 2)
+
+    error = _create(broker, PADDED)
+
+    assert broker.turns.count(PADDED) == 1
+    assert len(broker.posts) == 2
+    assert not isinstance(error, trioctl.broker_http.PromptDeliveryFailed)
+    assert broker.deletes == []
 
 
 # -- uncertain: an unaccounted copy -> no re-post, no delete ------------
@@ -552,24 +606,31 @@ def test_ambiguous_corrective_post_never_deletes(clock, fate):
         assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
 
 
-def test_definite_corrective_rejection_fails_and_deletes(clock):
+@pytest.mark.parametrize("status", [409, 502])
+def test_corrective_rejection_only_4xx_fails_and_deletes(clock, status):
     """Every earlier copy is accounted for (mangled) and the corrective
-    POST is refused (502, rolled back): a known failure."""
+    POST is refused with nothing forwarded. Only a 4xx is definite (0.14
+    raises none after the forward); a 502 is held, not deleted."""
     broker = Native014Broker(clock, corrupt=("head",), row_lag=5.0)
     original = Native014Broker.send_message
 
     def refuse_second(self, session_id, message):
         if self.posts:
             self.posts.append(round(self.clock.now, 1))
-            raise BrokerHttpError("HTTP 502", status_code=502)
+            raise BrokerHttpError(f"HTTP {status}", status_code=status)
         return original(self, session_id, message)
 
     broker.send_message = refuse_second.__get__(broker)
     error = _create(broker, PADDED)
 
-    assert isinstance(error, trioctl.broker_http.PromptDeliveryFailed)
-    assert error.status_code == 502
-    assert broker.deletes == [f"/v1/sessions/{SID}"]
+    if status < 500:
+        assert isinstance(error, trioctl.broker_http.PromptDeliveryFailed)
+        assert error.status_code == status
+        assert broker.deletes == [f"/v1/sessions/{SID}"]
+    else:
+        assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+        assert broker.deletes == []
+    assert len(broker.posts) == 2
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, None])
@@ -950,6 +1011,65 @@ def test_run_loop_resume_refuses_lead_and_evaluator_while_held(
     with pytest.raises(trioctl.TrioctlError, match="Not dispatching"):
         core.run_loop(mailbox, 3, resume, repo=None)
     assert creates == []
+
+
+def test_resume_after_accepted_502_does_not_dispatch_second_lead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
+) -> None:
+    """G1c: a Lead copy accepted then answered 502, with no user row by
+    the end of the wait, is held (STATE needs_human, no DELETE), so a
+    resume creates no second Lead while it runs. (If the row mirrors in
+    time the copy counts as landed, exactly as after a 202.)"""
+    core = trioctl._load_trio_loop(HERE.parents[1])
+    mailbox = tmp_path / "loop"
+    mailbox.mkdir()
+    (mailbox / "LOG.md").write_text("# Trio loop log\n", encoding="utf-8")
+    (mailbox / "VERDICT.md").write_text("VERDICT: none\n", encoding="utf-8")
+    (mailbox / "STATE.md").write_text(
+        "iteration: 0\nstatus: ready\nphase: idle\n", encoding="utf-8"
+    )
+    first = Native014Broker(clock, row_lag=500.0)
+    _accept_then_502(first, 1)
+    runner = _runner(tmp_path, first, monkeypatch, timeout=120.0)
+    with pytest.raises(trioctl.TrioctlError, match="held dispatch"):
+        core.run_loop(mailbox, 3, runner, repo=None)
+    first.run_until(clock.now + 1000)
+    assert first.turns == [PROMPT]  # the first Lead copy runs
+    assert first.deletes == []
+    assert (mailbox / ".sessions" / f"held-{SID}.json").is_file()
+    assert "status: needs_human" in (mailbox / "STATE.md").read_text("utf-8")
+
+    second = Native014Broker(clock, row_lag=5.0)
+    creates: list[str] = []
+    original = second.create_session
+    second.create_session = lambda *a, **k: (creates.append(a[0]), original(*a, **k))[1]
+    resume = _runner(tmp_path, second, monkeypatch, timeout=60.0)
+    assert core.run_loop(mailbox, 3, resume, repo=None) == 5  # needs_human
+    assert creates == []
+
+
+def test_held_record_write_failure_still_marks_needs_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
+) -> None:
+    """N1: no durable record (OSError) -> STATE still set to needs_human."""
+    mailbox = _mailbox(tmp_path)
+    (mailbox / "STATE.md").write_text(
+        "iteration: 1\nstatus: running\nphase: lead-running\n",
+        encoding="utf-8",
+    )
+    broker = Native014Broker(clock, ready_at=None)
+    runner = _runner(tmp_path, broker, monkeypatch, timeout=300.0)
+
+    def fail(mailbox, record):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(trioctl, "_write_held_record", fail)
+    with pytest.raises(trioctl.TrioctlError, match="could NOT record"):
+        runner.run("lead", 1, mailbox)
+
+    state = (mailbox / "STATE.md").read_text("utf-8")
+    assert "status: needs_human" in state and "running" not in state
+    assert broker.deletes == []
 
 
 def test_unreadable_held_record_skips_prune(
