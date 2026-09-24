@@ -1805,6 +1805,8 @@ class OmnigentRunner:
         self._observe = observe
         self.session_ids: dict[str, str] = {}
         self.created_session_ids: list[str] = []
+        # First-prompt delivery uncertain: kept out of post-loop prune.
+        self.held_session_ids: list[str] = []
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -2049,10 +2051,12 @@ class OmnigentRunner:
         runner_id: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
+        prompt_timeout: float | None = None,
     ) -> Any:
         """Call the checked-in client seam or a small test double.
 
-        Extra kwargs (`runner_id`, `host_id`, `workspace`) are forwarded
+        Extra kwargs (`runner_id`, `host_id`, `workspace`,
+        `prompt_timeout`) are forwarded
         only when the target method declares them (or accepts **kwargs).
         The fakes in test_omnigent_loop.py take the legacy 4-argument
         shape and must keep working unchanged.
@@ -2069,6 +2073,8 @@ class OmnigentRunner:
             extra["host_id"] = host_id
         if workspace:
             extra["workspace"] = workspace
+        if prompt_timeout is not None:
+            extra["prompt_timeout"] = prompt_timeout
         if extra:
             try:
                 params = inspect.signature(method).parameters
@@ -2197,6 +2203,7 @@ class OmnigentRunner:
             runner_id=self._runner_id,
             host_id=self._host_id,
             workspace=self._workspace,
+            prompt_timeout=self._timeout,
         )
         session_id = self._session_id(created)
         if session_id is None:
@@ -2319,6 +2326,11 @@ class OmnigentRunner:
                 before_mtime,
                 context,
             )
+        except broker_http.PromptDeliveryUncertain as exc:
+            # A copy may still be queued or running: never re-dispatch
+            # or prune it; stop and surface the session for a human.
+            self.held_session_ids.append(exc.session_id)
+            raise TrioctlError(str(exc)) from exc
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
@@ -2562,6 +2574,14 @@ def command_loop(args: argparse.Namespace) -> int:
         if not keep_sessions:
             created = list(getattr(runner, "created_session_ids", []) or [])
             created.extend(_read_session_ids_file(ids_file))
+            held = set(getattr(runner, "held_session_ids", []) or [])
+            for session_id in sorted(held):
+                print(
+                    f"trioctl: kept session {session_id}: first-prompt "
+                    "delivery uncertain; inspect before deleting",
+                    file=sys.stderr,
+                )
+            created = [sid for sid in created if sid not in held]
             _run_post_loop_session_prune(
                 mailbox, getattr(args, "base_url", None), created,
                 keep_unarchived=getattr(args, "keep_unarchived", False),

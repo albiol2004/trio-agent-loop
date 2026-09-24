@@ -46,8 +46,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _prompt_wait() -> float:
-    """Seconds to wait for the first user item per attempt."""
-    return _env_float("TRIO_OMNIGENT_PROMPT_WAIT", 20.0)
+    """Longest wait for an unaccounted first-prompt copy.
+
+    Default is Omnigent 0.14's pending-input TTL; archived user rows
+    arrived up to 573 s after create.
+    """
+    return _env_float("TRIO_OMNIGENT_PROMPT_WAIT", 600.0)
 
 
 def _prompt_interval() -> float:
@@ -95,23 +99,21 @@ def _item_role(item: Any) -> str:
     return nested.lower() if isinstance(nested, str) else ""
 
 
-def _items_contain_user_text(items: list[Any], message: str) -> bool:
-    """True when a user row matches the prompt, or any empty user row.
+def _prompt_text(text: str) -> str:
+    """Normalize like the cursor paste: CR/CRLF to LF, controls but tab dropped."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        ch for ch in text if ch in "\n\t" or ord(ch) >= 0x20
+    ).strip()
 
-    Match the first 200 chars of the prompt against item text. A user
-    row with no body still counts as landed (cold TUI ACK with no
-    content yet). A user row with a different body is not a hit.
-    """
-    needle = message.strip()[:200]
-    for item in items:
-        if _item_role(item) != "user":
-            continue
-        text = _item_text(item).strip()
-        if not text:
-            return True
-        if needle and (needle in text or text in needle):
-            return True
-    return False
+
+def _user_row_texts(items: list[Any]) -> list[str]:
+    """Normalized bodies of every user row, empty ones included."""
+    return [
+        _prompt_text(_item_text(item))
+        for item in items
+        if _item_role(item) == "user"
+    ]
 
 
 def _item_text(item: Any) -> str:
@@ -138,36 +140,24 @@ def _item_text(item: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _pending_inputs(snapshot: Any) -> list[Any]:
-    """Pending composer inputs from a session snapshot."""
-    if not isinstance(snapshot, dict):
-        return []
-    pending = snapshot.get("pending_inputs")
-    return pending if isinstance(pending, list) else []
-
-
-def _snapshot_status(snapshot: Any) -> str:
-    """Lower-cased session status, or empty."""
-    if not isinstance(snapshot, dict):
-        return ""
-    status = snapshot.get("status")
-    return status.lower() if isinstance(status, str) else ""
-
-
-def _runner_bound(snapshot: Any) -> bool:
-    """A missing ``runner_id`` field counts as bound (older brokers)."""
-    if not isinstance(snapshot, dict) or "runner_id" not in snapshot:
-        return True
-    value = snapshot.get("runner_id")
-    return isinstance(value, str) and bool(value.strip())
-
-
 class BrokerHttpError(RuntimeError):
     """An actionable failure while talking to the broker."""
 
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class PromptDeliveryUncertain(BrokerHttpError):
+    """A first-prompt copy is unaccounted for: it may still run.
+
+    The session is left alive (never re-posted, never deleted) so a
+    queued or running copy is not duplicated or killed mid-work.
+    """
+
+    def __init__(self, message: str, session_id: str):
+        super().__init__(message)
+        self.session_id = session_id
 
 
 def _expired(expires_at: object) -> bool:
@@ -438,6 +428,7 @@ class BrokerClient:
         runner_id: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
+        prompt_timeout: float | None = None,
     ) -> Any:
         """Create one session on a dedicated host runner.
 
@@ -451,9 +442,11 @@ class BrokerClient:
 
         After POST, the session id is written to
         ``TRIO_MAILBOX_SESSION_IDS`` before bind/dispatch. Any later
-        failure deletes the session so the loop does not leave orphans.
-        The first user prompt is re-posted to the same session if it
-        does not appear in items (cold cursor-native race).
+        failure deletes the session so the loop does not leave orphans,
+        except :class:`PromptDeliveryUncertain`, which keeps it. The
+        first prompt is re-posted to the same session only on a known
+        miss (see :meth:`ensure_first_prompt`); ``prompt_timeout`` caps
+        its wait (the caller's role timeout).
         """
         workdir = workspace or os.getcwd()
         preferred_source = "--runner-id"
@@ -508,8 +501,13 @@ class BrokerClient:
                     created.setdefault("id", session_id)
 
             self.send_message(session_id, message)
-            self.ensure_first_prompt(session_id, message)
+            wait = _prompt_wait()
+            if prompt_timeout is not None:
+                wait = min(wait, prompt_timeout)
+            self.ensure_first_prompt(session_id, message, wait_seconds=wait)
             return created
+        except PromptDeliveryUncertain:
+            raise
         except Exception:
             if session_id:
                 self._delete_started_session(session_id)
@@ -623,70 +621,57 @@ class BrokerClient:
         wait_seconds: float | None = None,
         interval: float | None = None,
     ) -> None:
-        """Re-post the first prompt on the same session if it is missing.
+        """Return once a user row equals the prompt; re-post only a known miss.
 
-        Cold cursor-native sessions often ACK the event while the TUI
-        is still on the welcome screen. Creating a second session makes
-        the race worse; retry the same id instead.
+        The caller already POSTed once. On Omnigent 0.14 a 2xx POST only
+        queues the copy for injection; the user row, mirrored from
+        Cursor's own chat store, is the only receipt and records what
+        Cursor actually received. ``pending_inputs`` drains on *any* user
+        row and ``running`` is PTY activity, so neither shows integrity,
+        and a re-post while a copy is queued or running later runs as a
+        whole extra turn (canary 6f173b9d; live s2 POST #3).
+
+        Landed: a user row equal to the prompt, normalized as the cursor
+        paste encoder does. Known miss: every accepted POST has produced a
+        user row and none matches (e.g. a head-truncated paste) -- re-post,
+        up to ``attempts`` copies, then raise :class:`BrokerHttpError`.
+        Otherwise a copy is unaccounted for: wait up to ``wait_seconds``
+        from the last POST, then raise :class:`PromptDeliveryUncertain`
+        without re-posting. A runner restart or a welcome-screen drop
+        that leaves no row cannot be told apart from a slow turn here, so
+        it ends as uncertain rather than being retried.
         """
         tries = attempts if attempts is not None else _prompt_attempts()
-        window = (
-            wait_seconds if wait_seconds is not None else _prompt_wait()
+        ceiling = max(
+            wait_seconds if wait_seconds is not None else _prompt_wait(), 0.0
         )
         poll = interval if interval is not None else _prompt_interval()
-        for attempt in range(tries):
-            if self._first_prompt_visible(session_id, message, window, poll):
-                return
-            if attempt + 1 >= tries:
-                break
-            self.send_message(session_id, message)
-        raise BrokerHttpError(
-            f"cannot start session: first prompt did not land on "
-            f"{session_id} after {tries} attempt(s)"
-        )
-
-    def _first_prompt_visible(
-        self,
-        session_id: str,
-        message: str,
-        wait_seconds: float,
-        interval: float,
-    ) -> bool:
-        """True when the prompt is in items or the runner consumed it.
-
-        Cursor-native writes the user row only with the first assistant
-        row (13-573 s after create in archived sessions), so a missing
-        row inside the window is not a miss. Re-posting a consumed
-        prompt queues a copy that the broker delivers after the real
-        turn ends -- a duplicate role pass after SHIP retirement.
-        Consumed means, at the deadline: nothing pending on a bound
-        runner, after the prompt was seen pending or the session was
-        seen running. Still pending (cold TUI), no evidence at all, or
-        an unbound runner (restart blip) stays a miss.
-        """
-        deadline = time.monotonic() + max(wait_seconds, 0.0)
-        saw_pending = False
-        saw_running = False
+        want = _prompt_text(message)
+        posts = 1
+        deadline = time.monotonic() + ceiling
         while True:
-            items = _session_item_rows(self.get_items(session_id))
-            if _items_contain_user_text(items, message) or any(
-                _item_role(item) == "assistant" for item in items
-            ):
-                return True
-            snapshot = self.get_session(session_id)
-            pending = _pending_inputs(snapshot)
-            if pending:
-                saw_pending = True
-            if _snapshot_status(snapshot) == "running":
-                saw_running = True
+            rows = _user_row_texts(_session_item_rows(self.get_items(session_id)))
+            if want and want in rows:
+                return
+            if len(rows) >= posts:
+                if posts >= tries:
+                    raise BrokerHttpError(
+                        f"cannot start session: first prompt did not land "
+                        f"intact on {session_id} after {posts} attempt(s)"
+                    )
+                self.send_message(session_id, message)
+                posts += 1
+                deadline = time.monotonic() + ceiling
+                continue
             now = time.monotonic()
             if now >= deadline:
-                return (
-                    not pending
-                    and (saw_pending or saw_running)
-                    and _runner_bound(snapshot)
+                raise PromptDeliveryUncertain(
+                    f"first prompt on {session_id}: {posts - len(rows)} of "
+                    f"{posts} posted copies unaccounted for after "
+                    f"{ceiling:g}s; not re-posting, session kept",
+                    session_id,
                 )
-            time.sleep(min(interval, max(deadline - now, 0.0)))
+            time.sleep(min(poll, deadline - now))
 
     def list_runners(self) -> Any:
         """List runners available for binding a newly created session."""

@@ -1,22 +1,44 @@
-"""Offline regression: a consumed first prompt is never re-posted.
+"""Offline regression: re-post a first prompt only on a known miss.
 
 Canary eval-canary-retirement/run-1d716d4, session 6f173b9d: the
-Evaluator prompt was POSTed once at create (21:28:18Z). Cursor-native
-writes the user row only together with the first assistant row
-(21:28:53Z, 35 s later), so ``ensure_first_prompt`` declared a miss and
-re-posted. The broker queued that copy behind the running turn and
-delivered it when the turn went idle -- 30 s after the SHIP retirement
-commit -- and the Evaluator re-ran its whole pass in the same session.
+Evaluator prompt was POSTed at create (21:28:18Z); cursor-native wrote
+its user row only with the first assistant row (+35 s). The 20 s
+first-prompt window re-posted it, the TUI queued the copy as a
+follow-up, and it ran as a second Evaluator turn after the SHIP
+retirement commit.
 
-The fake below runs on a virtual clock with the live defaults (20 s
-window, 0.4 s interval, 3 attempts): POSTed messages queue, a bound
-idle runner consumes one per turn, and the user+assistant rows appear
-``ingest_lag`` virtual seconds after the turn starts (35 s observed).
+``Native014Broker`` follows Omnigent 0.14.0 (139c74a1) source, read-only:
+
+* ``fixtures/omnigent_0140_pending_inputs.py`` is the real
+  ``omnigent/runtime/pending_inputs.py`` (Apache-2.0, sha256 pinned
+  below). POST /events records an entry before forwarding and rolls it
+  back only if the forward fails (routes/_sessions/orchestration.py
+  ~6012/~6156); it drains only when the transcript user row is
+  persisted (resolve_oldest ~2448), or after the 600 s TTL.
+* Cursor injection (harnesses/cursor_native/bridge.py): wait up to
+  30 s for the input box, else paste blind; a blind paste into a
+  booting TUI is lost. Pasting into a busy TUI queues a follow-up turn.
+* Status is PTY-activity-derived (runner/resource_registry.py): any
+  pane change reads ``running``, 1 s of quiet reads ``idle``. Working
+  turns can blip idle; that is modelled with ``quiet_gaps``.
+
+Live shapes (first-prompt-canary/FINDINGS.md, installed e07075c): s1
+user row +13.8 s, first assistant row +54.4 s; s2 (9,339-byte prompt)
+first delivery persisted a user row missing the first 3,885 chars plus
+a leaked ``[201~`` and got an assistant reply; POSTs at 0/21.4/41.5 s,
+the third ran as a duplicate turn. Intact rows equal the posted text.
+
+Contract (eval-c19913b-opus/DELIVERY-CONTRACT.md, coordinator rulings):
+landed = a user row equal to the prompt; known miss = every accepted
+POST has a user row and none matches -> bounded re-post; otherwise
+uncertain -> no re-post, no delete, session held from prune.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
+import sys
 import time as real_time
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,195 +47,44 @@ from typing import Any
 import pytest
 
 
-SCRIPT = Path(__file__).parents[1] / "trioctl"
+HERE = Path(__file__).parent
+SCRIPT = HERE.parent / "trioctl"
+PENDING_FIXTURE = HERE / "fixtures" / "omnigent_0140_pending_inputs.py"
+PENDING_SHA256 = (
+    "c06c4623de38fb839ac5fe0825cb1c5c5354af4ae8a97992fe65e25e089d8178"
+)
 ATTEMPT = "725cd824ca98470592cabb6e83829bae"
 PIN = "ab1f0d76ac30ba946cbecf378a48554b45e27335"
 PROMPT = (
     f"LOCKSTEP CONTEXT: attempt={ATTEMPT} sha={PIN}\n\n"
     "# Trio Evaluator — one headless iteration\n"
 )
+SID = "s1"
+SETTLE_S = 30.0  # bridge._TMUX_READY_TIMEOUT_S
+PASTE_S = 0.5  # paste render + settle before Enter
+TICK = 0.1
 
 
-def load_trioctl():
-    loader = importlib.machinery.SourceFileLoader("trioctl", str(SCRIPT))
+def _load(path: Path, name: str):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # dataclasses resolve their module here
     loader.exec_module(module)
     return module
 
 
-trioctl = load_trioctl()
+trioctl = _load(SCRIPT, "trioctl")
 BrokerClient = trioctl.broker_http.BrokerClient
 BrokerHttpError = trioctl.broker_http.BrokerHttpError
-
-
-class CursorQueueBroker(BrokerClient):
-    """In-memory broker with Omnigent queue + Cursor-native row timing.
-
-    ``accept`` controls when the TUI consumes queued input:
-    ``"poll"`` on the first session poll after a send (pending visible
-    once), ``"send"`` immediately (pending never visible), ``"never"``
-    (welcome-screen: stays pending), or ``"second"`` (only once a second
-    copy arrives -- the documented cold-TUI recovery).
-    """
-
-    def __init__(
-        self,
-        *,
-        accept: str = "poll",
-        running_polls: int | None = None,
-        unbind_after_consume: bool = False,
-        rows_on_consume: bool = False,
-        expose_pending: bool = True,
-        turn_polls: int = 3,
-        ingest_lag: float = 35.0,
-        mailbox: Path | None = None,
-        clock: "VirtualClock | None" = None,
-    ) -> None:
-        super().__init__("http://fake.invalid")
-        self.accept = accept
-        self.running_polls = running_polls
-        self.unbind_after_consume = unbind_after_consume
-        self.rows_on_consume = rows_on_consume
-        self.expose_pending = expose_pending
-        self.turn_polls = turn_polls
-        self.mailbox = mailbox
-        self.ingest_lag = ingest_lag
-        self.clock = clock
-        self.consumed_at = 0.0
-        self.events: list[str] = []
-        self.queue: list[str] = []
-        self.turns: list[str] = []
-        self.rows: list[dict[str, Any]] = [
-            {"id": "r0", "type": "resource_event", "status": "completed"}
-        ]
-        self.status = "idle"
-        self.runner_id: str | None = "runner-1"
-        self.polls_since_consume = 0
-        self.wait_polls = 0
-        self.deletes: list[str] = []
-        self.completed_turns = 0
-
-    # -- HTTP seams -------------------------------------------------
-    def _request(self, method, path, payload=None, expected_status=200):
-        if method == "POST" and path == "/v1/sessions":
-            return {"id": "s1", "status": "idle", "runner_id": "runner-1"}
-        if method == "DELETE":
-            self.deletes.append(path)
-            return {}
-        raise AssertionError(f"unexpected {method} {path}")
-
-    def list_hosts(self):
-        return {"hosts": [{"host_id": "h1", "status": "online"}]}
-
-    def send_message(self, session_id, message):
-        self.events.append(message)
-        self.queue.append(message)
-        if (
-            self.accept == "send"
-            and self.status == "idle"
-            and self.runner_id is not None
-        ):
-            self._consume()
-        elif self.accept == "second" and len(self.queue) >= 2:
-            self.queue.clear()
-            self._consume(message)
-        return {"queued": True}
-
-    # -- simulated runner ------------------------------------------
-    def _consume(self, message: str | None = None) -> None:
-        text = message if message is not None else self.queue.pop(0)
-        self.turns.append(text)
-        self.status = "running"
-        self.polls_since_consume = 0
-        self.consumed_at = self.clock.now if self.clock else 0.0
-        if self.unbind_after_consume:
-            self.runner_id = None
-        if self.rows_on_consume:
-            self._emit_rows(text)
-
-    def _emit_rows(self, text: str) -> None:
-        n = len(self.rows)
-        self.rows.append({"id": f"u{n}", "role": "user", "type": "message",
-                          "status": "completed",
-                          "content": [{"type": "input_text", "text": text}]})
-        self.rows.append({"id": f"a{n}", "role": "assistant",
-                          "type": "message", "status": "completed",
-                          "content": [{"type": "output_text", "text": "ok"}]})
-
-    def _ingest(self) -> None:
-        """Cursor writes user+assistant rows ``ingest_lag`` after start."""
-        if (
-            self.turns
-            and self.clock is not None
-            and self.clock.now - self.consumed_at >= self.ingest_lag
-            and not self._has_rows_for(self.turns[-1])
-        ):
-            self._emit_rows(self.turns[-1])
-
-    def _finish_turn(self) -> None:
-        self.completed_turns += 1
-        if self.mailbox is not None and self.completed_turns == 1:
-            (self.mailbox / "VERDICT.md").write_text(
-                "VERDICT: SHIP\niteration: 1\n"
-                f"attempt: {ATTEMPT}\nevaluated: {PIN}\ncommit: {PIN}\n",
-                encoding="utf-8",
-            )
-        self.status = "idle"
-
-    def get_session(self, session_id):
-        if (
-            self.status == "idle"
-            and self.queue
-            and self.runner_id is not None
-            and self.accept in {"poll", "send"}
-        ):
-            # Omnigent hands queued input to an idle bound runner.
-            self._consume()
-        elif self.status == "running" and self.running_polls is not None:
-            self.polls_since_consume += 1
-            if self.polls_since_consume > self.running_polls:
-                self.status = "idle"  # think gap / blip settles idle
-        self._ingest()
-        snap: dict[str, Any] = {
-            "id": session_id,
-            "status": self.status,
-            "runner_id": self.runner_id,
-        }
-        if self.expose_pending:
-            snap["pending_inputs"] = [
-                {"id": f"p{i}"} for i in range(len(self.queue))
-            ]
-        return snap
-
-    def get_items(self, session_id, limit=100, order="asc", after=None):
-        if order == "desc" and limit == 10:
-            # Driver wait poll: the running turn makes progress here only.
-            self.wait_polls += 1
-            if self.status == "running" and self.clock is not None:
-                self.clock.now += 1.0  # the model works while we wait
-                self._ingest()
-                if self._has_rows_for(self.turns[-1]):
-                    self.polls_since_consume += 1
-                    if self.polls_since_consume >= self.turn_polls:
-                        self._finish_turn()
-            return {"data": list(reversed(self.rows))[:10]}
-        self._ingest()
-        return {"data": list(self.rows)}
-
-    def _has_rows_for(self, text: str) -> bool:
-        return sum(
-            1 for r in self.rows if r.get("role") == "user"
-            and r["content"][0]["text"] == text
-        ) >= self.turns.count(text)
 
 
 class VirtualClock:
     """sleep() advances time; every monotonic() read ticks 1 ms."""
 
     def __init__(self) -> None:
-        self.now = 1000.0
+        self.now = 0.0
 
     def monotonic(self) -> float:
         self.now += 0.001
@@ -223,9 +94,222 @@ class VirtualClock:
         self.now += max(float(seconds), 0.0)
 
 
+class Native014Broker(BrokerClient):
+    """Omnigent 0.14 native-terminal session driven on a virtual clock."""
+
+    def __init__(
+        self,
+        clock: VirtualClock,
+        *,
+        ready_at: float | None = 1.0,
+        boot_active: bool = False,
+        row_lag: float = 35.0,
+        assistant_lag: float | None = None,
+        turn_len: float = 400.0,
+        corrupt: tuple[str, ...] = (),
+        corrupt_row_lag: float = 19.5,
+        corrupt_turn_len: float = 38.0,  # live s2 replies at +21, +38 s
+        quiet_gaps: tuple[tuple[float, float], ...] = (),
+        expose_pending: bool = True,
+        unbind_at: float | None = None,
+        rebind_at: float | None = None,
+        forward_fails: bool = False,
+        writes_rows: bool = True,
+        mailbox: Path | None = None,
+    ) -> None:
+        super().__init__("http://fake.invalid")
+        self.clock = clock
+        self.pi = _load(PENDING_FIXTURE, f"pending_inputs_{id(self)}")
+        self.pi._now = lambda: clock.now
+        self.ready_at = ready_at
+        self.boot_active = boot_active
+        self.row_lag = row_lag
+        self.assistant_lag = row_lag if assistant_lag is None else assistant_lag
+        self.turn_len = turn_len
+        self.corrupt = list(corrupt)
+        self.corrupt_row_lag = corrupt_row_lag
+        self.corrupt_turn_len = corrupt_turn_len
+        self.quiet_gaps = quiet_gaps
+        self.expose_pending = expose_pending
+        self.unbind_at = unbind_at
+        self.rebind_at = rebind_at
+        self.forward_fails = forward_fails
+        self.writes_rows = writes_rows
+        self.mailbox = mailbox
+        self.runner_id: str | None = "runner-1"
+        self.sim_t = 0.0
+        self.posts: list[float] = []
+        self.forwards: list[dict[str, Any]] = []
+        self.busy_until = 0.0
+        self.followups: list[str] = []
+        self.turn: dict[str, Any] | None = None
+        self.turns: list[str] = []
+        self.dropped = 0
+        self.rows: list[dict[str, Any]] = [
+            {"id": "r0", "type": "resource_event", "status": "completed"}
+        ]
+        self.deletes: list[str] = []
+
+    # -- HTTP seams --------------------------------------------------
+    def _request(self, method, path, payload=None, expected_status=200):
+        if method == "POST" and path == "/v1/sessions":
+            return {"id": SID, "status": "idle", "runner_id": "runner-1"}
+        if method == "DELETE":
+            self.deletes.append(path)
+            return {}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def list_hosts(self):
+        return {"hosts": [{"host_id": "h1", "status": "online"}]}
+
+    def send_message(self, session_id, message):
+        self._advance()
+        self.posts.append(round(self.clock.now, 1))
+        content = [{"type": "input_text", "text": message}]
+        pid = self.pi.record(SID, content)
+        if self.forward_fails:
+            self.pi.resolve(SID, pid)
+            raise BrokerHttpError("POST events returned HTTP 502")
+        self.forwards.append({"text": message, "posted": self.clock.now})
+        return {"queued": True}
+
+    def get_session(self, session_id):
+        self._advance()
+        snap: dict[str, Any] = {
+            "id": SID,
+            "status": self._status(),
+            "runner_id": self.runner_id,
+        }
+        if self.expose_pending:
+            snap["pending_inputs"] = self.pi.snapshot_for(SID)
+        return snap
+
+    def get_items(self, session_id, limit=100, order="asc", after=None):
+        self._advance()
+        rows = list(self.rows)
+        if order == "desc":
+            rows.reverse()
+        return {"data": rows[:limit]}
+
+    # -- simulation --------------------------------------------------
+    def run_until(self, t: float) -> None:
+        self.clock.now = max(self.clock.now, t)
+        self._advance()
+
+    def _advance(self) -> None:
+        while self.sim_t < self.clock.now:
+            self.sim_t = min(self.clock.now, self.sim_t + TICK)
+            self._tick(self.sim_t)
+
+    def _tick(self, t: float) -> None:
+        if self.unbind_at is not None and t >= self.unbind_at:
+            self.unbind_at = None
+            self.runner_id = None
+            self.turn = None  # the pane died with its runner
+            self.followups.clear()
+        if self.rebind_at is not None and t >= self.rebind_at:
+            self.rebind_at = None
+            self.runner_id = "runner-2"
+            self.ready_at = t + 1.0
+            self.busy_until = t
+        if self.runner_id is not None and self.forwards:
+            fwd = self.forwards[0]
+            if "paste_at" not in fwd:
+                start = max(fwd["posted"], self.busy_until)
+                ready = self.ready_at
+                if ready is not None and ready <= start + SETTLE_S:
+                    fwd["paste_at"] = max(start, ready) + PASTE_S
+                    fwd["lost"] = False
+                else:
+                    fwd["paste_at"] = start + SETTLE_S + PASTE_S
+                    fwd["lost"] = True
+            if t >= fwd["paste_at"]:
+                self.forwards.pop(0)
+                self.busy_until = fwd["paste_at"]
+                if fwd["lost"]:
+                    self.dropped += 1
+                elif self.turn is not None:
+                    self.followups.append(fwd["text"])
+                else:
+                    self._start_turn(fwd["text"], t)
+        turn = self.turn
+        if turn is None:
+            return
+        if not self.writes_rows:
+            pass
+        elif not turn["user_row"] and t >= turn["start"] + turn["row_lag"]:
+            turn["user_row"] = True
+            self.pi.resolve_oldest(SID)  # transcript mirrored a user row
+            self._row("user", turn["row_text"])
+        elif turn["user_row"] and not turn["reply"] and (
+            t >= turn["start"] + turn["assistant_lag"]
+        ):
+            turn["reply"] = True
+            self._row("assistant", "working")
+        if t >= turn["start"] + turn["len"]:
+            if self.mailbox is not None and self.intact_turns() == 1:
+                (self.mailbox / "VERDICT.md").write_text(
+                    "VERDICT: SHIP\niteration: 1\n"
+                    f"attempt: {ATTEMPT}\nevaluated: {PIN}\ncommit: {PIN}\n",
+                    encoding="utf-8",
+                )
+            self.turn = None
+            if self.followups:
+                self._start_turn(self.followups.pop(0), t)
+
+    def _start_turn(self, text: str, t: float) -> None:
+        turn = {
+            "text": text, "start": t, "user_row": False, "reply": False,
+            "row_text": text, "row_lag": self.row_lag,
+            "assistant_lag": max(self.assistant_lag, self.row_lag),
+            "len": self.turn_len,
+        }
+        if self.corrupt:
+            # Cold TUI mangled this paste; Cursor records what it got.
+            mode = self.corrupt.pop(0)
+            turn.update(
+                row_text={
+                    "head": text[3885:] + "\n[201~",  # live s2
+                    "tail": text[: len(text) // 2],
+                    "prefix": text[:16],  # "LOCKSTEP CONTEXT"
+                    "empty": "",
+                }[mode],
+                row_lag=self.corrupt_row_lag,
+                assistant_lag=self.corrupt_row_lag + 1.0,
+                len=self.corrupt_turn_len,
+            )
+        self.turn = turn
+        self.turns.append(turn["row_text"])
+
+    def intact_turns(self) -> int:
+        return sum(1 for text in self.turns if text == PROMPT)
+
+    def _row(self, role: str, text: str) -> None:
+        kind = "input_text" if role == "user" else "output_text"
+        self.rows.append({
+            "id": f"r{len(self.rows)}", "type": "message", "role": role,
+            "status": "completed",
+            "content": [{"type": kind, "text": text}],
+        })
+
+    def _status(self) -> str:
+        t = self.sim_t
+        if self.runner_id is None:
+            return "idle"
+        if self.turn is not None:
+            offset = t - self.turn["start"]
+            for lo, hi in self.quiet_gaps:
+                if lo <= offset < hi:
+                    return "idle"
+            return "running"
+        if self.boot_active and (self.ready_at is None or t < self.ready_at):
+            return "running"
+        return "idle"
+
+
 @pytest.fixture(autouse=True)
 def clock(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
-    """Live prompt defaults on a virtual clock (no env overrides)."""
+    """Live defaults (600 s ceiling, 0.4 s poll, 3 copies) on a virtual clock."""
     for name in (
         "TRIO_OMNIGENT_PROMPT_WAIT",
         "TRIO_OMNIGENT_PROMPT_INTERVAL",
@@ -247,84 +331,169 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
     return virtual
 
 
-# -- create-time: consumed prompts are not re-posted -------------------
+def _create(broker: Native014Broker, prompt: str = PROMPT):
+    """create_session, then let every queued copy run; the error or None."""
+    try:
+        broker.create_session("agent", "model", prompt, "title")
+        error = None
+    except BrokerHttpError as exc:
+        error = exc
+    broker.run_until(broker.clock.now + 2000.0)
+    return error
+
+
+PADDED = PROMPT + "".join(
+    f"reference line {i:05d}: inert padding, ignore it.\n"
+    for i in range(200)
+)
+
+
+def test_vendored_pending_inputs_is_pinned():
+    digest = hashlib.sha256(PENDING_FIXTURE.read_bytes()).hexdigest()
+    assert digest == PENDING_SHA256
+
+
+# -- landed: an intact user row, however late --------------------------
 
 @pytest.mark.parametrize(
     "shape",
     [
-        # Incident: pending seen once, drained, turn running, no rows yet.
-        {"accept": "poll"},
-        # Consumed before the first poll: pending never observed.
-        {"accept": "send"},
-        # Consumed, then a think gap reads idle on a bound runner.
-        {"accept": "send", "running_polls": 1},
-        # Broker that does not expose pending_inputs at all.
-        {"accept": "send", "expose_pending": False},
+        # Canary 6f173b9d: rows +35 s after the paste.
+        {"row_lag": 35.0},
+        # Live s1: user row +13.8 s, first assistant row +54.4 s.
+        {"row_lag": 13.3, "assistant_lag": 53.9},
+        {"row_lag": 5.0},
+        {"row_lag": 73.0},
+        # Longest archived user-row delay (573 s), inside the 600 s ceiling.
+        {"row_lag": 572.0, "turn_len": 900.0},
+        # Working turn with PTY-quiet blips.
+        {"row_lag": 120.0,
+         "quiet_gaps": ((5.0, 25.0), (40.0, 65.0), (80.0, 105.0))},
+        # TUI still booting (animated) when the prompt is POSTed.
+        {"ready_at": 20.0, "boot_active": True, "row_lag": 35.0},
+        # Broker without the pending_inputs field.
+        {"row_lag": 35.0, "expose_pending": False},
     ],
-    ids=["drain", "consumed-unseen", "think-gap-idle", "no-pending-field"],
+    ids=["canary-lag35", "live-s1", "lag5", "lag73", "lag573",
+         "quiet-blips", "booting-animated", "no-pending-field"],
 )
-def test_consumed_first_prompt_without_rows_is_not_reposted(shape, clock):
-    broker = CursorQueueBroker(**shape, clock=clock)
+def test_intact_prompt_runs_exactly_once(clock, shape):
+    broker = Native014Broker(clock, **shape)
 
-    created = broker.create_session("agent", "model", PROMPT, "title")
+    assert _create(broker) is None
+    assert len(broker.posts) == 1
+    assert broker.turns == [PROMPT], "duplicate turn from a re-post"
+    assert broker.deletes == []
+    assert broker.pi.snapshot_for(SID) == []
 
-    assert created["id"] == "s1"
-    assert broker.events == [PROMPT]
-    assert broker.queue == []
+
+# -- known miss: every copy has a row, none intact -> bounded re-post ---
+
+def test_live_s2_head_loss_reposts_once_and_lands_at_43s(clock):
+    """Row 1 lost 3,885 head chars and got a reply; copy 2 lands ~+43 s.
+
+    The re-post is needed. A third POST while copy 2 waits behind the
+    reply to the garbage would run later as a duplicate turn (live POST
+    #3 at 41.5 s).
+    """
+    broker = Native014Broker(
+        clock, corrupt=("head",), row_lag=5.0, turn_len=45.0
+    )
+
+    assert _create(broker, PADDED) is None
+    assert broker.turns[0].endswith("[201~")
+    # Live POST #2 went out at +21.4 s, on the mangled row.
+    assert broker.posts[0] == 0.0 and 20.5 < broker.posts[1] < 22.0
+    assert len(broker.posts) == 2
+    assert broker.turns[1:] == [PADDED], "duplicate intact turn"
+    assert broker.rows[-2]["role"] == "user"  # intact row ~ +43 s
     assert broker.deletes == []
 
 
-# -- create-time: genuine misses still recover on the same session -----
+@pytest.mark.parametrize("mode", ["head", "tail", "prefix", "empty"])
+def test_mangled_row_is_a_known_miss_even_with_a_reply(clock, mode):
+    """No row shortcut: an assistant reply to a mangled row is not landed.
 
-def test_prompt_stuck_pending_on_welcome_screen_is_reposted(clock):
-    """014 cold TUI: prompt stays pending, no item; re-post nudges it."""
-    broker = CursorQueueBroker(
-        accept="second", rows_on_consume=True, clock=clock
+    The mangled row lands at +5 s, inside the old 20 s window, so an
+    old prefix/substring/empty-row match or row shortcut accepts it.
+    """
+    broker = Native014Broker(
+        clock, corrupt=(mode,), corrupt_row_lag=5.0, row_lag=5.0
     )
 
-    broker.create_session("agent", "model", PROMPT, "title")
+    assert _create(broker, PADDED) is None
+    assert len(broker.posts) == 2
+    assert broker.turns[1:] == [PADDED]
 
-    assert broker.events == [PROMPT, PROMPT]
-    assert broker.turns == [PROMPT]
+
+def test_every_copy_mangled_fails_closed_after_attempts(clock):
+    broker = Native014Broker(
+        clock, corrupt=("head", "tail", "prefix"), row_lag=5.0
+    )
+
+    error = _create(broker, PADDED)
+
+    assert isinstance(error, BrokerHttpError)
+    assert not isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert "did not land intact" in str(error)
+    assert len(broker.posts) == 3
+    assert PADDED not in broker.turns
+    assert broker.deletes == [f"/v1/sessions/{SID}"]
+
+
+def test_failed_post_rolls_back_and_deletes(clock):
+    """HTTP error from the forward: pending rolled back, nothing queued."""
+    broker = Native014Broker(clock, forward_fails=True)
+
+    error = _create(broker)
+
+    assert error is not None and "502" in str(error)
+    assert broker.pi.snapshot_for(SID) == []
+    assert broker.deletes == [f"/v1/sessions/{SID}"]
+
+
+# -- uncertain: an unaccounted copy -> no re-post, no delete ------------
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # Welcome-screen drop, static pane: pending stays, status idle.
+        {"ready_at": None},
+        # Same, animated boot: pending stays, status running.
+        {"ready_at": None, "boot_active": True},
+        # Accepted and running, but no row ever mirrored.
+        {"writes_rows": False, "turn_len": 5000.0},
+        # Runner lost mid-turn (it may already have run tools).
+        {"unbind_at": 2.0, "rebind_at": 50.0},
+    ],
+    ids=["stuck-pending-idle", "stuck-pending-running", "running-no-row",
+         "unbound"],
+)
+def test_unaccounted_copy_is_uncertain_not_reposted_or_deleted(clock, shape):
+    broker = Native014Broker(clock, **shape)
+
+    error = _create(broker)
+
+    assert isinstance(error, trioctl.broker_http.PromptDeliveryUncertain)
+    assert error.session_id == SID
+    assert broker.posts == [0.0]
+    assert 599.0 < clock.now - 2000.0 < 602.0  # the 600 s ceiling
     assert broker.deletes == []
 
 
-def test_restart_blip_unbinds_after_consume_is_reposted(clock):
-    """Runner consumed then dropped (unbound, no rows): a real miss."""
-    broker = CursorQueueBroker(
-        accept="send", unbind_after_consume=True, clock=clock
-    )
-    original_send = broker.send_message
+def test_prompt_timeout_caps_the_uncertain_wait(clock):
+    broker = Native014Broker(clock, ready_at=None)
 
-    def rebind_then_send(session_id, message):
-        if broker.events:
-            broker.runner_id = "runner-2"
-            broker.unbind_after_consume = False
-            broker.rows_on_consume = True
-        return original_send(session_id, message)
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain):
+        broker.create_session(
+            "agent", "model", PROMPT, "title", prompt_timeout=120.0
+        )
 
-    broker.send_message = rebind_then_send  # type: ignore[method-assign]
-
-    broker.create_session("agent", "model", PROMPT, "title")
-
-    assert broker.events == [PROMPT, PROMPT]
+    assert 119.0 < clock.now < 122.0
     assert broker.deletes == []
 
 
-def test_no_delivery_evidence_is_reposted_then_fails_closed(clock):
-    """Never consumed, nothing pending, idle: bounded re-posts, DELETE."""
-    broker = CursorQueueBroker(
-        accept="never", expose_pending=False, clock=clock
-    )
-
-    with pytest.raises(BrokerHttpError, match="first prompt did not land"):
-        broker.create_session("agent", "model", PROMPT, "title")
-
-    assert broker.events == [PROMPT, PROMPT, PROMPT]
-    assert broker.deletes == ["/v1/sessions/s1"]
-
-
-# -- end to end: no duplicate Evaluator turn after SHIP ----------------
+# -- end to end through OmnigentRunner and the loop wrapper ------------
 
 def _mailbox(tmp_path: Path) -> Path:
     mailbox = tmp_path / "loop-natural-trial"
@@ -334,9 +503,10 @@ def _mailbox(tmp_path: Path) -> Path:
     return mailbox
 
 
-def _runner(tmp_path: Path, broker, monkeypatch, timeout: float = 600.0):
+def _runner(tmp_path: Path, broker, monkeypatch, timeout: float = 3000.0):
+    # interval=1: live idle dwell (30 s) on the virtual clock.
     runner = trioctl.OmnigentRunner(
-        repo=tmp_path, broker_client=broker, interval=0, timeout=timeout
+        repo=tmp_path, broker_client=broker, interval=1, timeout=timeout
     )
     monkeypatch.setattr(runner, "_agent_id", lambda role: "evaluator-agent")
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
@@ -344,60 +514,120 @@ def _runner(tmp_path: Path, broker, monkeypatch, timeout: float = 600.0):
     return runner
 
 
-@pytest.mark.parametrize("accept", ["send", "poll"], ids=["canary", "drain"])
-def test_evaluator_ship_is_not_followed_by_a_reposted_duplicate_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock, accept
-) -> None:
-    """Replay 6f173b9d: rows land 35 s after start, past the 20 s window.
-
-    Unfixed, the create-time re-post queues a second prompt that runs
-    as a full Evaluator turn after the SHIP artifact is written.
-    """
-    mailbox = _mailbox(tmp_path)
-    broker = CursorQueueBroker(accept=accept, mailbox=mailbox, clock=clock)
-    runner = _runner(tmp_path, broker, monkeypatch)
-    context = {"evaluator_attempt": ATTEMPT, "pinned_sha": PIN}
-
-    assert runner.run("evaluator", 1, mailbox, context) == 0
-
-    assert len(broker.turns) == 1, "duplicate Evaluator turn after SHIP"
-    assert broker.events == [PROMPT]
-    assert broker.queue == []
-    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
-    assert f"attempt: {ATTEMPT}" in verdict
+CONTEXT = {"evaluator_attempt": ATTEMPT, "pinned_sha": PIN}
 
 
-def test_stale_verdict_with_consumed_prompt_still_times_out(
+def test_evaluator_ship_is_not_followed_by_a_duplicate_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
 ) -> None:
-    """No re-post does not relax the artifact gate: stale SHIP != pass."""
+    """Replay 6f173b9d end to end: one prompt, one turn, fresh SHIP."""
+    mailbox = _mailbox(tmp_path)
+    broker = Native014Broker(clock, row_lag=35.0, mailbox=mailbox)
+    runner = _runner(tmp_path, broker, monkeypatch)
+
+    assert runner.run("evaluator", 1, mailbox, CONTEXT) == 0
+    broker.run_until(clock.now + 2000.0)
+
+    assert broker.turns == [PROMPT], "duplicate Evaluator turn after SHIP"
+    assert len(broker.posts) == 1
+    verdict = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    assert f"attempt: {ATTEMPT}" in verdict
+    assert runner.held_session_ids == []
+
+
+def test_uncertain_delivery_fails_the_role_and_holds_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
+) -> None:
+    mailbox = _mailbox(tmp_path)
+    broker = Native014Broker(clock, ready_at=None, mailbox=mailbox)
+    runner = _runner(tmp_path, broker, monkeypatch, timeout=300.0)
+
+    with pytest.raises(trioctl.TrioctlError, match="unaccounted"):
+        runner.run("evaluator", 1, mailbox, CONTEXT)
+
+    assert runner.held_session_ids == [SID]
+    assert broker.posts == [0.0]
+    assert broker.deletes == []
+    assert (mailbox / "VERDICT.md").read_text(encoding="utf-8") == (
+        "VERDICT: none\n"
+    )
+
+
+def test_loop_prune_skips_held_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The run's ids file lists the held session; prune must not get it."""
+    mailbox = _mailbox(tmp_path)
+    pruned: list[list[str]] = []
+
+    class HeldRunner:
+        created_session_ids = ["done-1"]
+        held_session_ids = [SID]
+        session_ids: dict[str, str] = {}
+
+    class RaisingLoop:
+        @staticmethod
+        def run_loop(mailbox_path, *args, **kwargs):
+            ids = mailbox_path / ".sessions"
+            ids.mkdir(exist_ok=True)
+            for path in ids.glob("run-*.ids"):
+                path.unlink()
+            (ids / f"run-{trioctl.os.getpid()}.ids").write_text(
+                f"done-1\n{SID}\n", encoding="utf-8"
+            )
+            raise trioctl.TrioctlError("first prompt unaccounted")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: RaisingLoop)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: HeldRunner())
+    monkeypatch.setattr(
+        trioctl,
+        "_run_post_loop_session_prune",
+        lambda mailbox, base_url, ids, **kw: pruned.append(sorted(ids)),
+    )
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(mailbox),
+         "--max-iterations", "1"]
+    )
+
+    with pytest.raises(trioctl.TrioctlError):
+        args.func(args)
+
+    assert pruned == [["done-1", "done-1"]]
+    assert f"kept session {SID}" in capsys.readouterr().err
+
+
+def test_stale_verdict_is_not_accepted_as_ship(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
+) -> None:
+    """Idle/exit is not SHIP: a stale attempt's verdict times out."""
     mailbox = _mailbox(tmp_path)
     stale = (
         "VERDICT: SHIP\niteration: 1\nattempt: 0000stale\n"
         f"evaluated: {PIN}\n"
     )
     (mailbox / "VERDICT.md").write_text(stale, encoding="utf-8")
-    broker = CursorQueueBroker(accept="send", clock=clock)  # no VERDICT
-    runner = _runner(tmp_path, broker, monkeypatch, timeout=120.0)
-    context = {"evaluator_attempt": ATTEMPT, "pinned_sha": PIN}
+    broker = Native014Broker(clock, row_lag=35.0, turn_len=100.0)
+    runner = _runner(tmp_path, broker, monkeypatch, timeout=600.0)
 
     with pytest.raises(trioctl.TrioctlError, match="timed out"):
-        runner.run("evaluator", 1, mailbox, context)
+        runner.run("evaluator", 1, mailbox, CONTEXT)
 
-    assert broker.events == [PROMPT]
+    assert len(broker.posts) == 1
     assert (mailbox / "VERDICT.md").read_text(encoding="utf-8") == stale
 
 
-def test_wrong_pin_verdict_with_consumed_prompt_still_times_out(
+def test_wrong_pin_verdict_is_not_accepted_as_ship(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock
 ) -> None:
-    """A fresh-attempt SHIP for another pin is not this iteration."""
     mailbox = _mailbox(tmp_path)
-    broker = CursorQueueBroker(accept="send", mailbox=mailbox, clock=clock)
-    runner = _runner(tmp_path, broker, monkeypatch, timeout=120.0)
+    broker = Native014Broker(
+        clock, row_lag=35.0, turn_len=100.0, mailbox=mailbox
+    )
+    runner = _runner(tmp_path, broker, monkeypatch, timeout=600.0)
     context = {"evaluator_attempt": ATTEMPT, "pinned_sha": "f" * 40}
 
     with pytest.raises(trioctl.TrioctlError, match="timed out"):
         runner.run("evaluator", 1, mailbox, context)
 
-    assert broker.events == [PROMPT]
+    assert len(broker.posts) == 1

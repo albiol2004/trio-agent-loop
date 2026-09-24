@@ -267,9 +267,9 @@ def fake_broker():
 def _item_list_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Rows for GET /items when this is not a wait-style poll.
 
-    Default: a user item with no text (ensure_first_prompt treats that
-    as landed). Tests override via item_rows or items_after_event_count
-    to exercise pending-prompt retry.
+    Default: a user item echoing the last posted text (landed). Tests
+    override via item_rows or items_after_event_count to exercise
+    pending-prompt retry.
     """
     if state["item_rows"] is not None:
         return list(state["item_rows"])
@@ -284,7 +284,11 @@ def _item_list_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
             except (KeyError, IndexError, TypeError):
                 pass
         return [{"id": "item-1", "role": "user", "text": text}]
-    return [{"id": "item-1", "role": "user"}]
+    if not state["events"]:
+        return [{"id": "item-1", "role": "user"}]
+    # The prompt as posted (an empty user row is not a delivery).
+    text = state["events"][-1]["data"]["content"][0]["text"]
+    return [{"id": "item-1", "role": "user", "text": text}]
 
 
 def test_cursor_lead_resolves_grok_medium():
@@ -945,15 +949,13 @@ def test_create_session_host_id_env_selects_among_many(fake_broker, monkeypatch)
     assert state["runner_launches"][0]["session_id"] == "session-1"
 
 
-def test_first_prompt_retries_on_same_session_never_duplicates(
+def test_first_prompt_without_row_is_uncertain_not_reposted(
     fake_broker, monkeypatch
 ):
-    """Cold TUI: first event stays pending, no item; re-POST the same id."""
+    """Queued copy, no user row yet: never re-POST, never DELETE."""
     trioctl = load_trioctl()
     base_url, state = fake_broker
-    # Land only after the second /events POST (create + one retry).
-    state["items_after_event_count"] = 2
-    # loop-omnigent-014: the prompt stayed in pending inputs.
+    state["item_rows"] = []
     state["pending_inputs"] = [{"id": "p1"}]
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.05")
@@ -961,97 +963,49 @@ def test_first_prompt_retries_on_same_session_never_duplicates(
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
     client = trioctl.broker_http.BrokerClient(base_url)
 
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as exc:
+        client.create_session("agent-1", "model-1", "Please land", "title")
+
+    assert exc.value.session_id == "session-1"
+    assert len(state["posts"]) == 1
+    assert len(state["events"]) == 1
+    assert state["deletes"] == []
+
+
+def test_mismatched_first_row_is_reposted_on_same_session(
+    fake_broker, monkeypatch
+):
+    """A user row that is not the prompt (mangled paste): re-POST once."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["item_rows"] = [{"id": "item-1", "role": "user", "text": "land"}]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.01")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    client = trioctl.broker_http.BrokerClient(base_url)
+    original_items = client.get_items
+
+    def items_after_repost(session_id: str, **kwargs):
+        if len(state["events"]) >= 2:
+            state["item_rows"] = [
+                {"id": "item-1", "role": "user", "text": "land"},
+                {"id": "item-2", "role": "user", "text": "Please land"},
+            ]
+        return original_items(session_id, **kwargs)
+
+    client.get_items = items_after_repost  # type: ignore[method-assign]
     created = client.create_session(
         "agent-1", "model-1", "Please land", "title"
     )
 
     assert created["id"] == "session-1"
     assert len(state["posts"]) == 1
-    assert len(state["events"]) == 2
-    assert state["events"][0]["data"]["content"][0]["text"] == "Please land"
-    assert state["events"][1]["data"]["content"][0]["text"] == "Please land"
+    assert [e["data"]["content"][0]["text"] for e in state["events"]] == [
+        "Please land",
+        "Please land",
+    ]
     assert state["deletes"] == []
-
-
-def test_pending_drain_on_bound_runner_is_not_reposted(
-    fake_broker, monkeypatch
-):
-    """Drained pending on a bound runner: consumed, even with no row yet.
-
-    Cursor-native writes the user row with the first assistant row, so
-    a re-post here queues a duplicate turn behind the real one.
-    """
-    trioctl = load_trioctl()
-    base_url, state = fake_broker
-    state["item_rows"] = []
-    state["pending_inputs"] = [{"id": "p1"}]
-    state["session_runner_ids"] = ["runner-1"]
-    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.02")
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
-    client = trioctl.broker_http.BrokerClient(base_url)
-    original_get = client.get_session
-    polls = {"n": 0}
-
-    def get_session_then_clear(session_id: str):
-        polls["n"] += 1
-        snap = original_get(session_id)
-        if polls["n"] >= 2:
-            state["pending_inputs"] = []
-        return snap
-
-    client.get_session = get_session_then_clear  # type: ignore[method-assign]
-    created = client.create_session("agent-1", "model-1", "hi", "title")
-
-    assert created["id"] == "session-1"
-    assert len(state["events"]) == 1
-    assert state["deletes"] == []
-
-
-def test_pending_drain_on_unbound_runner_counts_as_miss_then_repost(
-    fake_broker, monkeypatch
-):
-    """Pending cleared but the runner dropped (restart blip): re-post."""
-    trioctl = load_trioctl()
-    base_url, state = fake_broker
-    state["item_rows"] = []
-    state["pending_inputs"] = [{"id": "p1"}]
-    state["session_runner_ids"] = ["runner-1", None]
-    state["items_after_event_count"] = None
-    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.02")
-    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
-    client = trioctl.broker_http.BrokerClient(base_url)
-
-    # After the first poll sees pending, clear it while the runner shows
-    # unbound; land the user row only after that retry.
-    original_get = client.get_session
-    original_items = client.get_items
-    polls = {"n": 0}
-
-    def get_session_then_clear(session_id: str):
-        polls["n"] += 1
-        snap = original_get(session_id)
-        if polls["n"] >= 2:
-            state["pending_inputs"] = []
-        return snap
-
-    def get_items_until_repost(session_id: str, **kwargs):
-        if len(state["events"]) >= 2:
-            state["item_rows"] = [
-                {"id": "item-1", "role": "user", "text": "hi"}
-            ]
-        return original_items(session_id, **kwargs)
-
-    client.get_session = get_session_then_clear  # type: ignore[method-assign]
-    client.get_items = get_items_until_repost  # type: ignore[method-assign]
-    created = client.create_session("agent-1", "model-1", "hi", "title")
-
-    assert created["id"] == "session-1"
-    assert len(state["posts"]) == 1
-    assert len(state["events"]) >= 2
 
 
 def test_pending_drain_grace_poll_skips_repost_when_item_lands(
@@ -1119,9 +1073,10 @@ def test_orphan_deleted_when_runner_launch_fails(
     assert len(state["posts"]) == 1
 
 
-def test_orphan_deleted_when_first_prompt_never_lands(
+def test_first_prompt_never_lands_keeps_session_for_prune_hold(
     fake_broker, tmp_path, monkeypatch
 ):
+    """Unaccounted copy: raise uncertain, keep the session, keep its id."""
     trioctl = load_trioctl()
     base_url, state = fake_broker
     state["item_rows"] = []
@@ -1133,11 +1088,11 @@ def test_orphan_deleted_when_first_prompt_never_lands(
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "1")
     client = trioctl.broker_http.BrokerClient(base_url)
 
-    with pytest.raises(trioctl.broker_http.BrokerHttpError) as excinfo:
+    with pytest.raises(trioctl.broker_http.PromptDeliveryUncertain) as excinfo:
         client.create_session("agent-1", "model-1", "hi", "title")
 
-    assert "first prompt did not land" in str(excinfo.value)
-    assert state["deletes"] == ["/v1/sessions/session-1"]
+    assert "unaccounted" in str(excinfo.value)
+    assert state["deletes"] == []
     assert "session-1" in ids_path.read_text(encoding="utf-8")
     assert len(state["posts"]) == 1
 
