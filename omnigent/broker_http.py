@@ -146,6 +146,22 @@ def _pending_inputs(snapshot: Any) -> list[Any]:
     return pending if isinstance(pending, list) else []
 
 
+def _snapshot_status(snapshot: Any) -> str:
+    """Lower-cased session status, or empty."""
+    if not isinstance(snapshot, dict):
+        return ""
+    status = snapshot.get("status")
+    return status.lower() if isinstance(status, str) else ""
+
+
+def _runner_bound(snapshot: Any) -> bool:
+    """A missing ``runner_id`` field counts as bound (older brokers)."""
+    if not isinstance(snapshot, dict) or "runner_id" not in snapshot:
+        return True
+    value = snapshot.get("runner_id")
+    return isinstance(value, str) and bool(value.strip())
+
+
 class BrokerHttpError(RuntimeError):
     """An actionable failure while talking to the broker."""
 
@@ -636,30 +652,40 @@ class BrokerClient:
         wait_seconds: float,
         interval: float,
     ) -> bool:
-        """True when items show the user text, or pending inputs drain."""
+        """True when the prompt is in items or the runner consumed it.
+
+        Cursor-native writes the user row only with the first assistant
+        row (13-573 s after create in archived sessions), so a missing
+        row inside the window is not a miss. Re-posting a consumed
+        prompt queues a copy that the broker delivers after the real
+        turn ends -- a duplicate role pass after SHIP retirement.
+        Consumed means, at the deadline: nothing pending on a bound
+        runner, after the prompt was seen pending or the session was
+        seen running. Still pending (cold TUI), no evidence at all, or
+        an unbound runner (restart blip) stays a miss.
+        """
         deadline = time.monotonic() + max(wait_seconds, 0.0)
         saw_pending = False
+        saw_running = False
         while True:
             items = _session_item_rows(self.get_items(session_id))
-            if _items_contain_user_text(items, message):
+            if _items_contain_user_text(items, message) or any(
+                _item_role(item) == "assistant" for item in items
+            ):
                 return True
             snapshot = self.get_session(session_id)
             pending = _pending_inputs(snapshot)
             if pending:
                 saw_pending = True
-            elif saw_pending:
-                # Pending drained with no item yet. One more items poll
-                # after `interval` covers store-write lag before re-post.
-                now = time.monotonic()
-                if now < deadline:
-                    time.sleep(min(interval, max(deadline - now, 0.0)))
-                items = _session_item_rows(self.get_items(session_id))
-                if _items_contain_user_text(items, message):
-                    return True
-                return False
+            if _snapshot_status(snapshot) == "running":
+                saw_running = True
             now = time.monotonic()
             if now >= deadline:
-                return False
+                return (
+                    not pending
+                    and (saw_pending or saw_running)
+                    and _runner_bound(snapshot)
+                )
             time.sleep(min(interval, max(deadline - now, 0.0)))
 
     def list_runners(self) -> Any:

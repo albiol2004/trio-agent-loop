@@ -948,11 +948,13 @@ def test_create_session_host_id_env_selects_among_many(fake_broker, monkeypatch)
 def test_first_prompt_retries_on_same_session_never_duplicates(
     fake_broker, monkeypatch
 ):
-    """Cold TUI: first event ACKs but no item; re-POST the same id."""
+    """Cold TUI: first event stays pending, no item; re-POST the same id."""
     trioctl = load_trioctl()
     base_url, state = fake_broker
     # Land only after the second /events POST (create + one retry).
     state["items_after_event_count"] = 2
+    # loop-omnigent-014: the prompt stayed in pending inputs.
+    state["pending_inputs"] = [{"id": "p1"}]
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.05")
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.01")
@@ -971,14 +973,51 @@ def test_first_prompt_retries_on_same_session_never_duplicates(
     assert state["deletes"] == []
 
 
-def test_pending_inputs_drain_counts_as_miss_then_repost(
+def test_pending_drain_on_bound_runner_is_not_reposted(
     fake_broker, monkeypatch
 ):
-    """Pending composer that clears without an item is a miss."""
+    """Drained pending on a bound runner: consumed, even with no row yet.
+
+    Cursor-native writes the user row with the first assistant row, so
+    a re-post here queues a duplicate turn behind the real one.
+    """
     trioctl = load_trioctl()
     base_url, state = fake_broker
     state["item_rows"] = []
     state["pending_inputs"] = [{"id": "p1"}]
+    state["session_runner_ids"] = ["runner-1"]
+    monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_INTERVAL", "0.02")
+    monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
+    client = trioctl.broker_http.BrokerClient(base_url)
+    original_get = client.get_session
+    polls = {"n": 0}
+
+    def get_session_then_clear(session_id: str):
+        polls["n"] += 1
+        snap = original_get(session_id)
+        if polls["n"] >= 2:
+            state["pending_inputs"] = []
+        return snap
+
+    client.get_session = get_session_then_clear  # type: ignore[method-assign]
+    created = client.create_session("agent-1", "model-1", "hi", "title")
+
+    assert created["id"] == "session-1"
+    assert len(state["events"]) == 1
+    assert state["deletes"] == []
+
+
+def test_pending_drain_on_unbound_runner_counts_as_miss_then_repost(
+    fake_broker, monkeypatch
+):
+    """Pending cleared but the runner dropped (restart blip): re-post."""
+    trioctl = load_trioctl()
+    base_url, state = fake_broker
+    state["item_rows"] = []
+    state["pending_inputs"] = [{"id": "p1"}]
+    state["session_runner_ids"] = ["runner-1", None]
     state["items_after_event_count"] = None
     monkeypatch.delenv("TRIO_OMNIGENT_RUNNER_ID", raising=False)
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_WAIT", "0.2")
@@ -986,9 +1025,8 @@ def test_pending_inputs_drain_counts_as_miss_then_repost(
     monkeypatch.setenv("TRIO_OMNIGENT_PROMPT_ATTEMPTS", "3")
     client = trioctl.broker_http.BrokerClient(base_url)
 
-    # After the first poll sees pending, clear it so the helper
-    # treats the drain as a miss (even after the extra grace items
-    # poll) and re-posts. Land the user row only after that retry.
+    # After the first poll sees pending, clear it while the runner shows
+    # unbound; land the user row only after that retry.
     original_get = client.get_session
     original_items = client.get_items
     polls = {"n": 0}
