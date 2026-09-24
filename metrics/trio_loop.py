@@ -210,37 +210,150 @@ def _number(value: str) -> int:
     match = re.match(r"\d+", value.strip())
     return int(match.group(0)) if match else 0
 
-def _acquire_lock(mailbox: Path) -> Path | None:
-    """mkdir is atomic; replace a lock only after its pid is stale."""
-    lock = mailbox / ".lock"
-    try:
-        lock.mkdir()
-    except FileExistsError:
+# The mailbox lock is the `.lock` directory with a `pid` file (unchanged
+# on-disk protocol, so older drivers still see it). Every acquire, stale
+# takeover and release by this module happens under an flock on the
+# mailbox directory itself, so no two of them interleave: a second
+# process never sees the mkdir-before-pid window, and a stale lock is
+# taken over by one process only. A pid-less `.lock` is an acquirer
+# between mkdir and pid (or an older driver) and is only stale after
+# LOCK_EMPTY_GRACE_SECONDS. Release removes the lock only when its
+# `owner` token is ours, never another owner's.
+LOCK_EMPTY_GRACE_SECONDS = 60.0
+_LOCK_TOKENS: dict[str, str] = {}
+
+
+class _MailboxGuard:
+    """Exclusive flock on the mailbox directory (released on close)."""
+
+    def __init__(self, mailbox: Path) -> None:
+        self.mailbox = mailbox
+
+    def __enter__(self) -> "_MailboxGuard":
+        import fcntl
+
+        self.fd = os.open(self.mailbox, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            pid = int((lock / "pid").read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pid = 0
-        if pid > 0:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                pass
-            else:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        os.close(self.fd)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _lock_pid(lock: Path) -> int:
+    try:
+        return int((lock / "pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_lock_file(lock: Path, name: str, text: str) -> None:
+    tmp = lock / f".{name}.{os.getpid()}.tmp"
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, lock / name)
+
+
+def _discard_lock_dir(mailbox: Path, lock: Path) -> None:
+    """Atomically move `lock` aside, then delete the moved copy."""
+    tomb = mailbox / f".lock.stale-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        os.rename(lock, tomb)
+    except FileNotFoundError:
+        return
+    shutil.rmtree(tomb, ignore_errors=True)
+
+
+def _acquire_lock(mailbox: Path) -> Path | None:
+    """Take the mailbox lock, or None while another owner holds it."""
+    mailbox = Path(mailbox)
+    lock = mailbox / ".lock"
+    with _MailboxGuard(mailbox):
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            pid = _lock_pid(lock)
+            if pid > 0 and _pid_alive(pid):
                 print(
                     f"Mailbox {mailbox}/ is owned by a live driver "
                     f"(pid {pid}).",
                     file=sys.stderr,
                 )
                 return None
-        print(
-            f"Removing stale lock on {mailbox}/ "
-            f"(pid {pid or 'unknown'} is gone).",
-            file=sys.stderr,
-        )
-        shutil.rmtree(lock, ignore_errors=True)
-        lock.mkdir()
-    (lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+            if pid <= 0:
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except FileNotFoundError:
+                    age = 0.0  # released by a non-guarded holder just now
+                if age < LOCK_EMPTY_GRACE_SECONDS:
+                    print(
+                        f"Mailbox {mailbox}/ lock is being acquired "
+                        "(no pid yet); not taking it.",
+                        file=sys.stderr,
+                    )
+                    return None
+            print(
+                f"Removing stale lock on {mailbox}/ "
+                f"(pid {pid or 'unknown'} is gone).",
+                file=sys.stderr,
+            )
+            _discard_lock_dir(mailbox, lock)
+            try:
+                lock.mkdir()
+            except FileExistsError:
+                return None  # an older, unguarded driver got in first
+        token = uuid.uuid4().hex
+        _write_lock_file(lock, "owner", f"{token}\n")
+        _write_lock_file(lock, "pid", f"{os.getpid()}\n")
+        _LOCK_TOKENS[str(lock)] = token
     return lock
+
+
+def _release_lock(lock: Path | None) -> None:
+    """Remove `lock` only if this process's owner token is still on it."""
+    if lock is None:
+        return
+    lock = Path(lock)
+    token = _LOCK_TOKENS.pop(str(lock), None)
+    if token is None:
+        return
+    try:
+        guard = _MailboxGuard(lock.parent)
+        guard.__enter__()
+    except OSError:
+        return
+    try:
+        try:
+            owner = (lock / "owner").read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if owner != token:
+            print(
+                f"Not removing {lock}: it now belongs to another owner.",
+                file=sys.stderr,
+            )
+            return
+        _discard_lock_dir(lock.parent, lock)
+    finally:
+        guard.__exit__()
 
 def _commit_gate(mailbox: Path, repo: Path | None) -> tuple[bool, str]:
     """Run trio-shadow; exit 0 passes and exits 1/2 fail."""
@@ -1305,7 +1418,7 @@ def _run_lockstep(
             _write_driver_state(mailbox, runner, iteration, "lead-done")
             state = _read_state(state_path)
     finally:
-        shutil.rmtree(lock, ignore_errors=True)
+        _release_lock(lock)
 
 
 def run_loop(
@@ -1992,7 +2105,7 @@ def run_open_loop(
         stop_event.set()
         if lead_thread is not None:
             lead_thread.join(timeout=5)
-        shutil.rmtree(lock, ignore_errors=True)
+        _release_lock(lock)
 
 
 class _PortableRunner:

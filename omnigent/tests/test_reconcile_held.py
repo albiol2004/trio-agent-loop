@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -239,6 +240,59 @@ def apply(mailbox, broker, core, **kw):
 
 # -- provenance at dispatch -------------------------------------------------
 
+def _t1_shape_hold(tmp_path, clock, **runner_kw):
+    core = trioctl._load_trio_loop(TREE)
+    mailbox = tmp_path / "loop"
+    mailbox.mkdir()
+    (mailbox / "STATE.md").write_text(
+        "iteration: 0\nstatus: ready\nphase: idle\n", "utf-8")
+    (mailbox / "LOG.md").write_text("# Trio loop log\n", "utf-8")
+    (mailbox / "VERDICT.md").write_text("VERDICT: none\n", "utf-8")
+    broker = h.Native014Broker(clock, row_lag=35.0, turn_len=100.0)
+    payloads = []
+    real_request = broker._request
+
+    def spy(method, path, payload=None, expected_status=200):
+        if method == "POST" and path == "/v1/sessions":
+            payloads.append(payload)
+        return real_request(method, path, payload, expected_status)
+    broker._request = spy
+    runner = trioctl.OmnigentRunner(
+        repo=tmp_path, broker_client=broker, interval=1, timeout=300.0,
+        **runner_kw)
+    runner._agent_id = lambda role: "lead-agent"
+    runner._resolve_model = lambda role: "m"
+    runner._prompt = lambda *a, **k: h.PROMPT
+    with pytest.raises(trioctl.TrioctlError, match="held dispatch recorded"):
+        core.run_loop(mailbox, 3, runner, repo=None)
+    return mailbox, broker, payloads
+
+
+def test_default_dispatch_is_unchanged_without_opt_in(tmp_path, clock):
+    """No --completion-receipts: no label, no nonce, no provenance files,
+    and the held record has exactly the 31f5a5a fields."""
+    mailbox, broker, payloads = _t1_shape_hold(tmp_path, clock)
+    assert payloads and "labels" not in payloads[0]
+    assert broker.turns == [h.PROMPT]
+    record = json.loads(
+        (mailbox / ".sessions" / f"held-{h.SID}.json").read_text())
+    assert set(record) == {"session_id", "role", "iteration", "title",
+                           "hold", "reason", "recorded_at"}
+    names = sorted(p.name for p in (mailbox / ".sessions").iterdir())
+    assert names == [f"held-{h.SID}.json"]
+    decision = decide(mailbox, ContractBroker())
+    assert decision["legacy_hold"] is True
+    assert "unsupported" in decision["reasons"][0]
+
+
+def test_loop_cli_completion_receipts_flag_defaults_off():
+    args = trioctl.parser().parse_args(["omnigent", "loop"])
+    assert args.completion_receipts is False and args.reconcile_held is False
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--completion-receipts"])
+    assert args.completion_receipts is True
+
+
 def test_new_dispatch_saves_provenance_label_and_nonce(
     tmp_path, monkeypatch, clock
 ):
@@ -261,7 +315,8 @@ def test_new_dispatch_saves_provenance_label_and_nonce(
         return real_request(method, path, payload, expected_status)
     broker._request = spy
     runner = trioctl.OmnigentRunner(
-        repo=tmp_path, broker_client=broker, interval=1, timeout=300.0)
+        repo=tmp_path, broker_client=broker, interval=1, timeout=300.0,
+        completion_receipts=True)
     runner._agent_id = lambda role: "lead-agent"
     runner._resolve_model = lambda role: "m"
     runner._prompt = lambda *a, **k: h.PROMPT
@@ -654,31 +709,121 @@ def test_mailbox_lock_excludes_second_reconciler(tmp_path, monkeypatch):
     assert apply(mailbox, broker, core_ok(monkeypatch))["action"] == "applied"
 
 
-def test_crash_while_applying_is_replayed_without_new_fence(tmp_path,
-                                                            monkeypatch):
+class Crash(Exception):
+    pass
+
+
+def _crash_first(monkeypatch, name, when=lambda *a, **k: True):
+    real = getattr(rc, name)
+    state = {"done": False}
+
+    def boom(*a, **k):
+        if not state["done"] and when(*a, **k):
+            state["done"] = True
+            raise Crash(f"crash in {name}")
+        return real(*a, **k)
+    monkeypatch.setattr(rc, name, boom)
+
+
+def test_crash_after_own_state_write_finishes_without_new_fence(
+    tmp_path, monkeypatch
+):
+    """Crash after LOG+STATE were written, before the hold rename: the
+    replay recognizes exactly its own writes and finishes."""
     mailbox, prompt = make_held(tmp_path)
     broker = ContractBroker(receipt=good_receipt(prompt))
     core = core_ok(monkeypatch)
-    real = rc._rewrite_state
-
-    def crash(*a, **k):
-        raise KeyboardInterrupt("crash mid-apply")
-    monkeypatch.setattr(rc, "_rewrite_state", crash)
-    with pytest.raises(KeyboardInterrupt):
+    _crash_first(monkeypatch, "durable_write_json",
+                 lambda path, obj: Path(path).name.startswith("reconciled-"))
+    with pytest.raises(Crash):
         apply(mailbox, broker, core)
-    journal = rc.read_journal(mailbox, SID)
-    assert journal["step"] == "applying"
+    assert rc.read_journal(mailbox, SID)["step"] == "applying"
+    assert rc.read_state(mailbox)["phase"] == "lead-done"
     assert list((mailbox / ".sessions").glob("held-*.json"))
     assert not (mailbox / ".lock").exists()  # released on unwind
-    monkeypatch.setattr(rc, "_rewrite_state", real)
-    # Even an unreachable broker cannot stop the journaled replay.
-    broker.unreachable = True
+    broker.unreachable = True  # own writes need no broker to finish
     result = apply(mailbox, broker, core)
     assert (result["action"], result["code"]) == (
         "applied", "resumed_interrupted_apply")
+    assert "(after)" in result["reasons"][0]
     assert len(broker.writes()) == 1
-    assert rc.read_state(mailbox)["phase"] == "lead-done"
     assert (mailbox / "LOG.md").read_text().count("reconciled held") == 1
+
+
+def test_crash_before_any_write_revalidates_then_applies(tmp_path,
+                                                         monkeypatch):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    _crash_first(monkeypatch, "_finish")
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    broker.unreachable = True  # "before" needs a fresh decision
+    assert apply(mailbox, broker, core)["code"] == "broker_unreachable"
+    assert rc.read_state(mailbox)["status"] == "needs_human"
+    broker.unreachable = False
+    result = apply(mailbox, broker, core)
+    assert result["action"] == "applied" and "(before)" in result["reasons"][0]
+    assert len(broker.writes()) == 1
+
+
+@pytest.mark.parametrize("change", [
+    "log_line_removed", "log_rewritten", "state_operator_blocked",
+    "state_after_crash_edited", "receipt_changed", "gate_now_fails"])
+def test_interrupted_apply_preserves_external_changes(tmp_path, monkeypatch,
+                                                      change):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    if change == "state_after_crash_edited":
+        _crash_first(monkeypatch, "durable_write_json",
+                     lambda path, obj: Path(path).name.startswith(
+                         "reconciled-"))
+    else:
+        _crash_first(monkeypatch, "_finish")
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    log, state = mailbox / "LOG.md", mailbox / "STATE.md"
+    if change == "log_line_removed":
+        log.write_text(log.read_text().replace(
+            "- iter 1 | lead | built the slice\n", ""))
+    elif change == "log_rewritten":
+        log.write_text("# Trio loop log\n")
+    elif change == "state_operator_blocked":
+        state.write_text(state.read_text().replace(
+            "status: needs_human", "status: blocked"))
+    elif change == "state_after_crash_edited":
+        state.write_text(state.read_text().replace(
+            "phase: lead-done", "phase: lead-running"))
+    elif change == "receipt_changed":
+        broker.receipt = good_receipt(prompt, rev=2, detail={
+            "observed_max_acked": False, "store_max": 41})
+    else:
+        monkeypatch.setattr(core, "run_commit_gate",
+                            lambda m, r: (False, "commit gate failed"))
+    snapshot = {n: (mailbox / n).read_text() for n in ("LOG.md", "STATE.md")}
+    result = apply(mailbox, broker, core)
+    assert result["action"] != "applied", result
+    assert {n: (mailbox / n).read_text()
+            for n in ("LOG.md", "STATE.md")} == snapshot
+    assert list((mailbox / ".sessions").glob("held-*.json"))
+    assert rc.read_journal(mailbox, SID)["step"] == "applying"
+
+
+def test_interrupted_evaluator_apply_with_changed_verdict_is_kept(
+    tmp_path, monkeypatch
+):
+    mailbox, prompt = make_held(tmp_path, "evaluator")
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    _crash_first(monkeypatch, "_finish")
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    verdict = mailbox / "VERDICT.md"
+    verdict.write_text(verdict.read_text().replace("SHIP", "ITERATE"))
+    result = apply(mailbox, broker, core)
+    assert result["action"] == "blocked"
+    assert rc.read_state(mailbox)["status"] == "needs_human"
 
 
 def test_stale_applying_journal_never_rewrites_state(tmp_path, monkeypatch):
@@ -918,3 +1063,174 @@ def test_t1_fixture_legacy_hold_stays_held(tmp_path, capsys, monkeypatch):
     assert all(method == "GET" for method, _ in broker.requests)
     assert tree_hash(mailbox) == copy_before
     assert tree_hash(src) == before
+
+
+# -- mailbox lock: real cross-process ownership ------------------------------
+
+def _hold_lock_child(mailbox, ready, release, result):
+    core = trioctl._load_trio_loop(TREE)
+    lock = core._acquire_lock(Path(mailbox))
+    result.put(None if lock is None else (lock / "owner").read_text())
+    ready.set()
+    release.wait(30)
+    core._release_lock(lock)
+
+
+def _two_process(mailbox):
+    import multiprocessing
+    ctx = multiprocessing.get_context("fork")
+    ready, release, result = ctx.Event(), ctx.Event(), ctx.Queue()
+    proc = ctx.Process(target=_hold_lock_child,
+                       args=(str(mailbox), ready, release, result))
+    proc.start()
+    assert ready.wait(30)
+    return proc, release, result.get(timeout=5)
+
+
+def test_second_process_cannot_take_or_release_a_held_lock(tmp_path):
+    core = trioctl._load_trio_loop(TREE)
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    proc, release, owner = _two_process(mailbox)
+    try:
+        assert owner  # child owns it
+        assert core._acquire_lock(mailbox) is None
+        # A forged release from this process never removes the lock.
+        core._release_lock(mailbox / ".lock")
+        core._LOCK_TOKENS[str(mailbox / ".lock")] = "not-the-owner"
+        core._release_lock(mailbox / ".lock")
+        assert (mailbox / ".lock" / "owner").read_text() == owner
+    finally:
+        release.set()
+        proc.join(30)
+    lock = core._acquire_lock(mailbox)
+    assert lock is not None
+    core._release_lock(lock)
+    assert not lock.exists()
+
+
+def test_acquire_is_serialized_across_processes(tmp_path):
+    """Deterministic mkdir-before-pid window: the holder pauses inside
+    _acquire_lock after mkdir; a second process's acquire waits on the
+    mailbox guard and then sees a live owner (never a pid-less lock)."""
+    import multiprocessing
+    import threading
+    core = trioctl._load_trio_loop(TREE)
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    ctx = multiprocessing.get_context("fork")
+    in_window, go, result = ctx.Event(), ctx.Event(), ctx.Queue()
+
+    def child():
+        real = core._write_lock_file
+
+        def slow(lock, name, text):
+            if name == "owner":
+                in_window.set()
+                go.wait(30)
+            return real(lock, name, text)
+        core._write_lock_file = slow
+        lock = core._acquire_lock(mailbox)
+        result.put(lock is not None)
+        go.wait(30)
+    proc = ctx.Process(target=child)
+    proc.start()
+    assert in_window.wait(30)
+    assert (mailbox / ".lock").is_dir()
+    assert not (mailbox / ".lock" / "pid").exists()  # inside the window
+    got = []
+    t = threading.Thread(target=lambda: got.append(
+        core._acquire_lock(mailbox)))
+    t.start()
+    t.join(0.5)
+    assert t.is_alive()  # blocked on the guard, not stealing
+    go.set()
+    t.join(30)
+    assert result.get(timeout=5) is True
+    assert got == [None]
+    proc.join(30)
+
+
+def _hammer(mailbox, rounds, q):
+    import contextlib
+    import io
+    core = trioctl._load_trio_loop(TREE)
+    overlaps = errors = got = 0
+    for _ in range(rounds):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                lock = core._acquire_lock(Path(mailbox))
+        except OSError:
+            errors += 1
+            continue
+        if lock is None:
+            continue
+        got += 1
+        marker = Path(mailbox) / "owner-marker"
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            os.unlink(marker)
+        except FileExistsError:
+            overlaps += 1
+        core._release_lock(lock)
+    q.put((overlaps, errors, got))
+
+
+def test_two_processes_never_overlap(tmp_path):
+    import multiprocessing
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    ctx = multiprocessing.get_context("fork")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_hammer, args=(str(mailbox), 1500, q))
+             for _ in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+    results = [q.get(timeout=5) for _ in procs]
+    assert all(r[0] == 0 and r[1] == 0 for r in results), results
+    assert sum(r[2] for r in results) > 0
+    assert not (mailbox / ".lock").exists()
+    assert not list(mailbox.glob(".lock.stale-*"))
+
+
+def test_fresh_pidless_lock_is_not_stolen_but_old_one_is(tmp_path):
+    core = trioctl._load_trio_loop(TREE)
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    (mailbox / ".lock").mkdir()
+    assert core._acquire_lock(mailbox) is None
+    old = time.time() - core.LOCK_EMPTY_GRACE_SECONDS - 5
+    os.utime(mailbox / ".lock", (old, old))
+    lock = core._acquire_lock(mailbox)
+    assert lock is not None
+    assert (lock / "pid").read_text().strip() == str(os.getpid())
+    core._release_lock(lock)
+
+
+def test_dead_pid_lock_is_taken_over_and_released(tmp_path):
+    core = trioctl._load_trio_loop(TREE)
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    (mailbox / ".lock").mkdir()
+    (mailbox / ".lock" / "pid").write_text("999999999\n")
+    lock = core._acquire_lock(mailbox)
+    assert lock is not None
+    core._release_lock(lock)
+    assert not (mailbox / ".lock").exists()
+
+
+def test_reconciler_and_driver_exclude_each_other(tmp_path, monkeypatch):
+    mailbox, prompt = make_held(tmp_path)
+    proc, release, owner = _two_process(mailbox)
+    try:
+        broker = ContractBroker(receipt=good_receipt(prompt))
+        result = apply(mailbox, broker, core_ok(monkeypatch))
+        assert result["code"] == "mailbox_locked"
+        assert broker.requests == []
+        assert (mailbox / ".lock" / "owner").read_text() == owner
+    finally:
+        release.set()
+        proc.join(30)

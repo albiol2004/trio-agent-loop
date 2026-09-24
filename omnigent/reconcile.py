@@ -280,7 +280,8 @@ def _waiting(code: str, *reasons: str, **extra: Any) -> dict:
 
 def _provenance_problem(prov: Any) -> str | None:
     if not isinstance(prov, dict) or prov.get("schema") != PROVENANCE_SCHEMA:
-        return "no dispatch provenance (legacy hold)"
+        return ("legacy hold: no dispatch provenance (dispatched without "
+                "--completion-receipts); unsupported, resolve by hand")
     missing = [
         k for k in REQUIRED_PROVENANCE if prov.get(k) in (None, "", [], {})
     ]
@@ -746,20 +747,24 @@ def evidence(obs: dict[str, Any]) -> dict[str, Any]:
 
 # -- apply (under the mailbox lock) -------------------------------------
 
-def _rewrite_state(mailbox: Path, updates: dict[str, str]) -> None:
-    """Replace owned keys, keep every other line; durable."""
-    path = mailbox / "STATE.md"
-    lines = (_read_text(path) or "").splitlines()
+def _state_text_after(text: str, updates: dict[str, str]) -> str:
+    """STATE.md with owned keys replaced, every other line kept."""
     pending = dict(updates)
     out = []
-    for line in lines:
+    for line in text.splitlines():
         match = re.match(r"^\s*([A-Za-z_]+)\s*:", line)
         key = match.group(1).lower() if match else None
         if key in pending:
             line = f"{key}: {pending.pop(key)}"
         out.append(line)
     out.extend(f"{k}: {v}" for k, v in pending.items())
-    durable_write(path, "\n".join(out) + "\n")
+    return "\n".join(out) + "\n"
+
+
+def _rewrite_state(mailbox: Path, updates: dict[str, str]) -> None:
+    """Replace owned keys, keep every other line; durable."""
+    path = mailbox / "STATE.md"
+    durable_write(path, _state_text_after(_read_text(path) or "", updates))
 
 
 def _log_line(record: dict[str, Any], journal: dict[str, Any]) -> str:
@@ -773,21 +778,67 @@ def _log_line(record: dict[str, Any], journal: dict[str, Any]) -> str:
     )
 
 
-def _append_log_once(mailbox: Path, line: str) -> None:
-    path = mailbox / "LOG.md"
-    text = _read_text(path) or "# Trio loop log\n"
-    if line in text.splitlines():
-        return
+def _log_text_after(text: str, line: str) -> str:
     if not text.endswith("\n"):
         text += "\n"
-    durable_write(path, text + line + "\n")
+    return text + line + "\n"
+
+
+class ExternalChange(RuntimeError):
+    """Mailbox files are neither the journaled before nor after state."""
+
+
+def _transition_plan(mailbox: Path, record: dict[str, Any],
+                     journal: dict[str, Any], repo: Path | None) -> dict:
+    """Exact before/after hashes of every file the transition writes."""
+    state = _read_text(mailbox / "STATE.md") or ""
+    log = _read_text(mailbox / "LOG.md") or "# Trio loop log\n"
+    artifact = _read_text(mailbox / ARTIFACT[record["role"]]) or ""
+    return {
+        "state_before": sha256_text(state),
+        "state_after": sha256_text(_state_text_after(state, journal["target"])),
+        "log_before": sha256_text(log),
+        "log_after": sha256_text(_log_text_after(log, _log_line(record,
+                                                                 journal))),
+        "artifact": sha256_text(artifact),
+        "head": _git(repo, "rev-parse", "HEAD") if repo is not None else None,
+    }
+
+
+def _transition_position(mailbox: Path, plan: dict) -> str:
+    """"before", "after" (exactly our own writes) or "external"."""
+    state = sha256_text(_read_text(mailbox / "STATE.md") or "")
+    log = sha256_text(_read_text(mailbox / "LOG.md") or "# Trio loop log\n")
+    if state == plan["state_before"] and log in (
+        plan["log_before"], plan["log_after"]
+    ):
+        return "before"  # LOG is written first; STATE not yet
+    if state == plan["state_after"] and log == plan["log_after"]:
+        return "after"
+    return "external"
 
 
 def _finish(mailbox: Path, hold_path: Path, record: dict[str, Any],
             journal: dict[str, Any]) -> None:
-    """The idempotent tail: STATE, LOG, retire the hold, journal done."""
-    _append_log_once(mailbox, _log_line(record, journal))
-    _rewrite_state(mailbox, journal["target"])
+    """The tail: LOG, STATE, retire the hold, journal done.
+
+    Writes only when a file is exactly the journaled ``plan`` before
+    state (skips it when it is exactly the after state); anything else
+    raises ExternalChange and leaves the file as it is.
+    """
+    plan = journal["plan"]
+    log_path, state_path = mailbox / "LOG.md", mailbox / "STATE.md"
+    log = _read_text(log_path) or "# Trio loop log\n"
+    if sha256_text(log) == plan["log_before"]:
+        durable_write(log_path, _log_text_after(log, _log_line(record,
+                                                               journal)))
+    elif sha256_text(log) != plan["log_after"]:
+        raise ExternalChange("LOG.md changed since the journaled plan")
+    state = _read_text(state_path) or ""
+    if sha256_text(state) == plan["state_before"]:
+        durable_write(state_path, _state_text_after(state, journal["target"]))
+    elif sha256_text(state) != plan["state_after"]:
+        raise ExternalChange("STATE.md changed since the journaled plan")
     if hold_path.exists():
         resolved = dict(record)
         resolved["reconciled"] = {
@@ -859,7 +910,11 @@ def apply_once(
             new_fence_id,
         )
     finally:
-        shutil.rmtree(lock, ignore_errors=True)
+        release = getattr(loop_core, "_release_lock", None)
+        if release is not None:
+            release(lock)
+        else:  # an older loop core without owner tokens
+            shutil.rmtree(lock, ignore_errors=True)
 
 
 def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
@@ -900,10 +955,10 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
             if hold["sha256"] != journal.get("hold_sha256"):
                 return _blocked("journal_state_conflict",
                                 "held record changed during apply")
-            _finish(mailbox, Path(hold["path"]), hold["record"], journal)
-            return _decision("applied", "resumed_interrupted_apply",
-                             ["replayed the journaled continuation"],
-                             continuation=journal["target"])
+            return _replay_applying(
+                mailbox, repo, client, loop_core, artifact_ready,
+                broker_http, hold, journal,
+            )
 
     if not holds:
         return _decision("none", "nothing_held", ["no held record"])
@@ -1002,9 +1057,79 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     if failures:
         return _blocked("gate_failed", *failures)
 
+    journal["plan"] = _transition_plan(mailbox, record, journal, repo)
     journal["step"] = "applying"
     durable_write_json(jpath, journal)
-    _finish(mailbox, hold_path, record, journal)
+    try:
+        _finish(mailbox, hold_path, record, journal)
+    except ExternalChange as exc:
+        return _blocked("journal_state_conflict", str(exc))
     return _decision("applied", "late_valid_completion",
                      decision2["reasons"], continuation=journal["target"],
                      evidence=decision2.get("evidence"))
+
+
+def _replay_applying(mailbox, repo, client, loop_core, artifact_ready,
+                     broker_http, hold, journal) -> dict[str, Any]:
+    """Finish an interrupted `applying` only after revalidating it.
+
+    Recognizes exactly two positions: nothing committed yet ("before":
+    full re-decision under the lock with the journaled fence and receipt,
+    then the gates) or exactly this reconciler's own partial writes
+    ("after": artifact and HEAD unchanged, gates re-run). Any other
+    mailbox state is an external change (a person, the pane, another
+    tool) and is preserved: the hold and journal stay for a person.
+    """
+    record = hold["record"]
+    plan = journal.get("plan")
+    if not isinstance(plan, dict):
+        return _blocked("journal_state_conflict",
+                        "applying journal has no transition plan")
+    position = _transition_position(mailbox, plan)
+    if position == "external":
+        return _blocked("journal_state_conflict",
+                        "STATE.md/LOG.md changed after the interrupted "
+                        "apply; preserved for a person")
+    artifact = _read_text(mailbox / ARTIFACT[record["role"]]) or ""
+    if record["role"] != "lead" and sha256_text(artifact) != plan["artifact"]:
+        return _blocked("journal_state_conflict",
+                        f"{ARTIFACT[record['role']]} changed after the "
+                        "interrupted apply")
+    if repo is not None and plan.get("head") is not None and _git(
+        repo, "rev-parse", "HEAD"
+    ) != plan["head"]:
+        return _blocked("journal_state_conflict",
+                        "product HEAD changed after the interrupted apply")
+    if position == "before":
+        obs = observe(mailbox, repo=repo, client=client,
+                      artifact_ready=artifact_ready, broker_http=broker_http)
+        if obs.get("hold_sha256") != journal.get("hold_sha256"):
+            return _blocked("journal_state_conflict", "held record changed")
+        decision = decide(obs.get("record"), obs)
+        if decision["action"] != "ready":
+            return decision
+        snapshot = obs["broker"]["snapshot"]
+        fence, _ = parse_fence(snapshot)
+        receipt, _ = parse_receipt(snapshot)
+        if not (
+            isinstance(fence, dict)
+            and fence.get("fence_id") == journal.get("fence_id")
+            and fence.get("state") == "closed"
+            and fence.get("verified") is True
+        ):
+            return _blocked("fence_unverified",
+                            "journaled fence is not closed+verified")
+        if receipt_key(receipt) != journal.get("receipt"):
+            return _blocked("receipt_changed_after_fence",
+                            f"{journal.get('receipt')} -> "
+                            f"{receipt_key(receipt)}")
+    failures = _gates(mailbox, record, repo, loop_core)
+    if failures:
+        return _blocked("gate_failed", *failures)
+    try:
+        _finish(mailbox, Path(hold["path"]), record, journal)
+    except ExternalChange as exc:
+        return _blocked("journal_state_conflict", str(exc))
+    return _decision("applied", "resumed_interrupted_apply",
+                     [f"revalidated interrupted apply ({position})"],
+                     continuation=journal["target"])

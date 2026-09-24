@@ -134,8 +134,10 @@ def _load_reconcile() -> Any:
 reconcile = _load_reconcile()
 
 # Creation label that opts a new role session in to cursor-native
-# completion receipts (proposed contract v1, §0). Servers without the
-# capability ignore it; nothing reads it except `omnigent reconcile`.
+# completion receipts (proposed contract v1, §0). Sent -- together with
+# the prompt nonce and the saved dispatch provenance -- ONLY when the
+# runner is built with completion_receipts=True (`loop
+# --completion-receipts`); the default dispatch path is unchanged.
 COMPLETION_RECEIPT_LABELS = (
     {reconcile.CONTRACT["optin_label"]: reconcile.CONTRACT["optin_value"]}
     if reconcile is not None
@@ -1346,7 +1348,7 @@ def _posted_copies(client: Any, session_id: str, extra: int) -> dict[str, Any]:
 
 
 def _create_sends_labels(client: Any) -> bool:
-    """True when `_create` forwards the opt-in label to this client."""
+    """True when `_create` can forward the opt-in label to this client."""
     if not COMPLETION_RECEIPT_LABELS:
         return False
     method = getattr(client, "create_session", None) or getattr(
@@ -2056,6 +2058,7 @@ class OmnigentRunner:
         host_id: str | None = None,
         workspace: str | None = None,
         observe: dict[str, Any] | None = None,
+        completion_receipts: bool = False,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -2076,6 +2079,12 @@ class OmnigentRunner:
         # Opt-in `--observe-workers` run: {run_id, workers, phases,
         # trioctl}. None keeps prompts and mailbox writes unchanged.
         self._observe = observe
+        # Opt-in (default off): opt-in label, prompt nonce and dispatch
+        # provenance for `omnigent reconcile`. Needs a server + runner
+        # that implement the completion-receipt contract.
+        self._completion_receipts = bool(
+            completion_receipts and COMPLETION_RECEIPT_LABELS
+        )
         self.session_ids: dict[str, str] = {}
         self.created_session_ids: list[str] = []
         # First-prompt delivery uncertain: kept out of post-loop prune.
@@ -2328,6 +2337,7 @@ class OmnigentRunner:
         host_id: str | None = None,
         workspace: str | None = None,
         prompt_timeout: float | None = None,
+        labels: dict[str, str] | None = None,
     ) -> Any:
         """Call the checked-in client seam or a small test double.
 
@@ -2351,8 +2361,8 @@ class OmnigentRunner:
             extra["workspace"] = workspace
         if prompt_timeout is not None:
             extra["prompt_timeout"] = prompt_timeout
-        if COMPLETION_RECEIPT_LABELS:
-            extra["labels"] = dict(COMPLETION_RECEIPT_LABELS)
+        if labels:
+            extra["labels"] = dict(labels)
         if extra:
             try:
                 params = inspect.signature(method).parameters
@@ -2487,6 +2497,11 @@ class OmnigentRunner:
             host_id=self._host_id,
             workspace=self._workspace,
             prompt_timeout=self._timeout,
+            labels=(
+                dict(COMPLETION_RECEIPT_LABELS)
+                if self._completion_receipts
+                else None
+            ),
         )
         session_id = self._session_id(created)
         if session_id is None:
@@ -2516,10 +2531,9 @@ class OmnigentRunner:
         """
         return not _runner_is_bound(snapshot) and not _session_items(items)
 
-    @staticmethod
-    def _new_dispatch_nonce() -> str | None:
-        """A fresh nonce per dispatch (None: no receipt binding possible)."""
-        return uuid.uuid4().hex if COMPLETION_RECEIPT_LABELS else None
+    def _new_dispatch_nonce(self) -> str | None:
+        """A fresh nonce per opted-in dispatch; None on the default path."""
+        return uuid.uuid4().hex if self._completion_receipts else None
 
     def _record_dispatch(
         self, role: str, client: Any, session_id: str, created: Any
@@ -2667,16 +2681,18 @@ class OmnigentRunner:
         else:
             before_text = _mailbox_text(mailbox / "VERDICT.md")
             before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
-        self._delivery[role] = {
-            "mailbox": mailbox,
-            "prompt": prompt,
-            "baseline_text": before_text,
-            "base": _dispatch_provenance(
-                mailbox, self.repo, role, iteration, prompt, before_text,
-                context, agent_id=agent_id, model=model, title=title,
-                nonce=self._dispatch_nonce,
-            ),
-        }
+        self._delivery.pop(role, None)
+        if self._completion_receipts:
+            self._delivery[role] = {
+                "mailbox": mailbox,
+                "prompt": prompt,
+                "baseline_text": before_text,
+                "base": _dispatch_provenance(
+                    mailbox, self.repo, role, iteration, prompt, before_text,
+                    context, agent_id=agent_id, model=model, title=title,
+                    nonce=self._dispatch_nonce,
+                ),
+            }
         created_before = len(self.created_session_ids)
         try:
             snapshot, items = self._create_wait_read(
@@ -2872,8 +2888,11 @@ class OmnigentRunner:
             )
         send = getattr(client, "send_message", None)
         if send is not None:
-            delivery = self._delivery.setdefault(role, {})
-            delivery["extra_sends"] = int(delivery.get("extra_sends") or 0) + 1
+            delivery = self._delivery.get(role)
+            if delivery is not None:
+                delivery["extra_sends"] = (
+                    int(delivery.get("extra_sends") or 0) + 1
+                )
             send(session_id, prompt)
         ensure = getattr(client, "ensure_first_prompt", None)
         if ensure is not None:
@@ -3032,6 +3051,7 @@ def command_loop(args: argparse.Namespace) -> int:
         runner_id=getattr(args, "runner_id", None),
         host_id=getattr(args, "host_id", None),
         workspace=str(repo),
+        completion_receipts=getattr(args, "completion_receipts", False),
         **runner_kwargs,
     )
     keep_sessions = getattr(args, "keep_sessions", False)
@@ -3630,6 +3650,17 @@ def parser() -> argparse.ArgumentParser:
             "<mailbox>/.observe/<run-id>/) and ask for a REPORT.md "
             "'## Wave decisions' section; record Lead/Evaluator phase "
             "timing and write summary.json at exit. Never fails the loop"
+        ),
+    )
+    loop.add_argument(
+        "--completion-receipts",
+        action="store_true",
+        help=(
+            "opt-in (default off; only once the Omnigent server and runner "
+            "implement the completion-receipt contract): create role "
+            "sessions with the receipt opt-in label, add a per-dispatch "
+            "prompt nonce and save dispatch provenance under "
+            "<mailbox>/.sessions, so a later hold can be reconciled"
         ),
     )
     loop.add_argument(
