@@ -7,6 +7,10 @@ merge into the original repo. Read-only `CURRENT` at
 hash. Broker file sha256
 `22f00da15de13f34232e4694b5ed89fac451dde4510d14e91701b35bcdc432d7`.
 
+T1 (confirmed receipt, then role timeout, resume can
+duplicate) is **fixed** at pin `31f5a5a`; see
+[POST-DELIVERY-TIMEOUT-ROLLOUT.md](POST-DELIVERY-TIMEOUT-ROLLOUT.md).
+
 Observation pin `e07075c` is still documented in
 [WORKER-OBSERVATION-ROLLOUT.md](WORKER-OBSERVATION-ROLLOUT.md).
 That note used to blame a **restart blip** for a duplicate first
@@ -87,9 +91,11 @@ Reviewer mailbox
 `.runtime/eval-44238aa-opus/VERDICT.md`: scoped **SHIP**. That
 write-up also ran 254 + 36 adversarial with **1 expected**
 failure (legacy G1c: role timeout after a confirmed receipt,
-resume creates another Lead). That is **pre-existing**, not the
-install gate, and **not** fixed by this pin. Do not treat it as
-automatic-resume policy.
+resume creates another Lead). That is **pre-existing on this
+pin**, not the 44238aa install gate. Later pin `31f5a5a`
+holds that case; see
+[POST-DELIVERY-TIMEOUT-ROLLOUT.md](POST-DELIVERY-TIMEOUT-ROLLOUT.md).
+Do not treat 44238aa as automatic-resume policy.
 
 **Live canary (enough; n=2):**
 `.runtime/first-prompt-canary/runs-44238aa/{c1,c2}-sleep20-9k/`
@@ -108,7 +114,9 @@ follow-up, not this contract.
 
 ## Known leftovers (do not auto-fix)
 
-- **T1:** confirmed receipt, then role-artifact timeout, STATE
-  still `running`; a resume can duplicate the role. Pre-existing.
+- **T1 (open on this pin):** confirmed receipt, then
+  role-artifact timeout, STATE still `running`; a resume can
+  duplicate the role. **Closed at `31f5a5a`:**
+  [POST-DELIVERY-TIMEOUT-ROLLOUT.md](POST-DELIVERY-TIMEOUT-ROLLOUT.md).
 - Welcome / no-row by 600s: **held + human**, not retry.
 - Conservative uncertainty handling, not exactly-once.
