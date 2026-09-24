@@ -2,7 +2,7 @@
 
 A held dispatch (post-delivery timeout, 31f5a5a) may be resumed only when
 the proposed cursor-native completion receipt + input fence (contract v1
-rev 2, `.runtime/reconcile-completion-audit/PROPOSED-CONTRACT.md`) proves
+rev 3, `.runtime/reconcile-completion-audit/PROPOSED-CONTRACT.md`) proves
 the original turn ENDED, and the artifact gate proves it valid. Idle,
 dwell or a fresh artifact alone never do. Everything else stays held.
 
@@ -40,6 +40,7 @@ PIN = "b" * 40
 OPTIN = rc.CONTRACT["optin_label"]
 RECEIPT = rc.CONTRACT["receipt_label"]
 FENCE = rc.CONTRACT["fence_label"]
+BINDING = rc.CONTRACT["receipt_binding_label"]
 
 
 # -- fake contract broker ---------------------------------------------------
@@ -61,6 +62,9 @@ class ContractBroker:
         self.unreachable = False
         self.after_fence = None  # callable(broker) run after a close
         self.chat = CHAT
+        # Rev3 runner ack on a first close; None omits it (stored repeat).
+        self.runner_ack = {"same_fence": True, "already_closed": False,
+                           "bound": True, "bind_reason": None}
 
     def get_session(self, sid):
         self.requests.append(("GET", f"/v1/sessions/{sid}"))
@@ -72,11 +76,16 @@ class ContractBroker:
         if self.optin:
             labels[OPTIN] = "v1"
         if self.receipt is not None:
-            core = {k: v for k, v in self.receipt.items() if k != "detail"}
+            core = {k: v for k, v in self.receipt.items()
+                    if k not in ("detail", "binding")}
             labels[RECEIPT] = json.dumps(core)
             if "detail" in self.receipt:
                 labels[RECEIPT + ".detail"] = json.dumps(
                     self.receipt["detail"])
+            if "binding" in self.receipt:
+                binding = self.receipt["binding"]
+                labels[BINDING] = (binding if isinstance(binding, str)
+                                   else json.dumps(binding))
         if self.fence is not None:
             labels[FENCE] = json.dumps(self.fence)
         return {"id": sid, "status": self.status, "runner_id": self.runner_id,
@@ -107,14 +116,19 @@ class ContractBroker:
                       "reason": None if verified else self.fence_mode}
         if self.after_fence:
             self.after_fence(self)
-        return {"fenced": True, "fence": dict(self.fence)}
+        fence = dict(self.fence)
+        if self.runner_ack is not None:
+            fence["runner_ack"] = dict(self.runner_ack, fence_id=fence_id)
+        return {"fenced": True, "fence": fence}
 
     def writes(self):
         return [r for r in self.requests if r[0] != "GET"]
 
 
-def good_receipt(prompt: str, copies: int = 1, *, detail=None, **over):
-    """A stored rev-2 receipt: core fields plus ``detail`` (split on GET)."""
+def good_receipt(prompt: str, copies: int = 1, *, detail=None, binding=None,
+                 **over):
+    """A stored rev-3 receipt: core fields plus ``detail`` and ``binding``
+    (each split into its own label on GET)."""
     sha = rc.sha256_text(prompt)
     receipt = {
         "v": 1, "epoch": EPOCH, "turn_seq": copies,
@@ -131,6 +145,17 @@ def good_receipt(prompt: str, copies: int = 1, *, detail=None, **over):
         "unacked": 0,
     }
     receipt["detail"].update(detail or {})
+    receipt["binding"] = {
+        "bound": True, "reason": None,
+        "user_rows": receipt["inject_count"],
+        "closed_turns": receipt["inject_count"],
+    }
+    if isinstance(binding, dict):
+        receipt["binding"].update(binding)
+    elif binding is not None:
+        receipt["binding"] = binding  # raw label value, or "absent"
+    if receipt["binding"] == "absent":
+        del receipt["binding"]
     return receipt
 
 
@@ -913,6 +938,250 @@ def test_receipt_change_after_fence_keeps_hold(tmp_path, monkeypatch):
     result = apply(mailbox, broker, core_ok(monkeypatch))
     assert result["action"] == "blocked"
     assert list((mailbox / ".sessions").glob("held-*.json"))
+
+
+# -- contract rev3: turn binding (R3b, R6 re-read, runner bound ack) --------
+
+def _assert_held_unfenced(mailbox, broker):
+    """Hold kept, STATE untouched, and no fence was ever requested."""
+    assert broker.writes() == []
+    assert list((mailbox / ".sessions").glob("held-*.json"))
+    assert rc.read_state(mailbox)["status"] == "needs_human"
+    assert rc.read_journal(mailbox, SID) is None
+
+
+def test_bound_binding_is_ready_and_recorded(tmp_path):
+    mailbox, prompt = make_held(tmp_path, copies=2)
+    decision = decide(mailbox, ContractBroker(receipt=good_receipt(prompt, 2)))
+    assert (decision["action"], decision["code"]) == (
+        "ready", "late_valid_completion"), decision
+    assert decision["evidence"]["turn_binding"] == {
+        "bound": True, "reason": None, "user_rows": 2, "closed_turns": 2}
+
+
+@pytest.mark.parametrize("binding", [
+    "absent",  # rev2 server: no binding label at all
+    {"bound": None, "reason": "no_binding", "user_rows": None,
+     "closed_turns": None},  # rev2 runner on a rev3 server
+])
+def test_missing_or_null_binding_holds_without_fence(tmp_path, monkeypatch,
+                                                     binding):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt, binding=binding))
+    decision = decide(mailbox, broker)
+    assert (decision["action"], decision["code"]) == (
+        "blocked", "completion_unprovable_no_receipt")
+    assert "R3b" in decision["reasons"][0]
+    assert "do not fence" in decision["reasons"][0]
+    result = apply(mailbox, broker, core_ok(monkeypatch))
+    assert result["code"] == "completion_unprovable_no_receipt"
+    _assert_held_unfenced(mailbox, broker)
+
+
+@pytest.mark.parametrize("reason", [
+    "inject_unhashed", "user_rows_mismatch", "turn_end_unbound",
+    "duplicate_turn_end", "turn_open", "store_unbound"])
+def test_unbound_binding_holds_without_fence(tmp_path, monkeypatch, reason):
+    """Counts balance (R3 passes), but the runner did not bind the turns:
+    e.g. a follow-up or typed turn plus a still-queued copy (review F1)."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(
+        prompt, binding={"bound": False, "reason": reason}))
+    decision = decide(mailbox, broker)
+    assert (decision["action"], decision["code"]) == ("blocked",
+                                                      "turns_unbound")
+    assert reason in decision["reasons"][0]
+    apply(mailbox, broker, core_ok(monkeypatch))
+    _assert_held_unfenced(mailbox, broker)
+
+
+@pytest.mark.parametrize("counts", [
+    {"user_rows": 2}, {"closed_turns": 0}, {"user_rows": 2, "closed_turns": 2},
+    {"user_rows": None}, {"closed_turns": None}])
+def test_bound_binding_with_count_mismatch_holds(tmp_path, monkeypatch,
+                                                 counts):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt, binding=counts))
+    decision = decide(mailbox, broker)
+    assert (decision["action"], decision["code"]) == ("blocked",
+                                                      "turns_unbound"), counts
+    assert "inject_count 1" in decision["reasons"][0]
+    apply(mailbox, broker, core_ok(monkeypatch))
+    _assert_held_unfenced(mailbox, broker)
+
+
+@pytest.mark.parametrize("binding", [
+    "not json", json.dumps([True]), json.dumps("bound"),
+    {"bound": "true"}, {"bound": 1}, {"bound": True, "reason": "turn_open"},
+    {"bound": False, "reason": None}, {"bound": False, "reason": "nope"},
+    {"bound": None, "reason": None}, {"user_rows": -1}, {"closed_turns": 1.0},
+    {"user_rows": True},
+    json.dumps({"bound": True, "reason": None, "user_rows": 1}),
+])
+def test_malformed_binding_blocks(tmp_path, binding):
+    mailbox, prompt = make_held(tmp_path)
+    decision = decide(mailbox, ContractBroker(
+        receipt=good_receipt(prompt, binding=binding)))
+    assert (decision["action"], decision["code"]) == (
+        "blocked", "completion_unprovable_no_receipt"), binding
+    assert decision["reasons"][0].startswith("R3b: receipt binding")
+
+
+def test_binding_is_not_consulted_before_the_count_rules(tmp_path):
+    """R3 still waits on a turn that has not ended; R3b does not turn a
+    pending turn into a block."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(
+        prompt, turn_end_count=0, inject_count_at_end=0,
+        binding={"bound": False, "reason": "turn_open"}))
+    assert decide(mailbox, broker)["code"] == "turn_not_ended"
+
+
+def test_binding_does_not_rescue_legacy_or_opted_out(tmp_path):
+    mailbox, prompt = make_held(tmp_path, legacy=True)
+    decision = decide(mailbox, ContractBroker(receipt=good_receipt(prompt)))
+    assert decision["code"] == "completion_unprovable_no_receipt"
+    assert decision.get("legacy_hold") is True
+    mailbox2, prompt2 = make_held(tmp_path / "b")
+    decision = decide(mailbox2, ContractBroker(receipt=good_receipt(prompt2),
+                                               optin=False))
+    assert decision["code"] == "completion_unprovable_no_receipt"
+    assert "advertise" in decision["reasons"][0]
+
+
+@pytest.mark.parametrize("change", ["unbound", "removed", "null"])
+def test_binding_lost_after_fence_keeps_hold(tmp_path, monkeypatch, change):
+    """R6: the post-fence re-read must still be bound to the same turns,
+    even when the receipt key and flush state are unchanged."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+
+    def race(b):
+        binding = {"unbound": {"bound": False, "reason": "user_rows_mismatch"},
+                   "removed": "absent",
+                   "null": {"bound": None, "reason": "no_binding",
+                            "user_rows": None, "closed_turns": None}}[change]
+        b.receipt = good_receipt(prompt, rev=2, binding=binding)
+    broker.after_fence = race
+    before = _mailbox_bytes(mailbox)
+    result = apply(mailbox, broker, core_ok(monkeypatch))
+    assert result["action"] == "blocked", result
+    assert "R3b" in result["reasons"][0]
+    assert len(broker.writes()) == 1
+    assert _mailbox_bytes(mailbox) == before
+    assert rc.read_journal(mailbox, SID)["step"] == "fence_closed"
+
+
+def test_binding_counts_changed_after_fence_keeps_hold(tmp_path, monkeypatch):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    broker.after_fence = lambda b: setattr(b, "receipt", good_receipt(
+        prompt, rev=2, binding={"user_rows": 2, "closed_turns": 2}))
+    result = apply(mailbox, broker, core_ok(monkeypatch))
+    assert (result["action"], result["code"]) == ("blocked", "turns_unbound")
+    assert list((mailbox / ".sessions").glob("held-*.json"))
+
+
+def test_rev_advance_still_bound_after_fence_applies(tmp_path, monkeypatch):
+    """A delayed flush re-post (rev+1) that stays bound and ACKed is fine."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    broker.after_fence = lambda b: setattr(b, "receipt",
+                                           good_receipt(prompt, rev=3))
+    result = apply(mailbox, broker, core_ok(monkeypatch))
+    assert result["action"] == "applied", result
+
+
+@pytest.mark.parametrize("ack", [
+    {"bound": False, "bind_reason": "user_rows_mismatch"},
+    {"bound": None, "bind_reason": None},
+    "rev2",  # a rev2 runner's ack has no `bound` at all
+    {"same_fence": False},
+    {"fence_id": "someone-else"},
+    "not-an-object",
+])
+def test_verified_fence_without_bound_runner_ack_holds(tmp_path, monkeypatch,
+                                                       ack):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    if ack == "rev2":
+        del broker.runner_ack["bound"]
+        del broker.runner_ack["bind_reason"]
+    elif ack == "not-an-object":
+        broker.runner_ack = None
+        real = broker.input_fence
+
+        def fence_call(*a, **k):
+            out = real(*a, **k)
+            out["fence"]["runner_ack"] = "ok"
+            return out
+        broker.input_fence = fence_call
+    else:
+        broker.runner_ack.update(ack)
+        if "fence_id" in ack:
+            real = broker.input_fence
+
+            def fence_call(*a, **k):
+                out = real(*a, **k)
+                out["fence"]["runner_ack"]["fence_id"] = "someone-else"
+                return out
+            broker.input_fence = fence_call
+    before = _mailbox_bytes(mailbox)
+    result = apply(mailbox, broker, core_ok(monkeypatch))
+    assert (result["action"], result["code"]) == ("blocked",
+                                                  "fence_unverified"), result
+    assert "runner_ack" in result["reasons"][0]
+    assert _mailbox_bytes(mailbox) == before
+    assert rc.read_journal(mailbox, SID)["step"] == "fence_requested"
+
+
+def test_stored_verified_fence_without_runner_ack_applies(tmp_path,
+                                                          monkeypatch):
+    """The server's idempotent repeat returns the stored label (no
+    runner_ack); R3b already proved a rev3 server, so it is accepted."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    broker.runner_ack = None
+    assert apply(mailbox, broker, core_ok(monkeypatch))["action"] == "applied"
+
+
+def test_turns_unbound_fence_is_not_retried_as_transient(tmp_path,
+                                                         monkeypatch):
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt),
+                            fence_mode="turns_unbound")
+    core = core_ok(monkeypatch)
+    for _ in range(2):
+        result = apply(mailbox, broker, core)
+        assert (result["action"], result["code"]) == ("blocked",
+                                                      "fence_unverified")
+        assert "not retryable" in result["reasons"][0]
+    assert rc.read_state(mailbox)["status"] == "needs_human"
+    assert list((mailbox / ".sessions").glob("held-*.json"))
+
+
+def test_interrupted_apply_replay_rechecks_binding(tmp_path, monkeypatch):
+    """Replay from `applying` with nothing written re-decides: a binding
+    that became unbound meanwhile refuses; restored, it applies once."""
+    mailbox, prompt = make_held(tmp_path)
+    broker = ContractBroker(receipt=good_receipt(prompt))
+    core = core_ok(monkeypatch)
+    _crash_first(monkeypatch, "_finish")
+    with pytest.raises(Crash):
+        apply(mailbox, broker, core)
+    assert rc.read_journal(mailbox, SID)["step"] == "applying"
+    broker.receipt = good_receipt(prompt, binding={
+        "bound": False, "reason": "duplicate_turn_end"})
+    before = _mailbox_bytes(mailbox)
+    result = apply(mailbox, broker, core)
+    assert (result["action"], result["code"]) == ("blocked", "turns_unbound")
+    assert _mailbox_bytes(mailbox) == before
+    broker.receipt = good_receipt(prompt)
+    result = apply(mailbox, broker, core)
+    assert (result["action"], result["code"]) == (
+        "applied", "resumed_interrupted_apply")
+    assert len(broker.writes()) == 1
+    assert (mailbox / "LOG.md").read_text().count("reconciled held") == 1
 
 
 # -- external change while the first apply's gates run ----------------------

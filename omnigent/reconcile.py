@@ -39,7 +39,7 @@ from typing import Any, Callable
 PROVENANCE_SCHEMA = "trio.dispatch_provenance.v1"
 JOURNAL_SCHEMA = "trio.reconcile_journal.v1"
 
-# Proposed contract v1 (revision 2): every server-side name the reconciler reads.
+# Proposed contract v1 (revision 3): every server-side name the reconciler reads.
 CONTRACT: dict[str, Any] = {
     "optin_label": "omnigent.cursor_native.completion_receipts",
     "optin_value": "v1",
@@ -57,6 +57,13 @@ CONTRACT: dict[str, Any] = {
     "detail_required": (
         "msg_digest", "msg_listed", "truncated", "model_cmds", "stop_raw",
         "observed_max_acked", "store_max", "acked_through", "unacked",
+    ),
+    # Revision 3 turn binding (R3b): a third server-reserved label written
+    # in the same atomic upsert as core and detail.
+    "receipt_binding_label": "omnigent.cursor_native.turn_receipt.binding",
+    "binding_reasons": (
+        "inject_unhashed", "user_rows_mismatch", "turn_end_unbound",
+        "duplicate_turn_end", "turn_open", "store_unbound", "no_binding",
     ),
 }
 
@@ -240,6 +247,41 @@ def parse_receipt(snapshot: Any) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(detail.get("msg_digest"), str):
         return None, "receipt detail.msg_digest is not a string"
     return dict(core, detail=detail), None
+
+
+def parse_binding(snapshot: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """(binding, None) when the rev3 binding label is well formed, else
+    (None, problem). Absent is a problem too: R3b holds without it."""
+    key = CONTRACT["receipt_binding_label"]
+    binding, problem = _label_json(snapshot, key)
+    if problem:
+        return None, f"receipt binding malformed: {problem}"
+    if binding is None:
+        return None, (f"receipt binding label {key} missing (server predates "
+                      "contract rev3 turn binding)")
+    missing = [k for k in ("bound", "reason", "user_rows", "closed_turns")
+               if k not in binding]
+    if missing:
+        return None, "receipt binding missing " + ",".join(missing)
+    bound, reason = binding["bound"], binding["reason"]
+    if bound is not None and not isinstance(bound, bool):
+        return None, f"receipt binding.bound is {bound!r}, not a bool or null"
+    if reason is not None and reason not in CONTRACT["binding_reasons"]:
+        return None, f"receipt binding.reason {reason!r} is not a contract reason"
+    if (bound is True) != (reason is None):
+        return None, (f"receipt binding bound {bound!r} with reason "
+                      f"{reason!r} is inconsistent")
+    for count in ("user_rows", "closed_turns"):
+        value = binding[count]
+        if value is not None and (not _is_int(value) or value < 0):
+            return None, f"receipt binding.{count} is {value!r}, not a count"
+    return binding, None
+
+
+def binding_key(binding: dict[str, Any]) -> dict[str, Any]:
+    """The binding values a post-fence re-read must preserve (R6)."""
+    return {k: binding.get(k)
+            for k in ("bound", "reason", "user_rows", "closed_turns")}
 
 
 def message_digest(shas: list[str]) -> str:
@@ -485,6 +527,33 @@ def decide(record: Any, obs: dict[str, Any]) -> dict[str, Any]:
         return _blocked("completion_unprovable_no_receipt",
                         "receipt turn_seq is not the latest turn end")
 
+    # Contract R3b (rev3): every injected prompt's turn ended -- the runner
+    # bound each message injection to its own user row and turn end.
+    # Never fence an unbound receipt: the close would be `turns_unbound`,
+    # which is not retryable and fences the session for good.
+    binding, binding_problem = parse_binding(snapshot)
+    if binding_problem:
+        return _blocked("completion_unprovable_no_receipt",
+                        f"R3b: {binding_problem}; hold, do not fence")
+    assert binding is not None
+    if binding["bound"] is not True:
+        why = binding["reason"]
+        if binding["bound"] is None:
+            return _blocked("completion_unprovable_no_receipt",
+                            f"R3b: receipt binding is null (reason {why!r}): "
+                            "the runner predates contract rev3 turn "
+                            "binding; hold, do not fence")
+        return _blocked("turns_unbound",
+                        f"R3b: receipt binding is unbound (reason {why!r}): "
+                        "an injected prompt's turn end is not proven "
+                        "(foreign, duplicate, queued or open turn); hold, "
+                        "do not fence")
+    if not (binding["user_rows"] == binding["closed_turns"] == count):
+        return _blocked("turns_unbound",
+                        f"R3b: binding user_rows {binding['user_rows']!r} / "
+                        f"closed_turns {binding['closed_turns']!r} != "
+                        f"inject_count {count}; hold, do not fence")
+
     # Contract R4: every observed row ACKed (necessary, never success).
     if not (
         detail["observed_max_acked"] is True
@@ -504,6 +573,7 @@ def decide(record: Any, obs: dict[str, Any]) -> dict[str, Any]:
         "rev": receipt.get("rev"),
         "stop_reason": receipt.get("stop_reason"),
         "stop_raw": receipt["detail"].get("stop_raw"),
+        "turn_binding": binding_key(binding),
         "binding": "recorded_epoch" if prov.get("terminal_epoch") is not None
         else "fresh_session",
     }
@@ -1039,10 +1109,19 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
                             f"fence {fence.get('state')!r} "
                             f"reason {fence.get('reason')!r}; retry later "
                             "with the same fence_id")
+        if fence.get("reason") == "turns_unbound":
+            return _blocked("fence_unverified",
+                            "fence closed with turns_unbound (not "
+                            "retryable): the runner could not bind every "
+                            "injected prompt to its turn end; the session "
+                            "stays fenced until a person opens it")
         return _blocked("fence_unverified",
                         f"fence {fence.get('state')!r} verified "
                         f"{fence.get('verified')!r} reason "
                         f"{fence.get('reason')!r}")
+    ack_problem = _runner_ack_problem(fence, fence_id)
+    if ack_problem:
+        return _blocked("fence_unverified", ack_problem)
     journal["step"] = "fence_closed"
     durable_write_json(jpath, journal)
 
@@ -1072,6 +1151,13 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     ):
         return _blocked("receipt_changed_after_fence",
                         f"{key} -> {receipt_key(receipt2)}")
+    # Contract R6 (rev3): the re-read must still be bound, to the same turns.
+    binding, _ = parse_binding(obs["broker"]["snapshot"])
+    binding2, binding2_problem = parse_binding(snap2)
+    if binding2_problem or binding_key(binding2) != binding_key(binding):
+        return _blocked("receipt_changed_after_fence",
+                        f"binding {binding_key(binding)} -> "
+                        f"{binding2_problem or binding_key(binding2)}")
 
     failures = _gates(mailbox, record, repo, loop_core)
     if failures:
@@ -1091,6 +1177,27 @@ def _apply_locked(mailbox, repo, client, loop_core, artifact_ready,
     return _decision("applied", "late_valid_completion",
                      decision2["reasons"], continuation=journal["target"],
                      evidence=decision2.get("evidence"))
+
+
+def _runner_ack_problem(fence: dict[str, Any], fence_id: str) -> str | None:
+    """Contract §3 step 4 (rev3): a verified close rests on the runner's
+    `bound` acknowledgment. A first close carries ``runner_ack``; it must
+    be ours and bound. The idempotent repeat of an already verified close
+    returns the stored label without ``runner_ack``; that is accepted only
+    because R3b has already required the rev3 binding label, i.e. a rev3
+    server, whose `verified:true` includes `runner.bound == true`."""
+    if "runner_ack" not in fence:
+        return None
+    ack = fence["runner_ack"]
+    if not isinstance(ack, dict):
+        return f"fence runner_ack {ack!r} is not an object"
+    if ack.get("fence_id") != fence_id or ack.get("same_fence") is not True:
+        return "fence runner_ack is not for this fence"
+    if ack.get("bound") is not True:
+        return (f"fence verified but runner_ack.bound is {ack.get('bound')!r}"
+                f" (bind_reason {ack.get('bind_reason')!r}): the runner did "
+                "not acknowledge turn binding; hold")
+    return None
 
 
 def _replay_applying(mailbox, repo, client, loop_core, artifact_ready,
