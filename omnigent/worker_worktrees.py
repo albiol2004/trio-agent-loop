@@ -480,17 +480,25 @@ def _disposable_ignored(rel: str) -> bool:
 # the session ends. Left behind they are untracked (or modified tracked)
 # product paths, so a SHIP of that exact tree can never be accepted.
 #
-# trioctl records the pre-launch bytes once (``baseline``, in the git
-# common dir, mode 0600 -- never in the worktree, never committed), then
-# after its own root sessions have ended strips only entries bound to one
-# of *its* bridges (``sha256(session_id)[:32]``, the bridge dir basename).
-# The baseline is restored only when what remains equals exactly what
-# Omnigent's merge left of the baseline; any other difference (a user or
-# concurrent edit, a foreign session's entry) is left in place and the
-# product check keeps failing closed. Nothing is ever ignored or excluded.
+# trioctl records the pre-launch bytes once per aggregate root
+# (``baseline``, in the git common dir, mode 0600 -- never in a worktree,
+# never committed). Every record is keyed by and bound to the canonical
+# root path, so the main checkout and each linked worktree of one
+# repository (which share the common dir) never read, restore or delete
+# each other's state. After the caller's own root sessions have ended it
+# strips only entries bound to one of the bridges the caller passes
+# (``sha256(session_id)[:32]``, the bridge dir basename; held and
+# in-flight sessions are the caller's to exclude). The baseline is
+# restored only when what remains equals exactly what Omnigent's merge
+# left of it, through an atomic exchange that keeps any competing write.
+# Any other difference (a user or concurrent edit, a foreign or held
+# session's entry) is left in place and the product check keeps failing
+# closed. Nothing is ever ignored or excluded.
 
 ROOT_CURSOR_DIR_NAME = "root-cursor"
 _USAGE_HOOK_MODULE = "omnigent.harnesses.cursor_native.usage"
+#: Unkeyed files an earlier (d39bfd9) layout shared by every root.
+_UNKEYED_ROOT_FILES = ("baseline.json", "sessions.json", "mcp.json.orig", "hooks.json.orig")
 
 
 def bridge_key(session_id: str) -> str:
@@ -500,6 +508,105 @@ def bridge_key(session_id: str) -> str:
 
 def _root_cursor_dir(repo: Path) -> Path:
     return ledger_dir(repo) / ROOT_CURSOR_DIR_NAME
+
+
+def _root_identity(repo: Path) -> tuple[str, str]:
+    """(record key, canonical path) of the aggregate root holding *repo*.
+
+    The canonical path is the resolved worktree top level, so the main
+    checkout and every linked worktree of one repository differ.
+    """
+    root = str(repo_toplevel(repo))
+    return hashlib.sha256(root.encode()).hexdigest()[:16], root
+
+
+def _root_file(repo: Path, name: str) -> Path:
+    key, _root = _root_identity(repo)
+    return _root_cursor_dir(repo) / f"{key}.{name}"
+
+
+def _check_root(path: Path, data: object, repo: Path) -> dict[str, Any]:
+    _key, root = _root_identity(repo)
+    if not isinstance(data, dict):
+        raise WorktreeError(f"malformed root Cursor record {path}")
+    if data.get("root") != root:
+        raise WorktreeError(
+            f"root Cursor record {path} belongs to {data.get('root')!r}, not {root!r}; "
+            "refusing to use it"
+        )
+    return data
+
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+
+
+def _renameat2(src: Path, dst: Path, flags: int) -> None:
+    """Linux ``renameat2``; raises OSError (ENOSYS when unavailable)."""
+    import ctypes
+    import errno
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = getattr(libc, "renameat2", None)
+    if fn is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    if fn(_AT_FDCWD, os.fsencode(str(src)), _AT_FDCWD, os.fsencode(str(dst)), flags) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(src))
+
+
+def _swap_in(target: Path, expected: bytes, source: bytes | None, mode: int) -> str | None:
+    """Put *source* at *target* (None removes it) only if it still holds *expected*.
+
+    Atomic and conflict-safe: the new content is exchanged in (or the file
+    moved aside) in one ``renameat2``, then the displaced content is
+    compared with *expected*. A write that landed first is exchanged back
+    and stays live; a write racing the swap-back is kept beside the target
+    (``.<name>.trio-restore-*``) instead of being lost. Returns None on
+    success, else why the file was left in place.
+    """
+    rel = f"{target.parent.name}/{target.name}"
+    side = target.with_name(f".{target.name}.trio-restore-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    if source is None:
+        try:
+            _renameat2(target, side, _RENAME_NOREPLACE)
+        except FileNotFoundError:
+            return f"{rel} vanished during restore; nothing removed"
+        except OSError as exc:
+            return f"{rel}: atomic move unavailable ({exc.strerror}); left in place"
+        if _read_bytes(side) == expected:
+            side.unlink()
+            return None
+        try:
+            _renameat2(side, target, _RENAME_NOREPLACE)
+        except FileExistsError:
+            return (f"{rel} changed during restore and was recreated; the competing "
+                    f"content is kept at {side.name}")
+        return f"{rel} changed during restore; competing edit kept; left in place"
+    fd = os.open(side, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(source)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(side, mode)
+        _renameat2(side, target, _RENAME_EXCHANGE)
+    except FileNotFoundError:
+        side.unlink(missing_ok=True)
+        return f"{rel} was removed during restore; not recreated"
+    except OSError as exc:
+        side.unlink(missing_ok=True)
+        return f"{rel}: atomic exchange unavailable ({exc.strerror}); left in place"
+    if _read_bytes(side) == expected:
+        side.unlink()
+        return None
+    _renameat2(side, target, _RENAME_EXCHANGE)  # competing content back in place
+    if _read_bytes(side) == source:
+        side.unlink()
+        return f"{rel} changed during restore; competing edit kept; left in place"
+    return (f"{rel} changed twice during restore; the content written in between "
+            f"is kept at {side.name}")
 
 
 def _private_write(path: Path, data: bytes) -> None:
@@ -599,50 +706,83 @@ def _omnigent_base(rel: str, source: bytes | None) -> object:
     return base
 
 
-def _index_blob(repo: Path, rel: str) -> bytes | None:
+def _index_entry(repo: Path, rel: str) -> tuple[bytes, int] | None:
+    """(blob, file mode) of *rel* in the index, or None when untracked.
+
+    Raises WorktreeError for an index entry that is not a regular file.
+    """
     proc = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "-s", "--", rel], capture_output=True, text=True,
+    )
+    line = proc.stdout.strip()
+    if proc.returncode != 0 or not line:
+        return None
+    mode = line.split()[0]
+    if mode not in ("100644", "100755"):
+        raise WorktreeError(f"{rel} is tracked as mode {mode}, not a regular file")
+    blob = subprocess.run(
         ["git", "-C", str(repo), "show", f":{rel}"], capture_output=True,
     )
-    return proc.stdout if proc.returncode == 0 else None
+    if blob.returncode != 0:
+        raise WorktreeError(f"cannot read the index version of {rel}")
+    return blob.stdout, (0o755 if mode == "100755" else 0o644)
 
 
 def _root_baseline(repo: Path) -> dict[str, Any] | None:
+    path = _root_file(repo, "baseline.json")
     try:
-        data = json.loads((_root_cursor_dir(repo) / "baseline.json").read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:
-        raise WorktreeError(f"unreadable root Cursor baseline: {exc}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
-        raise WorktreeError("malformed root Cursor baseline")
+        raise WorktreeError(f"unreadable root Cursor baseline {path}: {exc}") from exc
+    data = _check_root(path, data, repo)
+    if not isinstance(data.get("files"), dict):
+        raise WorktreeError(f"malformed root Cursor baseline {path}")
     return data
 
 
-def root_owned_sessions(repo: Path) -> set[str]:
-    """Root session ids trioctl recorded as launched at this repository."""
+def root_owned_sessions(repo: Path) -> dict[str, str | None]:
+    """Root sessions trioctl recorded as launched at THIS root: id -> mailbox.
+
+    Only evidence: callers decide ownership (held and in-flight sessions
+    must be excluded before anything is passed to restore).
+    """
+    path = _root_file(repo, "sessions.json")
     try:
-        data = json.loads((_root_cursor_dir(repo) / "sessions.json").read_text())
-    except (OSError, ValueError):
-        return set()
-    return {str(s) for s in data} if isinstance(data, list) else set()
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise WorktreeError(f"unreadable root session record {path}: {exc}") from exc
+    data = _check_root(path, data, repo)
+    sessions = data.get("sessions")
+    if not isinstance(sessions, dict):
+        raise WorktreeError(f"malformed root session record {path}")
+    return {str(k): (str(v) if v else None) for k, v in sessions.items()}
 
 
-def record_root_session(repo: Path, session_id: str) -> None:
-    """Persist that trioctl launched *session_id* bound to the root."""
+def record_root_session(repo: Path, session_id: str, mailbox: Path | None = None) -> None:
+    """Persist that trioctl launched *session_id* bound to this root."""
+    _key, root = _root_identity(repo)
     with repo_lock(repo, "root-cursor"):
-        owned = root_owned_sessions(repo) | {str(session_id)}
+        sessions = root_owned_sessions(repo)
+        sessions[str(session_id)] = str(mailbox) if mailbox else sessions.get(str(session_id))
         _private_write(
-            _root_cursor_dir(repo) / "sessions.json",
-            (json.dumps(sorted(owned)) + "\n").encode(),
+            _root_file(repo, "sessions.json"),
+            (json.dumps({"schema": 2, "root": root, "sessions": sessions},
+                        indent=2, sort_keys=True) + "\n").encode(),
         )
 
 
 def snapshot_root_cursor(repo: Path) -> bool:
-    """Record the root's pre-launch ``.cursor`` config once; True if taken now.
+    """Record this root's pre-launch ``.cursor`` config once; True if taken now.
 
-    An existing baseline (a crashed earlier run) is kept: it is the only
-    record of the state before that run's sessions merged into the files.
+    An existing baseline of this root (a crashed earlier run) is kept: it
+    is the only record of the state before that run's sessions merged into
+    the files. Other roots' baselines are never consulted.
     """
+    _key, root = _root_identity(repo)
     with repo_lock(repo, "root-cursor"):
         if _root_baseline(repo) is not None:
             return False
@@ -657,15 +797,15 @@ def snapshot_root_cursor(repo: Path) -> bool:
             if data is None:
                 files[rel] = {"state": "absent"}
                 continue
-            _private_write(_root_cursor_dir(repo) / f"{name}.orig", data)
+            _private_write(_root_file(repo, f"{name}.orig"), data)
             files[rel] = {
                 "state": "file",
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "mode": target.stat().st_mode & 0o7777,
             }
         _private_write(
-            _root_cursor_dir(repo) / "baseline.json",
-            (json.dumps({"schema": 1, "taken_at": time.time(), "files": files},
+            _root_file(repo, "baseline.json"),
+            (json.dumps({"schema": 2, "root": root, "taken_at": time.time(), "files": files},
                         indent=2, sort_keys=True) + "\n").encode(),
         )
         return True
@@ -674,18 +814,38 @@ def snapshot_root_cursor(repo: Path) -> bool:
 def restore_root_cursor(
     repo: Path, owned_session_ids: set[str] | list[str], *, final: bool = False
 ) -> list[str]:
-    """Undo only this task's own Omnigent merges into the root ``.cursor`` config.
+    """Undo only the given sessions' Omnigent merges into THIS root's ``.cursor`` config.
 
-    Call only once every owned root session has ended (no cursor-agent at
-    the root). Returns the reasons a file was left in place; ``[]`` means
-    both files are back to the baseline (or, with no baseline, to the
-    index version when tracked and absent when untracked). With *final*
-    and nothing left in place, the baseline record is dropped.
+    *owned_session_ids* is the complete owned set: the caller has already
+    excluded held and in-flight sessions; nothing recorded is added back.
+    Call only once those sessions have ended (no cursor-agent at the
+    root). Returns the reasons a file was left in place; ``[]`` means both
+    files are back to this root's baseline (or, with no baseline, to the
+    index version and mode when tracked and absent when untracked). With
+    *final* and nothing left in place, only this root's records are
+    dropped; a problem keeps them as lifecycle evidence.
     """
-    keys = {bridge_key(s) for s in set(owned_session_ids) | root_owned_sessions(repo)}
+    keys = {bridge_key(s) for s in owned_session_ids}
     problems: list[str] = []
+    directory = _root_cursor_dir(repo)
+    for name in _UNKEYED_ROOT_FILES:
+        if (directory / name).exists():
+            problems.append(
+                f"unattributed root Cursor record {directory / name} (older layout shared by "
+                "every root of this repository) is neither used nor deleted; once no trioctl "
+                "loop runs on any root of this repository, check which root it belonged to "
+                "and remove it by hand"
+            )
     with repo_lock(repo, "root-cursor"):
         baseline = _root_baseline(repo)
+        hint = ""
+        if baseline is not None:
+            taken = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(baseline.get("taken_at", 0))))
+            hint = (
+                f" (baseline of this root taken {taken}: {_root_file(repo, 'baseline.json')}; "
+                "if no trioctl loop runs on this root and the current file is intended, "
+                "remove that baseline and its .orig copies to retire it)"
+            )
         for rel in OWNED_CURSOR_FILES:
             target = repo / rel
             if target.is_symlink() or (repo / ".cursor").is_symlink():
@@ -698,19 +858,25 @@ def restore_root_cursor(
             if entry is not None and entry.get("state") == "symlink":
                 problems.append(f"{rel} was a symlink before the run; left in place")
                 continue
-            if entry is None:  # no baseline: the committed state is the source
-                source = _index_blob(repo, rel)
-                mode = 0o644
+            if entry is None:  # no baseline: the committed state (and mode) is the source
+                try:
+                    indexed = _index_entry(repo, rel)
+                except WorktreeError as exc:
+                    problems.append(f"{exc}; left in place")
+                    continue
+                source, mode = indexed if indexed else (None, 0o644)
             elif entry.get("state") == "absent":
                 source, mode = None, 0o644
             else:
-                source = _read_bytes(_root_cursor_dir(repo) / f"{Path(rel).name}.orig")
+                source = _read_bytes(_root_file(repo, f"{Path(rel).name}.orig"))
                 if source is None or hashlib.sha256(source).hexdigest() != entry.get("sha256"):
                     problems.append(f"{rel}: baseline copy missing or altered; left in place")
                     continue
                 mode = int(entry.get("mode", 0o644))
             current = _read_bytes(target)
             if current == source:
+                if source is not None and target.stat().st_mode & 0o7777 != mode:
+                    os.chmod(target, mode)
                 continue
             if current is None:
                 problems.append(f"{rel} was removed during the run; not recreated")
@@ -722,28 +888,19 @@ def restore_root_cursor(
                 continue
             if _strip_owned(rel, parsed, keys) != _omnigent_base(rel, source):
                 problems.append(
-                    f"{rel} differs from the pre-run config beyond this task's own "
-                    "Omnigent entries (user, concurrent or foreign edit); left in place"
+                    f"{rel} differs from the pre-run config beyond the owned sessions' "
+                    f"Omnigent entries (user, concurrent, held or foreign edit); left in place{hint}"
                 )
                 continue
-            # Compare-and-swap: a writer racing the check keeps its content.
-            if _read_bytes(target) != current:
-                problems.append(f"{rel} changed during restore; left in place")
-                continue
-            if source is None:
-                target.unlink()
-            else:
-                tmp = target.with_name(f".{target.name}.trio-restore-{os.getpid()}")
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(source)
-                os.chmod(tmp, mode)
-                os.replace(tmp, target)
+            problem = _swap_in(target, current, source, mode)
+            if problem:
+                problems.append(problem)
         if final and not problems and baseline is not None:
-            directory = _root_cursor_dir(repo)
-            for item in directory.iterdir():
+            key, _root = _root_identity(repo)
+            for item in directory.glob(f"{key}.*"):
                 item.unlink()
-            directory.rmdir()
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # only when no other root has records left
     return problems
 
 

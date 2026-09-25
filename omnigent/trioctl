@@ -2878,11 +2878,21 @@ class OmnigentRunner:
     def _root_owned_ids(self, mailbox: Path) -> set[str]:
         """Root sessions this task provably launched and that no longer run.
 
-        This run's created ids plus ids an earlier trioctl run of this
-        mailbox archived (full id and locked title prefix); held and
-        in-flight dispatches are never included.
+        This run's created ids, ids recorded as launched at THIS root, and
+        ids an earlier trioctl run of this mailbox archived (full id and
+        locked title prefix). Held sessions (of this mailbox or of the
+        mailbox a recorded session belongs to) and in-flight dispatches are
+        never included; restore_root_cursor adds nothing back.
         """
         owned = set(self.created_session_ids)
+        held_elsewhere: set[str] = set()
+        recorded = worker_worktrees.root_owned_sessions(self.repo)
+        for sid, box in recorded.items():
+            owned.add(sid)
+            if box and Path(box).resolve() != mailbox.resolve():
+                held_elsewhere |= _held_session_ids(Path(box))
+                if _has_unreadable_hold(Path(box)):
+                    held_elsewhere.add(sid)
         prefix = f"trioctl {mailbox.name} "
         archive = mailbox / ".sessions"
         if archive.is_dir():
@@ -2898,7 +2908,7 @@ class OmnigentRunner:
                     and str(first.get("title") or "").startswith(prefix)
                 ):
                     owned.add(first["id"])
-        held = set(self.held_session_ids) | _held_session_ids(mailbox)
+        held = set(self.held_session_ids) | _held_session_ids(mailbox) | held_elsewhere
         with self._own_lock:
             inflight = set(self._inflight)
         return owned - held - inflight
@@ -2954,6 +2964,16 @@ class OmnigentRunner:
         except Exception as exc:  # noqa: BLE001 - config stays; acceptance fails closed
             print(f"trioctl: could not end evaluator session {session_id}: {exc}",
                   file=sys.stderr)
+            return
+        if not isinstance(counts, dict) or int(counts.get("deleted") or 0) < 1:
+            # Kept (archive failure, skipped, ...): it may still own the
+            # root, so keep its bookkeeping; the next root dispatch retries
+            # the release and the config stays until then.
+            print(
+                f"trioctl: finished root evaluator session {session_id} was not deleted "
+                f"({counts}); root Cursor config left in place, acceptance stays pending",
+                file=sys.stderr,
+            )
             return
         print(
             f"trioctl: ended finished root evaluator session {session_id}: {counts}",
@@ -3207,6 +3227,16 @@ class OmnigentRunner:
             dispatch["session_id"] = session_id
             with self._own_lock:
                 self._inflight.add(session_id)
+            if dispatch.get("root_mailbox") is not None:
+                # Durable ownership evidence as soon as the id exists, so a
+                # crash mid-dispatch still leaves a provable record.
+                try:
+                    worker_worktrees.record_root_session(
+                        self.repo, session_id, dispatch["root_mailbox"]
+                    )
+                except Exception as exc:  # noqa: BLE001 - finally retries it
+                    print(f"trioctl: could not record root session {session_id}: {exc}",
+                          file=sys.stderr)
         self.session_ids[role] = session_id
         self.created_session_ids.append(session_id)
         _record_created_session_id(session_id)
@@ -3426,6 +3456,8 @@ class OmnigentRunner:
             }
         dispatch["workspace"] = workspace
         root_bound = eval_wt is None and bool(self._isolate) and worker_worktrees is not None
+        if root_bound:
+            dispatch["root_mailbox"] = mailbox
         try:
             code = self._run_dispatch(
                 client, agent_id, model, prompt, title, role, iteration,
@@ -3436,7 +3468,7 @@ class OmnigentRunner:
             session_id = dispatch.get("session_id")
             if root_bound and session_id:
                 try:
-                    worker_worktrees.record_root_session(self.repo, session_id)
+                    worker_worktrees.record_root_session(self.repo, session_id, mailbox)
                 except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
                     print(f"trioctl: could not record root session {session_id}: {exc}",
                           file=sys.stderr)
@@ -3694,48 +3726,84 @@ class OmnigentRunner:
 REQUIRED_LOOP_CORE_API = 2
 
 
-def _loop_core_api(path: Path) -> int:
-    """The literal module-level ``LOOP_CORE_API`` of *path*, read without executing it."""
+#: The sibling module trio_loop.py imports by path (``METRICS_API``).
+REQUIRED_METRICS_API = 2
+
+
+def _api_marker(path: Path, name: str) -> int:
+    """The single literal module-level int ``name`` of *path*, read without executing it.
+
+    Missing means 1 (predates the marker). Any other binding of *name* at
+    module level (a second assignment, an annotated, augmented or
+    non-literal one) makes the marker ambiguous: 0, which never matches.
+    """
     import ast
 
     try:
         tree = ast.parse(path.read_bytes(), filename=str(path))
     except (OSError, SyntaxError, ValueError) as exc:
-        raise TrioctlError(f"cannot read loop core {path}: {exc}") from exc
+        raise TrioctlError(f"cannot read {path}: {exc}") from exc
+    values: list[int] = []
     for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and [getattr(t, "id", None) for t in node.targets] == ["LOOP_CORE_API"]
-            and isinstance(node.value, ast.Constant)
-            and type(node.value.value) is int
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [name]:
+            ok = isinstance(node.value, ast.Constant) and type(node.value.value) is int
+            values.append(node.value.value if ok else 0)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and getattr(node.target, "id", None) == name:
+            values.append(0)
+        elif isinstance(node, ast.Assign) and any(
+            name in {getattr(e, "id", None) for e in ast.walk(t)} for t in node.targets
         ):
-            return node.value.value
-    return 1
+            values.append(0)
+    if not values:
+        return 1
+    return values[0] if len(values) == 1 else 0
+
+
+def _loop_core_api(path: Path) -> int:
+    """The literal module-level ``LOOP_CORE_API`` of *path* (see :func:`_api_marker`)."""
+    return _api_marker(path, "LOOP_CORE_API")
+
+
+def _refuse_core(path: Path, what: str) -> TrioctlError:
+    import hashlib
+
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    return TrioctlError(
+        f"incompatible loop core {path} (sha256 {digest}…): {what}. Refresh the "
+        f"repository's metrics/ as a set (trio_loop.py, trio-metrics.py, trio-shadow.py, "
+        f"trio-check.py) from {bundled} (the release this trioctl belongs to) "
+        "and commit it, or run the trioctl release that matches the vendored "
+        "copy. Nothing was changed."
+    )
 
 
 def _check_loop_core_api(path: Path) -> None:
     """Refuse a loop core whose contract differs from what this trioctl drives.
 
-    trioctl loads the repository's own ``metrics/trio_loop.py``. A copy
+    trioctl loads the repository's own ``metrics/trio_loop.py`` and that
+    file loads its sibling ``trio-metrics.py``. A copy (or one of the two)
     vendored before an upgrade would otherwise run silently -- e.g. an
     unbound open-loop SHIP that can never be accepted -- so a mismatch is a
     clear refusal; the repository's files are never rewritten.
     """
-    import hashlib
-
     found = _loop_core_api(path)
-    if found == REQUIRED_LOOP_CORE_API:
-        return
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-    bundled = Path(__file__).resolve().parent.parent / "metrics"
-    raise TrioctlError(
-        f"incompatible loop core {path} (sha256 {digest}…): LOOP_CORE_API "
-        f"{found}, this trioctl requires {REQUIRED_LOOP_CORE_API}. Refresh the "
-        f"repository's metrics/ (trio_loop.py, trio-metrics.py, trio-shadow.py, "
-        f"trio-check.py) from {bundled} (the release this trioctl belongs to) "
-        "and commit it, or run the trioctl release that matches the vendored "
-        "copy. Nothing was changed."
-    )
+    if found != REQUIRED_LOOP_CORE_API:
+        raise _refuse_core(
+            path, f"LOOP_CORE_API {found}, this trioctl requires {REQUIRED_LOOP_CORE_API}"
+        )
+    metrics = path.with_name("trio-metrics.py")
+    if not metrics.is_file():
+        raise _refuse_core(path, f"its sibling {metrics.name} is missing")
+    found = _api_marker(metrics, "METRICS_API")
+    if found != REQUIRED_METRICS_API:
+        raise _refuse_core(
+            path, f"sibling {metrics.name} has METRICS_API {found}, this trioctl "
+            f"requires {REQUIRED_METRICS_API} (mixed metrics/ versions)"
+        )
 
 
 def _load_trio_loop(repo: Path) -> Any:
@@ -3749,7 +3817,10 @@ def _load_trio_loop(repo: Path) -> Any:
     if spec is None or spec.loader is None:
         raise TrioctlError(f"cannot load loop core from {path}")
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    try:
+        loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - any load failure is a refusal
+        raise _refuse_core(path, f"loading it failed ({type(exc).__name__}: {exc})") from exc
     if not callable(getattr(module, "run_loop", None)):
         raise TrioctlError(f"{path} does not expose run_loop")
     return module

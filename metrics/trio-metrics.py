@@ -17,6 +17,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Contract version metrics/trio_loop.py (and trioctl, before loading it)
+# relies on: 2 = read_queue / parse_slice_verdicts / parse_verdict_scope.
+# A copy without this constant predates it. Bump with LOOP_CORE_API.
+METRICS_API = 2
+
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
     re.IGNORECASE,

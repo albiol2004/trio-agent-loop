@@ -496,8 +496,10 @@ def test_root_reuse_ends_previous_session_and_fences_evaluation(
     trioctl, repo, root, monkeypatch
 ):
     pruned = []
+    # r5 (N6): bookkeeping is dropped only for a session the prune deleted.
     monkeypatch.setattr(trioctl, "_prune_broker_sessions",
-                        lambda client, mailbox, **kw: pruned.append(kw["session_ids"]) or {})
+                        lambda client, mailbox, **kw: pruned.append(kw["session_ids"])
+                        or {"deleted": len(kw["session_ids"])})
     runner, seen = _runner(trioctl, repo, root, monkeypatch)
     assert runner.run("lead", 1, repo / "loop", None) == 0
     assert runner.run("evaluator", 1, repo / "loop", None) == 0

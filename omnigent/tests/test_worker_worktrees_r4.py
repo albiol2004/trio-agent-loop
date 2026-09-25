@@ -227,7 +227,7 @@ def test_concurrent_user_edit_is_preserved_and_acceptance_fails_closed(wt, repo,
     assert (repo / ".cursor" / "mcp.json").read_bytes() == edited
     assert not (repo / ".cursor" / "hooks.json").exists()        # the untouched one is restored
     assert "untracked product paths: .cursor/mcp.json" == _product_problem(loop_core, repo)
-    assert (wt.ledger_dir(repo) / "root-cursor" / "baseline.json").is_file()  # kept
+    assert wt._root_file(repo, "baseline.json").is_file()  # kept (r5: keyed per root)
 
 
 def test_foreign_session_entry_is_never_stripped(wt, repo, loop_core):
@@ -266,7 +266,8 @@ def test_baseline_is_private_outside_the_worktree_and_survives_a_crash(wt, repo)
     wt.record_root_session(repo, "lead-crashed")
     # A later run: the earlier baseline is kept, not re-taken from the dirty state.
     assert wt.snapshot_root_cursor(repo) is False
-    assert wt.restore_root_cursor(repo, set(), final=True) == []   # ids from the ledger
+    # r5: the recorded ids are evidence only; the caller passes the owned set.
+    assert wt.restore_root_cursor(repo, set(wt.root_owned_sessions(repo)), final=True) == []
     assert (repo / ".cursor" / "mcp.json").read_text() == secret_ish
     assert not store.exists()
 
@@ -366,7 +367,8 @@ def _e2e_runner(trioctl, repo, root, monkeypatch, client, *, end_root_sessions=T
     ended = []
     monkeypatch.setattr(trioctl, "_prune_broker_sessions",
                         lambda client, mailbox, session_ids=None, **kw:
-                        ended.extend(session_ids) or {"archived": len(session_ids)})
+                        ended.extend(session_ids) or {"archived": len(session_ids),
+                                                      "deleted": len(session_ids)})
 
     def commit_mailbox(message):
         git(repo, "add", "loop")
@@ -506,7 +508,7 @@ def test_newer_or_non_literal_api_is_also_refused(trioctl, repo):
     with pytest.raises(trioctl.TrioctlError, match="LOOP_CORE_API 3"):
         trioctl._load_trio_loop(repo)
     core.write_text(text.replace("LOOP_CORE_API = 2", "LOOP_CORE_API = int('2')"))
-    with pytest.raises(trioctl.TrioctlError, match="LOOP_CORE_API 1"):
+    with pytest.raises(trioctl.TrioctlError, match="LOOP_CORE_API 0"):   # r5: ambiguous
         trioctl._load_trio_loop(repo)
 
 

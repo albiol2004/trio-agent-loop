@@ -44,6 +44,7 @@ exec "$BWRAP" \
     omnigent/tests/test_worker_worktrees_r2.py \
     omnigent/tests/test_worker_worktrees_r3.py \
     omnigent/tests/test_worker_worktrees_r4.py \
+    omnigent/tests/test_worker_worktrees_r5.py \
     omnigent/tests/test_worker_events.py \
     omnigent/tests/test_trioctl.py \
     omnigent/tests/test_omnigent_loop.py \
