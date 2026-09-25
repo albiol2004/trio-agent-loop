@@ -111,6 +111,26 @@ def _load_worker_events() -> Any:
 worker_events = _load_worker_events()
 
 
+def _load_worker_worktrees() -> Any:
+    """Load sibling worker-worktree isolation, or None when not installed."""
+    path = Path(__file__).with_name("worker_worktrees.py")
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader(
+        "trioctl_worker_worktrees",
+        str(path),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"cannot load worker worktrees: {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+worker_worktrees = _load_worker_worktrees()
+
+
 def _load_reconcile() -> Any:
     """Load the sibling held-dispatch reconciler, or None when absent.
 
@@ -685,6 +705,17 @@ def _emit_worker_event(
     worker_events.emit(path, rec)
 
 
+def _kill_worker(proc: subprocess.Popen[str], isolated: bool) -> None:
+    """Kill the worker; an isolated one takes its whole process group."""
+    if isolated:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    proc.kill()
+
+
 def run_cursor_worker(
     role: str,
     config: dict[str, Any],
@@ -694,12 +725,20 @@ def run_cursor_worker(
     models: list[dict[str, Any]] | None = None,
     timeout: float | None = None,
     events: dict[str, Any] | None = None,
+    isolated: bool = False,
+    on_spawn: Any = None,
 ) -> str:
     """Run one ephemeral Cursor worker with the live profile-resolved model.
 
     Optional ``events`` is opt-in subprocess telemetry. Missing/empty
     preserves historical behavior and writes no files. Telemetry must
     not change exit codes, exceptions, or process cleanup.
+
+    ``isolated`` binds the process itself to *workspace* (cwd as well as
+    ``--workspace``, since cursor-agent derives its project ``.cursor``
+    config root from the physical cwd) and starts it as its own process
+    group so every descendant is tracked and killed with it. ``on_spawn``
+    receives the Popen right after launch (ledger bookkeeping).
     """
     if role not in CURSOR_WORKER_ROLES:
         raise TrioctlError(
@@ -739,17 +778,24 @@ def run_cursor_worker(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                **(
+                    {"cwd": str(workspace.resolve()), "start_new_session": True}
+                    if isolated
+                    else {}
+                ),
             )
         except OSError as exc:
             _emit_worker_event(events, "spawn_failed", role, pid=None)
             raise TrioctlError(f"Cursor {role} failed to run: {exc}") from exc
         _emit_worker_event(events, "spawned", role, pid=proc.pid)
+        if on_spawn is not None:
+            on_spawn(proc)
         try:
             stdout, stderr = proc.communicate(
                 input=full_prompt, timeout=timeout
             )
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
+            _kill_worker(proc, isolated)
             try:
                 proc.communicate()
             except OSError:
@@ -766,7 +812,7 @@ def run_cursor_worker(
                 f"Cursor {role} failed to run: {exc}"
             ) from exc
         except KeyboardInterrupt:
-            proc.kill()
+            _kill_worker(proc, isolated)
             try:
                 proc.communicate()
             except OSError:
@@ -812,10 +858,17 @@ def run_cursor_worker(
         return output
     finally:
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            _kill_worker(proc, isolated)
             try:
                 proc.wait(timeout=1)
             except (OSError, subprocess.TimeoutExpired):
+                pass
+        if isolated and proc is not None:
+            # Ephemeral worker: descendants left behind in its group would
+            # keep using the worktree after the wrapper exits.
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
                 pass
 
 
@@ -839,6 +892,8 @@ def command_run(args: argparse.Namespace) -> int:
             raise TrioctlError(
                 f"cannot read prompt file {args.prompt_file}: {exc}"
             ) from exc
+    if getattr(args, "isolate", False):
+        return _command_run_isolated(args, config, prompt)
     output = run_cursor_worker(
         args.role,
         config,
@@ -849,6 +904,192 @@ def command_run(args: argparse.Namespace) -> int:
     )
     print(output)
     return 0
+
+
+ISOLATED_RETAINED_EXIT = 3
+
+_ISOLATED_BUILDER_NOTE = (
+    "ISOLATED WORKTREE: your workspace is the task-owned git worktree "
+    "`{path}` (branch `{branch}`, based on aggregate `{base}`). Work only "
+    "inside it; it is your repository root. Do not commit, merge, switch "
+    "branches, or touch the aggregate checkout `{repo}` or the Trio "
+    "mailbox. When you exit, trioctl commits everything you left in this "
+    "worktree as `slice({slice}): ...` and merges it into the aggregate."
+)
+
+
+def _require_worktrees() -> Any:
+    if worker_worktrees is None:
+        raise TrioctlError("worker_worktrees.py is not installed next to trioctl")
+    return worker_worktrees
+
+
+def _command_run_isolated(
+    args: argparse.Namespace, config: dict[str, Any], prompt: str
+) -> int:
+    """Builder in its own worktree; commit + integrate on success.
+
+    Exit 0 only when the worker's changes are merged into the aggregate
+    branch. Any other outcome keeps the worktree and reports a retained,
+    recoverable state (`omnigent worktrees integrate <id>` retries).
+    """
+    wt = _require_worktrees()
+    if args.role != "builder":
+        raise TrioctlError("--isolate applies to builder workers only")
+    slice_id = getattr(args, "worker_slice", None)
+    if not slice_id:
+        raise TrioctlError("--isolate requires --worker-slice <slice-id>")
+    mailbox_arg = getattr(args, "worker_events_mailbox", None)
+    if not mailbox_arg:
+        raise TrioctlError("--isolate requires --mailbox <mailbox dir>")
+    repo = wt.repo_toplevel(Path(args.workspace).resolve())
+    mailbox = _resolve_mailbox(mailbox_arg, repo)
+    try:
+        record = wt.create(
+            repo,
+            slice_id=slice_id,
+            mailbox=mailbox,
+            root=(
+                Path(args.worktree_root).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
+            run_id=getattr(args, "worker_run_id", None),
+        )
+    except wt.WorktreeError as exc:
+        raise TrioctlError(str(exc)) from exc
+    path = Path(record["path"])
+    print(
+        f"trioctl: isolated builder {record['id']} in {path} "
+        f"(branch {record['branch']})",
+        file=sys.stderr,
+    )
+    note = _ISOLATED_BUILDER_NOTE.format(
+        path=path, branch=record["branch"], base=record["base"][:12],
+        repo=repo, slice=slice_id,
+    )
+
+    def on_spawn(proc: subprocess.Popen[str]) -> None:
+        wt.mark_running(repo, record, proc.pid, pgid=proc.pid)
+
+    returncode: int | None = 0
+    output = ""
+    try:
+        output = run_cursor_worker(
+            args.role,
+            config,
+            prompt=f"{note}\n\n{prompt}",
+            workspace=path,
+            timeout=args.timeout,
+            events=_worker_event_ctx(args) or None,
+            isolated=True,
+            on_spawn=on_spawn,
+        )
+    except TrioctlError as exc:
+        returncode = 1
+        record = wt.load_record(repo, record["id"])
+        wt.mark_exited(repo, record, returncode)
+        record = wt._retain(repo, record, "worker_failed", str(exc)[-2000:])
+        print(json.dumps(_worktree_view(record), sort_keys=True))
+        print(
+            f"trioctl: worker failed; worktree retained: {wt.summarize(record)}",
+            file=sys.stderr,
+        )
+        return ISOLATED_RETAINED_EXIT
+    record = wt.load_record(repo, record["id"])
+    wt.mark_exited(repo, record, returncode)
+    summary = getattr(args, "summary", None) or f"isolated builder {record['id']}"
+    record = wt.integrate(repo, record["id"], summary=summary)
+    print(output)
+    print(json.dumps(_worktree_view(record), sort_keys=True))
+    print(f"trioctl: {wt.summarize(record)}", file=sys.stderr)
+    return 0 if record.get("state") == "integrated" else ISOLATED_RETAINED_EXIT
+
+
+def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "id", "slice", "kind", "state", "retained_reason", "retained_detail",
+        "path", "branch", "base", "worker_commit", "merge_commit",
+        "accepted_by",
+    )
+    return {"worker_worktree": {k: record.get(k) for k in keys if k in record}}
+
+
+def _held_session_ids(mailbox: Path | None) -> set[str]:
+    if mailbox is None:
+        return set()
+    return {
+        str(record.get("session_id"))
+        for _path, record in _held_records(mailbox)
+        if record.get("session_id")
+    }
+
+
+def _has_unreadable_hold(mailbox: Path | None) -> bool:
+    return mailbox is not None and any(
+        not record.get("session_id") for _path, record in _held_records(mailbox)
+    )
+
+
+def _run_worktree_cleanup(repo: Path, mailbox: Path | None) -> list[dict[str, Any]]:
+    """Scoped, idempotent cleanup; an unreadable hold keeps everything."""
+    wt = _require_worktrees()
+    if _has_unreadable_hold(mailbox):
+        print(
+            "trioctl: unreadable held record; skipping worker worktree cleanup",
+            file=sys.stderr,
+        )
+        return []
+    results = wt.cleanup(repo, mailbox=mailbox, held_sessions=_held_session_ids(mailbox))
+    for record in results:
+        print(f"trioctl: worktree {wt.summarize(record)}", file=sys.stderr)
+    return results
+
+
+def command_worktrees(args: argparse.Namespace) -> int:
+    """create / integrate / finish / status / cleanup task-owned worktrees."""
+    wt = _require_worktrees()
+    repo = wt.repo_toplevel(Path(getattr(args, "repo", None) or ".").resolve())
+    mailbox = (
+        _resolve_mailbox(args.mailbox, repo) if getattr(args, "mailbox", None) else None
+    )
+    try:
+        if args.worktrees_command == "create":
+            record = wt.create(
+                repo,
+                slice_id=args.slice,
+                mailbox=mailbox,
+                root=Path(args.worktree_root).expanduser() if args.worktree_root else None,
+                role=args.role,
+                detach_at=args.detach_at,
+            )
+            if args.session_id:
+                wt.mark_running(repo, record, None, session_id=args.session_id)
+            print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
+            return 0
+        if args.worktrees_command == "integrate":
+            record = wt.integrate(repo, args.id, summary=args.summary)
+            print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
+            return 0 if record.get("state") in ("integrated", "accepted", "removed") else ISOLATED_RETAINED_EXIT
+        if args.worktrees_command == "finish":
+            record = wt.mark_finished(repo, args.id)
+            print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
+            return 0
+        if args.worktrees_command == "status":
+            rows = [
+                _worktree_view(rec)["worker_worktree"] if rec else {"id": wid, "state": "unreadable"}
+                for wid, rec in wt.list_records(repo)
+                if rec is None or mailbox is None or rec.get("mailbox") == str(mailbox)
+            ]
+            print(json.dumps(rows, indent=2, sort_keys=True))
+            return 0
+        if args.worktrees_command == "cleanup":
+            results = _run_worktree_cleanup(repo, mailbox)
+            print(json.dumps([_worktree_view(r)["worker_worktree"] for r in results], indent=2, sort_keys=True))
+            return 0
+    except wt.WorktreeError as exc:
+        raise TrioctlError(str(exc)) from exc
+    raise TrioctlError(f"unknown worktrees command {args.worktrees_command}")
 
 
 def command_worker_events_report(args: argparse.Namespace) -> int:
@@ -2059,6 +2300,7 @@ class OmnigentRunner:
         workspace: str | None = None,
         observe: dict[str, Any] | None = None,
         completion_receipts: bool = False,
+        isolate_workers: dict[str, Any] | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -2079,6 +2321,10 @@ class OmnigentRunner:
         # Opt-in `--observe-workers` run: {run_id, workers, phases,
         # trioctl}. None keeps prompts and mailbox writes unchanged.
         self._observe = observe
+        # Opt-in `--isolate-workers`: {trioctl, worktree_root}. Builders
+        # get their own worktree via `run --isolate`; open-loop slice-evals
+        # are bound to a detached worktree at their pinned sha.
+        self._isolate = isolate_workers
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
         # that implement the completion-receipt contract.
@@ -2228,6 +2474,8 @@ class OmnigentRunner:
             )
         if self._observe and role in ("lead", "repair"):
             result += self._observe_block(iteration, mailbox)
+        if self._isolate and role in ("lead", "repair"):
+            result += self._isolate_block(iteration, mailbox)
         if context and context.get("mode") == "open-loop":
             result = self._open_loop_context_block(context) + result
         elif context and (
@@ -2283,6 +2531,59 @@ class OmnigentRunner:
             "serially, the reason. Mark it agent-reported; it is not "
             "measured causality.\n"
         )
+
+    def _isolate_block(self, iteration: int, mailbox: Path) -> str:
+        """Explicit isolated-builder dispatch CLI for this loop run."""
+        iso = self._isolate or {}
+        q = shlex.quote
+        root = iso.get("worktree_root")
+        command = (
+            f"{q(sys.executable)} {q(str(iso['trioctl']))} omnigent run builder "
+            "--isolate \\\n"
+            f"    --mailbox {q(str(Path(mailbox).resolve()))} \\\n"
+            "    --worker-slice <slice-id> --summary '<one-line summary>' \\\n"
+            + (f"    --worktree-root {q(str(root))} \\\n" if root else "")
+            + f"    --workspace {q(str(self.repo))} --prompt-file <task-file>"
+        )
+        return (
+            "\n## Isolated builders (opt-in for this loop run)\n"
+            "Dispatch every builder with exactly this command, replacing only "
+            "`<slice-id>`, `<one-line summary>` and `<task-file>`:\n\n"
+            f"```\n{command}\n```\n\n"
+            "Each builder runs in its own task-owned git worktree. On exit 0 "
+            "trioctl has already committed its work as `slice(<id>): "
+            "<summary>` and merged it into this checkout -- do not re-commit "
+            "those files. Commit your own product edits before dispatching a "
+            "builder (a dirty checkout is refused, since the worker would not "
+            "see them). Exit 3 means the worktree was retained (merge "
+            "conflict, failure, dirty state): read the JSON line it prints, "
+            "then fix or retry with `omnigent worktrees integrate <id>`; never "
+            "delete retained worktrees. Concurrency rules for waves are "
+            "unchanged: only ready slices with disjoint `writes:` and no "
+            "`reads:` of another wave member run together; a slice that reads "
+            "another's output is dispatched after that slice is merged.\n"
+        )
+
+    def _slice_eval_worktree(
+        self, role: str, mailbox: Path, context: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """A detached worktree at the slice-eval pin, or None."""
+        if not self._isolate or role != "evaluator" or worker_worktrees is None:
+            return None
+        if not context or context.get("kind") != "slice-eval" or not context.get("sha"):
+            return None
+        root = self._isolate.get("worktree_root")
+        try:
+            return worker_worktrees.create(
+                self.repo,
+                slice_id=f"eval-{context.get('slice') or 'slice'}",
+                mailbox=mailbox,
+                root=Path(root) if root else None,
+                role="evaluator",
+                detach_at=str(context["sha"]),
+            )
+        except worker_worktrees.WorktreeError as exc:
+            raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
 
     def _observe_phase(
         self,
@@ -2481,6 +2782,7 @@ class OmnigentRunner:
         title: str,
         role: str,
         started: float | None = None,
+        workspace: str | None = None,
     ) -> tuple[Any, Any]:
         """One create+wait+read cycle. Returns (session snapshot, items).
 
@@ -2495,7 +2797,7 @@ class OmnigentRunner:
             title,
             runner_id=self._runner_id,
             host_id=self._host_id,
-            workspace=self._workspace,
+            workspace=workspace or self._workspace,
             prompt_timeout=self._timeout,
             labels=(
                 dict(COMPLETION_RECEIPT_LABELS)
@@ -2672,6 +2974,18 @@ class OmnigentRunner:
         if self._dispatch_nonce:
             prompt += f"\nDispatch nonce: {self._dispatch_nonce}\n"
         title = self._title(mailbox, iteration, role, context)
+        eval_wt = self._slice_eval_worktree(role, mailbox, context)
+        workspace = self._workspace
+        if eval_wt is not None:
+            workspace = eval_wt["path"]
+            prompt = (
+                "ISOLATED EVALUATOR WORKSPACE: this session's workspace is "
+                f"the task-owned detached worktree `{eval_wt['path']}` at "
+                f"`{eval_wt['base']}`. For step 2 grade inside it and do NOT "
+                "run `git worktree add`/`remove`. Leave it clean. Write "
+                f"VERDICT.md/QUEUE.md only under the absolute mailbox "
+                f"`{mailbox}`.\n\n" + prompt
+            )
         client = self._client()
         started = time.monotonic()
         if role == "lead":
@@ -2694,8 +3008,53 @@ class OmnigentRunner:
             }
         created_before = len(self.created_session_ids)
         try:
+            return self._run_dispatch(
+                client, agent_id, model, prompt, title, role, iteration,
+                mailbox, context, started, before_text, before_mtime,
+                created_before, workspace,
+            )
+        finally:
+            if eval_wt is not None:
+                self._release_eval_worktree(eval_wt, created_before)
+
+    def _release_eval_worktree(
+        self, eval_wt: dict[str, Any], created_before: int
+    ) -> None:
+        """Record the bound session(s) and end this dispatch's claim."""
+        try:
+            record = worker_worktrees.load_record(self.repo, eval_wt["id"])
+            for session_id in self.created_session_ids[created_before:]:
+                record.setdefault("session_ids", []).append(session_id)
+            worker_worktrees.save_record(self.repo, record)
+            worker_worktrees.mark_finished(self.repo, eval_wt["id"])
+        except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
+            print(
+                f"trioctl: could not update evaluator worktree record "
+                f"{eval_wt.get('id')}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _run_dispatch(
+        self,
+        client: Any,
+        agent_id: str,
+        model: str,
+        prompt: str,
+        title: str,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+        started: float,
+        before_text: str,
+        before_mtime: Any,
+        created_before: int,
+        workspace: str,
+    ) -> int:
+        try:
             snapshot, items = self._create_wait_read(
-                client, agent_id, model, prompt, title, role, started
+                client, agent_id, model, prompt, title, role, started,
+                workspace=workspace,
             )
             if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
                 return 1
@@ -3018,6 +3377,21 @@ def command_loop(args: argparse.Namespace) -> int:
             f"in {observe['dir']}",
             file=sys.stderr,
         )
+    isolate = None
+    if getattr(args, "isolate_workers", False):
+        _require_worktrees()
+        isolate = {
+            "trioctl": Path(__file__).resolve(),
+            "worktree_root": (
+                str(Path(args.worktree_root).expanduser().resolve())
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
+        }
+        runner_kwargs["isolate_workers"] = isolate
+        # Restart-safe: finish removals an earlier run left half done and
+        # retire anything already accepted before new work starts.
+        _run_worktree_cleanup(repo, mailbox)
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
@@ -3099,6 +3473,13 @@ def command_loop(args: argparse.Namespace) -> int:
                 ids_file.unlink()
             except OSError:
                 pass
+        if isolate:
+            # After prune, so deleted role sessions no longer hold their
+            # worktrees; held sessions keep theirs (see _blocking_state).
+            try:
+                _run_worktree_cleanup(repo, mailbox)
+            except Exception as exc:  # noqa: BLE001 - never change the exit code
+                print(f"trioctl: worker worktree cleanup failed: {exc}", file=sys.stderr)
         if observe:
             _finish_observation(observe)
 
@@ -3541,7 +3922,54 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--worker-run-id", default=None)
     run.add_argument("--worker-iteration", default=None)
     run.add_argument("--worker-slice", default=None)
+    run.add_argument(
+        "--isolate",
+        action="store_true",
+        help="builder only: run in a task-owned git worktree bound as the "
+        "worker's cwd/--workspace, then commit and merge it into the "
+        "aggregate (requires --worker-slice and --mailbox); exit 3 = retained",
+    )
+    run.add_argument("--summary", default=None,
+                     help="with --isolate: slice commit summary")
+    run.add_argument("--worktree-root", default=None,
+                     help="with --isolate: directory for worker worktrees "
+                     f"(default ${'{'}{'TRIO_WORKTREE_ROOT'}{'}'} or XDG state)")
     run.set_defaults(func=command_run)
+
+    worktrees = commands.add_parser(
+        "worktrees", help="task-owned worker worktrees (isolation, cleanup)"
+    )
+    worktrees_commands = worktrees.add_subparsers(
+        dest="worktrees_command", required=True
+    )
+    wt_create = worktrees_commands.add_parser(
+        "create", help="create a worktree to bind a worker session to"
+    )
+    wt_create.add_argument("--slice", required=True)
+    wt_create.add_argument("--role", default="builder")
+    wt_create.add_argument("--detach-at", default=None,
+                           help="evaluator: detached worktree at this sha")
+    wt_create.add_argument("--session-id", default=None,
+                           help="broker session bound to the worktree")
+    wt_create.add_argument("--worktree-root", default=None)
+    wt_integrate = worktrees_commands.add_parser(
+        "integrate", help="commit + merge (or retry) one worker worktree"
+    )
+    wt_integrate.add_argument("id")
+    wt_integrate.add_argument("--summary", default=None)
+    wt_finish = worktrees_commands.add_parser(
+        "finish", help="mark an evaluator worktree's session finished"
+    )
+    wt_finish.add_argument("id")
+    worktrees_commands.add_parser("status", help="list ledger records")
+    worktrees_commands.add_parser(
+        "cleanup",
+        help="remove accepted, verified, idle worktrees (never forced)",
+    )
+    for sub in worktrees_commands.choices.values():
+        sub.add_argument("--repo", default=".")
+        sub.add_argument("--mailbox", default=None)
+    worktrees.set_defaults(func=command_worktrees)
 
     events_report = commands.add_parser(
         "worker-events-report",
@@ -3656,6 +4084,16 @@ def parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--reconcile-interval", type=float, default=15.0,
                       help=argparse.SUPPRESS)
+    loop.add_argument(
+        "--isolate-workers",
+        action="store_true",
+        help="opt-in: builders run in task-owned worktrees merged back on "
+        "exit, open-loop slice-evals are bound to a detached worktree at "
+        "their pin, and accepted/idle/clean worktrees are removed before "
+        "and after the loop",
+    )
+    loop.add_argument("--worktree-root", default=None,
+                      help="with --isolate-workers: worker worktree directory")
     loop.set_defaults(func=command_loop)
 
     recon = commands.add_parser(
