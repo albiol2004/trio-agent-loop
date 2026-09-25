@@ -1268,6 +1268,49 @@ def _lockstep_eval_context(
     }
 
 
+def _open_loop_integration_context(
+    mailbox: Path,
+    repo: Path | None,
+    iteration: int,
+    state_path: Path,
+) -> dict:
+    """Bind an open-loop integration-eval to one exact pin and attempt.
+
+    Same STATE.md keys as lockstep (``evaluated_sha``/``evaluator_attempt``)
+    so ``_finalize_ship`` can verify the SHIP names this dispatch and the
+    graded revision, and later acceptance consumers can bind to it. A
+    persisted pair is reused only while the product tree is unchanged since
+    that pin (resume of the same evaluation; mailbox-only commits such as
+    the retirement do not count); otherwise HEAD is pinned with a new
+    attempt, so an earlier ITERATE's pin can never be reused.
+    """
+    del mailbox
+    state = _read_state(state_path)
+    attempt = state.get("evaluator_attempt", "").strip()
+    pinned = state.get("evaluated_sha", "").strip()
+    git_root = _git_root(repo)
+    head = _git_head(git_root) if git_root is not None else None
+    reuse = bool(attempt and pinned)
+    if reuse and git_root is not None:
+        reuse = _evaluated_product_intact(git_root, state_path.parent, pinned)
+    if not reuse:
+        attempt = uuid.uuid4().hex
+        pinned = head or ""
+    _update_state(
+        state_path, {"evaluated_sha": pinned, "evaluator_attempt": attempt}
+    )
+    return {
+        "mode": "open-loop",
+        "slice": None,
+        "sha": pinned or None,
+        "kind": "integration-eval",
+        "pinned_sha": pinned,
+        "expected_sha": pinned,
+        "evaluator_attempt": attempt,
+        "iteration": iteration,
+    }
+
+
 def _run_lockstep(
     mailbox: Path,
     max_iterations: int,
@@ -2012,12 +2055,9 @@ def run_open_loop(
                         "evaluator", current_iteration(), False, True
                     )
                     iteration_now = current_iteration()
-                    context = {
-                        "mode": "open-loop",
-                        "slice": None,
-                        "sha": None,
-                        "kind": "integration-eval",
-                    }
+                    context = _open_loop_integration_context(
+                        mailbox, repo, iteration_now, state_path
+                    )
                     integration_attempts = 0
                     while True:
                         verdict_snapshot = (
@@ -2085,6 +2125,12 @@ def run_open_loop(
                     )
                     if code is not None:
                         return finish(code)
+                    # The graded pin/attempt belong to that verdict only;
+                    # the next integration-eval must bind a fresh one.
+                    _update_state(
+                        state_path,
+                        {"evaluator_attempt": "", "evaluated_sha": ""},
+                    )
                     # ITERATE: wake the Lead for another pass, forcing at
                     # least one even if the queue currently looks "done"
                     # (the integration verdict is the authority here).

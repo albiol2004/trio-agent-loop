@@ -57,7 +57,6 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 #: Retained reasons whose worktree holds output of a worker that did not
 #: finish successfully; never integrated without an explicit override.
 UNVERIFIED_OUTPUT_REASONS = ("worker_failed", "interrupted", "create_failed")
-FENCE_FILE = "integration-fence.json"
 #: Hard ceiling for an isolated worker whose dispatcher gave no timeout.
 DEFAULT_WORKER_MAX_SECONDS = 4 * 3600.0
 WORKER_MAX_SECONDS_ENV = "TRIO_WORKER_MAX_SECONDS"
@@ -598,7 +597,29 @@ def create(
     return record
 
 
+#: Literal markers of an Omnigent session binding. Detection is bounded to
+#: these markers: a binding hidden behind an arbitrary wrapper script with
+#: none of them in its config is NOT detectable here (documented limit).
+_SESSION_MARKERS = ("--bridge-dir", "serve-mcp", "omnigent", "cursor-native", "record-usage")
+
+
+def _strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in (str(k), *_strings(v))]
+    if isinstance(value, list):
+        return [s for item in value for s in _strings(item)]
+    return []
+
+
+def _marked(value: object) -> bool:
+    text = " ".join(_strings(value)).lower()
+    return any(marker in text for marker in _SESSION_MARKERS)
+
+
 def _session_bound_mcp_servers(path: Path) -> list[str]:
+    """Session-bound MCP servers in one config file (any name, url or env)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -606,25 +627,71 @@ def _session_bound_mcp_servers(path: Path) -> list[str]:
     except (OSError, ValueError):
         return [f"{path} is unreadable or not JSON (cannot prove it is safe)"]
     servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if servers is None and isinstance(data, dict):
+        servers = data.get("servers")  # alternate plugin schema
     problems = []
     for name, spec in (servers or {}).items() if isinstance(servers, dict) else []:
-        args = spec.get("args") if isinstance(spec, dict) else None
-        text = " ".join(str(a) for a in args) if isinstance(args, list) else ""
-        if name == "omnigent" or ("serve-mcp" in text and "--bridge-dir" in text):
+        if name == "omnigent" or _marked(spec):
             problems.append(f"{path} declares session-bound Omnigent MCP server {name!r}")
     return problems
 
 
 def _omnigent_hooks(path: Path) -> list[str]:
     try:
-        text = path.read_text(encoding="utf-8")
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
-    except OSError:
-        return [f"{path} is unreadable (cannot prove it is safe)"]
-    if "record-usage" in text or "omnigent" in text:
+    except (OSError, ValueError):
+        return [f"{path} is unreadable or not JSON (cannot prove it is safe)"]
+    if _marked(data):
         return [f"{path} carries an Omnigent session hook"]
     return []
+
+
+def _plugin_sources(plugins: Path) -> tuple[list[Path], list[Path], list[str]]:
+    """(mcp files, hook files, unresolved problems) contributed by plugins.
+
+    Mirrors the installed cursor-agent bundle's plugin loading: an MCP file
+    (``mcp.json`` / ``.mcp.json``) and hooks from ``hooks/hooks.json`` or a
+    manifest ``hooks`` path. A manifest hook source that cannot be resolved
+    to a readable file is reported (fail closed).
+    """
+    mcp, hooks, problems = [], [], []
+    if not plugins.is_dir():
+        return mcp, hooks, problems
+    for path in plugins.rglob("*"):
+        if path.is_symlink() and path.is_dir():
+            problems.append(f"{path} is a symlinked plugin directory (cannot prove it is safe)")
+            continue
+        if not path.is_file():
+            continue
+        if path.name in ("mcp.json", ".mcp.json"):
+            mcp.append(path)
+        elif path.name == "hooks.json":
+            hooks.append(path)
+        elif path.name == "plugin.json":
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                problems.append(f"{path} is an unreadable plugin manifest (cannot prove it is safe)")
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            for key in ("hooks", "mcpServers"):
+                ref = manifest.get(key)
+                if isinstance(ref, dict) or isinstance(ref, list):
+                    if _marked(ref):
+                        problems.append(f"{path} declares session-bound Omnigent {key}")
+                elif isinstance(ref, str):
+                    plugin_root = path.parent.parent if path.parent.name.startswith(".") else path.parent
+                    target = (plugin_root / ref.lstrip("./")).resolve()
+                    if target.is_dir():
+                        target = target / "hooks.json"
+                    if not target.is_file():
+                        problems.append(f"{path} {key} source {ref!r} is unresolved (fail closed)")
+                    else:
+                        (hooks if key == "hooks" else mcp).append(target)
+    return mcp, hooks, problems
 
 
 def inherited_cursor_problems(
@@ -633,12 +700,17 @@ def inherited_cursor_problems(
     """Session-bound Omnigent config every cursor-agent inherits, if any.
 
     A worktree isolates only the *project* ``.cursor`` scope. cursor-agent
-    also loads ``~/.cursor/mcp.json`` (verified live: ``cursor-agent mcp
-    list`` in an isolated worktree lists the user servers) and user/system
-    hooks. An Omnigent server or hook there is bound to one session's
-    bridge, so a worker would route tools (and possibly receipts) to that
-    foreign session. The user's global config is never edited here; the
-    caller refuses isolated dispatch instead.
+    also loads (per the installed 2026.09.23 bundle, and verified live for
+    user MCP via ``cursor-agent mcp list`` in an isolated worktree):
+    enterprise hooks (``/etc/cursor/hooks.json``), team-managed hooks
+    (``~/.cursor/managed/active-team-hooks/hooks.json``), user
+    ``~/.cursor/{mcp,hooks}.json`` and plugin MCP/hooks under
+    ``~/.cursor/plugins``. A session-bound Omnigent entry in any of them
+    routes a worker's tools/receipts to a foreign session. Detection is by
+    literal markers (``_SESSION_MARKERS``, any server name, url or env);
+    unreadable or unresolvable sources fail closed. A binding hidden behind
+    an arbitrary wrapper with no marker is not detectable -- this is not a
+    proof of complete isolation. The user's config is never edited.
     """
     base = (home if home is not None else Path.home()) / ".cursor"
     problems: list[str] = []
@@ -646,6 +718,13 @@ def inherited_cursor_problems(
         problems.append(f"{base} is a symlink (shared Cursor config; cannot prove it is safe)")
     problems += _session_bound_mcp_servers(base / "mcp.json")
     problems += _omnigent_hooks(base / "hooks.json")
+    problems += _omnigent_hooks(base / "managed" / "active-team-hooks" / "hooks.json")
+    mcp, hooks, unresolved = _plugin_sources(base / "plugins")
+    problems += unresolved
+    for path in mcp:
+        problems += _session_bound_mcp_servers(path)
+    for path in hooks:
+        problems += _omnigent_hooks(path)
     for path in system_hooks:
         problems += _omnigent_hooks(path)
     return problems
@@ -718,14 +797,14 @@ def integrate(
     worker_id: str,
     *,
     summary: str | None = None,
-    override_unverified: str | None = None,
 ) -> dict[str, Any]:
     """Commit the worker's changes and merge them into the aggregate branch.
 
     Serialized per repository. Only output of a worker the dispatcher saw
     exit 0 is integrated; failed, interrupted or never-finished output is
-    refused (``unverified_output``) unless a human passes
-    *override_unverified* (a reason, recorded in the ledger). Refused while
+    always refused (there is no override: the recovery path is a fresh,
+    successful re-dispatch, and the failed worktree stays retained as
+    unaccepted work). Refused while
     an integration fence is held (an integration evaluation/retirement is
     in progress) and while any process still uses the worktree. Any failure
     leaves the worktree, branch and aggregate untouched (a started merge is
@@ -741,20 +820,13 @@ def integrate(
         if identity_alive(record.get("worker")) or group_alive(record.get("pgid")):
             return _retain(repo, record, "active_session", "worker process still running")
         if not record.get("worker_ok"):
-            if not (override_unverified and override_unverified.strip()):
-                prior = record.get("retained_reason")
-                reason = prior if prior in UNVERIFIED_OUTPUT_REASONS else "unverified_output"
-                return _retain(
-                    repo, record, reason,
-                    "worker did not finish successfully; its partial output is "
-                    "never integrated automatically (re-dispatch a fresh builder, "
-                    "or a human repairs it and integrates with an explicit override)",
-                )
-            record["override_unverified"] = {
-                "reason": override_unverified.strip(),
-                "by": process_identity(os.getpid()),
-                "at": time.time(),
-            }
+            prior = record.get("retained_reason")
+            reason = prior if prior in UNVERIFIED_OUTPUT_REASONS else "unverified_output"
+            return _retain(
+                repo, record, reason,
+                "worker did not finish successfully; its partial output is never "
+                "integrated -- re-dispatch a fresh builder for the slice",
+            )
         fence = active_fence(repo)
         if fence is not None:
             return _retain(
@@ -844,74 +916,113 @@ def _accepting_revision(
     repo: Path, record: dict[str, Any], acceptance_for: Any
 ) -> dict[str, Any] | None:
     """The verified acceptance covering this record's exact merge, or None."""
+    """Sets ``record["acceptance_pending"]`` to the reason when not accepted.
+
+    ``acceptance_for(mailbox)`` returns ``{"evaluated": sha, ...}`` for a
+    verified retired SHIP or ``{"pending": "<reason>"}`` / None otherwise.
+    """
     merge = record.get("merge_commit")
-    if not merge or not record.get("mailbox") or acceptance_for is None:
+    if acceptance_for is None:
+        record["acceptance_pending"] = "no acceptance source (cleanup cannot verify a SHIP)"
+        return None
+    if not merge or not record.get("mailbox"):
+        record["acceptance_pending"] = "record has no merge or mailbox"
         return None
     try:
         acceptance = acceptance_for(Path(record["mailbox"]))
-    except Exception:  # noqa: BLE001 - unverifiable acceptance is no acceptance
+    except Exception as exc:  # noqa: BLE001 - unverifiable acceptance is no acceptance
+        record["acceptance_pending"] = f"acceptance check failed: {type(exc).__name__}"
         return None
-    if not isinstance(acceptance, dict):
+    if not isinstance(acceptance, dict) or not acceptance.get("evaluated"):
+        pending = acceptance.get("pending") if isinstance(acceptance, dict) else None
+        record["acceptance_pending"] = pending or "no verified retired SHIP"
         return None
     evaluated = rev(repo, str(acceptance.get("evaluated") or ""))
     aggregate = rev(repo, record["aggregate_ref"])
     if evaluated is None or aggregate is None or evaluated != acceptance.get("evaluated"):
-        return None  # short, unknown or non-canonical sha
+        record["acceptance_pending"] = "evaluated sha is not a full commit on this repo"
+        return None
     # The graded revision must contain the exact integrated merge and be
     # on the aggregate branch; a merge landing after the pin is not covered.
-    if not is_ancestor(repo, merge, evaluated) or not is_ancestor(repo, evaluated, aggregate):
+    if not is_ancestor(repo, merge, evaluated):
+        record["acceptance_pending"] = (
+            f"merge {merge[:12]} is not contained in evaluated pin {evaluated[:12]}"
+        )
         return None
+    if not is_ancestor(repo, evaluated, aggregate):
+        record["acceptance_pending"] = f"evaluated pin {evaluated[:12]} is not on the aggregate branch"
+        return None
+    record.pop("acceptance_pending", None)
     return dict(acceptance)
 
 
 # ------------------------------------------------------------------ fence
+#
+# Multi-holder: each acquire creates its own token file under
+# ``<ledger>/fences/``; release removes only the caller's token. Integrations
+# are blocked while ANY live holder's token exists. A token whose holder
+# process is dead is stale and ignored (crash recovery); an unreadable token
+# counts as held (fail closed).
 
 
-def _fence_path(repo: Path) -> Path:
-    return ledger_dir(repo) / FENCE_FILE
+def _fence_dir(repo: Path) -> Path:
+    return ledger_dir(repo) / "fences"
 
 
-def acquire_fence(repo: Path, *, reason: str, mailbox: Path | None = None) -> dict[str, Any]:
-    """Block integrations into *repo* while an evaluation/retirement runs."""
+def acquire_fence(repo: Path, *, reason: str, mailbox: Path | None = None) -> str:
+    """Add one fence holder; returns its token (pass it to :func:`release_fence`)."""
     repo = repo_toplevel(repo)
+    token = uuid.uuid4().hex
     with repo_lock(repo):
+        directory = _fence_dir(repo)
+        directory.mkdir(parents=True, exist_ok=True)
         fence = {
+            "token": token,
             "holder": process_identity(os.getpid()),
             "reason": reason,
             "mailbox": str(mailbox) if mailbox else None,
             "at": time.time(),
         }
-        path = _fence_path(repo)
-        tmp = path.with_suffix(f".tmp-{os.getpid()}")
+        tmp = directory / f".{token}.tmp"
         tmp.write_text(json.dumps(fence, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        return fence
+        os.replace(tmp, directory / f"{token}.json")
+    return token
 
 
-def release_fence(repo: Path) -> None:
-    """Drop this process's fence (another holder's fence is left alone)."""
+def release_fence(repo: Path, token: str) -> bool:
+    """Remove exactly this holder's token; True when it existed."""
+    if not token or _SAFE.sub("", token) != token:
+        return False
     repo = repo_toplevel(repo)
     with repo_lock(repo):
-        path = _fence_path(repo)
+        path = _fence_dir(repo) / f"{token}.json"
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+
+def active_fences(repo: Path) -> list[dict[str, Any]]:
+    """Live (or unreadable) fence holders for *repo*."""
+    directory = _fence_dir(repo)
+    if not directory.is_dir():
+        return []
+    held = []
+    for path in sorted(directory.glob("*.json")):
         try:
             fence = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
-        if (fence.get("holder") or {}).get("pid") == os.getpid():
-            with contextlib.suppress(OSError):
-                path.unlink()
+            held.append({"reason": f"unreadable fence {path.name} (uncertain)"})
+            continue
+        if identity_alive(fence.get("holder")):
+            held.append(fence)
+    return held
 
 
 def active_fence(repo: Path) -> dict[str, Any] | None:
-    """The fence if its holder is alive; an unreadable fence counts as held."""
-    path = _fence_path(repo)
-    if not path.exists():
-        return None
-    try:
-        fence = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"reason": "unreadable integration fence (uncertain)"}
-    return fence if identity_alive(fence.get("holder")) else None
+    fences = active_fences(repo)
+    return fences[0] if fences else None
 
 
 # ----------------------------------------------------------------- cleanup
@@ -1057,6 +1168,7 @@ def cleanup_one(
     if not is_eval and not record.get("accepted_by"):
         acceptance = _accepting_revision(repo, record, acceptance_for)
         if acceptance is None:
+            save_record(repo, record)  # persist the explicit pending reason
             return record  # integrated; waiting for verified acceptance
         record["accepted_by"] = acceptance
         record["state"] = "accepted"
@@ -1132,6 +1244,8 @@ def summarize(record: dict[str, Any]) -> str:
     text = f"{record.get('id')}: {state}"
     if reason:
         text += f" ({reason})"
+    elif state in ("integrated", "exited") and record.get("acceptance_pending"):
+        text += f" (acceptance pending: {record['acceptance_pending']})"
     return text
 
 

@@ -849,6 +849,11 @@ class BrokerClient:
         path = f"/v1/sessions/{quote(session_id, safe='')}"
         return self._request("DELETE", path, expected_status=200)
 
+    def archive_session(self, session_id: str) -> Any:
+        """Archive one session (the server then stops its host runner)."""
+        path = f"/v1/sessions/{quote(session_id, safe='')}"
+        return self._request("PATCH", path, {"archived": True})
+
     def get_session(self, session_id: str) -> Any:
         """Fetch one session snapshot."""
         path = f"/v1/sessions/{quote(session_id, safe='')}"

@@ -537,15 +537,13 @@ def test_interrupted_dispatch_is_retained_then_recoverable(wt, repo, root):
     (result,) = clean(wt, repo)
     assert result["retained_reason"] == "interrupted"
     assert Path(record["path"]).is_dir()
-    # Partial output is never integrated automatically (r2 / M2) ...
+    # Partial output is never integrated (r2 M2 / r3 M2': no override);
+    # recovery is a fresh successful dispatch, this worktree stays retained.
     refused = wt.integrate(repo, record["id"])
     assert refused["state"] == "retained" and refused["retained_reason"] == "interrupted"
     assert not (repo / "i.txt").exists()
-    # ... only with an explicit, recorded human override.
-    done = wt.integrate(repo, record["id"], override_unverified="repaired and checked by hand")
-    assert done["state"] == "integrated"
-    assert done["override_unverified"]["reason"] == "repaired and checked by hand"
-    assert (repo / "i.txt").read_text() == "partial\n"
+    assert clean(wt, repo)[0]["state"] == "retained"
+    assert Path(record["path"]).is_dir()
 
 
 def test_restart_after_worktree_removed_finishes_branch_step(wt, repo, root):
@@ -624,10 +622,10 @@ def test_slice_eval_session_is_bound_to_detached_pinned_worktree(wt, repo, root,
 
     def fake_dispatch(client, agent_id, model, prompt, title, role, iteration,
                       mailbox, ctx, started, before_text, before_mtime,
-                      created_before, workspace):
+                      dispatch, workspace):
         seen["prompt"] = prompt
         runner._create_wait_read(client, agent_id, model, prompt, title, role,
-                                 workspace=workspace)
+                                 workspace=workspace, dispatch=dispatch)
         return 0
 
     monkeypatch.setattr(runner, "_run_dispatch", fake_dispatch)

@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import uuid
@@ -1066,8 +1067,8 @@ def _command_run_isolated(
 def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "id", "slice", "kind", "state", "retained_reason", "retained_detail",
-        "path", "branch", "base", "worker_commit", "merge_commit",
-        "accepted_by",
+        "acceptance_pending", "path", "branch", "base", "worker_commit",
+        "merge_commit", "accepted_by",
     )
     return {"worker_worktree": {k: record.get(k) for k in keys if k in record}}
 
@@ -1102,36 +1103,52 @@ def _load_loop_core_for(repo: Path) -> Any:
 
 def _ship_acceptance(
     mailbox: Path, repo: Path, loop_core: Any = None
-) -> dict[str, Any] | None:
-    """Verified SHIP acceptance of an exact revision, or None.
+) -> dict[str, Any]:
+    """Verified SHIP acceptance of an exact revision, or ``{"pending": why}``.
 
     Reuses the loop core's own retirement contract instead of parsing
-    ``commit:`` lines: STATE.md must be driver-finalized ``shipped`` with
-    a bound ``evaluator_attempt`` and full ``evaluated_sha``;
-    ``_ship_retirement_problem`` must report nothing (SHIP first line,
-    attempt/evaluated recorded in VERDICT.md, product tree unchanged
-    since the pin, ``loop: iteration N — SHIP`` retirement commit on
-    HEAD); and VERDICT.md must be tracked with no uncommitted edits.
+    ``commit:`` lines, for lockstep and open-loop alike (both persist
+    ``evaluator_attempt``/``evaluated_sha`` before the evaluator runs):
+    STATE.md driver-finalized ``shipped`` with a bound attempt and full
+    ``evaluated_sha``; ``_ship_retirement_problem`` reports nothing (SHIP
+    first line, attempt/evaluated recorded in VERDICT.md, product tree
+    unchanged since the pin, ``loop: iteration N — SHIP`` retirement commit
+    on HEAD); VERDICT.md tracked with no uncommitted edits. All of it is
+    evaluated on one stable snapshot of the inputs (VERDICT.md, STATE.md,
+    HEAD, status); a concurrent change yields ``pending``.
     """
     core = loop_core or _load_loop_core_for(repo)
     if core is None:
-        return None
+        return {"pending": "no loop core (metrics/trio_loop.py) to verify retirement"}
     try:
-        state = core._read_state(mailbox / "STATE.md")
-    except Exception:  # noqa: BLE001
-        return None
-    if str(state.get("status", "")).strip() != "shipped":
-        return None
+        before = core._retirement_snapshot(mailbox, repo)
+        result = _ship_acceptance_once(mailbox, repo, core)
+        after = core._retirement_snapshot(mailbox, repo)
+    except Exception as exc:  # noqa: BLE001
+        return {"pending": f"acceptance check failed: {type(exc).__name__}"}
+    if before != after:
+        return {"pending": "mailbox or git state changed during the acceptance check"}
+    return result
+
+
+def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any]:
+    state = core._read_state(mailbox / "STATE.md")
+    status = str(state.get("status", "")).strip()
+    if status != "shipped":
+        return {"pending": f"loop status is {status or 'unset'!r}, not a driver-finalized 'shipped'"}
     evaluated = str(state.get("evaluated_sha", "")).strip()
     attempt = str(state.get("evaluator_attempt", "")).strip()
     try:
         iteration = int(str(state.get("iteration", "")).strip())
     except ValueError:
-        return None
-    if not attempt or not re.fullmatch(r"[0-9a-f]{40}", evaluated):
-        return None
-    if core._ship_retirement_problem(mailbox, iteration, repo) is not None:
-        return None
+        return {"pending": "STATE.md iteration is not a number"}
+    if not attempt:
+        return {"pending": "SHIP is not bound to an evaluator attempt"}
+    if not re.fullmatch(r"[0-9a-f]{40}", evaluated):
+        return {"pending": "SHIP is not bound to a full evaluated sha"}
+    problem = core._ship_retirement_problem(mailbox, iteration, repo)
+    if problem is not None:
+        return {"pending": f"retirement not verified: {problem[1]}"}
     verdict = mailbox / "VERDICT.md"
     tracked = subprocess.run(
         ["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", str(verdict)],
@@ -1141,8 +1158,10 @@ def _ship_acceptance(
         ["git", "-C", str(repo), "status", "--porcelain", "--", str(verdict)],
         capture_output=True, text=True,
     )
-    if tracked.returncode != 0 or dirty.returncode != 0 or dirty.stdout.strip():
-        return None
+    if tracked.returncode != 0:
+        return {"pending": "VERDICT.md is not committed"}
+    if dirty.returncode != 0 or dirty.stdout.strip():
+        return {"pending": "VERDICT.md has uncommitted edits after retirement"}
     return {"evaluated": evaluated, "iteration": iteration, "attempt": attempt}
 
 
@@ -1190,10 +1209,7 @@ def command_worktrees(args: argparse.Namespace) -> int:
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0
         if args.worktrees_command == "integrate":
-            record = wt.integrate(
-                repo, args.id, summary=args.summary,
-                override_unverified=args.accept_unverified_output,
-            )
+            record = wt.integrate(repo, args.id, summary=args.summary)
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0 if record.get("state") in ("integrated", "accepted", "removed") else ISOLATED_RETAINED_EXIT
         if args.worktrees_command == "finish":
@@ -2207,6 +2223,11 @@ def _prune_broker_sessions(
         delete_session = getattr(client, "delete_session", None)
         if delete_session is None:
             raise TrioctlError("broker client has no session-delete method")
+        # DELETE alone does not stop a host-launched session's dedicated
+        # runner (observed: runners held their workspaces ~1h until their
+        # idle reaper). Broker-archiving first is the supported, session-
+        # scoped path that makes the server send the host `stop_runner`.
+        _stop_session_runner(client, session_id)
         try:
             delete_session(session_id)
         except broker_http.BrokerHttpError as exc:
@@ -2223,6 +2244,48 @@ def _prune_broker_sessions(
                 f"-> {archive_path}"
             )
     return counts
+
+
+RUNNER_STOP_WAIT_SECONDS = 20.0
+
+
+def _stop_session_runner(client: Any, session_id: str) -> bool | None:
+    """Archive one session so its host runner is stopped; best effort.
+
+    Returns True once the broker reports ``runner_online`` false, False
+    when it stays online past the bounded wait, None when the client or
+    session cannot say (fakes, older brokers). Never raises: a runner
+    left to its idle reaper is the pre-existing behaviour.
+    """
+    archive = getattr(client, "archive_session", None)
+    get = getattr(client, "get_session", None)
+    if archive is None:
+        return None
+    try:
+        archive(session_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if get is None:
+        return None
+    deadline = time.monotonic() + RUNNER_STOP_WAIT_SECONDS
+    while True:
+        try:
+            snap = get(session_id)
+        except Exception:  # noqa: BLE001
+            return None
+        online = snap.get("runner_online") if isinstance(snap, dict) else None
+        if online is None:
+            return None
+        if online is False:
+            return True
+        if time.monotonic() >= deadline:
+            print(
+                f"trioctl: runner for {session_id} still online after archive; "
+                "it will stop on its idle timeout",
+                file=sys.stderr,
+            )
+            return False
+        time.sleep(0.5)
 
 
 def command_sessions_prune(args: argparse.Namespace) -> int:
@@ -2366,15 +2429,19 @@ _OPEN_LOOP_SLICE_EVAL_PROCEDURE = (
 
 _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
     "Open-loop mode is active — every planned slice is retired and no\n"
-    "fault is `open`/`taken`, so run one integration evaluation of HEAD\n"
-    "against GOAL.md's acceptance criteria (the Method and Output sections\n"
-    "above apply in full):\n"
+    "fault is `open`/`taken`, so run one integration evaluation of the\n"
+    "pinned revision `{sha}` against GOAL.md's acceptance criteria (the\n"
+    "Method and Output sections above apply in full). Grade exactly that\n"
+    "revision; below the first line VERDICT.md MUST record the exact field\n"
+    "lines `iteration: {iteration}`, `attempt: {attempt}` and\n"
+    "`evaluated: {sha}` (worker worktrees are only cleaned up after a SHIP\n"
+    "bound to this pin and attempt is retired):\n"
     "1. Overwrite loop/VERDICT.md; the FIRST LINE must be exactly one of\n"
     "   `VERDICT: SHIP`, `VERDICT: ITERATE`, `VERDICT: NEEDS_HUMAN`, or\n"
     "   `VERDICT: BLOCKED`, followed by the standard verdict body.\n"
     "2. SHIP → follow the Retirement commit convention: commit the\n"
     "   verified product changes as `slice(<id>): ...`, append your\n"
-    "   LOG.md line, then commit loop/ as `loop: iteration N — SHIP`,\n"
+    "   LOG.md line, then commit loop/ as `loop: iteration {iteration} — SHIP`,\n"
     "   recording each `commit: <full sha>` in VERDICT.md.\n"
     "3. ITERATE → append one `faults:` entry to QUEUE.md (`id: f<N>`,\n"
     "   `scope`, `reason`, `status: open`) and leave the tree uncommitted\n"
@@ -2453,7 +2520,19 @@ class OmnigentRunner:
         # Root-bound (aggregate workspace) sessions this runner created, in
         # order; used to prove the previous one no longer owns the root's
         # project Cursor config before the root is reused.
-        self._root_sessions: list[str] = []
+        #
+        # Ownership is recorded per dispatch (never by slicing the shared
+        # created_session_ids list: open-loop runs the Lead thread and the
+        # evaluator on ONE runner concurrently). Only a FINISHED root-bound
+        # dispatch's own session is ever ended for root reuse; sessions of
+        # in-flight dispatches (any role) are never touched.
+        self._own_lock = threading.Lock()
+        self._root_finished: list[dict[str, Any]] = []
+        self._inflight: set[str] = set()
+        # Integration-fence tokens this runner holds: acquired per evaluator
+        # dispatch; only tokens of FINISHED evaluator dispatches are released
+        # at the next Lead/repair dispatch; all are released at loop end.
+        self._fence_tokens: dict[str, bool] = {}
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
         # that implement the completion-receipt contract.
@@ -2553,7 +2632,11 @@ class OmnigentRunner:
                 slice=slice_id or "<slice>", sha=sha or "<sha>"
             )
         elif kind == "integration-eval":
-            procedure = _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE
+            procedure = _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE.format(
+                sha=context.get("pinned_sha") or sha or "HEAD",
+                attempt=context.get("evaluator_attempt") or "<none>",
+                iteration=context.get("iteration") or "N",
+            )
         else:
             procedure = ""
         if not procedure:
@@ -2734,7 +2817,11 @@ class OmnigentRunner:
         are archived and deleted through the normal id-scoped prune, then
         no cursor-agent may remain with its cwd at the root.
         """
-        previous = [sid for sid in self._root_sessions]
+        with self._own_lock:
+            previous = [
+                entry["session_id"] for entry in self._root_finished
+                if entry["session_id"] not in self._inflight
+            ]
         if previous:
             held = set(self.held_session_ids) | {
                 str(r.get("session_id")) for _p, r in _held_records(mailbox)
@@ -2759,7 +2846,10 @@ class OmnigentRunner:
                 f"reusing the aggregate root: {counts}",
                 file=sys.stderr,
             )
-            self._root_sessions = []
+            with self._own_lock:
+                self._root_finished = [
+                    e for e in self._root_finished if e["session_id"] not in previous
+                ]
         deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
         while True:
             live = worker_worktrees.cursor_processes_at(self.repo)
@@ -2970,8 +3060,12 @@ class OmnigentRunner:
         role: str,
         started: float | None = None,
         workspace: str | None = None,
+        dispatch: dict[str, Any] | None = None,
     ) -> tuple[Any, Any]:
         """One create+wait+read cycle. Returns (session snapshot, items).
+
+        *dispatch* (per-call, not shared) receives this call's own
+        ``session_id`` the moment it exists.
 
         With ``started``, the prompt phase inside create counts against
         the role timeout: the wait only gets what is left of it.
@@ -2995,6 +3089,10 @@ class OmnigentRunner:
         session_id = self._session_id(created)
         if session_id is None:
             raise TrioctlError("session create response has no session id")
+        if dispatch is not None:
+            dispatch["session_id"] = session_id
+            with self._own_lock:
+                self._inflight.add(session_id)
         self.session_ids[role] = session_id
         self.created_session_ids.append(session_id)
         _record_created_session_id(session_id)
@@ -3161,6 +3259,7 @@ class OmnigentRunner:
         if self._dispatch_nonce:
             prompt += f"\nDispatch nonce: {self._dispatch_nonce}\n"
         title = self._title(mailbox, iteration, role, context)
+        dispatch: dict[str, Any] = {"role": role, "session_id": None, "fence": None}
         eval_wt = self._slice_eval_worktree(role, mailbox, context)
         workspace = self._workspace
         if self._isolate and worker_worktrees is not None and eval_wt is None:
@@ -3169,13 +3268,17 @@ class OmnigentRunner:
             self._release_root(mailbox)
             if role == "evaluator":
                 # No worker merge may land while the aggregate is graded or
-                # retired; released at the next Lead/repair dispatch or
-                # loop end (acceptance is also bound to the exact pin).
-                worker_worktrees.acquire_fence(
+                # retired; held until the next Lead/repair dispatch after
+                # this evaluation FINISHED, or loop end (acceptance is also
+                # bound to the exact pin).
+                token = worker_worktrees.acquire_fence(
                     self.repo, reason=f"{role} iteration {iteration}", mailbox=mailbox,
                 )
+                dispatch["fence"] = token
+                with self._own_lock:
+                    self._fence_tokens[token] = False
             else:
-                worker_worktrees.release_fence(self.repo)
+                self._release_fences(finished_only=True)
         if eval_wt is not None:
             workspace = eval_wt["path"]
             prompt = (
@@ -3206,26 +3309,51 @@ class OmnigentRunner:
                     nonce=self._dispatch_nonce,
                 ),
             }
-        created_before = len(self.created_session_ids)
+        dispatch["workspace"] = workspace
         try:
             return self._run_dispatch(
                 client, agent_id, model, prompt, title, role, iteration,
                 mailbox, context, started, before_text, before_mtime,
-                created_before, workspace,
+                dispatch, workspace,
             )
         finally:
+            session_id = dispatch.get("session_id")
+            with self._own_lock:
+                if session_id:
+                    self._inflight.discard(session_id)
+                if dispatch.get("fence"):
+                    self._fence_tokens[dispatch["fence"]] = True  # finished
+                if eval_wt is None and self._isolate and session_id:
+                    self._root_finished.append(
+                        {"session_id": session_id, "role": role, "workspace": workspace}
+                    )
             if eval_wt is not None:
-                self._release_eval_worktree(eval_wt, created_before)
-            elif self._isolate:
-                self._root_sessions.extend(self.created_session_ids[created_before:])
+                self._release_eval_worktree(eval_wt, session_id)
+
+    def _release_fences(self, *, finished_only: bool) -> None:
+        """Release this runner's fence tokens (finished evaluations only, or all)."""
+        with self._own_lock:
+            tokens = [
+                t for t, finished in self._fence_tokens.items()
+                if finished or not finished_only
+            ]
+            for token in tokens:
+                self._fence_tokens.pop(token, None)
+        for token in tokens:
+            worker_worktrees.release_fence(self.repo, token)
+
+    def release_all_fences(self) -> None:
+        """Loop end: no evaluation of this runner can still be running."""
+        if worker_worktrees is not None:
+            self._release_fences(finished_only=False)
 
     def _release_eval_worktree(
-        self, eval_wt: dict[str, Any], created_before: int
+        self, eval_wt: dict[str, Any], session_id: str | None
     ) -> None:
-        """Record the bound session(s) and end this dispatch's claim."""
+        """Record this dispatch's own session and end its claim."""
         try:
             record = worker_worktrees.load_record(self.repo, eval_wt["id"])
-            for session_id in self.created_session_ids[created_before:]:
+            if session_id:
                 record.setdefault("session_ids", []).append(session_id)
             worker_worktrees.save_record(self.repo, record)
             worker_worktrees.mark_finished(self.repo, eval_wt["id"])
@@ -3250,13 +3378,13 @@ class OmnigentRunner:
         started: float,
         before_text: str,
         before_mtime: Any,
-        created_before: int,
+        dispatch: dict[str, Any],
         workspace: str,
     ) -> int:
         try:
             snapshot, items = self._create_wait_read(
                 client, agent_id, model, prompt, title, role, started,
-                workspace=workspace,
+                workspace=workspace, dispatch=dispatch,
             )
             if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
                 return 1
@@ -3288,11 +3416,9 @@ class OmnigentRunner:
                 exc, "first_prompt_uncertain",
             )
         except (TrioctlError, broker_http.BrokerHttpError) as exc:
-            session_id = (
-                self.created_session_ids[-1]
-                if len(self.created_session_ids) > created_before
-                else None
-            )
+            # This dispatch's own session (a concurrent role's create must
+            # never be held or accepted in its place).
+            session_id = dispatch.get("session_id")
             if session_id is None:
                 # Nothing was delivered (or create said so definitely).
                 if isinstance(exc, TrioctlError):
@@ -3689,7 +3815,7 @@ def command_loop(args: argparse.Namespace) -> int:
                 pass
         if isolate:
             try:
-                worker_worktrees.release_fence(repo)
+                runner.release_all_fences()
             except Exception as exc:  # noqa: BLE001
                 print(f"trioctl: could not release integration fence: {exc}", file=sys.stderr)
             # After prune, so deleted role sessions no longer hold their
@@ -4175,14 +4301,7 @@ def parser() -> argparse.ArgumentParser:
     )
     wt_integrate.add_argument("id")
     wt_integrate.add_argument("--summary", default=None)
-    wt_integrate.add_argument(
-        "--accept-unverified-output",
-        metavar="REASON",
-        default=None,
-        help="HUMAN override: integrate output of a worker that failed or was "
-        "interrupted (after you repaired and checked it); the reason is "
-        "recorded. Evaluator acceptance is still required before cleanup.",
-    )
+
     wt_finish = worktrees_commands.add_parser(
         "finish", help="mark an evaluator worktree's session finished"
     )

@@ -42,6 +42,7 @@ exec "$BWRAP" \
     -o cache_dir="$WORKDIR" \
     omnigent/tests/test_worker_worktrees.py \
     omnigent/tests/test_worker_worktrees_r2.py \
+    omnigent/tests/test_worker_worktrees_r3.py \
     omnigent/tests/test_worker_events.py \
     omnigent/tests/test_trioctl.py \
     omnigent/tests/test_omnigent_loop.py \

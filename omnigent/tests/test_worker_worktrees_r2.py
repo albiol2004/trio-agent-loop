@@ -254,7 +254,7 @@ def test_p02_handwritten_uncommitted_short_sha_ship_is_rejected(
     rec = integrated_worker(wt, repo, root)
     short = git(repo, "rev-parse", "--short=7", "HEAD")
     (repo / "loop" / "VERDICT.md").write_text(f"VERDICT: SHIP\n\ncommit: {short}\n")
-    assert trioctl._ship_acceptance(repo / "loop", repo, loop_core) is None
+    assert "pending" in trioctl._ship_acceptance(repo / "loop", repo, loop_core)
     (result,) = wt.cleanup(repo, acceptance_for=acceptance(trioctl, repo, loop_core))
     assert result["state"] == "integrated"
     assert Path(rec["path"]).is_dir()
@@ -295,7 +295,7 @@ def test_forged_stale_or_incomplete_acceptance_is_rejected(
     elif mutate == "late_merge":
         # A leftover builder merges after the graded pin (M4 late mutation).
         integrated_worker(wt, repo, root, slice_id="LATE")
-    assert trioctl._ship_acceptance(repo / "loop", repo, loop_core) is None
+    assert "pending" in trioctl._ship_acceptance(repo / "loop", repo, loop_core)
     results = {r["id"]: r for r in wt.cleanup(repo, acceptance_for=acceptance(trioctl, repo, loop_core))}
     assert results[rec["id"]]["state"] == "integrated"
     assert Path(rec["path"]).is_dir()
@@ -321,8 +321,9 @@ def test_failed_or_interrupted_output_is_never_integrated(wt, repo, root, return
     assert not (repo / "half.txt").exists()
     subjects = git(repo, "log", "--format=%s").splitlines()
     assert not any(s.startswith("slice(F)") for s in subjects)
-    # An empty override string is not an override.
-    assert wt.integrate(repo, rec["id"], override_unverified="  ")["state"] == "retained"
+    # There is no override path at all (M2'): the API has no bypass.
+    with pytest.raises(TypeError):
+        wt.integrate(repo, rec["id"], override_unverified="human said so")
 
 
 def test_empty_integration_clears_stale_reason(wt, repo, root):
@@ -435,17 +436,17 @@ def test_integration_fence_blocks_merges_during_evaluation(wt, repo, root):
     (Path(rec["path"]) / "g.txt").write_text("g\n")
     wt.mark_exited(repo, wt.load_record(repo, rec["id"]), 0)
     head = git(repo, "rev-parse", "HEAD")
-    wt.acquire_fence(repo, reason="evaluator iteration 1", mailbox=repo / "loop")
+    token = wt.acquire_fence(repo, reason="evaluator iteration 1", mailbox=repo / "loop")
     result = wt.integrate(repo, rec["id"])
     assert result["retained_reason"] == "integration_fenced"
     assert git(repo, "rev-parse", "HEAD") == head
-    wt.release_fence(repo)
+    wt.release_fence(repo, token)
     assert wt.integrate(repo, rec["id"])["state"] == "integrated"
 
 
 def test_dead_fence_holder_does_not_block_and_unreadable_fence_does(wt, repo, root):
-    wt.acquire_fence(repo, reason="x")
-    fence = wt.ledger_dir(repo) / wt.FENCE_FILE
+    token = wt.acquire_fence(repo, reason="x")
+    fence = wt.ledger_dir(repo) / "fences" / f"{token}.json"
     data = json.loads(fence.read_text())
     data["holder"] = {"pid": 2**22 + 11, "start": "0"}
     fence.write_text(json.dumps(data))
@@ -479,15 +480,15 @@ def _runner(trioctl, repo, root, monkeypatch):
     monkeypatch.setattr(runner, "_prompt", lambda *a, **k: "p\n")
     seen = []
 
-    def dispatch(client, agent_id, model, prompt, title, role, iteration, mailbox,
-                 ctx, started, before_text, before_mtime, created_before, workspace):
+    def run_dispatch(client, agent_id, model, prompt, title, role, iteration, mailbox,
+                     ctx, started, before_text, before_mtime, dispatch, workspace):
         seen.append({"role": role, "workspace": workspace,
                      "fence": trioctl.worker_worktrees.active_fence(repo)})
         runner._create_wait_read(client, agent_id, model, prompt, title, role,
-                                 workspace=workspace)
+                                 workspace=workspace, dispatch=dispatch)
         return 0
 
-    monkeypatch.setattr(runner, "_run_dispatch", dispatch)
+    monkeypatch.setattr(runner, "_run_dispatch", run_dispatch)
     return runner, seen
 
 
@@ -544,7 +545,7 @@ def test_slice_eval_record_has_live_owner_during_dispatch(trioctl, wt, repo, roo
     states = []
 
     def dispatch(client, agent_id, model, prompt, title, role, iteration, mailbox,
-                 ctx, started, before_text, before_mtime, created_before, workspace):
+                 ctx, started, before_text, before_mtime, dispatch, workspace):
         (rec,) = [r for _i, r in wt.list_records(repo)]
         states.append((rec["state"], wt.identity_alive(rec.get("dispatcher"))))
         # A concurrent cleanup must not relabel a live dispatch as interrupted.
