@@ -142,6 +142,12 @@ FAKE_CURSOR = textwrap.dedent(
     time.sleep(float(os.environ.get("FAKE_SLEEP", "1.5")))
     with open(os.path.join(cwd, f"{slice_id}.txt"), "w") as fh:
         fh.write(slice_id + "\\n")
+    if "LINGER" in prompt:
+        import subprocess
+        linger = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # same group
+        with open(os.path.join(os.environ["FAKE_LOG"], f"{slice_id}.linger"), "w") as fh:
+            fh.write(str(linger.pid))
     if "RESIDUE" in prompt:
         os.makedirs(os.path.join(cwd, ".cursor"), exist_ok=True)
         json.dump(%(mcp)s, open(os.path.join(cwd, ".cursor", "mcp.json"), "w"))
@@ -237,6 +243,20 @@ def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(
     (result,) = wt.cleanup(repo, mailbox=repo / "loop")
     assert result["state"] == "removed", result
     assert not Path(record["path"]).exists()
+
+
+def test_lingering_worker_descendant_is_drained_before_integration(
+    wt, repo, root, fake_env, tmp_path
+):
+    # Live cursor-agent leaves helpers behind after the wrapper exits.
+    proc = launch(dict(fake_env, FAKE_SLEEP="0.1"), repo, root, "L", extra="LINGER")
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    linger = int((tmp_path / "fake-log" / "L.linger").read_text())
+    assert not os.path.exists(f"/proc/{linger}") or "Z" in Path(
+        f"/proc/{linger}/stat").read_text().rsplit(")", 1)[-1].split()[0]
+    (record,) = [r for _i, r in wt.list_records(repo)]
+    assert record["state"] == "integrated"
 
 
 def test_sigterm_to_dispatcher_kills_worker_group_and_retains(

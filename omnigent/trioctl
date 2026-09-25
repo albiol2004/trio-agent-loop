@@ -716,6 +716,40 @@ def _kill_worker(proc: subprocess.Popen[str], isolated: bool) -> None:
     proc.kill()
 
 
+WORKER_GROUP_DRAIN_SECONDS = 10.0
+
+
+def _drain_worker_group(pgid: int) -> None:
+    """SIGTERM what is left of an isolated worker's group, then SIGKILL.
+
+    Live cursor-agent leaves helper processes that take a moment to exit
+    after the wrapper returns; integration must not see them as an
+    active session (it retains the worktree) nor leave them running.
+    """
+    def alive() -> bool:
+        if worker_worktrees is not None:
+            return worker_worktrees.group_alive(pgid)
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except OSError:
+            return False
+
+    for sig, wait in (
+        (signal.SIGTERM, WORKER_GROUP_DRAIN_SECONDS),
+        (signal.SIGKILL, 2.0),
+    ):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            return
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if not alive():
+                return
+            time.sleep(0.05)
+
+
 def run_cursor_worker(
     role: str,
     config: dict[str, Any],
@@ -866,10 +900,7 @@ def run_cursor_worker(
         if isolated and proc is not None:
             # Ephemeral worker: descendants left behind in its group would
             # keep using the worktree after the wrapper exits.
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            _drain_worker_group(proc.pid)
 
 
 def command_run(args: argparse.Namespace) -> int:

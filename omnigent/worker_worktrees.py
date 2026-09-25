@@ -283,7 +283,8 @@ def group_alive(pgid: int | None) -> bool:
         except OSError:
             continue
         fields = stat.rsplit(")", 1)[-1].split()
-        if len(fields) > 2 and fields[2] == str(pgid):
+        # fields: state, ppid, pgrp, ... (zombies hold no cwd/files)
+        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
             return True
     return False
 
