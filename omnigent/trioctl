@@ -1090,7 +1090,11 @@ def _has_unreadable_hold(mailbox: Path | None) -> bool:
 
 
 def _load_loop_core_for(repo: Path) -> Any:
-    """The loop core that owns SHIP retirement for *repo* (repo copy first)."""
+    """The loop core that owns SHIP retirement for *repo* (repo copy first).
+
+    An incompatible repo copy raises (it is never skipped in favour of the
+    bundled one: that copy is what drove the repo's loop).
+    """
     candidates = [
         repo / "metrics" / "trio_loop.py",
         Path(__file__).resolve().parent.parent / "metrics" / "trio_loop.py",
@@ -1117,7 +1121,10 @@ def _ship_acceptance(
     evaluated on one stable snapshot of the inputs (VERDICT.md, STATE.md,
     HEAD, status); a concurrent change yields ``pending``.
     """
-    core = loop_core or _load_loop_core_for(repo)
+    try:
+        core = loop_core or _load_loop_core_for(repo)
+    except TrioctlError as exc:
+        return {"pending": f"loop core not usable: {exc}"}
     if core is None:
         return {"pending": "no loop core (metrics/trio_loop.py) to verify retirement"}
     try:
@@ -2493,6 +2500,7 @@ class OmnigentRunner:
         observe: dict[str, Any] | None = None,
         completion_receipts: bool = False,
         isolate_workers: dict[str, Any] | None = None,
+        end_root_sessions: bool = True,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -2517,6 +2525,11 @@ class OmnigentRunner:
         # get their own worktree via `run --isolate`; open-loop slice-evals
         # are bound to a detached worktree at their pinned sha.
         self._isolate = isolate_workers
+        # Isolated runs end a finished root-bound evaluator's own session
+        # and then undo this run's own Omnigent merges into the root's
+        # project Cursor config, so the graded tree is the product alone
+        # (False with --keep-sessions: the config stays, acceptance waits).
+        self._end_root_sessions = end_root_sessions
         # Root-bound (aggregate workspace) sessions this runner created, in
         # order; used to prove the previous one no longer owns the root's
         # project Cursor config before the root is reused.
@@ -2861,6 +2874,107 @@ class OmnigentRunner:
                     f"aggregate root {self.repo}; not reusing its Cursor config"
                 )
             time.sleep(0.5 if self._interval else 0.0)
+
+    def _root_owned_ids(self, mailbox: Path) -> set[str]:
+        """Root sessions this task provably launched and that no longer run.
+
+        This run's created ids plus ids an earlier trioctl run of this
+        mailbox archived (full id and locked title prefix); held and
+        in-flight dispatches are never included.
+        """
+        owned = set(self.created_session_ids)
+        prefix = f"trioctl {mailbox.name} "
+        archive = mailbox / ".sessions"
+        if archive.is_dir():
+            for path in sorted(archive.glob("*.jsonl")):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        first = json.loads(fh.readline())
+                except (OSError, ValueError):
+                    continue
+                if (
+                    isinstance(first, dict)
+                    and isinstance(first.get("id"), str)
+                    and str(first.get("title") or "").startswith(prefix)
+                ):
+                    owned.add(first["id"])
+        held = set(self.held_session_ids) | _held_session_ids(mailbox)
+        with self._own_lock:
+            inflight = set(self._inflight)
+        return owned - held - inflight
+
+    def _restore_root_config(self, mailbox: Path, *, final: bool = False) -> list[str]:
+        """Undo this task's own Omnigent merges into the root ``.cursor`` config.
+
+        Only while no cursor-agent runs at the root; anything not provably
+        this task's own is left in place, so acceptance stays pending.
+        """
+        if _has_unreadable_hold(mailbox):
+            problems = ["unreadable held record: root Cursor config left in place"]
+        elif worker_worktrees.cursor_processes_at(self.repo):
+            problems = ["a cursor-agent still runs at the root; its Cursor config was left in place"]
+        else:
+            try:
+                problems = worker_worktrees.restore_root_cursor(
+                    self.repo, self._root_owned_ids(mailbox), final=final,
+                )
+            except worker_worktrees.WorktreeError as exc:
+                problems = [str(exc)]
+        for problem in problems:
+            print(f"trioctl: root Cursor config: {problem}", file=sys.stderr)
+        return problems
+
+    def _prepare_root_config(self, mailbox: Path) -> None:
+        """Before a root-bound launch (root already released): restore, then baseline."""
+        self._restore_root_config(mailbox)
+        try:
+            worker_worktrees.snapshot_root_cursor(self.repo)
+        except worker_worktrees.WorktreeError as exc:
+            print(f"trioctl: root Cursor config baseline not taken: {exc}", file=sys.stderr)
+
+    def _end_root_evaluator(self, mailbox: Path, session_id: str) -> None:
+        """End a finished root-bound evaluator's own session, then restore the root.
+
+        The evaluator session is never reused; the post-loop prune would
+        end it anyway. A held session is never touched.
+        """
+        if not self._end_root_sessions:
+            print(
+                "trioctl: root Cursor config left in place (--keep-sessions keeps "
+                f"evaluator session {session_id}); acceptance stays pending",
+                file=sys.stderr,
+            )
+            return
+        if session_id in set(self.held_session_ids) | _held_session_ids(mailbox):
+            return
+        try:
+            counts = _prune_broker_sessions(
+                self._client(), mailbox, session_ids=[session_id], keep_unarchived=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - config stays; acceptance fails closed
+            print(f"trioctl: could not end evaluator session {session_id}: {exc}",
+                  file=sys.stderr)
+            return
+        print(
+            f"trioctl: ended finished root evaluator session {session_id}: {counts}",
+            file=sys.stderr,
+        )
+        with self._own_lock:
+            self._root_finished = [
+                e for e in self._root_finished if e["session_id"] != session_id
+            ]
+        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
+        while worker_worktrees.cursor_processes_at(self.repo):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5 if self._interval else 0.0)
+        self._restore_root_config(mailbox)
+
+    def restore_root_config_final(self, mailbox: Path) -> list[str]:
+        """Loop end, after the post-loop prune: restore and drop the baseline."""
+        if not self._isolate or worker_worktrees is None:
+            return []
+        return self._restore_root_config(mailbox, final=True)
 
     def _observe_phase(
         self,
@@ -3266,6 +3380,7 @@ class OmnigentRunner:
             # Root-bound dispatch (Lead, repair, lockstep evaluator,
             # integration-eval): the root must be free first.
             self._release_root(mailbox)
+            self._prepare_root_config(mailbox)
             if role == "evaluator":
                 # No worker merge may land while the aggregate is graded or
                 # retired; held until the next Lead/repair dispatch after
@@ -3310,14 +3425,21 @@ class OmnigentRunner:
                 ),
             }
         dispatch["workspace"] = workspace
+        root_bound = eval_wt is None and bool(self._isolate) and worker_worktrees is not None
         try:
-            return self._run_dispatch(
+            code = self._run_dispatch(
                 client, agent_id, model, prompt, title, role, iteration,
                 mailbox, context, started, before_text, before_mtime,
                 dispatch, workspace,
             )
         finally:
             session_id = dispatch.get("session_id")
+            if root_bound and session_id:
+                try:
+                    worker_worktrees.record_root_session(self.repo, session_id)
+                except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
+                    print(f"trioctl: could not record root session {session_id}: {exc}",
+                          file=sys.stderr)
             with self._own_lock:
                 if session_id:
                     self._inflight.discard(session_id)
@@ -3329,6 +3451,10 @@ class OmnigentRunner:
                     )
             if eval_wt is not None:
                 self._release_eval_worktree(eval_wt, session_id)
+        if root_bound and role == "evaluator" and code == 0 and dispatch.get("session_id"):
+            # The loop core grades acceptance right after this returns.
+            self._end_root_evaluator(mailbox, dispatch["session_id"])
+        return code
 
     def _release_fences(self, *, finished_only: bool) -> None:
         """Release this runner's fence tokens (finished evaluations only, or all)."""
@@ -3563,11 +3689,61 @@ class OmnigentRunner:
         return snapshot
 
 
+#: Loop-core contract this trioctl drives (``LOOP_CORE_API`` in
+#: metrics/trio_loop.py). A core without the constant predates it (1).
+REQUIRED_LOOP_CORE_API = 2
+
+
+def _loop_core_api(path: Path) -> int:
+    """The literal module-level ``LOOP_CORE_API`` of *path*, read without executing it."""
+    import ast
+
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise TrioctlError(f"cannot read loop core {path}: {exc}") from exc
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and [getattr(t, "id", None) for t in node.targets] == ["LOOP_CORE_API"]
+            and isinstance(node.value, ast.Constant)
+            and type(node.value.value) is int
+        ):
+            return node.value.value
+    return 1
+
+
+def _check_loop_core_api(path: Path) -> None:
+    """Refuse a loop core whose contract differs from what this trioctl drives.
+
+    trioctl loads the repository's own ``metrics/trio_loop.py``. A copy
+    vendored before an upgrade would otherwise run silently -- e.g. an
+    unbound open-loop SHIP that can never be accepted -- so a mismatch is a
+    clear refusal; the repository's files are never rewritten.
+    """
+    import hashlib
+
+    found = _loop_core_api(path)
+    if found == REQUIRED_LOOP_CORE_API:
+        return
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    raise TrioctlError(
+        f"incompatible loop core {path} (sha256 {digest}…): LOOP_CORE_API "
+        f"{found}, this trioctl requires {REQUIRED_LOOP_CORE_API}. Refresh the "
+        f"repository's metrics/ (trio_loop.py, trio-metrics.py, trio-shadow.py, "
+        f"trio-check.py) from {bundled} (the release this trioctl belongs to) "
+        "and commit it, or run the trioctl release that matches the vendored "
+        "copy. Nothing was changed."
+    )
+
+
 def _load_trio_loop(repo: Path) -> Any:
     """Load loop-core by path so the ``omnigent`` directory is not a package."""
     path = repo / "metrics" / "trio_loop.py"
     if not path.is_file():
         raise TrioctlError(f"loop core is missing: {path}")
+    _check_loop_core_api(path)
     loader = importlib.machinery.SourceFileLoader("trio_loop", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     if spec is None or spec.loader is None:
@@ -3740,6 +3916,7 @@ def command_loop(args: argparse.Namespace) -> int:
         host_id=getattr(args, "host_id", None),
         workspace=str(repo),
         completion_receipts=getattr(args, "completion_receipts", False),
+        end_root_sessions=not getattr(args, "keep_sessions", False),
         **runner_kwargs,
     )
     keep_sessions = getattr(args, "keep_sessions", False)
@@ -3818,6 +3995,11 @@ def command_loop(args: argparse.Namespace) -> int:
                 runner.release_all_fences()
             except Exception as exc:  # noqa: BLE001
                 print(f"trioctl: could not release integration fence: {exc}", file=sys.stderr)
+            if not keep_sessions:
+                try:
+                    runner.restore_root_config_final(mailbox)
+                except Exception as exc:  # noqa: BLE001 - never change the exit code
+                    print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
             # After prune, so deleted role sessions no longer hold their
             # worktrees; held sessions keep theirs (see _blocking_state).
             try:

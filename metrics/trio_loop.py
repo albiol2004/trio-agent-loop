@@ -26,6 +26,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+# Contract version callers (trioctl) check before driving this core. 2 =
+# open-loop integration-eval binds evaluated_sha/evaluator_attempt and
+# `_evaluated_product_problem` gates SHIP finalization. A core without
+# this constant predates that contract (treated as 1). Bump on any change
+# a caller must not silently run against.
+LOOP_CORE_API = 2
+
 def _load_metrics_module():
     path = Path(__file__).resolve().with_name("trio-metrics.py")
     spec = importlib.util.spec_from_file_location("trio_metrics", path)

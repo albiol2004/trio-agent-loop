@@ -472,6 +472,281 @@ def _disposable_ignored(rel: str) -> bool:
     return any(part in DISPOSABLE_IGNORED for part in parts) or rel.endswith((".pyc", ".pyo"))
 
 
+# ------------------------------------------ root Cursor config provenance
+#
+# A root-bound cursor-native session (Lead, integration evaluator) makes
+# Omnigent merge its own MCP server and usage ``stop`` hook into the
+# aggregate root's ``.cursor/{mcp,hooks}.json``; nothing removes them when
+# the session ends. Left behind they are untracked (or modified tracked)
+# product paths, so a SHIP of that exact tree can never be accepted.
+#
+# trioctl records the pre-launch bytes once (``baseline``, in the git
+# common dir, mode 0600 -- never in the worktree, never committed), then
+# after its own root sessions have ended strips only entries bound to one
+# of *its* bridges (``sha256(session_id)[:32]``, the bridge dir basename).
+# The baseline is restored only when what remains equals exactly what
+# Omnigent's merge left of the baseline; any other difference (a user or
+# concurrent edit, a foreign session's entry) is left in place and the
+# product check keeps failing closed. Nothing is ever ignored or excluded.
+
+ROOT_CURSOR_DIR_NAME = "root-cursor"
+_USAGE_HOOK_MODULE = "omnigent.harnesses.cursor_native.usage"
+
+
+def bridge_key(session_id: str) -> str:
+    """Bridge dir basename Omnigent derives from a broker session id."""
+    return hashlib.sha256(str(session_id).encode()).hexdigest()[:32]
+
+
+def _root_cursor_dir(repo: Path) -> Path:
+    return ledger_dir(repo) / ROOT_CURSOR_DIR_NAME
+
+
+def _private_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _bridge_arg(argv: object) -> str | None:
+    """Basename of the ``--bridge-dir`` value in an argv list, if exactly one."""
+    if not isinstance(argv, list):
+        return None
+    values = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--bridge-dir"]
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    return Path(values[0]).name
+
+
+def _usage_hook_bridge(entry: object) -> str | None:
+    import shlex
+
+    if not isinstance(entry, dict):
+        return None
+    try:
+        argv = shlex.split(str(entry.get("command", "")))
+    except ValueError:
+        return None
+    if _USAGE_HOOK_MODULE not in argv:
+        return None
+    return _bridge_arg(argv)
+
+
+def _strip_owned(rel: str, data: object, keys: set[str]) -> object:
+    """*data* minus the Omnigent entries bound to one of *keys* (a copy)."""
+    data = json.loads(json.dumps(data))
+    if not isinstance(data, dict):
+        return data
+    if rel.endswith("mcp.json"):
+        servers = data.get("mcpServers")
+        entry = servers.get("omnigent") if isinstance(servers, dict) else None
+        if isinstance(entry, dict) and _bridge_arg(entry.get("args")) in keys:
+            del servers["omnigent"]
+        return data
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event, entries in hooks.items():
+            if isinstance(entries, list):
+                hooks[event] = [e for e in entries if _usage_hook_bridge(e) not in keys]
+    return data
+
+
+def _omnigent_base(rel: str, source: bytes | None) -> object:
+    """What Omnigent's merge leaves of *source* before adding its own entry.
+
+    Mirrors ``write_mcp_config`` / ``write_hooks_config`` (Omnigent
+    2a84483a): a missing or non-dict file becomes ``{}``; mcp gets a dict
+    ``mcpServers`` whose ``omnigent`` key is replaced; hooks get a dict
+    ``hooks``, ``version`` defaulting to 1, and every usage hook dropped
+    from ``stop`` before Omnigent appends its own.
+    """
+    data: object = None
+    if source is not None:
+        with contextlib.suppress(ValueError):
+            data = json.loads(source.decode("utf-8"))
+    base: dict[str, Any] = data if isinstance(data, dict) else {}
+    if rel.endswith("mcp.json"):
+        servers = base.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+        servers.pop("omnigent", None)
+        base["mcpServers"] = servers
+        return base
+    hooks = base.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    base["hooks"] = hooks
+    base.setdefault("version", 1)
+    stop = hooks.get("stop")
+    stop = stop if isinstance(stop, list) else []
+    hooks["stop"] = [
+        e for e in stop
+        if not (isinstance(e, dict) and _USAGE_HOOK_MODULE in str(e.get("command", "")))
+    ]
+    return base
+
+
+def _index_blob(repo: Path, rel: str) -> bytes | None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", f":{rel}"], capture_output=True,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _root_baseline(repo: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads((_root_cursor_dir(repo) / "baseline.json").read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise WorktreeError(f"unreadable root Cursor baseline: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+        raise WorktreeError("malformed root Cursor baseline")
+    return data
+
+
+def root_owned_sessions(repo: Path) -> set[str]:
+    """Root session ids trioctl recorded as launched at this repository."""
+    try:
+        data = json.loads((_root_cursor_dir(repo) / "sessions.json").read_text())
+    except (OSError, ValueError):
+        return set()
+    return {str(s) for s in data} if isinstance(data, list) else set()
+
+
+def record_root_session(repo: Path, session_id: str) -> None:
+    """Persist that trioctl launched *session_id* bound to the root."""
+    with repo_lock(repo, "root-cursor"):
+        owned = root_owned_sessions(repo) | {str(session_id)}
+        _private_write(
+            _root_cursor_dir(repo) / "sessions.json",
+            (json.dumps(sorted(owned)) + "\n").encode(),
+        )
+
+
+def snapshot_root_cursor(repo: Path) -> bool:
+    """Record the root's pre-launch ``.cursor`` config once; True if taken now.
+
+    An existing baseline (a crashed earlier run) is kept: it is the only
+    record of the state before that run's sessions merged into the files.
+    """
+    with repo_lock(repo, "root-cursor"):
+        if _root_baseline(repo) is not None:
+            return False
+        files: dict[str, Any] = {}
+        for rel in OWNED_CURSOR_FILES:
+            target = repo / rel
+            name = Path(rel).name
+            if target.is_symlink() or (repo / ".cursor").is_symlink():
+                files[rel] = {"state": "symlink"}
+                continue
+            data = _read_bytes(target)
+            if data is None:
+                files[rel] = {"state": "absent"}
+                continue
+            _private_write(_root_cursor_dir(repo) / f"{name}.orig", data)
+            files[rel] = {
+                "state": "file",
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mode": target.stat().st_mode & 0o7777,
+            }
+        _private_write(
+            _root_cursor_dir(repo) / "baseline.json",
+            (json.dumps({"schema": 1, "taken_at": time.time(), "files": files},
+                        indent=2, sort_keys=True) + "\n").encode(),
+        )
+        return True
+
+
+def restore_root_cursor(
+    repo: Path, owned_session_ids: set[str] | list[str], *, final: bool = False
+) -> list[str]:
+    """Undo only this task's own Omnigent merges into the root ``.cursor`` config.
+
+    Call only once every owned root session has ended (no cursor-agent at
+    the root). Returns the reasons a file was left in place; ``[]`` means
+    both files are back to the baseline (or, with no baseline, to the
+    index version when tracked and absent when untracked). With *final*
+    and nothing left in place, the baseline record is dropped.
+    """
+    keys = {bridge_key(s) for s in set(owned_session_ids) | root_owned_sessions(repo)}
+    problems: list[str] = []
+    with repo_lock(repo, "root-cursor"):
+        baseline = _root_baseline(repo)
+        for rel in OWNED_CURSOR_FILES:
+            target = repo / rel
+            if target.is_symlink() or (repo / ".cursor").is_symlink():
+                problems.append(f"{rel} is a symlink; left in place")
+                continue
+            entry = (baseline or {}).get("files", {}).get(rel) if baseline else None
+            if baseline is not None and entry is None:
+                problems.append(f"{rel}: baseline has no entry; left in place")
+                continue
+            if entry is not None and entry.get("state") == "symlink":
+                problems.append(f"{rel} was a symlink before the run; left in place")
+                continue
+            if entry is None:  # no baseline: the committed state is the source
+                source = _index_blob(repo, rel)
+                mode = 0o644
+            elif entry.get("state") == "absent":
+                source, mode = None, 0o644
+            else:
+                source = _read_bytes(_root_cursor_dir(repo) / f"{Path(rel).name}.orig")
+                if source is None or hashlib.sha256(source).hexdigest() != entry.get("sha256"):
+                    problems.append(f"{rel}: baseline copy missing or altered; left in place")
+                    continue
+                mode = int(entry.get("mode", 0o644))
+            current = _read_bytes(target)
+            if current == source:
+                continue
+            if current is None:
+                problems.append(f"{rel} was removed during the run; not recreated")
+                continue
+            try:
+                parsed = json.loads(current.decode("utf-8"))
+            except ValueError:
+                problems.append(f"{rel} is not JSON; left in place")
+                continue
+            if _strip_owned(rel, parsed, keys) != _omnigent_base(rel, source):
+                problems.append(
+                    f"{rel} differs from the pre-run config beyond this task's own "
+                    "Omnigent entries (user, concurrent or foreign edit); left in place"
+                )
+                continue
+            # Compare-and-swap: a writer racing the check keeps its content.
+            if _read_bytes(target) != current:
+                problems.append(f"{rel} changed during restore; left in place")
+                continue
+            if source is None:
+                target.unlink()
+            else:
+                tmp = target.with_name(f".{target.name}.trio-restore-{os.getpid()}")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(source)
+                os.chmod(tmp, mode)
+                os.replace(tmp, target)
+        if final and not problems and baseline is not None:
+            directory = _root_cursor_dir(repo)
+            for item in directory.iterdir():
+                item.unlink()
+            directory.rmdir()
+    return problems
+
+
 # ---------------------------------------------------------------- creation
 
 

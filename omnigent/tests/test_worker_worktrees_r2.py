@@ -501,10 +501,13 @@ def test_root_reuse_ends_previous_session_and_fences_evaluation(
     runner, seen = _runner(trioctl, repo, root, monkeypatch)
     assert runner.run("lead", 1, repo / "loop", None) == 0
     assert runner.run("evaluator", 1, repo / "loop", None) == 0
-    assert pruned == [["s1"]]  # the Lead's session ended before root reuse
+    # The Lead's session ended before root reuse; since r4 the finished root
+    # evaluator's own session (s2) is ended right after it, before the loop
+    # core grades acceptance, so its root Cursor config can be restored.
+    assert pruned == [["s1"], ["s2"]]
     assert seen[0]["fence"] is None and seen[1]["fence"] is not None
     assert runner.run("lead", 2, repo / "loop", None) == 0
-    assert pruned[-1] == ["s2"]
+    assert pruned == [["s1"], ["s2"]]  # nothing left to end at the next Lead pass
     assert seen[2]["fence"] is None  # released at the next Lead pass
 
 
