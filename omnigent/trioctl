@@ -761,6 +761,7 @@ def run_cursor_worker(
     events: dict[str, Any] | None = None,
     isolated: bool = False,
     on_spawn: Any = None,
+    wrap: Any = None,
 ) -> str:
     """Run one ephemeral Cursor worker with the live profile-resolved model.
 
@@ -802,6 +803,8 @@ def run_cursor_worker(
     if role == "scout":
         command.extend(["--mode", "ask"])
     full_prompt = f"{CURSOR_ROLE_PROMPTS[role]}\n\nTASK FROM LEAD:\n{prompt.strip()}\n"
+    if wrap is not None:
+        command = wrap(command)
     started = time.monotonic_ns()
     proc: subprocess.Popen[str] | None = None
     try:
@@ -944,8 +947,11 @@ _ISOLATED_BUILDER_NOTE = (
     "`{path}` (branch `{branch}`, based on aggregate `{base}`). Work only "
     "inside it; it is your repository root. Do not commit, merge, switch "
     "branches, or touch the aggregate checkout `{repo}` or the Trio "
-    "mailbox. When you exit, trioctl commits everything you left in this "
-    "worktree as `slice({slice}): ...` and merges it into the aggregate."
+    "mailbox. Mailbox files inside this worktree are the last COMMITTED "
+    "copy and may be stale; read the live mailbox only at `{mailbox}` and "
+    "never write it. When you exit 0, trioctl commits everything you left in "
+    "this worktree as `slice({slice}): ...` and merges it into the aggregate; "
+    "a failed or interrupted run is never integrated."
 )
 
 
@@ -997,7 +1003,7 @@ def _command_run_isolated(
     )
     note = _ISOLATED_BUILDER_NOTE.format(
         path=path, branch=record["branch"], base=record["base"][:12],
-        repo=repo, slice=slice_id,
+        repo=repo, slice=slice_id, mailbox=mailbox,
     )
 
     def on_spawn(proc: subprocess.Popen[str]) -> None:
@@ -1022,11 +1028,16 @@ def _command_run_isolated(
             events=_worker_event_ctx(args) or None,
             isolated=True,
             on_spawn=on_spawn,
+            # Group leader with a bounded lifetime that also dies with this
+            # dispatcher (even on SIGKILL), taking its group with it.
+            wrap=lambda cmd: wt.watchdog_command(
+                cmd, max_seconds=wt.worker_max_seconds(args.timeout)
+            ),
         )
     except TrioctlError as exc:
         returncode = 1
         record = wt.load_record(repo, record["id"])
-        wt.mark_exited(repo, record, returncode)
+        wt.mark_exited(repo, record, returncode)  # worker_ok stays False
         record = wt._retain(repo, record, "worker_failed", str(exc)[-2000:])
         print(json.dumps(_worktree_view(record), sort_keys=True))
         print(
@@ -1077,7 +1088,67 @@ def _has_unreadable_hold(mailbox: Path | None) -> bool:
     )
 
 
-def _run_worktree_cleanup(repo: Path, mailbox: Path | None) -> list[dict[str, Any]]:
+def _load_loop_core_for(repo: Path) -> Any:
+    """The loop core that owns SHIP retirement for *repo* (repo copy first)."""
+    candidates = [
+        repo / "metrics" / "trio_loop.py",
+        Path(__file__).resolve().parent.parent / "metrics" / "trio_loop.py",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return _load_trio_loop(path.parent.parent)
+    return None
+
+
+def _ship_acceptance(
+    mailbox: Path, repo: Path, loop_core: Any = None
+) -> dict[str, Any] | None:
+    """Verified SHIP acceptance of an exact revision, or None.
+
+    Reuses the loop core's own retirement contract instead of parsing
+    ``commit:`` lines: STATE.md must be driver-finalized ``shipped`` with
+    a bound ``evaluator_attempt`` and full ``evaluated_sha``;
+    ``_ship_retirement_problem`` must report nothing (SHIP first line,
+    attempt/evaluated recorded in VERDICT.md, product tree unchanged
+    since the pin, ``loop: iteration N — SHIP`` retirement commit on
+    HEAD); and VERDICT.md must be tracked with no uncommitted edits.
+    """
+    core = loop_core or _load_loop_core_for(repo)
+    if core is None:
+        return None
+    try:
+        state = core._read_state(mailbox / "STATE.md")
+    except Exception:  # noqa: BLE001
+        return None
+    if str(state.get("status", "")).strip() != "shipped":
+        return None
+    evaluated = str(state.get("evaluated_sha", "")).strip()
+    attempt = str(state.get("evaluator_attempt", "")).strip()
+    try:
+        iteration = int(str(state.get("iteration", "")).strip())
+    except ValueError:
+        return None
+    if not attempt or not re.fullmatch(r"[0-9a-f]{40}", evaluated):
+        return None
+    if core._ship_retirement_problem(mailbox, iteration, repo) is not None:
+        return None
+    verdict = mailbox / "VERDICT.md"
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", str(verdict)],
+        capture_output=True, text=True,
+    )
+    dirty = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--", str(verdict)],
+        capture_output=True, text=True,
+    )
+    if tracked.returncode != 0 or dirty.returncode != 0 or dirty.stdout.strip():
+        return None
+    return {"evaluated": evaluated, "iteration": iteration, "attempt": attempt}
+
+
+def _run_worktree_cleanup(
+    repo: Path, mailbox: Path | None, loop_core: Any = None
+) -> list[dict[str, Any]]:
     """Scoped, idempotent cleanup; an unreadable hold keeps everything."""
     wt = _require_worktrees()
     if _has_unreadable_hold(mailbox):
@@ -1086,7 +1157,12 @@ def _run_worktree_cleanup(repo: Path, mailbox: Path | None) -> list[dict[str, An
             file=sys.stderr,
         )
         return []
-    results = wt.cleanup(repo, mailbox=mailbox, held_sessions=_held_session_ids(mailbox))
+    results = wt.cleanup(
+        repo,
+        mailbox=mailbox,
+        held_sessions=_held_session_ids(mailbox),
+        acceptance_for=lambda box: _ship_acceptance(box, repo, loop_core),
+    )
     for record in results:
         print(f"trioctl: worktree {wt.summarize(record)}", file=sys.stderr)
     return results
@@ -1114,7 +1190,10 @@ def command_worktrees(args: argparse.Namespace) -> int:
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0
         if args.worktrees_command == "integrate":
-            record = wt.integrate(repo, args.id, summary=args.summary)
+            record = wt.integrate(
+                repo, args.id, summary=args.summary,
+                override_unverified=args.accept_unverified_output,
+            )
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0 if record.get("state") in ("integrated", "accepted", "removed") else ISOLATED_RETAINED_EXIT
         if args.worktrees_command == "finish":
@@ -2371,6 +2450,10 @@ class OmnigentRunner:
         # get their own worktree via `run --isolate`; open-loop slice-evals
         # are bound to a detached worktree at their pinned sha.
         self._isolate = isolate_workers
+        # Root-bound (aggregate workspace) sessions this runner created, in
+        # order; used to prove the previous one no longer owns the root's
+        # project Cursor config before the root is reused.
+        self._root_sessions: list[str] = []
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
         # that implement the completion-receipt contract.
@@ -2601,10 +2684,14 @@ class OmnigentRunner:
             "<summary>` and merged it into this checkout -- do not re-commit "
             "those files. Commit your own product edits before dispatching a "
             "builder (a dirty checkout is refused, since the worker would not "
-            "see them). Exit 3 means the worktree was retained (merge "
-            "conflict, failure, dirty state): read the JSON line it prints, "
-            "then fix or retry with `omnigent worktrees integrate <id>`; never "
-            "delete retained worktrees. Concurrency rules for waves are "
+            "see them). Exit 3 means the worktree was retained: read the JSON "
+            "line it prints. For `worker_failed`, `interrupted` or "
+            "`unverified_output`, do NOT integrate that output -- dispatch a "
+            "fresh builder for the slice (or stop for a human). For "
+            "`merge_conflict`, `aggregate_dirty`, `aggregate_moved`, "
+            "`integration_fenced` or `active_session`, remove the cause, then "
+            "run `omnigent worktrees integrate <id>` once. Never delete "
+            "retained worktrees. Concurrency rules for waves are "
             "unchanged: only ready slices with disjoint `writes:` and no "
             "`reads:` of another wave member run together; a slice that reads "
             "another's output is dispatched after that slice is merged.\n"
@@ -2620,7 +2707,7 @@ class OmnigentRunner:
             return None
         root = self._isolate.get("worktree_root")
         try:
-            return worker_worktrees.create(
+            record = worker_worktrees.create(
                 self.repo,
                 slice_id=f"eval-{context.get('slice') or 'slice'}",
                 mailbox=mailbox,
@@ -2628,8 +2715,62 @@ class OmnigentRunner:
                 role="evaluator",
                 detach_at=str(context["sha"]),
             )
+            # Live owner for the whole dispatch: this process (session id
+            # is appended once created).
+            worker_worktrees.mark_running(self.repo, record, None)
+            return record
         except worker_worktrees.WorktreeError as exc:
             raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
+
+    ROOT_RELEASE_WAIT = 30.0
+
+    def _release_root(self, mailbox: Path) -> None:
+        """Before a root-bound dispatch: prove no earlier session owns the root.
+
+        Cursor-native writes the aggregate root's project ``.cursor``
+        config at launch, overwriting whatever an earlier root session
+        (e.g. the idle Lead of the previous pass) still has loaded. A held
+        earlier session is never touched: the dispatch is refused. Others
+        are archived and deleted through the normal id-scoped prune, then
+        no cursor-agent may remain with its cwd at the root.
+        """
+        previous = [sid for sid in self._root_sessions]
+        if previous:
+            held = set(self.held_session_ids) | {
+                str(r.get("session_id")) for _p, r in _held_records(mailbox)
+                if r.get("session_id")
+            }
+            if any(not r.get("session_id") for _p, r in _held_records(mailbox)):
+                raise TrioctlError(
+                    "unreadable held record: cannot prove the aggregate root "
+                    "is free; not reusing it"
+                )
+            blocked = [sid for sid in previous if sid in held]
+            if blocked:
+                raise TrioctlError(
+                    f"held session(s) {blocked} still own the aggregate root's "
+                    "Cursor config; not reusing the root"
+                )
+            counts = _prune_broker_sessions(
+                self._client(), mailbox, session_ids=previous, keep_unarchived=True,
+            )
+            print(
+                f"trioctl: ended previous root session(s) {previous} before "
+                f"reusing the aggregate root: {counts}",
+                file=sys.stderr,
+            )
+            self._root_sessions = []
+        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
+        while True:
+            live = worker_worktrees.cursor_processes_at(self.repo)
+            if not live:
+                return
+            if time.monotonic() >= deadline:
+                raise TrioctlError(
+                    f"cursor-agent process(es) {live[:10]} still run at the "
+                    f"aggregate root {self.repo}; not reusing its Cursor config"
+                )
+            time.sleep(0.5 if self._interval else 0.0)
 
     def _observe_phase(
         self,
@@ -3022,6 +3163,19 @@ class OmnigentRunner:
         title = self._title(mailbox, iteration, role, context)
         eval_wt = self._slice_eval_worktree(role, mailbox, context)
         workspace = self._workspace
+        if self._isolate and worker_worktrees is not None and eval_wt is None:
+            # Root-bound dispatch (Lead, repair, lockstep evaluator,
+            # integration-eval): the root must be free first.
+            self._release_root(mailbox)
+            if role == "evaluator":
+                # No worker merge may land while the aggregate is graded or
+                # retired; released at the next Lead/repair dispatch or
+                # loop end (acceptance is also bound to the exact pin).
+                worker_worktrees.acquire_fence(
+                    self.repo, reason=f"{role} iteration {iteration}", mailbox=mailbox,
+                )
+            else:
+                worker_worktrees.release_fence(self.repo)
         if eval_wt is not None:
             workspace = eval_wt["path"]
             prompt = (
@@ -3062,6 +3216,8 @@ class OmnigentRunner:
         finally:
             if eval_wt is not None:
                 self._release_eval_worktree(eval_wt, created_before)
+            elif self._isolate:
+                self._root_sessions.extend(self.created_session_ids[created_before:])
 
     def _release_eval_worktree(
         self, eval_wt: dict[str, Any], created_before: int
@@ -3425,7 +3581,19 @@ def command_loop(args: argparse.Namespace) -> int:
         )
     isolate = None
     if getattr(args, "isolate_workers", False):
-        _require_worktrees()
+        wt = _require_worktrees()
+        if getattr(args, "observe_workers", False):
+            raise TrioctlError(
+                "--isolate-workers and --observe-workers each prescribe the one "
+                "worker dispatch command; they cannot be combined yet"
+            )
+        inherited = wt.inherited_cursor_problems()
+        if inherited:
+            raise TrioctlError(
+                "--isolate-workers refused: Cursor user/system config carries "
+                "session-bound Omnigent bindings that every worker would load "
+                "(trioctl never edits it): " + "; ".join(inherited)
+            )
         isolate = {
             "trioctl": Path(__file__).resolve(),
             "worktree_root": (
@@ -3520,6 +3688,10 @@ def command_loop(args: argparse.Namespace) -> int:
             except OSError:
                 pass
         if isolate:
+            try:
+                worker_worktrees.release_fence(repo)
+            except Exception as exc:  # noqa: BLE001
+                print(f"trioctl: could not release integration fence: {exc}", file=sys.stderr)
             # After prune, so deleted role sessions no longer hold their
             # worktrees; held sessions keep theirs (see _blocking_state).
             try:
@@ -4003,6 +4175,14 @@ def parser() -> argparse.ArgumentParser:
     )
     wt_integrate.add_argument("id")
     wt_integrate.add_argument("--summary", default=None)
+    wt_integrate.add_argument(
+        "--accept-unverified-output",
+        metavar="REASON",
+        default=None,
+        help="HUMAN override: integrate output of a worker that failed or was "
+        "interrupted (after you repaired and checked it); the reason is "
+        "recorded. Evaluator acceptance is still required before cleanup.",
+    )
     wt_finish = worktrees_commands.add_parser(
         "finish", help="mark an evaluator worktree's session finished"
     )

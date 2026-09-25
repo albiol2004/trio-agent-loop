@@ -16,9 +16,15 @@ common dir so it survives restarts and never shows in ``git status``)::
     (any)   -> retained:<reason>   (recoverable; never deleted)
 
 Deletion happens only for a ledger-owned worktree whose worker commit is
-merged into the aggregate branch, whose merge is contained in a commit the
-Evaluator accepted with ``VERDICT: SHIP``, that no live process uses, and
-that has no dirty, untracked or unmerged state. Removal uses plain
+merged into the aggregate branch, whose merge is contained in the exact
+revision a driver-finalized, retired SHIP evaluated (the caller supplies
+that acceptance from the loop core's own retirement contract), that no
+live process uses, and that has no dirty, untracked or unmerged state.
+
+Isolation covers only Cursor's *project* config scope. User-scope
+(``~/.cursor``) and system hook/MCP config is still loaded by every
+cursor-agent, so isolated dispatch is refused while that scope carries
+session-bound Omnigent entries (see :func:`inherited_cursor_problems`). Removal uses plain
 ``git worktree remove`` and ``git branch -d`` -- never ``--force``/``-D``
 and never ``git worktree prune``.
 """
@@ -48,7 +54,18 @@ ACTIVE_STATES = ("created", "running")
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_VERDICT_COMMIT = re.compile(r"^\s*[-*]?\s*`?commit:\s*`?\s*([0-9a-f]{7,40})\b", re.I)
+#: Retained reasons whose worktree holds output of a worker that did not
+#: finish successfully; never integrated without an explicit override.
+UNVERIFIED_OUTPUT_REASONS = ("worker_failed", "interrupted", "create_failed")
+FENCE_FILE = "integration-fence.json"
+#: Hard ceiling for an isolated worker whose dispatcher gave no timeout.
+DEFAULT_WORKER_MAX_SECONDS = 4 * 3600.0
+WORKER_MAX_SECONDS_ENV = "TRIO_WORKER_MAX_SECONDS"
+#: System-wide hook files cursor-agent reads (Linux, macOS).
+SYSTEM_CURSOR_HOOKS = (
+    Path("/etc/cursor/hooks.json"),
+    Path("/Library/Application Support/Cursor/hooks.json"),
+)
 
 
 class WorktreeError(RuntimeError):
@@ -289,20 +306,63 @@ def group_alive(pgid: int | None) -> bool:
     return False
 
 
-def processes_using(path: Path) -> list[int]:
-    """PIDs whose cwd or root lies inside *path* (same-user /proc scan)."""
+def processes_using(path: Path, *, exclude: tuple[int, ...] = ()) -> list[int]:
+    """PIDs whose cwd, root or any open fd lies inside *path*.
+
+    Same-user /proc scan; processes whose links cannot be read are not
+    reported (the caller's other checks stay conservative).
+    """
     target = str(path.resolve())
+    skip = {os.getpid(), *exclude}
+
+    def inside(link: str) -> bool:
+        return link == target or link.startswith(target + os.sep)
+
     users: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) in skip:
+            continue
+        hit = False
+        for name in ("cwd", "root"):
+            try:
+                if inside(os.readlink(entry / name)):
+                    hit = True
+                    break
+            except OSError:
+                continue
+        if not hit:
+            try:
+                fds = list((entry / "fd").iterdir())
+            except OSError:
+                fds = []
+            for fd in fds:
+                try:
+                    if inside(os.readlink(fd)):
+                        hit = True
+                        break
+                except OSError:
+                    continue
+        if hit:
+            users.append(int(entry.name))
+    return users
+
+
+def cursor_processes_at(root: Path) -> list[int]:
+    """Live cursor-agent processes whose project root cwd is exactly *root*."""
+    target = str(root.resolve())
+    found: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            cwd = os.readlink(entry / "cwd")
+            if os.readlink(entry / "cwd") != target:
+                continue
+            cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
         except OSError:
             continue
-        if cwd == target or cwd.startswith(target + os.sep):
-            users.append(int(entry.name))
-    return users
+        if b"cursor-agent" in cmd:
+            found.append(int(entry.name))
+    return found
 
 
 # ------------------------------------------------- owned generated content
@@ -383,6 +443,31 @@ def ignored_entries(path: Path) -> list[str]:
     return [_status_path(line) for line in out.splitlines() if line.startswith("!!")]
 
 
+def _owned_ignored_cursor(path: Path, rel: str) -> list[str] | None:
+    """Owned residue paths if ignored *rel* is only Omnigent's generated config.
+
+    Repositories that gitignore ``.cursor/`` report the whole directory as
+    one ignored entry; it is disposable only when every file in it is the
+    exact generated config (:func:`owned_residue`).
+    """
+    rel = rel.rstrip("/")
+    if rel in OWNED_CURSOR_FILES:
+        return [rel] if owned_residue(path, rel) else None
+    if rel != ".cursor":
+        return None
+    base = path / ".cursor"
+    if base.is_symlink() or not base.is_dir():
+        return None
+    files = []
+    for item in base.rglob("*"):
+        if item.is_dir() and not item.is_symlink():
+            continue
+        files.append(item.relative_to(path).as_posix())
+    if not files or not all(f in OWNED_CURSOR_FILES and owned_residue(path, f) for f in files):
+        return None
+    return files
+
+
 def _disposable_ignored(rel: str) -> bool:
     parts = rel.rstrip("/").split("/")
     return any(part in DISPOSABLE_IGNORED for part in parts) or rel.endswith((".pyc", ".pyo"))
@@ -432,6 +517,7 @@ def create(
     role: str = "builder",
     run_id: str | None = None,
     detach_at: str | None = None,
+    home: Path | None = None,
 ) -> dict[str, Any]:
     """Create one task-owned worktree.
 
@@ -446,6 +532,14 @@ def create(
     base = rev(repo, detach_at or "HEAD")
     if base is None:
         raise WorktreeError(f"no commit to create the worktree at: {detach_at or 'HEAD'}")
+    inherited = inherited_cursor_problems(home=home)
+    if inherited:
+        raise WorktreeError(
+            "refusing isolated dispatch: Cursor loads user/system config into every "
+            "worktree and it carries session-bound Omnigent bindings (tools/receipts "
+            "would route to a foreign session). Remove them from your own Cursor "
+            "config first; trioctl never edits it: " + "; ".join(inherited)
+        )
     blockers = [] if detach_at else aggregate_blockers(repo, mailbox)
     if blockers:
         raise WorktreeError(
@@ -504,6 +598,59 @@ def create(
     return record
 
 
+def _session_bound_mcp_servers(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        return [f"{path} is unreadable or not JSON (cannot prove it is safe)"]
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    problems = []
+    for name, spec in (servers or {}).items() if isinstance(servers, dict) else []:
+        args = spec.get("args") if isinstance(spec, dict) else None
+        text = " ".join(str(a) for a in args) if isinstance(args, list) else ""
+        if name == "omnigent" or ("serve-mcp" in text and "--bridge-dir" in text):
+            problems.append(f"{path} declares session-bound Omnigent MCP server {name!r}")
+    return problems
+
+
+def _omnigent_hooks(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [f"{path} is unreadable (cannot prove it is safe)"]
+    if "record-usage" in text or "omnigent" in text:
+        return [f"{path} carries an Omnigent session hook"]
+    return []
+
+
+def inherited_cursor_problems(
+    *, home: Path | None = None, system_hooks: tuple[Path, ...] = SYSTEM_CURSOR_HOOKS
+) -> list[str]:
+    """Session-bound Omnigent config every cursor-agent inherits, if any.
+
+    A worktree isolates only the *project* ``.cursor`` scope. cursor-agent
+    also loads ``~/.cursor/mcp.json`` (verified live: ``cursor-agent mcp
+    list`` in an isolated worktree lists the user servers) and user/system
+    hooks. An Omnigent server or hook there is bound to one session's
+    bridge, so a worker would route tools (and possibly receipts) to that
+    foreign session. The user's global config is never edited here; the
+    caller refuses isolated dispatch instead.
+    """
+    base = (home if home is not None else Path.home()) / ".cursor"
+    problems: list[str] = []
+    if base.is_symlink():
+        problems.append(f"{base} is a symlink (shared Cursor config; cannot prove it is safe)")
+    problems += _session_bound_mcp_servers(base / "mcp.json")
+    problems += _omnigent_hooks(base / "hooks.json")
+    for path in system_hooks:
+        problems += _omnigent_hooks(path)
+    return problems
+
+
 def cursor_config_conflicts(path: Path) -> list[str]:
     """Session-bound Omnigent Cursor config already present in a worktree."""
     problems = []
@@ -540,8 +687,10 @@ def mark_running(
 
 
 def mark_exited(repo: Path, record: dict[str, Any], returncode: int | None) -> None:
+    """Record the dispatcher-observed exit; only exit 0 marks output usable."""
     record["state"] = "exited"
     record["returncode"] = returncode
+    record["worker_ok"] = returncode == 0
     save_record(repo, record)
 
 
@@ -569,13 +718,18 @@ def integrate(
     worker_id: str,
     *,
     summary: str | None = None,
+    override_unverified: str | None = None,
 ) -> dict[str, Any]:
     """Commit the worker's changes and merge them into the aggregate branch.
 
-    Serialized per repository. Any failure leaves the worktree, branch and
-    aggregate untouched (a started merge is rolled back with
-    ``git merge --abort``) and records a retained state that a later
-    ``integrate`` call may retry.
+    Serialized per repository. Only output of a worker the dispatcher saw
+    exit 0 is integrated; failed, interrupted or never-finished output is
+    refused (``unverified_output``) unless a human passes
+    *override_unverified* (a reason, recorded in the ledger). Refused while
+    an integration fence is held (an integration evaluation/retirement is
+    in progress) and while any process still uses the worktree. Any failure
+    leaves the worktree, branch and aggregate untouched (a started merge is
+    rolled back with ``git merge --abort``).
     """
     repo = repo_toplevel(repo)
     with repo_lock(repo):
@@ -586,7 +740,31 @@ def integrate(
             return record
         if identity_alive(record.get("worker")) or group_alive(record.get("pgid")):
             return _retain(repo, record, "active_session", "worker process still running")
+        if not record.get("worker_ok"):
+            if not (override_unverified and override_unverified.strip()):
+                prior = record.get("retained_reason")
+                reason = prior if prior in UNVERIFIED_OUTPUT_REASONS else "unverified_output"
+                return _retain(
+                    repo, record, reason,
+                    "worker did not finish successfully; its partial output is "
+                    "never integrated automatically (re-dispatch a fresh builder, "
+                    "or a human repairs it and integrates with an explicit override)",
+                )
+            record["override_unverified"] = {
+                "reason": override_unverified.strip(),
+                "by": process_identity(os.getpid()),
+                "at": time.time(),
+            }
+        fence = active_fence(repo)
+        if fence is not None:
+            return _retain(
+                repo, record, "integration_fenced",
+                f"integration evaluation/retirement in progress: {fence.get('reason')}",
+            )
         path = Path(record["path"])
+        users = processes_using(path) if path.is_dir() else []
+        if users:
+            return _retain(repo, record, "active_session", f"processes using worktree: {users[:10]}")
         if not path.is_dir():
             return _retain(repo, record, "missing_worktree", str(path))
         if rev(path, "HEAD") is None:
@@ -604,6 +782,8 @@ def integrate(
             record["merge_commit"] = record["base"]
             record["empty"] = True
             record["dispatcher"] = None
+            record.pop("retained_reason", None)
+            record.pop("retained_detail", None)
             save_record(repo, record)
             return record
         record["worker_commit"] = commit
@@ -651,39 +831,87 @@ def integrate(
 
 
 # -------------------------------------------------------------- acceptance
+#
+# Acceptance is NOT parsed here. The caller (trioctl) derives it from the
+# loop core's own SHIP retirement contract (driver-finalized ``shipped``
+# state, attempt/evaluated binding, product tree unchanged since the
+# evaluated pin, committed ``loop: iteration N — SHIP`` retirement, clean
+# committed VERDICT.md) and passes ``acceptance_for(mailbox)`` returning
+# ``{"evaluated": <full sha>, "iteration": N, ...}`` or None.
 
 
-def accepted_shas(mailbox: Path) -> list[str]:
-    """Commit shas the Evaluator accepted in an integration ``VERDICT: SHIP``.
-
-    Slice-level open-loop ``## slice ... — SHIP`` sections do not count:
-    cleanup requires acceptance of the aggregate.
-    """
-    try:
-        text = (mailbox / "VERDICT.md").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    lines = text.splitlines()
-    first = next((line.strip() for line in lines if line.strip()), "")
-    if first != "VERDICT: SHIP":
-        return []
-    return [m.group(1) for line in lines if (m := _VERDICT_COMMIT.match(line))]
-
-
-def _accepting_sha(repo: Path, record: dict[str, Any]) -> str | None:
+def _accepting_revision(
+    repo: Path, record: dict[str, Any], acceptance_for: Any
+) -> dict[str, Any] | None:
+    """The verified acceptance covering this record's exact merge, or None."""
     merge = record.get("merge_commit")
-    if not merge or not record.get("mailbox"):
+    if not merge or not record.get("mailbox") or acceptance_for is None:
         return None
+    try:
+        acceptance = acceptance_for(Path(record["mailbox"]))
+    except Exception:  # noqa: BLE001 - unverifiable acceptance is no acceptance
+        return None
+    if not isinstance(acceptance, dict):
+        return None
+    evaluated = rev(repo, str(acceptance.get("evaluated") or ""))
     aggregate = rev(repo, record["aggregate_ref"])
-    if aggregate is None:
+    if evaluated is None or aggregate is None or evaluated != acceptance.get("evaluated"):
+        return None  # short, unknown or non-canonical sha
+    # The graded revision must contain the exact integrated merge and be
+    # on the aggregate branch; a merge landing after the pin is not covered.
+    if not is_ancestor(repo, merge, evaluated) or not is_ancestor(repo, evaluated, aggregate):
         return None
-    for sha in accepted_shas(Path(record["mailbox"])):
-        full = rev(repo, sha)
-        # The accepted revision must contain the exact integrated merge and
-        # itself be on the aggregate branch (not a side or rewound commit).
-        if full and is_ancestor(repo, merge, full) and is_ancestor(repo, full, aggregate):
-            return full
-    return None
+    return dict(acceptance)
+
+
+# ------------------------------------------------------------------ fence
+
+
+def _fence_path(repo: Path) -> Path:
+    return ledger_dir(repo) / FENCE_FILE
+
+
+def acquire_fence(repo: Path, *, reason: str, mailbox: Path | None = None) -> dict[str, Any]:
+    """Block integrations into *repo* while an evaluation/retirement runs."""
+    repo = repo_toplevel(repo)
+    with repo_lock(repo):
+        fence = {
+            "holder": process_identity(os.getpid()),
+            "reason": reason,
+            "mailbox": str(mailbox) if mailbox else None,
+            "at": time.time(),
+        }
+        path = _fence_path(repo)
+        tmp = path.with_suffix(f".tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(fence, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return fence
+
+
+def release_fence(repo: Path) -> None:
+    """Drop this process's fence (another holder's fence is left alone)."""
+    repo = repo_toplevel(repo)
+    with repo_lock(repo):
+        path = _fence_path(repo)
+        try:
+            fence = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if (fence.get("holder") or {}).get("pid") == os.getpid():
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def active_fence(repo: Path) -> dict[str, Any] | None:
+    """The fence if its holder is alive; an unreadable fence counts as held."""
+    path = _fence_path(repo)
+    if not path.exists():
+        return None
+    try:
+        fence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"reason": "unreadable integration fence (uncertain)"}
+    return fence if identity_alive(fence.get("holder")) else None
 
 
 # ----------------------------------------------------------------- cleanup
@@ -731,8 +959,16 @@ def _blocking_state(
     if users:
         return "active_session", f"processes using worktree: {users[:10]}"
     entries, residue = _split_status(path, status_entries(path))
+    ignored = []
+    for rel in ignored_entries(path):
+        if _disposable_ignored(rel):
+            continue
+        owned = _owned_ignored_cursor(path, rel)
+        if owned is None:
+            ignored.append(rel)
+        else:
+            residue.extend(r for r in owned if r not in residue)
     record["residue"] = residue
-    ignored = [rel for rel in ignored_entries(path) if not _disposable_ignored(rel)]
     if ignored:
         return "ignored_content", "; ".join(ignored[:5])
     if any(line[:2] in ("DD", "AU", "UD", "UA", "DU", "AA", "UU") for line in entries):
@@ -784,7 +1020,11 @@ def _finish_removal(repo: Path, record: dict[str, Any]) -> dict[str, Any]:
 
 
 def cleanup_one(
-    repo: Path, worker_id: str, *, held_sessions: set[str] | None = None
+    repo: Path,
+    worker_id: str,
+    *,
+    held_sessions: set[str] | None = None,
+    acceptance_for: Any = None,
 ) -> dict[str, Any]:
     """Advance one record toward removal; idempotent and restart-safe."""
     record = load_record(repo, worker_id)
@@ -815,10 +1055,10 @@ def cleanup_one(
         # Retained before integration finished: only `integrate` may advance it.
         return record
     if not is_eval and not record.get("accepted_by"):
-        sha = _accepting_sha(repo, record)
-        if sha is None:
-            return record  # integrated; waiting for evaluator acceptance
-        record["accepted_by"] = sha
+        acceptance = _accepting_revision(repo, record, acceptance_for)
+        if acceptance is None:
+            return record  # integrated; waiting for verified acceptance
+        record["accepted_by"] = acceptance
         record["state"] = "accepted"
         save_record(repo, record)
     reason = _owned_worktree(repo, record)
@@ -849,6 +1089,7 @@ def cleanup(
     *,
     mailbox: Path | None = None,
     held_sessions: set[str] | None = None,
+    acceptance_for: Any = None,
 ) -> list[dict[str, Any]]:
     """Clean every ledger-owned worker for *repo* (optionally one mailbox)."""
     repo = repo_toplevel(repo)
@@ -862,7 +1103,11 @@ def cleanup(
             if mailbox is not None and record.get("mailbox") != str(mailbox.resolve()):
                 continue
             try:
-                results.append(cleanup_one(repo, worker_id, held_sessions=held_sessions))
+                results.append(cleanup_one(
+                    repo, worker_id,
+                    held_sessions=held_sessions,
+                    acceptance_for=acceptance_for,
+                ))
             except WorktreeError as exc:
                 record = load_record(repo, worker_id)
                 results.append(_retain(repo, record, "cleanup_error", str(exc)))
@@ -888,3 +1133,89 @@ def summarize(record: dict[str, Any]) -> str:
     if reason:
         text += f" ({reason})"
     return text
+
+
+# --------------------------------------------------------------- watchdog
+
+
+def watchdog(parent_pid: int, parent_start: str | None, max_seconds: float, command: list[str]) -> int:
+    """Group leader for an isolated worker: bounded lifetime, dies with its owner.
+
+    Runs *command* as a child in this process group. When the dispatcher
+    (identity *parent_pid* + start time) is gone -- e.g. SIGKILLed with no
+    chance to clean up -- or *max_seconds* elapse, the whole group gets
+    SIGTERM, then SIGKILL. Descendants that escape the group (``setsid``)
+    are not tracked here; cleanup/integrate still refuse while any process
+    uses the worktree.
+    """
+    import signal as _signal
+
+    child = subprocess.Popen(command)
+    deadline = time.monotonic() + max(max_seconds, 1.0)
+    owner = {"pid": parent_pid, "start": parent_start}
+
+    def members() -> list[int]:
+        pgid, me = str(os.getpgrp()), os.getpid()
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == me:
+                continue
+            with contextlib.suppress(OSError, IndexError):
+                fields = (entry / "stat").read_text().rsplit(")", 1)[-1].split()
+                if fields[2] == pgid and fields[0] != "Z":
+                    found.append(int(entry.name))
+        return found
+
+    def stop_group(code: int) -> int:
+        for sig, wait in ((_signal.SIGTERM, 5.0), (_signal.SIGKILL, 2.0)):
+            for pid in members():
+                with contextlib.suppress(OSError):
+                    os.kill(pid, sig)
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                child.poll()  # reap so the child does not linger as a member
+                if not members():
+                    break
+                time.sleep(0.05)
+        child.poll()
+        return code
+
+    while True:
+        code = child.poll()
+        if code is not None:
+            return code
+        if not identity_alive(owner):
+            return stop_group(125)
+        if time.monotonic() >= deadline:
+            return stop_group(124)
+        time.sleep(0.25)
+
+
+def worker_max_seconds(timeout: float | None) -> float:
+    if timeout:
+        return float(timeout) + 60.0
+    raw = os.environ.get(WORKER_MAX_SECONDS_ENV, "").strip()
+    try:
+        return float(raw) if raw else DEFAULT_WORKER_MAX_SECONDS
+    except ValueError:
+        return DEFAULT_WORKER_MAX_SECONDS
+
+
+def watchdog_command(command: list[str], *, max_seconds: float) -> list[str]:
+    """Prefix *command* with this module's watchdog bound to the caller."""
+    import sys as _sys
+
+    pid = os.getpid()
+    return [
+        _sys.executable, "-I", str(Path(__file__).resolve()), "watchdog",
+        str(pid), str(_proc_start(pid) or ""), str(max_seconds), "--", *command,
+    ]
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    argv = _sys.argv[1:]
+    if len(argv) >= 5 and argv[0] == "watchdog" and argv[4] == "--":
+        _sys.exit(watchdog(int(argv[1]), argv[2] or None, float(argv[3]), argv[5:]))
+    _sys.exit(2)

@@ -41,10 +41,28 @@ def _load(name: str, path: Path):
 
 
 @pytest.fixture()
-def wt(monkeypatch):
+def wt(monkeypatch, tmp_path):
     for key, value in GIT_ENV.items():
         monkeypatch.setenv(key, value)
+    # A clean user scope: the real ~/.cursor may carry session bindings.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
     return _load("worker_worktrees_under_test", MODULE)
+
+
+ACCEPTED: dict[str, str] = {}
+
+
+def clean(wt, repo, **kw):
+    """Cleanup with acceptance as the caller would derive it after ship()."""
+    return wt.cleanup(
+        repo,
+        acceptance_for=lambda box: (
+            {"evaluated": ACCEPTED[str(box)]} if str(box) in ACCEPTED else None
+        ),
+        **kw,
+    )
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -102,9 +120,9 @@ def write_owned_cursor(where: Path, bridge: str = "/bridges/lead-session") -> No
 
 
 def ship(repo: Path, sha: str) -> None:
-    (repo / "loop" / "VERDICT.md").write_text(
-        f"VERDICT: SHIP\n\nAll accepts pass.\n\ncommit: {sha}\n"
-    )
+    """Stand-in for a verified, retired SHIP of exactly *sha* (see r2 tests
+    for the real loop-core contract that trioctl derives this from)."""
+    ACCEPTED[str((repo / "loop").resolve())] = git(repo, "rev-parse", sha)
 
 
 def make_worker(wt, repo, root, slice_id="A", files=None):
@@ -172,7 +190,10 @@ def fake_env(tmp_path: Path) -> dict[str, str]:
     config = tmp_path / "omnigent.toml"
     config.write_text((ROOT / "trioctl.example.toml").read_text())
     env = dict(os.environ, **GIT_ENV)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     env.update({
+        "HOME": str(home),
         "PATH": f"{bindir}:/usr/bin:/bin",
         "FAKE_LOG": str(log),
         "TRIO_TEST_CONFIG": str(config),
@@ -213,8 +234,11 @@ def test_concurrent_builders_get_separate_roots_and_keep_lead_config(
         assert wt.cursor_project_root(Path(log["cwd"])) == Path(log["cwd"])
         # The Lead's bridge/stop hook was not visible to the builder.
         assert log["seen"] == {"mcp.json": None, "hooks.json": None}
-        assert log["pgid"] == log["pid"]  # own process group
-    assert a["cwd"] != b["cwd"]
+        # Own process group, led by the bounded-lifetime watchdog.
+        assert log["pgid"] != os.getpgid(0)
+    assert a["cwd"] != b["cwd"] and a["pgid"] != b["pgid"]
+    for record in (r for _i, r in wt.list_records(repo)):
+        assert record["pgid"] in (a["pgid"], b["pgid"])
     # Lead config untouched byte-for-byte.
     for name, data in lead_before.items():
         assert (repo / ".cursor" / name).read_bytes() == data
@@ -240,7 +264,7 @@ def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(
     (record,) = [r for _i, r in wt.list_records(repo)]
     assert (Path(record["path"]) / ".cursor" / "mcp.json").exists()
     ship(repo, git(repo, "rev-parse", "HEAD"))
-    (result,) = wt.cleanup(repo, mailbox=repo / "loop")
+    (result,) = clean(wt, repo, mailbox=repo / "loop")
     assert result["state"] == "removed", result
     assert not Path(record["path"]).exists()
 
@@ -278,7 +302,7 @@ def test_sigterm_to_dispatcher_kills_worker_group_and_retains(
     (record,) = [r for _i, r in wt.list_records(repo)]
     assert record["state"] == "retained" and record["retained_reason"] == "interrupted"
     assert Path(record["path"]).is_dir()
-    assert wt.cleanup(repo)[0]["state"] == "retained"
+    assert clean(wt, repo)[0]["state"] == "retained"
 
 
 def test_failed_worker_keeps_worktree(wt, repo, root, fake_env, tmp_path):
@@ -308,7 +332,7 @@ def test_merge_conflict_is_retained_and_aggregate_is_untouched(wt, repo, root):
     assert git(repo, "status", "--porcelain") == ""
     # Retained: cleanup never deletes it, even with a SHIP on HEAD.
     ship(repo, head)
-    (after,) = wt.cleanup(repo, mailbox=repo / "loop")
+    (after,) = clean(wt, repo, mailbox=repo / "loop")
     assert after["state"] == "retained"
     assert Path(record["path"]).is_dir()
     assert wt.rev(repo, f"refs/heads/{record['branch']}") is not None
@@ -350,16 +374,16 @@ def test_worktree_root_inside_aggregate_is_refused(wt, repo):
 
 def test_cleanup_waits_for_integration_ship_bound_to_aggregate(wt, repo, root):
     record = make_worker(wt, repo, root, "S")
-    assert wt.cleanup(repo)[0]["state"] == "exited"  # not integrated: kept
+    assert clean(wt, repo)[0]["state"] == "exited"  # not integrated: kept
     wt.integrate(repo, record["id"])
     merged = git(repo, "rev-parse", "HEAD")
-    assert wt.cleanup(repo)[0]["state"] == "integrated"  # no verdict yet
+    assert clean(wt, repo)[0]["state"] == "integrated"  # no verdict yet
     # Slice-level SHIP section is not aggregate acceptance.
     (repo / "loop" / "VERDICT.md").write_text(f"## slice S @{merged} — SHIP\n")
-    assert wt.cleanup(repo)[0]["state"] == "integrated"
+    assert clean(wt, repo)[0]["state"] == "integrated"
     # A SHIP naming a commit that predates the merge does not cover it.
     ship(repo, record["base"])
-    assert wt.cleanup(repo)[0]["state"] == "integrated"
+    assert clean(wt, repo)[0]["state"] == "integrated"
     # A SHIP on a side commit not on the aggregate branch is refused.
     git(repo, "checkout", "-q", "-b", "side")
     (repo / "side.txt").write_text("s\n")
@@ -368,10 +392,10 @@ def test_cleanup_waits_for_integration_ship_bound_to_aggregate(wt, repo, root):
     side = git(repo, "rev-parse", "HEAD")
     git(repo, "checkout", "-q", "main")
     ship(repo, side)
-    assert wt.cleanup(repo)[0]["state"] == "integrated"
+    assert clean(wt, repo)[0]["state"] == "integrated"
     ship(repo, merged)
-    (done,) = wt.cleanup(repo)
-    assert done["state"] == "removed" and done["accepted_by"] == merged
+    (done,) = clean(wt, repo)
+    assert done["state"] == "removed" and done["accepted_by"]["evaluated"] == merged
     assert not Path(record["path"]).exists()
     assert wt.rev(repo, f"refs/heads/{record['branch']}") is None
 
@@ -387,7 +411,7 @@ def test_successful_cleanup_is_scoped_and_idempotent(wt, repo, root, tmp_path):
     (Path(a["path"]) / "__pycache__").mkdir()
     (Path(a["path"]) / "__pycache__" / "x.pyc").write_bytes(b"\0")
     ship(repo, git(repo, "rev-parse", "HEAD"))
-    states = {r["id"]: r["state"] for r in wt.cleanup(repo)}
+    states = {r["id"]: r["state"] for r in clean(wt, repo)}
     assert states == {a["id"]: "removed", b["id"]: "removed"}
     assert unrelated.is_dir()
     branches = git(repo, "branch", "--format=%(refname:short)").splitlines()
@@ -395,8 +419,8 @@ def test_successful_cleanup_is_scoped_and_idempotent(wt, repo, root, tmp_path):
     worktrees = git(repo, "worktree", "list", "--porcelain")
     assert str(unrelated) in worktrees
     # Idempotent second (and third) pass.
-    assert {r["state"] for r in wt.cleanup(repo)} == {"removed"}
-    assert {r["state"] for r in wt.cleanup(repo)} == {"removed"}
+    assert {r["state"] for r in clean(wt, repo)} == {"removed"}
+    assert {r["state"] for r in clean(wt, repo)} == {"removed"}
 
 
 @pytest.mark.parametrize(
@@ -412,7 +436,7 @@ def test_post_integration_work_is_retained(wt, repo, root, mutate, reason):
     wt.integrate(repo, record["id"])
     ship(repo, git(repo, "rev-parse", "HEAD"))
     mutate(Path(record["path"]))
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["state"] == "retained" and result["retained_reason"] == reason
     assert Path(record["path"]).is_dir()
 
@@ -425,7 +449,7 @@ def test_new_commit_in_worktree_after_integration_is_retained(wt, repo, root):
     (path / "late.txt").write_text("late\n")
     git(path, "add", "late.txt")
     git(path, "commit", "-qm", "late work")
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["retained_reason"] == "unintegrated_commits"
 
 
@@ -438,7 +462,7 @@ def test_non_owned_cursor_config_is_user_content(wt, repo, root):
     extra = json.loads((path / ".cursor" / "mcp.json").read_text())
     extra["mcpServers"]["mine"] = {"command": "my-server"}
     (path / ".cursor" / "mcp.json").write_text(json.dumps(extra))
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["retained_reason"] == "untracked"
     assert (path / ".cursor" / "mcp.json").exists()
 
@@ -449,13 +473,13 @@ def test_active_session_blocks_until_it_exits(wt, repo, root):
     ship(repo, git(repo, "rev-parse", "HEAD"))
     user = subprocess.Popen(["sleep", "60"], cwd=record["path"])
     try:
-        (result,) = wt.cleanup(repo)
+        (result,) = clean(wt, repo)
         assert result["retained_reason"] == "active_session"
         assert Path(record["path"]).is_dir()
     finally:
         user.kill()
         user.wait()
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["state"] == "removed"
 
 
@@ -469,12 +493,12 @@ def test_orphaned_process_group_member_blocks_cleanup(wt, repo, root, tmp_path):
         rec = wt.load_record(repo, record["id"])
         rec["pgid"] = orphan.pid
         wt.save_record(repo, rec)
-        (result,) = wt.cleanup(repo)
+        (result,) = clean(wt, repo)
         assert result["retained_reason"] == "active_session"
     finally:
         orphan.kill()
         orphan.wait()
-    assert wt.cleanup(repo)[0]["state"] == "removed"
+    assert clean(wt, repo)[0]["state"] == "removed"
 
 
 def test_held_broker_session_keeps_worktree(wt, repo, root):
@@ -484,9 +508,9 @@ def test_held_broker_session_keeps_worktree(wt, repo, root):
     wt.save_record(repo, rec)
     wt.integrate(repo, record["id"])
     ship(repo, git(repo, "rev-parse", "HEAD"))
-    (result,) = wt.cleanup(repo, held_sessions={"sess-held"})
+    (result,) = clean(wt, repo, held_sessions={"sess-held"})
     assert result["retained_reason"] == "held_session"
-    assert wt.cleanup(repo, held_sessions=set())[0]["state"] == "removed"
+    assert clean(wt, repo, held_sessions=set())[0]["state"] == "removed"
 
 
 def test_tampered_ownership_is_retained(wt, repo, root):
@@ -494,7 +518,7 @@ def test_tampered_ownership_is_retained(wt, repo, root):
     wt.integrate(repo, record["id"])
     ship(repo, git(repo, "rev-parse", "HEAD"))
     (Path(record["admin_dir"]) / wt.OWNER_MARKER).write_text("someone-else\n")
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["retained_reason"] == "uncertain_ownership"
     assert Path(record["path"]).is_dir()
 
@@ -510,10 +534,17 @@ def test_interrupted_dispatch_is_retained_then_recoverable(wt, repo, root):
     rec["dispatcher"] = {"pid": 2**22 + 7, "start": "0"}  # dead
     rec["worker"] = None
     wt.save_record(repo, rec)
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["retained_reason"] == "interrupted"
     assert Path(record["path"]).is_dir()
-    assert wt.integrate(repo, record["id"])["state"] == "integrated"
+    # Partial output is never integrated automatically (r2 / M2) ...
+    refused = wt.integrate(repo, record["id"])
+    assert refused["state"] == "retained" and refused["retained_reason"] == "interrupted"
+    assert not (repo / "i.txt").exists()
+    # ... only with an explicit, recorded human override.
+    done = wt.integrate(repo, record["id"], override_unverified="repaired and checked by hand")
+    assert done["state"] == "integrated"
+    assert done["override_unverified"]["reason"] == "repaired and checked by hand"
     assert (repo / "i.txt").read_text() == "partial\n"
 
 
@@ -528,10 +559,10 @@ def test_restart_after_worktree_removed_finishes_branch_step(wt, repo, root):
     wt.save_record(repo, rec)
     git(repo, "worktree", "remove", record["path"])
     assert wt.rev(repo, f"refs/heads/{record['branch']}") is not None
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["state"] == "removed"
     assert wt.rev(repo, f"refs/heads/{record['branch']}") is None
-    assert wt.cleanup(repo)[0]["state"] == "removed"
+    assert clean(wt, repo)[0]["state"] == "removed"
 
 
 def test_restart_before_worktree_removed_resumes(wt, repo, root):
@@ -542,7 +573,7 @@ def test_restart_before_worktree_removed_resumes(wt, repo, root):
     rec["state"] = "removing"
     rec["accepted_by"] = git(repo, "rev-parse", "HEAD")
     wt.save_record(repo, rec)
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["state"] == "removed"
     assert not Path(record["path"]).exists()
 
@@ -552,7 +583,7 @@ def test_crash_after_create_record_before_worktree_is_retained(wt, repo, root):
     rec = wt.load_record(repo, record["id"])
     rec["creator"] = {"pid": 2**22 + 9, "start": "0"}
     wt.save_record(repo, rec)
-    (result,) = wt.cleanup(repo)
+    (result,) = clean(wt, repo)
     assert result["state"] == "retained"
     assert Path(record["path"]).is_dir()
 
@@ -611,8 +642,8 @@ def test_slice_eval_session_is_bound_to_detached_pinned_worktree(wt, repo, root,
     assert record["kind"] == "eval" and record["finished"]
     assert record["session_ids"] == ["sess-1"]
     # Held: kept. Released: owned residue deleted and worktree removed.
-    assert wt.cleanup(repo, held_sessions={"sess-1"})[0]["retained_reason"] == "held_session"
-    assert wt.cleanup(repo, held_sessions=set())[0]["state"] == "removed"
+    assert clean(wt, repo, held_sessions={"sess-1"})[0]["retained_reason"] == "held_session"
+    assert clean(wt, repo, held_sessions=set())[0]["state"] == "removed"
     assert not Path(bound).exists()
 
 
@@ -623,4 +654,5 @@ def test_lead_prompt_carries_isolated_dispatch_block(repo, root):
     )
     block = runner._isolate_block(2, repo / "loop")
     assert "--isolate" in block and "--worker-slice <slice-id>" in block
-    assert str(root) in block and "never" in block
+    assert str(root) in block and "never delete" in block.lower()
+    assert "do not integrate" in block.lower()
