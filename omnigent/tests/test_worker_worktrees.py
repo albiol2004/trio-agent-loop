@@ -136,8 +136,10 @@ FAKE_CURSOR = textwrap.dedent(
         p = os.path.join(cwd, ".cursor", name)
         seen[name] = open(p).read() if os.path.exists(p) else None
     start = time.time()
-    time.sleep(float(os.environ.get("FAKE_SLEEP", "1.5")))
     slice_id = prompt.split("SLICE=")[1].split()[0]
+    with open(os.path.join(os.environ["FAKE_LOG"], f"{slice_id}.started"), "w") as fh:
+        fh.write(str(os.getpid()))
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "1.5")))
     with open(os.path.join(cwd, f"{slice_id}.txt"), "w") as fh:
         fh.write(slice_id + "\\n")
     if "RESIDUE" in prompt:
@@ -237,9 +239,31 @@ def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(
     assert not Path(record["path"]).exists()
 
 
-def test_failed_worker_keeps_worktree(wt, repo, root, fake_env):
-    bad = dict(fake_env, PATH=f"{Path(fake_env['PATH'].split(':')[0])}:/usr/bin:/bin",
-               FAKE_LOG="/nonexistent-log-dir")
+def test_sigterm_to_dispatcher_kills_worker_group_and_retains(
+    wt, repo, root, fake_env, tmp_path
+):
+    proc = launch(dict(fake_env, FAKE_SLEEP="60"), repo, root, "T")
+    started = tmp_path / "fake-log" / "T.started"
+    deadline = time.time() + 30
+    while not started.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    worker_pid = int(started.read_text())
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=30)
+    assert proc.returncode == 130
+    deadline = time.time() + 10
+    while os.path.exists(f"/proc/{worker_pid}") and time.time() < deadline:
+        time.sleep(0.05)
+    assert not os.path.exists(f"/proc/{worker_pid}")
+    (record,) = [r for _i, r in wt.list_records(repo)]
+    assert record["state"] == "retained" and record["retained_reason"] == "interrupted"
+    assert Path(record["path"]).is_dir()
+    assert wt.cleanup(repo)[0]["state"] == "retained"
+
+
+def test_failed_worker_keeps_worktree(wt, repo, root, fake_env, tmp_path):
+    (tmp_path / "fake-log").chmod(0o500)  # stub cannot write its log -> exits 1
+    bad = fake_env
     proc = launch(bad, repo, root, "F")
     out, err = proc.communicate(timeout=60)
     assert proc.returncode == 3

@@ -974,6 +974,13 @@ def _command_run_isolated(
 
     returncode: int | None = 0
     output = ""
+    # The worker is its own session, so a terminal/`timeout`/supervisor
+    # signal to this dispatcher no longer reaches it: turn SIGTERM/SIGHUP
+    # into KeyboardInterrupt so run_cursor_worker kills the whole group.
+    previous = {
+        sig: signal.signal(sig, _loop_signal_handler)
+        for sig in (signal.SIGTERM, signal.SIGHUP)
+    }
     try:
         output = run_cursor_worker(
             args.role,
@@ -996,6 +1003,14 @@ def _command_run_isolated(
             file=sys.stderr,
         )
         return ISOLATED_RETAINED_EXIT
+    except KeyboardInterrupt:
+        record = wt.load_record(repo, record["id"])
+        wt.mark_exited(repo, record, None)
+        wt._retain(repo, record, "interrupted", "dispatcher signalled; worker group killed")
+        return 130
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     record = wt.load_record(repo, record["id"])
     wt.mark_exited(repo, record, returncode)
     summary = getattr(args, "summary", None) or f"isolated builder {record['id']}"
