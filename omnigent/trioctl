@@ -1458,6 +1458,27 @@ def _wait_for_session(
     ``terminal_cursor_main`` resource_event), so an idle+bound+saw_running
     snapshot with no items at all is treated as not-yet-terminal instead
     of starting (or continuing) the ``stable_idle`` dwell.
+
+    Why the live dwell is 30 s (``TRIO_OMNIGENT_IDLE_DWELL``; per-kind
+    ``TRIO_OMNIGENT_IDLE_DWELL_SLICE_EVAL``, see `_idle_dwell`) -- do not
+    lower it blindly:
+
+    - Cursor turns have think/tool gaps where the session reads ``idle``
+      while the agent is still working; Cursor-native also posts an early
+      completed assistant ack long before the role is done. A short dwell
+      turns those gaps into a false "done".
+    - Grok (live Lead sessions) often leaves no assistant row at all, only
+      a ``resource_event``: the "ran and has items" rule is then the only
+      completion signal and needs idle to stick for a while to mean it.
+    - The post-restart blip (bound -> running -> idle within seconds)
+      is filtered by the zero-items rule above, but a restart landing
+      mid-turn can still look idle briefly; the dwell rides that out.
+
+    A premature "done" is expensive: the caller moves on to artifact
+    checks and a held/uncertain record while the pane is still writing.
+    Each dwell is paid per `_wait` call: when the role artifact is not yet
+    on disk after the first wait, `_wait_for_role_artifact` re-enters
+    `_wait`, which pays the dwell again.
     """
     if timeout < 0:
         raise TrioctlError("--timeout must be non-negative")
@@ -2604,6 +2625,39 @@ def _omnigent_prompt_dirs(repo: Path) -> list[Path]:
     return dirs
 
 
+IDLE_DWELL_ENV = "TRIO_OMNIGENT_IDLE_DWELL"
+IDLE_DWELL_SLICE_EVAL_ENV = "TRIO_OMNIGENT_IDLE_DWELL_SLICE_EVAL"
+DEFAULT_IDLE_DWELL = 30.0
+
+
+def _idle_dwell(kind: str | None = None) -> float:
+    """Seconds a live session must stay idle before its turn counts as done.
+
+    ``TRIO_OMNIGENT_IDLE_DWELL`` (default 30 s) applies to every role. For
+    open-loop slice-evals only, ``TRIO_OMNIGENT_IDLE_DWELL_SLICE_EVAL``
+    overrides it (unset: the same value), so a qualification run can try a
+    shorter slice-eval dwell without touching Lead / repair /
+    integration-eval behavior. Invalid, non-finite or negative values are
+    ignored (fall back one level). Read `_wait_for_session` before
+    lowering either.
+    """
+    base = broker_http._env_float(IDLE_DWELL_ENV, DEFAULT_IDLE_DWELL)
+    if base < 0:
+        base = DEFAULT_IDLE_DWELL
+    if kind == "slice-eval":
+        override = broker_http._env_float(IDLE_DWELL_SLICE_EVAL_ENV, -1.0)
+        if override >= 0:
+            return override
+    return base
+
+
+def _slice_eval_kind(context: dict[str, Any] | None) -> dict[str, Any]:
+    """``{"kind": "slice-eval"}`` for a slice-eval dispatch, else ``{}``."""
+    if isinstance(context, dict) and context.get("kind") == "slice-eval":
+        return {"kind": "slice-eval"}
+    return {}
+
+
 class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
@@ -3285,8 +3339,14 @@ class OmnigentRunner:
         client: Any,
         session_id: str,
         timeout: float | None = None,
+        **dispatch_kind: Any,
     ) -> Any:
-        """Wait through a fake seam or poll the real broker session."""
+        """Wait through a fake seam or poll the real broker session.
+
+        ``kind="slice-eval"`` (passed only for open-loop slice-evals, so
+        existing ``_wait`` doubles keep their signature) selects that kind's
+        idle dwell; see `_idle_dwell`.
+        """
         wait_timeout = self._timeout if timeout is None else timeout
         method = getattr(client, "wait_session", None) or getattr(
             client, "wait", None
@@ -3304,7 +3364,8 @@ class OmnigentRunner:
         # Live Cursor turns have think/tool gaps that look idle. Hold
         # idle after running (or after an early assistant ack) so those
         # gaps are not terminal. Tests use interval=0 and skip the dwell.
-        # TRIO_OMNIGENT_IDLE_DWELL overrides the live default (30s).
+        # TRIO_OMNIGENT_IDLE_DWELL overrides the live default (30s);
+        # TRIO_OMNIGENT_IDLE_DWELL_SLICE_EVAL overrides it for slice-evals.
         return _wait_for_session(
             client,
             session_id,
@@ -3313,9 +3374,7 @@ class OmnigentRunner:
             stable_idle=(
                 0.0
                 if self._interval == 0
-                else broker_http._env_float(
-                    "TRIO_OMNIGENT_IDLE_DWELL", 30.0
-                )
+                else _idle_dwell(dispatch_kind.get("kind"))
             ),
         )
 
@@ -3438,7 +3497,10 @@ class OmnigentRunner:
             if started is None
             else max(self._timeout - (time.monotonic() - started), 0.0)
         )
-        snapshot = self._wait(client, session_id, timeout=remaining)
+        snapshot = self._wait(
+            client, session_id, timeout=remaining,
+            **_slice_eval_kind((dispatch or {}).get("meta")),
+        )
         items = self._read(client, session_id)
         return snapshot, items
 
@@ -3931,7 +3993,10 @@ class OmnigentRunner:
                     f"session {session_id} timed out after "
                     f"{self._timeout:g} seconds"
                 )
-            snapshot = self._wait(client, session_id, timeout=remaining)
+            snapshot = self._wait(
+                client, session_id, timeout=remaining,
+                **_slice_eval_kind(context),
+            )
             if _session_status(snapshot) in SESSION_FAILURE_STATUSES:
                 return snapshot
             self._read(client, session_id)
@@ -4841,7 +4906,10 @@ def parser() -> argparse.ArgumentParser:
             "environment variables:\n"
             "  TRIO_OMNIGENT_IDLE_DWELL  seconds a session must stay idle\n"
             "                            before a live role wait returns\n"
-            "                            (default 30). interval=0 skips it."
+            "                            (default 30). interval=0 skips it.\n"
+            "  TRIO_OMNIGENT_IDLE_DWELL_SLICE_EVAL  the same, for open-loop\n"
+            "                            slice-evals only (default: the\n"
+            "                            value above)."
         ),
     )
     loop.add_argument("--mailbox", type=Path, default=Path("loop"))
