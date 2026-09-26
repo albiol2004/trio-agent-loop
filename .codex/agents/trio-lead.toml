@@ -115,7 +115,9 @@ outputs, a module's companion test file, a hyphenated CLI's mirrored
 writes. After a wave lands, run `python3 metrics/trio-shadow.py --mailbox
 <dir>` and, if two slices in the wave actually touched the same file,
 review that file's diff explicitly before committing — this is the one
-hazard check.
+hazard check. In open-loop mode (below) the same check runs only AFTER
+each wave member has already been retired individually — never hold a
+retirement for it.
 
 The parent Codex task owns native agent spawning and tells you whether this is
 the initial planning pass or the post-Builder review. Never spawn another agent.
@@ -157,14 +159,31 @@ extension"), run this loop instead of waiting for a verdict:
 2. Otherwise take the next `planned` slice from PLAN.md's `slices:` block.
    Give every slice you plan an `accepts:` list — that is what the
    Evaluator grades it against.
-3. On finishing a slice: commit, set `status: complete` for it in PLAN.md's
-   `slices:` block, and append a `retired:` entry to `QUEUE.md` (`slice`,
-   the sha it's retired at, `at`). A post-retirement fix (step 1's
-   `fix f<N>` commit) doesn't edit that entry — it appends a **new**
-   `retired:` entry for the same slice id with the fix's sha; repeated
-   slice ids are expected, only a repeated (slice, sha) pair is invalid.
+3. **Retire each slice the moment it lands — per slice, not per wave.**
+   As soon as an isolated builder's run prints `integrated` (its
+   `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's
+   `status: complete` in PLAN.md's `slices:` block and append its
+   `retired:` entry to `QUEUE.md` (`slice`, the `merge_commit` sha from
+   the builder's JSON output line, `at`) — before waiting for any other
+   builder in the wave. Do not wait for the wave to land or for the
+   hazard check to retire a slice. A slice you implemented yourself is
+   retired the same way right after its `slice(<id>):` commit, at that
+   commit's sha. A post-retirement fix (step 1's `fix f<N>` commit)
+   doesn't edit that entry — it appends a **new** `retired:` entry for
+   the same slice id with the fix's sha; repeated slice ids are expected,
+   only a repeated (slice, sha) pair is invalid.
+   **Hazard check after retirement:** once every member of the wave is
+   retired, run the wave-level hazard check (`python3
+   metrics/trio-shadow.py --mailbox <dir>` over the whole mailbox, plus an
+   explicit diff review of any file two wave members both touched). If it
+   finds a same-file conflict, fix it with a `slice(<id>): fix …` commit
+   and append a NEW `retired:` entry for that slice at the fix sha — the
+   same post-retirement-fix mechanism as above; never edit the earlier
+   entry.
 4. Never wait for a verdict before starting the next fault or slice — the
    Evaluator grades retired slices independently, on its own schedule.
+   Keep dispatching the remaining slices and faults while earlier retired
+   slices are being graded.
 5. **Backpressure**: while 2 or more faults are `open` or `taken`, take no
    new slice — drain faults first. This replaces the two-consecutive-ITERATE
    drain rule while `QUEUE.md` exists.
