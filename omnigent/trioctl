@@ -2110,13 +2110,30 @@ def _held_dispatch_message(mailbox: Path) -> str | None:
                 f"    {HELD_REASONS['abandoned_on_exit']} (slice-eval "
                 f"{record.get('slice', '?')} @{record.get('sha', '?')})"
             )
+    abandoned = [r for _p, r in held if r.get("hold") == "abandoned_on_exit"]
+    if len(abandoned) == len(held):
+        # The loop core's abandoned_on_exit hold never touches STATE.md.
+        state_note = (
+            "check STATE.md status/phase (an abandoned_on_exit hold leaves it "
+            "as the loop last wrote it) and set it for the step to run next"
+        )
+    elif abandoned:
+        state_note = (
+            "set STATE.md status/phase for the step to run next (a "
+            "delivery/completion hold set it to needs_human; an "
+            "abandoned_on_exit hold does not change it)"
+        )
+    else:
+        state_note = (
+            "set STATE.md status/phase for the step to run next (it was set "
+            "to needs_human)"
+        )
     lines.append(
         "  resolve: `trioctl omnigent session read <session>` and check the "
         "mailbox and git state; once that session has finished or is gone "
         "and its output is reconciled by hand, delete the held-*.json record, "
-        "set STATE.md status/phase for the step to run next (it was set to "
-        "needs_human), and re-run. `trioctl omnigent sessions prune` can then "
-        "remove the session."
+        f"{state_note}, and re-run. `trioctl omnigent sessions prune` can "
+        "then remove the session."
     )
     return "\n".join(lines)
 

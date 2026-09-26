@@ -369,6 +369,9 @@ def test_abandoned_on_exit_hold_blocks_resume_with_reason(tmp_path: Path) -> Non
     assert "session s-9 (role evaluator, iteration 3" in message
     assert "slice-eval still running when the loop exited" in message
     assert f"slice-eval alpha @{FULL_SHA}" in message
+    # N4: the abandoned hold never sets STATE to needs_human; say so.
+    assert "was set to needs_human" not in message
+    assert "abandoned_on_exit hold leaves it as the loop last wrote it" in message
 
 
 # F3: interrupted drain -> cleanup never DELETEs a live worker's session --
