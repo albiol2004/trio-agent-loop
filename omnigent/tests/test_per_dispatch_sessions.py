@@ -476,3 +476,157 @@ def test_second_interrupt_during_drain_keeps_inflight_sessions_out_of_cleanup(
     for t in [t for t in threading.enumerate() if t.name.startswith("slice-eval")]:
         t.join(5)
         assert not t.is_alive()
+
+
+# F7: cleanup skips only in-flight slice-eval sessions ------------------
+
+
+def test_ctrl_c_mid_lead_turn_prunes_lead_session_n1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Real loop core, N=1: SIGINT while the Lead is mid-turn (its thread's
+    5 s join times out, so its session is still in flight) -> the Lead's
+    session is DELETEd exactly as on 3b5b93b, never `skipped_inflight`."""
+    import os
+    import signal
+    import time
+
+    from metrics import trio_loop
+    from metrics.tests.test_open_loop_concurrent_evals import plan
+    from metrics.tests.test_open_loop_driver import make_open_loop_mailbox
+
+    trioctl = load_trioctl()
+    mailbox = make_open_loop_mailbox(tmp_path, plan("alpha"))
+    release = threading.Event()
+
+    class Runner:
+        held_session_ids: list[str] = []
+
+        def __init__(self) -> None:
+            self.created_session_ids: list[str] = []
+            self._inflight: dict[str, dict] = {}
+            self.lock = threading.Lock()
+
+        def run(self, role, iteration, mb, context=None):
+            assert role == "lead"
+            with self.lock:
+                self.created_session_ids.append("s-lead-1")
+                self._inflight["s-lead-1"] = {
+                    "role": "lead", "kind": (context or {}).get("kind"),
+                    "slice": None, "sha": None,
+                }
+            try:
+                release.wait(30)
+            finally:
+                with self.lock:
+                    self._inflight.pop("s-lead-1", None)
+            return 0
+
+        def inflight_sessions(self):
+            with self.lock:
+                return {k: dict(v) for k, v in self._inflight.items()}
+
+    runner = Runner()
+    pruned: list[list[str]] = []
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: trio_loop)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: runner)
+    monkeypatch.setattr(
+        trioctl, "_run_post_loop_session_prune",
+        lambda mb, base_url, sids, **kw: pruned.append(sorted(sids)) or [],
+    )
+
+    def sigint_mid_lead():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not runner.inflight_sessions():
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.chdir(tmp_path)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "3"]
+    )
+    killer = threading.Thread(target=sigint_mid_lead, daemon=True)
+    try:
+        killer.start()
+        assert args.func(args) == 130
+        killer.join(5)
+        # The Lead is still mid-turn when cleanup runs ...
+        assert "s-lead-1" in runner.inflight_sessions()
+        # ... and its session is still pruned.
+        assert pruned == [["s-lead-1"]]
+        assert "skipped_inflight" not in capsys.readouterr().err
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("concurrency", "inflight", "expect_pruned", "expect_skipped"),
+    [
+        pytest.param(
+            2,
+            {
+                "s-lead": {"role": "lead", "kind": "lead-pass"},
+                "s-eval": {"role": "evaluator", "kind": "slice-eval",
+                           "slice": "alpha", "sha": "a" * 40},
+            },
+            ["s-done", "s-lead"],
+            ["s-eval"],
+            id="n2-slice-eval-skipped-lead-deleted",
+        ),
+        pytest.param(
+            2,
+            {"s-int": {"role": "evaluator", "kind": "integration-eval"}},
+            ["s-done", "s-int"],
+            [],
+            id="integration-eval-deleted",
+        ),
+        pytest.param(
+            1,
+            {"s-lead": {"role": "lead", "kind": "lead-pass"},
+             "s-repair": {"role": "lead", "kind": None}},
+            ["s-done", "s-lead", "s-repair"],
+            [],
+            id="n1-lead-and-repair-deleted",
+        ),
+    ],
+)
+def test_cleanup_skips_only_inflight_slice_eval_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+    concurrency, inflight, expect_pruned, expect_skipped,
+) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+
+    class Core:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None,
+                     slice_eval_concurrency=1, slice_eval_drain_seconds=None):
+            raise KeyboardInterrupt
+
+    class Runner:
+        held_session_ids: list[str] = []
+        created_session_ids = ["s-done", *inflight]
+
+        def inflight_sessions(self):
+            return {k: dict(v) for k, v in inflight.items()}
+
+    pruned: list[list[str]] = []
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Core)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: Runner())
+    monkeypatch.setattr(
+        trioctl, "_run_post_loop_session_prune",
+        lambda mb, base_url, sids, **kw: pruned.append(sorted(sids)) or [],
+    )
+    monkeypatch.chdir(tmp_path)
+    argv = ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "3"]
+    if concurrency != 1:
+        argv += ["--slice-eval-concurrency", str(concurrency)]
+    args = trioctl.parser().parse_args(argv)
+    assert args.func(args) == 130
+    assert pruned == [expect_pruned]
+    err = capsys.readouterr().err
+    for sid in inflight:
+        if sid in expect_skipped:
+            assert f"skipped_inflight session {sid}" in err
+        else:
+            assert f"skipped_inflight session {sid}" not in err

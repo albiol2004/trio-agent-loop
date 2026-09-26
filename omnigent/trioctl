@@ -4425,14 +4425,23 @@ def command_loop(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             created = [sid for sid in created if sid not in held]
-            # A worker thread may still be running a dispatch (e.g. a
-            # slice-eval abandoned by an interrupted drain): never DELETE a
-            # session out from under it.
+            # A slice-eval pool worker may still be running its dispatch
+            # (abandoned by an interrupted or expired drain): never DELETE
+            # that session out from under it. Only in-flight sessions whose
+            # meta says kind == "slice-eval" are skipped; every other
+            # in-flight session (Lead, repair, integration-eval, N=1) is
+            # pruned exactly as before, so Ctrl-C mid-Lead-turn still kills
+            # the Lead's pane.
             inflight: set[str] = set()
             snapshot_fn = getattr(runner, "inflight_sessions", None)
             if callable(snapshot_fn):
                 try:
-                    inflight = {str(sid) for sid in (snapshot_fn() or {})}
+                    inflight = {
+                        str(sid)
+                        for sid, meta in (snapshot_fn() or {}).items()
+                        if isinstance(meta, dict)
+                        and meta.get("kind") == "slice-eval"
+                    }
                 except Exception:  # noqa: BLE001 - cleanup must still run
                     inflight = set()
             for session_id in sorted(inflight & set(created)):
