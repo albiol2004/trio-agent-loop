@@ -907,6 +907,53 @@ def run_cursor_worker(
             _drain_worker_group(proc.pid)
 
 
+def _driver_config_path(mailbox_arg: Any) -> Path | None:
+    """The loop driver's pinned profile from ``<mailbox>/.driver.json``.
+
+    None when the file, its ``config_path`` key, or the named file is
+    missing (the last one warns: the driver's profile is gone).
+    """
+    mailbox = Path(str(mailbox_arg)).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = Path.cwd() / mailbox
+    try:
+        data = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("config_path") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value).expanduser()
+    if not path.is_file():
+        print(
+            f"trioctl: driver config {path} from {mailbox / '.driver.json'} "
+            f"is missing; using {config_path(None)}",
+            file=sys.stderr,
+        )
+        return None
+    return path
+
+
+def _run_config_path(args: argparse.Namespace) -> Path:
+    """Profile for a worker run: --config, else the driver's, else env/default."""
+    if getattr(args, "config", None):
+        return config_path(args.config)
+    default = config_path(None)
+    mailbox_arg = getattr(args, "worker_events_mailbox", None)
+    if not mailbox_arg:
+        return default
+    pinned = _driver_config_path(mailbox_arg)
+    if pinned is None:
+        return default
+    try:
+        same = pinned.resolve() == default.expanduser().resolve()
+    except OSError:
+        same = False
+    if not same:
+        print(f"trioctl: using driver config {pinned}", file=sys.stderr)
+    return pinned
+
+
 def command_run(args: argparse.Namespace) -> int:
     """Run one headless Cursor worker (a separate OS process from `loop`).
 
@@ -917,7 +964,7 @@ def command_run(args: argparse.Namespace) -> int:
     process-boundary hook exists to route a headless worker's session id
     through if a future dispatch path ever opens a broker-tracked one.
     """
-    config = load_config(config_path(args.config))
+    config = load_config(_run_config_path(args))
     if args.prompt_file == "-":
         prompt = sys.stdin.read()
     else:
@@ -2638,11 +2685,20 @@ class OmnigentRunner:
         # Per-role dispatch provenance for the held record (never inferred).
         self._delivery: dict[str, dict[str, Any]] = {}
         self._dispatch_nonce: str | None = None
+        # The profile this driver resolves roles from, pinned at start and
+        # recorded in `.driver.json` (loop core `_driver_meta`) so workers
+        # the Lead dispatches with `--mailbox` use the same profile even
+        # when the Lead's shell carries a different TRIOCTL_CONFIG.
+        self._config_path = config_path().expanduser().resolve()
+        self.driver_meta: dict[str, Any] = (
+            {"config_path": str(self._config_path)} if config is None else {}
+        )
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
         if self._config is None:
-            self._config = load_config(config_path())
+            path = getattr(self, "_config_path", None) or config_path()
+            self._config = load_config(path)
         return self._config
 
     def _agent_id(self, role: str) -> str:

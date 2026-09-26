@@ -29,6 +29,9 @@ SECRET = "PROMPT_SECRET_TOKEN_do_not_log"
 LEAKED_KEY = "sk-live1234567890abcdefXYZ"
 OBSERVE_HEADING = "## Worker observability"
 
+# Loop driver profile. Workers dispatched with `--mailbox` use the
+# driver's pinned profile (`.driver.json` config_path), so its worker
+# roles must be dispatchable Cursor roles.
 CLAUDE_PROFILE = """\
 version = 1
 [roles.lead]
@@ -40,13 +43,15 @@ provider = "claude"
 model = "evaluator-model"
 effort = "medium"
 [roles.builder]
-provider = "claude"
-model = "builder-model"
-effort = "medium"
+provider = "cursor"
+model_family = "glm-5.2"
+fallback_model = "glm-5.2-max"
+effort = "max"
 [roles.scout]
-provider = "claude"
-model = "scout-model"
-effort = "medium"
+provider = "cursor"
+model_family = "glm-5.2"
+fallback_model = "glm-5.2-max"
+effort = "max"
 """
 
 WORKER_PROFILE = """\
@@ -253,6 +258,11 @@ def test_observe_routes_real_lead_prompt_to_exact_cli_and_summarizes(
     for result in broker.worker_results:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "OK"
+        # The Lead shell's XDG profile differs; the driver's pin wins.
+        assert (
+            f"trioctl: using driver config {(tmp_path / 'loop-profile.toml').resolve()}"
+            in result.stderr
+        )
 
     summary_path = observe["summary"]
     summary = json.loads(summary_path.read_text(encoding="utf-8"))

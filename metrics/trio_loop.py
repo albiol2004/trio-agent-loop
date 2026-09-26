@@ -181,6 +181,24 @@ def _write_state_verdict(state_path: Path, word: str) -> None:
     )
 
 
+def _driver_meta(*runners: object) -> dict:
+    """Extra `.driver.json` keys a runner opts into via ``driver_meta``.
+
+    e.g. the Omnigent runner's resolved ``config_path``, which isolated
+    worker dispatches read back so builders use the driver's profile.
+    Runners without the attribute add nothing (historical payload).
+    """
+    meta: dict = {}
+    for runner in runners:
+        extra = getattr(runner, "driver_meta", None)
+        if isinstance(extra, dict):
+            meta.update(
+                (key, value) for key, value in extra.items()
+                if isinstance(key, str)
+            )
+    return meta
+
+
 def _write_driver_state(
     mailbox: Path, runner: RoleRunner, iteration: int, phase: str
 ) -> None:
@@ -191,6 +209,8 @@ def _write_driver_state(
         "phase": phase,
         "session_ids": getattr(runner, "session_ids", {}) or {},
     }
+    for key, value in _driver_meta(runner).items():
+        payload.setdefault(key, value)
     (mailbox / ".driver.json").write_text(
         json.dumps(payload) + "\n",
         encoding="utf-8",
@@ -1577,6 +1597,8 @@ def _write_open_loop_sidecars(
         "lead_alive": lead_alive,
         "eval_alive": eval_alive,
     }
+    for key, value in _driver_meta(lead_runner, eval_runner).items():
+        driver_payload.setdefault(key, value)
     (mailbox / ".driver.json").write_text(
         json.dumps(driver_payload) + "\n", encoding="utf-8"
     )
