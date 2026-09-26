@@ -109,6 +109,47 @@ def _prompt_text(text: str) -> str:
     ).strip()
 
 
+_REPLACEMENT = "\ufffd"
+_MAX_REPLACEMENT_RUN = 3  # one UTF-8 code point is at most 4 bytes; seen: 2
+
+
+def _row_matches_prompt(row: str, want: str) -> bool:
+    """True if ``row`` is ``want``, allowing only bounded mojibake.
+
+    Both sides are already :func:`_prompt_text`-normalized. The only
+    tolerated difference: each maximal run of 1-3 U+FFFD in ``row``
+    stands for exactly one non-ASCII character (``ord >= 0x80``) of
+    ``want`` at that position (the UTF-8 bytes of that one character
+    were split and decoded as replacement characters). Everything else
+    must be identical: no truncation, no extra leading or trailing
+    characters, no U+FFFD standing for an ASCII character. If ``want``
+    itself contains U+FFFD, only exact equality counts. One linear
+    left-to-right pass.
+    """
+    if row == want:
+        return True
+    if _REPLACEMENT in want or _REPLACEMENT not in row:
+        return False
+    i = j = 0
+    n, m = len(row), len(want)
+    while i < n and j < m:
+        ch = row[i]
+        if ch == want[j]:
+            i += 1
+            j += 1
+            continue
+        if ch != _REPLACEMENT or ord(want[j]) < 0x80:
+            return False
+        run = i
+        while run < n and row[run] == _REPLACEMENT:
+            run += 1
+        if run - i > _MAX_REPLACEMENT_RUN:
+            return False
+        i = run
+        j += 1
+    return i == n and j == m
+
+
 def _user_row_texts(items: list[Any]) -> list[str]:
     """Normalized bodies of every user row, empty ones included."""
     return [
@@ -690,6 +731,15 @@ class BrokerClient:
         only proven non-delivery is a refused POST (:meth:`_post_prompt`
         raises :class:`PromptDeliveryFailed`). ``attempts`` is ignored;
         it stays for old callers.
+
+        One bounded exception to equality (:func:`_row_matches_prompt`):
+        a mirrored row may carry mojibake where one non-ASCII character
+        of the prompt came back as a run of 1-3 U+FFFD. In run
+        20260926T114109Z session 3f5a37b6 the Evaluator row equalled
+        the prompt except one EM DASH (char ~6109) mirrored as two
+        U+FFFD; the turn ran to completion, yet the exact check held it
+        as uncertain. Nothing else (truncation, DEL prefix, a U+FFFD for
+        an ASCII character) is tolerated.
         """
         del attempts  # no row authorizes a re-post
         ceiling = wait_seconds if wait_seconds is not None else _prompt_wait()
@@ -711,7 +761,7 @@ class BrokerClient:
             except BrokerHttpError:
                 pass  # transient read failure: keep polling to the deadline
             else:
-                if want and want in rows:
+                if want and any(_row_matches_prompt(r, want) for r in rows):
                     return
             now = time.monotonic()
             if now >= deadline:
