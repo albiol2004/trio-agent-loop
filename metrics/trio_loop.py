@@ -560,6 +560,32 @@ def _verdict_commit_shas(text: str) -> list[str]:
     return shas
 
 
+_SLICE_SECTION_HEADING_RE = re.compile(r"^##\s+slice\s+\S+\s+@[0-9a-fA-F]{7,40}\b")
+
+
+def _integration_verdict_text(text: str) -> str:
+    """VERDICT.md with every open-loop ``## slice <id> @<sha>`` section removed.
+
+    Open-loop slice-evals append their own sections (with their own
+    ``iteration:``/``evaluated:``/``attempt:`` lines) to the same file as
+    the integration verdict. A section runs from its heading up to (not
+    including) the next ``# ``/``## `` heading that is not itself a slice
+    heading, or EOF. Everything else is kept in order, so integration
+    field checks see only the integration verdict's own block.
+    """
+    kept: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if _SLICE_SECTION_HEADING_RE.match(line):
+            skipping = True
+            continue
+        if skipping and (line.startswith("# ") or line.startswith("## ")):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
+
+
 def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     """True when the verdict names this iteration and no other one.
 
@@ -890,6 +916,8 @@ def _verdict_binds_lockstep(
     """
     if git_root is None:
         return True
+    # Only the integration block binds; appended slice sections do not.
+    text = _integration_verdict_text(text)
     attempt = state.get("evaluator_attempt", "").strip()
     evaluated = state.get("evaluated_sha", "").strip()
     if not attempt or not _verdict_records_attempt(text, attempt):
@@ -1011,7 +1039,9 @@ def _ship_retirement_problem_once(
         evaluated = state.get("evaluated_sha", "").strip()
         if not attempt:
             detail = "STATE.md has no evaluator_attempt to bind the SHIP"
-        elif not _verdict_records_attempt(text, attempt):
+        elif not _verdict_records_attempt(
+            _integration_verdict_text(text), attempt
+        ):
             detail = (
                 f"VERDICT.md does not record attempt: {attempt} "
                 "(stale or unbound evaluator artifact)"
@@ -1186,6 +1216,8 @@ def _fresh_evaluator_artifact(
     word, _scope = _first_verdict(path)
     if word is None:
         return False
+    # Appended open-loop slice sections carry their own field lines.
+    text = _integration_verdict_text(text)
     if not _verdict_mentions_iteration(text, iteration):
         return False
     context = context or {}

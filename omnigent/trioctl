@@ -1492,6 +1492,32 @@ def _verdict_line_ready(text: str) -> bool:
     return False
 
 
+_SLICE_SECTION_HEADING_RE = re.compile(r"^##\s+slice\s+\S+\s+@[0-9a-fA-F]{7,40}\b")
+
+
+def _integration_verdict_text(text: str) -> str:
+    """VERDICT.md with every open-loop ``## slice <id> @<sha>`` section removed.
+
+    Open-loop slice-evals append their own sections (with their own
+    ``iteration:``/``evaluated:``/``attempt:`` lines) to the same file as
+    the integration verdict. A section runs from its heading up to (not
+    including) the next ``# ``/``## `` heading that is not itself a slice
+    heading, or EOF. Everything else is kept in order, so integration
+    field checks see only the integration verdict's own block.
+    """
+    kept: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if _SLICE_SECTION_HEADING_RE.match(line):
+            skipping = True
+            continue
+        if skipping and (line.startswith("# ") or line.startswith("## ")):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
+
+
 def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
     """True when the verdict names this iteration and no other one.
 
@@ -1589,19 +1615,22 @@ def _role_artifact_ready(
         )
         if slice_eval:
             return True
-        if not _verdict_line_ready(text):
+        # Integration verdict: appended open-loop slice sections carry
+        # their own field lines and must not vote on this attempt.
+        scoped = _integration_verdict_text(text)
+        if not _verdict_line_ready(scoped):
             return False
-        if not _verdict_mentions_iteration(text, iteration):
+        if not _verdict_mentions_iteration(scoped, iteration):
             return False
         pinned = None
         attempt = None
         if context:
             pinned = context.get("pinned_sha") or context.get("expected_sha")
             attempt = context.get("evaluator_attempt")
-        if attempt and not _verdict_records_attempt(text, str(attempt)):
+        if attempt and not _verdict_records_attempt(scoped, str(attempt)):
             return False
         if pinned:
-            return _verdict_records_sha(text, str(pinned))
+            return _verdict_records_sha(scoped, str(pinned))
         return True
     return True
 
