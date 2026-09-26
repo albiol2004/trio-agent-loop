@@ -187,7 +187,9 @@ full Lead iteration:
 7. **Termination**: once every planned slice is retired and no fault is
    `open` or `taken`, run one integration evaluation on HEAD against
    GOAL.md's acceptance criteria; SHIP uses the existing retirement-commit
-   convention, ITERATE appends a fault and the loop continues.
+   convention, ITERATE appends a fault and the loop continues. In
+   open-loop, REPORT.md is a dispatch ledger, not a verification claim;
+   your own full-suite run is the sole authoritative verification.
 
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.

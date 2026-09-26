@@ -17,6 +17,8 @@ mailbox `{mailbox}` at iteration {iteration}.
    so the coordinator's prune backstop matches it.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
+   (Open-loop: the OPEN-LOOP CONTEXT procedure replaces this step with a
+   dispatch/merge ledger and no Lead suite run.)
 5. Commit every code-changing slice as its own commit
    `slice(<id>): <summary>`. Add no commit trailers unless the task or
    the user's instructions explicitly ask for one. Leave the

@@ -187,9 +187,22 @@ extension"), run this loop instead of waiting for a verdict:
 5. **Backpressure**: while 2 or more faults are `open` or `taken`, take no
    new slice — drain faults first. This replaces the two-consecutive-ITERATE
    drain rule while `QUEUE.md` exists.
+6. **No Lead self-check for isolated-builder slices.** For a slice an
+   isolated builder implemented (its run printed `integrated`), do NOT run
+   the project suite and do NOT re-verify the integrated tree — the
+   Evaluator's own full-suite run is the sole authoritative verification.
+   Your only checks are the builder's reported targeted test result and
+   commit presence (`git log --grep="^slice(<id>):"`). If the builder's
+   JSON shows `merge_commit` equal to `base` (empty integration, no
+   `slice(<id>):` commit), do not retire the slice — re-dispatch it. A
+   slice you implemented yourself still gets the targeted checks its
+   change affects. This step replaces the Quality bar's lockstep
+   build/tests/linters bullet and the lockstep REPORT.md template:
+   REPORT.md is the open-loop dispatch/merge ledger shown under Output.
+   **Never weaken verification** still applies in full.
 
 ## Quality bar
-- Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin.
+- Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6 replaces this bullet.)
 - **Never weaken verification to pass it**: no deleting/skipping tests, no loosening assertions, no hardcoding expected outputs — the Evaluator audits test diffs and treats it as an automatic fail. A genuinely wrong test may be fixed, with justification in the report.
 - Smallest diff that satisfies the increment; match existing style; stay inside your own out-of-scope fence.
 
@@ -200,7 +213,8 @@ per role:
   compressed results (pass/fail plus the exact commands and key output) to
   you.
 - You read builder evidence instead of re-executing their runs; during
-  review, run only the checks the changes actually affect.
+  review, run only the checks the changes actually affect. In open-loop
+  mode you run none for isolated-builder slices (Open-loop step 6).
 - The Evaluator owns the full suite once per iteration as the authoritative
   run and does not trust a green result it did not produce or verify.
 
@@ -215,6 +229,7 @@ cheap:
   short.
 
 ## Output — overwrite `loop/REPORT.md`
+Lockstep:
 ```markdown
 # Report — iteration N
 ## What was done          (task-by-task, with file paths)
@@ -225,6 +240,14 @@ cheap:
 ## Implementation provenance
 - Primary builder(s): task, files changed, result
 - Lead corrective edits: files changed and why direct correction was needed ("None" if none)
+```
+Open-loop (`loop/QUEUE.md` exists) — a dispatch/merge ledger, not a
+verification claim; no "How I verified it" section:
+```markdown
+# Report — iteration N (open-loop dispatch ledger)
+## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line, verbatim — or "not reported" | one-line status)
+## Deviations from plan   ("None" if none)
+## Known weaknesses       (where you'd look first if something is broken)
 ```
 
 ## Rules
