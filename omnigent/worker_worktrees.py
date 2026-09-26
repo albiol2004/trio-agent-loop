@@ -1658,6 +1658,160 @@ def cleanup(
     return results
 
 
+# ------------------------------------------ settling after session teardown
+#
+# Archive/DELETE of a session makes its host runner exit, but not
+# instantly: cleanup that runs right after the post-loop prune sees the
+# exiting runner still using an evaluator worktree and retains it
+# (``active_session``) with nothing left to retry (D1). These helpers wait,
+# bounded, for exactly the processes using such a worktree to exit and then
+# re-run the unchanged guards once. Nothing is killed or forced.
+
+
+def owner_exit_state(ident: dict[str, Any]) -> str:
+    """``exited``, ``alive`` or ``unknown`` for a ``{pid, start}`` identity.
+
+    A vanished pid, a reused pid (different start ticks) or a zombie (it
+    holds no cwd/fds) count as exited. A process whose stat cannot be read
+    is ``unknown`` and is never treated as gone.
+    """
+    pid = ident.get("pid")
+    proc = Path(f"/proc/{pid}")
+    try:
+        stat = (proc / "stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return "exited"
+    except OSError:
+        return "unknown" if proc.exists() else "exited"
+    fields = stat.rsplit(")", 1)[-1].split()
+    if len(fields) <= 19 or ident.get("start") is None:
+        return "unknown"
+    if fields[19] != ident.get("start") or fields[0] in ("Z", "X"):
+        return "exited"
+    return "alive"
+
+
+def settle_candidates(results: list[dict[str, Any]], torn_down: Any) -> list[str]:
+    """Ids retained only by processes of sessions this run just tore down.
+
+    Every session bound to the worktree must be in *torn_down*, and no
+    recorded worker/dispatcher/process group may be alive: those are live
+    owners with their own lifecycle and are never waited out.
+    """
+    gone = {sid for sid in torn_down or () if isinstance(sid, str) and sid}
+    ids = []
+    for record in results:
+        if record.get("state") != "retained" or record.get("retained_reason") != "active_session":
+            continue
+        sessions = set(record.get("session_ids") or [])
+        if not sessions or not sessions <= gone:
+            continue
+        if identity_alive(record.get("worker")) or identity_alive(record.get("dispatcher")):
+            continue
+        if group_alive(record.get("pgid")):
+            continue
+        ids.append(record["id"])
+    return ids
+
+
+def await_owner_exit(
+    repo: Path,
+    worker_ids: list[str],
+    *,
+    deadline_s: float,
+    poll_s: float = 0.05,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> dict[str, dict[str, Any]]:
+    """Wait, at most *deadline_s* in total, for each worktree's users to exit.
+
+    Read-only and lock-free. Each poll rescans the worktree, so a process
+    that starts using it meanwhile is tracked too. Returns, per id,
+    ``outcome`` (``exited`` | ``timeout`` | ``unconfirmed``), ``waited_s``
+    and the pids still counted against it.
+    """
+    start = clock()
+    tracked: dict[str, dict[int, dict[str, Any]]] = {wid: {} for wid in worker_ids}
+    paths = {wid: Path(load_record(repo, wid)["path"]) for wid in worker_ids}
+    pending = set(worker_ids)
+    result: dict[str, dict[str, Any]] = {}
+    delay = poll_s
+    while True:
+        for wid in sorted(pending):
+            idents = tracked[wid]
+            try:
+                users = processes_using(paths[wid])
+            except OSError:
+                users = None  # /proc not listable: exit cannot be confirmed
+            for pid in users or ():
+                ident = idents.get(pid)
+                if ident is None or owner_exit_state(ident) == "exited":
+                    idents[pid] = process_identity(pid)
+            states = {pid: owner_exit_state(i) for pid, i in idents.items()}
+            alive = sorted(p for p, s in states.items() if s == "alive")
+            unknown = sorted(p for p, s in states.items() if s == "unknown")
+            if users is not None and not users and not alive and not unknown:
+                result[wid] = {"outcome": "exited", "pids": []}
+                pending.discard(wid)
+            else:
+                result[wid] = {
+                    "outcome": "timeout" if alive and users is not None else "unconfirmed",
+                    "pids": alive or unknown,
+                }
+        elapsed = clock() - start
+        if not pending or elapsed >= deadline_s:
+            break
+        sleep(min(delay, deadline_s - elapsed))
+        delay = min(delay * 2, 0.5)
+    waited = round(clock() - start, 3)
+    for entry in result.values():
+        entry["waited_s"] = waited
+    return result
+
+
+def recheck_settled(
+    repo: Path,
+    outcomes: dict[str, dict[str, Any]],
+    *,
+    deadline_s: float,
+    held_sessions: set[str] | None = None,
+    acceptance_for: Any = None,
+) -> list[dict[str, Any]]:
+    """Re-run ``cleanup_one`` for worktrees whose users exited; retain the rest."""
+    repo = repo_toplevel(repo)
+    results: list[dict[str, Any]] = []
+    with repo_lock(repo):
+        for worker_id, outcome in sorted(outcomes.items()):
+            record = load_record(repo, worker_id)
+            if record.get("state") != "retained":
+                results.append(record)  # changed meanwhile: leave it alone
+                continue
+            record["owner_exit"] = dict(outcome)
+            save_record(repo, record)
+            pids = outcome.get("pids") or []
+            if outcome.get("outcome") == "timeout":
+                results.append(_retain(
+                    repo, record, "active_session",
+                    f"processes still using worktree after {deadline_s:g}s: {pids[:10]}",
+                ))
+                continue
+            if outcome.get("outcome") != "exited":
+                results.append(_retain(
+                    repo, record, "active_session",
+                    f"exit of processes using worktree unconfirmed: {pids[:10]}",
+                ))
+                continue
+            try:
+                results.append(cleanup_one(
+                    repo, worker_id,
+                    held_sessions=held_sessions,
+                    acceptance_for=acceptance_for,
+                ))
+            except WorktreeError as exc:
+                results.append(_retain(repo, load_record(repo, worker_id), "cleanup_error", str(exc)))
+    return results
+
+
 def mark_finished(repo: Path, worker_id: str) -> dict[str, Any]:
     """An evaluator session using this worktree has ended its dispatch."""
     with repo_lock(repo):

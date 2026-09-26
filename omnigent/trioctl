@@ -1172,10 +1172,25 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
     return {"evaluated": evaluated, "iteration": iteration, "attempt": attempt}
 
 
+# Upper bound on waiting for torn-down sessions' runners to leave their
+# worktrees before the final cleanup gives up and retains them.
+WORKTREE_SETTLE_SECONDS = 30.0
+
+
 def _run_worktree_cleanup(
-    repo: Path, mailbox: Path | None, loop_core: Any = None
+    repo: Path,
+    mailbox: Path | None,
+    loop_core: Any = None,
+    *,
+    torn_down: Any = (),
 ) -> list[dict[str, Any]]:
-    """Scoped, idempotent cleanup; an unreadable hold keeps everything."""
+    """Scoped, idempotent cleanup; an unreadable hold keeps everything.
+
+    *torn_down* names sessions this run just archived and deleted. A
+    worktree retained only because those sessions' processes are still
+    exiting is re-checked once they have exited (bounded by
+    ``WORKTREE_SETTLE_SECONDS``); every guard runs again unchanged.
+    """
     wt = _require_worktrees()
     if _has_unreadable_hold(mailbox):
         print(
@@ -1183,12 +1198,35 @@ def _run_worktree_cleanup(
             file=sys.stderr,
         )
         return []
+    acceptance_for = lambda box: _ship_acceptance(box, repo, loop_core)  # noqa: E731
     results = wt.cleanup(
         repo,
         mailbox=mailbox,
         held_sessions=_held_session_ids(mailbox),
-        acceptance_for=lambda box: _ship_acceptance(box, repo, loop_core),
+        acceptance_for=acceptance_for,
     )
+    settle = wt.settle_candidates(results, torn_down)
+    if settle:
+        outcomes = wt.await_owner_exit(
+            repo, settle, deadline_s=WORKTREE_SETTLE_SECONDS
+        )
+        if _has_unreadable_hold(mailbox):
+            print(
+                "trioctl: unreadable held record; not re-checking worktrees "
+                "of torn-down sessions",
+                file=sys.stderr,
+            )
+        else:
+            rechecked = {
+                r["id"]: r
+                for r in wt.recheck_settled(
+                    repo, outcomes,
+                    deadline_s=WORKTREE_SETTLE_SECONDS,
+                    held_sessions=_held_session_ids(mailbox),
+                    acceptance_for=acceptance_for,
+                )
+            }
+            results = [rechecked.get(r.get("id"), r) for r in results]
     for record in results:
         print(f"trioctl: worktree {wt.summarize(record)}", file=sys.stderr)
     return results
@@ -2084,6 +2122,7 @@ def _prune_broker_sessions(
     session_ids: Any = None,
     include_sub_agents: bool = False,
     keep_unarchived: bool = False,
+    deleted_ids: list[str] | None = None,
 ) -> dict[str, int]:
     """Archive-then-delete broker sessions, id-scoped or title-scoped.
 
@@ -2122,6 +2161,9 @@ def _prune_broker_sessions(
     RAM per role). With ``keep_unarchived`` the old keep-and-skip
     behavior is restored for callers that would rather leak than lose
     an incomplete transcript.
+
+    ``deleted_ids``, when given, receives each session id whose DELETE
+    succeeded.
     """
     rows = _fetch_all_broker_sessions(
         client, kind="any" if include_sub_agents else None
@@ -2240,6 +2282,8 @@ def _prune_broker_sessions(
         except broker_http.BrokerHttpError as exc:
             raise TrioctlError(str(exc)) from exc
         counts["deleted"] += 1
+        if deleted_ids is not None:
+            deleted_ids.append(session_id)
         if read_error is None:
             print(
                 f"trioctl: archived and deleted {session_id} -> "
@@ -2337,7 +2381,7 @@ def _run_post_loop_session_prune(
     session_ids: Any,
     *,
     keep_unarchived: bool = False,
-) -> None:
+) -> list[str]:
     """Best-effort cleanup after a headless `loop` run exits (default-on).
 
     Runs after the loop returns regardless of its exit code, unless the
@@ -2354,25 +2398,31 @@ def _run_post_loop_session_prune(
     retry -- terminals only die on broker DELETE, never on process
     exit, so keeping them leaks 200-600 MB of RAM per role. The matching
     `loop --keep-unarchived` flag opts back into keep-and-skip.
+
+    Returns the ids actually deleted (also on a partial failure), so the
+    worktree cleanup can wait for exactly those sessions' runners to exit.
     """
     ids = sorted({sid for sid in session_ids if isinstance(sid, str) and sid})
+    deleted: list[str] = []
     if not ids:
-        return
+        return deleted
     try:
         client = _session_client(base_url)
         counts = _prune_broker_sessions(
             client, mailbox, session_ids=ids,
             keep_unarchived=keep_unarchived,
+            deleted_ids=deleted,
         )
     except TrioctlError as exc:
         print(f"trioctl: session prune failed: {exc}", file=sys.stderr)
-        return
+        return deleted
     print(
         "trioctl: session prune archived "
         f"{counts['archived']}, deleted {counts['deleted']}, "
         f"skipped running {counts['skipped_running']}, "
         f"failed {counts['failed']}"
     )
+    return deleted
 
 
 # Kind-specific Open-loop procedures appended to OPEN-LOOP CONTEXT blocks.
@@ -4038,6 +4088,7 @@ def command_loop(args: argparse.Namespace) -> int:
             os.environ.pop(SESSION_IDS_ENV_VAR, None)
         else:
             os.environ[SESSION_IDS_ENV_VAR] = previous_ids_env
+        torn_down: list[str] = []
         if not keep_sessions:
             created = list(getattr(runner, "created_session_ids", []) or [])
             created.extend(_read_session_ids_file(ids_file))
@@ -4064,10 +4115,10 @@ def command_loop(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 created = []
-            _run_post_loop_session_prune(
+            torn_down = _run_post_loop_session_prune(
                 mailbox, getattr(args, "base_url", None), created,
                 keep_unarchived=getattr(args, "keep_unarchived", False),
-            )
+            ) or []
             try:
                 ids_file.unlink()
             except OSError:
@@ -4084,8 +4135,10 @@ def command_loop(args: argparse.Namespace) -> int:
                     print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
             # After prune, so deleted role sessions no longer hold their
             # worktrees; held sessions keep theirs (see _blocking_state).
+            # Their runners exit asynchronously after archive/DELETE, so
+            # worktrees they still hold are re-checked once they exit.
             try:
-                _run_worktree_cleanup(repo, mailbox)
+                _run_worktree_cleanup(repo, mailbox, torn_down=torn_down)
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: worker worktree cleanup failed: {exc}", file=sys.stderr)
         if observe:
