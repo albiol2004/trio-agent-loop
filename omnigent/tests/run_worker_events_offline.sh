@@ -17,7 +17,7 @@ SITE="/home/coder/.local/lib/python3.12/site-packages"
 test -x "$BWRAP"
 test -x "$PYTHON"
 
-exec "$BWRAP" \
+"$BWRAP" \
   --unshare-net \
   --die-with-parent \
   --clearenv \

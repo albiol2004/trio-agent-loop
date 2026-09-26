@@ -32,7 +32,7 @@ if [ -d "$FIXTURE" ]; then
   FIXTURE_ARGS=(--ro-bind "$FIXTURE" "$FIXTURE")
 fi
 
-exec "$BWRAP" \
+"$BWRAP" \
   --unshare-net \
   --die-with-parent \
   --clearenv \
