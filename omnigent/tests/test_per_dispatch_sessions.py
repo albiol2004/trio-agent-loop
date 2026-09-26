@@ -163,3 +163,162 @@ def test_real_loop_core_accepts_slice_eval_concurrency() -> None:
 
     for fn in (trio_loop.run_loop, trio_loop.run_open_loop):
         assert "slice_eval_concurrency" in inspect.signature(fn).parameters
+
+
+# F1: a slice-eval's readiness is scoped to its OWN section ---------------
+
+FULL_SHA = "abc1234def5678abc1234def5678abc1234def56"
+
+
+class SiblingAppendClient:
+    """A goes idle WITHOUT writing after sibling B appended its section;
+    A's re-entered wait parks until released, then A appends its own."""
+
+    def __init__(self, verdict: Path) -> None:
+        self.verdict = verdict
+        self.lock = threading.Lock()
+        self.by_session: dict[str, str] = {}
+        self.a_waits = 0
+        self.both_created = threading.Event()
+        self.b_appended = threading.Event()
+        self.a_reentered = threading.Event()
+        self.release_a = threading.Event()
+
+    def _append(self, slice_id: str, verdict: str = "SHIP") -> None:
+        with self.lock, self.verdict.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## slice {slice_id} @{FULL_SHA} — {verdict}\nevidence\n")
+
+    def create(self, agent_id, model, message, title):
+        with self.lock:
+            sid = f"s-{len(self.by_session) + 1}"
+            self.by_session[sid] = message.split()[-1]
+            if len(self.by_session) == 2:
+                self.both_created.set()
+        return {"id": sid}
+
+    def wait_session(self, session_id, timeout=None, interval=None):
+        assert self.both_created.wait(5)
+        slice_id = self.by_session[session_id]
+        if slice_id == "b":
+            self._append("b")
+            self.b_appended.set()
+            return {"id": session_id, "status": "idle"}
+        with self.lock:
+            self.a_waits += 1
+            first = self.a_waits == 1
+        if first:  # idle without writing, after B's append
+            assert self.b_appended.wait(5)
+            return {"id": session_id, "status": "idle"}
+        self.a_reentered.set()
+        assert self.release_a.wait(5)
+        self._append("a")
+        return {"id": session_id, "status": "idle"}
+
+    def get_items(self, session_id, **_kw):
+        return {"items": [{"role": "assistant", "status": "completed"}]}
+
+
+def _slice_runner(trioctl, tmp_path, client):
+    runner = _runner(trioctl, tmp_path, client)
+    runner._prompt = lambda role, it, mb, ctx: f"prompt {ctx['slice']}"
+    return runner
+
+
+def _slice_ctx(slice_id: str, sha: str = FULL_SHA) -> dict:
+    return {"mode": "open-loop", "kind": "slice-eval", "slice": slice_id, "sha": sha}
+
+
+def test_sibling_append_does_not_satisfy_idle_slice_eval(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    client = SiblingAppendClient(mailbox / "VERDICT.md")
+    runner = _slice_runner(trioctl, tmp_path, client)
+    codes: dict[str, int] = {}
+
+    def go(slice_id: str) -> None:
+        codes[slice_id] = runner.run("evaluator", 1, mailbox, _slice_ctx(slice_id))
+
+    threads = {s: threading.Thread(target=go, args=(s,), name=f"eval-{s}") for s in "ab"}
+    for t in threads.values():
+        t.start()
+    threads["b"].join(10)
+    assert codes.get("b") == 0
+    # A went idle without writing; B's append must not be accepted for A.
+    assert client.a_reentered.wait(5), "A did not re-enter its own wait"
+    assert threads["a"].is_alive() and "a" not in codes
+    assert "## slice a @" not in (mailbox / "VERDICT.md").read_text(encoding="utf-8")
+    client.release_a.set()
+    threads["a"].join(10)
+    assert not threads["a"].is_alive()
+    assert codes == {"a": 0, "b": 0}
+
+
+def _slice_ready(trioctl, tmp_path, text, *, slice_id, sha=FULL_SHA,
+                 before="# Verdicts\n"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mailbox = make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(text, encoding="utf-8")
+    return trioctl._role_artifact_ready(
+        mailbox, "evaluator", 1, before, 0.0, _slice_ctx(slice_id, sha)
+    )
+
+
+def test_slice_eval_ready_requires_own_slice_and_sha(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    base = "# Verdicts\n"
+    other_sha = "f" * 40
+    # Same slice at a different sha: not this dispatch.
+    assert not _slice_ready(
+        trioctl, tmp_path / "1", base + f"## slice a @{other_sha} — SHIP\n",
+        slice_id="a",
+    )
+    # Different slice at the same sha: not this dispatch.
+    assert not _slice_ready(
+        trioctl, tmp_path / "2", base + f"## slice b @{FULL_SHA} — SHIP\n",
+        slice_id="a",
+    )
+    # 7-char heading prefix of the full context sha matches.
+    assert _slice_ready(
+        trioctl, tmp_path / "3", base + f"## slice a @{FULL_SHA[:7]} — SHIP\n",
+        slice_id="a",
+    )
+    # Short context sha, full heading sha: prefix either way.
+    assert _slice_ready(
+        trioctl, tmp_path / "4", base + f"## slice a @{FULL_SHA} — SHIP\n",
+        slice_id="a", sha=FULL_SHA[:7],
+    )
+    # ITERATE suffix matches.
+    assert _slice_ready(
+        trioctl, tmp_path / "5", base + f"## slice a @{FULL_SHA} — ITERATE\n",
+        slice_id="a",
+    )
+    # Own section present but text unchanged (stale): not fresh.
+    stale = base + f"## slice a @{FULL_SHA} — SHIP\n"
+    assert not _slice_ready(trioctl, tmp_path / "6", stale, before=stale, slice_id="a")
+
+
+class SingleAppendClient:
+    def __init__(self, verdict: Path) -> None:
+        self.verdict = verdict
+        self.waits = 0
+
+    def create(self, agent_id, model, message, title):
+        return {"id": "s-1"}
+
+    def wait_session(self, session_id, timeout=None, interval=None):
+        self.waits += 1
+        with self.verdict.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## slice solo @{FULL_SHA[:7]} — SHIP\n")
+        return {"id": session_id, "status": "idle"}
+
+    def get_items(self, session_id, **_kw):
+        return {"items": [{"role": "assistant", "status": "completed"}]}
+
+
+def test_single_slice_eval_appender_unchanged(tmp_path: Path) -> None:
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    client = SingleAppendClient(mailbox / "VERDICT.md")
+    runner = _slice_runner(trioctl, tmp_path, client)
+    assert runner.run("evaluator", 1, mailbox, _slice_ctx("solo")) == 0
+    assert client.waits == 1

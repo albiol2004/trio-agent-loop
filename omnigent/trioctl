@@ -1651,6 +1651,31 @@ def _verdict_records_sha(text: str, sha: str) -> bool:
     return False
 
 
+_SLICE_VERDICT_HEADING_RE = re.compile(
+    r"^##\s+slice\s+(\S+)\s+@([0-9a-fA-F]{4,40})\s+(?:—|--|-)\s+(SHIP|ITERATE)\s*$"
+)
+"""Same shape as metrics' ``SLICE_VERDICT_RE`` (``parse_slice_verdicts``),
+which the driver's ``wrote_section`` check uses to grade a slice-eval."""
+
+
+def _slice_section_present(text: str, slice_id: str, sha: str) -> bool:
+    """True when VERDICT.md holds ``## slice <slice_id> @<sha> — SHIP|ITERATE``.
+
+    Heading sha matches full-or-prefix either way, as ``_verdict_records_sha``.
+    """
+    want = sha.strip().lower()
+    if not want:
+        return False
+    for raw in text.splitlines():
+        match = _SLICE_VERDICT_HEADING_RE.match(raw.strip())
+        if not match or match.group(1) != slice_id:
+            continue
+        got = match.group(2).lower()
+        if got == want or want.startswith(got) or got.startswith(want):
+            return True
+    return False
+
+
 def _role_artifact_ready(
     mailbox: Path,
     role: str,
@@ -1666,6 +1691,9 @@ def _role_artifact_ready(
     *content* to change; a stale file that merely exists (or is touched)
     is not this attempt. ``before_mtime`` is kept for callers but is not
     a freshness signal — mtime-only bumps must not accept stale text.
+    With ``slice``/``sha`` in the context, the changed text must also hold
+    this dispatch's own ``## slice <slice> @<sha> — SHIP|ITERATE`` heading
+    (concurrent siblings append to the same file).
     """
     del before_mtime
     if role == "lead":
@@ -1683,7 +1711,16 @@ def _role_artifact_ready(
             context and context.get("kind") == "slice-eval"
         )
         if slice_eval:
-            return True
+            # Scoped to THIS dispatch: under concurrent slice-evals a
+            # sibling's append also changes the file, so freshness alone
+            # would accept a session that went idle without writing.
+            slice_id = str(context.get("slice") or "").strip()
+            sha = str(
+                context.get("sha") or context.get("pinned_sha") or ""
+            ).strip()
+            if not slice_id or not sha:
+                return True  # legacy callers without slice/sha context
+            return _slice_section_present(text, slice_id, sha)
         # Integration verdict: appended open-loop slice sections carry
         # their own field lines and must not vote on this attempt.
         scoped = _integration_verdict_text(text)
