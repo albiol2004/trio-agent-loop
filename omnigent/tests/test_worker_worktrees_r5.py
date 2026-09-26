@@ -213,6 +213,63 @@ def test_b2_runner_excludes_held_in_any_recording_mailbox_and_inflight(trioctl, 
     assert runner._root_owned_ids(here) == {"done-1"}
 
 
+def test_b3_runner_never_owns_another_mailboxs_running_or_unattributed_record(
+    trioctl, wt, repo, root
+):
+    here, there = repo / "loop", repo / "other-box"
+    there.mkdir()
+    runner = trioctl.OmnigentRunner(repo=repo, broker_client=object(), config={}, interval=0,
+                                    isolate_workers={"trioctl": SCRIPT, "worktree_root": str(root)})
+    wt.record_root_session(repo, "done-1", here)
+    wt.record_root_session(repo, "other-live", there)       # not held, not in our _inflight
+    wt.record_root_session(repo, "no-box")                  # ownership uncertain
+    wt.record_root_session(repo, "contested", there)
+    runner.created_session_ids.append("contested")          # conflicting evidence: fail closed
+    assert runner._root_owned_ids(here) == {"done-1"}
+    assert runner._root_owned_ids(there) == {"other-live", "contested"}   # its own records
+
+
+def test_b3_reviewer_r18b_other_mailboxs_new_session_survives_restore(
+    trioctl, wt, repo, root, monkeypatch
+):
+    """R18b: loop B's session is recorded before its cursor-agent starts."""
+    here, there = repo / "loop", repo / "box2"
+    there.mkdir()
+    raw = b'{ "mcpServers" : {"db": {"command": "mine", "env": {"API_TOKEN": "%s"}}}}' % (
+        FAKE_MAIN.encode())
+    (repo / ".cursor").mkdir()
+    (repo / ".cursor" / "mcp.json").write_bytes(raw)
+    monkeypatch.setattr(wt, "cursor_processes_at", lambda _repo: [])  # the launch gap
+    runner = trioctl.OmnigentRunner(repo=repo, broker_client=object(), config={}, interval=0,
+                                    isolate_workers={"trioctl": SCRIPT, "worktree_root": str(root)})
+    runner._prepare_root_config(here)                        # loop A's baseline
+    wt.record_root_session(repo, "other-live", there)        # loop B (another process)
+    omnigent_launch(repo, "other-live")
+    mcp_before = (repo / ".cursor" / "mcp.json").read_bytes()
+    hooks_before = (repo / ".cursor" / "hooks.json").read_bytes()
+    problems = runner._restore_root_config(here, final=True)
+    assert (repo / ".cursor" / "mcp.json").read_bytes() == mcp_before
+    assert (repo / ".cursor" / "hooks.json").read_bytes() == hooks_before
+    data = json.loads(mcp_before)
+    assert wt._bridge_arg(data["mcpServers"]["omnigent"]["args"]) == wt.bridge_key("other-live")
+    assert problems, "unowned residue must fail closed, not report a clean restore"
+    assert not any(FAKE_MAIN in p for p in problems)
+    assert wt.root_owned_sessions(repo) == {"other-live": str(there)}   # evidence kept
+
+    # Same-mailbox cleanup still works once loop B's residue is gone: A's own
+    # recorded (not created-in-process) session is undone back to the baseline.
+    (repo / ".cursor" / "mcp.json").write_bytes(raw)
+    (repo / ".cursor" / "hooks.json").unlink()
+    wt.record_root_session(repo, "own-done", here)
+    omnigent_launch(repo, "own-done")
+    fresh = trioctl.OmnigentRunner(repo=repo, broker_client=object(), config={}, interval=0,
+                                   isolate_workers={"trioctl": SCRIPT, "worktree_root": str(root)})
+    assert fresh._root_owned_ids(here) == {"own-done"}
+    assert fresh._restore_root_config(here) == []
+    assert (repo / ".cursor" / "mcp.json").read_bytes() == raw
+    assert not (repo / ".cursor" / "hooks.json").exists()
+
+
 def test_b2_e2e_held_root_session_config_survives_the_run(
     trioctl, wt, repo, root, loop_core, monkeypatch
 ):

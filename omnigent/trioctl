@@ -2878,21 +2878,32 @@ class OmnigentRunner:
     def _root_owned_ids(self, mailbox: Path) -> set[str]:
         """Root sessions this task provably launched and that no longer run.
 
-        This run's created ids, ids recorded as launched at THIS root, and
-        ids an earlier trioctl run of this mailbox archived (full id and
-        locked title prefix). Held sessions (of this mailbox or of the
-        mailbox a recorded session belongs to) and in-flight dispatches are
-        never included; restore_root_cursor adds nothing back.
+        This run's created ids, ids recorded at THIS root under THIS
+        mailbox, and ids an earlier trioctl run of this mailbox archived
+        (full id and locked title prefix). A session recorded under another
+        mailbox, or with no mailbox, is only evidence: another trioctl
+        process may have it in flight (recorded before its cursor-agent
+        starts), so it is never included, whatever else claims it. Held
+        sessions (of this mailbox or of the mailbox a recorded session
+        belongs to) and in-flight dispatches are never included either;
+        restore_root_cursor adds nothing back.
         """
         owned = set(self.created_session_ids)
         held_elsewhere: set[str] = set()
+        foreign: set[str] = set()
         recorded = worker_worktrees.root_owned_sessions(self.repo)
+        here = mailbox.resolve()
         for sid, box in recorded.items():
-            owned.add(sid)
-            if box and Path(box).resolve() != mailbox.resolve():
+            try:
+                ours = bool(box) and Path(box).resolve() == here
+            except (OSError, RuntimeError):
+                ours = False
+            if ours:
+                owned.add(sid)
+                continue
+            foreign.add(sid)
+            if box:
                 held_elsewhere |= _held_session_ids(Path(box))
-                if _has_unreadable_hold(Path(box)):
-                    held_elsewhere.add(sid)
         prefix = f"trioctl {mailbox.name} "
         archive = mailbox / ".sessions"
         if archive.is_dir():
@@ -2911,7 +2922,7 @@ class OmnigentRunner:
         held = set(self.held_session_ids) | _held_session_ids(mailbox) | held_elsewhere
         with self._own_lock:
             inflight = set(self._inflight)
-        return owned - held - inflight
+        return owned - held - inflight - foreign
 
     def _restore_root_config(self, mailbox: Path, *, final: bool = False) -> list[str]:
         """Undo this task's own Omnigent merges into the root ``.cursor`` config.
