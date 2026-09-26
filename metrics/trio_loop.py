@@ -9,6 +9,7 @@ this driver accepts exactly what trio-check.py accepts.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib.machinery
 import importlib.util
 import inspect
@@ -526,8 +527,34 @@ def _slice_verdict_blocks(text: str) -> list[dict]:
         })
     return blocks
 
+def _read_text_settled(path: Path, tries: int = 5, pause: float = 0.02) -> str:
+    """Read *path* until two consecutive reads agree (bounded).
+
+    Concurrent slice-eval sessions rewrite VERDICT.md while the driver
+    reads it; a single read can catch a truncated, half-written file.
+    """
+    def once() -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+    text = once()
+    for _ in range(tries):
+        time.sleep(pause)
+        again = once()
+        if again == text:
+            return text
+        text = again
+    return text
+
+
 def _restore_clobbered_verdict_sections(
-    mailbox: Path, verdict_path: Path, snapshot_text: str, kind: str, iteration: int
+    mailbox: Path,
+    verdict_path: Path,
+    snapshot_text: str,
+    kind: str,
+    iteration: int,
+    read_text=None,
 ) -> None:
     """Guard against an Evaluator session rewriting VERDICT.md whole instead
     of appending: if any ``## slice ... — SHIP|ITERATE`` section present
@@ -540,11 +567,14 @@ def _restore_clobbered_verdict_sections(
     rebuild is the new text's own sections followed by the missing old
     ones, both in their original relative order.
     """
-    new_text = (
-        verdict_path.read_text(encoding="utf-8", errors="replace")
-        if verdict_path.is_file()
-        else ""
-    )
+    if read_text is not None:
+        new_text = read_text(verdict_path)
+    else:
+        new_text = (
+            verdict_path.read_text(encoding="utf-8", errors="replace")
+            if verdict_path.is_file()
+            else ""
+        )
     old_blocks = _slice_verdict_blocks(snapshot_text)
     if not old_blocks:
         return
@@ -1531,8 +1561,12 @@ def run_loop(
     repo: Path | None = None,
     poll_seconds: float = 30,
     mode: str = "auto",
+    slice_eval_concurrency: int = 1,
 ) -> int:
     """Dispatch to open-loop or lockstep (api: engine entry points).
+
+    ``slice_eval_concurrency`` (open-loop only; default 1 = the serial
+    slice-eval loop) is passed through to `run_open_loop`.
 
     `mode="auto"` (default) selects open-loop iff `(mailbox / "QUEUE.md")`
     is a file; `mode="lockstep"` always takes the lockstep path (byte
@@ -1554,6 +1588,9 @@ def run_loop(
             file=sys.stderr,
         )
         return 3
+    extra: dict = {}
+    if slice_eval_concurrency != 1:
+        extra["slice_eval_concurrency"] = slice_eval_concurrency
     return run_open_loop(
         mailbox,
         max_iterations,
@@ -1561,6 +1598,7 @@ def run_loop(
         runner,
         repo=repo,
         poll_seconds=poll_seconds,
+        **extra,
     )
 
 
@@ -1577,6 +1615,7 @@ def _write_open_loop_sidecars(
     lead_alive: bool,
     eval_alive: bool,
     started_at: str,
+    evaluator_sessions: dict | None = None,
 ) -> None:
     """Write BOTH sidecars for an open-loop driver (api:OpenLoopSidecar).
 
@@ -1584,6 +1623,12 @@ def _write_open_loop_sidecars(
     session_ids) plus open_loop/lead_alive/eval_alive. `.session.json` is
     open-loop only (lockstep never writes it); `phase` is exactly one of
     "lead" | "evaluator" | "done" in both files.
+
+    With concurrent slice-evals (``evaluator_sessions`` not None),
+    `.driver.json` also carries ``evaluator_sessions``:
+    ``{"<slice>@<sha>": "<session id>" | null}`` for every in-flight
+    slice-eval (null until its session exists); ``session_ids.evaluator``
+    stays the last-dispatched evaluator session.
     """
     session_ids: dict = {}
     session_ids.update(getattr(lead_runner, "session_ids", {}) or {})
@@ -1597,6 +1642,8 @@ def _write_open_loop_sidecars(
         "lead_alive": lead_alive,
         "eval_alive": eval_alive,
     }
+    if evaluator_sessions is not None:
+        driver_payload["evaluator_sessions"] = dict(evaluator_sessions)
     for key, value in _driver_meta(lead_runner, eval_runner).items():
         driver_payload.setdefault(key, value)
     (mailbox / ".driver.json").write_text(
@@ -1847,6 +1894,27 @@ def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
     return result.returncode
 
 
+#: Drain budget for in-flight slice-evals when the runner exposes no
+#: per-dispatch timeout (OmnigentRunner's default role timeout).
+DEFAULT_SLICE_EVAL_DRAIN_SECONDS = 3600.0
+
+
+def _slice_eval_drain_seconds(eval_runner: object) -> float:
+    """The same budget a single dispatch gets today (runner's role timeout)."""
+    for name in ("timeout", "_timeout"):
+        value = getattr(eval_runner, name, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if math.isfinite(value) and value >= 0:
+                return float(value)
+    return DEFAULT_SLICE_EVAL_DRAIN_SECONDS
+
+
+def _merge_slice_blocks(known: dict, text: str) -> None:
+    """Remember every `## slice ... — SHIP|ITERATE` block seen in *text*."""
+    for block in _slice_verdict_blocks(text):
+        known.setdefault((block["slice"], block["sha"]), block["text"])
+
+
 def run_open_loop(
     mailbox: Path,
     max_iterations: int,
@@ -1855,19 +1923,107 @@ def run_open_loop(
     *,
     repo: Path | None = None,
     poll_seconds: float = 30,
+    slice_eval_concurrency: int = 1,
+    slice_eval_drain_seconds: float | None = None,
 ) -> int:
     """Run the open-loop Lead+Evaluator state machine against a QUEUE.md
     mailbox: one stdlib Lead thread plus an Evaluator poll loop on the
-    calling thread, sharing the ONE mailbox lock this function acquires."""
+    calling thread, sharing the ONE mailbox lock this function acquires.
+
+    ``slice_eval_concurrency`` 1 (default) grades retired slices one after
+    another on the calling thread (unchanged). N>1 dispatches up to N
+    slice-evals at once on a bounded thread pool: every polling turn
+    submits one future per retired, ungraded, not-in-flight
+    ``(slice, sha)`` (commit gate still run first, on this thread), then
+    harvests finished futures and applies the same post-processing
+    (clobber restore, verdict-section check, graded/gate_blocked/
+    slice_eval_attempts/eval_pending) on this thread only. An in-flight
+    slice-eval blocks the integration-eval exactly like a pending one; the
+    integration gate is re-checked right after each harvest. On any exit,
+    queued futures are cancelled and running ones are waited for up to
+    ``slice_eval_drain_seconds`` (default: the eval runner's own role
+    timeout, i.e. one dispatch's budget).
+    """
+    if not isinstance(slice_eval_concurrency, int) or slice_eval_concurrency < 1:
+        raise ValueError(
+            f"slice_eval_concurrency must be an int >= 1, got {slice_eval_concurrency!r}"
+        )
     mailbox = Path(mailbox).resolve()
     lock = _acquire_lock(mailbox)
     if lock is None:
         return 5
     lead_thread: threading.Thread | None = None
     stop_event = threading.Event()
+    concurrent_evals = slice_eval_concurrency > 1
+    pool: concurrent.futures.ThreadPoolExecutor | None = None
+    # (slice, sha) -> {"future", "snapshot", "seen"}; outer thread only.
+    inflight: dict[tuple[str, str], dict] = {}
+    drain_budget = (
+        slice_eval_drain_seconds
+        if slice_eval_drain_seconds is not None
+        else _slice_eval_drain_seconds(eval_runner)
+    )
+    verdict_path = mailbox / "VERDICT.md"
+
+    def evaluator_sessions() -> dict | None:
+        """In-flight slice-evals -> session id (None until created)."""
+        if not concurrent_evals:
+            return None
+        snapshot_fn = getattr(eval_runner, "inflight_sessions", None)
+        live: dict = {}
+        if callable(snapshot_fn):
+            try:
+                for sid, meta in (snapshot_fn() or {}).items():
+                    if isinstance(meta, dict) and meta.get("kind") == "slice-eval":
+                        live[f"{meta.get('slice')}@{meta.get('sha')}"] = sid
+            except Exception:  # noqa: BLE001 - a sidecar must not fail the loop
+                live = {}
+        return {
+            f"{slice_id}@{sha}": live.get(f"{slice_id}@{sha}")
+            for (slice_id, sha) in list(inflight)
+        }
+
+    def drain_slice_evals() -> None:
+        """Cancel queued slice-evals; wait (bounded) for running ones."""
+        nonlocal pool
+        if pool is None:
+            return
+        entries = list(inflight.items())
+        for _key, entry in entries:
+            entry["future"].cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        running = [e["future"] for _k, e in entries if not e["future"].cancelled()]
+        _done, not_done = concurrent.futures.wait(running, timeout=drain_budget)
+        try:
+            iteration_now = _number(_read_state(mailbox / "STATE.md")["iteration"])
+        except Exception:  # noqa: BLE001 - best effort on exit
+            iteration_now = 0
+        for (slice_id, sha), entry in entries:
+            future = entry["future"]
+            if future.cancelled() or not future.done():
+                continue
+            if future.exception() is None and future.result() == 0:
+                # The loop is exiting: bookkeeping no longer matters, but a
+                # finished eval's clobber restore still protects VERDICT.md.
+                try:
+                    _restore_clobbered_verdict_sections(
+                        mailbox, verdict_path, "".join(entry["seen"].values()),
+                        "slice-eval", iteration_now, read_text=_read_text_settled,
+                    )
+                except Exception:  # noqa: BLE001 - best effort on exit
+                    pass
+        inflight.clear()
+        if not_done:
+            _append_log(
+                mailbox,
+                f"- iter {iteration_now} | loop | open-loop: {len(not_done)} "
+                f"slice-eval(s) still running after the {drain_budget:g}s "
+                "drain budget; abandoned",
+            )
+        pool = None
+
     try:
         state_path = mailbox / "STATE.md"
-        verdict_path = mailbox / "VERDICT.md"
         repair_path = mailbox / ".repairs"
         if not (mailbox / "LOG.md").is_file():
             (mailbox / "LOG.md").write_text(
@@ -1876,24 +2032,48 @@ def run_open_loop(
         _read_state(state_path)
         started_at = _iso_now()
 
+        # The Lead thread writes the sidecars too: with concurrent evals
+        # snapshot+write happen under one lock and the last-written
+        # evaluator_sessions is remembered, so the driver thread can tell
+        # when `.driver.json` is stale.
+        sidecar_lock = threading.Lock()
+        written_sessions: list = [{}]
+
         def write_sidecar(
             phase: str, iteration: int, lead_alive: bool, eval_alive: bool
         ) -> None:
-            _write_open_loop_sidecars(
-                mailbox,
-                lead_runner,
-                eval_runner,
-                iteration,
-                phase,
-                lead_alive,
-                eval_alive,
-                started_at,
-            )
+            if not concurrent_evals:
+                _write_open_loop_sidecars(
+                    mailbox,
+                    lead_runner,
+                    eval_runner,
+                    iteration,
+                    phase,
+                    lead_alive,
+                    eval_alive,
+                    started_at,
+                )
+                return
+            with sidecar_lock:
+                sessions = evaluator_sessions()
+                _write_open_loop_sidecars(
+                    mailbox,
+                    lead_runner,
+                    eval_runner,
+                    iteration,
+                    phase,
+                    lead_alive,
+                    eval_alive,
+                    started_at,
+                    sessions,
+                )
+                written_sessions[0] = sessions
 
         def current_iteration() -> int:
             return _number(_read_state(state_path)["iteration"])
 
         def finish(code: int) -> int:
+            drain_slice_evals()
             write_sidecar("done", current_iteration(), False, False)
             return code
 
@@ -1941,6 +2121,45 @@ def run_open_loop(
         # same as gate_blocked -- see open-loop output verification.
         slice_eval_attempts: dict[tuple[str, str], int] = {}
         eval_pending: set[tuple[str, str]] = set()
+        # Concurrent slice-evals: one lock around every bookkeeping pass
+        # (harvest) so the sets above stay single-writer; only this outer
+        # thread ever takes it or touches them.
+        bookkeeping_lock = threading.Lock()
+
+        def harvest_slice_evals(post) -> int | None:
+            """Apply post-processing to every finished slice-eval future.
+
+            Successful ones first (in submission order); then the first
+            failure (non-zero exit / exception) is raised exactly as the
+            serial loop raises it -- the remaining ones are drained on exit.
+            """
+            current = _read_text_settled(verdict_path)
+            for entry in inflight.values():
+                # Everything seen on disk while an eval ran is protected by
+                # its clobber check (concurrent evals share VERDICT.md).
+                _merge_slice_blocks(entry["seen"], current)
+            failure: BaseException | None = None
+            for key in [k for k, e in inflight.items() if e["future"].done()]:
+                entry = inflight.pop(key)
+                future = entry["future"]
+                if future.cancelled():
+                    continue
+                exc = future.exception()
+                if exc is None and future.result() != 0:
+                    exc = RuntimeError(
+                        f"evaluator runner failed with exit {future.result()}"
+                    )
+                if exc is not None:
+                    if failure is None:
+                        failure = exc
+                    continue
+                snapshot = "".join(entry["seen"].values())
+                code = post(key[0], key[1], snapshot)
+                if code is not None:
+                    return code
+            if failure is not None:
+                raise failure
+            return None
 
         while True:
             lead_alive = not lead_result.get("finished", False)
@@ -1956,16 +2175,82 @@ def run_open_loop(
             )
             verdict_sections = _METRICS.parse_slice_verdicts(verdict_text)
 
+            def post_slice_eval(
+                slice_id: str, sha: str, verdict_snapshot: str
+            ) -> int | None:
+                """Post-process one finished slice-eval (outer thread only).
+
+                Returns an exit code to finish with, or None to go on.
+                """
+                key = (slice_id, sha)
+                # Concurrent evals may be rewriting VERDICT.md right now:
+                # read it settled so a torn read neither triggers a bogus
+                # restore nor hides this slice's section.
+                settled = _read_text_settled if concurrent_evals else None
+                _restore_clobbered_verdict_sections(
+                    mailbox, verdict_path, verdict_snapshot, "slice-eval",
+                    current_iteration(), read_text=settled,
+                )
+                # Verify against VERDICT.md on disk -- a runner exit of 0 is
+                # not proof the role did its job (a blip session can return
+                # 0 having written nothing).
+                if settled is not None:
+                    verdict_text_after = settled(verdict_path)
+                else:
+                    verdict_text_after = (
+                        verdict_path.read_text(encoding="utf-8", errors="replace")
+                        if verdict_path.is_file()
+                        else ""
+                    )
+                wrote_section = any(
+                    v["slice"] == slice_id and sha.startswith(v["sha"])
+                    for v in _METRICS.parse_slice_verdicts(verdict_text_after)
+                )
+                if wrote_section:
+                    graded.add(key)
+                    gate_blocked.discard(key)
+                    eval_pending.discard(key)
+                    slice_eval_attempts.pop(key, None)
+                    return None
+                attempts = slice_eval_attempts.get(key, 0) + 1
+                slice_eval_attempts[key] = attempts
+                _append_log(
+                    mailbox,
+                    f"- iter {current_iteration()} | loop | open-loop: "
+                    f"slice-eval for {slice_id}@{sha} wrote no verdict "
+                    f"section (attempt {attempts})",
+                )
+                if attempts >= 3:
+                    stop_event.set()
+                    wake_event.set()
+                    lead_thread.join(timeout=5)
+                    _update_state(state_path, {"status": "error"})
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | open-loop: "
+                        f"slice-eval for {slice_id}@{sha} failed to write a "
+                        f"verdict section after {attempts} attempts",
+                    )
+                    return 3
+                eval_pending.add(key)
+                return None
+
             for slice_id, entry in latest_retired.items():
                 sha = entry["sha"]
                 key = (slice_id, sha)
-                if key in graded:
+                if key in graded or key in inflight:
                     continue
                 if any(
                     v["slice"] == slice_id and sha.startswith(v["sha"])
                     for v in verdict_sections
                 ):
                     graded.add(key)
+                    if concurrent_evals:
+                        # A section that shows up after a harvest judged
+                        # it missing settles that key (the serial loop
+                        # never reaches this state).
+                        eval_pending.discard(key)
+                        slice_eval_attempts.pop(key, None)
                     continue
                 write_sidecar(
                     "evaluator", current_iteration(), lead_alive, True
@@ -2002,6 +2287,26 @@ def run_open_loop(
                     if verdict_path.is_file()
                     else ""
                 )
+                if concurrent_evals:
+                    # Submit and move on; harvested below on this thread.
+                    if pool is None:
+                        pool = concurrent.futures.ThreadPoolExecutor(
+                            max_workers=slice_eval_concurrency,
+                            thread_name_prefix="slice-eval",
+                        )
+                    future = pool.submit(
+                        _invoke_runner, eval_runner, "evaluator",
+                        current_iteration(), mailbox, context,
+                    )
+                    seen: dict = {}
+                    _merge_slice_blocks(seen, verdict_snapshot)
+                    inflight[key] = {
+                        "future": future,
+                        "snapshot": verdict_snapshot,
+                        "seen": seen,
+                    }
+                    future.add_done_callback(lambda _f: wake_event.set())
+                    continue
                 result = _invoke_runner(
                     eval_runner, "evaluator", current_iteration(), mailbox, context
                 )
@@ -2009,49 +2314,26 @@ def run_open_loop(
                     raise RuntimeError(
                         f"evaluator runner failed with exit {result}"
                     )
-                _restore_clobbered_verdict_sections(
-                    mailbox, verdict_path, verdict_snapshot, "slice-eval",
-                    current_iteration(),
-                )
-                # Verify against VERDICT.md on disk -- a runner exit of 0 is
-                # not proof the role did its job (a blip session can return
-                # 0 having written nothing).
-                verdict_text_after = (
-                    verdict_path.read_text(encoding="utf-8", errors="replace")
-                    if verdict_path.is_file()
-                    else ""
-                )
-                wrote_section = any(
-                    v["slice"] == slice_id and sha.startswith(v["sha"])
-                    for v in _METRICS.parse_slice_verdicts(verdict_text_after)
-                )
-                if wrote_section:
-                    graded.add(key)
-                    gate_blocked.discard(key)
-                    eval_pending.discard(key)
-                    slice_eval_attempts.pop(key, None)
-                    continue
-                attempts = slice_eval_attempts.get(key, 0) + 1
-                slice_eval_attempts[key] = attempts
-                _append_log(
-                    mailbox,
-                    f"- iter {current_iteration()} | loop | open-loop: "
-                    f"slice-eval for {slice_id}@{sha} wrote no verdict "
-                    f"section (attempt {attempts})",
-                )
-                if attempts >= 3:
-                    stop_event.set()
-                    wake_event.set()
-                    lead_thread.join(timeout=5)
-                    _update_state(state_path, {"status": "error"})
-                    _append_log(
-                        mailbox,
-                        f"- iter {current_iteration()} | loop | open-loop: "
-                        f"slice-eval for {slice_id}@{sha} failed to write a "
-                        f"verdict section after {attempts} attempts",
+                code = post_slice_eval(slice_id, sha, verdict_snapshot)
+                if code is not None:
+                    return finish(code)
+
+            if inflight:
+                with bookkeeping_lock:
+                    code = harvest_slice_evals(post_slice_eval)
+                if code is not None:
+                    return finish(code)
+            if concurrent_evals:
+                # `.driver.json` evaluator_sessions, rewritten from this
+                # thread whenever the in-flight set or its session ids
+                # changed (ids appear once each worker's create returns).
+                sessions_now = evaluator_sessions()
+                if sessions_now != written_sessions[0]:
+                    alive_now = not lead_result.get("finished", False)
+                    write_sidecar(
+                        "evaluator" if inflight or not alive_now else "lead",
+                        current_iteration(), alive_now, True,
                     )
-                    return finish(3)
-                eval_pending.add(key)
 
             lead_alive = not lead_result.get("finished", False)
             if not lead_alive:
@@ -2094,10 +2376,22 @@ def run_open_loop(
                     (sid, latest_for_gate[sid]["sha"]) in eval_pending
                     for sid in (slice_ids or [])
                     if sid in latest_for_gate
-                )
+                ) or bool(inflight)  # a running slice-eval is pending too
                 fully_retired = _slices_fully_retired(
                     slice_ids, retired_ids, open_or_taken
                 )
+                # The queue was re-read just above: a slice retired after
+                # this turn's dispatch pass is neither graded nor pending
+                # yet and must not let the integration-eval start.
+                any_ungraded = any(
+                    (sid, latest_for_gate[sid]["sha"]) not in graded
+                    for sid in (slice_ids or [])
+                    if sid in latest_for_gate
+                )
+                if fully_retired and any_ungraded and not (
+                    any_gate_blocked or any_eval_pending
+                ):
+                    continue  # dispatch it on the next turn, no wait
                 if fully_retired and (any_gate_blocked or any_eval_pending):
                     # Every declared slice has a retired entry, but at
                     # least one is still waiting on its commit gate
@@ -2210,6 +2504,7 @@ def run_open_loop(
             wake_event.clear()
     finally:
         stop_event.set()
+        drain_slice_evals()
         if lead_thread is not None:
             lead_thread.join(timeout=5)
         _release_lock(lock)
@@ -2293,6 +2588,14 @@ def main(argv: list[str] | None = None) -> int:
         default=30,
         help="open-loop Evaluator poll interval in seconds (default: 30)",
     )
+    run.add_argument(
+        "--slice-eval-concurrency",
+        type=int,
+        default=1,
+        metavar="N",
+        help="open-loop: grade up to N retired slices at once "
+        "(default 1: one after another)",
+    )
     mode_group = run.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--open-loop",
@@ -2319,6 +2622,7 @@ def main(argv: list[str] | None = None) -> int:
         repo=repo,
         poll_seconds=args.poll_seconds,
         mode=mode,
+        slice_eval_concurrency=args.slice_eval_concurrency,
     )
 
 if __name__ == "__main__":

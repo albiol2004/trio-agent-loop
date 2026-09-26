@@ -118,3 +118,48 @@ def test_timeout_holds_this_dispatchs_session_not_the_last_created(
         )
     assert "session mine " in str(err.value)
     assert "someone-else" not in str(err.value)
+
+
+# `trioctl omnigent loop --slice-eval-concurrency N` plumbing ------------
+
+
+def test_slice_eval_concurrency_flag_defaults_to_serial_and_passes_through() -> None:
+    trioctl = load_trioctl()
+    default = trioctl.parser().parse_args(["omnigent", "loop"])
+    assert default.slice_eval_concurrency == 1
+
+    class NewCore:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None,
+                     poll_seconds=30, mode="auto", slice_eval_concurrency=1):
+            return 0
+
+    class OldCore:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None):
+            return 0
+
+    # Default: the run_loop call is unchanged (no new kwarg), any core.
+    assert trioctl._slice_eval_concurrency_kwargs(OldCore, default) == {}
+    three = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--slice-eval-concurrency", "3"]
+    )
+    assert trioctl._slice_eval_concurrency_kwargs(NewCore, three) == {
+        "slice_eval_concurrency": 3
+    }
+    with pytest.raises(trioctl.TrioctlError, match="refused"):
+        trioctl._slice_eval_concurrency_kwargs(OldCore, three)
+    zero = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--slice-eval-concurrency", "0"]
+    )
+    with pytest.raises(trioctl.TrioctlError, match=">= 1"):
+        trioctl._slice_eval_concurrency_kwargs(NewCore, zero)
+
+
+def test_real_loop_core_accepts_slice_eval_concurrency() -> None:
+    import inspect
+
+    from metrics import trio_loop
+
+    for fn in (trio_loop.run_loop, trio_loop.run_open_loop):
+        assert "slice_eval_concurrency" in inspect.signature(fn).parameters

@@ -4123,6 +4123,31 @@ def command_observe_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _slice_eval_concurrency_kwargs(
+    loop_core: Any, args: argparse.Namespace
+) -> dict[str, Any]:
+    """`--slice-eval-concurrency N`: {} for the default 1 (call unchanged).
+
+    N>1 needs a loop core whose run_loop accepts it; refused otherwise.
+    """
+    value = getattr(args, "slice_eval_concurrency", 1)
+    value = 1 if value is None else value
+    if not isinstance(value, int) or value < 1:
+        raise TrioctlError("--slice-eval-concurrency must be an integer >= 1")
+    if value == 1:
+        return {}
+    try:
+        params = inspect.signature(loop_core.run_loop).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "slice_eval_concurrency" not in params:
+        raise TrioctlError(
+            "--slice-eval-concurrency refused: this loop core's run_loop "
+            "does not support concurrent slice-evals"
+        )
+    return {"slice_eval_concurrency": value}
+
+
 def command_loop(args: argparse.Namespace) -> int:
     """Run loop-core with the Omnigent role runner.
 
@@ -4164,6 +4189,7 @@ def command_loop(args: argparse.Namespace) -> int:
         print(f"trioctl: {refusal}", file=sys.stderr)
         return HELD_DISPATCH_EXIT
     loop_core = _load_trio_loop(repo)
+    loop_kwargs = _slice_eval_concurrency_kwargs(loop_core, args)
     observe = (
         _start_observation(mailbox)
         if getattr(args, "observe_workers", False)
@@ -4236,6 +4262,7 @@ def command_loop(args: argparse.Namespace) -> int:
             args.max_iterations,
             runner,
             repo=repo,
+            **loop_kwargs,
         )
         return exit_code
     except KeyboardInterrupt:
@@ -4920,6 +4947,15 @@ def parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--worktree-root", default=None,
                       help="with --isolate-workers: worker worktree directory")
+    loop.add_argument(
+        "--slice-eval-concurrency",
+        type=int,
+        default=1,
+        metavar="N",
+        help="open-loop opt-in: grade up to N retired slices at once, each "
+        "in its own evaluator session (default 1: one after another; the "
+        "integration-eval still waits for every slice-eval)",
+    )
     loop.set_defaults(func=command_loop)
 
     recon = commands.add_parser(

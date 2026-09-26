@@ -195,26 +195,34 @@ class ScriptedLeadRunner:
 
 
 class ScriptedEvalRunner:
-    """Fake Evaluator runner dispatching on context['kind']."""
+    """Fake Evaluator runner dispatching on context['kind'].
+
+    Thread-safe: with --slice-eval-concurrency > 1 several slice-evals run
+    on worker threads at once, so pops/appends happen under a lock (the
+    scripted action itself runs outside it, so actions may block).
+    """
 
     def __init__(self, slice_actions=None, integration_actions=None) -> None:
         self.slice_actions = dict(slice_actions or {})
         self.integration_actions = list(integration_actions or [])
         self.calls: list[dict] = []
+        self._lock = threading.Lock()
 
     def run(self, role, iteration, mailbox, context=None):
         assert role == "evaluator"
-        self.calls.append({"iteration": iteration, "context": dict(context)})
         kind = context["kind"]
-        if kind == "slice-eval":
-            key = (context["slice"], context["sha"])
-            action = self.slice_actions.pop(key)
-            action(mailbox)
-        elif kind == "integration-eval":
-            assert self.integration_actions, (
-                "integration eval invoked more times than scripted"
-            )
-            action = self.integration_actions.pop(0)
+        with self._lock:
+            self.calls.append({"iteration": iteration, "context": dict(context)})
+            if kind == "slice-eval":
+                action = self.slice_actions.pop((context["slice"], context["sha"]))
+            elif kind == "integration-eval":
+                assert self.integration_actions, (
+                    "integration eval invoked more times than scripted"
+                )
+                action = self.integration_actions.pop(0)
+            else:
+                action = None
+        if kind in ("slice-eval", "integration-eval"):
             action(mailbox)
         else:  # pragma: no cover - defensive
             raise AssertionError(f"unexpected kind {kind!r}")
