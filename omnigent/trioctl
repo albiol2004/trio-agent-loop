@@ -2763,7 +2763,8 @@ class OmnigentRunner:
         # Opt-in `--observe-workers` run: {run_id, workers, phases,
         # trioctl}. None keeps prompts and mailbox writes unchanged.
         self._observe = observe
-        # Opt-in `--isolate-workers`: {trioctl, worktree_root}. Builders
+        # Worker isolation (default ON since r11; `--no-isolate-workers`
+        # disables it): {trioctl, worktree_root}. Builders
         # get their own worktree via `run --isolate`; open-loop slice-evals
         # are bound to a detached worktree at their pinned sha.
         self._isolate = isolate_workers
@@ -3058,7 +3059,7 @@ class OmnigentRunner:
             + f"    --workspace {q(str(self.repo))} --prompt-file <task-file>"
         )
         return (
-            "\n## Isolated builders (opt-in for this loop run)\n"
+            "\n## Isolated builders (on for this loop run)\n"
             "Dispatch every builder with exactly this command, replacing only "
             "`<slice-id>`, `<one-line summary>` and `<task-file>`:\n\n"
             f"```\n{command}\n```\n\n"
@@ -4251,16 +4252,39 @@ def command_observe_summary(args: argparse.Namespace) -> int:
     return 0
 
 
-def _slice_eval_concurrency_kwargs(
-    loop_core: Any, args: argparse.Namespace
-) -> dict[str, Any]:
-    """`--slice-eval-concurrency N`: {} for the default 1 (call unchanged).
+#: `loop` default for `--slice-eval-concurrency` (qualified at 4 in r10).
+#: `--slice-eval-concurrency 1` keeps the serial slice-eval path.
+DEFAULT_SLICE_EVAL_CONCURRENCY = 4
 
-    N>1 needs a loop core whose run_loop accepts it; refused otherwise.
+OLD_CORE_SERIAL_WARNING = (
+    "trioctl: vendored loop core predates concurrent slice-eval; running "
+    "serial (refresh metrics/ to enable)"
+)
+LOCKSTEP_CONCURRENCY_NOTICE = (
+    "trioctl: lockstep mode: slice-eval concurrency not applicable"
+)
+
+
+def _slice_eval_concurrency_kwargs(
+    loop_core: Any,
+    args: argparse.Namespace,
+    *,
+    isolation_off: str | None = None,
+) -> dict[str, Any]:
+    """Resolve `--slice-eval-concurrency N` / `--slice-eval-drain-seconds`.
+
+    Not given, N defaults to ``DEFAULT_SLICE_EVAL_CONCURRENCY`` (4). The
+    default degrades to 1 (the serial path, call unchanged) with one stderr
+    line when the loop core's run_loop predates the kwarg, and silently when
+    worker isolation is off (*isolation_off* names why). An EXPLICIT N>1 is
+    refused in both cases: against an old core as before, and without
+    isolation because concurrent slice-evals would share the root checkout.
+    Returns {} whenever the resolved call is the pre-r10 serial one.
     """
-    value = getattr(args, "slice_eval_concurrency", 1)
-    value = 1 if value is None else value
-    if not isinstance(value, int) or value < 1:
+    raw = getattr(args, "slice_eval_concurrency", None)
+    explicit = raw is not None
+    value = DEFAULT_SLICE_EVAL_CONCURRENCY if raw is None else raw
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise TrioctlError("--slice-eval-concurrency must be an integer >= 1")
     drain = getattr(args, "slice_eval_drain_seconds", None)
     if drain is not None and (
@@ -4270,19 +4294,29 @@ def _slice_eval_concurrency_kwargs(
         or drain < 0
     ):
         raise TrioctlError("--slice-eval-drain-seconds must be a number >= 0")
-    if value == 1 and drain is None:
-        return {}
+    if value > 1 and isolation_off is not None:
+        if explicit:
+            raise TrioctlError(
+                f"--slice-eval-concurrency {value} refused: concurrent "
+                f"slice-evals need worker isolation, which is off "
+                f"({isolation_off}); drop --no-isolate-workers or pass "
+                "--slice-eval-concurrency 1"
+            )
+        value = 1
     try:
         params = inspect.signature(loop_core.run_loop).parameters
     except (TypeError, ValueError):
         params = {}
-    kwargs: dict[str, Any] = {}
-    if value != 1:
-        if "slice_eval_concurrency" not in params:
+    if value > 1 and "slice_eval_concurrency" not in params:
+        if explicit:
             raise TrioctlError(
                 "--slice-eval-concurrency refused: this loop core's run_loop "
                 "does not support concurrent slice-evals"
             )
+        print(OLD_CORE_SERIAL_WARNING, file=sys.stderr)
+        value = 1
+    kwargs: dict[str, Any] = {}
+    if value != 1:
         kwargs["slice_eval_concurrency"] = value
     if drain is not None:
         if "slice_eval_drain_seconds" not in params:
@@ -4292,6 +4326,97 @@ def _slice_eval_concurrency_kwargs(
             )
         kwargs["slice_eval_drain_seconds"] = float(drain)
     return kwargs
+
+
+def _loop_is_lockstep(mailbox: Path) -> bool:
+    """True when `run_loop(mode="auto")` will take the lockstep path."""
+    return not (Path(mailbox) / "QUEUE.md").is_file()
+
+
+def _isolation_default_unavailable(reason: str) -> None:
+    print(
+        f"trioctl: worker isolation unavailable ({reason}); running without "
+        "isolation and with serial slice-evals (pass --no-isolate-workers to "
+        "silence)",
+        file=sys.stderr,
+    )
+
+
+def _resolve_isolation(
+    args: argparse.Namespace, repo: Path
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve worker isolation: ``(isolate config or None, off reason)``.
+
+    Default ON. ``--no-isolate-workers`` turns it off; ``--isolate-workers``
+    (accepted for compatibility) makes every prerequisite a hard refusal.
+    When it is only the default, a missing prerequisite (worktree module,
+    git branch checkout, `--observe-workers`, inherited session-bound Cursor
+    bindings) degrades to the pre-r11 non-isolated run with one stderr line.
+    Isolation is trioctl-only: it does not depend on the vendored loop core.
+    The worktree root is `--worktree-root`, else
+    `worker_worktrees.default_worktree_root` (``$TRIO_WORKTREE_ROOT``, else
+    ``$XDG_STATE_HOME``/``~/.local/state`` ``/trio-agent-loop/worktrees/
+    <repo-name>-<sha256(git common dir)[:12]>``, outside the repository,
+    created on the first worktree).
+    """
+    raw = getattr(args, "isolate_workers", None)
+    if raw is False:
+        return None, "--no-isolate-workers"
+    explicit = raw is True
+    if worker_worktrees is None:
+        if explicit:
+            _require_worktrees()
+        reason = "worker_worktrees.py is not installed next to trioctl"
+        _isolation_default_unavailable(reason)
+        return None, reason
+    wt = worker_worktrees
+    if getattr(args, "observe_workers", False):
+        if explicit:
+            raise TrioctlError(
+                "--isolate-workers and --observe-workers each prescribe the one "
+                "worker dispatch command; they cannot be combined yet"
+            )
+        reason = "--observe-workers prescribes its own worker command"
+        _isolation_default_unavailable(reason)
+        return None, reason
+    toplevel = repo
+    if not explicit:
+        try:
+            toplevel = wt.repo_toplevel(repo)
+            branch = wt.git(
+                toplevel, "symbolic-ref", "-q", "HEAD", check=False
+            ).stdout.strip()
+        except (OSError, wt.WorktreeError):
+            reason = "not a git checkout"
+            _isolation_default_unavailable(reason)
+            return None, reason
+        if not branch.startswith("refs/heads/"):
+            reason = "checkout is not on a branch (detached HEAD)"
+            _isolation_default_unavailable(reason)
+            return None, reason
+    inherited = wt.inherited_cursor_problems()
+    if inherited:
+        if explicit:
+            raise TrioctlError(
+                "--isolate-workers refused: Cursor user/system config carries "
+                "session-bound Omnigent bindings that every worker would load "
+                "(trioctl never edits it): " + "; ".join(inherited)
+            )
+        reason = (
+            "Cursor user/system config carries session-bound Omnigent "
+            "bindings: " + "; ".join(inherited)
+        )
+        _isolation_default_unavailable(reason)
+        return None, reason
+    if getattr(args, "worktree_root", None):
+        root = Path(args.worktree_root).expanduser().resolve()
+    else:
+        try:
+            root = wt.default_worktree_root(wt.repo_toplevel(toplevel))
+        except (OSError, wt.WorktreeError) as exc:
+            raise TrioctlError(f"cannot derive a worktree root: {exc}") from exc
+    print(f"trioctl: worktree root {root}", file=sys.stderr)
+    return {"trioctl": Path(__file__).resolve(), "worktree_root": str(root)}, None
 
 
 def _abandoned_slice_eval_threads(
@@ -4395,7 +4520,17 @@ def _command_loop(args: argparse.Namespace) -> int:
         print(f"trioctl: {refusal}", file=sys.stderr)
         return HELD_DISPATCH_EXIT
     loop_core = _load_trio_loop(repo)
-    loop_kwargs = _slice_eval_concurrency_kwargs(loop_core, args)
+    # r11: worker isolation and concurrent slice-eval are default ON; the
+    # --no-isolate-workers / --slice-eval-concurrency 1 flags disable them.
+    isolate, isolation_off = _resolve_isolation(args, repo)
+    loop_kwargs = _slice_eval_concurrency_kwargs(
+        loop_core, args, isolation_off=isolation_off
+    )
+    if (
+        loop_kwargs.get("slice_eval_concurrency", 1) > 1
+        and _loop_is_lockstep(mailbox)
+    ):
+        print(LOCKSTEP_CONCURRENCY_NOTICE, file=sys.stderr)
     observe = (
         _start_observation(mailbox)
         if getattr(args, "observe_workers", False)
@@ -4409,29 +4544,7 @@ def _command_loop(args: argparse.Namespace) -> int:
             f"in {observe['dir']}",
             file=sys.stderr,
         )
-    isolate = None
-    if getattr(args, "isolate_workers", False):
-        wt = _require_worktrees()
-        if getattr(args, "observe_workers", False):
-            raise TrioctlError(
-                "--isolate-workers and --observe-workers each prescribe the one "
-                "worker dispatch command; they cannot be combined yet"
-            )
-        inherited = wt.inherited_cursor_problems()
-        if inherited:
-            raise TrioctlError(
-                "--isolate-workers refused: Cursor user/system config carries "
-                "session-bound Omnigent bindings that every worker would load "
-                "(trioctl never edits it): " + "; ".join(inherited)
-            )
-        isolate = {
-            "trioctl": Path(__file__).resolve(),
-            "worktree_root": (
-                str(Path(args.worktree_root).expanduser().resolve())
-                if getattr(args, "worktree_root", None)
-                else None
-            ),
-        }
+    if isolate:
         runner_kwargs["isolate_workers"] = isolate
         # Restart-safe: finish removals an earlier run left half done and
         # retire anything already accepted before new work starts.
@@ -5172,24 +5285,47 @@ def parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--reconcile-interval", type=float, default=15.0,
                       help=argparse.SUPPRESS)
-    loop.add_argument(
-        "--isolate-workers",
-        action="store_true",
-        help="opt-in: builders run in task-owned worktrees merged back on "
-        "exit, open-loop slice-evals are bound to a detached worktree at "
-        "their pin, and accepted/idle/clean worktrees are removed before "
-        "and after the loop",
+    isolation = loop.add_mutually_exclusive_group()
+    isolation.add_argument(
+        "--no-isolate-workers",
+        dest="isolate_workers",
+        action="store_const",
+        const=False,
+        default=None,
+        help="disable worker isolation (default ON: builders run in "
+        "task-owned worktrees merged back on exit, open-loop slice-evals "
+        "are bound to a detached worktree at their pin, and accepted/idle/"
+        "clean worktrees are removed before and after the loop). Also "
+        "forces serial slice-evals; an explicit "
+        "--slice-eval-concurrency N>1 is refused with it",
     )
-    loop.add_argument("--worktree-root", default=None,
-                      help="with --isolate-workers: worker worktree directory")
+    isolation.add_argument(
+        "--isolate-workers",
+        dest="isolate_workers",
+        action="store_const",
+        const=True,
+        help="compatibility no-op (isolation is the default); when given, "
+        "an unmet isolation prerequisite is a refusal instead of a "
+        "fallback to a non-isolated run",
+    )
+    loop.add_argument(
+        "--worktree-root",
+        default=None,
+        help="worker worktree directory (default: $TRIO_WORKTREE_ROOT, else "
+        "$XDG_STATE_HOME or ~/.local/state + /trio-agent-loop/worktrees/"
+        "<repo>-<hash>, outside the repository, created on demand)",
+    )
     loop.add_argument(
         "--slice-eval-concurrency",
         type=int,
-        default=1,
+        default=None,
         metavar="N",
-        help="open-loop opt-in: grade up to N retired slices at once, each "
-        "in its own evaluator session (default 1: one after another; the "
-        "integration-eval still waits for every slice-eval)",
+        help="open-loop: grade up to N retired slices at once, each in its "
+        f"own evaluator session (default {DEFAULT_SLICE_EVAL_CONCURRENCY}; "
+        "1 = one after another; the integration-eval still waits for every "
+        "slice-eval). The default falls back to 1 without isolation or on a "
+        "vendored loop core that predates it; an explicit N>1 is refused "
+        "there. Not applicable in lockstep mode",
     )
     loop.add_argument(
         "--slice-eval-drain-seconds",

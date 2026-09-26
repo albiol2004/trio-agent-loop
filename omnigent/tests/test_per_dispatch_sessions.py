@@ -121,12 +121,21 @@ def test_timeout_holds_this_dispatchs_session_not_the_last_created(
 
 
 # `trioctl omnigent loop --slice-eval-concurrency N` plumbing ------------
+def _isolation_not_a_factor(trioctl, monkeypatch) -> None:
+    """r11: isolation is default ON and an explicit N>1 is refused when it is
+    off. These tests exercise the slice-eval drain/cleanup plumbing in a
+    plain tmp dir (no git checkout), so stub the isolation resolver to
+    "no isolate config, not switched off" -- the pre-r11 call shape."""
+    monkeypatch.setattr(trioctl, "_resolve_isolation", lambda args, repo: (None, None))
 
 
-def test_slice_eval_concurrency_flag_defaults_to_serial_and_passes_through() -> None:
+
+def test_slice_eval_concurrency_flag_defaults_to_four_and_passes_through(capsys) -> None:
     trioctl = load_trioctl()
     default = trioctl.parser().parse_args(["omnigent", "loop"])
-    assert default.slice_eval_concurrency == 1
+    # r11: "not given" is None and resolves to DEFAULT_SLICE_EVAL_CONCURRENCY.
+    assert default.slice_eval_concurrency is None
+    assert trioctl.DEFAULT_SLICE_EVAL_CONCURRENCY == 4
 
     class NewCore:
         @staticmethod
@@ -139,8 +148,18 @@ def test_slice_eval_concurrency_flag_defaults_to_serial_and_passes_through() -> 
         def run_loop(mailbox, max_iterations, runner, *, repo=None):
             return 0
 
-    # Default: the run_loop call is unchanged (no new kwarg), any core.
+    assert trioctl._slice_eval_concurrency_kwargs(NewCore, default) == {
+        "slice_eval_concurrency": 4
+    }
+    # Default against an old core: serial, call unchanged, one warning.
     assert trioctl._slice_eval_concurrency_kwargs(OldCore, default) == {}
+    assert trioctl.OLD_CORE_SERIAL_WARNING in capsys.readouterr().err
+    one = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--slice-eval-concurrency", "1"]
+    )
+    assert trioctl._slice_eval_concurrency_kwargs(NewCore, one) == {}
+    assert trioctl._slice_eval_concurrency_kwargs(OldCore, one) == {}
+    assert capsys.readouterr().err == ""
     three = trioctl.parser().parse_args(
         ["omnigent", "loop", "--slice-eval-concurrency", "3"]
     )
@@ -173,12 +192,15 @@ def test_slice_eval_drain_seconds_flag_passes_through() -> None:
                      slice_eval_concurrency=1):
             return 0
 
-    assert trioctl._slice_eval_concurrency_kwargs(OldCore, default) == {}
+    # r11: the concurrency default (4) passes through; no drain kwarg.
+    assert trioctl._slice_eval_concurrency_kwargs(OldCore, default) == {
+        "slice_eval_concurrency": 4
+    }
     args = trioctl.parser().parse_args(
         ["omnigent", "loop", "--slice-eval-drain-seconds", "30"]
     )
     assert trioctl._slice_eval_concurrency_kwargs(NewCore, args) == {
-        "slice_eval_drain_seconds": 30.0
+        "slice_eval_concurrency": 4, "slice_eval_drain_seconds": 30.0
     }
     with pytest.raises(trioctl.TrioctlError, match="refused"):
         trioctl._slice_eval_concurrency_kwargs(OldCore, args)
@@ -456,6 +478,7 @@ def test_second_interrupt_during_drain_keeps_inflight_sessions_out_of_cleanup(
         os.kill(os.getpid(), signal.SIGINT)
 
     monkeypatch.chdir(tmp_path)
+    _isolation_not_a_factor(trioctl, monkeypatch)
     args = trioctl.parser().parse_args(
         ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "5",
          "--slice-eval-concurrency", "2", "--slice-eval-drain-seconds", "30"]
@@ -630,6 +653,7 @@ def test_cleanup_skips_only_inflight_slice_eval_sessions(
         lambda mb, base_url, sids, **kw: pruned.append(sorted(sids)) or [],
     )
     monkeypatch.chdir(tmp_path)
+    _isolation_not_a_factor(trioctl, monkeypatch)
     argv = ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "3"]
     if concurrency != 1:
         argv += ["--slice-eval-concurrency", str(concurrency)]
@@ -706,6 +730,7 @@ def test_cli_exits_without_joining_abandoned_slice_eval(
         os.kill(os.getpid(), signal.SIGINT)
 
     monkeypatch.chdir(tmp_path)
+    _isolation_not_a_factor(trioctl, monkeypatch)
     args = trioctl.parser().parse_args(
         ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "5",
          "--slice-eval-concurrency", "2", "--slice-eval-drain-seconds", "0.3"]
