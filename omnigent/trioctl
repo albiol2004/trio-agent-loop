@@ -4275,7 +4275,67 @@ def _slice_eval_concurrency_kwargs(
     return kwargs
 
 
+def _abandoned_slice_eval_threads(
+    before: frozenset[threading.Thread] | set[threading.Thread] = frozenset(),
+) -> list[threading.Thread]:
+    """Live slice-eval pool workers (loop core `thread_name_prefix`) not in
+    `before` (the threads alive when this loop run started).
+
+    After the loop core's exit drain these are only evals it abandoned: a
+    finished or idle pool worker exits as soon as the pool is shut down.
+    """
+    current = threading.current_thread()
+    return [
+        t for t in threading.enumerate()
+        if t is not current and t not in before and t.is_alive()
+        and t.name.startswith("slice-eval")
+    ]
+
+
 def command_loop(args: argparse.Namespace) -> int:
+    """`trioctl omnigent loop`: run `_command_loop`, then exit promptly.
+
+    A slice-eval the loop core's exit drain abandoned is still running on a
+    non-daemon `ThreadPoolExecutor` worker, and Python's exit hook
+    (`concurrent.futures` atexit / `threading._shutdown`) would join it --
+    blocking process exit up to the role timeout even though cleanup is
+    done. So when any such thread is alive after cleanup, flush stdio and
+    `os._exit(code)` without joining it (`_command_loop`'s cleanup has
+    already held or skipped its session, never deleted it). Exits with no
+    abandoned eval are unchanged.
+    """
+    before = set(threading.enumerate())
+    try:
+        code = _command_loop(args)
+    except TrioctlError as exc:
+        if not _abandoned_slice_eval_threads(before):
+            raise
+        print(f"trioctl: {exc}", file=sys.stderr)
+        code = 1
+    except Exception:  # noqa: BLE001 - report, then still exit promptly
+        if not _abandoned_slice_eval_threads(before):
+            raise
+        import traceback
+
+        traceback.print_exc()
+        code = 1
+    abandoned = _abandoned_slice_eval_threads(before)
+    if abandoned:
+        print(
+            f"trioctl: exiting without joining {len(abandoned)} abandoned "
+            "slice-eval thread(s)",
+            file=sys.stderr,
+        )
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001 - exit regardless
+                pass
+        os._exit(code)
+    return code
+
+
+def _command_loop(args: argparse.Namespace) -> int:
     """Run loop-core with the Omnigent role runner.
 
     Session cleanup is default-on and scoped to this run: unless

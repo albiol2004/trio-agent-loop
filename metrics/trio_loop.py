@@ -2061,6 +2061,12 @@ def run_open_loop(
         Interrupt-safe: a second signal inside the wait still runs the
         bookkeeping below (clobber restore, "abandoned" log, held records)
         before the interrupt propagates.
+
+        An abandoned eval keeps running on its (non-daemon) pool thread;
+        this function returns without waiting for it, but the interpreter's
+        exit hook still joins it, so the process lingers until it finishes
+        unless the caller exits with `os._exit` after cleanup (as
+        `trioctl omnigent loop` does).
         """
         nonlocal pool
         if pool is None:

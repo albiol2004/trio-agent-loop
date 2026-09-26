@@ -443,6 +443,8 @@ def test_second_interrupt_during_drain_keeps_inflight_sessions_out_of_cleanup(
         return real_wait(fs, timeout=timeout, return_when=return_when)
 
     monkeypatch.setattr(concurrent.futures, "wait", wait)
+    exits: list[int] = []
+    monkeypatch.setattr(os, "_exit", exits.append)
 
     def first_sigint():
         deadline = time.monotonic() + 10
@@ -471,6 +473,9 @@ def test_second_interrupt_during_drain_keeps_inflight_sessions_out_of_cleanup(
         assert "skipped_inflight session s-ghost" in err
         for sid in eval_sids:
             assert f"kept session {sid}" in err
+        # N1: the CLI does not wait for the abandoned eval threads.
+        assert exits == [130]
+        assert "exiting without joining 2 abandoned slice-eval thread(s)" in err
     finally:
         release.set()
     for t in [t for t in threading.enumerate() if t.name.startswith("slice-eval")]:
@@ -541,6 +546,7 @@ def test_ctrl_c_mid_lead_turn_prunes_lead_session_n1(
             time.sleep(0.01)
         os.kill(os.getpid(), signal.SIGINT)
 
+    monkeypatch.setattr(os, "_exit", lambda code: pytest.fail("os._exit called"))
     monkeypatch.chdir(tmp_path)
     args = trioctl.parser().parse_args(
         ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "3"]
@@ -611,6 +617,9 @@ def test_cleanup_skips_only_inflight_slice_eval_sessions(
             return {k: dict(v) for k, v in inflight.items()}
 
     pruned: list[list[str]] = []
+    import os
+
+    monkeypatch.setattr(os, "_exit", lambda code: pytest.fail("os._exit called"))
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Core)
     monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: Runner())
     monkeypatch.setattr(
@@ -630,3 +639,125 @@ def test_cleanup_skips_only_inflight_slice_eval_sessions(
             assert f"skipped_inflight session {sid}" in err
         else:
             assert f"skipped_inflight session {sid}" not in err
+
+
+# N1: abandoned slice-evals do not keep the CLI process alive -----------
+
+
+def test_cli_exits_without_joining_abandoned_slice_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A slice-eval blocked on an event outlives a 0.3 s drain: the CLI
+    returns within the drain budget + margin and calls `os._exit` with the
+    loop's exit code (mocked here, so the call returns)."""
+    import os
+    import signal
+    import time
+
+    from metrics import trio_loop
+    from metrics.tests.test_open_loop_concurrent_evals import TrackingEvalRunner, plan
+    from metrics.tests.test_open_loop_driver import (
+        QueueModel, ScriptedLeadRunner, fake_sha, make_open_loop_mailbox,
+    )
+
+    trioctl = load_trioctl()
+    ids = ("alpha", "beta")
+    mailbox = make_open_loop_mailbox(tmp_path, plan(*ids))
+    queue = QueueModel(mailbox, threading.Lock())
+    shas = {sid: fake_sha(f"{sid}-n1") for sid in ids}
+    release = threading.Event()
+
+    def block(mb):
+        assert release.wait(30)
+
+    lead = ScriptedLeadRunner([lambda mb: [queue.retire(s, shas[s]) for s in ids]])
+    evaluator = TrackingEvalRunner(slice_actions={(s, shas[s]): block for s in ids})
+
+    class Runner:
+        held_session_ids: list[str] = []
+        created_session_ids: list[str] = []
+
+        def run(self, role, iteration, mb, context=None):
+            target = lead if role == "lead" else evaluator
+            return target.run(role, iteration, mb, context)
+
+        def inflight_sessions(self):
+            return evaluator.inflight_sessions()
+
+    runner = Runner()
+    exits: list[int] = []
+    monkeypatch.setattr(os, "_exit", exits.append)
+    monkeypatch.setattr(trio_loop, "_per_slice_gate", lambda *a, **k: 0)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: trio_loop)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: runner)
+    monkeypatch.setattr(
+        trioctl, "_run_post_loop_session_prune", lambda *a, **kw: [],
+    )
+    sigint_at: list[float] = []
+
+    def sigint_when_evals_run():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(evaluator.inflight_sessions()) < 2:
+            time.sleep(0.01)
+        sigint_at.append(time.monotonic())
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.chdir(tmp_path)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "5",
+         "--slice-eval-concurrency", "2", "--slice-eval-drain-seconds", "0.3"]
+    )
+    killer = threading.Thread(target=sigint_when_evals_run, daemon=True)
+    try:
+        killer.start()
+        assert args.func(args) == 130
+        elapsed = time.monotonic() - sigint_at[0]
+        killer.join(5)
+        assert elapsed < 0.3 + 2.0
+        assert exits == [130]
+        err = capsys.readouterr().err
+        assert "exiting without joining 2 abandoned slice-eval thread(s)" in err
+        # The eval threads really were still running (not joined).
+        assert [t for t in threading.enumerate() if t.name.startswith("slice-eval")]
+    finally:
+        release.set()
+    for t in [t for t in threading.enumerate() if t.name.startswith("slice-eval")]:
+        t.join(5)
+        assert not t.is_alive()
+
+
+def test_cli_normal_exit_does_not_hard_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+
+    class Core:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None, **kw):
+            return 4
+
+    class Runner:
+        held_session_ids: list[str] = []
+        created_session_ids: list[str] = []
+
+    # A stray slice-eval-named thread alive BEFORE this run is not ours.
+    stray_release = threading.Event()
+    stray = threading.Thread(target=stray_release.wait, args=(10,),
+                             name="slice-eval_stray", daemon=True)
+    stray.start()
+    monkeypatch.setattr(os, "_exit", lambda code: pytest.fail("os._exit called"))
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Core)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: Runner())
+    monkeypatch.setattr(trioctl, "_run_post_loop_session_prune", lambda *a, **kw: [])
+    monkeypatch.chdir(tmp_path)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "3"]
+    )
+    try:
+        assert args.func(args) == 4
+    finally:
+        stray_release.set()
+        stray.join(5)
