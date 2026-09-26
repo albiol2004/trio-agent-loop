@@ -2056,44 +2056,59 @@ def run_open_loop(
         }
 
     def drain_slice_evals() -> None:
-        """Cancel queued slice-evals; wait (bounded) for running ones."""
+        """Cancel queued slice-evals; wait (bounded) for running ones.
+
+        Interrupt-safe: a second signal inside the wait still runs the
+        bookkeeping below (clobber restore, "abandoned" log, held records)
+        before the interrupt propagates.
+        """
         nonlocal pool
         if pool is None:
             return
         entries = list(inflight.items())
-        for _key, entry in entries:
-            entry["future"].cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
-        running = [e["future"] for _k, e in entries if not e["future"].cancelled()]
-        _done, not_done = concurrent.futures.wait(running, timeout=drain_budget)
+        running: list = []
+        interrupted = True
         try:
-            iteration_now = _number(_read_state(mailbox / "STATE.md")["iteration"])
-        except Exception:  # noqa: BLE001 - best effort on exit
-            iteration_now = 0
-        for (slice_id, sha), entry in entries:
-            future = entry["future"]
-            if future.cancelled() or not future.done():
-                continue
-            if future.exception() is None and future.result() == 0:
-                # The loop is exiting: bookkeeping no longer matters, but a
-                # finished eval's clobber restore still protects VERDICT.md.
-                try:
-                    _restore_clobbered_verdict_sections(
-                        mailbox, verdict_path, "".join(entry["seen"].values()),
-                        "slice-eval", iteration_now, read_text=_read_text_settled,
-                    )
-                except Exception:  # noqa: BLE001 - best effort on exit
-                    pass
-        inflight.clear()
-        if not_done:
-            _append_log(
-                mailbox,
-                f"- iter {iteration_now} | loop | open-loop: {len(not_done)} "
-                f"slice-eval(s) still running after the {drain_budget:g}s "
-                "drain budget; abandoned",
-            )
-            hold_abandoned(entries, not_done, iteration_now)
-        pool = None
+            for _key, entry in entries:
+                entry["future"].cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            running = [e["future"] for _k, e in entries if not e["future"].cancelled()]
+            concurrent.futures.wait(running, timeout=drain_budget)
+            interrupted = False
+        finally:
+            not_done = {f for f in running if not f.done()}
+            try:
+                iteration_now = _number(_read_state(mailbox / "STATE.md")["iteration"])
+            except Exception:  # noqa: BLE001 - best effort on exit
+                iteration_now = 0
+            for (slice_id, sha), entry in entries:
+                future = entry["future"]
+                if future.cancelled() or not future.done():
+                    continue
+                if future.exception() is None and future.result() == 0:
+                    # The loop is exiting: bookkeeping no longer matters, but a
+                    # finished eval's clobber restore still protects VERDICT.md.
+                    try:
+                        _restore_clobbered_verdict_sections(
+                            mailbox, verdict_path, "".join(entry["seen"].values()),
+                            "slice-eval", iteration_now, read_text=_read_text_settled,
+                        )
+                    except Exception:  # noqa: BLE001 - best effort on exit
+                        pass
+            inflight.clear()
+            pool = None
+            if not_done:
+                why = (
+                    "when the drain was interrupted"
+                    if interrupted
+                    else f"after the {drain_budget:g}s drain budget"
+                )
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration_now} | loop | open-loop: {len(not_done)} "
+                    f"slice-eval(s) still running {why}; abandoned",
+                )
+                hold_abandoned(entries, not_done, iteration_now)
 
     def hold_abandoned(entries: list, not_done, iteration_now: int) -> None:
         """Held record per abandoned slice-eval whose session id is known."""
@@ -2615,10 +2630,16 @@ def run_open_loop(
             wake_event.clear()
     finally:
         stop_event.set()
-        drain_slice_evals()
-        if lead_thread is not None:
-            lead_thread.join(timeout=5)
-        _release_lock(lock)
+        # Nested so a second signal during the drain (or the Lead join)
+        # still releases the mailbox lock.
+        try:
+            drain_slice_evals()
+        finally:
+            try:
+                if lead_thread is not None:
+                    lead_thread.join(timeout=5)
+            finally:
+                _release_lock(lock)
 
 
 class _PortableRunner:

@@ -526,3 +526,80 @@ def test_no_held_record_when_evals_finish_inside_the_drain(tmp_path: Path) -> No
     assert code == 4
     assert _held(mailbox) == []
     _assert_no_slice_threads()
+
+
+# F3: a second interrupt during the exit drain -----------------------------
+
+
+def _interrupt_during_drain(monkeypatch, budget: float) -> None:
+    """The drain's own wait (timeout == *budget*) receives a real SIGINT."""
+    import concurrent.futures
+    import os
+    import signal
+
+    real_wait = concurrent.futures.wait
+
+    def wait(fs, timeout=None, return_when=concurrent.futures.ALL_COMPLETED):
+        if timeout == budget:
+            os.kill(os.getpid(), signal.SIGINT)
+        return real_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(concurrent.futures, "wait", wait)
+
+
+def _sigint_when(predicate) -> threading.Thread:
+    import os
+    import signal
+
+    def body():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not predicate():
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    thread = threading.Thread(target=body, name="test-first-sigint", daemon=True)
+    thread.start()
+    return thread
+
+
+def test_second_interrupt_during_drain_releases_lock_and_holds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import signal
+
+    ids = ("alpha", "beta")
+    mailbox, queue, verdict = _setup(tmp_path, ids)
+    shas = {sid: fake_sha(f"{sid}-sigint") for sid in ids}
+    lead = ScriptedLeadRunner([lambda mb: [queue.retire(s, shas[s]) for s in ids]])
+    release = threading.Event()
+
+    def grade(sid):
+        def action(mb):
+            assert release.wait(10)
+            verdict.append_slice_section(sid, shas[sid], "SHIP")
+        return action
+
+    evaluator = TrackingEvalRunner(
+        slice_actions={(s, shas[s]): grade(s) for s in ids},
+    )
+    _interrupt_during_drain(monkeypatch, 30.0)
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        first = _sigint_when(lambda: len(evaluator.inflight_sessions()) == 2)
+        with pytest.raises(KeyboardInterrupt):
+            trio_loop.run_open_loop(
+                mailbox, 5, lead, evaluator, poll_seconds=0.01,
+                slice_eval_concurrency=2, slice_eval_drain_seconds=30.0,
+            )
+        first.join(5)
+        assert not (mailbox / ".lock").exists()
+        held = _held(mailbox)
+        assert sorted(r["slice"] for r in held) == ["alpha", "beta"]
+        assert all(r["hold"] == "abandoned_on_exit" for r in held)
+        assert "still running when the drain was interrupted; abandoned" in (
+            mailbox / "LOG.md"
+        ).read_text(encoding="utf-8")
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        release.set()
+    _assert_no_slice_threads()

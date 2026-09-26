@@ -369,3 +369,110 @@ def test_abandoned_on_exit_hold_blocks_resume_with_reason(tmp_path: Path) -> Non
     assert "session s-9 (role evaluator, iteration 3" in message
     assert "slice-eval still running when the loop exited" in message
     assert f"slice-eval alpha @{FULL_SHA}" in message
+
+
+# F3: interrupted drain -> cleanup never DELETEs a live worker's session --
+
+
+def test_second_interrupt_during_drain_keeps_inflight_sessions_out_of_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    import concurrent.futures
+    import os
+    import signal
+    import time
+
+    from metrics import trio_loop
+    from metrics.tests.test_open_loop_concurrent_evals import TrackingEvalRunner, plan
+    from metrics.tests.test_open_loop_driver import (
+        QueueModel, ScriptedLeadRunner, VerdictModel, fake_sha, make_open_loop_mailbox,
+    )
+
+    trioctl = load_trioctl()
+    ids = ("alpha", "beta")
+    mailbox = make_open_loop_mailbox(tmp_path, plan(*ids))
+    lock = threading.Lock()
+    queue, verdict = QueueModel(mailbox, lock), VerdictModel(mailbox, lock)
+    shas = {sid: fake_sha(f"{sid}-cleanup") for sid in ids}
+    release = threading.Event()
+
+    def grade(sid):
+        def action(mb):
+            assert release.wait(10)
+            verdict.append_slice_section(sid, shas[sid], "SHIP")
+        return action
+
+    lead = ScriptedLeadRunner([lambda mb: [queue.retire(s, shas[s]) for s in ids]])
+    evaluator = TrackingEvalRunner(slice_actions={(s, shas[s]): grade(s) for s in ids})
+    eval_sids = [f"sess-{s}-{shas[s]}"[:40] for s in ids]
+
+    class Runner:
+        """Lead + evaluator; 's-ghost' is a live worker's session with no
+        held record (e.g. created after the drain's snapshot)."""
+
+        held_session_ids: list[str] = []
+
+        def __init__(self) -> None:
+            self.created_session_ids = ["s-lead", "s-ghost", *eval_sids]
+
+        def run(self, role, iteration, mb, context=None):
+            target = lead if role == "lead" else evaluator
+            return target.run(role, iteration, mb, context)
+
+        def inflight_sessions(self):
+            live = evaluator.inflight_sessions()
+            if not release.is_set():
+                live["s-ghost"] = {"role": "evaluator", "kind": "slice-eval",
+                                   "slice": "ghost", "sha": "0" * 40}
+            return live
+
+    runner = Runner()
+    pruned: list[list[str]] = []
+    monkeypatch.setattr(trio_loop, "_per_slice_gate", lambda *a, **k: 0)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: trio_loop)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: runner)
+    monkeypatch.setattr(
+        trioctl, "_run_post_loop_session_prune",
+        lambda mb, base_url, sids, **kw: pruned.append(sorted(sids)) or [],
+    )
+    real_wait = concurrent.futures.wait
+
+    def wait(fs, timeout=None, return_when=concurrent.futures.ALL_COMPLETED):
+        if timeout == 30.0:  # the exit drain: second SIGINT lands here
+            os.kill(os.getpid(), signal.SIGINT)
+        return real_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(concurrent.futures, "wait", wait)
+
+    def first_sigint():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(evaluator.inflight_sessions()) < 2:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.chdir(tmp_path)
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(mailbox), "--max-iterations", "5",
+         "--slice-eval-concurrency", "2", "--slice-eval-drain-seconds", "30"]
+    )
+    killer = threading.Thread(target=first_sigint, daemon=True)
+    try:
+        killer.start()
+        assert args.func(args) == 130
+        killer.join(5)
+        assert not (mailbox / ".lock").exists()
+        held = sorted(
+            p.name for p in (mailbox / ".sessions").glob("held-*.json")
+        )
+        assert held == sorted(f"held-{sid}.json" for sid in eval_sids)
+        # Only the finished Lead session reaches cleanup.
+        assert pruned == [["s-lead"]]
+        err = capsys.readouterr().err
+        assert "skipped_inflight session s-ghost" in err
+        for sid in eval_sids:
+            assert f"kept session {sid}" in err
+    finally:
+        release.set()
+    for t in [t for t in threading.enumerate() if t.name.startswith("slice-eval")]:
+        t.join(5)
+        assert not t.is_alive()

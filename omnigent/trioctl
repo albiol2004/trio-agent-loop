@@ -4425,6 +4425,23 @@ def command_loop(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             created = [sid for sid in created if sid not in held]
+            # A worker thread may still be running a dispatch (e.g. a
+            # slice-eval abandoned by an interrupted drain): never DELETE a
+            # session out from under it.
+            inflight: set[str] = set()
+            snapshot_fn = getattr(runner, "inflight_sessions", None)
+            if callable(snapshot_fn):
+                try:
+                    inflight = {str(sid) for sid in (snapshot_fn() or {})}
+                except Exception:  # noqa: BLE001 - cleanup must still run
+                    inflight = set()
+            for session_id in sorted(inflight & set(created)):
+                print(
+                    f"trioctl: skipped_inflight session {session_id}: a "
+                    "worker thread still owns it; not pruned",
+                    file=sys.stderr,
+                )
+            created = [sid for sid in created if sid not in inflight]
             if any(not record.get("session_id") for _path, record in records):
                 # An unreadable hold could name any of them: keep all.
                 print(
