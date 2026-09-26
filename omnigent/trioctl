@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
 import inspect
@@ -2668,6 +2669,8 @@ class OmnigentRunner:
         self._own_lock = threading.Lock()
         self._root_finished: list[dict[str, Any]] = []
         self._inflight: set[str] = set()
+        # {session_id: {role, kind, slice, sha}} for in-flight dispatches.
+        self._inflight_meta: dict[str, dict[str, Any]] = {}
         # Integration-fence tokens this runner holds: acquired per evaluator
         # dispatch; only tokens of FINISHED evaluator dispatches are released
         # at the next Lead/repair dispatch; all are released at loop end.
@@ -2678,13 +2681,24 @@ class OmnigentRunner:
         self._completion_receipts = bool(
             completion_receipts and COMPLETION_RECEIPT_LABELS
         )
+        # Last-dispatched session per role. Back-compat only (`.driver.json`,
+        # prune, tests): with concurrent open-loop slice-evals several
+        # evaluator dispatches are in flight at once, so nothing on the
+        # in-flight dispatch path reads it -- each dispatch carries its own
+        # session id (`dispatch["session_id"]`). Written under _own_lock.
         self.session_ids: dict[str, str] = {}
         self.created_session_ids: list[str] = []
         # First-prompt delivery uncertain: kept out of post-loop prune.
         self.held_session_ids: list[str] = []
-        # Per-role dispatch provenance for the held record (never inferred).
+        # Per-dispatch provenance for the held record (never inferred),
+        # keyed by session id once the create returned one. Guarded by
+        # _own_lock; popped when the dispatch ends.
         self._delivery: dict[str, dict[str, Any]] = {}
+        # Last dispatch's nonce (back-compat); each dispatch uses its own.
         self._dispatch_nonce: str | None = None
+        # Lazy client/config initialisation may race between the Lead
+        # thread and slice-eval worker threads.
+        self._init_lock = threading.Lock()
         # The profile this driver resolves roles from, pinned at start and
         # recorded in `.driver.json` (loop core `_driver_meta`) so workers
         # the Lead dispatches with `--mailbox` use the same profile even
@@ -2697,9 +2711,32 @@ class OmnigentRunner:
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
         if self._config is None:
-            path = getattr(self, "_config_path", None) or config_path()
-            self._config = load_config(path)
+            with self._lazy_lock():
+                if self._config is None:
+                    path = getattr(self, "_config_path", None) or config_path()
+                    self._config = load_config(path)
         return self._config
+
+    def _lazy_lock(self) -> Any:
+        """The lazy-init lock (a no-op context for __new__-built test runners)."""
+        lock = self.__dict__.get("_init_lock")
+        return lock if lock is not None else contextlib.nullcontext()
+
+    def _dict_lock(self) -> Any:
+        """_own_lock (a no-op context for __new__-built test runners)."""
+        lock = self.__dict__.get("_own_lock")
+        return lock if lock is not None else contextlib.nullcontext()
+
+    def inflight_sessions(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of in-flight dispatches that already have a session id.
+
+        ``{session_id: {"role", "kind", "slice", "sha"}}``, taken under
+        _own_lock; the open-loop driver writes it to `.driver.json`.
+        """
+        with self._dict_lock():
+            meta = dict(self.__dict__.get("_inflight_meta") or {})
+            inflight = set(self.__dict__.get("_inflight") or set())
+        return {sid: dict(meta.get(sid) or {}) for sid in inflight}
 
     def _agent_id(self, role: str) -> str:
         """Resolve only the exact persisted Lead/Evaluator registry key."""
@@ -3181,7 +3218,9 @@ class OmnigentRunner:
     def _client(self) -> Any:
         """Reuse an injected fake or build the real HTTP client once."""
         if self._broker_client is None:
-            self._broker_client = _session_client(self._base_url)
+            with self._lazy_lock():
+                if self._broker_client is None:
+                    self._broker_client = _session_client(self._base_url)
         return self._broker_client
 
     @staticmethod
@@ -3369,10 +3408,13 @@ class OmnigentRunner:
         session_id = self._session_id(created)
         if session_id is None:
             raise TrioctlError("session create response has no session id")
+        delivery = dispatch.get("delivery") if dispatch is not None else None
         if dispatch is not None:
             dispatch["session_id"] = session_id
             with self._own_lock:
                 self._inflight.add(session_id)
+                meta = self.__dict__.setdefault("_inflight_meta", {})
+                meta[session_id] = dict(dispatch.get("meta") or {"role": role})
             if dispatch.get("root_mailbox") is not None:
                 # Durable ownership evidence as soon as the id exists, so a
                 # crash mid-dispatch still leaves a provable record.
@@ -3383,10 +3425,14 @@ class OmnigentRunner:
                 except Exception as exc:  # noqa: BLE001 - finally retries it
                     print(f"trioctl: could not record root session {session_id}: {exc}",
                           file=sys.stderr)
-        self.session_ids[role] = session_id
-        self.created_session_ids.append(session_id)
+        with self._dict_lock():
+            # Last dispatch of this role (back-compat); never read in flight.
+            self.session_ids[role] = session_id
+            self.created_session_ids.append(session_id)
+            if delivery:
+                self._delivery[session_id] = delivery
         _record_created_session_id(session_id)
-        self._record_dispatch(role, client, session_id, created)
+        self._record_dispatch(role, client, session_id, created, delivery)
         remaining = (
             None
             if started is None
@@ -3413,14 +3459,20 @@ class OmnigentRunner:
         return uuid.uuid4().hex if self._completion_receipts else None
 
     def _record_dispatch(
-        self, role: str, client: Any, session_id: str, created: Any
+        self,
+        role: str,
+        client: Any,
+        session_id: str,
+        created: Any,
+        delivery: dict[str, Any] | None = None,
     ) -> None:
         """Save dispatch provenance right after create, before the wait.
 
+        *delivery* is this dispatch's own record (never looked up by role:
+        several evaluator dispatches may be in flight at once).
         Identity comes only from the create response (null when absent);
         a failed write leaves the dispatch unreconcilable, never broken.
         """
-        delivery = self._delivery.get(role)
         if not delivery or reconcile is None:
             return
         delivery.update(client=client, session_id=session_id, extra_sends=0)
@@ -3456,8 +3508,12 @@ class OmnigentRunner:
     def _final_provenance(
         self, role: str, session_id: str
     ) -> dict[str, Any] | None:
-        """The saved provenance with the final copy count, or None."""
-        delivery = self._delivery.get(role) or {}
+        """The saved provenance with the final copy count, or None.
+
+        Looked up by this dispatch's own session id (per dispatch).
+        """
+        with self._dict_lock():
+            delivery = self._delivery.get(session_id) or {}
         prov = delivery.get("provenance")
         if not prov or delivery.get("session_id") != session_id:
             return None
@@ -3545,11 +3601,23 @@ class OmnigentRunner:
         prompt = self._prompt(role, iteration, mailbox, context)
         # Per-dispatch nonce: no two dispatches share a prompt hash, so a
         # completion receipt's injection sha256 binds to exactly this one.
-        self._dispatch_nonce = self._new_dispatch_nonce()
-        if self._dispatch_nonce:
-            prompt += f"\nDispatch nonce: {self._dispatch_nonce}\n"
+        nonce = self._new_dispatch_nonce()
+        self._dispatch_nonce = nonce  # last dispatch (back-compat only)
+        if nonce:
+            prompt += f"\nDispatch nonce: {nonce}\n"
         title = self._title(mailbox, iteration, role, context)
-        dispatch: dict[str, Any] = {"role": role, "session_id": None, "fence": None}
+        dispatch: dict[str, Any] = {
+            "role": role,
+            "session_id": None,
+            "fence": None,
+            "delivery": None,
+            "meta": {
+                "role": role,
+                "kind": (context or {}).get("kind"),
+                "slice": (context or {}).get("slice"),
+                "sha": (context or {}).get("sha"),
+            },
+        }
         eval_wt = self._slice_eval_worktree(role, mailbox, context)
         workspace = self._workspace
         if self._isolate and worker_worktrees is not None and eval_wt is None:
@@ -3588,16 +3656,15 @@ class OmnigentRunner:
         else:
             before_text = _mailbox_text(mailbox / "VERDICT.md")
             before_mtime = _mailbox_mtime(mailbox / "VERDICT.md")
-        self._delivery.pop(role, None)
         if self._completion_receipts:
-            self._delivery[role] = {
+            dispatch["delivery"] = {
                 "mailbox": mailbox,
                 "prompt": prompt,
                 "baseline_text": before_text,
                 "base": _dispatch_provenance(
                     mailbox, self.repo, role, iteration, prompt, before_text,
                     context, agent_id=agent_id, model=model, title=title,
-                    nonce=self._dispatch_nonce,
+                    nonce=nonce,
                 ),
             }
         dispatch["workspace"] = workspace
@@ -3621,6 +3688,8 @@ class OmnigentRunner:
             with self._own_lock:
                 if session_id:
                     self._inflight.discard(session_id)
+                    self.__dict__.setdefault("_inflight_meta", {}).pop(session_id, None)
+                    self._delivery.pop(session_id, None)
                 if dispatch.get("fence"):
                     self._fence_tokens[dispatch["fence"]] = True  # finished
                 if eval_wt is None and self._isolate and session_id:
@@ -3696,7 +3765,7 @@ class OmnigentRunner:
                 # Empty items on an unbound runner do not prove the turn
                 # never ran: hold the session below, never re-send.
                 raise TrioctlError(
-                    f"session {self.session_ids.get(role)}: runner "
+                    f"session {dispatch.get('session_id')}: runner "
                     "unbound and no items after the wait; the prompt "
                     "was already submitted and is not re-sent"
                 )
@@ -3711,6 +3780,7 @@ class OmnigentRunner:
                 before_text,
                 before_mtime,
                 context,
+                session_id=dispatch.get("session_id"),
             )
         except broker_http.PromptDeliveryUncertain as exc:
             # A copy may still be queued or running: never re-dispatch
@@ -3765,7 +3835,8 @@ class OmnigentRunner:
         (``provenance``), which `omnigent reconcile` needs; a record
         without it stays held for a person.
         """
-        self.held_session_ids.append(session_id)
+        with self._dict_lock():
+            self.held_session_ids.append(session_id)
         record = {
             "session_id": session_id,
             "role": role,
@@ -3825,9 +3896,17 @@ class OmnigentRunner:
         before_text: str,
         before_mtime: float,
         context: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> Any:
-        """Re-enter wait on this session until the role artifact exists."""
-        session_id = self.session_ids.get(role)
+        """Re-enter wait on this session until the role artifact exists.
+
+        *session_id* is this dispatch's own session (the dispatch path
+        always passes it; the per-role ``session_ids`` fallback is only for
+        direct callers, since concurrent slice-evals share the role).
+        """
+        if session_id is None:
+            session_id = self.session_ids.get(role)
         if session_id is None:
             raise TrioctlError(f"role {role} has no session id")
         snapshot: Any = {"id": session_id, "status": "idle"}
