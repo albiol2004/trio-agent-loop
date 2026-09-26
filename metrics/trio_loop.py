@@ -1562,11 +1562,13 @@ def run_loop(
     poll_seconds: float = 30,
     mode: str = "auto",
     slice_eval_concurrency: int = 1,
+    slice_eval_drain_seconds: float | None = None,
 ) -> int:
     """Dispatch to open-loop or lockstep (api: engine entry points).
 
     ``slice_eval_concurrency`` (open-loop only; default 1 = the serial
-    slice-eval loop) is passed through to `run_open_loop`.
+    slice-eval loop) and ``slice_eval_drain_seconds`` (None = default
+    budget) are passed through to `run_open_loop`.
 
     `mode="auto"` (default) selects open-loop iff `(mailbox / "QUEUE.md")`
     is a file; `mode="lockstep"` always takes the lockstep path (byte
@@ -1591,6 +1593,8 @@ def run_loop(
     extra: dict = {}
     if slice_eval_concurrency != 1:
         extra["slice_eval_concurrency"] = slice_eval_concurrency
+    if slice_eval_drain_seconds is not None:
+        extra["slice_eval_drain_seconds"] = slice_eval_drain_seconds
     return run_open_loop(
         mailbox,
         max_iterations,
@@ -1898,15 +1902,85 @@ def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
 #: per-dispatch timeout (OmnigentRunner's default role timeout).
 DEFAULT_SLICE_EVAL_DRAIN_SECONDS = 3600.0
 
+#: Default cap on the exit drain: a Ctrl-C/SIGTERM must not block for a
+#: whole role timeout before prune. Override: `--slice-eval-drain-seconds`
+#: or ``TRIO_SLICE_EVAL_DRAIN_SECONDS``.
+SLICE_EVAL_DRAIN_CAP_SECONDS = 120.0
+SLICE_EVAL_DRAIN_ENV = "TRIO_SLICE_EVAL_DRAIN_SECONDS"
 
-def _slice_eval_drain_seconds(eval_runner: object) -> float:
-    """The same budget a single dispatch gets today (runner's role timeout)."""
+#: Held-record kind for a slice-eval still running when the drain gave up.
+ABANDONED_ON_EXIT_HOLD = "abandoned_on_exit"
+
+
+def _drain_seconds_value(value: object) -> float | None:
+    """A finite, non-negative number of seconds, else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _slice_eval_drain_seconds(
+    eval_runner: object, override: float | None = None
+) -> float:
+    """Exit-drain budget for running slice-evals.
+
+    Precedence: explicit *override* (the loop flag), then
+    ``TRIO_SLICE_EVAL_DRAIN_SECONDS``, then min(runner role timeout, 120 s).
+    An invalid override/env value falls through to the next source.
+    """
+    for candidate in (override, os.environ.get(SLICE_EVAL_DRAIN_ENV)):
+        if candidate is None or candidate == "":
+            continue
+        seconds = _drain_seconds_value(candidate)
+        if seconds is not None:
+            return seconds
+    timeout = DEFAULT_SLICE_EVAL_DRAIN_SECONDS
     for name in ("timeout", "_timeout"):
         value = getattr(eval_runner, name, None)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if math.isfinite(value) and value >= 0:
-                return float(value)
-    return DEFAULT_SLICE_EVAL_DRAIN_SECONDS
+                timeout = float(value)
+                break
+    return min(timeout, SLICE_EVAL_DRAIN_CAP_SECONDS)
+
+
+def _write_abandoned_hold(
+    mailbox: Path, session_id: str, slice_id: str, sha: str,
+    iteration: int, budget: float,
+) -> Path:
+    """Durable ``.sessions/held-<sid>.json`` (same shape as trioctl's holds)
+    for a slice-eval the exit drain abandoned: it may still be running, so
+    the next resume is refused until a person resolves it."""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", session_id).strip("-") or "session"
+    path = mailbox / ".sessions" / f"held-{slug}.json"
+    record = {
+        "session_id": session_id,
+        "role": "evaluator",
+        "iteration": iteration,
+        "hold": ABANDONED_ON_EXIT_HOLD,
+        "kind": "slice-eval",
+        "slice": slice_id,
+        "sha": sha,
+        "pinned_sha": sha,
+        "reason": (
+            f"slice-eval still running after the {budget:g}s exit drain "
+            "budget; abandoned on loop exit"
+        ),
+        "recorded_at": _iso_now(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return path
 
 
 def _merge_slice_blocks(known: dict, text: str) -> None:
@@ -1941,8 +2015,10 @@ def run_open_loop(
     slice-eval blocks the integration-eval exactly like a pending one; the
     integration gate is re-checked right after each harvest. On any exit,
     queued futures are cancelled and running ones are waited for up to
-    ``slice_eval_drain_seconds`` (default: the eval runner's own role
-    timeout, i.e. one dispatch's budget).
+    ``slice_eval_drain_seconds`` (default: ``TRIO_SLICE_EVAL_DRAIN_SECONDS``,
+    else min(eval runner role timeout, 120 s)). A slice-eval still running
+    after that is abandoned: logged, and held (``held-<sid>.json``, hold
+    ``abandoned_on_exit``) when its session id is known.
     """
     if not isinstance(slice_eval_concurrency, int) or slice_eval_concurrency < 1:
         raise ValueError(
@@ -1958,11 +2034,7 @@ def run_open_loop(
     pool: concurrent.futures.ThreadPoolExecutor | None = None
     # (slice, sha) -> {"future", "snapshot", "seen"}; outer thread only.
     inflight: dict[tuple[str, str], dict] = {}
-    drain_budget = (
-        slice_eval_drain_seconds
-        if slice_eval_drain_seconds is not None
-        else _slice_eval_drain_seconds(eval_runner)
-    )
+    drain_budget = _slice_eval_drain_seconds(eval_runner, slice_eval_drain_seconds)
     verdict_path = mailbox / "VERDICT.md"
 
     def evaluator_sessions() -> dict | None:
@@ -2020,7 +2092,46 @@ def run_open_loop(
                 f"slice-eval(s) still running after the {drain_budget:g}s "
                 "drain budget; abandoned",
             )
+            hold_abandoned(entries, not_done, iteration_now)
         pool = None
+
+    def hold_abandoned(entries: list, not_done, iteration_now: int) -> None:
+        """Held record per abandoned slice-eval whose session id is known."""
+        try:
+            live = getattr(eval_runner, "inflight_sessions", None)
+            snapshot = (live() or {}) if callable(live) else {}
+        except Exception:  # noqa: BLE001 - best effort on exit
+            snapshot = {}
+        by_key = {
+            (meta.get("slice"), meta.get("sha")): sid
+            for sid, meta in snapshot.items()
+            if isinstance(meta, dict) and meta.get("kind") == "slice-eval"
+        }
+        for (slice_id, sha), entry in entries:
+            if entry["future"] not in not_done:
+                continue
+            session_id = by_key.get((slice_id, sha))
+            if not session_id:
+                continue
+            try:
+                path = _write_abandoned_hold(
+                    mailbox, str(session_id), slice_id, sha,
+                    iteration_now, drain_budget,
+                )
+            except OSError as exc:
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration_now} | loop | open-loop: could NOT "
+                    f"hold abandoned slice-eval {slice_id} session "
+                    f"{session_id} ({exc}); do not resume until it is resolved",
+                )
+                continue
+            _append_log(
+                mailbox,
+                f"- iter {iteration_now} | loop | held evaluator session "
+                f"{session_id}: slice-eval {slice_id} abandoned on exit; "
+                f"see {path.name}",
+            )
 
     try:
         state_path = mailbox / "STATE.md"
@@ -2596,6 +2707,15 @@ def main(argv: list[str] | None = None) -> int:
         help="open-loop: grade up to N retired slices at once "
         "(default 1: one after another)",
     )
+    run.add_argument(
+        "--slice-eval-drain-seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help="open-loop: on exit, wait up to S seconds for running "
+        f"slice-evals (default: ${SLICE_EVAL_DRAIN_ENV}, else "
+        "min(role timeout, 120))",
+    )
     mode_group = run.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--open-loop",
@@ -2623,6 +2743,7 @@ def main(argv: list[str] | None = None) -> int:
         poll_seconds=args.poll_seconds,
         mode=mode,
         slice_eval_concurrency=args.slice_eval_concurrency,
+        slice_eval_drain_seconds=args.slice_eval_drain_seconds,
     )
 
 if __name__ == "__main__":

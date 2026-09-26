@@ -156,6 +156,39 @@ def test_slice_eval_concurrency_flag_defaults_to_serial_and_passes_through() -> 
         trioctl._slice_eval_concurrency_kwargs(NewCore, zero)
 
 
+def test_slice_eval_drain_seconds_flag_passes_through() -> None:
+    trioctl = load_trioctl()
+    default = trioctl.parser().parse_args(["omnigent", "loop"])
+    assert default.slice_eval_drain_seconds is None
+
+    class NewCore:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None,
+                     slice_eval_concurrency=1, slice_eval_drain_seconds=None):
+            return 0
+
+    class OldCore:
+        @staticmethod
+        def run_loop(mailbox, max_iterations, runner, *, repo=None,
+                     slice_eval_concurrency=1):
+            return 0
+
+    assert trioctl._slice_eval_concurrency_kwargs(OldCore, default) == {}
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--slice-eval-drain-seconds", "30"]
+    )
+    assert trioctl._slice_eval_concurrency_kwargs(NewCore, args) == {
+        "slice_eval_drain_seconds": 30.0
+    }
+    with pytest.raises(trioctl.TrioctlError, match="refused"):
+        trioctl._slice_eval_concurrency_kwargs(OldCore, args)
+    bad = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--slice-eval-drain-seconds", "-1"]
+    )
+    with pytest.raises(trioctl.TrioctlError, match=">= 0"):
+        trioctl._slice_eval_concurrency_kwargs(NewCore, bad)
+
+
 def test_real_loop_core_accepts_slice_eval_concurrency() -> None:
     import inspect
 
@@ -322,3 +355,17 @@ def test_single_slice_eval_appender_unchanged(tmp_path: Path) -> None:
     runner = _slice_runner(trioctl, tmp_path, client)
     assert runner.run("evaluator", 1, mailbox, _slice_ctx("solo")) == 0
     assert client.waits == 1
+
+
+def test_abandoned_on_exit_hold_blocks_resume_with_reason(tmp_path: Path) -> None:
+    from metrics import trio_loop
+
+    trioctl = load_trioctl()
+    mailbox = make_mailbox(tmp_path)
+    path = trio_loop._write_abandoned_hold(mailbox, "s-9", "alpha", FULL_SHA, 3, 120.0)
+    assert path == trioctl._held_record_path(mailbox, "s-9")
+    assert trioctl._held_session_ids(mailbox) == {"s-9"}
+    message = trioctl._held_dispatch_message(mailbox)
+    assert "session s-9 (role evaluator, iteration 3" in message
+    assert "slice-eval still running when the loop exited" in message
+    assert f"slice-eval alpha @{FULL_SHA}" in message

@@ -462,11 +462,67 @@ def test_concurrent_eval_clobbering_a_section_written_mid_flight_is_restored(
     _assert_no_slice_threads()
 
 
-def test_drain_budget_defaults_to_the_runner_role_timeout() -> None:
+def test_drain_budget_defaults_to_min_of_role_timeout_and_120(monkeypatch) -> None:
+    monkeypatch.delenv(trio_loop.SLICE_EVAL_DRAIN_ENV, raising=False)
+
     class R:
         _timeout = 42.0
 
+    class Big:
+        _timeout = 3600.0
+
     assert trio_loop._slice_eval_drain_seconds(R()) == 42.0
-    assert trio_loop._slice_eval_drain_seconds(object()) == (
-        trio_loop.DEFAULT_SLICE_EVAL_DRAIN_SECONDS
-    )
+    assert trio_loop._slice_eval_drain_seconds(Big()) == 120.0
+    # No runner timeout: the 3600 s role default, capped at 120.
+    assert trio_loop._slice_eval_drain_seconds(object()) == 120.0
+
+
+def test_drain_budget_explicit_override_and_env(monkeypatch) -> None:
+    class Big:
+        _timeout = 3600.0
+
+    monkeypatch.delenv(trio_loop.SLICE_EVAL_DRAIN_ENV, raising=False)
+    assert trio_loop._slice_eval_drain_seconds(Big(), 5.0) == 5.0
+    assert trio_loop._slice_eval_drain_seconds(Big(), 900) == 900.0
+    assert trio_loop._slice_eval_drain_seconds(Big(), 0) == 0.0
+    monkeypatch.setenv(trio_loop.SLICE_EVAL_DRAIN_ENV, "7")
+    assert trio_loop._slice_eval_drain_seconds(Big()) == 7.0
+    assert trio_loop._slice_eval_drain_seconds(Big(), 3.0) == 3.0  # flag wins
+    for bad in ("abc", "-1", "nan", "inf"):
+        monkeypatch.setenv(trio_loop.SLICE_EVAL_DRAIN_ENV, bad)
+        assert trio_loop._slice_eval_drain_seconds(Big()) == 120.0
+    # run_loop passes the override through only when given.
+    import inspect
+
+    assert "slice_eval_drain_seconds" in inspect.signature(trio_loop.run_loop).parameters
+
+
+def _held(mailbox: Path) -> list[dict]:
+    return [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in sorted((mailbox / ".sessions").glob("held-*.json"))
+    ]
+
+
+def test_abandoned_slice_eval_gets_a_held_record(tmp_path: Path) -> None:
+    code, _elapsed, evaluator, mailbox = _capped_run(tmp_path, hold=1.0, drain=0.1)
+    assert code == 4
+    held = _held(mailbox)
+    started = sorted(n for kind, n in evaluator.events if kind == "start")
+    assert sorted(r["slice"] for r in held) == started and len(held) == 2
+    for record in held:
+        assert record["hold"] == "abandoned_on_exit"
+        assert record["role"] == "evaluator" and record["kind"] == "slice-eval"
+        sha = record["sha"]
+        assert record["session_id"] == f"sess-{record['slice']}-{sha}"[:40]
+        assert record["pinned_sha"] == sha
+    log = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "abandoned on exit; see held-" in log
+    _assert_no_slice_threads(timeout=5.0)
+
+
+def test_no_held_record_when_evals_finish_inside_the_drain(tmp_path: Path) -> None:
+    code, _elapsed, _evaluator, mailbox = _capped_run(tmp_path, hold=0.3, drain=10)
+    assert code == 4
+    assert _held(mailbox) == []
+    _assert_no_slice_threads()
