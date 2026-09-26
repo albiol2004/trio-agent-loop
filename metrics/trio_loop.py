@@ -555,10 +555,12 @@ def _restore_clobbered_verdict_sections(
     kind: str,
     iteration: int,
     read_text=None,
-) -> None:
+) -> int:
     """Guard against an Evaluator session rewriting VERDICT.md whole instead
     of appending: if any ``## slice ... — SHIP|ITERATE`` section present
     before the runner ran is missing afterwards, restore it.
+
+    Returns the number of sections restored (0 when nothing was missing).
 
     Never drops anything the runner just wrote. When the new text still
     opens with an overall ``VERDICT: ...`` line, that whole new text is
@@ -577,12 +579,12 @@ def _restore_clobbered_verdict_sections(
         )
     old_blocks = _slice_verdict_blocks(snapshot_text)
     if not old_blocks:
-        return
+        return 0
     new_blocks = _slice_verdict_blocks(new_text)
     new_keys = {(b["slice"], b["sha"]) for b in new_blocks}
     missing = [b for b in old_blocks if (b["slice"], b["sha"]) not in new_keys]
     if not missing:
-        return
+        return 0
     first_line = next((line.strip() for line in new_text.splitlines() if line.strip()), "")
     if VERDICT_RE.match(first_line):
         base = new_text
@@ -597,6 +599,7 @@ def _restore_clobbered_verdict_sections(
         f"- iter {iteration} | loop | open-loop: restored {len(missing)} "
         f"clobbered per-slice section(s) in VERDICT.md after {kind}",
     )
+    return len(missing)
 
 def _verdict_commit_shas(text: str) -> list[str]:
     """Return ``commit: <sha>`` values recorded in VERDICT.md."""
@@ -817,6 +820,123 @@ def _mailbox_retirement_commit_present(
         if any(_path_in_mailbox(p, mailbox_rel) for p in paths):
             return True
     return False
+
+
+def _fold_restored_verdict_into_retirement(
+    mailbox: Path, repo: Path | None, iteration: int, restored: int
+) -> bool:
+    """Fold VERDICT.md sections the driver just restored into the SHIP
+    retirement commit the integration Evaluator already made.
+
+    The Evaluator may rewrite VERDICT.md whole and commit it (``loop:
+    iteration N — SHIP``) without the per-slice sections; the clobber
+    restore then re-appends them to the working tree only, leaving
+    VERDICT.md dirty after retirement. Amend that commit with VERDICT.md
+    only when every condition holds: the verdict is SHIP; a retirement
+    commit for this iteration is an ancestor of HEAD; HEAD itself is that
+    commit (single parent, message names it) and touches only mailbox
+    paths; nothing is staged; the only dirty tracked mailbox path besides
+    the LOG.md/STATE.md driver sidecars (which the retirement check never
+    reads as dirty) is VERDICT.md; and the working VERDICT.md extends the
+    committed one byte-for-byte (the restore only appends). Otherwise
+    nothing is amended and the reason is logged (non-SHIP verdicts and
+    no-repo runs, where no retirement commit exists, are skipped silently). The graded pin
+    (``evaluated_sha``) is the product revision, which the amend never
+    changes. Returns True when the amend happened.
+    """
+    verdict, scope = _first_verdict(mailbox / "VERDICT.md")
+    if verdict != "SHIP" or scope is not None:
+        return False
+
+    def refuse(reason: str) -> bool:
+        _append_log(
+            mailbox,
+            f"- iter {iteration} | loop | open-loop: restored sections "
+            f"could not be folded into retirement ({reason})",
+        )
+        return False
+
+    git_root = _git_root(repo)
+    if git_root is None:
+        # No-repo fakes have no retirement commit to fold into.
+        return False
+    mailbox_rel = _mailbox_rel(git_root, mailbox)
+    if not mailbox_rel:
+        return refuse("mailbox is not inside the repository")
+    needle = f"loop: iteration {iteration} — SHIP"
+    if not _mailbox_retirement_commit_present(git_root, mailbox, iteration):
+        return refuse(
+            f"no '{needle}' commit touching {mailbox_rel}/ is an "
+            "ancestor of HEAD"
+        )
+    head = _git_head(git_root)
+    if head is None:
+        return refuse("repository has no HEAD commit")
+    info = _git(git_root, "log", "-1", "--format=%P%n%B", head)
+    if info.returncode != 0:
+        return refuse("git log of HEAD failed")
+    parents_line, _sep, message = info.stdout.partition("\n")
+    if len(parents_line.split()) != 1:
+        return refuse(f"HEAD {head[:12]} is a merge or root commit")
+    if needle not in message:
+        return refuse(f"HEAD {head[:12]} is not the retirement commit")
+    head_paths = _commit_paths(git_root, head)
+    outside = [p for p in head_paths if not _path_in_mailbox(p, mailbox_rel)]
+    if not head_paths or outside:
+        return refuse(
+            f"HEAD {head[:12]} touches paths outside {mailbox_rel}/: "
+            + (", ".join(outside) or "(none in the mailbox)")
+        )
+    staged = _diff_paths(git_root, "--cached", "HEAD")
+    if staged is None:
+        return refuse("git diff --cached failed")
+    if staged:
+        return refuse(f"index has staged changes: {', '.join(staged)}")
+    dirty = _diff_paths(git_root, "HEAD", "--", mailbox_rel)
+    if dirty is None:
+        return refuse("git diff of the mailbox failed")
+    verdict_rel = f"{mailbox_rel}/VERDICT.md"
+    sidecars = {f"{mailbox_rel}/LOG.md", f"{mailbox_rel}/STATE.md"}
+    if verdict_rel not in dirty:
+        return refuse("VERDICT.md has no uncommitted edits")
+    others = [p for p in dirty if p != verdict_rel and p not in sidecars]
+    if others:
+        return refuse(
+            f"other mailbox paths have uncommitted edits: {', '.join(others)}"
+        )
+    try:
+        committed = subprocess.run(
+            ["git", "-C", str(git_root), "show", f"HEAD:{verdict_rel}"],
+            capture_output=True,
+            check=False,
+        )
+        working = (mailbox / "VERDICT.md").read_bytes()
+    except OSError:
+        return refuse("could not read VERDICT.md")
+    if committed.returncode != 0:
+        return refuse("VERDICT.md is not in the retirement commit")
+    if not working.startswith(committed.stdout):
+        return refuse("working VERDICT.md does not extend the committed one")
+    if _git_head(git_root) != head:
+        return refuse("HEAD moved during the fold checks")
+    if _git(git_root, "add", "--", verdict_rel).returncode != 0:
+        return refuse("git add VERDICT.md failed")
+    amend = _git(git_root, "commit", "--amend", "--no-edit", "--no-verify", "-q")
+    if amend.returncode != 0:
+        _git(git_root, "reset", "-q", "--", verdict_rel)
+        detail = (amend.stderr or amend.stdout).strip().splitlines()
+        return refuse(
+            "git commit --amend failed"
+            + (f": {detail[-1]}" if detail else "")
+        )
+    new_head = _git_head(git_root) or "?"
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | open-loop: folded {restored} restored "
+        f"per-slice section(s) into retirement commit "
+        f"{head[:12]}->{new_head[:12]}",
+    )
+    return True
 
 
 def _verified_verdict_commit_shas(repo: Path, text: str) -> list[str]:
@@ -2562,7 +2682,7 @@ def run_open_loop(
                             raise RuntimeError(
                                 f"evaluator runner failed with exit {result}"
                             )
-                        _restore_clobbered_verdict_sections(
+                        restored_sections = _restore_clobbered_verdict_sections(
                             mailbox, verdict_path, verdict_snapshot,
                             "integration-eval", iteration_now,
                         )
@@ -2591,6 +2711,14 @@ def run_open_loop(
                                 f"{integration_attempts} attempts",
                             )
                             return finish(3)
+                    if restored_sections:
+                        # The Evaluator may already have committed its
+                        # rewritten VERDICT.md as the SHIP retirement; the
+                        # restore left the sections uncommitted, which the
+                        # acceptance check rightly treats as dirty.
+                        _fold_restored_verdict_into_retirement(
+                            mailbox, repo, iteration_now, restored_sections
+                        )
                     verdict, scope = _first_verdict(verdict_path)
                     if verdict is None:
                         _update_state(state_path, {"status": "error"})
