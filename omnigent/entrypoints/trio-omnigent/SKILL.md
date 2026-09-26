@@ -276,8 +276,33 @@ verdict.
 `trioctl omnigent loop` runs unattended iterations over the broker's HTTP API:
 ```bash
 trioctl omnigent loop --mailbox loop/ [--max-iterations N] [--wait-timeout S] \
-  [--host-id ID] [--runner-id ID]
+  [--host-id ID] [--runner-id ID] \
+  [--no-isolate-workers] [--slice-eval-concurrency N] [--worktree-root DIR]
 ```
+
+Plain `trioctl omnigent loop --mailbox <m>` is the fast path: worker
+isolation (each builder in a task-owned git worktree merged back on exit,
+each open-loop slice-eval in a detached worktree at its pin, accepted
+worktrees removed before and after the loop) and up to 4 concurrent
+slice-evals are ON by default. Worktrees live outside the repository under
+`$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`)
+`/trio-agent-loop/worktrees/<repo>-<hash>`; the loop prints
+`trioctl: worktree root <path>` once. Disable with:
+
+- `--no-isolate-workers` (also makes slice-evals serial; an explicit
+  `--slice-eval-concurrency N>1` is then refused)
+- `--slice-eval-concurrency 1` (serial slice-evals, isolation kept)
+- `--worktree-root DIR` overrides the worktree location.
+
+A default whose prerequisite is missing falls back with one stderr line
+(not a git branch checkout, `--observe-workers`, session-bound Omnigent
+bindings in the user's Cursor config: non-isolated; a vendored
+`metrics/trio_loop.py` older than r10: serial slice-evals, refresh
+`metrics/` to enable). An explicit flag never falls back: `--isolate-workers`
+(accepted, otherwise a no-op) and `--slice-eval-concurrency N>1` are refused
+instead. In lockstep (no `QUEUE.md`) slice-eval concurrency does not apply
+and the loop says so. Design and speed evidence:
+`docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
 
 The command owns the mailbox lock and manages verdict parsing, repairs (max 2
 consecutive scoped repairs), resume state, and exit codes. `--wait-timeout`

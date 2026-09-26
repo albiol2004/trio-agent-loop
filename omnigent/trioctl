@@ -5181,6 +5181,16 @@ def parser() -> argparse.ArgumentParser:
     loop = commands.add_parser(
         "loop",
         help="run loop-core with Omnigent Lead and Evaluator sessions",
+        description=(
+            "Run loop-core with Omnigent Lead and Evaluator sessions.\n\n"
+            "Fast path (defaults): `trioctl omnigent loop --mailbox <m>`\n"
+            "isolates workers in task-owned worktrees outside the repo and\n"
+            "grades up to 4 retired open-loop slices concurrently.\n"
+            "Disable with --no-isolate-workers (also serial slice-evals) or\n"
+            "--slice-eval-concurrency 1; --worktree-root DIR relocates the\n"
+            "worktrees. Defaults fall back (with a stderr line) when a\n"
+            "prerequisite is missing; explicit flags are refused instead."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "environment variables:\n"
@@ -5252,7 +5262,8 @@ def parser() -> argparse.ArgumentParser:
             "(this trioctl path, run id, iteration, events file under "
             "<mailbox>/.observe/<run-id>/) and ask for a REPORT.md "
             "'## Wave decisions' section; record Lead/Evaluator phase "
-            "timing and write summary.json at exit. Never fails the loop"
+            "timing and write summary.json at exit. Never fails the loop. Turns the default worker isolation (and so "
+            "concurrent slice-eval) off; cannot combine with --isolate-workers"
         ),
     )
     loop.add_argument(

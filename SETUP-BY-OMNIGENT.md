@@ -222,6 +222,32 @@ configs.
 Use a different mailbox such as `loop-auth` for a concurrent mission. Never
 point two live runs at one mailbox.
 
+## Headless loop defaults
+
+Plain `trioctl omnigent loop --mailbox <m>` is the fast path: worker
+isolation (each builder in a task-owned git worktree merged back on exit,
+each open-loop slice-eval in a detached worktree at its pin, accepted
+worktrees removed before and after the loop) and up to 4 concurrent
+slice-evals are ON by default. Worktrees live outside the repository under
+`$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`)
+`/trio-agent-loop/worktrees/<repo>-<hash>`; the loop prints
+`trioctl: worktree root <path>` once. Disable with:
+
+- `--no-isolate-workers` (also makes slice-evals serial; an explicit
+  `--slice-eval-concurrency N>1` is then refused)
+- `--slice-eval-concurrency 1` (serial slice-evals, isolation kept)
+- `--worktree-root DIR` overrides the worktree location.
+
+A default whose prerequisite is missing falls back with one stderr line
+(not a git branch checkout, `--observe-workers`, session-bound Omnigent
+bindings in the user's Cursor config: non-isolated; a vendored
+`metrics/trio_loop.py` older than r10: serial slice-evals, refresh
+`metrics/` to enable). An explicit flag never falls back: `--isolate-workers`
+(accepted, otherwise a no-op) and `--slice-eval-concurrency N>1` are refused
+instead. In lockstep (no `QUEUE.md`) slice-eval concurrency does not apply
+and the loop says so. Design and speed evidence:
+`docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
+
 ## Session and anchor hygiene
 
 Each iteration's skill role runs under the title

@@ -2,8 +2,9 @@
 
 ## 1. Purpose
 
-`--isolate-workers` gives each concurrent role its own git worktree instead of
-sharing the driver's checkout:
+Worker isolation (`--isolate-workers`; default ON since r11, see
+[Defaults](#6-defaults)) gives each concurrent role its own git worktree
+instead of sharing the driver's checkout:
 
 - **Per-builder worktrees**: each Lead-dispatched builder runs in its own
   worktree/branch (`trio-worker/...`), so concurrent builders never race.
@@ -118,3 +119,31 @@ counted the launcher's own shell; `verify_r7.py` now excludes ancestor pids
 
 Candidate `33c9836` is lab-qualified (r9, `20260926T142519Z`) and **not
 installed** — the installed `CURRENT` remains `8a19a8cc`.
+
+## 6. Defaults
+
+Since r11 (branch `r11-defaults-on`) isolation is no longer opt-in: a plain
+`trioctl omnigent loop --mailbox <m>` isolates workers and runs up to 4
+slice-evals concurrently (`docs/CONCURRENT-SLICE-EVAL.md`).
+
+| setting | default | disable / override |
+|---|---|---|
+| worker isolation | ON | `--no-isolate-workers` (`--isolate-workers` is an accepted no-op) |
+| worktree root | `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` or `~/.local/state` + `/trio-agent-loop/worktrees/<repo>-<sha256(git common dir)[:12]>` | `--worktree-root DIR` |
+| slice-eval concurrency | 4 | `--slice-eval-concurrency 1` |
+
+- The root is resolved once at loop start, printed
+  (`trioctl: worktree root <path>`), pinned into the builder dispatch
+  command, and created with the first worktree. It is always outside the
+  repository (`worker_worktrees.create` refuses a root inside it). The
+  ledger stays in `<git common dir>/trio-worktrees/`, and the per-worktree
+  `.cursor` handling is relative to each worktree, so neither depends on
+  where the root is.
+- Isolation is implemented in trioctl only; it works with any loop core
+  that trioctl accepts (qualified above with 3b5b93b's).
+- Default fallbacks (one stderr line, pre-r11 non-isolated run, serial
+  slice-evals): `worker_worktrees.py` missing, not a git checkout on a
+  branch, `--observe-workers` (both prescribe the worker command), or
+  session-bound Omnigent bindings in the user's/system Cursor config. With
+  an explicit `--isolate-workers` each of these is a refusal, as before.
+- An explicit `--slice-eval-concurrency N>1` without isolation is refused.
