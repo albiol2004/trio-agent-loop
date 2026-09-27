@@ -473,6 +473,76 @@ def _disposable_ignored(rel: str) -> bool:
     return any(part in DISPOSABLE_IGNORED for part in parts) or rel.endswith((".pyc", ".pyo"))
 
 
+#: Ignored directories whose content is rebuildable from tracked inputs
+#: (lockfiles, sources); an accepted/finished, owner-verified task worktree
+#: may be retired with them (see :func:`_blocking_state`).
+REBUILDABLE_IGNORED_DIRS = (
+    "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox", ".nox", ".next", ".turbo", ".parcel-cache", ".cache", "coverage",
+)
+#: Build-output directories that are rebuildable only when the repository's
+#: own ``.gitignore`` names them (a global/info exclude does not count).
+REPO_IGNORED_BUILD_DIRS = ("dist", "build")
+#: Ignored file suffixes that are rebuildable build/bytecode artifacts.
+REBUILDABLE_IGNORED_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
+
+
+def _empty_ignored_dir(path: Path, rel: str) -> bool:
+    """Whether ignored *rel* is a real directory holding no file or symlink."""
+    target = path / rel.rstrip("/")
+    if target.is_symlink() or not target.is_dir():
+        return False
+    for current, dirs, files in os.walk(target):
+        if files or any(Path(current, d).is_symlink() for d in dirs):
+            return False
+    return True
+
+
+def _repo_gitignore_lists(path: Path, dir_rel: str) -> bool:
+    """Whether a ``.gitignore`` inside worktree *path* names directory *dir_rel*.
+
+    ``git check-ignore -v`` must attribute the match to a tracked-tree
+    ``.gitignore`` (relative source, not ``.git/info/exclude`` nor the global
+    ``core.excludesFile``) whose non-negated, wildcard-free pattern ends in
+    exactly that directory name.
+    """
+    proc = git(path, "check-ignore", "-v", "--", dir_rel, check=False)
+    line = proc.stdout.splitlines()[0] if proc.returncode == 0 and proc.stdout else ""
+    match = re.match(r"^(.*?):(\d+):(.*)\t", line)
+    if match is None:
+        return False
+    source, pattern = match.group(1), match.group(3)
+    src = Path(source)
+    if src.is_absolute() or src.name != ".gitignore" or ".git" in src.parts[:-1]:
+        return False
+    try:
+        (path / src).resolve().relative_to(path.resolve())
+    except ValueError:
+        return False
+    if pattern.startswith("!") or any(c in pattern for c in "*?[\\"):
+        return False
+    return pattern.strip("/").split("/")[-1] == dir_rel.rstrip("/").split("/")[-1]
+
+
+def _rebuildable_ignored(path: Path, rel: str) -> bool:
+    """Whether ignored *rel* is an empty dir or a rebuildable artifact."""
+    if rel.endswith(REBUILDABLE_IGNORED_SUFFIXES) or _empty_ignored_dir(path, rel):
+        return True
+    parts = rel.rstrip("/").split("/")
+    is_dir = rel.endswith("/") or (
+        (path / rel).is_dir() and not (path / rel.rstrip("/")).is_symlink()
+    )
+    dir_parts = parts if is_dir else parts[:-1]
+    for index, part in enumerate(dir_parts):
+        if part in REBUILDABLE_IGNORED_DIRS:
+            return True
+        if part in REPO_IGNORED_BUILD_DIRS and _repo_gitignore_lists(
+            path, "/".join(parts[: index + 1])
+        ):
+            return True
+    return False
+
+
 # ------------------------------------------ root Cursor config provenance
 #
 # A root-bound cursor-native session (Lead, integration evaluator) makes
@@ -1636,10 +1706,39 @@ def _owned_worktree(repo: Path, record: dict[str, Any]) -> str | None:
     return None
 
 
+def _retirement_accepted(record: dict[str, Any]) -> bool:
+    """Builder merged and SHIP-bound (``accepted_by``), or evaluator finished."""
+    if record.get("kind") == "eval":
+        return bool(record.get("finished"))
+    return bool(record.get("merge_commit")) and bool(record.get("accepted_by"))
+
+
 def _blocking_state(
-    repo: Path, record: dict[str, Any], held_sessions: set[str] | None = None
+    repo: Path,
+    record: dict[str, Any],
+    held_sessions: set[str] | None = None,
+    *,
+    owner_verified: bool = False,
 ) -> tuple[str, str] | None:
+    """Why the worktree of *record* must be retained, or None to remove it.
+
+    Ignored content (``git status --ignored=matching``) is protected because
+    ``git worktree remove`` deletes it silently (``.env``, ``.runtime/``,
+    ``.context/``, uncommitted evidence). Always disposable: Python caches
+    (:data:`DISPOSABLE_IGNORED`, ``*.pyc``/``*.pyo``) and Omnigent's exact
+    generated ``.cursor`` config. Additionally, when *owner_verified* (the
+    caller checked :func:`_owned_worktree`) AND the record is accepted
+    (builder merged + ``accepted_by``) or finished (evaluator), an ignored
+    entry does not block when it is (a) a directory holding no file or
+    symlink, or (b) a rebuildable artifact: any directory component in
+    :data:`REBUILDABLE_IGNORED_DIRS`, or ``dist``/``build`` when a
+    ``.gitignore`` in the worktree names that exact directory (global and
+    ``info/exclude`` patterns do not count), or a suffix in
+    :data:`REBUILDABLE_IGNORED_SUFFIXES`. Everything else retains the
+    worktree as ``ignored_content`` with the first 5 blocking paths as detail.
+    """
     path = Path(record["path"])
+    retirable = owner_verified and _retirement_accepted(record)
     if identity_alive(record.get("worker")) or identity_alive(record.get("dispatcher")):
         return "active_session", "recorded worker/dispatcher process is alive"
     if group_alive(record.get("pgid")):
@@ -1653,7 +1752,7 @@ def _blocking_state(
     entries, residue = _split_status(path, status_entries(path))
     ignored = []
     for rel in ignored_entries(path):
-        if _disposable_ignored(rel):
+        if _disposable_ignored(rel) or (retirable and _rebuildable_ignored(path, rel)):
             continue
         owned = _owned_ignored_cursor(path, rel)
         if owned is None:
@@ -1757,7 +1856,7 @@ def cleanup_one(
     reason = _owned_worktree(repo, record)
     if reason is not None:
         return _retain(repo, record, "uncertain_ownership", reason)
-    blocking = _blocking_state(repo, record, held_sessions)
+    blocking = _blocking_state(repo, record, held_sessions, owner_verified=True)
     if blocking is not None:
         return _retain(repo, record, *blocking)
     record["state"] = "removing"

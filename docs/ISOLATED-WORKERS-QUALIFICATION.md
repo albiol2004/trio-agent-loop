@@ -171,3 +171,30 @@ isolation stays OFF unless `--isolate-workers` is explicit.
   other blocker to stop the pass with
   `- iter N | lead | blocked: uncommitted foreign changes: <files>` and
   STATE `status: needs_human`.
+
+### Worktree retirement and ignored content
+
+`git worktree remove` silently deletes ignored files, so retirement
+(`worker_worktrees._blocking_state`) protects them: any ignored entry
+retains the worktree as `ignored_content`, and the record's
+`retained_detail` names the first 5 blocking paths so a human can act.
+Always disposable: Python caches (`__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `*.pyc`/`*.pyo`) and Omnigent's exact
+generated `.cursor` config. Once a worktree's owner marker is verified AND
+it is accepted (builder merged + `accepted_by` the binding SHIP) or finished
+(evaluator), an ignored entry also does not block when it is (a) a directory
+holding no file or symlink (e.g. an empty `.eval-scratch/`), or (b) a
+rebuildable artifact: any directory component in `REBUILDABLE_IGNORED_DIRS`
+(`node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `.next`, `.turbo`,
+`.parcel-cache`, `.cache`, `coverage`), `dist`/`build` only when a
+`.gitignore` in the repository names that exact directory with a
+non-wildcard pattern (`git check-ignore -v`; a global `core.excludesFile` or
+`.git/info/exclude` does not count), or a `*.pyc`/`*.pyo`/`*.tsbuildinfo`
+file. A symlink is never treated as an artifact directory. Everything else
+(`.env`, `pi/.env`, `.runtime/`, `.context/`, a non-empty `.eval-scratch/`,
+logs, evidence) still retains the worktree. Before acceptance, or with an
+unverified owner, the pre-r11 rule applies unchanged. (Live motivation:
+openrouter/D retained all 8 accepted/finished worktrees solely for
+`api/node_modules/` from a builder's `npm ci`, plus one empty
+`.eval-scratch/`.)
