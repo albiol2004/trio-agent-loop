@@ -38,12 +38,16 @@ TM = _load(METRICS_PATH, "trio_metrics")
 
 def test_read_queue_no_file_returns_empty_queues(tmp_path: Path) -> None:
     """A2: no QUEUE.md at all -> empty queues, no exception."""
-    assert TM.read_queue(tmp_path) == {"retired": [], "faults": [], "errors": []}
+    assert TM.read_queue(tmp_path) == {
+        "retired": [], "faults": [], "errors": [], "malformed_slices": []
+    }
 
 
 def test_read_queue_empty_file_returns_empty_queues(tmp_path: Path) -> None:
     (tmp_path / "QUEUE.md").write_text("", encoding="utf-8")
-    assert TM.read_queue(tmp_path) == {"retired": [], "faults": [], "errors": []}
+    assert TM.read_queue(tmp_path) == {
+        "retired": [], "faults": [], "errors": [], "malformed_slices": []
+    }
 
 
 def test_read_queue_only_retired_block(tmp_path: Path) -> None:

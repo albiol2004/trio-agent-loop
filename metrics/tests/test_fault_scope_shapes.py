@@ -318,3 +318,192 @@ def test_trio_check_cli_fails_on_malformed_fault(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "`faults:` block" in (result.stdout + result.stderr)
+
+
+# --- r11 queue-harden F2: a complete entry survives a stray line --------------
+
+
+def test_wrapped_reason_continuation_is_folded_not_an_error() -> None:
+    entry = (
+        "  - id: f1\n"
+        "    slice: alpha\n"
+        f"    observed_at: {SHA}\n"
+        "    scope: local:a.py\n"
+        "    reason: the route test is red on the merged tree because\n"
+        "      the banner path returns HTML 200\n"
+        "    status: open\n"
+    )
+    q = _parse(entry, _fault("f2", "    scope: design\n"))
+    assert q["errors"] == []
+    assert [f["id"] for f in q["faults"]] == ["f1", "f2"]
+    assert q["faults"][0]["reason"] == (
+        "the route test is red on the merged tree because "
+        "the banner path returns HTML 200"
+    )
+    assert q["faults"][0]["status"] == "open"
+    # Strict mode agrees: folding is valid YAML, not a violation.
+    lines = TM.find_queue_block(_faults_block(entry), "faults")
+    assert TM.parse_faults(lines)[0]["reason"].endswith("returns HTML 200")
+
+
+def test_wrapped_continuation_after_last_key_is_folded() -> None:
+    entry = (
+        "  - id: f1\n    slice: alpha\n"
+        f"    observed_at: {SHA}\n    scope: a.py\n    status: open\n"
+        "    reason: long\n      tail\n"
+    )
+    q = _parse(entry)
+    assert q["errors"] == []
+    assert q["faults"][0]["reason"] == "long tail"
+
+
+def test_prose_line_after_complete_entry_keeps_entry_one_error() -> None:
+    q = _parse(
+        _fault("f1", "    scope: local:a.py\n")
+        + "  this fault is about the route test and nothing else\n",
+        _fault("f2", "    scope: design\n"),
+    )
+    assert [f["id"] for f in q["faults"]] == ["f1", "f2"]
+    assert len(q["errors"]) == 1
+    err = q["errors"][0]
+    assert err.startswith("`faults:` block: line 8: unexpected content: ")
+    assert "'this fault is about the route test and nothing else'" in err
+    assert "`- id: f1` entry at line 2 is kept" in err
+
+
+def test_long_junk_line_is_reported_by_prefix() -> None:
+    junk = "x" * 200
+    q = _parse(_fault("f1", "    scope: a.py\n") + f"    {junk}\n")
+    assert [f["id"] for f in q["faults"]] == ["f1"]
+    assert len(q["errors"]) == 1
+    assert ("x" * 60 + "…") in q["errors"][0] and junk not in q["errors"][0]
+
+
+def test_stray_id_line_after_complete_entry_keeps_entry() -> None:
+    q = _parse(
+        _fault("f1", "    scope: a.py\n") + "    id: f7\n",
+        _fault("f2", "    scope: b.py\n"),
+    )
+    assert [f["id"] for f in q["faults"]] == ["f1", "f2"]
+    assert len(q["errors"]) == 1 and "line 8: stray `id: f7` line" in q["errors"][0]
+
+
+def test_garbled_next_header_keeps_previous_entry() -> None:
+    # `-id: f2` is not a valid header; its key lines must not overwrite f1.
+    garbled = _fault("f2", "    scope: b.py\n").replace("  - id: f2", "  -id: f2")
+    q = _parse(_fault("f1", "    scope: a.py\n"), garbled, _fault("f3", "    scope: c.py\n"))
+    assert [(f["id"], f["scope"]) for f in q["faults"]] == [
+        ("f1", ["a.py"]), ("f3", ["c.py"]),
+    ]
+    assert len(q["errors"]) == 1 and "'-id: f2'" in q["errors"][0]
+
+
+def test_junk_inside_incomplete_entry_still_drops_it() -> None:
+    q = _parse(
+        "  - id: f1\n    slice: alpha\n    not yaml at all\n"
+        f"    observed_at: {SHA}\n    scope: a.py\n    reason: r\n    status: open\n",
+        _fault("f2", "    scope: b.py\n"),
+    )
+    assert [f["id"] for f in q["faults"]] == ["f2"]
+    assert len(q["errors"]) == 1
+
+
+def test_strict_mode_still_raises_on_stray_line_after_complete_entry() -> None:
+    lines = TM.find_queue_block(
+        _faults_block(_fault("f1", "    scope: a.py\n") + "  prose\n"), "faults"
+    )
+    with pytest.raises(TM.QueueParseError, match="line 8: unexpected content"):
+        TM.parse_faults(lines)
+
+
+# --- r11 queue-harden F1: malformed retired entries poison their slice --------
+
+SHA2 = "0" * 39 + "2"
+
+
+def _retired(*entries: str) -> str:
+    return "```yaml\nretired:\n" + "".join(entries) + "```\n"
+
+
+def test_newest_malformed_retired_entry_poisons_its_slice() -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n    sha: {SHA}\n    at: t1\n",
+        f"  - slice: beta\n    sha: {SHA}\n    at: t1\n",
+        f"  - slice: alpha\n    sha: {SHA2}\n",  # re-retire, missing `at:`
+    ))
+    assert [(e["slice"], e["sha"]) for e in q["retired"]] == [
+        ("alpha", SHA), ("beta", SHA),
+    ]
+    assert q["malformed_slices"] == ["alpha"]
+    assert len(q["errors"]) == 1
+
+
+def test_stray_slice_line_and_garbled_header_poison_named_slice() -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n    sha: {SHA}\n    at: t1\n",
+        "    slice: beta\n",
+        f"  - slice: gamma\n    sha: {SHA}\n    at: t1\n",
+        f"  -slice: delta\n    sha: {SHA2}\n    at: t2\n",
+    ))
+    # alpha and gamma are complete and kept; delta's lines never
+    # overwrite gamma's sha.
+    assert [(e["slice"], e["sha"]) for e in q["retired"]] == [
+        ("alpha", SHA), ("gamma", SHA),
+    ]
+    assert q["malformed_slices"] == ["beta", "delta"]
+    assert len(q["errors"]) == 2
+
+
+def test_valid_retired_block_has_no_malformed_slices() -> None:
+    q = TM.parse_queue_block(L_QUEUE)
+    assert q["malformed_slices"] == []
+
+
+def test_plain_scope_unterminated_quote_names_plain_value() -> None:
+    q = _parse(_fault("f1", '    scope: "a.py, b.py\n'))
+    assert q["faults"] == []
+    assert "quote in plain `scope:` value" in q["errors"][0]
+    assert "bracketed list" not in q["errors"][0]
+    q = _parse(_fault("f1", '    scope: ["a.py, b.py]\n'))
+    assert "quote in bracketed list" in q["errors"][0]
+
+
+# --- r11 queue-harden F3: METRICS_API 3 ---------------------------------------
+
+TRIOCTL = Path(__file__).parents[2] / "omnigent" / "trioctl"
+
+
+def _load_trioctl():
+    import importlib.machinery
+
+    loader = importlib.machinery.SourceFileLoader("trioctl_queue_harden", str(TRIOCTL))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_metrics_api_is_3_and_matches_trioctl() -> None:
+    assert TM.METRICS_API == 3
+    trioctl = _load_trioctl()
+    assert trioctl.REQUIRED_METRICS_API == TM.METRICS_API
+    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 3
+
+
+def test_too_old_vendored_metrics_is_refused_with_clear_message(
+    tmp_path: Path,
+) -> None:
+    trioctl = _load_trioctl()
+    metrics_dir = tmp_path / "metrics"
+    metrics_dir.mkdir()
+    core_src = Path(__file__).parents[1] / "trio_loop.py"
+    (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
+    (metrics_dir / "trio-metrics.py").write_text(
+        METRICS_PATH.read_text().replace("METRICS_API = 3\n", "METRICS_API = 2\n")
+    )
+    with pytest.raises(
+        trioctl.TrioctlError,
+        match=r"METRICS_API 2, this trioctl requires 3 \(mixed metrics/ versions\)",
+    ):
+        trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")

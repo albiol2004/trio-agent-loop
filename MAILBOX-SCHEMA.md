@@ -447,6 +447,29 @@ one, and reports the problem in `queue["errors"]`; `trio-check.py` fails
 on it and the open-loop driver logs
 `- iter N | loop | QUEUE.md parse error: <msg>` once per turn.
 
+Line-level rules of the reader (strict mode raises on every reported
+problem; lenient mode reports and continues):
+
+- A non-key line indented deeper than the scalar `key:` line above it
+  (e.g. a wrapped `reason:`) is YAML plain-scalar folding: it is appended
+  to that value with one space and is **not** an error.
+- An unexpected line (prose, a stray `id:`/`slice:` line, a garbled next
+  `- id:` header, a duplicate block key) that follows an entry which
+  already has **every required key** is reported — the message names the
+  line number and a prefix of its text — and skipped; the complete entry
+  is **kept**. Lines up to the next `- <id>:` header are skipped with it.
+  An entry still missing a required key at that point is dropped.
+- A `retired:` entry that is dropped for any reason, or whose slice id is
+  named by a stray `slice:` line or a garbled `- slice` header, puts its
+  slice in `queue["malformed_slices"]`. **Such a slice is not gated as
+  retired** — even when an older valid entry for it survives — until the
+  entry is repaired: the malformed entry is usually the re-retirement of a
+  fix, and trusting the older, already-graded sha would skip the fix's
+  slice-eval. The open-loop driver logs
+  `- iter N | loop | QUEUE.md: slice <id> has a malformed retired entry; not gated as retired`
+  once per turn; if the Lead makes no change, the 3-no-op stall guard
+  ends the run with `status: error`.
+
 `faults:` entries are **appended by the Evaluator only**; the Lead only
 transitions an existing entry's `status:` — the Lead never appends a new
 fault and never edits `slice`, `observed_at`, `scope`, or `reason`.
@@ -627,3 +650,17 @@ When `QUEUE.md` is present, `trio-check.py` also validates it (block
 shape, fault statuses, `retired:` entries referencing slice ids that
 exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
 absence is never a violation.
+
+## Changelog
+
+- **METRICS_API 3** (r11 queue-harden): `read_queue` returns
+  `malformed_slices`; a slice with a malformed `retired:` entry is not
+  gated as retired; a complete entry survives a stray line after it;
+  wrapped scalar continuations fold. Together with the plain fault
+  `scope:` values and lenient `errors` of r11 fault-scope, this is the
+  contract `trioctl` (`REQUIRED_METRICS_API = 3`) requires of a
+  repository's vendored `metrics/trio-metrics.py`; an older copy is
+  refused with "METRICS_API 2, this trioctl requires 3 (mixed metrics/
+  versions)" instead of silently dropping plain-scope faults.
+- **METRICS_API 2**: `read_queue`, `parse_slice_verdicts`,
+  `parse_verdict_scope`.

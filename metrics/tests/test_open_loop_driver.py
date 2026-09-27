@@ -92,6 +92,20 @@ class QueueModel:
             self.retired.append({"slice": slice_id, "sha": sha, "at": at})
             self._flush()
 
+    def retire_malformed(self, slice_id: str, sha: str) -> None:
+        """Append a `retired:` entry with no `at:` line (malformed)."""
+        with self.lock:
+            self.retired.append({"slice": slice_id, "sha": sha, "at": None})
+            self._flush()
+
+    def repair_retired(self, slice_id: str, sha: str,
+                       at: str = "2026-01-02T00:00:00Z") -> None:
+        with self.lock:
+            for entry in self.retired:
+                if (entry["slice"], entry["sha"]) == (slice_id, sha):
+                    entry["at"] = at
+            self._flush()
+
     def add_fault(
         self,
         fault_id: str,
@@ -130,8 +144,9 @@ class QueueModel:
             lines += [
                 f"  - slice: {entry['slice']}",
                 f"    sha: {entry['sha']}",
-                f"    at: {entry['at']}",
             ]
+            if entry["at"] is not None:
+                lines.append(f"    at: {entry['at']}")
         lines.append("```")
         lines.append("")
         lines.append("```yaml")
@@ -554,6 +569,141 @@ def test_malformed_fault_is_logged_once_and_valid_faults_still_gate(
     # At most one line per turn (iteration), never one per poll.
     iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in log_lines]
     assert len(iters) == len(set(iters))
+
+
+# --- r11 queue-harden F1: a malformed retired entry poisons its slice ----
+
+MALFORMED_RETIRED_LOG = (
+    "| loop | QUEUE.md: slice solo has a malformed retired entry; "
+    "not gated as retired"
+)
+
+
+def _malformed_retired_log_lines(mailbox: Path) -> list[str]:
+    return [
+        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
+        if MALFORMED_RETIRED_LOG in ln
+    ]
+
+
+def _solo_fix_scenario(tmp_path: Path, later_passes):
+    """solo@s1 is retired and slice-evaluated ITERATE (f1 open); the Lead's
+    fix pass marks f1 done and re-retires solo@s2 with a MALFORMED entry
+    (no `at:`), so only the older, already-graded solo@s1 entry parses.
+    `later_passes(queue, sha2)` builds the Lead's passes after that."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("poison-solo-1")
+    sha2 = fake_sha("poison-solo-2")
+
+    def pass1(mb):
+        queue.retire("solo", sha1)
+
+    def pass2(mb):
+        queue.set_fault_status("f1", "done")
+        queue.retire_malformed("solo", sha2)
+
+    lead = ScriptedLeadRunner([pass1, pass2, *later_passes(queue, sha2)])
+
+    def eval_solo_1(mb):
+        verdict.append_slice_section("solo", sha1, "ITERATE")
+        queue.add_fault("f1", "solo", sha1, "broken", scope="local:src/solo.py")
+
+    def eval_solo_2(mb):
+        verdict.append_slice_section("solo", sha2, "SHIP")
+
+    def integration_ship(mb):
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo_1, ("solo", sha2): eval_solo_2},
+        integration_actions=[integration_ship],
+    )
+    return mailbox, lead, evaluator, sha1, sha2
+
+
+def _eval_sequence(evaluator) -> list[tuple]:
+    return [
+        (c["context"]["kind"], c["context"].get("slice"), c["context"].get("sha"))
+        for c in evaluator.calls
+    ]
+
+
+def test_newest_malformed_retired_entry_closes_gate_and_stalls_to_error(
+    tmp_path: Path,
+) -> None:
+    """Older valid + newer malformed `retired:` entry for one slice: the
+    slice must NOT count as retired at the old sha. Before the fix the
+    driver trusted solo@s1 (already graded), skipped the fix's slice-eval
+    and started the integration eval. Now the gate stays closed, the Lead
+    gets passes, makes no change (it believes the text), and the 3-no-op
+    stall guard ends the run `status: error`."""
+    def noop(mb):
+        pass
+
+    mailbox, lead, evaluator, sha1, sha2 = _solo_fix_scenario(
+        tmp_path, lambda queue, sha2: [noop, noop, noop]
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 10, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 3
+    assert not lead.passes, "3 no-op passes, then the stall guard"
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert re.search(r"^status: error", state, re.M)
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "lead pass made no changes after 3 attempts" in log_text
+    lines = _malformed_retired_log_lines(mailbox)
+    assert lines, "the poisoned slice must be surfaced in LOG.md"
+    assert all(re.fullmatch(r"- iter \d+ " + re.escape(MALFORMED_RETIRED_LOG), ln)
+               for ln in lines)
+    # Once per iteration, never once per poll.
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in lines]
+    assert len(iters) == len(set(iters))
+
+
+def test_repaired_retired_entry_gets_slice_eval_before_integration(
+    tmp_path: Path,
+) -> None:
+    """Same start; the Lead's next pass repairs the malformed entry. The
+    fix sha's slice-eval must run BEFORE the integration eval."""
+    def later(queue, sha2):
+        return [lambda mb: queue.repair_retired("solo", sha2)]
+
+    mailbox, lead, evaluator, sha1, sha2 = _solo_fix_scenario(tmp_path, later)
+
+    code = trio_loop.run_open_loop(mailbox, 10, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [
+        ("slice-eval", "solo", sha1),
+        ("slice-eval", "solo", sha2),
+        ("integration-eval", None, None),
+    ]
+    lines = _malformed_retired_log_lines(mailbox)
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in lines]
+    assert len(iters) == len(set(iters))
+
+
+def test_gate_retired_ids_excludes_malformed_slices() -> None:
+    queue = {
+        "retired": [{"slice": "a", "sha": "1", "at": "t"},
+                    {"slice": "b", "sha": "1", "at": "t"}],
+        "faults": [],
+        "errors": ["x"],
+        "malformed_slices": ["a"],
+    }
+    assert trio_loop._gate_retired_ids(queue) == {"b"}
+    assert not trio_loop._slices_fully_retired(
+        ["a", "b"], trio_loop._gate_retired_ids(queue), []
+    )
+    # An older trio-metrics without the key: nothing is excluded.
+    del queue["malformed_slices"]
+    assert trio_loop._gate_retired_ids(queue) == {"a", "b"}
 
 
 # --- VERDICT.md clobber guard -------------------------------------------

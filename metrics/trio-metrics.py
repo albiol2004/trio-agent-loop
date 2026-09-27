@@ -18,9 +18,10 @@ from datetime import datetime
 from pathlib import Path
 
 # Contract version metrics/trio_loop.py (and trioctl, before loading it)
-# relies on: 2 = read_queue / parse_slice_verdicts / parse_verdict_scope.
-# A copy without this constant predates it. Bump with LOOP_CORE_API.
-METRICS_API = 2
+# relies on: 2 = read_queue / parse_slice_verdicts / parse_verdict_scope;
+# 3 = plain fault `scope:` values, lenient read_queue `errors` and
+# `malformed_slices`. A copy without this constant predates it.
+METRICS_API = 3
 
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
@@ -388,7 +389,9 @@ def _unquote(item: str) -> str:
     return item
 
 
-def _split_flow_items(body: str, line: int) -> list[str]:
+def _split_flow_items(
+    body: str, line: int, what: str = "bracketed list"
+) -> list[str]:
     """Split a flow-list body on top-level commas, quote-aware.
 
     A comma inside a single- or double-quoted item is part of the item, not
@@ -417,7 +420,7 @@ def _split_flow_items(body: str, line: int) -> list[str]:
             continue
         cur.append(ch)
     if quote is not None:
-        raise SliceParseError(f"line {line}: unterminated {quote!r} quote in bracketed list")
+        raise SliceParseError(f"line {line}: unterminated {quote!r} quote in {what}")
     items.append("".join(cur))
     return [part for part in items if part.strip()]
 
@@ -671,7 +674,7 @@ def _parse_scope_value(value: str, line: int) -> list[str]:
         except SliceParseError as exc:
             raise QueueParseError(str(exc)) from exc
     try:
-        parts = _split_flow_items(value, line)
+        parts = _split_flow_items(value, line, what="plain `scope:` value")
     except SliceParseError as exc:
         raise QueueParseError(str(exc)) from exc
     items = _normalize_scope_items(parts)
@@ -681,6 +684,11 @@ def _parse_scope_value(value: str, line: int) -> list[str]:
             "(expected `local:<paths>`, `design`, or a bracket list)"
         )
     return items
+
+
+def _junk_prefix(text: str, limit: int = 60) -> str:
+    """`text` cut to `limit` chars (with an ellipsis) for an error message."""
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _parse_queue_entries(
@@ -694,6 +702,7 @@ def _parse_queue_entries(
     list_fields: tuple[str, ...],
     scalar_list_fields: tuple[str, ...] = (),
     errors: list[str] | None = None,
+    malformed: set[str] | None = None,
 ) -> list[dict]:
     """Shared state machine for `retired:`/`faults:` entry lists.
 
@@ -701,46 +710,95 @@ def _parse_queue_entries(
     `key: value` lines; `list_fields` (e.g. `scope`) accept a flow list or a
     block `- item` list, exactly like `writes:`/`reads:` in parse_slices.
     `scalar_list_fields` additionally accept a plain inline value (see
-    `_parse_scope_value`).
+    `_parse_scope_value`). A non-key line indented deeper than the scalar
+    `key:` line above it is YAML plain-scalar folding and is appended to
+    that scalar (joined by one space), not an error.
 
     `errors` None (strict): the first violation raises QueueParseError.
-    `errors` a list (lenient): each violation is appended to it, the
-    offending entry is dropped, and parsing resumes at the next
-    `- <entry_field>:` line -- one malformed entry never discards the
-    valid entries around it.
+    `errors` a list (lenient): each violation is appended to it and parsing
+    resumes at the next `- <entry_field>:` line. An unexpected line inside
+    an entry that already has every required key is reported (line number
+    and text prefix) and skipped -- the complete entry is KEPT; an entry
+    still missing a required key is dropped. One malformed entry never
+    discards the valid entries around it.
+
+    `malformed` (lenient only): receives the `<entry_field>` value of every
+    dropped entry, plus the id named by a stray `<entry_field>:` line or a
+    garbled `- <entry_field>` header, so callers can refuse to trust that
+    id (see parse_queue_block `malformed_slices`).
     """
     entries: list[dict] = []
     cur: dict | None = None
     cur_line = 0
     list_key: str | None = None
+    # (key, indent) of the last scalar `key:` line of `cur`: deeper-indented
+    # non-key lines right after it fold into that scalar.
+    fold: tuple[str, int] | None = None
     saw_key = False
-    skipping = False  # lenient: inside a dropped (malformed) entry
+    skipping = False  # lenient: after a dropped/closed entry, until a header
+    garbled_header_re = re.compile(
+        rf"^(?:-\s*{re.escape(entry_field)}\b\s*[:=]?|"
+        rf"{re.escape(entry_field)}\s*[:=])\s*[\"']?([^\s\"']+)"
+    )
 
     def _fail(msg: str) -> None:
         if errors is None:
             raise QueueParseError(msg)
         errors.append(msg)
 
+    def _poison(ident: str | None) -> None:
+        ident = (ident or "").strip().strip("\"'")
+        if malformed is not None and ident:
+            malformed.add(ident)
+
+    def _missing(entry: dict) -> list[str]:
+        return [k for k in required if not str(entry.get(k, "")).strip()]
+
     def _finish(entry: dict, line: int) -> None:
-        missing = [k for k in required if not str(entry.get(k, "")).strip()]
+        missing = _missing(entry)
         if missing:
             _fail(
                 f"line {line}: {top_key_name} entry missing required "
                 f"key(s): {', '.join(missing)}"
             )
+            _poison(entry.get(entry_field))
             return
         entries.append(entry)
+
+    def _bad(msg: str, also_poison: str | None = None) -> None:
+        """Report `msg`, then close the current entry: keep it when it is
+        already complete, drop it (and poison its id) otherwise. Lines up
+        to the next `- <entry_field>:` header are skipped either way."""
+        nonlocal cur, skipping, list_key, fold
+        if cur is not None and not _missing(cur):
+            msg += (
+                f" (skipped; the complete `- {entry_field}: "
+                f"{cur.get(entry_field)}` entry at line {cur_line} is kept)"
+            )
+            _fail(msg)
+            entries.append(cur)
+        else:
+            _fail(msg)
+            if cur is not None:
+                _poison(cur.get(entry_field))
+        _poison(also_poison)
+        cur, skipping, list_key, fold = None, True, None, None
+
+    def _garbled_id(stripped: str) -> str | None:
+        m = garbled_header_re.match(stripped)
+        return m.group(1) if m else None
 
     for i, raw in enumerate(lines, 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        expanded = raw.expandtabs()
+        indent = len(expanded) - len(expanded.lstrip())
 
         m = top_key_re.match(stripped)
         if m:
             if cur is not None:
-                _fail(f"line {i}: duplicate `{top_key_name}:` key inside an entry")
-                cur, skipping = None, True
+                _bad(f"line {i}: duplicate `{top_key_name}:` key inside an entry")
                 continue
             if m.group(1).strip():
                 _fail(
@@ -758,31 +816,31 @@ def _parse_queue_entries(
             cur = {entry_field: m.group(1).strip()}
             cur_line = i
             list_key = None
+            fold = None
             skipping = False
             continue
 
         if skipping:
             continue
 
-        def _drop(msg: str) -> None:
-            nonlocal cur, skipping, list_key
-            _fail(msg)
-            cur, skipping, list_key = None, True, None
-
         if cur is None:
-            _drop(
-                f"line {i}: unexpected content before any `- {entry_field}:` entry: "
-                f"{stripped!r}"
+            _bad(
+                f"line {i}: unexpected content before any `- {entry_field}:` "
+                f"entry: {_junk_prefix(stripped)!r}",
+                also_poison=_garbled_id(stripped),
             )
             continue
 
         m = QUEUE_KEY_RE.match(stripped)
         if m:
             key, value = m.group(1), m.group(2).strip()
+            fold = None
             if key == entry_field:
-                _drop(
-                    f"line {i}: `{entry_field}` is set by the `- {entry_field}:` "
-                    "entry; remove this line"
+                _bad(
+                    f"line {i}: stray `{entry_field}: {_junk_prefix(value)}` "
+                    f"line: `{entry_field}` is set by the `- {entry_field}:` "
+                    "entry header",
+                    also_poison=value,
                 )
                 continue
             if key in list_fields:
@@ -797,10 +855,10 @@ def _parse_queue_entries(
                         # always raises SliceParseError; translate to this
                         # module's own error type so callers only ever see
                         # QueueParseError out of parse_retired/parse_faults.
-                        _drop(str(exc))
+                        _bad(str(exc))
                         continue
                     except QueueParseError as exc:
-                        _drop(str(exc))
+                        _bad(str(exc))
                         continue
                     list_key = None
                 else:
@@ -809,14 +867,15 @@ def _parse_queue_entries(
             else:
                 cur[key] = value
                 list_key = None
+                fold = (key, indent)
             continue
 
         if list_key is not None:
             m = ITEM_RE.match(stripped)
             if not m:
-                _drop(
+                _bad(
                     f"line {i}: expected a `- item` list entry under "
-                    f"`{list_key}:`, got {stripped!r}"
+                    f"`{list_key}:`, got {_junk_prefix(stripped)!r}"
                 )
                 continue
             item = _unquote(m.group(1).strip())
@@ -826,7 +885,16 @@ def _parse_queue_entries(
                 cur[list_key].append(item)
             continue
 
-        _drop(f"line {i}: unexpected content: {stripped!r}")
+        if fold is not None and indent > fold[1]:
+            # YAML plain-scalar folding: a wrapped `reason:` continuation.
+            key = fold[0]
+            cur[key] = f"{cur[key]} {stripped}".strip()
+            continue
+
+        _bad(
+            f"line {i}: unexpected content: {_junk_prefix(stripped)!r}",
+            also_poison=_garbled_id(stripped),
+        )
 
     if cur is not None:
         _finish(cur, cur_line)
@@ -838,11 +906,17 @@ def _parse_queue_entries(
     return entries
 
 
-def parse_retired(lines: list[str], errors: list[str] | None = None) -> list[dict]:
+def parse_retired(
+    lines: list[str],
+    errors: list[str] | None = None,
+    malformed: set[str] | None = None,
+) -> list[dict]:
     """Parse a `retired:` block into `{"slice", "sha", "at"}` dicts.
 
     Strict (raises QueueParseError) unless an `errors` list is passed, in
-    which case malformed entries are dropped and reported there."""
+    which case malformed entries are dropped and reported there, and the
+    slice id of every malformed entry is added to `malformed` (when given)
+    -- such a slice must not be gated as retired (MAILBOX-SCHEMA.md)."""
     return _parse_queue_entries(
         lines,
         top_key_re=RETIRED_KEY_RE,
@@ -852,6 +926,7 @@ def parse_retired(lines: list[str], errors: list[str] | None = None) -> list[dic
         required=RETIRED_KEYS,
         list_fields=(),
         errors=errors,
+        malformed=malformed,
     )
 
 
@@ -880,12 +955,17 @@ def parse_faults(lines: list[str], errors: list[str] | None = None) -> list[dict
 
 
 def _empty_queue() -> dict:
-    return {"retired": [], "faults": [], "errors": []}
+    return {"retired": [], "faults": [], "errors": [], "malformed_slices": []}
 
 
 def parse_queue_block(queue_text: str) -> dict:
     """Lenient: always returns {"retired": [...], "faults": [...],
-    "errors": [...]}.
+    "errors": [...], "malformed_slices": [...]}.
+
+    `malformed_slices` (sorted slice ids) names every slice with a
+    malformed `retired:` entry anywhere in the block; the open-loop driver
+    does not gate such a slice as retired, even when an older valid entry
+    for it survives, until the entry is repaired.
 
     Per-block wrapper around find_queue_block + parse_retired/parse_faults
     in their lenient mode: a malformed entry is dropped and described in
@@ -900,7 +980,14 @@ def parse_queue_block(queue_text: str) -> dict:
         if lines is None:
             continue
         block_errors: list[str] = []
-        result[key] = parser(lines, errors=block_errors)
+        if key == "retired":
+            malformed: set[str] = set()
+            result[key] = parse_retired(
+                lines, errors=block_errors, malformed=malformed
+            )
+            result["malformed_slices"] = sorted(malformed)
+        else:
+            result[key] = parser(lines, errors=block_errors)
         result["errors"].extend(f"`{key}:` block: {e}" for e in block_errors)
     return result
 
@@ -909,7 +996,8 @@ def read_queue(loop_dir: Path) -> dict:
     """Read and parse loop_dir/QUEUE.md; never raises.
 
     Missing QUEUE.md, an unreadable file, or an empty file all yield
-    {"retired": [], "faults": [], "errors": []} — indistinguishable from a
+    {"retired": [], "faults": [], "errors": [], "malformed_slices": []} —
+    indistinguishable from a
     QUEUE.md with two empty blocks (MAILBOX-SCHEMA.md: "absent always means
     an empty queue, never an error"). Parse problems in a present QUEUE.md
     land in `errors` (see parse_queue_block); they never raise.

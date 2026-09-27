@@ -1894,6 +1894,27 @@ def _slices_fully_retired(
     return all(sid in retired_ids for sid in slice_ids) and not open_or_taken
 
 
+def _malformed_retired_slices(queue: dict) -> set[str]:
+    """Slice ids with a malformed QUEUE.md `retired:` entry.
+
+    Such a slice is never gated as retired -- not even when an older valid
+    entry for it survives the lenient parse -- until the entry is repaired:
+    the malformed entry is most likely the re-retirement of a fix, and
+    trusting the older (already graded) sha would skip the fix's slice-eval
+    and start the integration eval (r11 queue-harden F1). With the Lead
+    making no progress the 3-no-op stall guard ends the run
+    `status: error`. `.get`: an older trio-metrics has no such key."""
+    return set(queue.get("malformed_slices") or [])
+
+
+def _gate_retired_ids(queue: dict) -> set[str]:
+    """Slice ids `_slices_fully_retired` may count as retired: every slice
+    with a valid `retired:` entry, minus `_malformed_retired_slices`."""
+    return {
+        e["slice"] for e in queue["retired"]
+    } - _malformed_retired_slices(queue)
+
+
 def _log_queue_errors(
     mailbox: Path, iteration: int, queue: dict, logged: set
 ) -> None:
@@ -1905,7 +1926,10 @@ def _log_queue_errors(
     to the integration gate -- so each distinct message is appended to
     LOG.md once for the current iteration (`logged` holds the
     `(iteration, message)` pairs already written; the poll loop re-reads
-    QUEUE.md every poll and must not spam LOG.md)."""
+    QUEUE.md every poll and must not spam LOG.md). Each slice in
+    `_malformed_retired_slices` also gets one
+    `QUEUE.md: slice <id> has a malformed retired entry; not gated as
+    retired` line per iteration."""
     for msg in queue.get("errors") or []:
         key = (iteration, msg)
         if key in logged:
@@ -1914,6 +1938,16 @@ def _log_queue_errors(
         _append_log(
             mailbox, f"- iter {iteration} | loop | QUEUE.md parse error: {msg}"
         )
+    for sid in sorted(_malformed_retired_slices(queue)):
+        msg = (
+            f"QUEUE.md: slice {sid} has a malformed retired entry; "
+            "not gated as retired"
+        )
+        key = (iteration, msg)
+        if key in logged:
+            continue
+        logged.add(key)
+        _append_log(mailbox, f"- iter {iteration} | loop | {msg}")
 
 
 def _git_head_sha(repo_dir: Path) -> str | None:
@@ -2019,7 +2053,7 @@ def _lead_thread_body(
             if not (first and force_first_pass):
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _METRICS.read_queue(mailbox)
-                retired_ids = {e["slice"] for e in queue["retired"]}
+                retired_ids = _gate_retired_ids(queue)
                 open_or_taken = [
                     f for f in queue["faults"] if f["status"] in ("open", "taken")
                 ]
@@ -2689,7 +2723,7 @@ def run_open_loop(
                 # fault after the Lead thread already decided it was done.
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _METRICS.read_queue(mailbox)
-                retired_ids = {e["slice"] for e in queue["retired"]}
+                retired_ids = _gate_retired_ids(queue)
                 open_or_taken = [
                     f for f in queue["faults"] if f["status"] in ("open", "taken")
                 ]
