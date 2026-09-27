@@ -187,7 +187,9 @@ holding no file or symlink (e.g. an empty `.eval-scratch/`), or (b) a
 rebuildable artifact: any directory component in `REBUILDABLE_IGNORED_DIRS`
 (`node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
 `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `.next`, `.turbo`,
-`.parcel-cache`, `.cache`, `coverage`), `dist`/`build` only when a
+`.parcel-cache`, `.cache`, `coverage`), any `*.egg-info` directory at any
+depth (`REBUILDABLE_IGNORED_DIR_SUFFIXES`, e.g. `src/x.egg-info/` from a
+`pip install -e`), `dist`/`build` only when a
 `.gitignore` in the repository names that exact directory with a
 non-wildcard pattern (`git check-ignore -v`; a global `core.excludesFile` or
 `.git/info/exclude` does not count), or a `*.pyc`/`*.pyo`/`*.tsbuildinfo`

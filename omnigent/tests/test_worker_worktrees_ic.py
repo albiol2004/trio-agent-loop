@@ -60,7 +60,7 @@ def wt(home):
     return _load("worker_worktrees_ic", MODULE)
 
 
-GITIGNORE = ".eval-scratch/\n.venv/\n__pycache__/\napi/node_modules/\n.env\n"
+GITIGNORE = ".eval-scratch/\n.venv/\n__pycache__/\napi/node_modules/\n*.egg-info/\n.env\n"
 
 
 @pytest.fixture()
@@ -135,6 +135,8 @@ def test_accepted_builder_with_node_modules_is_removed(wt, repo, root):
     ("empty-scratch", [(".eval-scratch", None)]),
     ("nested-empty", [(".eval-scratch/a/b", None)]),
     ("node-modules", [("api/node_modules/x.js", "x\n")]),
+    ("egg-info", [("src/x.egg-info/PKG-INFO", "Name: x\n"),
+                  ("src/x.egg-info/SOURCES.txt", "x\n")]),
 ])
 def test_finished_eval_with_rebuildable_or_empty_ignored_is_removed(wt, repo, root, name, entries):
     rec = finished_eval(wt, repo, root, name, entries)
@@ -172,6 +174,16 @@ def test_env_file_is_retained(wt, repo, root):
     assert (result["state"], result["retained_reason"]) == ("retained", "ignored_content")
     assert result["retained_detail"] == ".env"
     assert (Path(rec["path"]) / ".env").is_file()
+
+
+def test_env_file_still_retains_next_to_egg_info(wt, repo, root):
+    rec = finished_eval(wt, repo, root, "egg-env", [
+        ("src/x.egg-info/PKG-INFO", "Name: x\n"), (".env", "TOKEN=secret\n")])
+    assert sorted(wt.ignored_entries(Path(rec["path"]))) == [".env", "src/x.egg-info/"]
+    result = cleanup_by_slice(wt, repo)["egg-env"]
+    assert (result["state"], result["retained_reason"]) == ("retained", "ignored_content")
+    assert result["retained_detail"] == ".env"
+    assert (Path(rec["path"]) / "src" / "x.egg-info" / "PKG-INFO").is_file()
 
 
 def test_dist_ignored_only_globally_is_retained(wt, repo, root, home):

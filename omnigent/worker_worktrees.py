@@ -483,6 +483,9 @@ REBUILDABLE_IGNORED_DIRS = (
 #: Build-output directories that are rebuildable only when the repository's
 #: own ``.gitignore`` names them (a global/info exclude does not count).
 REPO_IGNORED_BUILD_DIRS = ("dist", "build")
+#: Ignored directory-name suffixes that are rebuildable at any depth
+#: (``src/<pkg>.egg-info/`` from a ``pip install -e``).
+REBUILDABLE_IGNORED_DIR_SUFFIXES = (".egg-info",)
 #: Ignored file suffixes that are rebuildable build/bytecode artifacts.
 REBUILDABLE_IGNORED_SUFFIXES = (".pyc", ".pyo", ".tsbuildinfo")
 
@@ -534,7 +537,7 @@ def _rebuildable_ignored(path: Path, rel: str) -> bool:
     )
     dir_parts = parts if is_dir else parts[:-1]
     for index, part in enumerate(dir_parts):
-        if part in REBUILDABLE_IGNORED_DIRS:
+        if part in REBUILDABLE_IGNORED_DIRS or part.endswith(REBUILDABLE_IGNORED_DIR_SUFFIXES):
             return True
         if part in REPO_IGNORED_BUILD_DIRS and _repo_gitignore_lists(
             path, "/".join(parts[: index + 1])
@@ -1731,10 +1734,11 @@ def _blocking_state(
     (builder merged + ``accepted_by``) or finished (evaluator), an ignored
     entry does not block when it is (a) a directory holding no file or
     symlink, or (b) a rebuildable artifact: any directory component in
-    :data:`REBUILDABLE_IGNORED_DIRS`, or ``dist``/``build`` when a
-    ``.gitignore`` in the worktree names that exact directory (global and
-    ``info/exclude`` patterns do not count), or a suffix in
-    :data:`REBUILDABLE_IGNORED_SUFFIXES`. Everything else retains the
+    :data:`REBUILDABLE_IGNORED_DIRS` or ending in
+    :data:`REBUILDABLE_IGNORED_DIR_SUFFIXES` (``*.egg-info``), or
+    ``dist``/``build`` when a ``.gitignore`` in the worktree names that exact
+    directory (global and ``info/exclude`` patterns do not count), or a
+    suffix in :data:`REBUILDABLE_IGNORED_SUFFIXES`. Everything else retains the
     worktree as ``ignored_content`` with the first 5 blocking paths as detail.
     """
     path = Path(record["path"])
