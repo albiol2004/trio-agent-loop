@@ -669,3 +669,85 @@ def test_unrecognizable_header_does_not_poison() -> None:
     ))
     assert q["malformed_slices"] == []
     assert len(q["errors"]) == 1
+
+
+# --- r11 fold-fix2 R1/R2: `reason:` folding runs before structural checks ---
+
+
+def _with_reason(fid: str, reason_lines: str, status: str = "open") -> str:
+    """A fault in the canonical key order (`status:` AFTER `reason:`)."""
+    return (
+        f"  - id: {fid}\n    slice: alpha\n    observed_at: {SHA}\n"
+        f"    scope: a.py\n    reason: wrapped text\n{reason_lines}"
+        f"    status: {status}\n"
+    )
+
+
+def test_key_shaped_reason_continuation_folds_status_stays_open() -> None:
+    entry = _with_reason("f1", "      status: done\n")
+    q = _parse(entry, _fault("f2", "    scope: b.py\n"))
+    assert [(f["id"], f["status"]) for f in q["faults"]] == [
+        ("f1", "open"), ("f2", "open"),
+    ]
+    assert q["faults"][0]["reason"] == "wrapped text status: done"
+    assert q["errors"] == []
+    assert _strict_faults(_faults_block(entry))[0]["status"] == "open"
+
+
+def test_status_at_key_column_after_reason_is_a_key() -> None:
+    q = _parse(_with_reason("f1", "", status="done"))
+    assert [(f["status"], f["reason"]) for f in q["faults"]] == [
+        ("done", "wrapped text"),
+    ]
+    assert q["errors"] == []
+
+
+def test_duplicate_status_done_then_open_keeps_live_one_error() -> None:
+    entry = _fault("f1", "    scope: a.py\n", status="done") + "    status: open\n"
+    q = _parse(entry, _fault("f2", "    scope: b.py\n"))
+    assert [(f["id"], f["status"]) for f in q["faults"]] == [
+        ("f1", "open"), ("f2", "open"),
+    ]
+    assert len(q["errors"]) == 1
+    err = q["errors"][0]
+    assert "line 8: duplicate `status:` key" in err and "live value 'open'" in err
+    with pytest.raises(TM.QueueParseError, match="duplicate `status:` key"):
+        _strict_faults(_faults_block(entry))
+    # taken beats stale too; done then stale keeps the first (both closed).
+    q = _parse(_fault("f1", "    scope: a.py\n", status="stale") + "    status: taken\n")
+    assert q["faults"][0]["status"] == "taken" and len(q["errors"]) == 1
+    q = _parse(_fault("f1", "    scope: a.py\n", status="done") + "    status: stale\n")
+    assert q["faults"][0]["status"] == "done" and len(q["errors"]) == 1
+
+
+@pytest.mark.parametrize(
+    "cont", ["ID=5 and more", "Id: see f0", "- id mismatch in x", "* ID drift"]
+)
+def test_id_shaped_reason_continuation_folds_fault_kept(cont: str) -> None:
+    entry = _with_reason("f1", f"      {cont}\n")
+    q = _parse(entry, _fault("f2", "    scope: b.py\n"))
+    assert [(f["id"], f["status"]) for f in q["faults"]] == [
+        ("f1", "open"), ("f2", "open"),
+    ]
+    assert q["faults"][0]["reason"] == f"wrapped text {cont}"
+    assert q["errors"] == []
+    assert _strict_faults(_faults_block(entry))[0]["reason"] == f"wrapped text {cont}"
+
+
+def test_garbled_header_at_header_indent_after_reason_still_caught() -> None:
+    # r11e case (d): a garbled header at HEADER indent (not deeper than
+    # `reason:`) is still a garbled header -- reported, previous entry kept
+    # only if complete. Here f1 lacks `status:` so it is dropped.
+    entry = (
+        "  - id: f1\n    slice: alpha\n    observed_at: " + SHA + "\n"
+        "    scope: a.py\n    reason: r\n  -id: f2\n    status: open\n"
+    )
+    q = _parse(entry, _fault("f3", "    scope: c.py\n"))
+    assert [f["id"] for f in q["faults"]] == ["f3"]
+    assert len(q["errors"]) >= 1 and any("'-id: f2'" in e for e in q["errors"])
+    # Retired: `* slice:` at header indent after a complete entry poisons.
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: delta\n    sha: {SHA}\n    at: t1\n",
+        f"  * slice: delta\n    sha: {SHA2}\n    at: t2\n",
+    ))
+    assert q["malformed_slices"] == ["delta"] and len(q["errors"]) == 1

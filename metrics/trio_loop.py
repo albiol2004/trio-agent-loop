@@ -2757,6 +2757,13 @@ def run_open_loop(
                 # fault after the Lead thread already decided it was done.
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _METRICS.read_queue(mailbox)
+                # Log parse errors / malformed slices / unknown statuses in
+                # THIS turn: the final slice-eval may have just written a
+                # malformed fault, and the integration eval must never be
+                # dispatched ahead of that LOG line (r11f R3).
+                _log_queue_errors(
+                    mailbox, current_iteration(), queue, queue_errors_logged
+                )
                 retired_ids = _gate_retired_ids(queue)
                 open_or_taken = _live_faults(queue)
                 latest_for_gate = {e["slice"]: e for e in queue["retired"]}

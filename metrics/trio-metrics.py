@@ -603,6 +603,8 @@ FAULT_KEYS = ("id", "slice", "observed_at", "scope", "reason", "status")
 # it is YAML plain-scalar folding. After any other key it is an error (a
 # stray note must never silently change `status`/`sha`/`slice`/...).
 QUEUE_FOLD_KEYS = ("reason",)
+# Fault statuses that close a fault; every other value gates as live.
+QUEUE_CLOSED_STATUSES = ("done", "stale")
 
 
 class QueueParseError(ValueError):
@@ -721,8 +723,11 @@ def _parse_queue_entries(
     (`status`, `sha`, `slice`, `observed_at`, `at`, ...) is an error naming
     the line, a text prefix and the key it followed; the line is skipped
     and the entry is kept with that key UNCHANGED (parsing of the entry
-    continues). A key repeated inside one entry is an error too: the FIRST
-    value is kept, the repeat (and its continuation/item lines) skipped.
+    continues). The `reason:` fold is checked BEFORE any structural match,
+    so a deeper line shaped like a key or (garbled) header still folds. A
+    key repeated inside one entry is an error too: the FIRST value is
+    kept, the repeat (and its continuation/item lines) skipped -- except a
+    duplicated `status:`, where a live value beats done/stale (fail closed).
     A garbled entry header (`-slice:`, `* slice:`, `- Slice:`, `slice=`
     ...; case-insensitive key, `-`/`*` bullet) is recognized and its id
     poisoned; a header too mangled to name the key (`- slcie:`) is only
@@ -814,6 +819,25 @@ def _parse_queue_entries(
         expanded = raw.expandtabs()
         indent = len(expanded) - len(expanded.lstrip())
 
+        # `reason:` folding runs FIRST (r11f R1/R2): while the previous
+        # scalar is `reason:` (QUEUE_FOLD_KEYS), ANY line indented deeper
+        # than its key column is a wrapped continuation -- even one shaped
+        # like a key (`status: done`), an entry header, or a garbled header
+        # (`ID=5`, `- id ...`). Only a line at (or left of) the key column
+        # is parsed structurally, so a garbled header at header indent is
+        # still caught below.
+        if (
+            cur is not None
+            and not skipping
+            and fold is not None
+            and fold[0] in QUEUE_FOLD_KEYS
+            and fold[2] in ("fold", "dup")
+            and indent > fold[1]
+        ):
+            if fold[2] == "fold":
+                cur[fold[0]] = f"{cur[fold[0]]} {stripped}".strip()
+            continue  # "dup": continuation of a reported duplicate, skipped
+
         m = top_key_re.match(stripped)
         if m:
             if cur is not None:
@@ -862,6 +886,26 @@ def _parse_queue_entries(
             fold = None
             list_dup = False
             if key != entry_field and key in cur:
+                # Fail closed on a duplicated `status:`: a live value
+                # (anything but done/stale, non-empty) beats a closed one,
+                # whatever the order. Still reported as an error.
+                if (
+                    key == "status"
+                    and str(cur.get(key, "")) in QUEUE_CLOSED_STATUSES
+                    and value
+                    and value not in QUEUE_CLOSED_STATUSES
+                ):
+                    _fail(
+                        f"line {i}: duplicate `{key}:` key in the "
+                        f"`- {entry_field}: {cur.get(entry_field)}` entry at "
+                        f"line {cur_line}; the live value "
+                        f"{_junk_prefix(value)!r} is kept, "
+                        f"{_junk_prefix(str(cur[key]))!r} is dropped"
+                    )
+                    cur[key] = value
+                    list_key = None
+                    fold = (key, indent, "dup")
+                    continue
                 _fail(
                     f"line {i}: duplicate `{key}:` key in the "
                     f"`- {entry_field}: {cur.get(entry_field)}` entry at line "

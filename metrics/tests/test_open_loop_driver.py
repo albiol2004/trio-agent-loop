@@ -709,7 +709,9 @@ def test_gate_retired_ids_excludes_malformed_slices() -> None:
 # --- r11 fold-fix N1: a stray note never closes an open fault -----------
 
 
-def _open_fault_with_bad_status_scenario(tmp_path: Path, status: str):
+def _open_fault_with_bad_status_scenario(
+    tmp_path: Path, status: str, reason: str = "broken"
+):
     """solo@s1 is retired and slice-evaluated SHIP, but the Evaluator also
     appends fault f1 whose `status:` line is `status` verbatim (it may carry
     a continuation line). The Lead then makes 3 no-op passes. The
@@ -730,7 +732,7 @@ def _open_fault_with_bad_status_scenario(tmp_path: Path, status: str):
 
     def eval_solo_1(mb):
         verdict.append_slice_section("solo", sha1, "SHIP")
-        queue.add_fault("f1", "solo", sha1, "broken", status=status,
+        queue.add_fault("f1", "solo", sha1, reason, status=status,
                         scope="local:src/solo.py")
 
     evaluator = ScriptedEvalRunner(
@@ -787,6 +789,82 @@ def test_unknown_fault_status_is_treated_open_and_logged(tmp_path: Path) -> None
     assert lines
     assert all(re.fullmatch(r"- iter \d+ " + re.escape(msg), ln) for ln in lines)
     iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in lines]
+    assert len(iters) == len(set(iters))
+
+
+# --- r11 fold-fix2 R1/R3: reason continuations and same-turn logging ------
+
+
+def test_key_shaped_reason_continuation_cannot_close_open_fault(
+    tmp_path: Path,
+) -> None:
+    """r11f R1: `reason: wrapped text` + a DEEPER `status: done` + the real
+    `status: open`. The deeper line is a folded reason continuation, never
+    a key: f1 stays open with no parse error, and the integration eval is
+    never dispatched (the stall guard ends the run)."""
+    code, mailbox, lead, evaluator, sha1 = _open_fault_with_bad_status_scenario(
+        tmp_path, "open", reason="wrapped text\n      status: done"
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert [(f["id"], f["status"], f["reason"]) for f in parsed["faults"]] == [
+        ("f1", "open", "wrapped text status: done"),
+    ]
+    assert parsed["errors"] == []
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "QUEUE.md parse error" not in log_text
+
+
+def test_final_slice_eval_parse_error_is_logged_before_integration_eval(
+    tmp_path: Path,
+) -> None:
+    """r11f R3: the LAST slice-eval writes a malformed (dropped) fault. The
+    Lead thread's `done` re-check re-reads QUEUE.md and must log the parse
+    error in that same turn -- LOG.md already holds the line when the
+    integration eval starts."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("r3-solo-1")
+
+    def pass1(mb):
+        queue.retire("solo", sha1)
+
+    lead = ScriptedLeadRunner([pass1])
+
+    def eval_solo_1(mb):
+        verdict.append_slice_section("solo", sha1, "SHIP")
+        queue.add_fault("f9", "solo", sha1, "junk", status="done",
+                        scope='["unterminated]')
+
+    log_at_integration: list[str] = []
+
+    def integration_ship(mb):
+        log_at_integration.append(
+            (mb / "LOG.md").read_text(encoding="utf-8")
+        )
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo_1},
+        integration_actions=[integration_ship],
+    )
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert _eval_sequence(evaluator) == [
+        ("slice-eval", "solo", sha1), ("integration-eval", None, None),
+    ]
+    assert len(log_at_integration) == 1
+    assert "| loop | QUEUE.md parse error: `faults:` block:" in log_at_integration[0]
+    log_lines = [
+        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
+        if "QUEUE.md parse error" in ln
+    ]
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in log_lines]
     assert len(iters) == len(set(iters))
 
 
