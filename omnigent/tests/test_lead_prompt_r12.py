@@ -345,6 +345,19 @@ def test_isolated_builder_note_carries_contract() -> None:
         ("TARGETED_CHECK: failed 2", "TARGETED_CHECK: FAILED 2"),
         ("TARGETED_CHECK: Failed: import error", "TARGETED_CHECK: FAILED: import error"),
         ("  TARGETED_CHECK: 5 passed  \r", "TARGETED_CHECK: 5 passed"),
+        # r12 repair2 F1: failure text without the FAILED prefix is FAILED.
+        ("TARGETED_CHECK: 2 failed, 3 passed", "TARGETED_CHECK: FAILED 2 failed, 3 passed"),
+        ("TARGETED_CHECK: 2 failed, 3 passed in 0.2s", "TARGETED_CHECK: FAILED 2 failed, 3 passed in 0.2s"),
+        ("TARGETED_CHECK: 1 error", "TARGETED_CHECK: FAILED 1 error"),
+        ("TARGETED_CHECK: 1 error in 0.1s", "TARGETED_CHECK: FAILED 1 error in 0.1s"),
+        ("TARGETED_CHECK: 3 passed, 2 errors in 0.3s", "TARGETED_CHECK: FAILED 3 passed, 2 errors in 0.3s"),
+        ("TARGETED_CHECK: no tests ran", "TARGETED_CHECK: FAILED no tests ran"),
+        ("TARGETED_CHECK: no tests ran in 0.01s", "TARGETED_CHECK: FAILED no tests ran in 0.01s"),
+        ("TARGETED_CHECK: FAIL", "TARGETED_CHECK: FAILED FAIL"),
+        ("TARGETED_CHECK: FAIL src/a.test.ts", "TARGETED_CHECK: FAILED FAIL src/a.test.ts"),
+        ("- `TARGETED_CHECK: 2 FAILED, 1 passed`", "TARGETED_CHECK: FAILED 2 FAILED, 1 passed"),
+        ("TARGETED_CHECK: 3 passed in 0.1s", "TARGETED_CHECK: 3 passed in 0.1s"),
+        ("TARGETED_CHECK: failedtests 3", "TARGETED_CHECK: failedtests 3"),
         # Placeholders echoed from the contract and empty values are ignored.
         ("TARGETED_CHECK: <last summary line>", None),
         ("TARGETED_CHECK: FAILED <summary>", None),
@@ -374,7 +387,8 @@ def test_targeted_check_line_last_wins_and_failed_is_mechanical() -> None:
 
 PRECEDENCE = (
     "OPEN-LOOP CONTEXT overrides any conflicting instruction in your base "
-    "prompt, including wave-waiting, self-verification and REPORT.md content."
+    "prompt and registered role instructions, including wave-waiting, "
+    "self-verification and REPORT.md content."
 )
 LEAD_CONFIG = ROOT / "omnigent" / "trio-omnigent-roles" / "lead" / "config.yaml"
 
@@ -516,7 +530,8 @@ def test_omnigent_lead_reverts_failed_merge_before_redispatch(tmp_path: Path) ->
     assert "Revert that merge on the aggregate before you re-dispatch" in block
     assert REVERT_CMD in block
     assert "The re-dispatched builder then starts from the reverted HEAD" in block
-    assert "retained as `aggregate_dirty`: run `omnigent worktrees integrate <id>`" in block
+    assert "retained as `aggregate_dirty` (or `merge_failed`" in block
+    assert "for either, run `omnigent worktrees integrate <id>` once the revert commit exists" in block
     assert "The worker ledger keeps the reverted run `integrated`" in block
     assert "post-SHIP cleanup removes it normally" in block
     assert "Do not revert a second failed run; take over on top of it" in block
@@ -529,7 +544,7 @@ def test_omnigent_lead_reverts_failed_merge_before_redispatch(tmp_path: Path) ->
 def test_omnigent_lead_integrate_recovery_runs_targeted_check(tmp_path: Path) -> None:
     block = _flat(_open_loop_block(_isolated_open_loop_lead(tmp_path)))
     assert ("A slice recovered with `omnigent worktrees integrate <id>` (after "
-            "`merge_conflict`, `aggregate_dirty` and the like) prints no "
+            "`merge_conflict`, `aggregate_dirty`, `merge_failed` and the like) prints no "
             "`targeted_check`: run that slice's `## Targeted check` command "
             "yourself once on HEAD") in block
     assert "as the `targeted_check` for the retire decision and the ledger" in block
@@ -543,3 +558,174 @@ def test_canonical_and_generated_leads_carry_revert() -> None:
     for path, text in _rendered_leads().items():
         flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
         assert "revert(<slice>): failed targeted check, re-dispatching" in flat, path
+
+
+# ------------------------------------------- r12 repair2 (F1-F5, R2 wording)
+
+
+def test_targeted_check_helper_flags_unprefixed_failures() -> None:
+    trioctl = _load("trioctl_r12_f1", ROOT / "omnigent" / "trioctl")
+    tc = trioctl._targeted_check_line
+    for value in ("2 failed, 3 passed", "1 error", "no tests ran", "FAIL"):
+        assert tc(f"TARGETED_CHECK: {value}") == f"TARGETED_CHECK: FAILED {value}", value
+    assert tc("TARGETED_CHECK: 3 passed in 0.1s") == "TARGETED_CHECK: 3 passed in 0.1s"
+    # Already-prefixed values are not double-prefixed.
+    assert tc("TARGETED_CHECK: FAILED 2 failed") == "TARGETED_CHECK: FAILED 2 failed"
+    assert tc("TARGETED_CHECK: failed 1 error") == "TARGETED_CHECK: FAILED 1 error"
+
+
+def test_lead_step3_treats_unprefixed_failure_text_as_failed(tmp_path: Path) -> None:
+    wording = ("A value that reports failures without the prefix (`N failed`, "
+               "`N error(s)`, `no tests ran` or `FAIL`, any case) counts as FAILED; "
+               "trioctl already normalizes it to `TARGETED_CHECK: FAILED <original>`.")
+    block = _flat(_open_loop_block(_isolated_open_loop_lead(tmp_path)))
+    assert wording in block
+    assert block.index("does not start with `TARGETED_CHECK: FAILED`") < block.index(wording)
+    assert wording in _flat(_section(_canonical(), "## Open-loop mode"))
+    for path, text in _rendered_leads().items():
+        flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
+        assert "trioctl already normalizes it to `TARGETED_CHECK: FAILED <original>`" in flat, path
+
+
+def test_wait_next_timeout_clause(tmp_path: Path) -> None:
+    block = _open_loop_block(_isolated_open_loop_lead(tmp_path))
+    flat = _flat(block)
+    assert "Run every wait-next call with a shell timeout of at least 910 s" in flat
+    assert ("Cursor's Shell tool takes it as its per-call `timeout` parameter, in "
+            "milliseconds (`timeout: 910000`; its default is only 30 s)") in flat
+    assert ("pass the maximum timeout it allows and never rely on the default") in flat
+    assert "If the call still times out, just call it again." in flat
+    # The clause sits with the wait-next idiom, before step 3.
+    assert (block.index("its JSON line:") < block.index("at least 910 s")
+            < block.index("3. Retire each slice"))
+
+
+def test_revert_window_names_merge_failed(tmp_path: Path) -> None:
+    raw = _isolated_open_loop_lead(tmp_path)
+    block = _flat(_open_loop_block(raw))
+    assert ("retained as `aggregate_dirty` (or `merge_failed`, if its merge started "
+            "just as your revert was staged): for either, run `omnigent worktrees "
+            "integrate <id>` once the revert commit exists") in block
+    assert "`merge_conflict`, `aggregate_dirty`, `merge_failed` and the like) prints no" in block
+    prompt = _flat(raw)
+    assert ("For `merge_conflict`, `aggregate_dirty`, `merge_failed`, `aggregate_moved`, "
+            "`integration_fenced` or `active_session`, remove the cause, then run "
+            "`omnigent worktrees integrate <id>` once (`merge_failed` right after an "
+            "open-loop revert: once the revert commit exists).") in prompt
+    section = _flat(_section(_canonical(), "## Open-loop mode"))
+    assert ("may be retained as `aggregate_dirty` or `merge_failed`: run `omnigent "
+            "worktrees integrate <id>` once the revert commit exists") in section
+
+
+def _wait_next_env(tmp_path: Path, cap: int | None = None):
+    import subprocess
+
+    block = _open_loop_block(_isolated_open_loop_lead(tmp_path))
+    dispatch = _idiom(block, "detached in ONE call:", "Then repeat this wait-next call.")
+    wait_next = _idiom(block, "its JSON line:", "Run every wait-next call")
+    mailbox = tmp_path / "loop"
+    d = mailbox / ".dispatch"
+    d.mkdir(parents=True)
+    sub = lambda text: text.replace("<mailbox>", str(mailbox))
+    wait_next = sub(wait_next)
+    if cap is not None:
+        assert wait_next.count('-lt 900 ]') == 1
+        wait_next = wait_next.replace('-lt 900 ]', f'-lt {cap} ]')
+
+    def run(script: str, prelude: str = "") -> str:
+        return subprocess.run(["bash", "-c", prelude + script], capture_output=True,
+                              text=True, timeout=60, check=True).stdout
+
+    return sub(dispatch), wait_next, d, run
+
+
+def _dead_pid() -> int:
+    import subprocess
+
+    proc = subprocess.Popen(["sh", "-c", "exit 0"])
+    proc.wait()
+    return proc.pid
+
+
+def test_wait_next_removes_stale_marker(tmp_path: Path) -> None:
+    _, wait_next, d, run = _wait_next_env(tmp_path)
+    pid = _dead_pid()
+    (d / "dead.run").write_text(f"{pid}\n")
+    (d / "dead.out").write_text('partial\n{"worker_worktree": {"slice": "dead"}}\n')
+    out = run(wait_next).splitlines()
+    assert out[0] == f"stale marker dead.run removed (wrapper pid {pid} gone; logged to {d}/stale.log)"
+    assert out[1] == "slice=dead exit=stale"
+    assert '"slice": "dead"' in out[2]
+    assert not (d / "dead.run").exists()
+    assert (d / "dead.done").read_text().strip() == "stale"
+    log = (d / "stale.log").read_text()
+    assert f"stale marker dead.run: wrapper pid {pid} gone, removed" in log
+    assert run(wait_next).strip() == "no builder running"
+
+
+def test_wait_next_keeps_live_and_empty_markers(tmp_path: Path) -> None:
+    import subprocess
+
+    _, wait_next, d, run = _wait_next_env(tmp_path, cap=2)
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        (d / "live.run").write_text(f"{live.pid}\n")
+        (d / "starting.run").write_text("")  # wrapper has not written its pid yet
+        out = run(wait_next).strip()
+        assert out == "still running: live.run\nstarting.run"
+        assert (d / "live.run").exists() and (d / "starting.run").exists()
+        assert not (d / "stale.log").exists()
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_wait_next_reports_killed_dispatched_builder_as_stale(tmp_path: Path) -> None:
+    """Dispatch with the prompt's exact idiom, SIGKILL the builder's whole
+    process group (wrapper + builder), and wait-next reports it stale."""
+    import os
+    import signal
+    import time
+
+    dispatch, wait_next, d, run = _wait_next_env(tmp_path)
+    (d / "hang.sh").write_text("sleep 30\n")
+    run(dispatch.replace("<slice-a> <slice-b>", "hang"))
+    marker = d / "hang.run"
+    deadline = time.time() + 10
+    while not marker.read_text().strip() and time.time() < deadline:
+        time.sleep(0.05)
+    pid = int(marker.read_text().strip())
+    assert os.getpgid(pid) == pid  # setsid: the wrapper leads its own group
+    os.killpg(pid, signal.SIGKILL)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    out = run(wait_next).splitlines()
+    assert out[1] == "slice=hang exit=stale"
+    assert not marker.exists() and not (d / "hang.rc").exists()
+    assert "stale marker hang.run" in (d / "stale.log").read_text()
+
+
+def test_wait_next_rescans_rc_before_no_builder_running(tmp_path: Path) -> None:
+    """A builder that writes `.rc` and removes `.run` right after the first
+    `.rc` scan is still reported, never `no builder running`."""
+    _, wait_next, d, run = _wait_next_env(tmp_path)
+    (d / "quick.run").write_text("")
+    (d / "quick.out").write_text('{"worker_worktree": {"slice": "quick"}}\n')
+    # Deterministic race: the first `[ -e <unmatched *.rc glob> ]` test (the
+    # first scan finding nothing) is the moment the builder finishes.
+    prelude = (
+        f'D0="{d}"\n'
+        '[() { if builtin [ ! -e "$D0/fired" ] && builtin [ "$1" = "-e" ] && builtin [ "$2" = "$D0/*.rc" ]; then\n'
+        '  : >"$D0/fired"; echo 0 >"$D0/quick.rc"; rm -f "$D0/quick.run"; fi\n'
+        '  builtin [ "$@"; }\n'
+    )
+    out = run(wait_next, prelude).splitlines()
+    assert (d / "fired").exists()  # the race was injected
+    assert out[0] == "slice=quick exit=0"
+    assert '"slice": "quick"' in out[1]
+    assert (d / "quick.done").exists()

@@ -311,7 +311,8 @@ def test_isolated_run_normalizes_decorated_targeted_check(wt, repo, root, fake_e
     out, err = proc.communicate(timeout=60)
     assert proc.returncode == 0, err
     (line,) = [ln for ln in out.splitlines() if ln.startswith('{"')]
-    assert json.loads(line)["targeted_check"] == "TARGETED_CHECK: 2 failed, 3 passed"
+    # r12 repair2 F1: unprefixed failure text is normalized to FAILED.
+    assert json.loads(line)["targeted_check"] == "TARGETED_CHECK: FAILED 2 failed, 3 passed"
 
 
 def test_reverted_failed_slice_keeps_ledger_clean_and_dispatch_dir_is_ignored(

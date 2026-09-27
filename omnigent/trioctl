@@ -1138,13 +1138,21 @@ _TARGETED_CHECK_RE = re.compile(
 # The contract's own placeholder, echoed back instead of a real result.
 _TARGETED_CHECK_PLACEHOLDER_RE = re.compile(r"^(?:FAILED\s+)?<[^<>]*>$", re.IGNORECASE)
 _TARGETED_CHECK_FAILED_RE = re.compile(r"^failed\b", re.IGNORECASE)
+# A value that reports failures without the FAILED prefix (pytest's last
+# line copied verbatim, e.g. `2 failed, 3 passed`, `1 error`, `no tests
+# ran`) is still a failure for the Lead's retire test.
+_TARGETED_CHECK_FAILURE_TEXT_RE = re.compile(
+    r"\b(\d+ failed|\d+ errors?|no tests ran|FAIL)\b", re.IGNORECASE
+)
 
 
 def _targeted_check_line(output: str | None) -> str | None:
     """The builder's LAST `TARGETED_CHECK:` line, normalized, or None.
 
     Returned as ``TARGETED_CHECK: <value>`` (decorations stripped, a
-    case-insensitive leading ``failed`` upper-cased to ``FAILED``) so the
+    case-insensitive leading ``failed`` upper-cased to ``FAILED``, and a
+    value reporting failures without that prefix -- ``N failed``, ``N
+    error(s)``, ``no tests ran``, ``FAIL`` -- prefixed with ``FAILED ``) so the
     Lead's "does not start with `TARGETED_CHECK: FAILED`" test is
     mechanical. Empty values and echoed placeholders are ignored; the
     last matching line wins (fix-and-rerun reports the rerun).
@@ -1159,6 +1167,8 @@ def _targeted_check_line(output: str | None) -> str | None:
             continue
         if _TARGETED_CHECK_FAILED_RE.match(rest):
             rest = "FAILED" + rest[len("failed"):]
+        elif _TARGETED_CHECK_FAILURE_TEXT_RE.search(rest):
+            rest = "FAILED " + rest
         found = TARGETED_CHECK_PREFIX + rest
     return found
 
@@ -2655,8 +2665,8 @@ def _open_loop_queue_errors_note(errors: list[str]) -> str:
 # lets the Evaluator ever grade it (observed in a real open-loop run).
 _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "OPEN-LOOP CONTEXT overrides any conflicting instruction in your base\n"
-    "prompt, including wave-waiting, self-verification and REPORT.md\n"
-    "content.\n"
+    "prompt and registered role instructions, including wave-waiting,\n"
+    "self-verification and REPORT.md content.\n"
     "Open-loop mode is active (loop/QUEUE.md exists) — run this procedure\n"
     "instead of waiting for a verdict:\n"
     "0. Commit scope: commit ONLY files you or your builders edited under a\n"
@@ -2692,28 +2702,48 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   the whole wave detached in ONE call:\n"
     "     D=<mailbox>/.dispatch; mkdir -p \"$D\"\n"
     "     for s in <slice-a> <slice-b>; do\n"
-    "       touch \"$D/$s.run\"\n"
-    "       setsid nohup sh -c 'sh \"$1/$2.sh\" >\"$1/$2.out\" 2>&1; echo $? >\"$1/$2.rc\"; rm -f \"$1/$2.run\"' _ \"$D\" \"$s\" </dev/null >/dev/null 2>&1 &\n"
+    "       : >\"$D/$s.run\"\n"
+    "       setsid nohup sh -c 'echo $$ >\"$1/$2.run\"; sh \"$1/$2.sh\" >\"$1/$2.out\" 2>&1; echo $? >\"$1/$2.rc\"; rm -f \"$1/$2.run\"' _ \"$D\" \"$s\" </dev/null >/dev/null 2>&1 &\n"
     "     done\n"
+    "   Each `.run` marker holds its builder wrapper's pid (the wrapper\n"
+    "   writes it as its first action).\n"
     "   Then repeat this wait-next call. It returns as soon as ANY builder\n"
     "   finishes, printing that slice's exit code and its JSON line:\n"
     "     ( D=<mailbox>/.dispatch; t=0\n"
+    "     next_rc() { for rc in \"$D\"/*.rc; do [ -e \"$rc\" ] || continue; s=${rc##*/}; s=${s%.rc}; echo \"slice=$s exit=$(cat \"$rc\")\"; grep '\"worker_worktree\"' \"$D/$s.out\" 2>/dev/null | tail -n 1; mv \"$rc\" \"$D/$s.done\"; return 0; done; return 1; }\n"
     "     while [ \"$t\" -lt 900 ]; do\n"
-    "       for rc in \"$D\"/*.rc; do\n"
-    "         [ -e \"$rc\" ] || continue\n"
-    "         s=${rc##*/}; s=${s%.rc}\n"
-    "         echo \"slice=$s exit=$(cat \"$rc\")\"\n"
-    "         grep '\"worker_worktree\"' \"$D/$s.out\" | tail -n 1\n"
-    "         mv \"$rc\" \"$D/$s.done\"; exit 0\n"
+    "       next_rc && exit 0\n"
+    "       live=0\n"
+    "       for m in \"$D\"/*.run; do\n"
+    "         [ -e \"$m\" ] || continue\n"
+    "         p=$(cat \"$m\" 2>/dev/null); s=${m##*/}; s=${s%.run}\n"
+    "         if [ -z \"$p\" ] || kill -0 \"$p\" 2>/dev/null || kill -0 -- \"-$p\" 2>/dev/null || [ ! -e \"$m\" ]; then live=1; continue; fi\n"
+    "         rm -f \"$m\"; [ -e \"$D/$s.rc\" ] && continue\n"
+    "         echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) stale marker $s.run: wrapper pid $p gone, removed\" >>\"$D/stale.log\"\n"
+    "         echo \"stale marker $s.run removed (wrapper pid $p gone; logged to $D/stale.log)\"\n"
+    "         echo \"slice=$s exit=stale\"; grep '\"worker_worktree\"' \"$D/$s.out\" 2>/dev/null | tail -n 1\n"
+    "         echo stale >\"$D/$s.done\"; exit 0\n"
     "       done\n"
-    "       ls \"$D\"/*.run >/dev/null 2>&1 || { echo \"no builder running\"; exit 0; }\n"
+    "       [ \"$live\" = 1 ] || { next_rc && exit 0; echo \"no builder running\"; exit 0; }\n"
     "       sleep 2; t=$((t+2))\n"
     "     done\n"
     "     echo \"still running: $(cd \"$D\" && ls *.run)\" )\n"
+    "   Run every wait-next call with a shell timeout of at least 910 s:\n"
+    "   Cursor's Shell tool takes it as its per-call `timeout` parameter, in\n"
+    "   milliseconds (`timeout: 910000`; its default is only 30 s). With any\n"
+    "   other shell tool, pass the maximum timeout it allows and never rely\n"
+    "   on the default. If the call still times out, just call it again.\n"
+    "   A marker is live only while its recorded pid (or that wrapper's\n"
+    "   process group, i.e. the builder it started) is alive; a stale one\n"
+    "   (wrapper and builder killed) is removed, logged to `.dispatch/stale.log`, and\n"
+    "   reported as `exit=stale`. Before printing `no builder running` it\n"
+    "   re-scans the `.rc` files, so a builder that finishes between scans\n"
+    "   is still reported.\n"
     "   Handle each returned slice at once (step 3) before the next wait-next\n"
     "   call. Exit 0 means `integrated`. For exit 3, read the JSON's\n"
-    "   `retained_reason` (`## Isolated builders`). For any other exit or no\n"
-    "   JSON line, the run failed: re-dispatch once (step 3). Do not end the\n"
+    "   `retained_reason` (`## Isolated builders`). For any other exit\n"
+    "   (including `exit=stale`) or no JSON line, the run failed: re-dispatch\n"
+    "   once (step 3). Do not end the\n"
     "   pass while any `.run` marker remains. `.dispatch/` is untracked\n"
     "   runtime state, like `.sessions/`; never commit it.\n"
     "3. Retire each slice the moment it lands — per slice, not per wave.\n"
@@ -2728,7 +2758,10 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   the JSON's `merge_commit` differs from its `base` (a real\n"
     "   `slice(<id>):` commit landed), and its `targeted_check` field — the\n"
     "   builder's `TARGETED_CHECK: ` line — is present and does not start\n"
-    "   with `TARGETED_CHECK: FAILED`. Otherwise (empty integration,\n"
+    "   with `TARGETED_CHECK: FAILED`. A value that reports failures without\n"
+    "   the prefix (`N failed`, `N error(s)`, `no tests ran` or `FAIL`, any\n"
+    "   case) counts as FAILED; trioctl already normalizes it to\n"
+    "   `TARGETED_CHECK: FAILED <original>`. Otherwise (empty integration,\n"
     "   TARGETED_CHECK not reported, or FAILED) do NOT retire: re-dispatch\n"
     "   that slice once. trioctl merges a run before you see its\n"
     "   `targeted_check`, so a run with FAILED or missing `targeted_check`\n"
@@ -2739,8 +2772,9 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   The re-dispatched builder then starts from the reverted HEAD. If git\n"
     "   refuses because another builder is merging (`index.lock`), retry. A\n"
     "   builder whose integration ran during your revert is retained as\n"
-    "   `aggregate_dirty`: run `omnigent worktrees integrate <id>` once the\n"
-    "   revert commit exists. The worker ledger keeps the reverted run\n"
+    "   `aggregate_dirty` (or `merge_failed`, if its merge started just as\n"
+    "   your revert was staged): for either, run `omnigent worktrees\n"
+    "   integrate <id>` once the revert commit exists. The worker ledger keeps the reverted run\n"
     "   `integrated`, and its merge stays in history, so post-SHIP cleanup\n"
     "   removes it normally. Do not revert a second failed run; take over on\n"
     "   top of it.\n"
@@ -2754,7 +2788,8 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   commit's full sha. A pass that\n"
     "   commits without appending a `retired:` entry is incomplete.\n"
     "   A slice recovered with `omnigent worktrees integrate <id>` (after\n"
-    "   `merge_conflict`, `aggregate_dirty` and the like) prints no\n"
+    "   `merge_conflict`, `aggregate_dirty`, `merge_failed` and the like)\n"
+    "   prints no\n"
     "   `targeted_check`: run that slice's `## Targeted check` command\n"
     "   yourself once on HEAD and use its last summary line\n"
     "   (`TARGETED_CHECK: <line>`, or `TARGETED_CHECK: FAILED <summary>`)\n"
@@ -3275,9 +3310,11 @@ class OmnigentRunner:
             "fresh builder for the slice once, then take over (see step 3 "
             "of the OPEN-LOOP CONTEXT procedure in open-loop; in lockstep, "
             "implement the slice yourself or stop for a human). For "
-            "`merge_conflict`, `aggregate_dirty`, `aggregate_moved`, "
-            "`integration_fenced` or `active_session`, remove the cause, then "
-            "run `omnigent worktrees integrate <id>` once. Never delete "
+            "`merge_conflict`, `aggregate_dirty`, `merge_failed`, "
+            "`aggregate_moved`, `integration_fenced` or `active_session`, "
+            "remove the cause, then run `omnigent worktrees integrate <id>` "
+            "once (`merge_failed` right after an open-loop revert: once the "
+            "revert commit exists). Never delete "
             "retained worktrees. Concurrency rules for waves are "
             "unchanged: only ready slices with disjoint `writes:` and no "
             "`reads:` of another wave member run together; a slice that reads "

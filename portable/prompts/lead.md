@@ -158,7 +158,10 @@ extension"), run this loop instead of waiting for a verdict:
    JSON's `merge_commit` differs from its `base` (a real `slice(<id>):`
    commit landed), and its `targeted_check` field — the builder's
    `TARGETED_CHECK: ` line — is present and does not start with
-   `TARGETED_CHECK: FAILED`. Otherwise (empty integration, TARGETED_CHECK
+   `TARGETED_CHECK: FAILED`. A value that reports failures without the
+   prefix (`N failed`, `N error(s)`, `no tests ran` or `FAIL`, any case)
+   counts as FAILED; trioctl already normalizes it to
+   `TARGETED_CHECK: FAILED <original>`. Otherwise (empty integration, TARGETED_CHECK
    not reported, or FAILED) do NOT retire: re-dispatch that slice once.
    trioctl merges a run before you see its `targeted_check`, so a run with
    FAILED or missing `targeted_check` whose `merge_commit` differs from
@@ -167,7 +170,10 @@ extension"), run this loop instead of waiting for a verdict:
    broken slice: `git revert -m 1 --no-commit <merge_commit> && git commit
    -m "revert(<slice>): failed targeted check, re-dispatching"`. The
    re-dispatched builder starts from the reverted HEAD. Do not revert a
-   second failed run; take over on top of it. A slice recovered with
+   second failed run; take over on top of it. A builder whose integration
+   ran during your revert may be retained as `aggregate_dirty` or
+   `merge_failed`: run `omnigent worktrees integrate <id>` once the revert
+   commit exists. A slice recovered with
    `omnigent worktrees integrate <id>` prints no `targeted_check`: run its
    `## Targeted check` command yourself once on HEAD and use that line.
    If the second run still fails either condition, still do not retire
