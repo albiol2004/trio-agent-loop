@@ -706,6 +706,115 @@ def test_gate_retired_ids_excludes_malformed_slices() -> None:
     assert trio_loop._gate_retired_ids(queue) == {"a", "b"}
 
 
+# --- r11 fold-fix N1: a stray note never closes an open fault -----------
+
+
+def _open_fault_with_bad_status_scenario(tmp_path: Path, status: str):
+    """solo@s1 is retired and slice-evaluated SHIP, but the Evaluator also
+    appends fault f1 whose `status:` line is `status` verbatim (it may carry
+    a continuation line). The Lead then makes 3 no-op passes. The
+    integration eval is NOT scripted: running it fails the test."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("fold-solo-1")
+
+    def pass1(mb):
+        queue.retire("solo", sha1)
+
+    def noop(mb):
+        pass
+
+    lead = ScriptedLeadRunner([pass1, noop, noop, noop])
+
+    def eval_solo_1(mb):
+        verdict.append_slice_section("solo", sha1, "SHIP")
+        queue.add_fault("f1", "solo", sha1, "broken", status=status,
+                        scope="local:src/solo.py")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo_1}, integration_actions=[]
+    )
+    code = trio_loop.run_open_loop(mailbox, 10, lead, evaluator, poll_seconds=0.01)
+    return code, mailbox, lead, evaluator, sha1
+
+
+def test_open_fault_with_trailing_note_blocks_integration_and_is_logged(
+    tmp_path: Path,
+) -> None:
+    """r11 N1: `status: open` followed by a deeper-indented note used to
+    fold into `status: "open (see f0)"` with no error -- the gate treated
+    the fault as closed and ran the integration eval, LOG.md silent. Now
+    the status stays `open`, the note is a logged parse error, and the
+    integration eval never runs while f1 is open."""
+    code, mailbox, lead, evaluator, sha1 = _open_fault_with_bad_status_scenario(
+        tmp_path, "open\n      (see f0)"
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert [(f["id"], f["status"]) for f in parsed["faults"]] == [("f1", "open")]
+    assert len(parsed["errors"]) == 1
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    log_lines = [
+        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
+        if "QUEUE.md parse error" in ln
+    ]
+    assert log_lines
+    assert all(
+        "unexpected continuation line after `status:`" in ln and "(see f0)" in ln
+        for ln in log_lines
+    )
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in log_lines]
+    assert len(iters) == len(set(iters))
+
+
+def test_unknown_fault_status_is_treated_open_and_logged(tmp_path: Path) -> None:
+    """A fault status outside open/taken/done/stale (`opened`) is LIVE for
+    the gate (fail-closed) and logged once per iteration."""
+    code, mailbox, lead, evaluator, sha1 = _open_fault_with_bad_status_scenario(
+        tmp_path, "opened"
+    )
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    msg = "| loop | QUEUE.md: fault f1 has unknown status 'opened'; treated as open"
+    lines = [
+        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
+        if msg in ln
+    ]
+    assert lines
+    assert all(re.fullmatch(r"- iter \d+ " + re.escape(msg), ln) for ln in lines)
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in lines]
+    assert len(iters) == len(set(iters))
+
+
+def test_live_faults_counts_unknown_status_as_live() -> None:
+    faults = [
+        {"id": "f1", "status": "open"}, {"id": "f2", "status": "taken"},
+        {"id": "f3", "status": "done"}, {"id": "f4", "status": "stale"},
+        {"id": "f5", "status": "opened"}, {"id": "f6", "status": ""},
+    ]
+    queue = {"retired": [], "faults": faults, "errors": []}
+    assert [f["id"] for f in trio_loop._live_faults(queue)] == [
+        "f1", "f2", "f5", "f6",
+    ]
+    assert [f["id"] for f in trio_loop._unknown_status_faults(queue)] == [
+        "f5", "f6",
+    ]
+    assert not trio_loop._slices_fully_retired(
+        ["a"], {"a"}, trio_loop._live_faults(
+            {"faults": [{"id": "f5", "status": "opened"}]}
+        )
+    )
+    assert trio_loop._slices_fully_retired(
+        ["a"], {"a"}, trio_loop._live_faults(
+            {"faults": [{"id": "f3", "status": "done"}]}
+        )
+    )
+
+
 # --- VERDICT.md clobber guard -------------------------------------------
 
 

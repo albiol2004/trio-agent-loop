@@ -507,3 +507,165 @@ def test_too_old_vendored_metrics_is_refused_with_clear_message(
         match=r"METRICS_API 2, this trioctl requires 3 \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
+
+
+# --- r11 fold-fix N1: only `reason:` folds; other continuations are errors ----
+
+
+def _strict_faults(text: str):
+    return TM.parse_faults(TM.find_queue_block(text, "faults"))
+
+
+def test_status_with_trailing_note_stays_open_one_error() -> None:
+    entry = _fault("f1", "    scope: a.py\n").replace(
+        "    status: open\n", "    status: open\n      (see f0)\n"
+    )
+    q = _parse(entry, _fault("f2", "    scope: b.py\n"))
+    assert [(f["id"], f["status"]) for f in q["faults"]] == [
+        ("f1", "open"), ("f2", "open"),
+    ]
+    assert len(q["errors"]) == 1
+    err = q["errors"][0]
+    assert "line 8:" in err and "after `status:`" in err and "'(see f0)'" in err
+    with pytest.raises(TM.QueueParseError, match="line 8: unexpected continuation"):
+        _strict_faults(_faults_block(entry))
+
+
+def test_status_note_mid_entry_keeps_entry_and_parses_rest() -> None:
+    # The note sits before later keys: they still parse, the entry is kept.
+    entry = (
+        "  - id: f1\n    status: open\n      see f0 for context\n"
+        f"    slice: alpha\n    observed_at: {SHA}\n    scope: a.py\n"
+        "    reason: r\n"
+    )
+    q = _parse(entry)
+    assert [(f["id"], f["status"], f["reason"]) for f in q["faults"]] == [
+        ("f1", "open", "r"),
+    ]
+    assert len(q["errors"]) == 1 and "line 4:" in q["errors"][0]
+
+
+@pytest.mark.parametrize("key", ["slice", "observed_at"])
+def test_fault_key_with_junk_continuation_is_unchanged(key: str) -> None:
+    entry = _fault("f1", "    scope: a.py\n")
+    line = next(ln for ln in entry.splitlines(keepends=True)
+                if ln.startswith(f"    {key}:"))
+    q = _parse(entry.replace(line, line + "        junk here\n"))
+    expected = {"slice": "alpha", "observed_at": SHA}[key]
+    assert q["faults"][0][key] == expected
+    assert len(q["errors"]) == 1 and f"after `{key}:`" in q["errors"][0]
+
+
+def test_retired_sha_with_junk_continuation_is_unchanged() -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n    sha: {SHA}\n      junk\n    at: t1\n",
+    ))
+    assert [(e["slice"], e["sha"], e["at"]) for e in q["retired"]] == [
+        ("alpha", SHA, "t1"),
+    ]
+    assert len(q["errors"]) == 1
+    assert "line 4:" in q["errors"][0] and "after `sha:`" in q["errors"][0]
+    assert q["malformed_slices"] == []
+    with pytest.raises(TM.QueueParseError, match="after `sha:`"):
+        TM.parse_retired(TM.find_queue_block(_retired(
+            f"  - slice: alpha\n    sha: {SHA}\n      junk\n    at: t1\n",
+        ), "retired"))
+
+
+def test_retired_slice_and_at_with_junk_continuation_are_unchanged() -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n      junk\n    sha: {SHA}\n    at: t1\n        x\n",
+    ))
+    assert [(e["slice"], e["sha"], e["at"]) for e in q["retired"]] == [
+        ("alpha", SHA, "t1"),
+    ]
+    assert len(q["errors"]) == 2
+    assert "line 3:" in q["errors"][0] and "after `slice:`" in q["errors"][0]
+    assert "line 6:" in q["errors"][1] and "after `at:`" in q["errors"][1]
+    assert q["malformed_slices"] == []
+    # At the key column (not deeper) it is plain unexpected content: the
+    # incomplete entry is dropped and its slice poisoned, as before.
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n    junk\n    sha: {SHA}\n    at: t1\n",
+    ))
+    assert q["retired"] == [] and q["malformed_slices"] == ["alpha"]
+
+
+def test_reason_fold_still_works_lenient_and_strict() -> None:
+    entry = _fault("f1", "    scope: a.py\n").replace(
+        "    reason: broke it\n", "    reason: broke it\n      badly\n        twice\n"
+    )
+    q = _parse(entry)
+    assert q["errors"] == []
+    assert q["faults"][0]["reason"] == "broke it badly twice"
+    assert _strict_faults(_faults_block(entry))[0]["reason"] == "broke it badly twice"
+
+
+# --- r11 fold-fix N4: a duplicate key inside one entry ------------------------
+
+
+def test_duplicate_status_keeps_first_value_one_error() -> None:
+    entry = _fault("f1", "    scope: a.py\n") + "    status: done\n"
+    q = _parse(entry, _fault("f2", "    scope: b.py\n"))
+    assert [(f["id"], f["status"]) for f in q["faults"]] == [
+        ("f1", "open"), ("f2", "open"),
+    ]
+    assert len(q["errors"]) == 1
+    err = q["errors"][0]
+    assert "line 8: duplicate `status:` key" in err and "first value is kept" in err
+    with pytest.raises(TM.QueueParseError, match="duplicate `status:` key"):
+        _strict_faults(_faults_block(entry))
+
+
+def test_duplicate_slice_and_block_scope_keep_first() -> None:
+    entry = (
+        "  - id: f1\n    slice: alpha\n    slice: other\n"
+        f"    observed_at: {SHA}\n    scope:\n      - a.py\n"
+        "    scope:\n      - z.py\n    reason: r\n    status: open\n"
+    )
+    q = _parse(entry)
+    assert [(f["slice"], f["scope"]) for f in q["faults"]] == [("alpha", ["a.py"])]
+    assert len(q["errors"]) == 2
+    assert "line 4: duplicate `slice:`" in q["errors"][0]
+    assert "line 8: duplicate `scope:`" in q["errors"][1]
+
+
+def test_duplicate_retired_sha_keeps_first() -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: alpha\n    sha: {SHA}\n    sha: {SHA2}\n    at: t1\n",
+    ))
+    assert [e["sha"] for e in q["retired"]] == [SHA]
+    assert len(q["errors"]) == 1 and "duplicate `sha:`" in q["errors"][0]
+
+
+def test_trio_check_reports_duplicate_key(tmp_path: Path) -> None:
+    mb = _mailbox(tmp_path, _faults_block(
+        _fault("f1", "    scope: a.py\n") + "    status: done\n",
+    ))
+    errors = TC.check_queue(mb, TM, [{"id": "alpha"}])
+    assert any("duplicate `status:` key" in e for e in errors)
+
+
+# --- r11 fold-fix N3: `* slice:` / `- Slice:` headers poison the slice --------
+
+
+@pytest.mark.parametrize("header", ["  * slice: delta", "  - Slice: delta",
+                                    "  * SLICE: delta", "  -Slice=delta"])
+def test_bullet_and_case_garbled_headers_poison_slice(header: str) -> None:
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: delta\n    sha: {SHA}\n    at: t1\n",
+        f"{header}\n    sha: {SHA2}\n    at: t2\n",
+    ))
+    assert [(e["slice"], e["sha"]) for e in q["retired"]] == [("delta", SHA)]
+    assert q["malformed_slices"] == ["delta"]
+    assert len(q["errors"]) == 1
+
+
+def test_unrecognizable_header_does_not_poison() -> None:
+    # Documented limit: a key too mangled to identify names no slice.
+    q = TM.parse_queue_block(_retired(
+        f"  - slice: delta\n    sha: {SHA}\n    at: t1\n",
+        f"  - slcie: delta\n    sha: {SHA2}\n    at: t2\n",
+    ))
+    assert q["malformed_slices"] == []
+    assert len(q["errors"]) == 1

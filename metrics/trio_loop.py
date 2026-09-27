@@ -1915,6 +1915,30 @@ def _gate_retired_ids(queue: dict) -> set[str]:
     } - _malformed_retired_slices(queue)
 
 
+# MAILBOX-SCHEMA.md `faults:` `status` values. `open`/`taken` are live;
+# `done`/`stale` are closed. Anything else is UNKNOWN and treated as live
+# (fail-closed): a typo or a mangled value must block the integration gate,
+# never silently unblock it (r11 N1 gate hardening).
+FAULT_STATUSES = ("open", "taken", "done", "stale")
+CLOSED_FAULT_STATUSES = ("done", "stale")
+
+
+def _live_faults(queue: dict) -> list:
+    """Faults that block `_slices_fully_retired`: status `open`/`taken`, or
+    any status outside FAULT_STATUSES (see `_unknown_status_faults`)."""
+    return [
+        f for f in queue["faults"]
+        if f.get("status") not in CLOSED_FAULT_STATUSES
+    ]
+
+
+def _unknown_status_faults(queue: dict) -> list:
+    """Faults whose `status` is not one of FAULT_STATUSES."""
+    return [
+        f for f in queue["faults"] if f.get("status") not in FAULT_STATUSES
+    ]
+
+
 def _log_queue_errors(
     mailbox: Path, iteration: int, queue: dict, logged: set
 ) -> None:
@@ -1929,7 +1953,9 @@ def _log_queue_errors(
     QUEUE.md every poll and must not spam LOG.md). Each slice in
     `_malformed_retired_slices` also gets one
     `QUEUE.md: slice <id> has a malformed retired entry; not gated as
-    retired` line per iteration."""
+    retired` line per iteration, and each fault with a status outside
+    FAULT_STATUSES one `QUEUE.md: fault <id> has unknown status '<value>';
+    treated as open` line per iteration (see `_live_faults`)."""
     for msg in queue.get("errors") or []:
         key = (iteration, msg)
         if key in logged:
@@ -1942,6 +1968,16 @@ def _log_queue_errors(
         msg = (
             f"QUEUE.md: slice {sid} has a malformed retired entry; "
             "not gated as retired"
+        )
+        key = (iteration, msg)
+        if key in logged:
+            continue
+        logged.add(key)
+        _append_log(mailbox, f"- iter {iteration} | loop | {msg}")
+    for fault in _unknown_status_faults(queue):
+        msg = (
+            f"QUEUE.md: fault {fault.get('id')} has unknown status "
+            f"'{fault.get('status')}'; treated as open"
         )
         key = (iteration, msg)
         if key in logged:
@@ -2054,9 +2090,7 @@ def _lead_thread_body(
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _METRICS.read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
-                open_or_taken = [
-                    f for f in queue["faults"] if f["status"] in ("open", "taken")
-                ]
+                open_or_taken = _live_faults(queue)
                 if _slices_fully_retired(slice_ids, retired_ids, open_or_taken):
                     result_holder["outcome"] = "done"
                     return
@@ -2724,9 +2758,7 @@ def run_open_loop(
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _METRICS.read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
-                open_or_taken = [
-                    f for f in queue["faults"] if f["status"] in ("open", "taken")
-                ]
+                open_or_taken = _live_faults(queue)
                 latest_for_gate = {e["slice"]: e for e in queue["retired"]}
                 any_gate_blocked = any(
                     (sid, latest_for_gate[sid]["sha"]) in gate_blocked

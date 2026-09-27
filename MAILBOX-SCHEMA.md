@@ -450,9 +450,24 @@ on it and the open-loop driver logs
 Line-level rules of the reader (strict mode raises on every reported
 problem; lenient mode reports and continues):
 
-- A non-key line indented deeper than the scalar `key:` line above it
-  (e.g. a wrapped `reason:`) is YAML plain-scalar folding: it is appended
-  to that value with one space and is **not** an error.
+- A non-key line indented deeper than a `reason:` line above it (a
+  wrapped `reason:`) is YAML plain-scalar folding: it is appended to that
+  value with one space and is **not** an error. `reason` is the only
+  free-text field; the same continuation after **any other** key
+  (`status`, `sha`, `slice`, `observed_at`, `at`, or the `- id:`/`- slice:`
+  header value) is reported — line number, text prefix, and the key it
+  followed — and skipped; the entry is kept with that key **unchanged**
+  and parsing of the entry continues. (A note under `status: open` must
+  never turn the status into `open (see f0)` and silently close the
+  fault.)
+- A key repeated inside one entry (`status:` twice) is reported (line
+  number, key); the **first** value is kept, the repeat is skipped, the
+  entry is kept.
+- A garbled entry header is recognized case-insensitively with a `-` or
+  `*` bullet (`-slice: s1`, `* slice: s1`, `- Slice: s1`, `slice=s1`,
+  `- slice s1`) and poisons the slice it names (below). A header whose key
+  is too mangled to identify (`- slcie: s1`) names no slice: it is only
+  reported as unexpected content, and trio-check fails on it.
 - An unexpected line (prose, a stray `id:`/`slice:` line, a garbled next
   `- id:` header, a duplicate block key) that follows an entry which
   already has **every required key** is reported — the message names the
@@ -469,6 +484,12 @@ problem; lenient mode reports and continues):
   `- iter N | loop | QUEUE.md: slice <id> has a malformed retired entry; not gated as retired`
   once per turn; if the Lead makes no change, the 3-no-op stall guard
   ends the run with `status: error`.
+
+A fault whose `status` is not one of `open`, `taken`, `done`, `stale`
+counts as **live** for the open-loop integration gate (fail-closed, like
+`open`); the driver logs
+`- iter N | loop | QUEUE.md: fault <id> has unknown status '<value>'; treated as open`
+once per turn, and trio-check fails on it.
 
 `faults:` entries are **appended by the Evaluator only**; the Lead only
 transitions an existing entry's `status:` — the Lead never appends a new
@@ -653,6 +674,11 @@ absence is never a violation.
 
 ## Changelog
 
+- **METRICS_API 3, r11 fold-fix** (no API bump; stricter reader, same
+  shape): only `reason:` folds a continuation line; a continuation after
+  any other key and a duplicate key inside an entry are reported and the
+  first/unchanged value kept; `* slice:` / `- Slice:` headers poison their
+  slice; the driver treats an unknown fault status as live.
 - **METRICS_API 3** (r11 queue-harden): `read_queue` returns
   `malformed_slices`; a slice with a malformed `retired:` entry is not
   gated as retired; a complete entry survives a stray line after it;

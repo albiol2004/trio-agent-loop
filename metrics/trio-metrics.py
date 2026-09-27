@@ -599,6 +599,10 @@ FAULT_ENTRY_RE = re.compile(r"^\s*- id:\s*(.*)$")
 QUEUE_KEY_RE = re.compile(r"^([a-z_]+):\s*(.*)$")
 RETIRED_KEYS = ("slice", "sha", "at")
 FAULT_KEYS = ("id", "slice", "observed_at", "scope", "reason", "status")
+# The only free-text queue field: a deeper-indented continuation line after
+# it is YAML plain-scalar folding. After any other key it is an error (a
+# stray note must never silently change `status`/`sha`/`slice`/...).
+QUEUE_FOLD_KEYS = ("reason",)
 
 
 class QueueParseError(ValueError):
@@ -710,9 +714,19 @@ def _parse_queue_entries(
     `key: value` lines; `list_fields` (e.g. `scope`) accept a flow list or a
     block `- item` list, exactly like `writes:`/`reads:` in parse_slices.
     `scalar_list_fields` additionally accept a plain inline value (see
-    `_parse_scope_value`). A non-key line indented deeper than the scalar
-    `key:` line above it is YAML plain-scalar folding and is appended to
-    that scalar (joined by one space), not an error.
+    `_parse_scope_value`). A non-key line indented deeper than a
+    `reason:` line above it (QUEUE_FOLD_KEYS, the only free-text field) is
+    YAML plain-scalar folding and is appended to it (joined by one space),
+    not an error. The same continuation after ANY other scalar key
+    (`status`, `sha`, `slice`, `observed_at`, `at`, ...) is an error naming
+    the line, a text prefix and the key it followed; the line is skipped
+    and the entry is kept with that key UNCHANGED (parsing of the entry
+    continues). A key repeated inside one entry is an error too: the FIRST
+    value is kept, the repeat (and its continuation/item lines) skipped.
+    A garbled entry header (`-slice:`, `* slice:`, `- Slice:`, `slice=`
+    ...; case-insensitive key, `-`/`*` bullet) is recognized and its id
+    poisoned; a header too mangled to name the key (`- slcie:`) is only
+    reported as unexpected content.
 
     `errors` None (strict): the first violation raises QueueParseError.
     `errors` a list (lenient): each violation is appended to it and parsing
@@ -731,14 +745,19 @@ def _parse_queue_entries(
     cur: dict | None = None
     cur_line = 0
     list_key: str | None = None
-    # (key, indent) of the last scalar `key:` line of `cur`: deeper-indented
-    # non-key lines right after it fold into that scalar.
-    fold: tuple[str, int] | None = None
+    # (key, indent, mode) of the last scalar `key:` line of `cur`, for the
+    # deeper-indented non-key lines right after it. mode "fold": append to
+    # `reason`; "error": report + skip (non-free-text key); "dup": skip
+    # silently (continuation of an already-reported duplicate key).
+    fold: tuple[str, int, str] | None = None
+    # block-list items after a duplicate list key are skipped, not appended
+    list_dup = False
     saw_key = False
     skipping = False  # lenient: after a dropped/closed entry, until a header
     garbled_header_re = re.compile(
-        rf"^(?:-\s*{re.escape(entry_field)}\b\s*[:=]?|"
-        rf"{re.escape(entry_field)}\s*[:=])\s*[\"']?([^\s\"']+)"
+        rf"^(?:[-*]\s*{re.escape(entry_field)}\b\s*[:=]?|"
+        rf"{re.escape(entry_field)}\s*[:=])\s*[\"']?([^\s\"']+)",
+        re.IGNORECASE,
     )
 
     def _fail(msg: str) -> None:
@@ -816,7 +835,13 @@ def _parse_queue_entries(
             cur = {entry_field: m.group(1).strip()}
             cur_line = i
             list_key = None
-            fold = None
+            list_dup = False
+            # The header's own value is a non-free-text scalar too: a line
+            # indented deeper than its key column (after `- `) is a
+            # continuation of it -> reported, never folded.
+            after_dash = stripped[1:]
+            key_col = indent + 1 + len(after_dash) - len(after_dash.lstrip())
+            fold = (entry_field, key_col, "error")
             skipping = False
             continue
 
@@ -835,6 +860,20 @@ def _parse_queue_entries(
         if m:
             key, value = m.group(1), m.group(2).strip()
             fold = None
+            list_dup = False
+            if key != entry_field and key in cur:
+                _fail(
+                    f"line {i}: duplicate `{key}:` key in the "
+                    f"`- {entry_field}: {cur.get(entry_field)}` entry at line "
+                    f"{cur_line}; the first value is kept, "
+                    f"{_junk_prefix(value)!r} is skipped"
+                )
+                if key in list_fields and not value:
+                    list_key, list_dup = key, True
+                else:
+                    list_key = None
+                    fold = (key, indent, "dup")
+                continue
             if key == entry_field:
                 _bad(
                     f"line {i}: stray `{entry_field}: {_junk_prefix(value)}` "
@@ -867,7 +906,7 @@ def _parse_queue_entries(
             else:
                 cur[key] = value
                 list_key = None
-                fold = (key, indent)
+                fold = (key, indent, "fold" if key in QUEUE_FOLD_KEYS else "error")
             continue
 
         if list_key is not None:
@@ -878,6 +917,8 @@ def _parse_queue_entries(
                     f"`{list_key}:`, got {_junk_prefix(stripped)!r}"
                 )
                 continue
+            if list_dup:
+                continue
             item = _unquote(m.group(1).strip())
             if list_key in scalar_list_fields:
                 cur[list_key].extend(_normalize_scope_items([item]))
@@ -885,15 +926,27 @@ def _parse_queue_entries(
                 cur[list_key].append(item)
             continue
 
-        if fold is not None and indent > fold[1]:
-            # YAML plain-scalar folding: a wrapped `reason:` continuation.
-            key = fold[0]
-            cur[key] = f"{cur[key]} {stripped}".strip()
+        garbled = _garbled_id(stripped)
+        if fold is not None and indent > fold[1] and garbled is None:
+            key, _, mode = fold
+            if mode == "fold":
+                # YAML plain-scalar folding: a wrapped `reason:` continuation.
+                cur[key] = f"{cur[key]} {stripped}".strip()
+            elif mode == "error":
+                # Never fold into a non-free-text key: `status: open` plus an
+                # indented note must stay `open` (r11 N1). Report, skip the
+                # line, keep the entry and the key's value unchanged.
+                _fail(
+                    f"line {i}: unexpected continuation line after `{key}:` "
+                    f"(only `reason:` may continue on the next line): "
+                    f"{_junk_prefix(stripped)!r} (skipped; `{key}:` kept as "
+                    f"{_junk_prefix(str(cur.get(key, '')))!r})"
+                )
             continue
 
         _bad(
             f"line {i}: unexpected content: {_junk_prefix(stripped)!r}",
-            also_poison=_garbled_id(stripped),
+            also_poison=garbled,
         )
 
     if cur is not None:
