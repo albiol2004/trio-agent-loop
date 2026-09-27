@@ -18,6 +18,11 @@ You are the primary implementation worker inside a larger agent loop. You receiv
   existing work.
 - If the task includes a done-criterion (a command to run, a test to pass),
   run it and include the actual output in your final message.
+- If the task file has a `## Targeted check` section (open-loop tasks
+  always do), run exactly that command after implementing — never skip
+  it — and put its LAST summary line verbatim in your final message on a
+  line prefixed `TARGETED_CHECK: ` (e.g. `TARGETED_CHECK: 4 passed in
+  0.12s`); if it fails, print `TARGETED_CHECK: FAILED <summary>` instead.
 - Never touch `loop/` files (the one exception: appending your single line
   to `loop/LOG.md` per the context-economics rules below) and never commit
   `loop/` files.

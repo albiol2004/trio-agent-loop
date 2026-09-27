@@ -149,7 +149,11 @@ extension"), run this loop instead of waiting for a verdict:
    longer applies.
 2. Otherwise take the next `planned` slice from PLAN.md's `slices:` block.
    Give every slice you plan an `accepts:` list — that is what the
-   Evaluator grades it against.
+   Evaluator grades it against. **Every builder task file MUST contain a
+   `## Targeted check` section** with ONE exact command scoped to the
+   slice's `writes:` and derived from its `accepts:` (e.g. `python3 -m
+   pytest -q tests/test_<slice>.py` or `npx vitest run <path>`). A task
+   file without it is invalid — do not dispatch it.
 3. **Retire each slice the moment it lands — per slice, not per wave.**
    As soon as an isolated builder's run prints `integrated` (its
    `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's
@@ -157,7 +161,18 @@ extension"), run this loop instead of waiting for a verdict:
    `retired:` entry to `QUEUE.md` (`slice`, the `merge_commit` sha from
    the builder's JSON output line, `at`) — before waiting for any other
    builder in the wave. Do not wait for the wave to land or for the
-   hazard check to retire a slice. A slice you implemented yourself is
+   hazard check to retire a slice. **Retire only when both hold:** the
+   JSON's `merge_commit` differs from its `base` (a real `slice(<id>):`
+   commit landed), and its `targeted_check` field — the builder's
+   `TARGETED_CHECK: ` line — is present and does not start with
+   `TARGETED_CHECK: FAILED`. Otherwise (empty integration, TARGETED_CHECK
+   not reported, or FAILED) do NOT retire: re-dispatch that slice once.
+   If the second run still fails either condition, still do not retire
+   it and do not append a fault (faults are Evaluator-only per
+   MAILBOX-SCHEMA.md): take the slice over yourself — implement or fix
+   it, run its `## Targeted check` command once, commit it as
+   `slice(<id>): …`, and retire it at that sha with the command's last
+   summary line as its ledger evidence. A slice you implemented yourself is
    retired the same way right after its `slice(<id>):` commit, at that
    commit's sha. A post-retirement fix (step 1's `fix f<N>` commit)
    doesn't edit that entry — it appends a **new** `retired:` entry for
@@ -183,10 +198,10 @@ extension"), run this loop instead of waiting for a verdict:
    the project suite and do NOT re-verify the integrated tree — the
    Evaluator's own full-suite run is the sole authoritative verification.
    Your only checks are the builder's reported targeted test result and
-   commit presence (`git log --grep="^slice(<id>):"`). If the builder's
-   JSON shows `merge_commit` equal to `base` (empty integration, no
-   `slice(<id>):` commit), do not retire the slice — re-dispatch it. A
-   slice you implemented yourself still gets the targeted checks its
+   commit presence (`git log --grep="^slice(<id>):"`). Step 3's retire
+   conditions apply: `merge_commit` equal to `base` (empty integration)
+   or a missing/FAILED `TARGETED_CHECK:` line means no retirement and one
+   re-dispatch. A slice you implemented yourself still gets the targeted checks its
    change affects. This step replaces the Quality bar's lockstep
    build/tests/linters bullet and the lockstep REPORT.md template:
    REPORT.md is the open-loop dispatch/merge ledger shown under Output.
@@ -236,7 +251,7 @@ Open-loop (`loop/QUEUE.md` exists) — a dispatch/merge ledger, not a
 verification claim; no "How I verified it" section:
 ```markdown
 # Report — iteration N (open-loop dispatch ledger)
-## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line, verbatim — or "not reported" | one-line status)
+## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line — the `TARGETED_CHECK:` line (JSON `targeted_check`), verbatim, or "not reported" (then not retired; see step 3) | one-line status)
 ## Deviations from plan   ("None" if none)
 ## Known weaknesses       (where you'd look first if something is broken)
 ```

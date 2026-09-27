@@ -1108,9 +1108,26 @@ def _command_run_isolated(
     summary = getattr(args, "summary", None) or f"isolated builder {record['id']}"
     record = wt.integrate(repo, record["id"], summary=summary)
     print(output)
-    print(json.dumps(_worktree_view(record), sort_keys=True))
+    view = _worktree_view(record)
+    # The builder's `TARGETED_CHECK: ` line, surfaced so the open-loop Lead
+    # can copy it into its REPORT.md ledger mechanically (None = missing).
+    view["targeted_check"] = _targeted_check_line(output)
+    print(json.dumps(view, sort_keys=True))
     print(f"trioctl: {wt.summarize(record)}", file=sys.stderr)
     return 0 if record.get("state") == "integrated" else ISOLATED_RETAINED_EXIT
+
+
+TARGETED_CHECK_PREFIX = "TARGETED_CHECK: "
+
+
+def _targeted_check_line(output: str | None) -> str | None:
+    """The builder's LAST `TARGETED_CHECK: ` line, verbatim, or None."""
+    found = None
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if line.startswith(TARGETED_CHECK_PREFIX):
+            found = line
+    return found
 
 
 def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
@@ -2623,7 +2640,12 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   the Evaluator grades it against. Dispatch disjoint-writes slices to\n"
     "   builders concurrently: slices whose `writes:` are pairwise disjoint\n"
     "   and whose `reads:` name nothing another slice in the wave writes\n"
-    "   may be run as separate builders at the same time.\n"
+    "   may be run as separate builders at the same time. Every builder task\n"
+    "   file MUST contain a `## Targeted check` section with ONE exact\n"
+    "   command scoped to the slice's `writes:` and derived from its\n"
+    "   `accepts:` (e.g. `python3 -m pytest -q tests/test_<slice>.py` or\n"
+    "   `npx vitest run <path>`). A task file without it is invalid — do not\n"
+    "   dispatch it.\n"
     "3. Retire each slice the moment it lands — per slice, not per wave.\n"
     "   As soon as an isolated builder's run prints `integrated` (its\n"
     "   `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that\n"
@@ -2631,7 +2653,18 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   its `retired:` entry to QUEUE.md (`slice`, the full `merge_commit`\n"
     "   sha from the builder's JSON output line, `at`) — before waiting for\n"
     "   any other builder in the wave. Do not wait for the wave to land or\n"
-    "   for the hazard check to retire a slice. A slice you implement\n"
+    "   for the hazard check to retire a slice. Retire only when both hold:\n"
+    "   the JSON's `merge_commit` differs from its `base` (a real\n"
+    "   `slice(<id>):` commit landed), and its `targeted_check` field — the\n"
+    "   builder's `TARGETED_CHECK: ` line — is present and does not start\n"
+    "   with `TARGETED_CHECK: FAILED`. Otherwise (empty integration,\n"
+    "   TARGETED_CHECK not reported, or FAILED) do NOT retire: re-dispatch\n"
+    "   that slice once. If the second run still fails either condition,\n"
+    "   still do not retire it and do not append a fault (faults are\n"
+    "   Evaluator-only): take the slice over yourself — implement or fix it,\n"
+    "   run its `## Targeted check` command once, commit `slice(<id>): ...`,\n"
+    "   and retire it at that sha with the command's last summary line as\n"
+    "   its ledger evidence. A slice you implement\n"
     "   yourself is retired right after its `slice(<id>):` commit, at that\n"
     "   commit's full sha. A pass that\n"
     "   commits without appending a `retired:` entry is incomplete.\n"
@@ -2654,15 +2687,17 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   do NOT re-verify the integrated tree — the Evaluator's own full-suite\n"
     "   run is the sole authoritative verification. Your only checks are the\n"
     "   builder's reported targeted test result and commit presence\n"
-    "   (`git log --grep=\"^slice(<id>):\"`). If the builder's JSON shows\n"
-    "   `merge_commit` equal to `base` (empty integration, no commit), do not\n"
-    "   retire the slice — re-dispatch it. A slice you implement yourself\n"
+    "   (`git log --grep=\"^slice(<id>):\"`). Step 3's retire conditions\n"
+    "   apply: `merge_commit` equal to `base` (empty integration) or a\n"
+    "   missing/FAILED `TARGETED_CHECK:` line means no retirement and one\n"
+    "   re-dispatch. A slice you implement yourself\n"
     "   still gets the targeted checks its change affects. Never weaken\n"
     "   verification (no deleting/skipping tests or loosening assertions).\n"
     "7. REPORT.md is a dispatch/merge ledger, not a verification claim — no\n"
     "   'How I verified it' section. Per slice, one row: slice id | builder\n"
     "   id | merge sha | files | the builder-reported targeted test result\n"
-    "   line, verbatim (or `not reported`) | one-line status; then\n"
+    "   line — the JSON `targeted_check` (`TARGETED_CHECK: ...`) verbatim, or\n"
+    "   `not reported` (then not retired; see step 3) | one-line status; then\n"
     "   `## Deviations from plan` and `## Known weaknesses`.\n"
     "Append one line to loop/LOG.md: `- iter N | lead | <summary>`.\n"
 )

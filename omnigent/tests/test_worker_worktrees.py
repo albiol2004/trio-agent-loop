@@ -174,6 +174,8 @@ FAKE_CURSOR = textwrap.dedent(
                "workspace": ws, "seen": seen, "start": start,
                "end": time.time()}, open(log, "w"))
     print(f"built {slice_id}")
+    if "TARGETED" in prompt:
+        print("TARGETED_CHECK: 4 passed in 0.12s")
     """
 ) % {"mcp": repr(LEAD_MCP)}
 
@@ -252,6 +254,23 @@ def test_concurrent_builders_get_separate_roots_and_keep_lead_config(
     assert sorted(r["state"] for r in records) == ["integrated", "integrated"]
     for record in records:
         assert wt.is_ancestor(repo, record["worker_commit"], "HEAD")
+
+
+def test_isolated_run_json_surfaces_targeted_check_line(wt, repo, root, fake_env):
+    """r12 C: the builder's `TARGETED_CHECK: ` line lands in the JSON the
+    Lead copies into its ledger; a builder that prints none yields null."""
+    procs = {s: launch(fake_env, repo, root, s, extra=("TARGETED" if s == "A" else ""))
+             for s in ("A", "B")}
+    views = {}
+    for s, proc in procs.items():
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        (line,) = [ln for ln in out.splitlines() if ln.startswith('{"')]
+        views[s] = json.loads(line)
+    assert views["A"]["targeted_check"] == "TARGETED_CHECK: 4 passed in 0.12s"
+    assert views["A"]["worker_worktree"]["state"] == "integrated"
+    assert views["B"]["targeted_check"] is None
+    assert views["B"]["worker_worktree"]["state"] == "integrated"
 
 
 def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(

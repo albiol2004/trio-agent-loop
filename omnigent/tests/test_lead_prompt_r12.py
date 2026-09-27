@@ -222,3 +222,75 @@ def test_omnigent_integration_eval_prompt_names_ledger(tmp_path: Path) -> None:
     block = _flat(prompt.split("\n\n", 1)[0])
     assert block.startswith("OPEN-LOOP CONTEXT: kind=integration-eval")
     assert LEDGER_EVAL in block
+
+
+# ---------------------------------------------------------------- commit C
+
+TASK_MANDATE = "MUST contain a `## Targeted check` section"
+INVALID_TASK = "A task file without it is invalid — do not dispatch it"
+BUILDER_CONTRACT = (
+    "run exactly that command after implementing — never skip it — and put "
+    "its LAST summary line verbatim in your final message on a line prefixed "
+    "`TARGETED_CHECK: `"
+)
+BUILDER_FAILED = "print `TARGETED_CHECK: FAILED <summary>` instead"
+
+
+def _assert_retire_conditions(flat: str) -> None:
+    assert "Retire only when both hold" in flat
+    assert "`merge_commit` differs from its `base`" in flat
+    assert "`targeted_check` field" in flat
+    assert "does not start with `TARGETED_CHECK: FAILED`" in flat
+    assert "do NOT retire: re-dispatch that slice once" in flat
+    assert "do not append a fault" in flat
+    assert "take the slice over yourself" in flat
+
+
+def test_canonical_open_loop_requires_targeted_check_section() -> None:
+    section = _flat(_section(_canonical(), "## Open-loop mode"))
+    assert TASK_MANDATE in section
+    assert INVALID_TASK in section
+    assert "scoped to the slice's `writes:` and derived from its `accepts:`" in section
+    _assert_retire_conditions(section)
+    lockstep, open_loop = _output_templates(_canonical())
+    assert "`TARGETED_CHECK:` line (JSON `targeted_check`)" in _flat(open_loop)
+    assert "TARGETED_CHECK" not in lockstep
+
+
+def test_omnigent_open_loop_lead_prompt_requires_targeted_check(tmp_path: Path) -> None:
+    block = _flat(_open_loop_block(_omnigent_open_loop_lead(tmp_path)))
+    assert TASK_MANDATE in block
+    assert INVALID_TASK in block
+    _assert_retire_conditions(block)
+    assert "JSON `targeted_check` (`TARGETED_CHECK: ...`) verbatim" in block
+
+
+def test_generated_leads_carry_targeted_check_mandate() -> None:
+    for path, text in _rendered_leads().items():
+        flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
+        assert TASK_MANDATE in flat, path
+        assert "Retire only when both hold" in flat, path
+
+
+def test_builder_prompt_sources_carry_targeted_check_contract() -> None:
+    canonical = _flat((ROOT / "prompts" / "canonical" / "builder.md").read_text(encoding="utf-8"))
+    config = _flat((ROOT / "omnigent" / "trio-omnigent-roles" / "builder" / "config.yaml")
+                   .read_text(encoding="utf-8"))
+    for source in (canonical, config):
+        assert "`## Targeted check` section" in source
+        assert BUILDER_CONTRACT in source
+        assert BUILDER_FAILED in source
+    generate = _load("trio_generate_r12c", ROOT / "prompts" / "generate.py")
+    builders = [t for p, t in generate.all_outputs().items() if "builder" in p.name]
+    assert builders
+    for text in builders:
+        flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
+        assert "TARGETED_CHECK: " in flat
+
+
+def test_targeted_check_line_helper() -> None:
+    trioctl = _load("trioctl_r12_tc", ROOT / "omnigent" / "trioctl")
+    assert trioctl._targeted_check_line(None) is None
+    assert trioctl._targeted_check_line("built A\nall good") is None
+    out = "x\n  TARGETED_CHECK: 1 failed\nTARGETED_CHECK: 4 passed in 0.12s  \ndone"
+    assert trioctl._targeted_check_line(out) == "TARGETED_CHECK: 4 passed in 0.12s"
