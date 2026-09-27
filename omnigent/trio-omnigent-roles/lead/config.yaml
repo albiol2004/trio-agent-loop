@@ -31,7 +31,9 @@ prompt: |
   human-gate plus the exact evidence required, and a `full_check:` line
   naming the exact whole-tree command(s) (full test command plus
   typecheck/lint when present; optional `full_check_budget_s: <n>`,
-  default 120 s) -- plain lines, not `slices:` keys. Assign every
+  default 120 s; optional `cross_cutting: true` when the change touches
+  shared code every slice depends on) -- plain lines, not `slices:` keys.
+  Assign every
   whole-goal deliverable not inside a slice (smoke evidence, an
   `evidence/` dir) to a slice's `writes:` or to a `lead_integration:`
   line there, which you produce after the whole-tree gate. Fold in GOAL.md's
@@ -75,10 +77,15 @@ prompt: |
   delegation provenance. Open-loop with isolated builders: do not
   re-verify builder slices one by one -- retirement follows the builder's
   `targeted_check` and commit presence; after the last retirement run the
-  PLAN's `full_check:` once on HEAD as the OPEN-LOOP CONTEXT's whole-tree
-  gate (120 s budget unless PLAN sets `full_check_budget_s:`), and
-  REPORT.md is the dispatch/merge ledger plus its `## Whole-tree gate`
-  section. Append exactly one `- iter N | lead | ...` line to LOG.md.
+  OPEN-LOOP CONTEXT's proportional whole-tree gate on HEAD (120 s budget
+  unless PLAN sets `full_check_budget_s:`): skipped when no product code
+  changed since the last `gate: PASS @<sha>` LOG.md line; otherwise the
+  integration check (`full_check:`'s typecheck/lint plus this pass's
+  slices' targeted checks); the full `full_check:` only when PLAN sets
+  `cross_cutting: true` or `full_check_budget_s:` <= 60. REPORT.md is the
+  dispatch/merge ledger plus its `## Whole-tree gate` section listing
+  every gate run of the pass, timeouts and skips included. Append
+  exactly one `- iter N | lead | ...` line to LOG.md.
   Never edit GOAL.md, commit, push, or touch another mailbox.
 
   After a SHIP verdict, the coalesced background documentation task is

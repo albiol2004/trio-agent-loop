@@ -169,21 +169,49 @@ never reads `trio-omnigent-roles/builder/config.yaml`.
 
 ## 7. Choosing `full_check_budget_s` (r13)
 
-The open-loop Lead runs PLAN.md's `full_check:` once, as its whole-tree gate,
-under `timeout <budget>`. The budget is 120 s unless PLAN.md's
-`## Verification standard` has a `full_check_budget_s: <n>` line. If the gate
-runs over budget, the failure is recorded under `## Known weaknesses` and the
-Evaluator gets the pass. That brings back the round trip the gate exists to
-remove, so set the budget from measurement:
+The open-loop Lead runs one whole-tree gate per pass, under
+`timeout <budget>`. The budget is 120 s unless PLAN.md's
+`## Verification standard` has a `full_check_budget_s: <n>` line. Since the
+proportional gate (r13 G-1..G-3) the gate's scope depends on the pass:
 
-- Measure the full `full_check:` command on the run host, including any
-  typecheck or lint it chains.
+- **Skipped** when the pass committed no product code: the Lead reads the
+  last `gate: PASS @<sha>` from LOG.md and, if
+  `git diff --quiet <sha> HEAD -- . ':!<mailbox>'` exits 0, records
+  `gate: skipped (no product change since <sha>)`. A fault-only pass that
+  only marks a fault `stale` (vps-pool pass 2 in eval-r13b, 110 s) now
+  costs nothing.
+- **Integration check** by default: the typecheck/lint named in
+  `full_check:` (if any) plus the union of this pass's slices'
+  `## Targeted check` commands, re-run on merged HEAD. This catches
+  cross-slice breakage in the touched tests (the vps-pool board-HTTP hang
+  was in a retired slice's targeted check) in seconds instead of a full
+  suite.
+- **Full `full_check:`** only when the section has `cross_cutting: true`
+  or declares `full_check_budget_s:` ≤ 60 (a suite that cheap is
+  effectively free, e.g. openrouter's 11 s).
+
+The integration eval's own full suite stays the authoritative check. A
+timeout is a failure: the Lead identifies the hanging test, fixes it within
+its paths and re-runs once; a second failure or timeout goes to
+`## Known weaknesses` and the Evaluator gets the pass. REPORT.md
+`## Whole-tree gate` lists every gate run of the pass (scope, command,
+duration, summary line, PASS/FAIL/TIMEOUT), skips included.
+
+Choosing the budget:
+
+- Measure the command the gate will actually run on the run host: the full
+  `full_check:` (including any chained typecheck or lint) when
+  `cross_cutting: true` is likely, otherwise the typecheck plus the largest
+  plausible union of targeted checks. When in doubt, measure the full one.
 - Set `full_check_budget_s` to at least 1.3× that time, rounded up. The gate
   runs while slice-evals are still grading, so the box is loaded.
 - Add the line whenever 1.3× the measured time exceeds 120 s. Also add it when
-  the suite comes within about 40 s of 120 s, because load and suite growth
-  eat that margin.
+  the measured time comes within about 40 s of 120 s, because load and suite
+  growth eat that margin.
+- Declaring `full_check_budget_s:` ≤ 60 opts the gate into the full
+  `full_check:` on every changed pass; do that only for a suite that really
+  finishes well inside it.
 
-Examples: a 220 s suite needs about 300 (1.3 × 220 = 286). An 84 s suite is
-under 120 s by the 1.3× rule (109 s), but it leaves only about 36 s of slack,
-so 150 is the safer value.
+Examples: a 220 s suite needs about 300 (1.3 × 220 = 286) when it runs
+cross-cutting. An 84 s suite is under 120 s by the 1.3× rule (109 s), but it
+leaves only about 36 s of slack, so 150 is the safer value.

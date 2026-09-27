@@ -450,7 +450,8 @@ def test_lead_config_system_prompt_matches_r12(tmp_path: Path) -> None:
     assert "run no suite" not in text
     assert ("Open-loop with isolated builders: do not re-verify builder slices "
             "one by one") in text
-    assert "run the PLAN's `full_check:` once on HEAD as the OPEN-LOOP CONTEXT's whole-tree gate" in text
+    # r13 G-1: the gate is proportional (see test_lead_prompt_r13.py).
+    assert "run the OPEN-LOOP CONTEXT's proportional whole-tree gate on HEAD" in text
     assert "REPORT.md is the dispatch/merge ledger plus its `## Whole-tree gate` section" in text
     # Smoke-test anchors survive.
     assert "Before any deep reconnaissance" in text

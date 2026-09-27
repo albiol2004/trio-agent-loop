@@ -152,9 +152,21 @@ for the iteration:
   typecheck/lint when the repository has one, e.g.
   `full_check: cd api && npm test && npm run typecheck`. Optional
   `full_check_budget_s: <n>` overrides the default 120 s wall-clock budget.
-  In open-loop the Lead runs it once on HEAD after the last retirement
-  (its whole-tree gate). Plain lines under this heading — never keys in
-  the `slices:` block.
+  In open-loop the Lead's whole-tree gate after the last retirement is
+  proportional: skipped when no product code changed since the last
+  `gate: PASS @<sha>` LOG.md line; otherwise by default the integration
+  check (the typecheck/lint named in `full_check:` plus this pass's slices'
+  `## Targeted check` commands, re-run on merged HEAD); the full
+  `full_check:` only when `cross_cutting: true` is set or
+  `full_check_budget_s` is ≤ 60. Plain lines under this heading — never
+  keys in the `slices:` block.
+- **`cross_cutting:`** (optional, default false): the plain line
+  `cross_cutting: true` marks an iteration whose change touches shared code
+  every slice depends on (core types, shared config, build or test
+  infrastructure), so the open-loop gate runs the full `full_check:`
+  instead of the integration check. Like `full_check:`, a plain line under
+  this heading — never a key in the `slices:` block (a key inside that
+  block reads as a slice field).
 - **`lead_integration:`** (required when any exist): every whole-goal
   deliverable that is not inside a slice (smoke evidence, an `evidence/`
   dir, a generated report) is either in a slice's `writes:` or listed on

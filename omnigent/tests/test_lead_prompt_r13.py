@@ -99,16 +99,18 @@ B_EVAL = ("REPORT.md is a dispatch ledger, not a verification claim; your own "
           "full-suite run is the sole authoritative verification")
 GATE_HEAD = "Whole-tree gate — your ONE verification"
 GATE_WHEN = ("After the LAST builder of the wave has integrated and every slice "
-             "is retired, run the repository's whole-tree verification ONCE on HEAD")
+             "is retired (in a fault-only pass: after the last fault fix), run the "
+             "repository's whole-tree verification ONCE on HEAD")
 GATE_CMD = ("exactly the `full_check:` command(s) PLAN.md's `## Verification "
             "standard` names as the full check")
 GATE_BUDGET = ("with a wall-clock budget of 120 s by default — PLAN.md may "
                "override it with a `full_check_budget_s:` line there")
+GATE_OLD_GIVEUP = "If it still fails, or it exceeds the budget"
 GATE_FIX = ("On failure, fix ONLY within the failing paths: a `slice(<id>): fix")
 GATE_RETIRE = "NEW `retired:` entry at the fix sha (step 3's post-retirement rule), then re-run the gate once"
-GATE_GIVEUP = ("If it still fails, or it exceeds the budget, write the failure "
-               "(command, failing tests/errors) into REPORT.md `## Known weaknesses` "
-               "and end the pass — the Evaluator decides")
+GATE_GIVEUP = ("a second failure or timeout → Known weaknesses: write it (command, "
+               "failing tests/errors or the hanging test) into REPORT.md "
+               "`## Known weaknesses` and end the pass — the Evaluator decides")
 GATE_PARALLEL = "Slice-evals may still be grading the last retirements meanwhile; do not wait for them"
 EVAL_LEDGER = ("REPORT.md is the Lead's dispatch/merge ledger plus one "
                "`## Whole-tree gate` result — a claim to check, not evidence; your "
@@ -119,7 +121,7 @@ def _assert_gate(text: str) -> None:
     for needle in (GATE_HEAD, GATE_WHEN, GATE_CMD, GATE_BUDGET, GATE_FIX,
                    GATE_RETIRE, GATE_GIVEUP, GATE_PARALLEL):
         assert needle in text, needle
-    for needle in (B_NO_SUITE, B_NO_REVERIFY, B_SOLE):
+    for needle in (B_NO_SUITE, B_NO_REVERIFY, B_SOLE, GATE_OLD_GIVEUP):
         assert needle not in text, needle
 
 
@@ -139,8 +141,9 @@ def test_omnigent_open_loop_report_template_ledger_plus_gate(tmp_path: Path) -> 
     assert "REPORT.md = the dispatch/merge ledger plus the gate result" in block
     assert ("one row: slice id | builder id | merge sha | files | the "
             "builder-reported targeted test result line") in block
-    assert "Then `## Whole-tree gate`: the exact command(s)" in block
-    assert "`PASS` or `FAIL` — the only verification claim you make" in block
+    assert "Then `## Whole-tree gate`: a ledger of EVERY gate run of this pass" in block
+    assert ("`PASS`, `FAIL` or `TIMEOUT` (a skip row reads `skipped (no product "
+            "change since <sha>)`) — the only verification claim you make") in block
     assert "not a verification claim" not in block
     assert block.index("Then `## Whole-tree gate`") < block.rindex("## Known weaknesses")
 
@@ -175,9 +178,9 @@ def test_evaluator_ledger_sentence_names_gate(tmp_path: Path) -> None:
 def test_lead_config_and_base_prompt_name_gate(tmp_path: Path) -> None:
     config = _flat((ROLES / "lead" / "config.yaml").read_text(encoding="utf-8"))
     assert "run no suite" not in config
-    assert ("after the last retirement run the PLAN's `full_check:` once on HEAD "
-            "as the OPEN-LOOP CONTEXT's whole-tree gate (120 s budget unless PLAN "
-            "sets `full_check_budget_s:`)") in config
+    assert ("after the last retirement run the OPEN-LOOP CONTEXT's proportional "
+            "whole-tree gate on HEAD (120 s budget unless PLAN sets "
+            "`full_check_budget_s:`)") in config
     prompt = _flat(_lead_prompt(tmp_path))
     assert "no Lead suite run" not in prompt
     assert ("replaces this step with a dispatch/merge ledger and ONE whole-tree "
@@ -562,3 +565,244 @@ def test_evaluator_keeps_unverified_evidence_iterate(tmp_path: Path) -> None:
     assert EVIDENCE_GAP in prompt
     for path, flat in _generated_role("evaluator"):
         assert "Verification standard" in flat, path
+
+
+# ------------------------------- G-1..G-3 proportional whole-tree gate
+
+GATE_GREP = "grep -oE 'gate: PASS @[0-9a-f]{40}' <mailbox>/LOG.md | tail -n 1"
+GATE_DIFF = "git diff --quiet <gate_sha> HEAD -- . ':!<mailbox>'"
+GATE_SKIP = ("the pass committed no product code since that gate: run nothing "
+             "and record `gate: skipped (no product change since <gate_sha>)`")
+GATE_INTEGRATION = (
+    "Otherwise run the typecheck/lint named in `full_check:` (if any) plus the "
+    "union of the `## Targeted check` commands of every slice this pass retired "
+    "(builder merges, take-overs, fixes), re-run on merged HEAD under one budget"
+)
+GATE_NO_TARGETED = ("If this pass retired no slice with a targeted check (e.g. it "
+                    "fixed only an `integration` fault), run the full check.")
+GATE_FULL_WHEN = ("run only when that section has `cross_cutting: true` or declares "
+                  "`full_check_budget_s:`")
+GATE_AUTHORITATIVE = "The integration eval's own full suite stays the authoritative check."
+GATE_TIMEOUT = ("A timeout is a failure: identify the hanging test, fix within its "
+                "paths, re-run once; a second failure or timeout → Known weaknesses")
+GATE_LOG = ("End your LOG.md line with the pass's last gate outcome: "
+            "`gate: PASS @<full HEAD sha>`, `gate: FAIL @<full HEAD sha>` or "
+            "`gate: skipped (no product change since <gate_sha>)`")
+GATE_FAULT_PASS = "(in a fault-only pass: after the last fault fix)"
+
+
+def _assert_proportional(text: str) -> None:
+    for needle in (f"`{GATE_GREP}`", f"`{GATE_DIFF}`", GATE_SKIP, GATE_INTEGRATION,
+                   GATE_NO_TARGETED, GATE_FULL_WHEN, GATE_AUTHORITATIVE,
+                   GATE_TIMEOUT, GATE_FAULT_PASS, GATE_CMD, GATE_BUDGET):
+        assert needle in text, needle
+    assert "gate: PASS @<full HEAD sha>" in text
+    # The skip check precedes the scopes; the scopes precede the failure rule.
+    assert text.index(GATE_SKIP) < text.index(GATE_INTEGRATION) < text.index(GATE_FULL_WHEN)
+    assert text.index(GATE_FULL_WHEN) < text.index(GATE_TIMEOUT)
+
+
+def test_omnigent_open_loop_gate_is_proportional(tmp_path: Path) -> None:
+    for isolate in (True, False):
+        sub = tmp_path / str(isolate)
+        sub.mkdir()
+        block = _flat(_block(_lead_prompt(sub, isolate=isolate)))
+        step6 = block[block.index("6. Whole-tree gate"): block.index("7. REPORT.md")]
+        _assert_proportional(step6)
+        assert GATE_LOG in step6
+        assert "`full_check_budget_s:` <= 60" in step6
+        # The integration check is the default; the full check is not.
+        assert step6.index("Default scope: the integration check") < step6.index(
+            "Full check only when warranted")
+    # Unflattened: the commands are copyable verbatim from the raw block.
+    (tmp_path / "raw").mkdir()
+    raw = _block(_lead_prompt(tmp_path / "raw"))
+    assert f"`{GATE_GREP}`" in raw and f"`{GATE_DIFF}`" in raw
+
+
+def test_canonical_and_generated_leads_gate_is_proportional() -> None:
+    canonical = (CANONICAL / "lead.md").read_text(encoding="utf-8")
+    section = _flat(_section(canonical, "## Open-loop mode"))
+    _assert_proportional(section)
+    assert "`full_check_budget_s:` ≤ 60" in section
+    assert _flat(GATE_LOG.replace("End your", "end your")) in section
+    assert f"`{GATE_GREP}`" in canonical and f"`{GATE_DIFF}`" in canonical
+    # The one LOG.md read is named as the only exception to "never read it".
+    economics = _flat(_section(canonical, "## Context economics"))
+    assert ("Open-loop step 6's one `grep` for the last `gate: PASS @<sha>` is the "
+            "only exception") in economics
+    for path, flat in _generated_role("lead"):
+        _assert_proportional(flat)
+        assert f"`{GATE_GREP}`" in flat, path
+
+
+def test_report_gate_section_is_a_per_pass_ledger(tmp_path: Path) -> None:
+    block = _flat(_block(_lead_prompt(tmp_path)))
+    step7 = block[block.index("7. REPORT.md"):]
+    for needle in (
+        "a ledger of EVERY gate run of this pass, in order, including timeouts and skips",
+        "never overwrite an earlier row within the pass",
+        "scope (`integration`, `full` or `skipped`) | the exact command(s) | duration in s",
+        "`PASS`, `FAIL` or `TIMEOUT`",
+    ):
+        assert needle in step7, needle
+    canonical = (CANONICAL / "lead.md").read_text(encoding="utf-8")
+    output = canonical[canonical.index("## Output"): canonical.index("## Rules")]
+    open_loop = _flat(output.split("Open-loop (`loop/QUEUE.md` exists)", 1)[1])
+    for needle in (
+        "## Whole-tree gate (a ledger of EVERY gate run of this pass, in order, "
+        "including timeouts and skips; never overwrite an earlier row within the pass",
+        "scope `integration` | `full` | `skipped` | the exact command | duration in s",
+        "PASS, FAIL or TIMEOUT; a skip row reads `skipped (no product change since <sha>)`",
+    ):
+        assert needle in open_loop, needle
+    for path, flat in _generated_role("lead"):
+        assert "a ledger of EVERY gate run of this pass" in flat, path
+
+
+def test_plan_template_names_cross_cutting() -> None:
+    canonical = _flat((CANONICAL / "lead.md").read_text(encoding="utf-8"))
+    assert "`cross_cutting: true` when the iteration changes shared code" in canonical
+    assert "All three are plain lines under the heading, never keys in the `slices:` block" in canonical
+    config = _flat((ROLES / "lead" / "config.yaml").read_text(encoding="utf-8"))
+    assert "optional `cross_cutting: true` when the change touches shared code" in config
+    assert ("skipped when no product code changed since the last `gate: PASS @<sha>` "
+            "LOG.md line") in config
+    assert ("the full `full_check:` only when PLAN sets `cross_cutting: true` or "
+            "`full_check_budget_s:` <= 60") in config
+    assert "every gate run of the pass, timeouts and skips included" in config
+    schema = _flat((ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8"))
+    assert "**`cross_cutting:`** (optional, default false)" in schema
+    assert ("Like `full_check:`, a plain line under this heading — never a key in "
+            "the `slices:` block") in schema
+    docs = _flat((ROOT / "docs" / "CONCURRENT-SLICE-EVAL.md").read_text(encoding="utf-8"))
+    assert "gate: skipped (no product change since <sha>)" in docs
+    assert "`cross_cutting: true`" in docs
+    for path, flat in _generated_role("lead"):
+        assert "`cross_cutting: true` when the iteration changes shared code" in flat, path
+
+
+def _git(repo: Path, *args: str, check: bool = True):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                          text=True, check=check)
+
+
+def test_gate_skip_commands_apply_mechanically(tmp_path: Path) -> None:
+    """The documented LOG.md lookup and product-diff check, run for real."""
+    import shutil
+    import subprocess
+    if shutil.which("git") is None or shutil.which("grep") is None:
+        import pytest
+        pytest.skip("git/grep not installed")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "loop-hard").mkdir()
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "loop-hard" / "PLAN.md").write_text("plan\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "slice(a): one")
+    gate_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    old_sha = "c" * 40
+    log = repo / "loop-hard" / "LOG.md"
+    log.write_text(
+        "# Trio loop log\n"
+        f"- iter 1 | lead | wave 1 retired; gate: PASS @{old_sha}\n"
+        f"- iter 1 | evaluator | ITERATE f1\n"
+        f"- iter 2 | lead | fix f1; gate: PASS @{gate_sha}\n"
+        f"- iter 3 | lead | f2 stale; gate: skipped (no product change since {gate_sha})\n"
+        f"- iter 4 | lead | fix f3; gate: FAIL @{'d' * 40}\n",
+        encoding="utf-8",
+    )
+
+    def lookup() -> str:
+        cmd = GATE_GREP.replace("<mailbox>", "loop-hard")
+        out = subprocess.run(["sh", "-c", cmd], cwd=repo, capture_output=True, text=True)
+        return out.stdout.strip()
+
+    # The LAST PASS wins; skip and FAIL lines never become the baseline.
+    assert lookup() == f"gate: PASS @{gate_sha}"
+    found = lookup().split("@", 1)[1]
+
+    def unchanged() -> bool:
+        cmd = GATE_DIFF.replace("<gate_sha>", found).replace("<mailbox>", "loop-hard")
+        return subprocess.run(["sh", "-c", cmd], cwd=repo).returncode == 0
+
+    assert unchanged()
+    # Mailbox-only commits (PLAN/QUEUE/LOG) are not product changes.
+    (repo / "loop-hard" / "QUEUE.md").write_text("q\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "loop: mailbox")
+    assert unchanged()
+    # A product commit makes the gate run.
+    (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "slice(a): fix f3")
+    assert not unchanged()
+    # No PASS recorded yet -> nothing to skip against.
+    log.write_text("# Trio loop log\n- iter 1 | lead | gate: FAIL @" + "d" * 40 + "\n",
+                   encoding="utf-8")
+    assert lookup() == ""
+
+
+PLAN_VS_BASE = """\
+# Plan
+
+```yaml
+slices:
+  - id: alpha
+    writes: [a.py]
+    status: complete
+  - id: beta
+    writes: [b.py]
+    status: planned
+```
+
+## Verification standard
+- **Mode**: `implement-then-smoke`.
+"""
+PLAN_VS_KEYS = PLAN_VS_BASE + (
+    "full_check: python3 -m pytest -q\n"
+    "full_check_budget_s: 150\n"
+    "cross_cutting: true\n"
+    "lead_integration: evidence/full-check.txt\n"
+)
+
+
+def test_trio_check_accepts_plans_with_and_without_gate_keys(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+    checker = ROOT / "metrics" / "trio-check.py"
+    tm = _load("trio_metrics_r13_keys", ROOT / "metrics" / "trio-metrics.py")
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    for name, plan in (("without", PLAN_VS_BASE), ("with", PLAN_VS_KEYS),
+                       ("false", PLAN_VS_KEYS.replace("cross_cutting: true",
+                                                      "cross_cutting: false"))):
+        mailbox = tmp_path / name
+        mailbox.mkdir()
+        (mailbox / "GOAL.md").write_text("# Goal\nprofile: software\nFixture.\n", encoding="utf-8")
+        (mailbox / "STATE.md").write_text(
+            "schema: 1\niteration: 1\nmax_iterations: 5\nstatus: iterating\n"
+            "mission: Fixture.\n", encoding="utf-8")
+        (mailbox / "PLAN.md").write_text(plan, encoding="utf-8")
+        (mailbox / "REPORT.md").write_text("Fixture.\n", encoding="utf-8")
+        (mailbox / "VERDICT.md").write_text(f"## slice alpha @{sha} — SHIP\nok\n",
+                                            encoding="utf-8")
+        (mailbox / "LOG.md").write_text(
+            f"# Trio loop log\n- iter 1 | lead | wave 1; gate: PASS @{sha}\n",
+            encoding="utf-8")
+        (mailbox / "QUEUE.md").write_text(
+            "```yaml\nretired:\n  - slice: alpha\n"
+            f"    sha: {sha}\n    at: 2026-08-26T10:00:00Z\n```\n\n"
+            "```yaml\nfaults:\n```\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, str(checker), str(mailbox)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, (name, result.stdout, result.stderr)
+        # The plain lines never leak into the slices block.
+        slices = tm.parse_slices_block(plan)
+        assert [s["id"] for s in slices] == ["alpha", "beta"], name
+        for s in slices:
+            assert "cross_cutting" not in s and "full_check" not in s, name

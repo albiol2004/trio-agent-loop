@@ -48,9 +48,11 @@ reconciliation/integrity/idempotent re-runs for `profile: data`). The
 section MUST include a `full_check:` line: the exact whole-tree command(s)
 that are the full check (the full test command plus the typecheck/lint
 when the repository has one). It may add `full_check_budget_s: <n>` when
-that check needs more than the default 120 s. Both are plain lines under
-the heading, never keys in the `slices:` block; Open-loop step 6 runs
-`full_check:` once as the Lead's whole-tree gate. Every whole-goal
+that check needs more than the default 120 s, and `cross_cutting: true`
+when the iteration changes shared code every slice depends on (core types,
+shared config, build or test infrastructure). All three are plain lines
+under the heading, never keys in the `slices:` block; Open-loop step 6's
+proportional whole-tree gate draws on them. Every whole-goal
 deliverable that is not inside a slice (smoke evidence, an `evidence/`
 dir, a generated report) MUST be assigned either to a slice's `writes:`
 or to a `lead_integration:` line in the same section — the deliverables
@@ -257,21 +259,45 @@ extension"), run this loop instead of waiting for a verdict:
    plus a real `slice(<id>):` merge), plus your one targeted-check run
    for a `worktrees integrate` recovery (step 3); do not re-run checks
    per slice otherwise. After the LAST builder of the wave has integrated and every
-   slice is retired, run the repository's whole-tree verification ONCE on
-   HEAD: exactly the `full_check:` command(s) PLAN.md's `## Verification
-   standard` names as the full check (typically the full test command
-   plus the typecheck), with a wall-clock budget of 120 s by default —
-   PLAN.md may override it with a `full_check_budget_s:` line there —
-   e.g. `timeout <budget> sh -c '<full_check>'`. If PLAN.md names no
-   `full_check:`, add that line first. Slice-evals may still be grading
-   the last retirements meanwhile; do not wait for them. On failure, fix
-   ONLY within the failing paths: a `slice(<id>): fix …` commit plus a
-   NEW `retired:` entry at the fix sha (step 3's post-retirement rule),
-   then re-run the gate once. If it still fails, or it exceeds the
-   budget, write the failure (command, failing tests/errors) into
-   REPORT.md `## Known weaknesses` and end the pass — the Evaluator
-   decides. No other Lead verification: no per-slice re-review, no
-   open-ended self-review. Then produce each PLAN.md `lead_integration:`
+   slice is retired (in a fault-only pass: after the last fault fix), run
+   the repository's whole-tree verification ONCE on HEAD, proportionally
+   (`<mailbox>` is the loop directory, e.g. `loop`):
+   - **Skip when unchanged.** Look up the last PASS gate with
+     `grep -oE 'gate: PASS @[0-9a-f]{40}' <mailbox>/LOG.md | tail -n 1`
+     (the one LOG.md read you make). If there is one and
+     `git diff --quiet <gate_sha> HEAD -- . ':!<mailbox>'` exits 0, the
+     pass committed no product code since that gate: run nothing and
+     record `gate: skipped (no product change since <gate_sha>)`.
+   - **Default scope: the integration check.** Otherwise run the
+     typecheck/lint named in `full_check:` (if any) plus the union of
+     the `## Targeted check` commands of every slice this pass retired
+     (builder merges, take-overs, fixes), re-run on merged HEAD under
+     one budget, e.g. `timeout <budget> sh -c '<typecheck> && <check 1>
+     && <check 2>'`. If this pass retired no slice with a targeted check
+     (e.g. it fixed only an `integration` fault), run the full check.
+   - **Full check only when warranted:** exactly the `full_check:`
+     command(s) PLAN.md's `## Verification standard` names as the full
+     check, e.g. `timeout <budget> sh -c '<full_check>'`, run only when
+     that section has `cross_cutting: true` or declares
+     `full_check_budget_s:` ≤ 60. The integration eval's own full suite
+     stays the authoritative check.
+   The gate runs with a wall-clock budget of 120 s by default — PLAN.md
+   may override it with a `full_check_budget_s:` line there. If PLAN.md
+   names no `full_check:`, add that line first. Slice-evals may still be
+   grading the last retirements meanwhile; do not wait for them. On
+   failure, fix ONLY within the failing paths: a `slice(<id>): fix …`
+   commit plus a NEW `retired:` entry at the fix sha (step 3's
+   post-retirement rule), then re-run the gate once. A timeout is a
+   failure: identify the hanging test, fix within its paths, re-run
+   once; a second failure or timeout → Known weaknesses: write it
+   (command, failing tests/errors or the hanging test) into REPORT.md
+   `## Known weaknesses` and end the pass — the Evaluator decides.
+   Record every gate run of the pass, and a skip, in REPORT.md
+   `## Whole-tree gate`, and end your LOG.md line with the pass's last
+   gate outcome: `gate: PASS @<full HEAD sha>`,
+   `gate: FAIL @<full HEAD sha>` or
+   `gate: skipped (no product change since <gate_sha>)`. No other Lead
+   verification: no per-slice re-review, no open-ended self-review. Then produce each PLAN.md `lead_integration:`
    deliverable (whole-goal deliverables no slice's `writes:` owns, e.g.
    smoke evidence under an `evidence/` dir). A slice you implemented
    yourself still gets its `## Targeted check` run. This step replaces the Quality
@@ -301,7 +327,8 @@ per role:
 The mailbox is split into hot and cold files to keep fresh-context roles
 cheap:
 - APPEND to `loop/LOG.md` (your one line) but NEVER read it — it is machine
-  and human history, not role input.
+  and human history, not role input. (Open-loop step 6's one `grep` for the
+  last `gate: PASS @<sha>` is the only exception.)
 - `loop/REPORT.md` is a delta against the previous iteration: what changed
   this iteration plus evidence. Never restate the whole project.
 - `loop/STATE.md` is the hot summary roles read every iteration — keep it
@@ -323,7 +350,7 @@ verification claim; no "How I verified it" section:
 ```markdown
 # Report — iteration N (open-loop dispatch ledger)
 ## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line — the `TARGETED_CHECK:` line (JSON `targeted_check`), verbatim, or "not reported" (then not retired; see step 3) | one-line status)
-## Whole-tree gate        (the exact full_check command(s); each one's last summary line — the line stating the pass/fail counts, for a typecheck its exit code and error count; PASS or FAIL)
+## Whole-tree gate        (a ledger of EVERY gate run of this pass, in order, including timeouts and skips; never overwrite an earlier row within the pass. One row per run: scope `integration` | `full` | `skipped` | the exact command | duration in s | its last summary line — the line stating the pass/fail counts, for a typecheck its exit code and error count | PASS, FAIL or TIMEOUT; a skip row reads `skipped (no product change since <sha>)`)
 ## Lead integration       (each lead_integration: deliverable: path | done or not done; "None" if none)
 ## Deviations from plan   ("None" if none)
 ## Known weaknesses       (where you'd look first if something is broken)
