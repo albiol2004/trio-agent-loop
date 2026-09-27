@@ -38,12 +38,12 @@ TM = _load(METRICS_PATH, "trio_metrics")
 
 def test_read_queue_no_file_returns_empty_queues(tmp_path: Path) -> None:
     """A2: no QUEUE.md at all -> empty queues, no exception."""
-    assert TM.read_queue(tmp_path) == {"retired": [], "faults": []}
+    assert TM.read_queue(tmp_path) == {"retired": [], "faults": [], "errors": []}
 
 
 def test_read_queue_empty_file_returns_empty_queues(tmp_path: Path) -> None:
     (tmp_path / "QUEUE.md").write_text("", encoding="utf-8")
-    assert TM.read_queue(tmp_path) == {"retired": [], "faults": []}
+    assert TM.read_queue(tmp_path) == {"retired": [], "faults": [], "errors": []}
 
 
 def test_read_queue_only_retired_block(tmp_path: Path) -> None:
@@ -172,10 +172,14 @@ def test_malformed_block_raises_strict_and_empty_lenient() -> None:
     with pytest.raises(TM.QueueParseError, match=r"missing required key"):
         TM.parse_retired(lines)
 
-    assert TM.parse_queue_block(text) == {"retired": [], "faults": []}
+    queue = TM.parse_queue_block(text)
+    assert queue["retired"] == [] and queue["faults"] == []
+    assert len(queue["errors"]) == 1
+    assert "`retired:` block" in queue["errors"][0]
+    assert "missing required key" in queue["errors"][0]
 
 
-def test_malformed_faults_block_raises_strict_and_empty_lenient() -> None:
+def test_malformed_faults_block_raises_strict_and_reports_lenient() -> None:
     text = (
         "```yaml\n"
         "faults:\n"
@@ -190,7 +194,10 @@ def test_malformed_faults_block_raises_strict_and_empty_lenient() -> None:
     assert lines is not None
     with pytest.raises(TM.QueueParseError, match=r"missing required key"):
         TM.parse_faults(lines)
-    assert TM.parse_queue_block(text) == {"retired": [], "faults": []}
+    queue = TM.parse_queue_block(text)
+    assert queue["faults"] == []
+    assert len(queue["errors"]) == 1
+    assert "`faults:` block" in queue["errors"][0]
 
 
 # --- parse_slices `accepts:` --------------------------------------------------

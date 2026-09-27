@@ -635,6 +635,54 @@ def find_queue_block(queue_text: str, key: str) -> list[str] | None:
     return None
 
 
+def _normalize_scope_items(items: list[str]) -> list[str]:
+    """Normalize fault scope items to the internal shape: a list of path
+    strings, or exactly ``["design"]`` for a design-scoped fault.
+
+    A leading ``local:`` (the VERDICT.md ``scope=local:<paths>`` spelling
+    that evaluators copy into QUEUE.md) is stripped from any item, so
+    ``[local:a.py, b.py]`` and ``local:a.py,b.py`` both become
+    ``["a.py", "b.py"]``. Blank items are dropped.
+    """
+    out: list[str] = []
+    for item in items:
+        item = _unquote(item)
+        if item.lower().startswith("local:"):
+            item = item[len("local:"):].strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _parse_scope_value(value: str, line: int) -> list[str]:
+    """Parse a non-empty inline fault ``scope:`` value.
+
+    Accepted shapes (MAILBOX-SCHEMA.md ``faults:``):
+    - a flow list: ``[a.py, "b c.py"]`` (items may carry ``local:``);
+    - a plain ``local:<comma-separated paths>`` value;
+    - a plain ``design``;
+    - plain bare comma-separated paths.
+    All normalize to a list of path strings (``["design"]`` for design).
+    A plain value that normalizes to nothing (``local:``) is an error.
+    """
+    if FLOW_LIST_RE.match(value):
+        try:
+            return _normalize_scope_items(_parse_flow_list(value, line))
+        except SliceParseError as exc:
+            raise QueueParseError(str(exc)) from exc
+    try:
+        parts = _split_flow_items(value, line)
+    except SliceParseError as exc:
+        raise QueueParseError(str(exc)) from exc
+    items = _normalize_scope_items(parts)
+    if not items:
+        raise QueueParseError(
+            f"line {line}: `scope:` value {value!r} names no paths "
+            "(expected `local:<paths>`, `design`, or a bracket list)"
+        )
+    return items
+
+
 def _parse_queue_entries(
     lines: list[str],
     *,
@@ -644,26 +692,43 @@ def _parse_queue_entries(
     entry_field: str,
     required: tuple[str, ...],
     list_fields: tuple[str, ...],
+    scalar_list_fields: tuple[str, ...] = (),
+    errors: list[str] | None = None,
 ) -> list[dict]:
     """Shared state machine for `retired:`/`faults:` entry lists.
 
     Each entry is a `- <entry_field>: <value>` line followed by indented
     `key: value` lines; `list_fields` (e.g. `scope`) accept a flow list or a
     block `- item` list, exactly like `writes:`/`reads:` in parse_slices.
+    `scalar_list_fields` additionally accept a plain inline value (see
+    `_parse_scope_value`).
+
+    `errors` None (strict): the first violation raises QueueParseError.
+    `errors` a list (lenient): each violation is appended to it, the
+    offending entry is dropped, and parsing resumes at the next
+    `- <entry_field>:` line -- one malformed entry never discards the
+    valid entries around it.
     """
     entries: list[dict] = []
     cur: dict | None = None
     cur_line = 0
     list_key: str | None = None
     saw_key = False
+    skipping = False  # lenient: inside a dropped (malformed) entry
+
+    def _fail(msg: str) -> None:
+        if errors is None:
+            raise QueueParseError(msg)
+        errors.append(msg)
 
     def _finish(entry: dict, line: int) -> None:
         missing = [k for k in required if not str(entry.get(k, "")).strip()]
         if missing:
-            raise QueueParseError(
+            _fail(
                 f"line {line}: {top_key_name} entry missing required "
                 f"key(s): {', '.join(missing)}"
             )
+            return
         entries.append(entry)
 
     for i, raw in enumerate(lines, 1):
@@ -674,15 +739,16 @@ def _parse_queue_entries(
         m = top_key_re.match(stripped)
         if m:
             if cur is not None:
-                raise QueueParseError(
-                    f"line {i}: duplicate `{top_key_name}:` key inside an entry"
-                )
+                _fail(f"line {i}: duplicate `{top_key_name}:` key inside an entry")
+                cur, skipping = None, True
+                continue
             if m.group(1).strip():
-                raise QueueParseError(
+                _fail(
                     f"line {i}: expected `{top_key_name}:` with an empty value "
                     f"followed by `- {entry_field}:` entries"
                 )
             saw_key = True
+            skipping = False
             continue
 
         m = entry_re.match(stripped)
@@ -692,32 +758,50 @@ def _parse_queue_entries(
             cur = {entry_field: m.group(1).strip()}
             cur_line = i
             list_key = None
+            skipping = False
             continue
 
+        if skipping:
+            continue
+
+        def _drop(msg: str) -> None:
+            nonlocal cur, skipping, list_key
+            _fail(msg)
+            cur, skipping, list_key = None, True, None
+
         if cur is None:
-            raise QueueParseError(
+            _drop(
                 f"line {i}: unexpected content before any `- {entry_field}:` entry: "
                 f"{stripped!r}"
             )
+            continue
 
         m = QUEUE_KEY_RE.match(stripped)
         if m:
             key, value = m.group(1), m.group(2).strip()
             if key == entry_field:
-                raise QueueParseError(
+                _drop(
                     f"line {i}: `{entry_field}` is set by the `- {entry_field}:` "
                     "entry; remove this line"
                 )
+                continue
             if key in list_fields:
                 if value:
                     try:
-                        cur[key] = _parse_flow_list(value, i)
+                        if key in scalar_list_fields:
+                            cur[key] = _parse_scope_value(value, i)
+                        else:
+                            cur[key] = _parse_flow_list(value, i)
                     except SliceParseError as exc:
                         # _parse_flow_list is shared with parse_slices and
                         # always raises SliceParseError; translate to this
                         # module's own error type so callers only ever see
                         # QueueParseError out of parse_retired/parse_faults.
-                        raise QueueParseError(str(exc)) from exc
+                        _drop(str(exc))
+                        continue
+                    except QueueParseError as exc:
+                        _drop(str(exc))
+                        continue
                     list_key = None
                 else:
                     cur[key] = []
@@ -730,27 +814,35 @@ def _parse_queue_entries(
         if list_key is not None:
             m = ITEM_RE.match(stripped)
             if not m:
-                raise QueueParseError(
+                _drop(
                     f"line {i}: expected a `- item` list entry under "
                     f"`{list_key}:`, got {stripped!r}"
                 )
-            cur[list_key].append(_unquote(m.group(1).strip()))
+                continue
+            item = _unquote(m.group(1).strip())
+            if list_key in scalar_list_fields:
+                cur[list_key].extend(_normalize_scope_items([item]))
+            else:
+                cur[list_key].append(item)
             continue
 
-        raise QueueParseError(f"line {i}: unexpected content: {stripped!r}")
+        _drop(f"line {i}: unexpected content: {stripped!r}")
 
     if cur is not None:
         _finish(cur, cur_line)
     if not saw_key:
-        raise QueueParseError(
+        _fail(
             f"the yaml block has no top-level `{top_key_name}:` key "
             f"(expected `{top_key_name}:` followed by `- {entry_field}:` entries)"
         )
     return entries
 
 
-def parse_retired(lines: list[str]) -> list[dict]:
-    """Parse a `retired:` block into `{"slice", "sha", "at"}` dicts."""
+def parse_retired(lines: list[str], errors: list[str] | None = None) -> list[dict]:
+    """Parse a `retired:` block into `{"slice", "sha", "at"}` dicts.
+
+    Strict (raises QueueParseError) unless an `errors` list is passed, in
+    which case malformed entries are dropped and reported there."""
     return _parse_queue_entries(
         lines,
         top_key_re=RETIRED_KEY_RE,
@@ -759,13 +851,21 @@ def parse_retired(lines: list[str]) -> list[dict]:
         entry_field="slice",
         required=RETIRED_KEYS,
         list_fields=(),
+        errors=errors,
     )
 
 
-def parse_faults(lines: list[str]) -> list[dict]:
+def parse_faults(lines: list[str], errors: list[str] | None = None) -> list[dict]:
     """Parse a `faults:` block into `{"id", "slice", "observed_at", "scope",
-    "reason", "status"}` dicts. `scope:` accepts a flow list or block list,
-    same as `writes:`/`reads:`."""
+    "reason", "status"}` dicts.
+
+    `scope:` accepts a flow list, a block list, or a plain value
+    (`local:<comma-separated paths>`, `design`, or bare comma-separated
+    paths); every shape normalizes to a list of path strings, with
+    `["design"]` for a design-scoped fault and any `local:` prefix
+    stripped. Strict (raises QueueParseError) unless an `errors` list is
+    passed, in which case malformed entries are dropped and reported there
+    while valid entries survive."""
     return _parse_queue_entries(
         lines,
         top_key_re=FAULTS_KEY_RE,
@@ -774,31 +874,34 @@ def parse_faults(lines: list[str]) -> list[dict]:
         entry_field="id",
         required=FAULT_KEYS,
         list_fields=("scope",),
+        scalar_list_fields=("scope",),
+        errors=errors,
     )
 
 
-def parse_queue_block(queue_text: str) -> dict:
-    """Lenient: always returns {"retired": [...], "faults": [...]}.
+def _empty_queue() -> dict:
+    return {"retired": [], "faults": [], "errors": []}
 
-    Per-block wrapper around find_queue_block + parse_retired/parse_faults:
-    a block that fails to parse yields [] for that key (same lenient-wrapper
-    contract as parse_slices_block returning None), but unlike
-    parse_slices_block this never returns None overall — "no queue" and
-    "empty queue" must be indistinguishable to callers.
+
+def parse_queue_block(queue_text: str) -> dict:
+    """Lenient: always returns {"retired": [...], "faults": [...],
+    "errors": [...]}.
+
+    Per-block wrapper around find_queue_block + parse_retired/parse_faults
+    in their lenient mode: a malformed entry is dropped and described in
+    `errors` (prefixed with its block name) while every valid entry of the
+    same block survives -- a parse problem is never silently turned into an
+    empty queue. Never returns None: "no queue" and "empty queue" are
+    indistinguishable to callers (both have empty `errors`).
     """
-    result: dict = {"retired": [], "faults": []}
-    retired_lines = find_queue_block(queue_text, "retired")
-    if retired_lines is not None:
-        try:
-            result["retired"] = parse_retired(retired_lines)
-        except QueueParseError:
-            result["retired"] = []
-    faults_lines = find_queue_block(queue_text, "faults")
-    if faults_lines is not None:
-        try:
-            result["faults"] = parse_faults(faults_lines)
-        except QueueParseError:
-            result["faults"] = []
+    result = _empty_queue()
+    for key, parser in (("retired", parse_retired), ("faults", parse_faults)):
+        lines = find_queue_block(queue_text, key)
+        if lines is None:
+            continue
+        block_errors: list[str] = []
+        result[key] = parser(lines, errors=block_errors)
+        result["errors"].extend(f"`{key}:` block: {e}" for e in block_errors)
     return result
 
 
@@ -806,19 +909,20 @@ def read_queue(loop_dir: Path) -> dict:
     """Read and parse loop_dir/QUEUE.md; never raises.
 
     Missing QUEUE.md, an unreadable file, or an empty file all yield
-    {"retired": [], "faults": []} — indistinguishable from a QUEUE.md with
-    two empty blocks (MAILBOX-SCHEMA.md: "absent always means an empty
-    queue, never an error").
+    {"retired": [], "faults": [], "errors": []} — indistinguishable from a
+    QUEUE.md with two empty blocks (MAILBOX-SCHEMA.md: "absent always means
+    an empty queue, never an error"). Parse problems in a present QUEUE.md
+    land in `errors` (see parse_queue_block); they never raise.
     """
     queue_path = loop_dir / "QUEUE.md"
     if not queue_path.is_file():
-        return {"retired": [], "faults": []}
+        return _empty_queue()
     try:
         text = queue_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return {"retired": [], "faults": []}
+        return _empty_queue()
     if not text.strip():
-        return {"retired": [], "faults": []}
+        return _empty_queue()
     return parse_queue_block(text)
 
 

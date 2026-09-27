@@ -187,14 +187,46 @@ def _plan_slices(loop_dir: Path, tm) -> list[dict] | None:
     return tm.parse_slices_block(plan_text)
 
 
+def _fault_scope_errors(fid: str, scope) -> list[str]:
+    """Validate one parsed fault `scope` (MAILBOX-SCHEMA.md `faults:`).
+
+    The parser normalizes every accepted spelling (bracket/block list,
+    plain `local:<paths>`, plain `design`, bare paths) to a list of path
+    strings, `["design"]` for a design-scoped fault. Violations: empty,
+    not a list, `design` mixed with paths, or an item that still looks like
+    the VERDICT.md suffix (`scope=...`) or contains whitespace-only text.
+    """
+    if not isinstance(scope, list) or not scope:
+        return [f"QUEUE.md faults: {fid!r} has an empty `scope:`"]
+    errs: list[str] = []
+    lowered = [str(item).strip().lower() for item in scope]
+    if "design" in lowered and len(scope) > 1:
+        errs.append(
+            f"QUEUE.md faults: {fid!r} `scope:` mixes `design` with paths; "
+            "use either `design` or `local:<paths>`"
+        )
+    for item in scope:
+        text = str(item).strip()
+        if not text:
+            errs.append(f"QUEUE.md faults: {fid!r} `scope:` has a blank item")
+        elif text.lower().startswith("scope="):
+            errs.append(
+                f"QUEUE.md faults: {fid!r} `scope:` item {text!r} uses the "
+                "VERDICT.md `scope=` suffix; write `scope: local:<paths>` "
+                "or `scope: design`"
+            )
+    return errs
+
+
 def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
     """Validate QUEUE.md (v1 open-loop extension); [] when QUEUE.md is absent.
 
     `slices` is the loop's PLAN.md `slices:` block already parsed by the
     caller (see `_plan_slices`) — None means PLAN.md is missing or its
-    slices block does not parse. Uses the strict find_queue_block +
-    parse_retired/parse_faults (not the lenient parse_queue_block) so a
-    malformed block is a violation, not a silent []. See
+    slices block does not parse. Every parse error the parser collects
+    (one per malformed entry — see parse_retired/parse_faults `errors=`)
+    is a violation, and the entries that did parse are still validated,
+    so one bad entry neither hides the others nor passes silently. See
     MAILBOX-SCHEMA.md "v1 open-loop extension (optional)".
     """
     queue_path = loop_dir / "QUEUE.md"
@@ -210,18 +242,16 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
     retired: list[dict] = []
     retired_lines = tm.find_queue_block(queue_text, "retired")
     if retired_lines is not None:
-        try:
-            retired = tm.parse_retired(retired_lines)
-        except tm.QueueParseError as exc:
-            errors.append(f"QUEUE.md `retired:` block: {exc}")
+        parse_errors: list[str] = []
+        retired = tm.parse_retired(retired_lines, errors=parse_errors)
+        errors.extend(f"QUEUE.md `retired:` block: {e}" for e in parse_errors)
 
     faults: list[dict] = []
     faults_lines = tm.find_queue_block(queue_text, "faults")
     if faults_lines is not None:
-        try:
-            faults = tm.parse_faults(faults_lines)
-        except tm.QueueParseError as exc:
-            errors.append(f"QUEUE.md `faults:` block: {exc}")
+        parse_errors = []
+        faults = tm.parse_faults(faults_lines, errors=parse_errors)
+        errors.extend(f"QUEUE.md `faults:` block: {e}" for e in parse_errors)
 
     known_ids = {sl["id"] for sl in slices} if slices is not None else None
     if known_ids is None:
@@ -274,8 +304,7 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
                 f"QUEUE.md faults: {fid!r} has status {status!r}, expected "
                 f"one of {', '.join(VALID_FAULT_STATUSES)}"
             )
-        if not entry.get("scope"):
-            errors.append(f"QUEUE.md faults: {fid!r} has an empty `scope:`")
+        errors.extend(_fault_scope_errors(fid, entry.get("scope")))
         if not str(entry.get("reason", "")).strip():
             errors.append(f"QUEUE.md faults: {fid!r} is missing `reason:`")
         # A fault's `slice` not existing in PLAN.md is advisory only — the

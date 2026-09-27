@@ -417,9 +417,35 @@ faults:
 | `id` | yes | `f<N>` (lowercase `f` followed by digits) | fault identifier; unique within the file |
 | `slice` | yes | kebab-case string | the slice the fault was raised against |
 | `observed_at` | yes | full sha | the sha the Evaluator evaluated when it raised the fault |
-| `scope` | yes | single-line bracket flow list of paths | same style/semantics as `scope=local:<paths>` in the VERDICT.md first-line contract |
+| `scope` | yes | a plain value (`local:<comma-separated paths>`, `design`, or bare comma-separated paths) **or** a list (single-line bracket flow list, or block `- item` list) | same semantics as the `scope=` suffix in the VERDICT.md first-line contract; see "Fault `scope` shapes" below |
 | `reason` | yes | one line | why the fault was raised |
 | `status` | yes | `open` \| `taken` \| `done` \| `stale` | fault lifecycle state |
+
+#### Fault `scope` shapes
+
+Both spellings are accepted and mean the same thing:
+
+```yaml
+    scope: local:api/test/route.test.ts,api/src/route.ts   # plain local:
+    scope: design                                          # plain design
+    scope: api/src/route.ts                                # plain bare path(s)
+    scope: [api/test/route.test.ts, "dir with, comma/x.ts"]  # flow list
+    scope:                                                 # block list
+      - api/test/route.test.ts
+```
+
+Readers (`metrics/trio-metrics.py parse_faults`) normalize every shape to
+one list of path strings: a leading `local:` is stripped (from a plain
+value or from any list item), a plain value is split on top-level commas
+(quote-aware), and a design-scoped fault becomes exactly `["design"]`.
+`trio-check.py` rejects an empty scope, `design` mixed with paths, and an
+item written as the VERDICT.md suffix (`scope=...`).
+
+A malformed `retired:`/`faults:` entry never empties its block: the
+lenient reader (`read_queue`) drops only that entry, keeps every valid
+one, and reports the problem in `queue["errors"]`; `trio-check.py` fails
+on it and the open-loop driver logs
+`- iter N | loop | QUEUE.md parse error: <msg>` once per turn.
 
 `faults:` entries are **appended by the Evaluator only**; the Lead only
 transitions an existing entry's `status:` — the Lead never appends a new

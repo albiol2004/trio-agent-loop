@@ -2644,7 +2644,8 @@ _OPEN_LOOP_SLICE_EVAL_PROCEDURE = (
     "   `VERDICT:` — that token is reserved for the integration verdict.\n"
     "4. SHIP → append the section, record only, append no fault. ITERATE →\n"
     "   also append one `faults:` entry to QUEUE.md: `id: f<N>`, `slice`,\n"
-    "   `observed_at: {sha}`, `scope`, `reason`, `status: open`.\n"
+    "   `observed_at: {sha}`, `scope: local:<failing paths>` (or\n"
+    "   `design`), `reason`, `status: open`.\n"
     "5. Never edit `retired:` entries, and never set a fault's\n"
     "   `taken`/`done`/`stale` status — those transitions are the Lead's\n"
     "   job.\n"
@@ -2667,8 +2668,9 @@ _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
     "   LOG.md line, then commit loop/ as `loop: iteration {iteration} — SHIP`,\n"
     "   recording each `commit: <full sha>` in VERDICT.md.\n"
     "3. ITERATE → append one `faults:` entry to QUEUE.md (`id: f<N>`,\n"
-    "   `scope`, `reason`, `status: open`) and leave the tree uncommitted\n"
-    "   for the Lead's next pass.\n"
+    "   `slice: integration`, `observed_at: {sha}`, `scope` (`design` or\n"
+    "   `local:<paths>`), `reason`, `status: open`) and leave the tree\n"
+    "   uncommitted for the Lead's next pass.\n"
 )
 
 

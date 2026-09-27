@@ -99,14 +99,18 @@ class QueueModel:
         observed_at: str,
         reason: str,
         status: str = "open",
+        scope: str = "[]",
     ) -> None:
+        """`scope` is written verbatim after `scope: ` -- pass a plain
+        value (`local:a.py`, `design`) to write it the way live evaluators
+        do."""
         with self.lock:
             self.faults.append(
                 {
                     "id": fault_id,
                     "slice": slice_id,
                     "observed_at": observed_at,
-                    "scope": [],
+                    "scope": scope,
                     "reason": reason,
                     "status": status,
                 }
@@ -137,7 +141,7 @@ class QueueModel:
                 f"  - id: {fault['id']}",
                 f"    slice: {fault['slice']}",
                 f"    observed_at: {fault['observed_at']}",
-                "    scope: []",
+                f"    scope: {fault['scope']}",
                 f"    reason: {fault['reason']}",
                 f"    status: {fault['status']}",
             ]
@@ -386,6 +390,170 @@ def test_c1_happy_path_ships_after_a_fault_and_fix(tmp_path: Path) -> None:
     assert driver["phase"] == "done"
     assert driver["lead_alive"] is False
     assert driver["eval_alive"] is False
+
+
+# --- plain-scope faults gate the integration eval -------------------------
+
+
+def test_open_fault_with_plain_scope_blocks_integration_until_done(
+    tmp_path: Path,
+) -> None:
+    """Regression for the openrouter/L run: evaluators write fault scopes as
+    plain values (`scope: local:<paths>`, `scope: design`). The parser used
+    to reject those, `read_queue` swallowed the error and returned no
+    faults, so `_slices_fully_retired` saw every slice retired and no fault
+    open and the integration-eval started while f1 was still open. Now the
+    open plain-scope fault keeps `_slices_fully_retired` False (both in the
+    Lead thread and in the driver's integration gate re-check), the Lead
+    gets another pass to fix it, and the integration-eval only runs once f1
+    is `done`."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_TWO_SLICES)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+
+    sha_a1 = fake_sha("plain-alpha-1")
+    sha_b1 = fake_sha("plain-beta-1")
+    sha_b2 = fake_sha("plain-beta-2")
+
+    def pass1(mb):
+        queue.retire("alpha", sha_a1)
+        queue.retire("beta", sha_b1)
+
+    def pass2(mb):
+        # The Lead only gets this pass because f1 is visible as open.
+        queue.set_fault_status("f1", "done")
+        queue.set_fault_status("f2", "done")
+        queue.retire("beta", sha_b2)
+
+    lead = ScriptedLeadRunner([pass1, pass2])
+
+    def eval_alpha(mb):
+        verdict.append_slice_section("alpha", sha_a1, "ITERATE")
+        queue.add_fault(
+            "f2", "alpha", sha_a1, "cross-slice contract", scope="design"
+        )
+        queue.set_fault_status("f2", "done")  # a stale design fault
+
+    def eval_beta_1(mb):
+        verdict.append_slice_section("beta", sha_b1, "ITERATE")
+        queue.add_fault(
+            "f1", "beta", sha_b1, "route test red on merged tree",
+            scope="local:api/test/beta-route.test.ts",
+        )
+
+    def eval_beta_2(mb):
+        verdict.append_slice_section("beta", sha_b2, "SHIP")
+
+    seen_at_integration: list[list[tuple]] = []
+
+    def integration_ship(mb):
+        parsed = trio_loop._METRICS.read_queue(mb)
+        seen_at_integration.append(
+            [(f["id"], f["status"], f["scope"]) for f in parsed["faults"]]
+        )
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={
+            ("alpha", sha_a1): eval_alpha,
+            ("beta", sha_b1): eval_beta_1,
+            ("beta", sha_b2): eval_beta_2,
+        },
+        integration_actions=[integration_ship],
+    )
+
+    # The live QUEUE.md shape parses: plain scopes are visible to the gate.
+    queue.retire("alpha", sha_a1)
+    queue.add_fault(
+        "f1", "beta", sha_b1, "r", scope="local:api/test/beta-route.test.ts"
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert parsed.get("errors", []) == []
+    open_or_taken = [f for f in parsed["faults"] if f["status"] == "open"]
+    assert [f["scope"] for f in open_or_taken] == [["api/test/beta-route.test.ts"]]
+    assert not trio_loop._slices_fully_retired(
+        ["alpha"], {"alpha"}, open_or_taken
+    )
+    queue.retired.clear()
+    queue.faults.clear()
+    (mailbox / "QUEUE.md").write_text(EMPTY_QUEUE, encoding="utf-8")
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert not lead.passes, "the Lead must get a fix pass for the open fault"
+    assert seen_at_integration == [
+        [
+            ("f2", "done", ["design"]),
+            ("f1", "done", ["api/test/beta-route.test.ts"]),
+        ]
+    ]
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "QUEUE.md parse error" not in log_text
+
+
+def test_malformed_fault_is_logged_once_and_valid_faults_still_gate(
+    tmp_path: Path,
+) -> None:
+    """A malformed fault entry is dropped with a LOG.md line (once per
+    turn, not once per poll) while a valid open fault beside it still
+    blocks the integration-eval until the Lead marks it done."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("malformed-solo-1")
+    sha2 = fake_sha("malformed-solo-2")
+
+    def pass1(mb):
+        queue.retire("solo", sha1)
+
+    def pass2(mb):
+        queue.set_fault_status("f1", "done")
+        queue.retire("solo", sha2)
+
+    lead = ScriptedLeadRunner([pass1, pass2])
+
+    def eval_solo_1(mb):
+        verdict.append_slice_section("solo", sha1, "ITERATE")
+        queue.add_fault("f1", "solo", sha1, "broken", scope="local:src/solo.py")
+        # f9 has an unterminated quote in its scope list -> dropped.
+        queue.add_fault("f9", "solo", sha1, "junk", status="done",
+                        scope='["unterminated]')
+
+    def eval_solo_2(mb):
+        verdict.append_slice_section("solo", sha2, "SHIP")
+
+    integration_calls: list[list[tuple]] = []
+
+    def integration_ship(mb):
+        parsed = trio_loop._METRICS.read_queue(mb)
+        integration_calls.append(
+            [(f["id"], f["status"]) for f in parsed["faults"]]
+        )
+        verdict.set_integration_verdict("VERDICT: SHIP")
+
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo_1, ("solo", sha2): eval_solo_2},
+        integration_actions=[integration_ship],
+    )
+
+    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+
+    assert code == 0
+    assert not lead.passes
+    assert integration_calls == [[("f1", "done")]]
+    log_lines = [
+        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
+        if "QUEUE.md parse error" in ln
+    ]
+    assert log_lines, "the dropped fault must be surfaced in LOG.md"
+    assert all("| loop | QUEUE.md parse error: `faults:` block:" in ln
+               for ln in log_lines)
+    # At most one line per turn (iteration), never one per poll.
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in log_lines]
+    assert len(iters) == len(set(iters))
 
 
 # --- VERDICT.md clobber guard -------------------------------------------

@@ -1894,6 +1894,28 @@ def _slices_fully_retired(
     return all(sid in retired_ids for sid in slice_ids) and not open_or_taken
 
 
+def _log_queue_errors(
+    mailbox: Path, iteration: int, queue: dict, logged: set
+) -> None:
+    """Log each QUEUE.md parse error at most once per turn (iteration).
+
+    `read_queue` never raises: a malformed entry is dropped and described
+    in `queue["errors"]` while the valid entries survive. The driver must
+    not stay silent about the dropped ones -- a dropped fault is invisible
+    to the integration gate -- so each distinct message is appended to
+    LOG.md once for the current iteration (`logged` holds the
+    `(iteration, message)` pairs already written; the poll loop re-reads
+    QUEUE.md every poll and must not spam LOG.md)."""
+    for msg in queue.get("errors") or []:
+        key = (iteration, msg)
+        if key in logged:
+            continue
+        logged.add(key)
+        _append_log(
+            mailbox, f"- iter {iteration} | loop | QUEUE.md parse error: {msg}"
+        )
+
+
 def _git_head_sha(repo_dir: Path) -> str | None:
     """HEAD commit sha, or None when `repo_dir` is not a git repo (or git
     itself is unavailable) -- part of the open-loop Lead-pass snapshot, see
@@ -2466,10 +2488,14 @@ def run_open_loop(
                 raise failure
             return None
 
+        queue_errors_logged: set = set()
         while True:
             lead_alive = not lead_result.get("finished", False)
 
             queue = _METRICS.read_queue(mailbox)
+            _log_queue_errors(
+                mailbox, current_iteration(), queue, queue_errors_logged
+            )
             latest_retired: dict[str, dict] = {}
             for entry in queue["retired"]:
                 latest_retired[entry["slice"]] = entry
