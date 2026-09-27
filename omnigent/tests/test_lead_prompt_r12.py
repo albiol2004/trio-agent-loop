@@ -431,3 +431,71 @@ def test_isolate_block_redispatch_is_capped(tmp_path: Path) -> None:
     assert "dispatch a fresh builder for the slice once, then take over (see step 3" in prompt
     assert "dispatch a fresh builder for the slice (or stop for a human)" not in prompt
     assert prompt.startswith("OPEN-LOOP CONTEXT: kind=lead-pass " + PRECEDENCE)
+
+
+# ------------------------------------- r12 repair R3 (per-builder finish)
+
+
+def _idiom(block: str, start: str, end: str) -> str:
+    """The indented shell lines between two prose markers of the block."""
+    body = block[block.index(start) + len(start): block.index(end)]
+    return "\n".join(ln[5:] for ln in body.splitlines() if ln.startswith("     "))
+
+
+def test_open_loop_lead_prompt_gives_per_builder_finish_mechanics(tmp_path: Path) -> None:
+    block = _open_loop_block(_isolated_open_loop_lead(tmp_path))
+    flat = _flat(block)
+    assert "`<mailbox>/.dispatch/<slice>.sh`" in flat
+    assert "start the whole wave detached in ONE call" in flat
+    assert "It returns as soon as ANY builder finishes" in flat
+    assert "Handle each returned slice at once (step 3) before the next wait-next call" in flat
+    assert "Do not end the pass while any `.run` marker remains" in flat
+    assert "`.dispatch/` is untracked runtime state, like `.sessions/`; never commit it" in flat
+    assert "the wait-next call returns it" in flat
+    # Mechanics sit inside step 2, before step 3's retire rule.
+    assert block.index("wait-next call") < block.index("3. Retire each slice")
+
+
+def test_dispatch_idiom_reports_each_builder_as_it_finishes(tmp_path: Path) -> None:
+    """Run the prompt's exact shell idiom: the fast builder is reported
+    while the slow one is still running, then the slow one, then none."""
+    import subprocess
+    import time
+
+    block = _open_loop_block(_isolated_open_loop_lead(tmp_path))
+    dispatch = _idiom(block, "detached in ONE call:", "Then repeat this wait-next call.")
+    wait_next = _idiom(block, "its JSON line:", "Handle each returned slice")
+    mailbox = tmp_path / "loop"
+    mailbox.mkdir()
+    d = mailbox / ".dispatch"
+    d.mkdir()
+    for slice_id, delay, rc in (("fast", 0.2, 0), ("slow", 5, 3)):
+        (d / f"{slice_id}.sh").write_text(
+            f"sleep {delay}\necho built {slice_id}\n"
+            f"echo '{{\"targeted_check\": null, \"worker_worktree\": {{\"slice\": \"{slice_id}\"}}}}'\n"
+            f"exit {rc}\n"
+        )
+    sub = lambda text: text.replace("<mailbox>", str(mailbox))
+    dispatch = sub(dispatch).replace("<slice-a> <slice-b>", "fast slow")
+    wait_next = sub(wait_next)
+
+    def run(script: str) -> str:
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              timeout=60, check=True).stdout
+
+    run(dispatch)
+    deadline = time.time() + 10
+    while not (d / "fast.rc").exists() and time.time() < deadline:
+        time.sleep(0.05)
+    first = run(wait_next)
+    assert first.splitlines()[0] == "slice=fast exit=0"
+    assert '"slice": "fast"' in first
+    assert (d / "slow.run").exists()  # the slow builder was still running
+    second = run(wait_next)
+    assert second.splitlines()[0] == "slice=slow exit=3"
+    assert '"slice": "slow"' in second
+    assert run(wait_next).strip() == "no builder running"
+    deadline = time.time() + 5
+    while (d / "slow.run").exists() and time.time() < deadline:
+        time.sleep(0.1)
+    assert sorted(p.name for p in d.glob("*.done")) == ["fast.done", "slow.done"]
