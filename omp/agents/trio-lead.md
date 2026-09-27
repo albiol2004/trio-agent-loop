@@ -179,7 +179,15 @@ extension"), run this loop instead of waiting for a verdict:
    `retired:` entry to `QUEUE.md` (`slice`, the `merge_commit` sha from
    the builder's JSON output line, `at`) — before waiting for any other
    builder in the wave. Do not wait for the wave to land or for the
-   hazard check to retire a slice. **Retire only when both hold:** the
+   hazard check to retire a slice. **`retired:` is append-only:** every
+   retirement (builder merge, take-over, fix, recovery) appends ONE new
+   entry at the end of the block, with `at:` = that sha's committer time
+   from `git log -1 --format=%cI <merge_commit>` — never an invented or
+   estimated time. Never edit, replace, reorder or delete existing entries
+   (an edit whose old text is an earlier entry is a replace — insert after
+   the block's last line instead). Verify with `grep -c 'slice:' QUEUE.md`
+   before and after: the count must grow by exactly one. **Retire only
+   when both hold:** the
    JSON's `merge_commit` differs from its `base` (a real `slice(<id>):`
    commit landed), and its `targeted_check` field — the builder's
    `TARGETED_CHECK: ` line — is present and does not start with

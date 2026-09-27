@@ -269,3 +269,36 @@ def test_counts_lines_parse_through_real_helper() -> None:
     assert tc("TARGETED_CHECK: PASS 3") == "TARGETED_CHECK: PASS 3"
     assert tc("TARGETED_CHECK: <counts line>") is None
     assert tc("TARGETED_CHECK: <the line stating the pass/fail counts>") is None
+
+
+# ------------------------------------------------ G3 append-only retire
+
+APPEND_ONLY = ("appends ONE new entry at the end of the block, with `at:` = that "
+               "sha's committer time from `git log -1 --format=%cI <merge_commit>` "
+               "— never an invented or estimated time")
+NO_REWRITE = "Never edit, replace, reorder or delete existing entries"
+GREP_CHECK = ("Verify with `grep -c 'slice:' QUEUE.md` before and after: the count "
+              "must grow by exactly one")
+
+
+def test_omnigent_step3_retire_is_append_only(tmp_path: Path) -> None:
+    block = _flat(_block(_lead_prompt(tmp_path)))
+    step3 = block[block.index("3. Retire each slice"): block.index("4. Never wait for a verdict")]
+    assert "QUEUE.md `retired:` is APPEND-ONLY" in step3
+    for needle in (APPEND_ONLY, NO_REWRITE, GREP_CHECK):
+        assert needle in step3, needle
+    assert "insert after the block's last line instead" in step3
+    # The rule sits before the retire conditions it governs.
+    assert step3.index(APPEND_ONLY) < step3.index("Retire only when both hold")
+
+
+def test_canonical_and_generated_leads_retire_append_only() -> None:
+    section = _flat(_section((CANONICAL / "lead.md").read_text(encoding="utf-8"),
+                             "## Open-loop mode"))
+    assert "**`retired:` is append-only:**" in section
+    for needle in (APPEND_ONLY, NO_REWRITE, GREP_CHECK):
+        assert needle in section, needle
+    for path, flat in _generated_role("lead"):
+        assert APPEND_ONLY in flat and GREP_CHECK in flat, path
+    schema = _flat((ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8"))
+    assert "the committer time of `sha` (`git log -1 --format=%cI <sha>`)" in schema

@@ -390,10 +390,13 @@ retired:
 |---|---|---|---|
 | `slice` | yes | kebab-case string | the slice id; must exist in the PLAN.md `slices:` block |
 | `sha` | yes | full 40-char sha | the sha this entry retires the slice **at** |
-| `at` | yes | ISO-8601 timestamp | when this entry was appended |
+| `at` | yes | ISO-8601 timestamp | the committer time of `sha` (`git log -1 --format=%cI <sha>`), never an invented or estimated time |
 
 `retired:` is **append-only, Lead only**: the Lead is the only role that
-appends an entry, and no role ever edits or removes an existing one.
+appends an entry, and no role ever edits or removes an existing one. The
+Lead appends each entry after the block's last line — never by replacing
+an earlier entry — and checks that `grep -c 'slice:' QUEUE.md` grew by
+exactly one.
 
 An entry means "this slice was **retired at** `sha`" — not "the slice's
 last commit". Repeated slice ids are legal and expected: a post-retirement
