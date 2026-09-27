@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -501,6 +501,7 @@ class BrokerClient:
         workspace: str | None = None,
         prompt_timeout: float | None = None,
         labels: dict[str, str] | None = None,
+        on_session_id: Callable[[str], None] | None = None,
     ) -> Any:
         """Create one session on a dedicated host runner.
 
@@ -519,6 +520,11 @@ class BrokerClient:
         first prompt is POSTed once and never re-posted (see
         :meth:`ensure_first_prompt`); ``prompt_timeout`` caps its wait
         (the caller's role timeout).
+
+        ``on_session_id`` (optional) is called with the new id right after
+        it is recorded, before runner launch and the prompt wait; trioctl
+        uses it to start watching the session's chat binding (r14 S-1).
+        A raising callback is ignored.
         """
         workdir = workspace or os.getcwd()
         preferred_source = "--runner-id"
@@ -563,6 +569,11 @@ class BrokerClient:
                 )
             _record_created_session_id(session_id)
             created.setdefault("id", session_id)
+            if on_session_id is not None:
+                try:
+                    on_session_id(session_id)
+                except Exception:  # noqa: BLE001 - observer only
+                    pass
 
             if preferred:
                 created = self._bind_named_runner(
@@ -908,6 +919,16 @@ class BrokerClient:
         """Fetch one session snapshot."""
         path = f"/v1/sessions/{quote(session_id, safe='')}"
         return self._request("GET", path)
+
+    def session_chat_binding(self, session_id: str) -> str | None:
+        """The session's bound Cursor chat (``external_session_id``) or None."""
+        snapshot = self.get_session(session_id)
+        value = (
+            snapshot.get("external_session_id")
+            if isinstance(snapshot, dict)
+            else None
+        )
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
     def get_items(
         self,

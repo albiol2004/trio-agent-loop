@@ -144,6 +144,24 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
   the evaluator's own `git worktree add` at the pin, no root release/wait
   (the Lead may be live at the root), no integration fence, root `.cursor`
   baseline only. Other slice-evals stay isolated.
+- Same-cwd session creation is serialised (r14 S-1). Omnigent's
+  cursor-native forwarder binds a new session to the first new chat under
+  `~/.cursor/chats/<md5(cwd)>/`, so two sessions launched seconds apart in
+  one cwd can swap chats (observed: open-loop Lead + slice-eval at the root,
+  83 ms apart). trioctl holds a per-workspace `flock` (keyed by the
+  workspace realpath, under `$XDG_STATE_HOME/trio-agent-loop/cwd-locks/`,
+  override `TRIO_SAME_CWD_LOCK_DIR`) from just before create until the
+  broker reports the session's `external_session_id`, at most
+  `TRIO_SAME_CWD_BIND_WAIT_S` (default 45) s; on timeout it logs
+  `trioctl: same-cwd bind wait timed out for <session> (<workspace>); continuing`
+  and continues. Covers the Lead thread, slice-eval threads and a second
+  trioctl process; different workspaces (isolated worktrees) never wait. A
+  contended create records `same_cwd_serialised: true` + `same_cwd_wait_s`
+  in its session meta and appends to `same_cwd_serialised` in
+  `.driver.json`. A first-prompt hold whose only saved user rows are an
+  overlapping sibling dispatch's prompt is recorded as
+  `hold`/`reason: mirror_crosswired` with `crosswired_with: <sibling session>`
+  (still held, never tolerated).
 - An explicit `--isolate-workers` on a detached HEAD is refused
   (`--isolate-workers refused: checkout is not on a branch (detached HEAD); ...`);
   the plain default falls back to non-isolated, serial.

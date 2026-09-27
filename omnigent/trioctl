@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
@@ -1978,6 +1979,10 @@ HELD_REASONS = {
     "first_prompt_uncertain": "first-prompt delivery uncertain",
     "role_completion_uncertain": "prompt delivered, role completion uncertain",
     "abandoned_on_exit": "slice-eval still running when the loop exited",
+    "mirror_crosswired": (
+        "first prompt uncertain: the session's only saved user row is a "
+        "sibling dispatch's prompt (cross-wired chat binding)"
+    ),
 }
 
 
@@ -3052,6 +3057,234 @@ def _slice_eval_kind(context: dict[str, Any] | None) -> dict[str, Any]:
     return {}
 
 
+# r14 S-1: Omnigent's cursor-native forwarder binds a new session to the
+# first new chat under `~/.cursor/chats/<md5(cwd)>/` after its launch. Two
+# sessions launched within ~10 s in the SAME cwd can bind each other's chat
+# (diag 2026-09-27: lead 34ad got the slice-eval's chat and vice versa).
+# trioctl therefore serialises session creation per workspace: a file lock
+# keyed by the workspace realpath is held from just before create until the
+# broker reports the session's `external_session_id` (the bound chat), or
+# for at most TRIO_SAME_CWD_BIND_WAIT_S seconds. Different workspaces never
+# wait on each other.
+SAME_CWD_BIND_WAIT_ENV = "TRIO_SAME_CWD_BIND_WAIT_S"
+DEFAULT_SAME_CWD_BIND_WAIT = 45.0
+SAME_CWD_LOCK_DIR_ENV = "TRIO_SAME_CWD_LOCK_DIR"
+SAME_CWD_BIND_POLL_ENV = "TRIO_SAME_CWD_BIND_POLL_S"
+
+
+def _same_cwd_bind_wait() -> float:
+    value = broker_http._env_float(SAME_CWD_BIND_WAIT_ENV, DEFAULT_SAME_CWD_BIND_WAIT)
+    return value if value >= 0 else DEFAULT_SAME_CWD_BIND_WAIT
+
+
+def _same_cwd_lock_dir() -> Path:
+    """Per-user dir: the chat store is keyed by cwd alone, across repos/mailboxes."""
+    env = os.environ.get(SAME_CWD_LOCK_DIR_ENV, "").strip()
+    if env:
+        return Path(env).expanduser()
+    state = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(state) if state else Path.home() / ".local" / "state"
+    return base / "trio-agent-loop" / "cwd-locks"
+
+
+def _session_chat_binding(client: Any, session_id: str) -> str | None:
+    """The session's bound Cursor chat id, or None (unbound/unknown)."""
+    method = getattr(client, "session_chat_binding", None)
+    if callable(method):
+        value = method(session_id)
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+class _SameCwdGate:
+    """Per-workspace create serialisation (see SAME_CWD_BIND_WAIT_ENV).
+
+    ``flock`` on a per-workspace file: exclusive across threads (each
+    acquisition opens its own file description) and across processes.
+    Released by whichever comes first: the bind watcher seeing the bound
+    chat, the bounded wait, or a failed create. Never raises into the
+    dispatch. A client without ``session_chat_binding`` is not gated.
+    """
+
+    def __init__(self, client: Any, workspace: str) -> None:
+        self.client = client
+        self.workspace = os.path.realpath(workspace)
+        self.wait_s = _same_cwd_bind_wait()
+        poll = broker_http._env_float(SAME_CWD_BIND_POLL_ENV, 0.5)
+        self.poll = poll if poll > 0 else 0.5
+        self.contended = False
+        self.waited = 0.0
+        self.session_id: str | None = None
+        self._fh: Any = None
+        self._release_lock = threading.Lock()
+        self._watcher: threading.Thread | None = None
+        self._stop = threading.Event()
+        # Only clients that can report the binding get a bind wait.
+        self.watchable = callable(getattr(client, "session_chat_binding", None))
+
+    def _path(self) -> Path:
+        key = hashlib.sha256(self.workspace.encode("utf-8")).hexdigest()[:24]
+        return _same_cwd_lock_dir() / f"{key}.lock"
+
+    def acquire(self) -> None:
+        import fcntl
+
+        if not self.watchable:
+            # No way to see the bind (a test double or foreign client):
+            # serialising the bare create would protect nothing.
+            return
+        try:
+            path = self._path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(path, "a+", encoding="utf-8")
+        except OSError as exc:
+            print(f"trioctl: same-cwd lock unavailable for {self.workspace}: {exc}; continuing",
+                  file=sys.stderr)
+            return
+        start = time.monotonic()
+        # A live holder releases within its create + bind wait; a hung one
+        # must not stall the dispatch forever.
+        cap = 2 * self.wait_s + 60.0
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                self.contended = True
+            except OSError as exc:
+                print(f"trioctl: same-cwd lock failed for {self.workspace}: {exc}; continuing",
+                      file=sys.stderr)
+                fh.close()
+                return
+            if time.monotonic() - start >= cap:
+                print(f"trioctl: same-cwd lock wait timed out ({self.workspace}); continuing",
+                      file=sys.stderr)
+                fh.close()
+                self.waited = time.monotonic() - start
+                return
+            time.sleep(min(0.05, self.poll))
+        self.waited = time.monotonic() - start
+        self._fh = fh
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()} {self.workspace}\n")
+            fh.flush()
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        with self._release_lock:
+            fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            fh.close()  # closing the description drops the flock
+        except OSError:
+            pass
+
+    def _bind_wait(self, session_id: str) -> None:
+        deadline = time.monotonic() + self.wait_s
+        try:
+            while True:
+                try:
+                    if _session_chat_binding(self.client, session_id):
+                        return
+                except Exception:  # noqa: BLE001 - a read blip keeps polling
+                    pass
+                now = time.monotonic()
+                if now >= deadline or self._stop.is_set():
+                    break
+                self._stop.wait(min(self.poll, deadline - now))
+            if not self._stop.is_set():
+                print(
+                    f"trioctl: same-cwd bind wait timed out for {session_id} "
+                    f"({self.workspace}); continuing",
+                    file=sys.stderr,
+                )
+        finally:
+            self.release()
+
+    def session_created(self, session_id: str) -> None:
+        """Create callback: start the bind watcher as soon as the id exists."""
+        self.session_id = session_id
+        if not self.watchable or self._fh is None or self._watcher is not None:
+            return
+        self._watcher = threading.Thread(
+            target=self._bind_wait, args=(session_id,), daemon=True,
+            name=f"trioctl-bind-{session_id[:8]}",
+        )
+        self._watcher.start()
+
+    def finish(self, session_id: str | None, failed: bool, keep: bool = False) -> None:
+        """After create returned (or raised) in the dispatch thread.
+
+        A dead start releases now. A kept session (uncertain delivery) or a
+        live one keeps the watcher to its bind or deadline; a client without
+        the create callback gets the same bind wait here, synchronously.
+        """
+        if failed and not keep:
+            self._stop.set()
+            self.release()
+            return
+        if self._watcher is not None:
+            return
+        if session_id and self.watchable and self._fh is not None and not failed:
+            self._bind_wait(session_id)
+            return
+        self.release()
+
+
+# Prompts of this process's dispatches, per mailbox, so a first-prompt hold
+# can tell a cross-wired mirror (the only saved user row is a SIBLING
+# dispatch's prompt) from a generic uncertain delivery.
+_DISPATCH_PROMPTS_LOCK = threading.Lock()
+_DISPATCH_PROMPTS: dict[str, dict[str, Any]] = {}
+
+
+def _register_dispatch_prompt(token: str, mailbox: Path, prompt: str, meta: dict[str, Any]) -> None:
+    now = time.monotonic()
+    with _DISPATCH_PROMPTS_LOCK:
+        for key in [k for k, v in _DISPATCH_PROMPTS.items()
+                    if v.get("ended") is not None and now - v["ended"] > 3600]:
+            _DISPATCH_PROMPTS.pop(key, None)
+        _DISPATCH_PROMPTS[token] = {
+            "mailbox": str(mailbox), "prompt": prompt, "session_id": None,
+            "started": now, "ended": None, "meta": dict(meta or {}),
+        }
+
+
+def _dispatch_prompt_update(token: str | None, **fields: Any) -> None:
+    if not token:
+        return
+    with _DISPATCH_PROMPTS_LOCK:
+        entry = _DISPATCH_PROMPTS.get(token)
+        if entry is not None:
+            entry.update(fields)
+
+
+def _crosswired_sibling(
+    token: str | None, mailbox: Path, rows: list[str]
+) -> dict[str, Any] | None:
+    """The overlapping sibling dispatch whose prompt is every saved user row."""
+    if not token or not rows:
+        return None
+    with _DISPATCH_PROMPTS_LOCK:
+        mine = _DISPATCH_PROMPTS.get(token)
+        if mine is None:
+            return None
+        siblings = [
+            dict(v) for k, v in _DISPATCH_PROMPTS.items()
+            if k != token and v["mailbox"] == str(mailbox)
+            and (v["ended"] is None or v["ended"] >= mine["started"])
+        ]
+    for sibling in siblings:
+        want = broker_http._prompt_text(sibling["prompt"])
+        if want and all(broker_http._row_matches_prompt(r, want) for r in rows):
+            return sibling
+    return None
+
+
 class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
@@ -3805,6 +4038,7 @@ class OmnigentRunner:
         workspace: str | None = None,
         prompt_timeout: float | None = None,
         labels: dict[str, str] | None = None,
+        on_session_id: Any = None,
     ) -> Any:
         """Call the checked-in client seam or a small test double.
 
@@ -3830,6 +4064,8 @@ class OmnigentRunner:
             extra["prompt_timeout"] = prompt_timeout
         if labels:
             extra["labels"] = dict(labels)
+        if on_session_id is not None:
+            extra["on_session_id"] = on_session_id
         if extra:
             try:
                 params = inspect.signature(method).parameters
@@ -3964,23 +4200,44 @@ class OmnigentRunner:
         With ``started``, the prompt phase inside create counts against
         the role timeout: the wait only gets what is left of it.
         """
-        created = self._create(
-            client,
-            agent_id,
-            model,
-            prompt,
-            title,
-            runner_id=self._runner_id,
-            host_id=self._host_id,
-            workspace=workspace or self._workspace,
-            prompt_timeout=self._timeout,
-            labels=(
-                dict(COMPLETION_RECEIPT_LABELS)
-                if self._completion_receipts
-                else None
-            ),
-        )
+        token = (dispatch or {}).get("prompt_token")
+        gate = _SameCwdGate(client, workspace or self._workspace)
+        gate.acquire()
+        if gate.contended:
+            self._note_same_cwd_serialised(gate, role, dispatch)
+
+        def on_session_id(new_id: str) -> None:
+            _dispatch_prompt_update(token, session_id=new_id)
+            gate.session_created(new_id)
+
+        try:
+            created = self._create(
+                client,
+                agent_id,
+                model,
+                prompt,
+                title,
+                runner_id=self._runner_id,
+                host_id=self._host_id,
+                workspace=workspace or self._workspace,
+                prompt_timeout=self._timeout,
+                labels=(
+                    dict(COMPLETION_RECEIPT_LABELS)
+                    if self._completion_receipts
+                    else None
+                ),
+                on_session_id=on_session_id,
+            )
+        except broker_http.PromptDeliveryUncertain as exc:
+            _dispatch_prompt_update(token, session_id=exc.session_id)
+            gate.finish(exc.session_id, failed=True, keep=True)
+            raise
+        except BaseException:
+            gate.finish(None, failed=True)
+            raise
         session_id = self._session_id(created)
+        _dispatch_prompt_update(token, session_id=session_id)
+        gate.finish(session_id, failed=session_id is None)
         if session_id is None:
             raise TrioctlError("session create response has no session id")
         delivery = dispatch.get("delivery") if dispatch is not None else None
@@ -4019,6 +4276,56 @@ class OmnigentRunner:
         )
         items = self._read(client, session_id)
         return snapshot, items
+
+    def _note_same_cwd_serialised(
+        self, gate: "_SameCwdGate", role: str, dispatch: dict[str, Any] | None
+    ) -> None:
+        """Contended same-cwd lock: session meta + `.driver.json` evidence."""
+        wait_s = round(gate.waited, 3)
+        if dispatch is not None:
+            meta = dispatch.setdefault("meta", {"role": role})
+            meta["same_cwd_serialised"] = True
+            meta["same_cwd_wait_s"] = wait_s
+        entry = {
+            "role": role,
+            "kind": ((dispatch or {}).get("meta") or {}).get("kind"),
+            "slice": ((dispatch or {}).get("meta") or {}).get("slice"),
+            "workspace": gate.workspace,
+            "same_cwd_serialised": True,
+            "wait_s": wait_s,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with self._dict_lock():
+            current = self.__dict__.get("driver_meta")
+            current = dict(current) if isinstance(current, dict) else {}
+            events = list(current.get("same_cwd_serialised") or [])
+            events.append(entry)
+            current["same_cwd_serialised"] = events[-50:]
+            # Rebind, never mutate: the loop core may be serialising the
+            # old dict from another thread.
+            self.driver_meta = current
+
+    def _crosswire_hold(
+        self, client: Any, session_id: str, mailbox: Path,
+        dispatch: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Held-record fields when a first-prompt hold is a cross-wired mirror."""
+        try:
+            rows = broker_http._user_row_texts(
+                broker_http._session_item_rows(self._read(client, session_id))
+            )
+        except Exception:  # noqa: BLE001 - classification only; still held
+            return None
+        sibling = _crosswired_sibling(dispatch.get("prompt_token"), mailbox, rows)
+        if sibling is None:
+            return None
+        meta = sibling.get("meta") or {}
+        return {
+            "crosswired_with": sibling.get("session_id"),
+            "crosswired_role": meta.get("role"),
+            "crosswired_kind": meta.get("kind"),
+            "crosswired_slice": meta.get("slice"),
+        }
 
     @staticmethod
     def _is_restart_blip(snapshot: Any, items: Any) -> bool:
@@ -4256,6 +4563,10 @@ class OmnigentRunner:
                 ),
             }
         dispatch["workspace"] = workspace
+        dispatch["prompt_token"] = uuid.uuid4().hex
+        _register_dispatch_prompt(
+            dispatch["prompt_token"], mailbox, prompt, dispatch["meta"]
+        )
         root_bound = eval_wt is None and self._manages_root_config()
         if root_bound:
             dispatch["root_mailbox"] = mailbox
@@ -4266,6 +4577,9 @@ class OmnigentRunner:
                 dispatch, workspace,
             )
         finally:
+            _dispatch_prompt_update(
+                dispatch.get("prompt_token"), ended=time.monotonic()
+            )
             session_id = dispatch.get("session_id")
             if root_bound and session_id:
                 try:
@@ -4375,10 +4689,17 @@ class OmnigentRunner:
             )
         except broker_http.PromptDeliveryUncertain as exc:
             # A copy may still be queued or running: never re-dispatch
-            # or prune it; record it durably and stop for a human.
+            # or prune it; record it durably and stop for a human. When the
+            # only saved user row is a sibling dispatch's prompt, the chat
+            # binding was cross-wired (r14 S-1): classify it, still held.
+            crosswire = self._crosswire_hold(
+                client, exc.session_id, mailbox, dispatch
+            )
             self._hold_dispatch(
                 mailbox, exc.session_id, role, iteration, title, context,
-                exc, "first_prompt_uncertain",
+                exc,
+                "mirror_crosswired" if crosswire else "first_prompt_uncertain",
+                extra=crosswire,
             )
         except (TrioctlError, broker_http.BrokerHttpError) as exc:
             # This dispatch's own session (a concurrent role's create must
@@ -4421,6 +4742,7 @@ class OmnigentRunner:
         context: dict[str, Any] | None,
         exc: Exception,
         hold: str,
+        extra: dict[str, Any] | None = None,
     ) -> NoReturn:
         """Record a dispatch that may still run, mark STATE, and raise.
 
@@ -4441,6 +4763,11 @@ class OmnigentRunner:
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             ),
         }
+        if hold == "mirror_crosswired":
+            record["reason"] = "mirror_crosswired"
+            record["detail"] = str(exc)
+        if extra:
+            record.update(extra)
         for key, field in (
             ("evaluator_attempt", "attempt"),
             ("pinned_sha", "pinned_sha"),
