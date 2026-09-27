@@ -271,6 +271,34 @@ def test_counts_lines_parse_through_real_helper() -> None:
     assert tc("TARGETED_CHECK: <the line stating the pass/fail counts>") is None
 
 
+def test_zero_failure_counts_are_not_failed() -> None:
+    """r13 L-2: `| 0 failed`, `0 errors` are passes, not FAILED."""
+    tc = _trioctl("zero")._targeted_check_line
+    for value in (
+        "Tests  10 passed | 0 failed",
+        "Found 0 errors",
+        "0 errors",
+        "0 failed, 12 passed",
+        "PASS 12 (0 errors)",
+        "12 passed, 0 failed, 0 errors in 0.3s",
+    ):
+        assert tc(f"TARGETED_CHECK: {value}") == f"TARGETED_CHECK: {value}", value
+    for value in (
+        "1 failed",
+        "2 failed, 3 passed",
+        "Tests  1 failed | 384 passed (385)",
+        "10 failed",
+        "1 error",
+        "3 errors",
+        "12 passed, 0 failed, 1 error in 0.3s",
+        "no tests ran",
+        "FAIL\texample.com/pkg\t0.01s",
+    ):
+        assert tc(f"TARGETED_CHECK: {value}") == f"TARGETED_CHECK: FAILED {value}", value
+    assert tc("TARGETED_CHECK: FAILED 0 passed") == "TARGETED_CHECK: FAILED 0 passed"
+    assert tc("TARGETED_CHECK: failed 1") == "TARGETED_CHECK: FAILED 1"
+
+
 
 # ------------------------------------------ r13 doubt 2: template literals
 
@@ -311,8 +339,27 @@ APPEND_ONLY = ("appends ONE new entry at the end of the block, with `at:` = that
                "sha's committer time from `git log -1 --format=%cI <merge_commit>` "
                "— never an invented or estimated time")
 NO_REWRITE = "Never edit, replace, reorder or delete existing entries"
-GREP_CHECK = ("Verify with `grep -c 'slice:' QUEUE.md` before and after: the count "
-              "must grow by exactly one")
+AWK = ("awk '/^```/{f=0} f&&/^  - slice:/{n++} /^retired:/{f=1} "
+       "END{print n+0}' QUEUE.md")
+GREP_CHECK = _flat("count the entries inside the `retired:` fence only, before and after: "
+                   f"`{AWK}` — an append must grow it by exactly one")
+FENCE_RULE = ("The new entry goes INSIDE the ```yaml `retired:` fence, before its "
+              "closing ```, indented as a list item of `retired:`")
+FENCE_EXAMPLE = (
+    "```yaml\nretired:\n"
+    "  - slice: status-parse\n"
+    "    sha: af7d8220c4d606f549c4a374c9e22b6a6a03ec04\n"
+    "    at: 2026-09-27T03:03:20Z\n"
+    "  - slice: cli-whoami\n"
+    "    sha: e688fdf5493dac69e4db40345a69aa1287cd6aa1\n"
+    "    at: 2026-09-27T03:04:53Z\n"
+    "```\n"
+)
+SHA_KEYS = ("exactly three keys, in this order: `slice:`, `sha:`")
+SHA_NOT_MERGE = "the key is `sha:`, never `merge_commit:`"
+REPAIR = ("The ONLY edit allowed to an existing entry is repairing one the loop "
+          "has logged as malformed (`QUEUE.md: slice <id> has a malformed retired "
+          "entry`): fix that entry's keys in place, change nothing else.")
 
 
 def test_omnigent_step3_retire_is_append_only(tmp_path: Path) -> None:
@@ -321,7 +368,13 @@ def test_omnigent_step3_retire_is_append_only(tmp_path: Path) -> None:
     assert "QUEUE.md `retired:` is APPEND-ONLY" in step3
     for needle in (APPEND_ONLY, NO_REWRITE, GREP_CHECK):
         assert needle in step3, needle
-    assert "insert after the block's last line instead" in step3
+    assert "insert after the block's last line" not in step3
+    (tmp_path / "raw").mkdir()
+    assert f"`{AWK}`" in _block(_lead_prompt(tmp_path / "raw"))
+    assert "grep -c 'slice:'" not in step3
+    for needle in (FENCE_RULE, SHA_KEYS, SHA_NOT_MERGE, REPAIR,
+                   "`slice:`, `sha:` (the full `merge_commit` sha"):
+        assert needle in step3, needle
     # The rule sits before the retire conditions it governs.
     assert step3.index(APPEND_ONLY) < step3.index("Retire only when both hold")
 
@@ -332,10 +385,137 @@ def test_canonical_and_generated_leads_retire_append_only() -> None:
     assert "**`retired:` is append-only:**" in section
     for needle in (APPEND_ONLY, NO_REWRITE, GREP_CHECK):
         assert needle in section, needle
+    for needle in (FENCE_RULE, SHA_KEYS, SHA_NOT_MERGE, REPAIR):
+        assert needle in section, needle
+    assert "insert after the block's last line" not in section
     for path, flat in _generated_role("lead"):
         assert APPEND_ONLY in flat and GREP_CHECK in flat, path
+        assert FENCE_RULE in flat and REPAIR in flat and SHA_NOT_MERGE in flat, path
     schema = _flat((ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8"))
     assert "the committer time of `sha` (`git log -1 --format=%cI <sha>`)" in schema
+    assert ("Lead appends each entry INSIDE the ```yaml `retired:` fence, before its "
+            "closing ```, indented as a list item of `retired:`") in schema
+    assert ("exactly these three keys, in this order: `slice:`, `sha:`, `at:`. "
+            "The key is `sha:` — never `merge_commit:`") in schema
+    assert REPAIR in schema
+    assert _flat(f"`{AWK}`") in schema
+    # Unflattened: the exact command (two-space list indent) is copyable.
+    assert f"`{AWK}`" in (ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8")
+    assert f"`{AWK}`" in (CANONICAL / "lead.md").read_text(encoding="utf-8")
+    assert "after the block's last line" not in schema
+    assert "grep -c 'slice:'" not in schema
+
+
+def _dedent_example(text: str) -> str:
+    """The literal ```yaml example in ``text``, dedented."""
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.strip() == "```yaml"
+                 and lines[i + 1].strip() == "retired:")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "```")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    return "\n".join(l[indent:] for l in lines[start:end + 1]) + "\n"
+
+
+def test_fence_example_is_literal_and_parses(tmp_path: Path) -> None:
+    trioctl_block = _block(_lead_prompt(tmp_path))
+    sources = {
+        "trioctl": trioctl_block,
+        "canonical": (CANONICAL / "lead.md").read_text(encoding="utf-8"),
+        "schema": (ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8").split(
+            "`retired:` is **append-only, Lead only**")[1],
+    }
+    for path, _flat_text in _generated_role("lead"):
+        sources[str(path)] = _generated()[path].replace("\\n", "\n")
+    tm = _load("trio_metrics_r13_fence", ROOT / "metrics" / "trio-metrics.py")
+    for name, text in sources.items():
+        example = _dedent_example(text)
+        assert example == FENCE_EXAMPLE, name
+        # The example is a well-formed QUEUE.md: two retired entries, no errors.
+        queue = tm.parse_queue_block(example)
+        assert queue["errors"] == [] and queue["malformed_slices"] == [], name
+        assert [e["slice"] for e in queue["retired"]] == ["status-parse", "cli-whoami"], name
+
+
+# The real hard-fixture shape (speed/hard/runs/subusage/D/repo/loop-hard/QUEUE.md).
+HARD_QUEUE = (
+    "```yaml\nretired:\n"
+    "  - slice: status-parse\n    sha: af7d8220c4d606f549c4a374c9e22b6a6a03ec04\n    at: 2026-09-27T03:03:20Z\n"
+    "  - slice: docs-cursor-whoami\n    sha: 245dae8fc3a9522fa8a722a050cb9085d6e50b9d\n    at: 2026-09-27T03:03:45Z\n"
+    "  - slice: cli-whoami\n    sha: e688fdf5493dac69e4db40345a69aa1287cd6aa1\n    at: 2026-09-27T03:04:53Z\n"
+    "  - slice: collect-timeline\n    sha: f22ebc77de143b83e70405460a8fd2020d9c9d5c\n    at: 2026-09-27T03:05:54Z\n"
+    "```\n\n```yaml\nfaults:\n```\n"
+)
+NEW_ENTRY = "  - slice: x\n    sha: " + "a" * 40 + "\n    at: 2026-09-27T04:00:00Z\n"
+FAULT = ("  - id: f1\n    slice: cli-whoami\n    observed_at: " + "b" * 40 +
+         "\n    scope: [a.py]\n    reason: r\n    status: open\n")
+
+
+def _awk_count(tmp_path: Path, text: str) -> int:
+    import shutil
+    import subprocess
+    if shutil.which("awk") is None:
+        import pytest
+        pytest.skip("awk not installed")
+    q = tmp_path / "QUEUE.md"
+    q.write_text(text, encoding="utf-8")
+    script = AWK[len("awk '"):-len("' QUEUE.md")]
+    out = subprocess.run(["awk", script, str(q)], capture_output=True, text=True, check=True)
+    return int(out.stdout.strip())
+
+
+def test_awk_self_check_counts_only_retired_fence(tmp_path: Path) -> None:
+    assert _awk_count(tmp_path, HARD_QUEUE) == 4
+    assert _awk_count(tmp_path, "") == 0
+    inside = HARD_QUEUE.replace("```\n\n```yaml\nfaults:", NEW_ENTRY + "```\n\n```yaml\nfaults:", 1)
+    assert _awk_count(tmp_path, inside) == 5
+    # An entry after the closing fence (M-1) is NOT counted: the self-check fails.
+    outside = HARD_QUEUE.replace("```\n\n```yaml\nfaults:", "```\n" + NEW_ENTRY + "\n```yaml\nfaults:", 1)
+    assert _awk_count(tmp_path, outside) == 4
+    # A concurrently appended fault (L-4) does not move the count.
+    faulted = HARD_QUEUE.replace("faults:\n```", "faults:\n" + FAULT + "```")
+    assert _awk_count(tmp_path, faulted) == 4
+    assert _awk_count(tmp_path, faulted.replace("```\n\n```yaml\nfaults:", NEW_ENTRY + "```\n\n```yaml\nfaults:", 1)) == 5
+    # Faults block first, retired second.
+    swapped = "```yaml\nfaults:\n" + FAULT + "```\n\n" + HARD_QUEUE.split("\n\n")[0] + "\n"
+    assert _awk_count(tmp_path, swapped) == 4
+
+
+# ------------------------------------------------ L-3 tsc <project> rule
+
+TSC_PROJECT = ("`<project>` is the directory of the nearest tsconfig.json at or above "
+               "the slice's first `writes:` path; if none, omit the tsc prefix.")
+
+
+def _tsc_project(root: Path, writes: list[str]) -> str | None:
+    """The documented rule, applied mechanically to a fake tree."""
+    first = root / writes[0]
+    for d in [first.parent, *first.parent.parents]:
+        if (d / "tsconfig.json").is_file():
+            return d.relative_to(root).as_posix() or "."
+        if d == root:
+            break
+    return None
+
+
+def test_tsc_project_rule_named_and_applies(tmp_path: Path) -> None:
+    block = _flat(_block(_lead_prompt(tmp_path)))
+    assert TSC_PROJECT in block
+    canonical = _flat(_section((CANONICAL / "lead.md").read_text(encoding="utf-8"),
+                               "## Open-loop mode"))
+    assert TSC_PROJECT in canonical
+    for path, flat in _generated_role("lead"):
+        assert TSC_PROJECT in flat, path
+    repo = tmp_path / "repo"
+    (repo / "api" / "src" / "routes").mkdir(parents=True)
+    (repo / "api" / "tsconfig.json").write_text("{}", encoding="utf-8")
+    (repo / "web").mkdir()
+    # The example `-p api` falls out of the rule for a fake api slice.
+    assert _tsc_project(repo, ["api/src/routes/x.ts", "api/test/x.test.ts"]) == "api"
+    # Only the FIRST writes: path decides.
+    assert _tsc_project(repo, ["web/y.ts", "api/src/z.ts"]) is None
+    (repo / "tsconfig.json").write_text("{}", encoding="utf-8")
+    assert _tsc_project(repo, ["web/y.ts"]) == "."
+    assert _tsc_project(repo, ["api/src/routes/x.ts"]) == "api"
 
 
 # ------------------------------------------- G4 whole-goal deliverables

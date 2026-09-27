@@ -398,11 +398,38 @@ retired:
 | `sha` | yes | full 40-char sha | the sha this entry retires the slice **at** |
 | `at` | yes | ISO-8601 timestamp | the committer time of `sha` (`git log -1 --format=%cI <sha>`), never an invented or estimated time |
 
+Each entry has exactly these three keys, in this order: `slice:`, `sha:`,
+`at:`. The key is `sha:` — never `merge_commit:` (that is the builder JSON
+field the value comes from); any other key makes the entry malformed.
+
 `retired:` is **append-only, Lead only**: the Lead is the only role that
 appends an entry, and no role ever edits or removes an existing one. The
-Lead appends each entry after the block's last line — never by replacing
-an earlier entry — and checks that `grep -c 'slice:' QUEUE.md` grew by
-exactly one.
+Lead appends each entry INSIDE the ```yaml `retired:` fence, before its
+closing ```, indented as a list item of `retired:` — never by replacing an
+earlier entry, and never after the closing ``` (an entry outside the fence
+is silently ignored by the reader):
+
+````text
+```yaml
+retired:
+  - slice: status-parse
+    sha: af7d8220c4d606f549c4a374c9e22b6a6a03ec04
+    at: 2026-09-27T03:03:20Z
+  - slice: cli-whoami
+    sha: e688fdf5493dac69e4db40345a69aa1287cd6aa1
+    at: 2026-09-27T03:04:53Z
+```
+````
+
+(`status-parse` is an existing entry; `cli-whoami` is the appended one.)
+The ONLY edit allowed to an existing entry is repairing one the loop has
+logged as malformed (`QUEUE.md: slice <id> has a malformed retired entry`):
+fix that entry's keys in place, change nothing else. The Lead checks the
+append by counting the entries inside the `retired:` fence only, before and
+after —
+`awk '/^```/{f=0} f&&/^  - slice:/{n++} /^retired:/{f=1} END{print n+0}' QUEUE.md`
+— which must grow by exactly one (a malformed-entry repair leaves it
+unchanged).
 
 An entry means "this slice was **retired at** `sha`" — not "the slice's
 last commit". Repeated slice ids are legal and expected: a post-retirement

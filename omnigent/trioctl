@@ -1157,9 +1157,10 @@ _TARGETED_CHECK_TEMPLATE_LITERALS = frozenset({
 _TARGETED_CHECK_FAILED_RE = re.compile(r"^failed\b", re.IGNORECASE)
 # A value that reports failures without the FAILED prefix (pytest's last
 # line copied verbatim, e.g. `2 failed, 3 passed`, `1 error`, `no tests
-# ran`) is still a failure for the Lead's retire test.
+# ran`) is still a failure for the Lead's retire test. Zero counts
+# (`| 0 failed`, `0 errors`) are not failures.
 _TARGETED_CHECK_FAILURE_TEXT_RE = re.compile(
-    r"\b(\d+ failed|\d+ errors?|no tests ran|FAIL)\b", re.IGNORECASE
+    r"\b([1-9]\d* failed|[1-9]\d* errors?|no tests ran|FAIL)\b", re.IGNORECASE
 )
 
 
@@ -2726,6 +2727,8 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   files, the command MUST also typecheck the builder's project: prefix\n"
     "   it with `npx tsc --noEmit -p <project> && ` (e.g.\n"
     "   `npx tsc --noEmit -p api && npx vitest run api/test/x.test.ts`).\n"
+    "   `<project>` is the directory of the nearest tsconfig.json at or above\n"
+    "   the slice's first `writes:` path; if none, omit the tsc prefix.\n"
     "   End that section with this literal sentence, which the\n"
     "   builder sees verbatim: \"Print `TARGETED_CHECK: <the line stating the\n"
     "   pass/fail counts>` after running the check (pytest: `N passed[, M\n"
@@ -2789,19 +2792,40 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   wait-next call returns it; its `slice(<id>):` merge is already on\n"
     "   HEAD), IMMEDIATELY set that\n"
     "   slice's `status: complete` in PLAN.md's `slices:` block and append\n"
-    "   its `retired:` entry to QUEUE.md (`slice`, the full `merge_commit`\n"
-    "   sha from the builder's JSON output line, `at`) — before waiting for\n"
+    "   its `retired:` entry to QUEUE.md — exactly three keys, in this\n"
+    "   order: `slice:`, `sha:` (the full `merge_commit` sha from the\n"
+    "   builder's JSON output line; the key is `sha:`, never\n"
+    "   `merge_commit:`), `at:` — before waiting for\n"
     "   any other builder in the wave. Do not wait for the wave to land or\n"
     "   for the hazard check to retire a slice.\n"
     "   QUEUE.md `retired:` is APPEND-ONLY: every retirement (builder merge,\n"
     "   take-over, fix, recovery) appends ONE new entry at the end of the\n"
     "   block, with `at:` = that sha's committer time from\n"
     "   `git log -1 --format=%cI <merge_commit>` — never an invented or\n"
-    "   estimated time. Never edit, replace, reorder or delete existing\n"
-    "   entries (an edit whose old text is an earlier entry is a replace —\n"
-    "   insert after the block's last line instead). Verify with\n"
-    "   `grep -c 'slice:' QUEUE.md` before and after: the count must grow\n"
-    "   by exactly one.\n"
+    "   estimated time. The new entry goes INSIDE the ```yaml `retired:`\n"
+    "   fence, before its closing ```, indented as a list item of\n"
+    "   `retired:` (an entry after the closing ``` is silently ignored):\n"
+    "     ```yaml\n"
+    "     retired:\n"
+    "       - slice: status-parse\n"
+    "         sha: af7d8220c4d606f549c4a374c9e22b6a6a03ec04\n"
+    "         at: 2026-09-27T03:03:20Z\n"
+    "       - slice: cli-whoami\n"
+    "         sha: e688fdf5493dac69e4db40345a69aa1287cd6aa1\n"
+    "         at: 2026-09-27T03:04:53Z\n"
+    "     ```\n"
+    "   (`status-parse` is an existing entry; `cli-whoami` is the appended\n"
+    "   one.) Never edit, replace, reorder or delete existing entries (an\n"
+    "   edit whose old text is an earlier entry is a replace — add the new\n"
+    "   entry as the fence's last list item instead). The ONLY edit allowed\n"
+    "   to an existing entry is repairing one the loop has logged as\n"
+    "   malformed (`QUEUE.md: slice <id> has a malformed retired entry`):\n"
+    "   fix that entry's keys in place, change nothing else. Self-check —\n"
+    "   count the entries inside the `retired:` fence only, before and\n"
+    "   after:\n"
+    "   `awk '/^```/{f=0} f&&/^  - slice:/{n++} /^retired:/{f=1} END{print n+0}' QUEUE.md`\n"
+    "   — an append must grow it by exactly one (a malformed-entry repair\n"
+    "   leaves it unchanged).\n"
     "   Retire only when both hold:\n"
     "   the JSON's `merge_commit` differs from its `base` (a real\n"
     "   `slice(<id>):` commit landed), and its `targeted_check` field — the\n"

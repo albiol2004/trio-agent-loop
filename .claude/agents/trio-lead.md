@@ -171,7 +171,9 @@ extension"), run this loop instead of waiting for a verdict:
    `writes:` include `.ts` or `.tsx` files, the command MUST also
    typecheck the builder's project: prefix it with `npx tsc --noEmit -p
    <project> && ` (e.g. `npx tsc --noEmit -p api && npx vitest run
-   api/test/x.test.ts`). End that section with this literal sentence, which the
+   api/test/x.test.ts`). `<project>` is the directory of the nearest
+   tsconfig.json at or above the slice's first `writes:` path; if none, omit
+   the tsc prefix. End that section with this literal sentence, which the
    builder sees verbatim: "Print `TARGETED_CHECK: <the line stating the
    pass/fail counts>` after running the check (pytest: `N passed[, M
    failed] in ...`; vitest: ` Tests  N passed | M failed`, not
@@ -181,18 +183,41 @@ extension"), run this loop instead of waiting for a verdict:
    As soon as an isolated builder's run prints `integrated` (its
    `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's
    `status: complete` in PLAN.md's `slices:` block and append its
-   `retired:` entry to `QUEUE.md` (`slice`, the `merge_commit` sha from
-   the builder's JSON output line, `at`) — before waiting for any other
-   builder in the wave. Do not wait for the wave to land or for the
-   hazard check to retire a slice. **`retired:` is append-only:** every
-   retirement (builder merge, take-over, fix, recovery) appends ONE new
-   entry at the end of the block, with `at:` = that sha's committer time
-   from `git log -1 --format=%cI <merge_commit>` — never an invented or
-   estimated time. Never edit, replace, reorder or delete existing entries
-   (an edit whose old text is an earlier entry is a replace — insert after
-   the block's last line instead). Verify with `grep -c 'slice:' QUEUE.md`
-   before and after: the count must grow by exactly one. **Retire only
-   when both hold:** the
+   `retired:` entry to `QUEUE.md` — exactly three keys, in this order:
+   `slice:`, `sha:` (the `merge_commit` sha from the builder's JSON output
+   line; the key is `sha:`, never `merge_commit:`), `at:` — before waiting
+   for any other builder in the wave. Do not wait for the wave to land or
+   for the hazard check to retire a slice. **`retired:` is append-only:**
+   every retirement (builder merge, take-over, fix, recovery) appends ONE
+   new entry at the end of the block, with `at:` = that sha's committer
+   time from `git log -1 --format=%cI <merge_commit>` — never an invented
+   or estimated time. The new entry goes INSIDE the ```yaml `retired:`
+   fence, before its closing ```, indented as a list item of `retired:`
+   (an entry after the closing ``` is silently ignored):
+
+   ````text
+   ```yaml
+   retired:
+     - slice: status-parse
+       sha: af7d8220c4d606f549c4a374c9e22b6a6a03ec04
+       at: 2026-09-27T03:03:20Z
+     - slice: cli-whoami
+       sha: e688fdf5493dac69e4db40345a69aa1287cd6aa1
+       at: 2026-09-27T03:04:53Z
+   ```
+   ````
+
+   (`status-parse` is an existing entry; `cli-whoami` is the appended one.)
+   Never edit, replace, reorder or delete existing entries (an edit whose
+   old text is an earlier entry is a replace — add the new entry as the
+   fence's last list item instead). The ONLY edit allowed to an existing
+   entry is repairing one the loop has logged as malformed
+   (`QUEUE.md: slice <id> has a malformed retired entry`): fix that entry's
+   keys in place, change nothing else. Self-check — count the entries
+   inside the `retired:` fence only, before and after:
+   `awk '/^```/{f=0} f&&/^  - slice:/{n++} /^retired:/{f=1} END{print n+0}' QUEUE.md`
+   — an append must grow it by exactly one (a malformed-entry repair
+   leaves it unchanged). **Retire only when both hold:** the
    JSON's `merge_commit` differs from its `base` (a real `slice(<id>):`
    commit landed), and its `targeted_check` field — the builder's
    `TARGETED_CHECK: ` line — is present and does not start with
