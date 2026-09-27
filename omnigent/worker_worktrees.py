@@ -24,7 +24,12 @@ live process uses, and that has no dirty, untracked or unmerged state.
 Isolation covers only Cursor's *project* config scope. User-scope
 (``~/.cursor``) and system hook/MCP config is still loaded by every
 cursor-agent, so isolated dispatch is refused while that scope carries
-session-bound Omnigent entries (see :func:`inherited_cursor_problems`). Removal uses plain
+session-bound Omnigent entries (see :func:`inherited_cursor_problems`). A repository
+that TRACKS project ``.cursor/{mcp,hooks}.json`` gets them neutralised in
+each worktree (session-bound entries stripped, ``skip-worktree`` set in
+that worktree's own index; see :func:`neutralise_tracked_cursor`), so the
+worker never honours another session's binding and the overwrite never
+reaches the product diff or merge. Removal uses plain
 ``git worktree remove`` and ``git branch -d`` -- never ``--force``/``-D``
 and never ``git worktree prune``.
 """
@@ -1088,6 +1093,9 @@ def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]
     ``writes:``), untracked files outside other mailboxes stay ``product``
     blockers (the conservative pre-r11 behaviour). Entries are porcelain
     lines; ``ignored`` holds a mailbox directory once, else the path.
+    A tracked ``.cursor/{mcp,hooks}.json`` modified only by session-bound
+    Omnigent entries (the root Lead launch's merge,
+    :func:`omnigent_only_change`) is ``ignored`` too, never a blocker.
     """
     rel = _mailbox_rel(repo, mailbox)
     declared = declared_product_paths(mailbox)
@@ -1098,6 +1106,9 @@ def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]
         if rel and (path.startswith(rel) or path + "/" == rel):
             continue
         untracked = line.startswith("??")
+        if line[:2] == " M" and omnigent_only_change(repo, path):
+            out["ignored"].append(path)
+            continue
         if _covered(path, declared):
             out["product"].append(line)
             continue
@@ -1241,7 +1252,16 @@ def create(
     admin = Path(_out(path, "rev-parse", "--absolute-git-dir"))
     (admin / OWNER_MARKER).write_text(worker_id + "\n", encoding="utf-8")
     record["admin_dir"] = str(admin)
-    problems = cursor_config_conflicts(path)
+    try:
+        neutralised = neutralise_tracked_cursor(path)
+    except (OSError, WorktreeError) as exc:
+        neutralised = []
+        problems = [f"cannot neutralise tracked project Cursor config: {exc}"]
+    else:
+        problems = []
+    if neutralised:
+        record["neutralised_cursor"] = neutralised
+    problems += cursor_config_conflicts(path)
     if cursor_project_root(path) != path:
         problems.append(f"worktree {path} is not its own Cursor project root")
     if problems:
@@ -1401,6 +1421,129 @@ def cursor_config_conflicts(path: Path) -> list[str]:
     return problems
 
 
+def _strip_session_bound(rel: str, data: object) -> object:
+    """*data* minus every session-bound Omnigent entry (a copy).
+
+    Stricter than Omnigent's own merge (which only replaces the
+    ``omnigent`` server and drops usage hooks of the CURRENT module): any
+    MCP server named ``omnigent`` or carrying a session marker
+    (:data:`_SESSION_MARKERS`, e.g. an old-layout bridge on another home)
+    and any hook entry of any event carrying one are dropped. Everything
+    else (user servers and hooks) is kept verbatim.
+    """
+    data = json.loads(json.dumps(data))
+    if not isinstance(data, dict):
+        return data
+    if rel.endswith("mcp.json"):
+        for key in ("mcpServers", "servers"):
+            servers = data.get(key)
+            if isinstance(servers, dict):
+                for name in [n for n, spec in servers.items() if n == "omnigent" or _marked(spec)]:
+                    del servers[name]
+        return data
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event, entries in list(hooks.items()):
+            if isinstance(entries, list):
+                hooks[event] = [e for e in entries if not _marked(e)]
+    return data
+
+
+def neutralise_tracked_cursor(path: Path) -> list[str]:
+    """Neutralise TRACKED project ``.cursor/{mcp,hooks}.json`` in worktree *path*.
+
+    A repository may commit a project Cursor config carrying another
+    Omnigent session's binding (a stale ``omnigent`` MCP server, a usage
+    stop hook). Every checkout of it -- every task-owned worktree -- would
+    hand that binding to the worker's cursor-agent. For each such file that
+    is tracked in *path*'s index as a regular file, this writes the file
+    with every session-bound entry stripped (:func:`_strip_session_bound`;
+    user entries kept) and sets ``skip-worktree`` on it in *path*'s OWN
+    index (the aggregate checkout's index is never touched). The
+    overwrite, and whatever the worker's own Omnigent launch merges on top
+    of it, is therefore invisible to ``git status`` and ``git add -A``:
+    the builder commit, the integration merge and the evaluator's clean
+    check never see it, and ``git worktree remove`` discards it with the
+    worktree (no restore step can race or fail). :func:`integrate` still
+    refuses a worker commit that touches a neutralised path.
+
+    Untracked files, symlinks (file or ``.cursor`` dir), non-regular index
+    entries and unparsable JSON are never touched: they stay for
+    :func:`cursor_config_conflicts` to judge (an untracked foreign config
+    in a worktree is the genuinely unsafe case and is still refused).
+    Returns the neutralised repo-relative paths.
+    """
+    if (path / ".cursor").is_symlink():
+        return []
+    done: list[str] = []
+    for rel in OWNED_CURSOR_FILES:
+        target = path / rel
+        if target.is_symlink() or not target.is_file():
+            continue
+        try:
+            indexed = _index_entry(path, rel)
+        except WorktreeError:
+            continue
+        if indexed is None:
+            continue
+        _blob, mode = indexed
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        inert = _strip_session_bound(rel, data)
+        if inert == data:
+            continue
+        git(path, "update-index", "--skip-worktree", "--", rel)
+        tmp = target.with_name(f".{target.name}.trio-neutral-{os.getpid()}")
+        tmp.write_text(json.dumps(inert, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+        done.append(rel)
+    return done
+
+
+def _normal_cursor(rel: str, data: object) -> object:
+    """Session-bound entries stripped plus Omnigent's merge defaults filled."""
+    data = _strip_session_bound(rel, data)
+    if not isinstance(data, dict):
+        return data
+    if rel.endswith("mcp.json"):
+        if not isinstance(data.get("mcpServers"), dict):
+            data["mcpServers"] = {}
+        return data
+    data.setdefault("version", 1)
+    hooks = data.get("hooks")
+    hooks = hooks if isinstance(hooks, dict) else {}
+    data["hooks"] = {k: v for k, v in hooks.items() if v != []}
+    return data
+
+
+def omnigent_only_change(repo: Path, rel: str) -> bool:
+    """Whether tracked *rel* differs from its index version ONLY by
+    session-bound Omnigent entries (e.g. the root Lead launch's merge).
+
+    Such a modification is never product content: it neither hides a
+    product edit from a worker nor collides with a worker merge (a worker
+    cannot change the path, see :func:`neutralise_tracked_cursor`). Any
+    other difference, a symlink or unparsable content returns False.
+    """
+    if rel not in OWNED_CURSOR_FILES:
+        return False
+    target = repo / rel
+    if target.is_symlink() or (repo / ".cursor").is_symlink() or not target.is_file():
+        return False
+    try:
+        indexed = _index_entry(repo, rel)
+        if indexed is None:
+            return False
+        base = json.loads(indexed[0].decode("utf-8"))
+        current = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, WorktreeError):
+        return False
+    return _normal_cursor(rel, current) == _normal_cursor(rel, base)
+
+
 def mark_running(
     repo: Path,
     record: dict[str, Any],
@@ -1518,6 +1661,14 @@ def integrate(
         changed = _out(path, "diff", "--name-only", f"{record['base']}..{commit}").splitlines()
         if mailbox_rel and any(p.startswith(mailbox_rel) for p in changed):
             return _retain(repo, record, "mailbox_write", "worker changed mailbox files")
+        touched = [r for r in record.get("neutralised_cursor") or [] if r in changed]
+        if touched:
+            return _retain(
+                repo, record, "cursor_config_write",
+                "worker committed the neutralised tracked project Cursor config "
+                f"({', '.join(touched)}); its worktree copy is Omnigent session config, "
+                "never product -- change the tracked file on the aggregate by hand",
+            )
         head_ref = git(repo, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
         if head_ref != record["aggregate_ref"]:
             return _retain(

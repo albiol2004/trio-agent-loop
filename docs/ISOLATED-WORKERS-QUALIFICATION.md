@@ -200,3 +200,27 @@ unverified owner, the pre-r11 rule applies unchanged. (Live motivation:
 openrouter/D retained all 8 accepted/finished worktrees solely for
 `api/node_modules/` from a builder's `npm ci`, plus one empty
 `.eval-scratch/`.)
+
+### Tracked project `.cursor` config (r14 W-2)
+
+A repository may COMMIT `.cursor/mcp.json` / `.cursor/hooks.json` carrying
+another Omnigent session's binding (live: syngenta_p_l tracked an `omnigent`
+server on `/home/alex/...` and a usage stop hook; every builder/eval worktree
+was retained as `unsafe_cursor_config` and the slice-eval bind killed the
+driver). `create()` now neutralises such TRACKED files in the new worktree
+before the guard runs (`neutralise_tracked_cursor`): every session-bound
+entry (server named `omnigent` or carrying a session marker; any hook entry
+carrying one, including old-module usage hooks Omnigent's own merge would
+keep) is stripped, user entries are kept, and `skip-worktree` is set in that
+worktree's own index. The overwrite, and the worker's own Omnigent merge on
+top of it, is invisible to `git status`/`git add -A`, so the builder commit,
+the integration merge and the evaluator's clean check never carry it; the
+file is discarded with the worktree (no restore step, nothing to race).
+`integrate` retains a worker commit that touches a neutralised path
+(`cursor_config_write`). The record lists the paths as `neutralised_cursor`.
+The guard is unchanged for everything else: an UNTRACKED foreign config, a
+symlinked `.cursor`, a non-regular index entry or unparsable JSON is never
+touched and still refuses the worktree. At the aggregate root a tracked
+config modified ONLY by session-bound Omnigent entries (the Lead launch's
+merge) is listed as ignored by the dirty-checkout gate instead of blocking
+dispatch as a foreign change; any other edit to it still blocks.
