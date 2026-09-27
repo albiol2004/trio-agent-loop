@@ -256,6 +256,19 @@ Resolution by mailbox mode:
 | open-loop (`QUEUE.md` present) | isolated, N=4 | isolated, N=4; unmet prerequisite refused | not isolated, N=1 |
 | lockstep (no `QUEUE.md`) | not isolated, N=1, one line `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)` | isolated (opt-in; concurrency not applicable, the loop says so); unmet prerequisite refused | not isolated, N=1 |
 
+Dirty checkout: an isolated builder dispatch (`run builder --isolate`)
+refuses (exit 1, no worktree) on uncommitted or untracked files under a
+declared product path (any PLAN.md slice's `writes:`) and on modified
+tracked files outside them ("commit or stash YOUR change to <file>; the
+Lead must not commit files it did not edit"). Other untracked files and
+other mailboxes (a directory with GOAL.md + STATE.md, such as a concurrent
+`loop-auth`) do not block; they are listed once as
+`trioctl: ignored (not product paths; the worker worktree will not see them): ...`.
+The Lead commits only files it or its builders edited under declared
+`writes:`; on any other blocker it stops the pass (LOG
+`- iter N | lead | blocked: uncommitted foreign changes: <files>`, STATE
+`status: needs_human`).
+
 Design and speed evidence:
 `docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
 

@@ -154,3 +154,20 @@ isolation stays OFF unless `--isolate-workers` is explicit.
   that includes a detached HEAD (`--isolate-workers refused: checkout is
   not on a branch (detached HEAD); ...`).
 - An explicit `--slice-eval-concurrency N>1` without isolation is refused.
+- Dirty-checkout gate (`worker_worktrees.classify_aggregate`, checked at
+  builder dispatch and again at integration), for status entries outside
+  this mailbox:
+
+  | entry | effect |
+  |---|---|
+  | modified or untracked, under a declared product path (PLAN.md `writes:`) | blocker: `aggregate has uncommitted product changes ... commit them before an isolated dispatch: <entries>` |
+  | untracked, outside product paths | not a blocker; listed in `trioctl: ignored (not product paths; the worker worktree will not see them): <paths>` |
+  | anything inside another mailbox (a directory with GOAL.md + STATE.md) | not a blocker; listed as `<dir>/` in the same note |
+  | modified tracked, outside product paths | blocker: `... commit or stash YOUR change to <file>; the Lead must not commit files it did not edit` |
+
+  With no declared `writes:` at all, untracked files stay blockers (the
+  conservative pre-r11 rule). The Lead prompt tells the Lead to commit only
+  files it or its builders edited under declared `writes:`, and on any
+  other blocker to stop the pass with
+  `- iter N | lead | blocked: uncommitted foreign changes: <files>` and
+  STATE `status: needs_human`.

@@ -124,6 +124,12 @@ role that freezes. Consumers of that interface may then be delegated.
 No `QUEUE.md` → ignore this section entirely, the lockstep protocol above
 is unchanged. When it exists (schema: MAILBOX-SCHEMA.md "v1 open-loop
 extension"), run this loop instead of waiting for a verdict:
+0. **Commit scope**: commit ONLY files you or your builders edited under
+   a slice's declared `writes:`. When uncommitted changes you did not make
+   (a user's edits, another mission's files) block a commit or an isolated
+   builder dispatch, do NOT commit, stash or delete them: stop the pass,
+   append `- iter N | lead | blocked: uncommitted foreign changes: <files>`
+   to `loop/LOG.md`, and set `status: needs_human` in `loop/STATE.md`.
 1. Take `open` faults first, in order: mark the fault `taken`, fix strictly
    within its `scope:`, commit `slice(<id>): fix f<N> …`, then mark it
    `done`. Mark it `stale` instead of `done` when every path in its
