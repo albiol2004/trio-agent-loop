@@ -434,3 +434,49 @@ def test_resolve_isolation_lockstep_carve_out(trioctl, repo: Path, capsys) -> No
     (lockstep / "QUEUE.md").write_text("# queue\n")  # open-loop: unchanged
     isolate, off = trioctl._resolve_isolation(parse(trioctl), repo, lockstep)
     assert off is None and isolate["worktree_root"]
+
+
+def test_explicit_isolate_workers_refused_on_detached_head(
+    trioctl, repo: Path, capsys
+) -> None:
+    """F3: an explicit flag never falls back -- detached HEAD is refused."""
+    git(repo, "checkout", "-q", "--detach")
+    with pytest.raises(trioctl.TrioctlError) as info:
+        trioctl._resolve_isolation(parse(trioctl, "--isolate-workers"), repo)
+    assert str(info.value) == (
+        "--isolate-workers refused: checkout is not on a branch "
+        "(detached HEAD); isolated workers merge back onto a branch. "
+        "Check out a branch, or drop --isolate-workers"
+    )
+    assert "worker isolation unavailable" not in capsys.readouterr().err
+
+
+def test_explicit_isolate_workers_detached_head_exits_1_via_cli(
+    trioctl, repo: Path, env: Path
+) -> None:
+    (repo / "metrics").mkdir()
+    for name in ("trio_loop.py", "trio-metrics.py"):
+        shutil.copy(ROOT / "metrics" / name, repo / "metrics")
+    git(repo, "checkout", "-q", "--detach")
+    mailbox = make_mailbox(repo)
+    (mailbox / "QUEUE.md").write_text("# queue\n")
+    run_env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    proc = subprocess.run(
+        ["python3", str(ROOT / "omnigent" / "trioctl"), "omnigent", "loop",
+         "--mailbox", str(mailbox), "--isolate-workers",
+         "--base-url", "http://127.0.0.1:9"],
+        cwd=repo, capture_output=True, text=True, env=run_env, timeout=120,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "--isolate-workers refused: checkout is not on a branch (detached HEAD)" in proc.stderr
+
+
+def test_plain_detached_head_still_falls_back(trioctl, repo: Path, capsys) -> None:
+    git(repo, "checkout", "-q", "--detach")
+    isolate, off = trioctl._resolve_isolation(parse(trioctl), repo)
+    assert isolate is None
+    assert capsys.readouterr().err.strip() == (
+        "trioctl: worker isolation unavailable (checkout is not on a branch "
+        "(detached HEAD)); running without isolation and with serial "
+        "slice-evals (pass --no-isolate-workers to silence)"
+    )

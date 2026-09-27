@@ -247,7 +247,7 @@ bindings in the user's Cursor config: non-isolated; a vendored
 `metrics/trio_loop.py` older than r10: serial slice-evals, refresh
 `metrics/` to enable). An explicit flag never falls back: `--isolate-workers`
 (the lockstep opt-in, otherwise a no-op) and `--slice-eval-concurrency N>1`
-are refused instead.
+are refused instead, including on a detached HEAD.
 
 Resolution by mailbox mode:
 

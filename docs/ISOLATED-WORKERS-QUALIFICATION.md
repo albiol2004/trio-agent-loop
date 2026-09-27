@@ -150,5 +150,7 @@ isolation stays OFF unless `--isolate-workers` is explicit.
   slice-evals): `worker_worktrees.py` missing, not a git checkout on a
   branch, `--observe-workers` (both prescribe the worker command), or
   session-bound Omnigent bindings in the user's/system Cursor config. With
-  an explicit `--isolate-workers` each of these is a refusal, as before.
+  an explicit `--isolate-workers` each of these is a refusal, as before;
+  that includes a detached HEAD (`--isolate-workers refused: checkout is
+  not on a branch (detached HEAD); ...`).
 - An explicit `--slice-eval-concurrency N>1` without isolation is refused.

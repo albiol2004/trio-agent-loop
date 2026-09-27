@@ -4395,20 +4395,29 @@ def _resolve_isolation(
         _isolation_default_unavailable(reason)
         return None, reason
     toplevel = repo
-    if not explicit:
-        try:
-            toplevel = wt.repo_toplevel(repo)
-            branch = wt.git(
-                toplevel, "symbolic-ref", "-q", "HEAD", check=False
-            ).stdout.strip()
-        except (OSError, wt.WorktreeError):
-            reason = "not a git checkout"
-            _isolation_default_unavailable(reason)
-            return None, reason
-        if not branch.startswith("refs/heads/"):
-            reason = "checkout is not on a branch (detached HEAD)"
-            _isolation_default_unavailable(reason)
-            return None, reason
+    try:
+        toplevel = wt.repo_toplevel(repo)
+        branch = wt.git(
+            toplevel, "symbolic-ref", "-q", "HEAD", check=False
+        ).stdout.strip()
+    except (OSError, wt.WorktreeError) as exc:
+        if explicit:
+            raise TrioctlError(
+                f"cannot derive a worktree root: not a git checkout ({exc})"
+            ) from exc
+        reason = "not a git checkout"
+        _isolation_default_unavailable(reason)
+        return None, reason
+    if not branch.startswith("refs/heads/"):
+        if explicit:
+            raise TrioctlError(
+                "--isolate-workers refused: checkout is not on a branch "
+                "(detached HEAD); isolated workers merge back onto a branch. "
+                "Check out a branch, or drop --isolate-workers"
+            )
+        reason = "checkout is not on a branch (detached HEAD)"
+        _isolation_default_unavailable(reason)
+        return None, reason
     inherited = wt.inherited_cursor_problems()
     if inherited:
         if explicit:
@@ -5345,8 +5354,8 @@ def parser() -> argparse.ArgumentParser:
         const=True,
         help="opt in to isolation in lockstep mode (no QUEUE.md), where it "
         "is off by default; a no-op for open-loop (isolation is the "
-        "default). When given, an unmet isolation prerequisite is a "
-        "refusal instead of a fallback to a "
+        "default). When given, an unmet isolation prerequisite (incl. a "
+        "detached HEAD) is a refusal instead of a fallback to a "
         "non-isolated run",
     )
     loop.add_argument(

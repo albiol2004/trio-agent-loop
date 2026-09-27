@@ -135,3 +135,6 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
   an explicit `--slice-eval-concurrency N>1`:
   `trioctl: lockstep mode: slice-eval concurrency not applicable`; the
   lockstep core does not use N.
+- An explicit `--isolate-workers` on a detached HEAD is refused
+  (`--isolate-workers refused: checkout is not on a branch (detached HEAD); ...`);
+  the plain default falls back to non-isolated, serial.
