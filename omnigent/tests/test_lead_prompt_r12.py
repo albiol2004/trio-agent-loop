@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import re
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -294,3 +296,75 @@ def test_targeted_check_line_helper() -> None:
     assert trioctl._targeted_check_line("built A\nall good") is None
     out = "x\n  TARGETED_CHECK: 1 failed\nTARGETED_CHECK: 4 passed in 0.12s  \ndone"
     assert trioctl._targeted_check_line(out) == "TARGETED_CHECK: 4 passed in 0.12s"
+
+
+# ------------------------------------------------ r12 repair R1 (contract)
+
+TASK_SENTENCE = 'Print `TARGETED_CHECK: <last summary line>` after running the check.'
+
+
+def test_omnigent_lead_task_template_carries_builder_sentence(tmp_path: Path) -> None:
+    block = _flat(_open_loop_block(_omnigent_open_loop_lead(tmp_path)))
+    assert "End that section with this literal sentence, which the builder sees verbatim" in block
+    assert f'"{TASK_SENTENCE}"' in block
+
+
+def test_canonical_and_generated_leads_carry_builder_sentence() -> None:
+    assert TASK_SENTENCE in _flat(_section(_canonical(), "## Open-loop mode"))
+    for path, text in _rendered_leads().items():
+        flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
+        assert TASK_SENTENCE in flat, path
+
+
+def test_isolated_builder_note_carries_contract() -> None:
+    trioctl = _load("trioctl_r12_note", ROOT / "omnigent" / "trioctl")
+    note = _flat(trioctl._ISOLATED_BUILDER_NOTE.format(
+        path="/w", branch="b", base="c", repo="/r", slice="s", mailbox="/m"))
+    assert "run the task file's `## Targeted check` command (never skip it)" in note
+    assert "TARGETED_CHECK: <last summary line>" in note
+    assert "plain text, no backticks, no bold, no bullet" in note
+    assert "TARGETED_CHECK: FAILED <summary>" in note
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("TARGETED_CHECK: 4 passed in 0.12s", "TARGETED_CHECK: 4 passed in 0.12s"),
+        ("`TARGETED_CHECK: 4 passed`", "TARGETED_CHECK: 4 passed"),
+        ("**TARGETED_CHECK:** 4 passed", "TARGETED_CHECK: 4 passed"),
+        ("**TARGETED_CHECK: 4 passed**", "TARGETED_CHECK: 4 passed"),
+        ("- TARGETED_CHECK: 4 passed", "TARGETED_CHECK: 4 passed"),
+        ("* `TARGETED_CHECK: 4 passed`", "TARGETED_CHECK: 4 passed"),
+        ("1. TARGETED_CHECK: 4 passed", "TARGETED_CHECK: 4 passed"),
+        ("TARGETED_CHECK:3 passed", "TARGETED_CHECK: 3 passed"),
+        ("TARGETED_CHECK:\t3 passed", "TARGETED_CHECK: 3 passed"),
+        ("TARGETED_CHECK:    3 passed", "TARGETED_CHECK: 3 passed"),
+        ("targeted_check: 3 passed", "TARGETED_CHECK: 3 passed"),
+        ("TARGETED_CHECK: `3 passed`", "TARGETED_CHECK: 3 passed"),
+        ("TARGETED_CHECK: FAILED 2 failed", "TARGETED_CHECK: FAILED 2 failed"),
+        ("TARGETED_CHECK: failed 2", "TARGETED_CHECK: FAILED 2"),
+        ("TARGETED_CHECK: Failed: import error", "TARGETED_CHECK: FAILED: import error"),
+        ("  TARGETED_CHECK: 5 passed  \r", "TARGETED_CHECK: 5 passed"),
+        # Placeholders echoed from the contract and empty values are ignored.
+        ("TARGETED_CHECK: <last summary line>", None),
+        ("TARGETED_CHECK: FAILED <summary>", None),
+        ("TARGETED_CHECK:", None),
+        ("**TARGETED_CHECK:**", None),
+        ("the TARGETED_CHECK: line was missing", None),
+    ],
+)
+def test_targeted_check_line_variants(line: str, expected: str | None) -> None:
+    trioctl = _load("trioctl_r12_tcv", ROOT / "omnigent" / "trioctl")
+    assert trioctl._targeted_check_line(f"built A\n{line}\ndone") == expected
+
+
+def test_targeted_check_line_last_wins_and_failed_is_mechanical() -> None:
+    trioctl = _load("trioctl_r12_tcl", ROOT / "omnigent" / "trioctl")
+    tc = trioctl._targeted_check_line
+    # Fix-and-rerun: the rerun's line wins, in either direction.
+    assert tc("TARGETED_CHECK: FAILED 1 failed\n`TARGETED_CHECK: 4 passed`") == "TARGETED_CHECK: 4 passed"
+    assert tc("TARGETED_CHECK: 4 passed\n- targeted_check: failed 1") == "TARGETED_CHECK: FAILED 1"
+    # A trailing echoed placeholder does not erase the real result.
+    assert tc("TARGETED_CHECK: 4 passed\nTARGETED_CHECK: <last summary line>") == "TARGETED_CHECK: 4 passed"
+    for out in ("TARGETED_CHECK: failed x", "**TARGETED_CHECK:** FAILED y", "- targeted_check:FAILED"):
+        assert tc(out).startswith("TARGETED_CHECK: FAILED"), out

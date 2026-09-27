@@ -173,9 +173,15 @@ FAKE_CURSOR = textwrap.dedent(
     json.dump({"pid": os.getpid(), "pgid": os.getpgid(0), "cwd": cwd,
                "workspace": ws, "seen": seen, "start": start,
                "end": time.time()}, open(log, "w"))
+    with open(os.path.join(os.environ["FAKE_LOG"], f"{slice_id}.prompt"), "w") as fh:
+        fh.write(prompt)
     print(f"built {slice_id}")
-    if "TARGETED" in prompt:
-        print("TARGETED_CHECK: 4 passed in 0.12s")
+    # Obey the TARGETED_CHECK contract only when trioctl's RENDERED builder
+    # prompt (role prompt + isolated note, i.e. everything before the
+    # Lead's task text) carries it -- never because the task mentions it.
+    rendered = prompt.split("Implement slice.")[0]
+    if "TARGETED_CHECK" in rendered and "NO_TC" not in prompt:
+        print(os.environ.get("FAKE_TC", "TARGETED_CHECK: 4 passed in 0.12s"))
     """
 ) % {"mcp": repr(LEAD_MCP)}
 
@@ -258,8 +264,10 @@ def test_concurrent_builders_get_separate_roots_and_keep_lead_config(
 
 def test_isolated_run_json_surfaces_targeted_check_line(wt, repo, root, fake_env):
     """r12 C: the builder's `TARGETED_CHECK: ` line lands in the JSON the
-    Lead copies into its ledger; a builder that prints none yields null."""
-    procs = {s: launch(fake_env, repo, root, s, extra=("TARGETED" if s == "A" else ""))
+    Lead copies into its ledger; a builder that prints none yields null.
+    The fake prints the line only because trioctl's rendered builder
+    prompt asks for it (B simulates a builder that ignores the contract)."""
+    procs = {s: launch(fake_env, repo, root, s, extra=("NO_TC" if s == "B" else ""))
              for s in ("A", "B")}
     views = {}
     for s, proc in procs.items():
@@ -271,6 +279,39 @@ def test_isolated_run_json_surfaces_targeted_check_line(wt, repo, root, fake_env
     assert views["A"]["worker_worktree"]["state"] == "integrated"
     assert views["B"]["targeted_check"] is None
     assert views["B"]["worker_worktree"]["state"] == "integrated"
+
+
+def test_live_isolated_builder_prompt_carries_targeted_check_contract(
+    wt, repo, root, fake_env, tmp_path
+):
+    """r12 repair R1: the contract reaches the builder through the real
+    dispatch path (CURSOR_ROLE_PROMPTS["builder"] + _ISOLATED_BUILDER_NOTE,
+    rendered by `omnigent run builder --isolate`), not through a role
+    config.yaml that trioctl never reads -- and not only via the task."""
+    proc = launch(fake_env, repo, root, "A")
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    prompt = (tmp_path / "fake-log" / "A.prompt").read_text()
+    rendered, task = prompt.split("Implement slice.", 1)
+    assert "TARGETED" not in task
+    flat = " ".join(rendered.split())
+    assert "run the task file's `## Targeted check` command (never skip it)" in flat
+    assert "print its LAST summary line verbatim" in flat
+    assert "TARGETED_CHECK: <last summary line>" in flat
+    assert "plain text, no backticks, no bold, no bullet" in flat
+    assert "TARGETED_CHECK: FAILED <summary>" in flat
+    (line,) = [ln for ln in out.splitlines() if ln.startswith('{"')]
+    assert json.loads(line)["targeted_check"] == "TARGETED_CHECK: 4 passed in 0.12s"
+
+
+def test_isolated_run_normalizes_decorated_targeted_check(wt, repo, root, fake_env):
+    """A builder that wraps the line in markdown still reaches the ledger."""
+    env = dict(fake_env, FAKE_TC="- **TARGETED_CHECK:** `2 failed, 3 passed`")
+    proc = launch(env, repo, root, "A")
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    (line,) = [ln for ln in out.splitlines() if ln.startswith('{"')]
+    assert json.loads(line)["targeted_check"] == "TARGETED_CHECK: 2 failed, 3 passed"
 
 
 def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(

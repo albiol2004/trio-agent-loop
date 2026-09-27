@@ -143,7 +143,9 @@ extension"), run this loop instead of waiting for a verdict:
    `## Targeted check` section** with ONE exact command scoped to the
    slice's `writes:` and derived from its `accepts:` (e.g. `python3 -m
    pytest -q tests/test_<slice>.py` or `npx vitest run <path>`). A task
-   file without it is invalid — do not dispatch it.
+   file without it is invalid — do not dispatch it. End that section with
+   this literal sentence, which the builder sees verbatim: "Print
+   `TARGETED_CHECK: <last summary line>` after running the check."
 3. **Retire each slice the moment it lands — per slice, not per wave.**
    As soon as an isolated builder's run prints `integrated` (its
    `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's

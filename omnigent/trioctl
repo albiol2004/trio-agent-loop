@@ -1001,7 +1001,16 @@ _ISOLATED_BUILDER_NOTE = (
     "copy and may be stale; read the live mailbox only at `{mailbox}` and "
     "never write it. When you exit 0, trioctl commits everything you left in "
     "this worktree as `slice({slice}): ...` and merges it into the aggregate; "
-    "a failed or interrupted run is never integrated."
+    "a failed or interrupted run is never integrated.\n\n"
+    "TARGETED CHECK (mandatory): after implementing, run the task file's "
+    "`## Targeted check` command (never skip it) and print its LAST summary "
+    "line verbatim on a line of its own in your final message, in the form "
+    "TARGETED_CHECK: <last summary line> -- plain text, no backticks, no "
+    "bold, no bullet. If the command fails or cannot run, print "
+    "TARGETED_CHECK: FAILED <summary> instead. If the task file has no "
+    "`## Targeted check` section, print "
+    "TARGETED_CHECK: FAILED no targeted check in task. The Lead retires this "
+    "slice only on a TARGETED_CHECK line that is present and not FAILED."
 )
 
 
@@ -1118,15 +1127,39 @@ def _command_run_isolated(
 
 
 TARGETED_CHECK_PREFIX = "TARGETED_CHECK: "
+# Tolerant of the decorations models add despite the plain-text contract:
+# an optional list bullet / number, backticks, bold or underscores around
+# the prefix or the value, any case, any (or no) whitespace after the colon.
+_TARGETED_CHECK_RE = re.compile(
+    r"^(?:[-*+\u2022]\s+|\d+[.)]\s+)?[`*_]*\s*TARGETED_CHECK[`*_]*\s*:"
+    r"[\s`*_]*(?P<rest>.*?)[\s`*_]*$",
+    re.IGNORECASE,
+)
+# The contract's own placeholder, echoed back instead of a real result.
+_TARGETED_CHECK_PLACEHOLDER_RE = re.compile(r"^(?:FAILED\s+)?<[^<>]*>$", re.IGNORECASE)
+_TARGETED_CHECK_FAILED_RE = re.compile(r"^failed\b", re.IGNORECASE)
 
 
 def _targeted_check_line(output: str | None) -> str | None:
-    """The builder's LAST `TARGETED_CHECK: ` line, verbatim, or None."""
+    """The builder's LAST `TARGETED_CHECK:` line, normalized, or None.
+
+    Returned as ``TARGETED_CHECK: <value>`` (decorations stripped, a
+    case-insensitive leading ``failed`` upper-cased to ``FAILED``) so the
+    Lead's "does not start with `TARGETED_CHECK: FAILED`" test is
+    mechanical. Empty values and echoed placeholders are ignored; the
+    last matching line wins (fix-and-rerun reports the rerun).
+    """
     found = None
     for line in (output or "").splitlines():
-        line = line.strip()
-        if line.startswith(TARGETED_CHECK_PREFIX):
-            found = line
+        match = _TARGETED_CHECK_RE.match(line.strip())
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        if not rest or _TARGETED_CHECK_PLACEHOLDER_RE.match(rest):
+            continue
+        if _TARGETED_CHECK_FAILED_RE.match(rest):
+            rest = "FAILED" + rest[len("failed"):]
+        found = TARGETED_CHECK_PREFIX + rest
     return found
 
 
@@ -2645,7 +2678,9 @@ _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
     "   command scoped to the slice's `writes:` and derived from its\n"
     "   `accepts:` (e.g. `python3 -m pytest -q tests/test_<slice>.py` or\n"
     "   `npx vitest run <path>`). A task file without it is invalid — do not\n"
-    "   dispatch it.\n"
+    "   dispatch it. End that section with this literal sentence, which the\n"
+    "   builder sees verbatim: \"Print `TARGETED_CHECK: <last summary line>`\n"
+    "   after running the check.\"\n"
     "3. Retire each slice the moment it lands — per slice, not per wave.\n"
     "   As soon as an isolated builder's run prints `integrated` (its\n"
     "   `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that\n"
