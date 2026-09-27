@@ -2750,6 +2750,7 @@ class OmnigentRunner:
         completion_receipts: bool = False,
         isolate_workers: dict[str, Any] | None = None,
         end_root_sessions: bool = True,
+        restore_root_config: bool = False,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -2780,6 +2781,12 @@ class OmnigentRunner:
         # project Cursor config, so the graded tree is the product alone
         # (False with --keep-sessions: the config stays, acceptance waits).
         self._end_root_sessions = end_root_sessions
+        # Non-isolated loop runs (`--no-isolate-workers`, lockstep default):
+        # every session's workspace is the root, so Omnigent's generated
+        # `.cursor/{mcp,hooks}.json` lands there too. When set, the same
+        # baseline/restore as isolated mode applies to it, without ever
+        # waiting for the root before a launch (sessions may overlap).
+        self._restore_root_nonisolated = bool(restore_root_config) and not isolate_workers
         # Root-bound (aggregate workspace) sessions this runner created, in
         # order; used to prove the previous one no longer owns the root's
         # project Cursor config before the root is reused.
@@ -3248,6 +3255,41 @@ class OmnigentRunner:
             print(f"trioctl: root Cursor config: {problem}", file=sys.stderr)
         return problems
 
+    def _manages_root_config(self) -> bool:
+        """Whether root-bound dispatches baseline/restore the root ``.cursor``."""
+        return worker_worktrees is not None and bool(
+            self._isolate or self._restore_root_nonisolated
+        )
+
+    def _snapshot_root_config(self) -> None:
+        """Non-isolated launch: record the root's pre-run config once, never wait."""
+        try:
+            worker_worktrees.snapshot_root_cursor(self.repo)
+        except worker_worktrees.WorktreeError as exc:
+            print(f"trioctl: root Cursor config baseline not taken: {exc}", file=sys.stderr)
+
+    def _end_root_sessions_nonisolated(self, mailbox: Path) -> None:
+        """Non-isolated: after a finished evaluator, end finished root sessions, restore.
+
+        Only when no other dispatch of this runner is in flight (open-loop
+        can run the Lead and an evaluator at the root together; their
+        sessions are never touched and the config stays until loop end).
+        Held sessions refuse the release; the config is then left in place
+        and the loop core's acceptance check decides.
+        """
+        if not self._end_root_sessions:
+            return
+        with self._own_lock:
+            busy = bool(self._inflight)
+        if busy:
+            return
+        try:
+            self._release_root(mailbox)
+        except Exception as exc:  # noqa: BLE001 - config stays; acceptance decides
+            print(f"trioctl: root Cursor config left in place: {exc}", file=sys.stderr)
+            return
+        self._restore_root_config(mailbox)
+
     def _prepare_root_config(self, mailbox: Path) -> None:
         """Before a root-bound launch (root already released): restore, then baseline."""
         self._restore_root_config(mailbox)
@@ -3306,8 +3348,16 @@ class OmnigentRunner:
 
     def restore_root_config_final(self, mailbox: Path) -> list[str]:
         """Loop end, after the post-loop prune: restore and drop the baseline."""
-        if not self._isolate or worker_worktrees is None:
+        if not self._manages_root_config():
             return []
+        if not self._isolate:
+            # Non-isolated: nothing ended the root sessions before the
+            # post-loop prune; their runners exit asynchronously.
+            deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
+            while worker_worktrees.cursor_processes_at(self.repo):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5 if self._interval else 0.0)
         return self._restore_root_config(mailbox, final=True)
 
     def _observe_phase(
@@ -3777,6 +3827,8 @@ class OmnigentRunner:
                     self._fence_tokens[token] = False
             else:
                 self._release_fences(finished_only=True)
+        elif self._restore_root_nonisolated and worker_worktrees is not None and eval_wt is None:
+            self._snapshot_root_config()
         if eval_wt is not None:
             workspace = eval_wt["path"]
             prompt = (
@@ -3807,7 +3859,7 @@ class OmnigentRunner:
                 ),
             }
         dispatch["workspace"] = workspace
-        root_bound = eval_wt is None and bool(self._isolate) and worker_worktrees is not None
+        root_bound = eval_wt is None and self._manages_root_config()
         if root_bound:
             dispatch["root_mailbox"] = mailbox
         try:
@@ -3831,7 +3883,7 @@ class OmnigentRunner:
                     self._delivery.pop(session_id, None)
                 if dispatch.get("fence"):
                     self._fence_tokens[dispatch["fence"]] = True  # finished
-                if eval_wt is None and self._isolate and session_id:
+                if root_bound and session_id:
                     self._root_finished.append(
                         {"session_id": session_id, "role": role, "workspace": workspace}
                     )
@@ -3839,7 +3891,10 @@ class OmnigentRunner:
                 self._release_eval_worktree(eval_wt, session_id)
         if root_bound and role == "evaluator" and code == 0 and dispatch.get("session_id"):
             # The loop core grades acceptance right after this returns.
-            self._end_root_evaluator(mailbox, dispatch["session_id"])
+            if self._isolate:
+                self._end_root_evaluator(mailbox, dispatch["session_id"])
+            else:
+                self._end_root_sessions_nonisolated(mailbox)
         return code
 
     def _release_fences(self, *, finished_only: bool) -> None:
@@ -4192,6 +4247,9 @@ def _load_trio_loop(repo: Path) -> Any:
         raise _refuse_core(path, f"loading it failed ({type(exc).__name__}: {exc})") from exc
     if not callable(getattr(module, "run_loop", None)):
         raise TrioctlError(f"{path} does not expose run_loop")
+    if worker_worktrees is not None and hasattr(module, "owned_residue_check"):
+        # The same Omnigent-residue fingerprint trioctl restores by.
+        module.owned_residue_check = worker_worktrees.owned_residue
     return module
 
 
@@ -4607,6 +4665,7 @@ def _command_loop(args: argparse.Namespace) -> int:
         workspace=str(repo),
         completion_receipts=getattr(args, "completion_receipts", False),
         end_root_sessions=not getattr(args, "keep_sessions", False),
+        restore_root_config=not isolate,
         **runner_kwargs,
     )
     keep_sessions = getattr(args, "keep_sessions", False)
@@ -4726,6 +4785,13 @@ def _command_loop(args: argparse.Namespace) -> int:
                 _run_worktree_cleanup(repo, mailbox, torn_down=torn_down)
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: worker worktree cleanup failed: {exc}", file=sys.stderr)
+        elif not keep_sessions:
+            # Non-isolated: the root sessions were just pruned; undo their
+            # own Omnigent merges into the root `.cursor` config.
+            try:
+                runner.restore_root_config_final(mailbox)
+            except Exception as exc:  # noqa: BLE001 - never change the exit code
+                print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
         if observe:
             _finish_observation(observe)
 

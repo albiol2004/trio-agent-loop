@@ -494,7 +494,9 @@ def _disposable_ignored(rel: str) -> bool:
 # left of it, through an atomic exchange that keeps any competing write.
 # Any other difference (a user or concurrent edit, a foreign or held
 # session's entry) is left in place and the product check keeps failing
-# closed. Nothing is ever ignored or excluded.
+# closed. trioctl never ignores or excludes anything; the loop core only
+# exempts an untracked file whose content is EXACTLY the generated config
+# (:func:`owned_residue`), never a user-edited or tracked one.
 
 ROOT_CURSOR_DIR_NAME = "root-cursor"
 _USAGE_HOOK_MODULE = "omnigent.harnesses.cursor_native.usage"

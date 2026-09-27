@@ -442,10 +442,13 @@ def test_n6_prune_failure_keeps_bookkeeping_and_config(
 
     monkeypatch.setattr(trioctl, "_prune_broker_sessions", failing)
     code = _drive(loop_core, mailbox, repo, runner)
-    assert code == 6                                           # never shipped
+    # r11: the config is left in place, but exact generated residue is not
+    # product, so the bound SHIP is accepted (a user edit would still block).
+    assert code == 0
     assert (repo / ".cursor" / "mcp.json").exists()             # config left in place
     evaluators = [e for e in runner._root_finished if e["role"] == "evaluator"]
     assert evaluators, "finished evaluator bookkeeping must be kept"
+    (repo / ".cursor" / "other.json").write_text("{}\n")       # real product residue
     assert "pending" in trioctl._ship_acceptance(mailbox, repo, loop_core)
     assert Path(rec["path"]).is_dir()
 

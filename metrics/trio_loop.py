@@ -973,13 +973,63 @@ def _product_paths_changed(
     return any(not _path_in_mailbox(p, mailbox_rel) for p in paths)
 
 
+# Omnigent's cursor-native harness writes exactly these project config
+# files into every session workspace. When the workspace is the root
+# (non-isolated runs), an untracked copy whose content is exactly the
+# generated bridge config is Omnigent residue, not product. The
+# fingerprint lives in omnigent/worker_worktrees.py (``owned_residue``);
+# trioctl injects it as ``owned_residue_check`` when it loads this core,
+# otherwise the sibling copy of the repo layout is used. Without either,
+# nothing is exempt (fail closed). Any other ``.cursor`` path, a tracked
+# or modified config, or a file with user edits stays product.
+OMNIGENT_RESIDUE_PATHS = (".cursor/mcp.json", ".cursor/hooks.json")
+owned_residue_check = None
+_SIBLING_RESIDUE_CHECK: list = []
+
+
+def _residue_check():
+    """The Omnigent-residue predicate ``(root, rel) -> bool``, or None."""
+    if owned_residue_check is not None:
+        return owned_residue_check
+    if not _SIBLING_RESIDUE_CHECK:
+        check = None
+        path = Path(__file__).resolve().parent.parent / "omnigent" / "worker_worktrees.py"
+        if path.is_file():
+            try:
+                loader = importlib.machinery.SourceFileLoader(
+                    "trio_loop_worker_worktrees", str(path)
+                )
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                check = getattr(module, "owned_residue", None)
+            except Exception:  # noqa: BLE001 - no predicate means fail closed
+                check = None
+        _SIBLING_RESIDUE_CHECK.append(check if callable(check) else None)
+    return _SIBLING_RESIDUE_CHECK[0]
+
+
+def _is_omnigent_residue(repo: Path, rel: str) -> bool:
+    if rel not in OMNIGENT_RESIDUE_PATHS:
+        return False
+    check = _residue_check()
+    if check is None:
+        return False
+    try:
+        return bool(check(repo, rel))
+    except Exception:  # noqa: BLE001 - unreadable means product
+        return False
+
+
 def _product_untracked_paths(
     repo: Path, mailbox_rel: str | None
 ) -> list[str] | None:
     """Nonignored untracked paths outside the mailbox, or None on git error.
 
     Uses ``ls-files -o --exclude-standard`` so ignored build/runtime
-    outputs are omitted. Does not stage or delete anything.
+    outputs are omitted. Untracked Omnigent-generated root Cursor config
+    (exact fingerprint, see ``OMNIGENT_RESIDUE_PATHS``) is omitted too.
+    Does not stage or delete anything.
     """
     result = _git(
         repo, "ls-files", "-o", "--exclude-standard"
@@ -989,7 +1039,9 @@ def _product_untracked_paths(
     return [
         line.strip()
         for line in result.stdout.splitlines()
-        if line.strip() and not _path_in_mailbox(line.strip(), mailbox_rel)
+        if line.strip()
+        and not _path_in_mailbox(line.strip(), mailbox_rel)
+        and not _is_omnigent_residue(repo, line.strip())
     ]
 
 
@@ -1029,8 +1081,9 @@ def _evaluated_product_problem(
     HEAD must still descend from the pin. Later product commits,
     staged/unstaged product edits, and a missing pin object fail.
     Any nonignored untracked product file (even if it existed
-    before the pin) fails closed. Mailbox files and ignored
-    outputs do not block. No-repo callers skip this helper.
+    before the pin) fails closed. Mailbox files, ignored outputs and
+    untracked exact Omnigent-generated ``.cursor/{mcp,hooks}.json``
+    do not block. No-repo callers skip this helper.
     """
     if not evaluated_sha.strip():
         return None

@@ -164,7 +164,8 @@ def test_owned_generated_config_is_removed_and_tree_is_clean(wt, repo, loop_core
     assert wt.snapshot_root_cursor(repo) is True
     omnigent_launch(repo, "lead-1")
     omnigent_launch(repo, "eval-1")          # replaces the Lead's entries
-    assert "untracked product paths" in _product_problem(loop_core, repo)
+    # r11: exact generated residue is not product for the loop core either.
+    assert _product_problem(loop_core, repo) is None
     assert wt.restore_root_cursor(repo, {"lead-1", "eval-1"}, final=True) == []
     assert not (repo / ".cursor" / "mcp.json").exists()
     assert not (repo / ".cursor" / "hooks.json").exists()
@@ -237,7 +238,9 @@ def test_foreign_session_entry_is_never_stripped(wt, repo, loop_core):
     problems = wt.restore_root_cursor(repo, {"eval-1"})
     assert len(problems) == 2
     assert {p: (repo / p).read_bytes() for p in wt.OWNED_CURSOR_FILES} == before
-    assert "untracked product paths" in _product_problem(loop_core, repo)
+    # r11: left in place (not ours to strip), but exact generated residue
+    # is not a product path for acceptance.
+    assert _product_problem(loop_core, repo) is None
 
 
 def test_symlinked_cursor_dir_is_never_touched(wt, repo, tmp_path):
@@ -455,10 +458,18 @@ def test_e2e_keep_sessions_leaves_config_and_never_forges_acceptance(
     rec = _integrated_demo_worker(wt, repo, root)
     runner, ended = _e2e_runner(trioctl, repo, root, monkeypatch, _LaunchingClient(),
                                 end_root_sessions=False)
-    assert _drive(loop_core, mailbox, repo, runner) == 6        # needs_retirement
+    # r11: the kept sessions' exact generated config stays in place, but it
+    # is Omnigent residue, not product: the bound SHIP is accepted.
+    assert _drive(loop_core, mailbox, repo, runner) == 0
     assert (repo / ".cursor" / "mcp.json").exists()
+    state = loop_core._read_state(mailbox / "STATE.md")
     got = trioctl._ship_acceptance(mailbox, repo, loop_core)
-    assert "pending" in got
+    assert got["evaluated"] == state["evaluated_sha"]
+    # A user edit to that config makes it product again: acceptance pends.
+    data = json.loads((repo / ".cursor" / "mcp.json").read_text())
+    data["mcpServers"]["mine"] = {"command": "my-server"}
+    (repo / ".cursor" / "mcp.json").write_text(json.dumps(data))
+    assert "pending" in trioctl._ship_acceptance(mailbox, repo, loop_core)
     (res,) = [r for r in wt.cleanup(repo, acceptance_for=lambda box:
               trioctl._ship_acceptance(box, repo, loop_core)) if r["id"] == rec["id"]]
     assert res["state"] == "integrated" and Path(rec["path"]).is_dir()
