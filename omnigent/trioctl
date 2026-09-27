@@ -3461,8 +3461,61 @@ class OmnigentRunner:
             # is appended once created).
             worker_worktrees.mark_running(self.repo, record, None)
             return record
-        except worker_worktrees.WorktreeError as exc:
+        except (worker_worktrees.WorktreeError, OSError, subprocess.SubprocessError) as exc:
             raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
+
+    def _bind_slice_eval(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+        dispatch: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """(slice-eval worktree or None, degraded reason or None). Never raises.
+
+        A failed bind never kills the driver: it is logged once, recorded
+        as ``eval_isolation: degraded (<reason>)`` in this dispatch's
+        session bookkeeping (``inflight_sessions`` -> `.driver.json`) and
+        in LOG.md, and the slice-eval runs on the root-bound non-isolated
+        path (the evaluator grades in its own ``git worktree add`` at the
+        pin, as with ``--no-isolate-workers``).
+        """
+        try:
+            return self._slice_eval_worktree(role, mailbox, context), None
+        except TrioctlError as exc:
+            reason = str(exc)
+        slice_id = (context or {}).get("slice") or "?"
+        sha = str((context or {}).get("sha") or "")[:12]
+        note = f"eval_isolation: degraded ({reason})"
+        print(
+            f"trioctl: slice-eval {slice_id}@{sha}: {note}; grading on the "
+            "root-bound (non-isolated) path",
+            file=sys.stderr,
+        )
+        dispatch["meta"]["eval_isolation"] = f"degraded ({reason})"
+        with self._own_lock:
+            self.__dict__.setdefault("eval_isolation_degraded", []).append(
+                {"slice": slice_id, "sha": (context or {}).get("sha"), "reason": reason}
+            )
+        line = (
+            f"- iter {iteration} | loop | slice-eval {slice_id} @{sha} "
+            f"{note.replace(chr(10), ' ')}\n"
+        )
+        try:
+            log = mailbox / "LOG.md"
+            prefix = ""
+            if log.is_file():
+                with open(log, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    if fh.tell():
+                        fh.seek(-1, os.SEEK_END)
+                        prefix = "" if fh.read(1) == b"\n" else "\n"
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(prefix + line)
+        except OSError as exc:
+            print(f"trioctl: could not log degraded eval isolation: {exc}", file=sys.stderr)
+        return None, reason
 
     ROOT_RELEASE_WAIT = 30.0
 
@@ -4143,9 +4196,17 @@ class OmnigentRunner:
                 "sha": (context or {}).get("sha"),
             },
         }
-        eval_wt = self._slice_eval_worktree(role, mailbox, context)
+        eval_wt, eval_degraded = self._bind_slice_eval(
+            role, iteration, mailbox, context, dispatch
+        )
         workspace = self._workspace
-        if self._isolate and worker_worktrees is not None and eval_wt is None:
+        if eval_degraded is not None and worker_worktrees is not None:
+            # Degraded slice-eval: the non-isolated path. The Lead may be
+            # live at the root, so never wait for / release the root and
+            # hold no integration fence (the evaluator grades its own
+            # worktree at the pin); only baseline the root config once.
+            self._snapshot_root_config()
+        elif self._isolate and worker_worktrees is not None and eval_wt is None:
             # Root-bound dispatch (Lead, repair, lockstep evaluator,
             # integration-eval): the root must be free first.
             self._release_root(mailbox)
@@ -4227,7 +4288,7 @@ class OmnigentRunner:
                 self._release_eval_worktree(eval_wt, session_id)
         if root_bound and role == "evaluator" and code == 0 and dispatch.get("session_id"):
             # The loop core grades acceptance right after this returns.
-            if self._isolate:
+            if self._isolate and eval_degraded is None:
                 self._end_root_evaluator(mailbox, dispatch["session_id"])
             else:
                 self._end_root_sessions_nonisolated(mailbox)

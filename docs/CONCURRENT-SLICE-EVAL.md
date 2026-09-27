@@ -135,6 +135,15 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
   an explicit `--slice-eval-concurrency N>1`:
   `trioctl: lockstep mode: slice-eval concurrency not applicable`; the
   lockstep core does not use N.
+- A slice-eval whose detached worktree cannot be bound (r14 E-1; any
+  `create()` refusal or OS error) never ends the loop: one stderr line
+  `trioctl: slice-eval <slice>@<sha12>: eval_isolation: degraded (<reason>); ...`,
+  the same text as a `- iter N | loop | ...` LOG.md line and as
+  `eval_isolation` in that dispatch's in-flight session meta (`.driver.json`),
+  then that one slice-eval runs on the non-isolated path: root workspace,
+  the evaluator's own `git worktree add` at the pin, no root release/wait
+  (the Lead may be live at the root), no integration fence, root `.cursor`
+  baseline only. Other slice-evals stay isolated.
 - An explicit `--isolate-workers` on a detached HEAD is refused
   (`--isolate-workers refused: checkout is not on a branch (detached HEAD); ...`);
   the plain default falls back to non-isolated, serial.
