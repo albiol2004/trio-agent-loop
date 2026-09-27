@@ -271,6 +271,40 @@ def test_counts_lines_parse_through_real_helper() -> None:
     assert tc("TARGETED_CHECK: <the line stating the pass/fail counts>") is None
 
 
+
+# ------------------------------------------ r13 doubt 2: template literals
+
+
+def test_template_literals_copied_verbatim_are_not_reported() -> None:
+    tc = _trioctl("tpl")._targeted_check_line
+    literals = (
+        "PASS <n>", "PASS <count>", "<last summary line>", "<counts line>",
+        "<n> passed", "<n> passed in <t>s", "Tests <n> passed", "PASS n",
+        "...", "\u2026", "counts line", "last summary line", "FAILED <summary>",
+        "`PASS <n>`",
+    )
+    for value in literals:
+        assert tc(f"TARGETED_CHECK: {value}") is None, value
+        assert tc(f"- **TARGETED_CHECK:** {value}") is None, value
+        # An echoed literal after a real result does not erase it ...
+        assert tc(f"TARGETED_CHECK: 4 passed\nTARGETED_CHECK: {value}") == "TARGETED_CHECK: 4 passed", value
+        # ... and a literal alone never reads as a pass.
+        assert tc(f"built\nTARGETED_CHECK: {value}\ndone") is None, value
+
+
+def test_real_values_survive_template_filter() -> None:
+    tc = _trioctl("tplok")._targeted_check_line
+    assert tc("TARGETED_CHECK: PASS 3") == "TARGETED_CHECK: PASS 3"
+    assert tc("TARGETED_CHECK: 4 passed in 0.12s") == "TARGETED_CHECK: 4 passed in 0.12s"
+    assert tc("TARGETED_CHECK: Tests  9 passed (9)") == "TARGETED_CHECK: Tests  9 passed (9)"
+    assert tc("TARGETED_CHECK: PASS") == "TARGETED_CHECK: PASS"
+    # A real failure quoting `<...>` text is kept (and stays FAILED).
+    assert (tc("TARGETED_CHECK: FAILED test_x - assert <Foo> == 1")
+            == "TARGETED_CHECK: FAILED test_x - assert <Foo> == 1")
+    assert (tc("TARGETED_CHECK: 1 failed: <Foo> != 2")
+            == "TARGETED_CHECK: FAILED 1 failed: <Foo> != 2")
+
+
 # ------------------------------------------------ G3 append-only retire
 
 APPEND_ONLY = ("appends ONE new entry at the end of the block, with `at:` = that "

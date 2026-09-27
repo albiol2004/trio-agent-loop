@@ -1143,8 +1143,17 @@ _TARGETED_CHECK_RE = re.compile(
     r"[\s`*_]*(?P<rest>.*?)[\s`*_]*$",
     re.IGNORECASE,
 )
-# The contract's own placeholder, echoed back instead of a real result.
+# The contract's own placeholder, echoed back instead of a real result: a
+# value that is only a `<...>` placeholder (optionally after FAILED).
 _TARGETED_CHECK_PLACEHOLDER_RE = re.compile(r"^(?:FAILED\s+)?<[^<>]*>$", re.IGNORECASE)
+# Any unexpanded `<...>` placeholder anywhere in the value (`PASS <n>`,
+# `PASS <count>`, `<n> passed`): a template copied literally, never a pass.
+_TARGETED_CHECK_ANY_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
+# Template literals without angle brackets that are equally content-free.
+_TARGETED_CHECK_TEMPLATE_LITERALS = frozenset({
+    "...", "\u2026", "pass n", "pass <n>", "pass <count>", "line", "counts line",
+    "last summary line", "summary",
+})
 _TARGETED_CHECK_FAILED_RE = re.compile(r"^failed\b", re.IGNORECASE)
 # A value that reports failures without the FAILED prefix (pytest's last
 # line copied verbatim, e.g. `2 failed, 3 passed`, `1 error`, `no tests
@@ -1162,8 +1171,12 @@ def _targeted_check_line(output: str | None) -> str | None:
     value reporting failures without that prefix -- ``N failed``, ``N
     error(s)``, ``no tests ran``, ``FAIL`` -- prefixed with ``FAILED ``) so the
     Lead's "does not start with `TARGETED_CHECK: FAILED`" test is
-    mechanical. Empty values and echoed placeholders are ignored; the
-    last matching line wins (fix-and-rerun reports the rerun).
+    mechanical. Empty values, echoed placeholders and template literals
+    copied verbatim (``PASS <n>``, ``PASS <count>``, ``<last summary
+    line>``, any non-failure value holding an unexpanded ``<...>``) are
+    ignored, so a builder that only echoes the template reads as "not
+    reported"; the last matching line wins (fix-and-rerun reports the
+    rerun).
     """
     found = None
     for line in (output or "").splitlines():
@@ -1172,6 +1185,16 @@ def _targeted_check_line(output: str | None) -> str | None:
             continue
         rest = match.group("rest").strip()
         if not rest or _TARGETED_CHECK_PLACEHOLDER_RE.match(rest):
+            continue
+        if " ".join(rest.lower().split()) in _TARGETED_CHECK_TEMPLATE_LITERALS:
+            continue
+        # A non-failure value with an unexpanded placeholder is a template
+        # echo, not a result: treat as absent so the Lead re-dispatches.
+        # (A real failure may quote `<...>` text, e.g. `FAILED ... <Foo>`,
+        # and is kept: it is never retired either way.)
+        if (_TARGETED_CHECK_ANY_PLACEHOLDER_RE.search(rest)
+                and not _TARGETED_CHECK_FAILED_RE.match(rest)
+                and not _TARGETED_CHECK_FAILURE_TEXT_RE.search(rest)):
             continue
         if _TARGETED_CHECK_FAILED_RE.match(rest):
             rest = "FAILED" + rest[len("failed"):]
