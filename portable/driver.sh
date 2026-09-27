@@ -51,6 +51,11 @@ build_prompt() {
     printf 'OPEN-LOOP CONTEXT: kind=%s' "${TRIO_KIND:-}"
     [[ -n "${TRIO_SLICE:-}" ]] && printf ' slice=%s' "$TRIO_SLICE"
     [[ -n "${TRIO_SHA:-}" ]] && printf ' sha=%s' "$TRIO_SHA"
+    if [[ -n "${TRIO_QUEUE_ERRORS:-}" ]]; then
+      # r11g Q1: same note as trioctl _open_loop_queue_errors_note.
+      printf '\nQUEUE.md PARSE ERRORS: the integration gate is held until the `faults:` block parses cleanly. Repair these entries in place (keep every fault, fix its shape):'
+      while IFS= read -r qerr; do printf '\n- %s' "$qerr"; done <<<"$TRIO_QUEUE_ERRORS"
+    fi
     printf '\n\n'
   elif [[ -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
     # Lockstep: same LOCKSTEP CONTEXT prefix as OmnigentRunner._prompt.

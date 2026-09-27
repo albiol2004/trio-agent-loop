@@ -240,18 +240,18 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
     errors: list[str] = []
 
     retired: list[dict] = []
-    retired_lines = tm.find_queue_block(queue_text, "retired")
+    parse_errors: list[str] = []
+    retired_lines = tm.find_queue_block(queue_text, "retired", errors=parse_errors)
     if retired_lines is not None:
-        parse_errors: list[str] = []
         retired = tm.parse_retired(retired_lines, errors=parse_errors)
-        errors.extend(f"QUEUE.md `retired:` block: {e}" for e in parse_errors)
+    errors.extend(f"QUEUE.md `retired:` block: {e}" for e in parse_errors)
 
     faults: list[dict] = []
-    faults_lines = tm.find_queue_block(queue_text, "faults")
+    parse_errors = []
+    faults_lines = tm.find_queue_block(queue_text, "faults", errors=parse_errors)
     if faults_lines is not None:
-        parse_errors = []
         faults = tm.parse_faults(faults_lines, errors=parse_errors)
-        errors.extend(f"QUEUE.md `faults:` block: {e}" for e in parse_errors)
+    errors.extend(f"QUEUE.md `faults:` block: {e}" for e in parse_errors)
 
     known_ids = {sl["id"] for sl in slices} if slices is not None else None
     if known_ids is None:

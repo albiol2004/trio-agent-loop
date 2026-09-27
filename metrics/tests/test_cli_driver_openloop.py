@@ -543,3 +543,65 @@ def test_portable_dispatch_without_fields_does_not_ship(
     assert result.returncode == 6, result.stderr + result.stdout
     state = (mailbox / "STATE.md").read_text(encoding="utf-8")
     assert "status: needs_retirement" in state
+
+
+def _load_trioctl():
+    import importlib.machinery
+    import importlib.util
+
+    path = ROOT / "omnigent" / "trioctl"
+    loader = importlib.machinery.SourceFileLoader("trioctl_r11g", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_lead_pass_queue_errors_render_identically_in_both_runners(
+    tmp_path: Path,
+) -> None:
+    """r11g Q1: a held gate's `faults:` block errors reach the Lead in its
+    OPEN-LOOP CONTEXT block -- driver.sh (TRIO_QUEUE_ERRORS) and trioctl
+    (`queue_errors`) render the same text; absent, the block is unchanged."""
+    mailbox = make_mailbox_with_goal(tmp_path)
+    errors = [
+        "`faults:` block: line 2: faults entry missing required key(s): status",
+        "`faults:` block: line 9: a second fenced ```yaml `faults:` block is ignored",
+    ]
+
+    def driver_block(extra: dict) -> str:
+        result = subprocess.run(
+            [str(DRIVER), "--run-role", "lead"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "LOOP_DIR": str(mailbox),
+                "HARNESS": "generic",
+                "RUN_LEAD": "cat",
+                "TRIO_MODE": "open-loop",
+                "TRIO_KIND": "lead-pass",
+                **extra,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split("\n\n", 1)[0] + "\n\n"
+
+    trioctl = _load_trioctl()
+    ctx = {"mode": "open-loop", "kind": "lead-pass", "slice": None, "sha": None}
+    plain_py = trioctl.OmnigentRunner._open_loop_context_block(ctx)
+    held_py = trioctl.OmnigentRunner._open_loop_context_block(
+        {**ctx, "queue_errors": errors}
+    )
+    plain_sh = driver_block({})
+    held_sh = driver_block({"TRIO_QUEUE_ERRORS": "\n".join(errors)})
+
+    assert plain_sh == "OPEN-LOOP CONTEXT: kind=lead-pass\n\n"
+    assert plain_py.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n")
+    assert "QUEUE.md PARSE ERRORS" not in plain_py
+    note = trioctl._open_loop_queue_errors_note(errors)
+    assert held_sh == "OPEN-LOOP CONTEXT: kind=lead-pass\n" + note + "\n\n"
+    assert held_py.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n" + note + "\n")
+    for err in errors:
+        assert f"\n- {err}" in held_sh and f"\n- {err}" in held_py

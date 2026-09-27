@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import importlib.machinery
 import importlib.util
 import inspect
@@ -1939,6 +1940,53 @@ def _unknown_status_faults(queue: dict) -> list:
     ]
 
 
+QUEUE_FAULT_ERROR_PREFIX = "`faults:` block:"
+
+
+def _queue_fault_errors(queue: dict) -> list[str]:
+    """QUEUE.md parse errors of the `faults:` block (dropped/unparseable
+    faults, a second or mis-fenced `faults:` block), in parse order."""
+    return [
+        str(e) for e in (queue.get("errors") or [])
+        if str(e).startswith(QUEUE_FAULT_ERROR_PREFIX)
+    ]
+
+
+def _integration_gate_held(
+    mailbox: Path,
+    iteration: int,
+    queue: dict,
+    logged: set | None = None,
+    lock: threading.Lock | None = None,
+) -> bool:
+    """True while the `faults:` block has a parse error (r11g Q1).
+
+    A dropped fault is invisible to `_live_faults`, so the integration
+    gate must stay closed until the text is repaired: every gate site
+    checks `_slices_fully_retired(...) and not _integration_gate_held(...)`.
+    The `- iter N | loop | gate held: ...` LOG line (naming the first
+    error) is written at most once per iteration -- `logged` holds the
+    iterations already logged and is shared by the Lead thread and the
+    poll loop, guarded by `lock`. The Lead gets the error text through
+    the lead-pass OPEN-LOOP CONTEXT (`queue_errors`); a Lead that cannot
+    repair it makes no-op passes and the 3-no-op stall guard ends the run
+    `status: error`."""
+    errs = _queue_fault_errors(queue)
+    if not errs:
+        return False
+    if logged is not None:
+        with lock if lock is not None else contextlib.nullcontext():
+            if iteration in logged:
+                return True
+            logged.add(iteration)
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | gate held: QUEUE.md faults block has "
+        f"parse errors: {errs[0]}",
+    )
+    return True
+
+
 def _log_queue_errors(
     mailbox: Path, iteration: int, queue: dict, logged: set
 ) -> None:
@@ -2061,6 +2109,8 @@ def _lead_thread_body(
     result_holder: dict,
     force_first_pass: bool = False,
     repo: Path | None = None,
+    gate_held_logged: set | None = None,
+    gate_held_lock: threading.Lock | None = None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
@@ -2091,7 +2141,15 @@ def _lead_thread_body(
                 queue = _METRICS.read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
                 open_or_taken = _live_faults(queue)
-                if _slices_fully_retired(slice_ids, retired_ids, open_or_taken):
+                if _slices_fully_retired(
+                    slice_ids, retired_ids, open_or_taken
+                ) and not _integration_gate_held(
+                    mailbox,
+                    _number(_read_state(state_path)["iteration"]),
+                    queue,
+                    gate_held_logged,
+                    gate_held_lock,
+                ):
                     result_holder["outcome"] = "done"
                     return
             first = False
@@ -2108,6 +2166,12 @@ def _lead_thread_body(
                 "sha": None,
                 "kind": "lead-pass",
             }
+            # r11g Q1: a held gate's error text reaches the Lead through
+            # its OPEN-LOOP CONTEXT (the Lead never reads LOG.md). The key
+            # is only present when there is something to repair.
+            queue_errors = _queue_fault_errors(_METRICS.read_queue(mailbox))
+            if queue_errors:
+                context["queue_errors"] = queue_errors
             snapshot_before = _lead_pass_snapshot(mailbox, repo)
             result = _invoke_runner(lead_runner, "lead", iteration, mailbox, context)
             if result != 0:
@@ -2473,6 +2537,10 @@ def run_open_loop(
             return code
 
         wake_event = threading.Event()
+        # r11g Q1: iterations whose `gate held` LOG line is written, shared
+        # by the Lead thread and the done re-check below.
+        gate_held_logged: set = set()
+        gate_held_lock = threading.Lock()
 
         def spawn_lead(force_first_pass: bool = False) -> tuple[threading.Thread, dict]:
             holder: dict = {}
@@ -2489,6 +2557,8 @@ def run_open_loop(
                     holder,
                     force_first_pass,
                     repo,
+                    gate_held_logged,
+                    gate_held_lock,
                 ),
                 daemon=True,
             )
@@ -2781,8 +2851,18 @@ def run_open_loop(
                     for sid in (slice_ids or [])
                     if sid in latest_for_gate
                 ) or bool(inflight)  # a running slice-eval is pending too
+                # r11g Q1: a `faults:` block parse error (a dropped or
+                # unparseable fault) holds the gate exactly like a live
+                # fault: the Lead is re-spawned below instead of the
+                # integration eval being dispatched.
                 fully_retired = _slices_fully_retired(
                     slice_ids, retired_ids, open_or_taken
+                ) and not _integration_gate_held(
+                    mailbox,
+                    current_iteration(),
+                    queue,
+                    gate_held_logged,
+                    gate_held_lock,
                 )
                 # The queue was re-read just above: a slice retired after
                 # this turn's dispatch pass is neither graded nor pending
@@ -2951,6 +3031,14 @@ class _PortableRunner:
             environment["TRIO_KIND"] = context.get("kind") or ""
             environment["TRIO_SLICE"] = context.get("slice") or ""
             environment["TRIO_SHA"] = context.get("sha") or ""
+            # r11g Q1: `faults:` block errors for a held gate (lead-pass).
+            queue_errors = context.get("queue_errors") or []
+            if queue_errors:
+                environment["TRIO_QUEUE_ERRORS"] = "\n".join(
+                    str(e) for e in queue_errors
+                )
+            else:
+                environment.pop("TRIO_QUEUE_ERRORS", None)
         elif context:
             # Lockstep pin/attempt: same LOCKSTEP CONTEXT as Omnigent.
             attempt = str(context.get("evaluator_attempt") or "")

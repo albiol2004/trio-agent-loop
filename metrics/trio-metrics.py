@@ -611,37 +611,80 @@ class QueueParseError(ValueError):
     """QUEUE.md is present but does not match the restricted shape."""
 
 
-def find_queue_block(queue_text: str, key: str) -> list[str] | None:
+def find_queue_block(
+    queue_text: str, key: str, errors: list[str] | None = None
+) -> list[str] | None:
     """Return the body lines of the fenced yaml block whose only top-level
     key is `key` ("retired" or "faults"), or None when absent.
 
     Unlike find_slices_block, absence is not an error: a missing block means
     an empty queue for that key (MAILBOX-SCHEMA.md: "Either block may be
     absent ... absent always means an empty queue, never an error").
+
+    Only the FIRST fence opened with exactly ```` ```yaml ```` (or
+    ```` ```yml ````) that carries a `key:` line is returned. Any OTHER
+    fence carrying a `key:` line is a violation (r11g P1), since its
+    entries would otherwise be invisible to the gate: a second ```yaml
+    block with the key, or the key inside an untagged fence, a ``~~~``
+    fence, or a fence with a different/extra info string (```` ```yaml
+    title ````). `errors` None (strict): the first such violation raises
+    QueueParseError. `errors` a list (lenient): each is appended to it and
+    the first ```yaml block (if any) is still returned.
     """
     key_re = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*)$")
-    in_fence = False
-    yaml_fence = False
+    found: list[str] | None = None
+    fence: str | None = None  # "```" or "~~~" while inside a fence
+    fence_line = 0
+    info = ""
     buf: list[str] = []
-    for raw in queue_text.splitlines():
+
+    def _fail(msg: str) -> None:
+        if errors is None:
+            raise QueueParseError(msg)
+        errors.append(msg)
+
+    def _close() -> None:
+        nonlocal found
+        if not any(key_re.match(ln) for ln in buf):
+            return
+        yaml_fence = fence == "```" and info.lower() in ("yaml", "yml")
+        opener = f"{fence}{info}"
+        if not yaml_fence:
+            _fail(
+                f"line {fence_line}: a `{key}:` block in a "
+                f"{_junk_prefix(opener)!r} fence is ignored; the queue "
+                f"only reads a fence opened with exactly ```yaml -- move "
+                f"its entries into the ```yaml `{key}:` block"
+            )
+        elif found is not None:
+            _fail(
+                f"line {fence_line}: a second fenced ```yaml `{key}:` block "
+                f"is ignored; merge its entries into the first `{key}:` "
+                "block"
+            )
+        else:
+            found = list(buf)
+
+    for lineno, raw in enumerate(queue_text.splitlines(), 1):
         stripped = raw.strip()
-        if stripped.startswith("```"):
-            if in_fence:
-                if yaml_fence and any(key_re.match(ln) for ln in buf):
-                    return buf
-                in_fence = False
-                yaml_fence = False
-                buf = []
-            else:
-                in_fence = True
-                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
-                buf = []
+        opener = (
+            "```" if stripped.startswith("```")
+            else "~~~" if stripped.startswith("~~~")
+            else None
+        )
+        if fence is None:
+            if opener is not None:
+                fence, fence_line, buf = opener, lineno, []
+                info = stripped.lstrip(opener[0]).strip()
             continue
-        if in_fence and yaml_fence:
-            buf.append(raw)
-    if in_fence and yaml_fence and any(key_re.match(ln) for ln in buf):
-        return buf
-    return None
+        if opener == fence:
+            _close()
+            fence, info, buf = None, "", []
+            continue
+        buf.append(raw)
+    if fence is not None:
+        _close()
+    return found
 
 
 def _normalize_scope_items(items: list[str]) -> list[str]:
@@ -724,7 +767,9 @@ def _parse_queue_entries(
     the line, a text prefix and the key it followed; the line is skipped
     and the entry is kept with that key UNCHANGED (parsing of the entry
     continues). The `reason:` fold is checked BEFORE any structural match,
-    so a deeper line shaped like a key or (garbled) header still folds. A
+    so a deeper line shaped like a key or a garbled header still folds --
+    but a well-formed `- <entry_field>:` header or the top-level key never
+    does, at any indent (it starts the next entry / is reported). A
     key repeated inside one entry is an error too: the FIRST value is
     kept, the repeat (and its continuation/item lines) skipped -- except a
     duplicated `status:`, where a live value beats done/stale (fail closed).
@@ -822,10 +867,13 @@ def _parse_queue_entries(
         # `reason:` folding runs FIRST (r11f R1/R2): while the previous
         # scalar is `reason:` (QUEUE_FOLD_KEYS), ANY line indented deeper
         # than its key column is a wrapped continuation -- even one shaped
-        # like a key (`status: done`), an entry header, or a garbled header
-        # (`ID=5`, `- id ...`). Only a line at (or left of) the key column
-        # is parsed structurally, so a garbled header at header indent is
-        # still caught below.
+        # like a key (`status: done`) or a garbled header (`ID=5`,
+        # `- id ...`). Only a line at (or left of) the key column is parsed
+        # structurally, so a garbled header at header indent is still
+        # caught below. A well-formed entry header (`entry_re`) or the
+        # top-level key (`top_key_re`) is NEVER folded, whatever its indent
+        # (r11g NEW-S1): a `reason:`-last entry followed by a deeper or
+        # tab-indented `- id:` must still start the next entry.
         if (
             cur is not None
             and not skipping
@@ -833,6 +881,8 @@ def _parse_queue_entries(
             and fold[0] in QUEUE_FOLD_KEYS
             and fold[2] in ("fold", "dup")
             and indent > fold[1]
+            and not entry_re.match(stripped)
+            and not top_key_re.match(stripped)
         ):
             if fold[2] == "fold":
                 cur[fold[0]] = f"{cur[fold[0]]} {stripped}".strip()
@@ -1073,10 +1123,13 @@ def parse_queue_block(queue_text: str) -> dict:
     """
     result = _empty_queue()
     for key, parser in (("retired", parse_retired), ("faults", parse_faults)):
-        lines = find_queue_block(queue_text, key)
-        if lines is None:
-            continue
         block_errors: list[str] = []
+        lines = find_queue_block(queue_text, key, errors=block_errors)
+        if lines is None:
+            result["errors"].extend(
+                f"`{key}:` block: {e}" for e in block_errors
+            )
+            continue
         if key == "retired":
             malformed: set[str] = set()
             result[key] = parse_retired(

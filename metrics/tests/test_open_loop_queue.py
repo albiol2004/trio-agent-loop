@@ -525,3 +525,162 @@ def test_no_queue_md_is_a_noop(tmp_path: Path) -> None:
     doc = json.loads(result.stdout)
     info = doc["loops"][0]["info"]
     assert not any(line.startswith("queue:") for line in info)
+
+
+# --- r11g NEW-S1: a well-formed header after a `reason:`-last entry -----
+
+# (reason line, next header) -- the r11g evaluator's variants: `reason:` at
+# col 0/1 before a canonical `  - id:`, and a canonical col-4 `reason:`
+# before a tab-indented or col-6 `- id:` (plus the cross products).
+NEW_S1_VARIANTS = [
+    ("reason: flush-left reason", "  - id: f1"),
+    (" reason: col-1 reason", "  - id: f1"),
+    ("    reason: canonical reason", "\t- id: f1"),
+    ("    reason: canonical reason", "      - id: f1"),
+    ("reason: flush-left reason", "\t- id: f1"),
+    (" reason: col-1 reason", "      - id: f1"),
+]
+
+
+def new_s1_faults_block(reason_line: str, header_line: str) -> str:
+    return (
+        "```yaml\n"
+        "faults:\n"
+        "  - id: f0\n"
+        "    slice: solo\n"
+        "    observed_at: " + "a" * 40 + "\n"
+        "    scope: design\n"
+        "    status: done\n"
+        f"{reason_line}\n"
+        f"{header_line}\n"
+        "    slice: solo\n"
+        "    observed_at: " + "b" * 40 + "\n"
+        "    scope: local:src/solo.py\n"
+        "    reason: real bug\n"
+        "    status: open\n"
+        "```\n"
+    )
+
+
+@pytest.mark.parametrize("reason_line,header_line", NEW_S1_VARIANTS)
+def test_new_s1_header_after_reason_last_entry_starts_next_entry(
+    reason_line: str, header_line: str
+) -> None:
+    text = new_s1_faults_block(reason_line, header_line)
+    queue = TM.parse_queue_block(text)
+    assert queue["errors"] == []
+    assert [(f["id"], f["status"]) for f in queue["faults"]] == [
+        ("f0", "done"), ("f1", "open"),
+    ]
+    assert queue["faults"][0]["reason"] == reason_line.split(": ", 1)[1]
+    # strict mode: no violation, same entries
+    strict = TM.parse_faults(TM.find_queue_block(text, "faults"))
+    assert [(f["id"], f["status"]) for f in strict] == [
+        ("f0", "done"), ("f1", "open"),
+    ]
+
+
+def test_new_s1_top_level_key_is_never_folded_into_reason() -> None:
+    """A deeper `faults:` line after `reason:` is the duplicate top-level
+    key (reported), not reason text."""
+    text = (
+        "```yaml\nfaults:\n  - id: f1\n    slice: s\n    observed_at: abc\n"
+        "    scope: design\n    status: open\n    reason: r\n"
+        "      faults:\n```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert queue["faults"][0]["reason"] == "r"
+    assert any("duplicate `faults:` key" in e for e in queue["errors"])
+
+
+def test_key_and_garbled_id_shaped_reason_continuations_still_fold() -> None:
+    """R1/R2 unchanged: only a WELL-FORMED header/top key escapes the fold."""
+    for cont in ("status: done", "ID=5 and more", "Id: 7 x", "- id mismatch",
+                 "* id thing"):
+        text = (
+            "```yaml\nfaults:\n  - id: f1\n    slice: s\n    observed_at: abc\n"
+            f"    scope: design\n    reason: wrapped\n      {cont}\n"
+            "    status: open\n```\n"
+        )
+        queue = TM.parse_queue_block(text)
+        assert queue["errors"] == [], cont
+        assert queue["faults"][0]["status"] == "open"
+        assert queue["faults"][0]["reason"] == f"wrapped {cont}"
+
+
+# --- r11g P1: fence-level violations are reported -----------------------
+
+P1_ENTRY = (
+    "faults:\n  - id: f1\n    slice: s\n    observed_at: abc\n"
+    "    scope: design\n    reason: r\n    status: open\n"
+)
+
+
+def test_second_faults_fence_is_an_error() -> None:
+    first = "faults:\n  - id: f0\n    slice: s\n    observed_at: abc\n" \
+            "    scope: design\n    reason: r\n    status: done\n"
+    text = f"```yaml\n{first}```\n\n```yaml\n{P1_ENTRY}```\n"
+    queue = TM.parse_queue_block(text)
+    assert [f["id"] for f in queue["faults"]] == ["f0"]
+    assert len(queue["errors"]) == 1
+    assert queue["errors"][0].startswith("`faults:` block: line 11:")
+    assert "second fenced ```yaml `faults:` block" in queue["errors"][0]
+    with pytest.raises(TM.QueueParseError, match="second fenced"):
+        TM.find_queue_block(text, "faults")
+
+
+def test_second_retired_fence_is_an_error() -> None:
+    entry = "retired:\n  - slice: s1\n    sha: {}\n    at: t\n"
+    text = (
+        f"```yaml\n{entry.format('a' * 40)}```\n\n"
+        f"```yaml\n{entry.format('b' * 40)}```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert [e["sha"] for e in queue["retired"]] == ["a" * 40]
+    assert len(queue["errors"]) == 1
+    assert queue["errors"][0].startswith("`retired:` block:")
+
+
+@pytest.mark.parametrize("opener,closer", [
+    ("```", "```"),
+    ("~~~yaml", "~~~"),
+    ("~~~", "~~~"),
+    ("```yaml title", "```"),
+    ("```YAML extra", "```"),
+])
+def test_faults_block_in_non_yaml_fence_is_an_error(opener, closer) -> None:
+    text = f"{opener}\n{P1_ENTRY}{closer}\n"
+    queue = TM.parse_queue_block(text)
+    assert queue["faults"] == []
+    assert len(queue["errors"]) == 1
+    assert queue["errors"][0].startswith("`faults:` block: line 1:")
+    assert "fence is ignored" in queue["errors"][0]
+    with pytest.raises(TM.QueueParseError, match="fence is ignored"):
+        TM.find_queue_block(text, "faults")
+
+
+def test_single_yaml_fence_and_unrelated_fences_are_not_errors() -> None:
+    text = (
+        "Notes:\n\n```\nsome shell output\n```\n\n~~~\nmore\n~~~\n\n"
+        f"```yml\n{P1_ENTRY}```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert queue["errors"] == []
+    assert [f["id"] for f in queue["faults"]] == ["f1"]
+
+
+def test_trio_check_reports_fence_level_violation(tmp_path) -> None:
+    (tmp_path / "PLAN.md").write_text(
+        "```yaml\nslices:\n  - id: s\n    writes: []\n    reads: []\n```\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "QUEUE.md").write_text(f"```\n{P1_ENTRY}```\n", encoding="utf-8")
+    checker = _load(CHECKER, "trio_check_p1")
+    slices = TM.parse_slices(TM.find_slices_block(
+        (tmp_path / "PLAN.md").read_text(encoding="utf-8")
+    ))
+    errors = checker.check_queue(tmp_path, TM, slices)
+    assert any(
+        e.startswith("QUEUE.md `faults:` block: line 1:") and "fence" in e
+        for e in errors
+    )

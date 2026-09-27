@@ -16,6 +16,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from metrics import trio_loop
 
 PLAN_TWO_SLICES = """\
@@ -132,10 +134,13 @@ class QueueModel:
             self._flush()
 
     def set_fault_status(self, fault_id: str, status: str) -> None:
+        self.set_fault_field(fault_id, "status", status)
+
+    def set_fault_field(self, fault_id: str, key: str, value: str) -> None:
         with self.lock:
             for fault in self.faults:
                 if fault["id"] == fault_id:
-                    fault["status"] = status
+                    fault[key] = value
             self._flush()
 
     def _flush(self) -> None:
@@ -200,12 +205,17 @@ class ScriptedLeadRunner:
 
     def run(self, role, iteration, mailbox, context=None):
         assert role == "lead"
-        assert context == {
+        # r11g Q1: `queue_errors` is only present while the QUEUE.md
+        # `faults:` block has parse errors (the held gate's error text).
+        base = {k: v for k, v in context.items() if k != "queue_errors"}
+        assert base == {
             "mode": "open-loop",
             "slice": None,
             "sha": None,
             "kind": "lead-pass",
         }
+        if "queue_errors" in context:
+            assert context["queue_errors"], "present only when non-empty"
         self.calls.append({"iteration": iteration, "context": dict(context)})
         assert self.passes, "lead runner invoked more times than scripted"
         action = self.passes.pop(0)
@@ -526,6 +536,8 @@ def test_malformed_fault_is_logged_once_and_valid_faults_still_gate(
 
     def pass2(mb):
         queue.set_fault_status("f1", "done")
+        # r11g Q1: the dropped f9 holds the gate until its text is repaired.
+        queue.set_fault_field("f9", "scope", "design")
         queue.retire("solo", sha2)
 
     lead = ScriptedLeadRunner([pass1, pass2])
@@ -558,7 +570,12 @@ def test_malformed_fault_is_logged_once_and_valid_faults_still_gate(
 
     assert code == 0
     assert not lead.passes
-    assert integration_calls == [[("f1", "done")]]
+    assert integration_calls == [[("f1", "done"), ("f9", "done")]]
+    # The fix pass saw the dropped fault's error text in its context.
+    assert "queue_errors" not in lead.calls[0]["context"]
+    assert any(
+        "unterminated" in e for e in lead.calls[1]["context"]["queue_errors"]
+    )
     log_lines = [
         ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
         if "QUEUE.md parse error" in ln
@@ -817,13 +834,14 @@ def test_key_shaped_reason_continuation_cannot_close_open_fault(
     assert "QUEUE.md parse error" not in log_text
 
 
-def test_final_slice_eval_parse_error_is_logged_before_integration_eval(
+def test_final_slice_eval_parse_error_is_logged_and_holds_the_gate(
     tmp_path: Path,
 ) -> None:
-    """r11f R3: the LAST slice-eval writes a malformed (dropped) fault. The
-    Lead thread's `done` re-check re-reads QUEUE.md and must log the parse
-    error in that same turn -- LOG.md already holds the line when the
-    integration eval starts."""
+    """r11f R3 + r11g Q1: the LAST slice-eval writes a malformed (dropped)
+    fault. The done re-check logs the parse error in that same turn AND
+    holds the integration gate: the integration eval is never dispatched,
+    the Lead gets passes (making none, it stalls) and the run ends
+    `status: error` (exit 3)."""
     lock = threading.Lock()
     mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
     queue = QueueModel(mailbox, lock)
@@ -833,39 +851,275 @@ def test_final_slice_eval_parse_error_is_logged_before_integration_eval(
     def pass1(mb):
         queue.retire("solo", sha1)
 
-    lead = ScriptedLeadRunner([pass1])
+    def noop(mb):
+        pass
+
+    lead = ScriptedLeadRunner([pass1, noop, noop, noop])
 
     def eval_solo_1(mb):
         verdict.append_slice_section("solo", sha1, "SHIP")
         queue.add_fault("f9", "solo", sha1, "junk", status="done",
                         scope='["unterminated]')
 
-    log_at_integration: list[str] = []
+    evaluator = ScriptedEvalRunner(
+        slice_actions={("solo", sha1): eval_solo_1}, integration_actions=[],
+    )
+    code = trio_loop.run_open_loop(mailbox, 10, lead, evaluator, poll_seconds=0.01)
 
-    def integration_ship(mb):
-        log_at_integration.append(
-            (mb / "LOG.md").read_text(encoding="utf-8")
-        )
-        verdict.set_integration_verdict("VERDICT: SHIP")
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert re.search(r"^status: error", state, re.M)
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "lead pass made no changes after 3 attempts" in log_text
+    parse_lines = [ln for ln in log_text.splitlines()
+                   if "| loop | QUEUE.md parse error: `faults:` block:" in ln]
+    assert parse_lines
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in parse_lines]
+    assert len(iters) == len(set(iters))
+    _assert_gate_held_lines(mailbox, "unterminated")
+
+
+GATE_HELD = "| loop | gate held: QUEUE.md faults block has parse errors: "
+
+
+def _assert_gate_held_lines(mailbox: Path, needle: str) -> list[str]:
+    lines = [ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8")
+             .splitlines() if GATE_HELD in ln]
+    assert lines, "the held gate must be logged"
+    for ln in lines:
+        assert re.fullmatch(
+            r"- iter \d+ " + re.escape(GATE_HELD) + r"`faults:` block: .+", ln
+        ), ln
+        assert needle in ln
+    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in lines]
+    assert len(iters) == len(set(iters)), "once per iteration"
+    return lines
+
+
+def _queue_text(sha: str, faults_body: str) -> str:
+    return (
+        "```yaml\nretired:\n  - slice: solo\n"
+        f"    sha: {sha}\n    at: 2026-01-01T00:00:00Z\n```\n\n"
+        + faults_body
+    )
+
+
+def _raw_faults_scenario(tmp_path: Path, faults_body: str, later_passes=None,
+                         integration_actions=None):
+    """solo@s1 retired; its (final) slice-eval SHIPs and rewrites QUEUE.md
+    with `faults_body` verbatim (fences included). Default: 3 no-op Lead
+    passes and no scripted integration eval (running it fails the test)."""
+    lock = threading.Lock()
+    mailbox = make_open_loop_mailbox(tmp_path, PLAN_ONE_SLICE)
+    queue = QueueModel(mailbox, lock)
+    verdict = VerdictModel(mailbox, lock)
+    sha1 = fake_sha("raw-solo-1")
+
+    def pass1(mb):
+        queue.retire("solo", sha1)
+
+    def noop(mb):
+        pass
+
+    passes = later_passes(sha1) if later_passes else [noop, noop, noop]
+    lead = ScriptedLeadRunner([pass1, *passes])
+
+    def eval_solo_1(mb):
+        verdict.append_slice_section("solo", sha1, "SHIP")
+        with lock:
+            (mb / "QUEUE.md").write_text(
+                _queue_text(sha1, faults_body), encoding="utf-8"
+            )
 
     evaluator = ScriptedEvalRunner(
         slice_actions={("solo", sha1): eval_solo_1},
-        integration_actions=[integration_ship],
+        integration_actions=list(integration_actions or []),
     )
-    code = trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01)
+    code = trio_loop.run_open_loop(mailbox, 10, lead, evaluator, poll_seconds=0.01)
+    return code, mailbox, lead, evaluator, sha1
 
+
+# A fault dropped for a missing status: only a DEEPER `status: done`, which
+# folds into `reason:` (r11g Probe 1 attack).
+DROPPED_FAULT = (
+    "```yaml\nfaults:\n  - id: f1\n    slice: solo\n    observed_at: abc\n"
+    "    scope: local:src/solo.py\n    reason: real bug\n"
+    "      status: done\n```\n"
+)
+
+
+def test_dropped_fault_holds_gate_and_stalls_to_error(tmp_path: Path) -> None:
+    """r11g Q1 / verify 26: a fault dropped for a missing status used to
+    be logged and then SHIPped over. Now: integration never dispatched,
+    the `gate held` LOG line once per iteration, exit 3 `status: error`,
+    and every Lead pass after the drop gets the error text."""
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(
+        tmp_path, DROPPED_FAULT
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert parsed["faults"] == []
+    assert parsed["errors"] and "missing required key(s): status" in \
+        parsed["errors"][0]
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    state = (mailbox / "STATE.md").read_text(encoding="utf-8")
+    assert re.search(r"^status: error", state, re.M)
+    _assert_gate_held_lines(mailbox, "missing required key(s): status")
+    # pass1 ran before the fault existed; the 3 no-op passes all saw it.
+    assert "queue_errors" not in lead.calls[0]["context"]
+    for call in lead.calls[1:]:
+        assert call["context"]["queue_errors"] == parsed["errors"]
+
+
+def test_repaired_dropped_fault_releases_the_gate(tmp_path: Path) -> None:
+    """The Lead repairs the dropped entry (adds the real `status:`): the
+    fault is then visible (closed) and the integration eval runs."""
+    repaired = DROPPED_FAULT.replace(
+        "      status: done\n", "      status: done\n    status: done\n"
+    )
+
+    def later(sha1):
+        def repair(mb):
+            (mb / "QUEUE.md").write_text(
+                _queue_text(sha1, repaired), encoding="utf-8"
+            )
+        return [repair]
+
+    seen: list = []
+
+    def integration_ship(mb):
+        seen.append(trio_loop._METRICS.read_queue(mb))
+        VerdictModel(mb, threading.Lock()).set_integration_verdict(
+            "VERDICT: SHIP"
+        )
+
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(
+        tmp_path, DROPPED_FAULT, later, [integration_ship]
+    )
     assert code == 0
-    assert _eval_sequence(evaluator) == [
-        ("slice-eval", "solo", sha1), ("integration-eval", None, None),
+    assert not lead.passes
+    assert "queue_errors" in lead.calls[1]["context"]
+    assert _eval_sequence(evaluator)[-1] == ("integration-eval", None, None)
+    assert seen[0]["errors"] == []
+    assert [(f["id"], f["status"]) for f in seen[0]["faults"]] == [("f1", "done")]
+    _assert_gate_held_lines(mailbox, "missing required key(s): status")
+
+
+def _new_s1_body(reason_line: str, header_line: str, sha: str) -> str:
+    return (
+        "```yaml\nfaults:\n  - id: f0\n    slice: solo\n"
+        f"    observed_at: {sha}\n    scope: design\n    status: done\n"
+        f"{reason_line}\n{header_line}\n    slice: solo\n"
+        f"    observed_at: {sha}\n    scope: local:src/solo.py\n"
+        "    reason: real bug\n    status: open\n```\n"
+    )
+
+
+@pytest.mark.parametrize("reason_line,header_line", [
+    ("reason: flush-left reason", "  - id: f1"),
+    (" reason: col-1 reason", "  - id: f1"),
+    ("    reason: canonical reason", "\t- id: f1"),
+    ("    reason: canonical reason", "      - id: f1"),
+    ("reason: flush-left reason", "\t- id: f1"),
+    (" reason: col-1 reason", "      - id: f1"),
+])
+def test_new_s1_open_fault_after_reason_last_entry_blocks_integration(
+    tmp_path: Path, reason_line: str, header_line: str
+) -> None:
+    """r11g NEW-S1 / verify 25: the open f1 after a `reason:`-last f0 with a
+    deeper header used to be folded into f0's reason -- integration eval
+    dispatched, exit 0, LOG silent. Now f1 is live: no integration eval,
+    the stall guard ends the run."""
+    body = _new_s1_body(reason_line, header_line, "abc")
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(tmp_path, body)
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert parsed["errors"] == []
+    assert [f["id"] for f in trio_loop._live_faults(parsed)] == ["f1"]
+    assert code == 3
+    assert not lead.passes
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
+    assert "gate held" not in log_text  # held by the live fault itself
+
+
+P1_FAULT = (
+    "faults:\n  - id: f1\n    slice: solo\n    observed_at: abc\n"
+    "    scope: local:src/solo.py\n    reason: real bug\n    status: open\n"
+)
+
+
+@pytest.mark.parametrize("body,needle", [
+    # a second ```yaml faults fence (an Evaluator appending a new fence)
+    ("```yaml\nfaults:\n```\n\n```yaml\n" + P1_FAULT + "```\n",
+     "second fenced"),
+    # the faults block in an untagged fence
+    ("```\n" + P1_FAULT + "```\n", "fence is ignored"),
+    ("~~~yaml\n" + P1_FAULT + "~~~\n", "fence is ignored"),
+    ("```yaml title\n" + P1_FAULT + "```\n", "fence is ignored"),
+])
+def test_p1_misfenced_fault_holds_the_gate(
+    tmp_path: Path, body: str, needle: str
+) -> None:
+    """r11g P1 / verify 28: an open fault in a second or mis-tagged fence
+    was invisible with 0 errors (integration dispatched). Now the fence
+    violation is a `faults:` block error and the gate holds."""
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(tmp_path, body)
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert trio_loop._live_faults(parsed) == []
+    assert any(needle in e for e in trio_loop._queue_fault_errors(parsed))
+    assert code == 3
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    _assert_gate_held_lines(mailbox, needle)
+    assert any(needle in e for e in lead.calls[-1]["context"]["queue_errors"])
+
+
+def test_integration_gate_held_helper(tmp_path: Path) -> None:
+    (tmp_path / "LOG.md").write_text("", encoding="utf-8")
+    logged: set = set()
+    lock = threading.Lock()
+    q_ok = {"faults": [], "errors": ["`retired:` block: line 3: x"]}
+    q_bad = {"faults": [], "errors": ["`faults:` block: line 2: y",
+                                      "`faults:` block: line 9: z"]}
+    assert trio_loop._queue_fault_errors(q_ok) == []
+    assert trio_loop._queue_fault_errors(q_bad) == q_bad["errors"]
+    assert trio_loop._queue_fault_errors({"faults": []}) == []
+    assert not trio_loop._integration_gate_held(tmp_path, 1, q_ok, logged, lock)
+    for _ in range(3):
+        assert trio_loop._integration_gate_held(tmp_path, 1, q_bad, logged, lock)
+    assert trio_loop._integration_gate_held(tmp_path, 2, q_bad, logged, lock)
+    assert (tmp_path / "LOG.md").read_text(encoding="utf-8").splitlines() == [
+        f"- iter 1 {GATE_HELD}`faults:` block: line 2: y",
+        f"- iter 2 {GATE_HELD}`faults:` block: line 2: y",
     ]
-    assert len(log_at_integration) == 1
-    assert "| loop | QUEUE.md parse error: `faults:` block:" in log_at_integration[0]
-    log_lines = [
-        ln for ln in (mailbox / "LOG.md").read_text(encoding="utf-8").splitlines()
-        if "QUEUE.md parse error" in ln
-    ]
-    iters = [re.match(r"- iter (\d+) ", ln).group(1) for ln in log_lines]
-    assert len(iters) == len(set(iters))
+
+
+def test_portable_runner_passes_queue_errors_to_build_prompt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The lead-pass OPEN-LOOP CONTEXT carries the held gate's errors."""
+    captured: dict = {}
+
+    def fake_run(cmd, check, env):
+        captured.update(env)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(trio_loop.subprocess, "run", fake_run)
+    monkeypatch.setenv("TRIO_QUEUE_ERRORS", "stale from the parent env")
+    runner = trio_loop._PortableRunner()
+    ctx = {"mode": "open-loop", "kind": "lead-pass", "slice": None,
+           "sha": None, "queue_errors": ["`faults:` block: a", "`faults:` block: b"]}
+    runner.run("lead", 1, tmp_path, ctx)
+    assert captured["TRIO_QUEUE_ERRORS"] == "`faults:` block: a\n`faults:` block: b"
+    captured.clear()
+    ctx.pop("queue_errors")
+    runner.run("lead", 1, tmp_path, ctx)
+    assert "TRIO_QUEUE_ERRORS" not in captured
 
 
 def test_live_faults_counts_unknown_status_as_live() -> None:

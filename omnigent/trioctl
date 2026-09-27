@@ -2584,6 +2584,17 @@ def _run_post_loop_session_prune(
     return deleted
 
 
+def _open_loop_queue_errors_note(errors: list[str]) -> str:
+    """The QUEUE.md-parse-errors note of a lead-pass OPEN-LOOP CONTEXT
+    block (r11g Q1); byte-identical to portable/driver.sh build_prompt."""
+    return (
+        "QUEUE.md PARSE ERRORS: the integration gate is held until the "
+        "`faults:` block parses cleanly. Repair these entries in place "
+        "(keep every fault, fix its shape):\n"
+        + "\n".join(f"- {e}" for e in errors)
+    )
+
+
 # Kind-specific Open-loop procedures appended to OPEN-LOOP CONTEXT blocks.
 # Sourced from prompts/canonical/lead.md ("Open-loop mode", steps 1-5) and
 # prompts/canonical/evaluator.md ("Open-loop mode", steps 1-7) so Omnigent
@@ -2956,6 +2967,12 @@ class OmnigentRunner:
             )
         else:
             procedure = ""
+        queue_errors = [str(e) for e in context.get("queue_errors") or []]
+        if queue_errors:
+            # r11g Q1: the driver holds the integration gate while the
+            # QUEUE.md `faults:` block has parse errors; the Lead never
+            # reads LOG.md, so the error text rides on this block.
+            line += "\n" + _open_loop_queue_errors_note(queue_errors)
         if not procedure:
             return line + "\n\n"
         return line + "\n" + procedure + "\n"
