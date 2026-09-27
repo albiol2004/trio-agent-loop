@@ -162,9 +162,16 @@ extension"), run this loop instead of waiting for a verdict:
    `## Targeted check` section** with ONE exact command scoped to the
    slice's `writes:` and derived from its `accepts:` (e.g. `python3 -m
    pytest -q tests/test_<slice>.py` or `npx vitest run <path>`). A task
-   file without it is invalid — do not dispatch it. End that section with
-   this literal sentence, which the builder sees verbatim: "Print
-   `TARGETED_CHECK: <last summary line>` after running the check."
+   file without it is invalid — do not dispatch it. When the slice's
+   `writes:` include `.ts` or `.tsx` files, the command MUST also
+   typecheck the builder's project: prefix it with `npx tsc --noEmit -p
+   <project> && ` (e.g. `npx tsc --noEmit -p api && npx vitest run
+   api/test/x.test.ts`). End that section with this literal sentence, which the
+   builder sees verbatim: "Print `TARGETED_CHECK: <the line stating the
+   pass/fail counts>` after running the check (pytest: `N passed[, M
+   failed] in ...`; vitest: ` Tests  N passed | M failed`, not
+   `Duration`; go test: `ok`/`FAIL`; otherwise `TARGETED_CHECK: PASS <n>`
+   or `TARGETED_CHECK: FAILED <summary>`)."
 3. **Retire each slice the moment it lands — per slice, not per wave.**
    As soon as an isolated builder's run prints `integrated` (its
    `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's
@@ -198,8 +205,8 @@ extension"), run this loop instead of waiting for a verdict:
    it and do not append a fault (faults are Evaluator-only per
    MAILBOX-SCHEMA.md): take the slice over yourself — implement or fix
    it, run its `## Targeted check` command once, commit it as
-   `slice(<id>): …`, and retire it at that sha with the command's last
-   summary line as its ledger evidence. A slice you implemented yourself is
+   `slice(<id>): …`, and retire it at that sha with the command's counts
+   line as its ledger evidence. A slice you implemented yourself is
    retired the same way right after its `slice(<id>):` commit, at that
    commit's sha. A post-retirement fix (step 1's `fix f<N>` commit)
    doesn't edit that entry — it appends a **new** `retired:` entry for

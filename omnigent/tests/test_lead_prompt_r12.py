@@ -244,10 +244,11 @@ def test_omnigent_integration_eval_prompt_names_ledger(tmp_path: Path) -> None:
 
 TASK_MANDATE = "MUST contain a `## Targeted check` section"
 INVALID_TASK = "A task file without it is invalid — do not dispatch it"
+# r13 G2: "LAST summary line" became "the line that states the pass/fail COUNTS".
 BUILDER_CONTRACT = (
     "run exactly that command after implementing — never skip it — and put "
-    "its LAST summary line verbatim in your final message on a line prefixed "
-    "`TARGETED_CHECK: `"
+    "the output line that states the pass/fail COUNTS verbatim in your final "
+    "message on a line prefixed `TARGETED_CHECK: `"
 )
 BUILDER_FAILED = "print `TARGETED_CHECK: FAILED <summary>` instead"
 
@@ -314,7 +315,13 @@ def test_targeted_check_line_helper() -> None:
 
 # ------------------------------------------------ r12 repair R1 (contract)
 
-TASK_SENTENCE = 'Print `TARGETED_CHECK: <last summary line>` after running the check.'
+# r13 G2: the literal task sentence names the counts line, per runner.
+TASK_SENTENCE = (
+    "Print `TARGETED_CHECK: <the line stating the pass/fail counts>` after "
+    "running the check (pytest: `N passed[, M failed] in ...`; vitest: ` "
+    "Tests N passed | M failed`, not `Duration`; go test: `ok`/`FAIL`; "
+    "otherwise `TARGETED_CHECK: PASS <n>` or `TARGETED_CHECK: FAILED <summary>`)."
+)
 
 
 def test_omnigent_lead_task_template_carries_builder_sentence(tmp_path: Path) -> None:
@@ -335,7 +342,7 @@ def test_isolated_builder_note_carries_contract() -> None:
     note = _flat(trioctl._ISOLATED_BUILDER_NOTE.format(
         path="/w", branch="b", base="c", repo="/r", slice="s", mailbox="/m"))
     assert "run the task file's `## Targeted check` command (never skip it)" in note
-    assert "TARGETED_CHECK: <last summary line>" in note
+    assert "TARGETED_CHECK: <counts line>" in note  # r13 G2
     assert "plain text, no backticks, no bold, no bullet" in note
     assert "TARGETED_CHECK: FAILED <summary>" in note
 

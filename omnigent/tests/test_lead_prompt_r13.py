@@ -195,3 +195,77 @@ def test_plan_template_requires_full_check() -> None:
     assert "**`full_check:`** (required)" in schema
     for path, flat in _generated_role("lead"):
         assert "The section MUST include a `full_check:` line" in flat, path
+
+
+# ------------------------------------------------------ G2 counts line
+
+COUNTS_TASK = (
+    "Print `TARGETED_CHECK: <the line stating the pass/fail counts>` after "
+    "running the check (pytest: `N passed[, M failed] in ...`; vitest: ` "
+    "Tests N passed | M failed`, not `Duration`; go test: `ok`/`FAIL`; "
+    "otherwise `TARGETED_CHECK: PASS <n>` or `TARGETED_CHECK: FAILED <summary>`)."
+)
+TSC_RULE = ("When the slice's `writes:` include `.ts` or `.tsx` files, the "
+            "command MUST also typecheck the builder's project: prefix it with "
+            "`npx tsc --noEmit -p <project> && `")
+
+
+def test_isolated_builder_note_names_counts_line() -> None:
+    note = _flat(_trioctl("note")._ISOLATED_BUILDER_NOTE.format(
+        path="/w", branch="b", base="c", repo="/r", slice="s", mailbox="/m"))
+    assert "LAST summary line" not in note
+    assert "<last summary line>" not in note
+    assert "print the line of its output that states the pass/fail COUNTS" in note
+    assert "TARGETED_CHECK: <counts line>" in note
+    assert "pytest -> the `N passed[, M failed] in ...` line" in note
+    assert "vitest -> the ` Tests N passed | M failed` line (NOT the `Duration` line)" in note
+    assert "go test -> the `ok` / `FAIL` line" in note
+    assert "print TARGETED_CHECK: PASS <n>" in note
+    assert "TARGETED_CHECK: FAILED <summary>" in note
+    assert "use the test runner's counts line; any non-zero exit is a failure" in note
+
+
+def test_lead_task_template_counts_line_and_tsc(tmp_path: Path) -> None:
+    block = _flat(_block(_lead_prompt(tmp_path)))
+    assert f'"{COUNTS_TASK}"' in block
+    assert "<last summary line>" not in block
+    assert "last summary line" not in block.split("7. REPORT.md")[0]
+    assert TSC_RULE in block
+    assert "`npx tsc --noEmit -p api && npx vitest run api/test/x.test.ts`" in block
+    assert "with the command's counts line as its ledger evidence" in block
+    canonical = _flat(_section((CANONICAL / "lead.md").read_text(encoding="utf-8"),
+                               "## Open-loop mode"))
+    assert COUNTS_TASK in canonical and TSC_RULE in canonical
+    assert "<last summary line>" not in canonical
+    for path, flat in _generated_role("lead"):
+        assert COUNTS_TASK in flat, path
+        assert TSC_RULE in flat, path
+
+
+def test_builder_sources_name_counts_line() -> None:
+    sources = [
+        _flat((CANONICAL / "builder.md").read_text(encoding="utf-8")),
+        _flat((ROLES / "builder" / "config.yaml").read_text(encoding="utf-8")),
+    ]
+    sources += [_flat(t) for p, t in _generated().items() if "builder" in p.name]
+    assert len(sources) > 2
+    for flat in sources:
+        if "`## Targeted check` section" not in flat:
+            continue
+        assert "LAST summary line" not in flat
+        assert "the output line that states the pass/fail COUNTS verbatim" in flat
+        assert "vitest → the ` Tests N passed | M failed` line (NOT the `Duration` line)" in flat
+        assert "pytest → the `N passed[, M failed] in …` line" in flat
+        assert "go test → the `ok` / `FAIL` line" in flat
+        assert "`TARGETED_CHECK: PASS <n>` on success" in flat
+
+
+def test_counts_lines_parse_through_real_helper() -> None:
+    tc = _trioctl("tc")._targeted_check_line
+    assert tc("TARGETED_CHECK: Tests  9 passed (9)") == "TARGETED_CHECK: Tests  9 passed (9)"
+    assert tc("TARGETED_CHECK: Tests  1 failed | 384 passed (385)").startswith("TARGETED_CHECK: FAILED")
+    assert tc("TARGETED_CHECK: FAIL\texample.com/pkg\t0.01s").startswith("TARGETED_CHECK: FAILED")
+    assert tc("TARGETED_CHECK: ok  \texample.com/pkg\t0.01s") is not None
+    assert tc("TARGETED_CHECK: PASS 3") == "TARGETED_CHECK: PASS 3"
+    assert tc("TARGETED_CHECK: <counts line>") is None
+    assert tc("TARGETED_CHECK: <the line stating the pass/fail counts>") is None

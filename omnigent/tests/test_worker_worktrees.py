@@ -296,8 +296,10 @@ def test_live_isolated_builder_prompt_carries_targeted_check_contract(
     assert "TARGETED" not in task
     flat = " ".join(rendered.split())
     assert "run the task file's `## Targeted check` command (never skip it)" in flat
-    assert "print its LAST summary line verbatim" in flat
-    assert "TARGETED_CHECK: <last summary line>" in flat
+    # r13 G2: the counts line, not the last summary line.
+    assert "print the line of its output that states the pass/fail COUNTS" in flat
+    assert "TARGETED_CHECK: <counts line>" in flat
+    assert "(NOT the `Duration` line)" in flat
     assert "plain text, no backticks, no bold, no bullet" in flat
     assert "TARGETED_CHECK: FAILED <summary>" in flat
     (line,) = [ln for ln in out.splitlines() if ln.startswith('{"')]
