@@ -38,6 +38,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -921,22 +922,166 @@ def _mailbox_rel(repo: Path, mailbox: Path | None) -> str | None:
     return rel.as_posix().rstrip("/") + "/"
 
 
-def aggregate_blockers(repo: Path, mailbox: Path | None) -> list[str]:
-    """Aggregate status entries outside the mailbox (product work not committed).
+_WRITES_KEY = re.compile(r"^\s*(?:-\s+)?writes\s*:\s*(.*)$")
+_BLOCK_ITEM = re.compile(r"^\s*-\s+(.*)$")
 
-    A worker branches from committed HEAD, so uncommitted product edits in
-    the aggregate would be invisible to it (breaking declared ``reads:``)
-    and could collide with the integration merge.
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def declared_product_paths(mailbox: Path | None) -> list[str]:
+    """Every path in any PLAN.md slice's ``writes:`` (``api:`` entries
+    dropped; empty when unknown).
+
+    Lenient and stdlib-only (this module ships next to trioctl without the
+    vendored metrics parser): flow ``writes: [a, "b"]`` and block-style
+    ``writes:`` + ``- item`` lines are both read.
+    """
+    if mailbox is None:
+        return []
+    try:
+        lines = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    paths: list[str] = []
+    block_indent: int | None = None
+    for line in lines:
+        if block_indent is not None:
+            item = _BLOCK_ITEM.match(line)
+            indent = len(line) - len(line.lstrip())
+            if item and indent >= block_indent:
+                paths.append(_unquote(item.group(1)))
+                continue
+            block_indent = None
+        match = _WRITES_KEY.match(line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if not value:
+            block_indent = len(line) - len(line.lstrip())
+            continue
+        if value.startswith("[") and value.endswith("]"):
+            paths.extend(_unquote(v) for v in value[1:-1].split(",") if v.strip())
+        else:
+            paths.append(_unquote(value))
+    declared = []
+    for path in paths:
+        path = path.strip()
+        if not path or path.startswith("api:"):
+            continue
+        if path.startswith("./"):
+            path = path[2:]
+        declared.append(path.rstrip("/"))
+    return declared
+
+
+def _covered(path: str, declared: list[str]) -> bool:
+    return any(path == d or path.startswith(d + "/") for d in declared if d)
+
+
+def _foreign_mailbox(repo: Path, path: str) -> str | None:
+    """The repo-relative directory of another Trio mailbox containing *path*
+    (a directory holding GOAL.md and STATE.md), or None."""
+    parts = Path(path).parts
+    for depth in range(1, len(parts) + 1):
+        candidate = repo.joinpath(*parts[:depth])
+        if (
+            candidate.is_dir()
+            and (candidate / "GOAL.md").is_file()
+            and (candidate / "STATE.md").is_file()
+        ):
+            return Path(*parts[:depth]).as_posix() + "/"
+    return None
+
+
+def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]:
+    """Classify aggregate status entries outside this mailbox.
+
+    - ``product``: modified or untracked files under a declared product path
+      (any PLAN.md slice's ``writes:``) -- a worker would not see them.
+    - ``foreign``: modified TRACKED files outside the product paths -- a
+      worker would merge onto a tree that differs from what the user sees.
+    - ``ignored``: other untracked files, and anything inside another Trio
+      mailbox (GOAL.md + STATE.md). A worktree never carries untracked
+      files, so they cannot affect a worker; they are only reported.
+
+    With no declared product paths (no mailbox / no parsable PLAN.md
+    ``writes:``), untracked files outside other mailboxes stay ``product``
+    blockers (the conservative pre-r11 behaviour). Entries are porcelain
+    lines; ``ignored`` holds a mailbox directory once, else the path.
     """
     rel = _mailbox_rel(repo, mailbox)
-    blockers = []
+    declared = declared_product_paths(mailbox)
+    out: dict[str, list[str]] = {"product": [], "foreign": [], "ignored": []}
     user, _residue = _split_status(repo, status_entries(repo))
     for line in user:
         path = _status_path(line)
         if rel and (path.startswith(rel) or path + "/" == rel):
             continue
-        blockers.append(line)
-    return blockers
+        untracked = line.startswith("??")
+        if _covered(path, declared):
+            out["product"].append(line)
+            continue
+        other = _foreign_mailbox(repo, path)
+        if other:
+            if other not in out["ignored"]:
+                out["ignored"].append(other)
+            continue
+        if untracked:
+            if declared:
+                out["ignored"].append(path)
+            else:
+                out["product"].append(line)
+            continue
+        out["foreign"].append(line)
+    return out
+
+
+def aggregate_blockers(repo: Path, mailbox: Path | None) -> list[str]:
+    """Aggregate status entries that block an isolated dispatch/integration.
+
+    A worker branches from committed HEAD, so uncommitted product edits in
+    the aggregate would be invisible to it (breaking declared ``reads:``)
+    and modified tracked files could collide with the integration merge.
+    Untracked non-product files and other mailboxes do not block
+    (:func:`classify_aggregate`).
+    """
+    found = classify_aggregate(repo, mailbox)
+    return found["product"] + found["foreign"]
+
+
+def aggregate_refusal(found: dict[str, list[str]]) -> str | None:
+    """The isolated-dispatch refusal for *found* blockers, or None."""
+    parts = []
+    if found["product"]:
+        parts.append(
+            "aggregate has uncommitted product changes (under PLAN.md "
+            "writes:, or untracked with no writes: declared) a worker would "
+            "not see; commit them before an isolated dispatch: " + "; ".join(found["product"][:5])
+        )
+    if found["foreign"]:
+        files = ", ".join(_status_path(line) for line in found["foreign"][:5])
+        parts.append(
+            "aggregate has modified tracked files outside every declared "
+            f"product path: commit or stash YOUR change to {files}; the Lead "
+            "must not commit files it did not edit"
+        )
+    return "; ".join(parts) if parts else None
+
+
+def ignored_note(found: dict[str, list[str]]) -> str | None:
+    """One stderr line listing untracked/other-mailbox entries, or None."""
+    if not found["ignored"]:
+        return None
+    return (
+        "trioctl: ignored (not product paths; the worker worktree will not "
+        "see them): " + ", ".join(found["ignored"][:10])
+        + (f" (+{len(found['ignored']) - 10} more)" if len(found["ignored"]) > 10 else "")
+    )
 
 
 def create(
@@ -971,12 +1116,14 @@ def create(
             "would route to a foreign session). Remove them from your own Cursor "
             "config first; trioctl never edits it: " + "; ".join(inherited)
         )
-    blockers = [] if detach_at else aggregate_blockers(repo, mailbox)
-    if blockers:
-        raise WorktreeError(
-            "aggregate has uncommitted product changes a worker would not see; "
-            "commit them before an isolated dispatch: " + "; ".join(blockers[:5])
-        )
+    if not detach_at:
+        found = classify_aggregate(repo, mailbox)
+        refusal = aggregate_refusal(found)
+        if refusal:
+            raise WorktreeError(refusal)
+        note = ignored_note(found)
+        if note:
+            print(note, file=sys.stderr)
     worker_id = f"{_sanitize(slice_id)}-{uuid.uuid4().hex[:8]}"
     root = (root or default_worktree_root(repo)).expanduser().resolve()
     path = root / worker_id
