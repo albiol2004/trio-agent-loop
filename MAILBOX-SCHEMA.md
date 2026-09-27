@@ -738,6 +738,13 @@ skippable with `--keep-sessions`) write one JSONL transcript per archived
 broker session there before deleting it from the broker. Conformance
 tooling ignores it too.
 
+`trioctl omnigent loop` appends any missing runtime entry (`.dispatch/`,
+`.driver.json`, `.driver.pid`, `.session.json`, `.sessions/`, `driver.log`,
+`.lock`, `.repairs`) to `<mailbox>/.gitignore` at loop start; existing
+lines are never rewritten. The `.gitignore` may itself stay untracked
+until the next mailbox commit: files inside the active mailbox never block
+the dirty-checkout gate or the untracked-product scan.
+
 ## Context economics
 
 Mailbox files are split into hot and cold files so fresh-context roles stay

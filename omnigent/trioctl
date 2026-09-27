@@ -4973,6 +4973,55 @@ def command_loop(args: argparse.Namespace) -> int:
     return code
 
 
+#: Driver/runtime files a loop run creates inside the mailbox; never
+#: product and never committed (r14 M-1).
+MAILBOX_RUNTIME_IGNORES = (
+    ".dispatch/", ".driver.json", ".driver.pid", ".session.json",
+    ".sessions/", "driver.log", ".lock", ".repairs",
+)
+#: Runtime entries that are directories (``.lock`` is the loop core's lock
+#: dir), so an existing ``<name>/`` line already covers them.
+_MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock"})
+
+
+def _ensure_mailbox_gitignore(mailbox: Path) -> list[str]:
+    """Append the missing MAILBOX_RUNTIME_IGNORES lines to ``<mailbox>/.gitignore``.
+
+    Idempotent and append-only: existing lines are never rewritten or
+    reordered. An entry counts as present when an existing line names it
+    (ignoring a leading ``/``, and a trailing ``/`` for directory entries);
+    a user negation (``!name``) also counts, as a deliberate choice. The
+    file may itself stay untracked: it lies inside the mailbox, which the
+    dirty-checkout gate (``classify_aggregate``) and the loop core's
+    untracked-product scan both skip; the SHIP retirement commit of the
+    mailbox picks it up like any other mailbox file. Returns the lines
+    added.
+    """
+    path = Path(mailbox) / ".gitignore"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    present: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.lstrip("!").lstrip("/")
+        name = line.rstrip("/")
+        if line.endswith("/") and name not in _MAILBOX_RUNTIME_DIRS:
+            continue  # a dir-only pattern does not cover a runtime file
+        present.add(name)
+    missing = [e for e in MAILBOX_RUNTIME_IGNORES if e.rstrip("/") not in present]
+    if not missing:
+        return []
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    header = "" if text else "# Trio loop runtime files (added by trioctl)\n"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(prefix + header + "".join(f"{e}\n" for e in missing))
+    return missing
+
+
 def _command_loop(args: argparse.Namespace) -> int:
     """Run loop-core with the Omnigent role runner.
 
@@ -5013,6 +5062,12 @@ def _command_loop(args: argparse.Namespace) -> int:
     if refusal:
         print(f"trioctl: {refusal}", file=sys.stderr)
         return HELD_DISPATCH_EXIT
+    # Silent, append-only; after the held refusal so a refused start
+    # leaves the mailbox byte-identical.
+    try:
+        _ensure_mailbox_gitignore(mailbox)
+    except OSError as exc:
+        print(f"trioctl: could not update {mailbox / '.gitignore'}: {exc}", file=sys.stderr)
     loop_core = _load_trio_loop(repo)
     # r11: worker isolation and concurrent slice-eval are default ON; the
     # --no-isolate-workers / --slice-eval-concurrency 1 flags disable them.
