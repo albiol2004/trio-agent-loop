@@ -178,6 +178,16 @@ extension"), run this loop instead of waiting for a verdict:
    `TARGETED_CHECK: ` line — is present and does not start with
    `TARGETED_CHECK: FAILED`. Otherwise (empty integration, TARGETED_CHECK
    not reported, or FAILED) do NOT retire: re-dispatch that slice once.
+   trioctl merges a run before you see its `targeted_check`, so a run with
+   FAILED or missing `targeted_check` whose `merge_commit` differs from
+   its `base` is already on HEAD. Revert that merge on the aggregate
+   before you re-dispatch, so later slices' merge trees do not contain the
+   broken slice: `git revert -m 1 --no-commit <merge_commit> && git commit
+   -m "revert(<slice>): failed targeted check, re-dispatching"`. The
+   re-dispatched builder starts from the reverted HEAD. Do not revert a
+   second failed run; take over on top of it. A slice recovered with
+   `omnigent worktrees integrate <id>` prints no `targeted_check`: run its
+   `## Targeted check` command yourself once on HEAD and use that line.
    If the second run still fails either condition, still do not retire
    it and do not append a fault (faults are Evaluator-only per
    MAILBOX-SCHEMA.md): take the slice over yourself — implement or fix

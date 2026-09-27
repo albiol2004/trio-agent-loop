@@ -499,3 +499,47 @@ def test_dispatch_idiom_reports_each_builder_as_it_finishes(tmp_path: Path) -> N
     while (d / "slow.run").exists() and time.time() < deadline:
         time.sleep(0.1)
     assert sorted(p.name for p in d.glob("*.done")) == ["fast.done", "slow.done"]
+
+
+# ------------------------------------ r12 repair R4 (revert failed merges)
+
+REVERT_CMD = (
+    '`git revert -m 1 --no-commit <merge_commit> && git commit -m '
+    '"revert(<slice>): failed targeted check, re-dispatching"`'
+)
+
+
+def test_omnigent_lead_reverts_failed_merge_before_redispatch(tmp_path: Path) -> None:
+    block = _flat(_open_loop_block(_isolated_open_loop_lead(tmp_path)))
+    assert "trioctl merges a run before you see its `targeted_check`" in block
+    assert "is already on HEAD" in block
+    assert "Revert that merge on the aggregate before you re-dispatch" in block
+    assert REVERT_CMD in block
+    assert "The re-dispatched builder then starts from the reverted HEAD" in block
+    assert "retained as `aggregate_dirty`: run `omnigent worktrees integrate <id>`" in block
+    assert "The worker ledger keeps the reverted run `integrated`" in block
+    assert "post-SHIP cleanup removes it normally" in block
+    assert "Do not revert a second failed run; take over on top of it" in block
+    # Ordering: revert sits between "re-dispatch once" and the take-over.
+    assert (block.index("re-dispatch that slice once")
+            < block.index(REVERT_CMD)
+            < block.index("If the second run still fails either condition"))
+
+
+def test_omnigent_lead_integrate_recovery_runs_targeted_check(tmp_path: Path) -> None:
+    block = _flat(_open_loop_block(_isolated_open_loop_lead(tmp_path)))
+    assert ("A slice recovered with `omnigent worktrees integrate <id>` (after "
+            "`merge_conflict`, `aggregate_dirty` and the like) prints no "
+            "`targeted_check`: run that slice's `## Targeted check` command "
+            "yourself once on HEAD") in block
+    assert "as the `targeted_check` for the retire decision and the ledger" in block
+    assert "plus your one targeted-check run for a `worktrees integrate` recovery (step 3)" in block
+
+
+def test_canonical_and_generated_leads_carry_revert() -> None:
+    section = _flat(_section(_canonical(), "## Open-loop mode"))
+    assert REVERT_CMD in section
+    assert "run its `## Targeted check` command yourself once on HEAD" in section
+    for path, text in _rendered_leads().items():
+        flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
+        assert "revert(<slice>): failed targeted check, re-dispatching" in flat, path

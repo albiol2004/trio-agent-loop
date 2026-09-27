@@ -314,6 +314,42 @@ def test_isolated_run_normalizes_decorated_targeted_check(wt, repo, root, fake_e
     assert json.loads(line)["targeted_check"] == "TARGETED_CHECK: 2 failed, 3 passed"
 
 
+def test_reverted_failed_slice_keeps_ledger_clean_and_dispatch_dir_is_ignored(
+    wt, repo, root
+):
+    """r12 repair R3/R4: the Lead's `<mailbox>/.dispatch/` runtime files do
+    not block dispatch/integration, and reverting a failed slice's merge
+    (`git revert -m 1`) leaves its record `integrated` with the merge still
+    in history, so a later slice starts without it and post-SHIP cleanup
+    removes both worktrees normally (no forever-retained record)."""
+    a = make_worker(wt, repo, root, "A")
+    a = wt.integrate(repo, a["id"], summary="add A")
+    assert a["state"] == "integrated" and (repo / "a.txt").exists()
+    dispatch = repo / "loop" / ".dispatch"
+    dispatch.mkdir()
+    for name in ("A.sh", "A.out", "A.done", "B.run"):
+        (dispatch / name).write_text("x\n")
+    found = wt.classify_aggregate(repo, repo / "loop")
+    assert found["product"] == [] and found["foreign"] == []
+    assert wt.aggregate_blockers(repo, repo / "loop") == []
+    git(repo, "revert", "-m", "1", "--no-commit", a["merge_commit"])
+    git(repo, "commit", "-q", "-m", "revert(A): failed targeted check, re-dispatching")
+    assert not (repo / "a.txt").exists()
+    assert wt.load_record(repo, a["id"])["state"] == "integrated"
+    assert wt.is_ancestor(repo, a["merge_commit"], "HEAD")
+    b = make_worker(wt, repo, root, "B")  # dispatch not blocked by .dispatch/
+    assert not (Path(b["path"]) / "a.txt").exists()  # starts from reverted HEAD
+    b = wt.integrate(repo, b["id"], summary="add B")
+    assert b["state"] == "integrated"
+    # A stays in B's ancestry (a revert is additive) but not in B's tree:
+    # B's slice-eval, which grades the tree at B's merge sha, never sees A.
+    tree = git(repo, "ls-tree", "-r", "--name-only", b["merge_commit"]).splitlines()
+    assert "b.txt" in tree and "a.txt" not in tree
+    ship(repo, "HEAD")
+    states = {r["slice"]: r["state"] for r in clean(wt, repo)}
+    assert states == {"A": "removed", "B": "removed"}
+
+
 def test_worker_owned_cursor_residue_is_not_committed_and_is_removed(
     wt, repo, root, fake_env
 ):
