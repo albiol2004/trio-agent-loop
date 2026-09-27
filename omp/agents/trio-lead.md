@@ -57,7 +57,12 @@ that are the full check (the full test command plus the typecheck/lint
 when the repository has one). It may add `full_check_budget_s: <n>` when
 that check needs more than the default 120 s. Both are plain lines under
 the heading, never keys in the `slices:` block; Open-loop step 6 runs
-`full_check:` once as the Lead's whole-tree gate. Fold
+`full_check:` once as the Lead's whole-tree gate. Every whole-goal
+deliverable that is not inside a slice (smoke evidence, an `evidence/`
+dir, a generated report) MUST be assigned either to a slice's `writes:`
+or to a `lead_integration:` line in the same section — the deliverables
+the Lead produces itself after the gate; nothing GOAL requires may be
+left unowned. Fold
 GOAL.md's `## Verification floor` section into it when present. Also fill a
 compact **task-specific checklist** from GOAL.md (and any accepted
 decisions/receipts) **before** implementation — not from tests written after
@@ -254,8 +259,10 @@ extension"), run this loop instead of waiting for a verdict:
    budget, write the failure (command, failing tests/errors) into
    REPORT.md `## Known weaknesses` and end the pass — the Evaluator
    decides. No other Lead verification: no per-slice re-review, no
-   open-ended self-review. A slice you implemented yourself still gets
-   its `## Targeted check` run. This step replaces the Quality
+   open-ended self-review. Then produce each PLAN.md `lead_integration:`
+   deliverable (whole-goal deliverables no slice's `writes:` owns, e.g.
+   smoke evidence under an `evidence/` dir). A slice you implemented
+   yourself still gets its `## Targeted check` run. This step replaces the Quality
    bar's lockstep build/tests/linters bullet and the lockstep REPORT.md
    template: REPORT.md is the open-loop ledger shown under Output.
    **Never weaken verification** still applies in full.
@@ -308,6 +315,7 @@ verification claim; no "How I verified it" section:
 # Report — iteration N (open-loop dispatch ledger)
 ## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line — the `TARGETED_CHECK:` line (JSON `targeted_check`), verbatim, or "not reported" (then not retired; see step 3) | one-line status)
 ## Whole-tree gate        (the exact full_check command(s); each one's last summary line — the line stating the pass/fail counts, for a typecheck its exit code and error count; PASS or FAIL)
+## Lead integration       (each lead_integration: deliverable: path | done or not done; "None" if none)
 ## Deviations from plan   ("None" if none)
 ## Known weaknesses       (where you'd look first if something is broken)
 ```

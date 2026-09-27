@@ -31,7 +31,10 @@ prompt: |
   human-gate plus the exact evidence required, and a `full_check:` line
   naming the exact whole-tree command(s) (full test command plus
   typecheck/lint when present; optional `full_check_budget_s: <n>`,
-  default 120 s) -- plain lines, not `slices:` keys. Fold in GOAL.md's
+  default 120 s) -- plain lines, not `slices:` keys. Assign every
+  whole-goal deliverable not inside a slice (smoke evidence, an
+  `evidence/` dir) to a slice's `writes:` or to a `lead_integration:`
+  line there, which you produce after the whole-tree gate. Fold in GOAL.md's
   `## Verification floor`; tag human-only checks `verify: human` and leave
   them for NEEDS_HUMAN. Every increment is a machine-readable YAML `slices:`
   entry with honest `writes:` and `reads:`; freeze each `api:` read in

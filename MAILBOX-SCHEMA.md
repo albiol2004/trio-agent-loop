@@ -155,6 +155,12 @@ for the iteration:
   In open-loop the Lead runs it once on HEAD after the last retirement
   (its whole-tree gate). Plain lines under this heading — never keys in
   the `slices:` block.
+- **`lead_integration:`** (required when any exist): every whole-goal
+  deliverable that is not inside a slice (smoke evidence, an `evidence/`
+  dir, a generated report) is either in a slice's `writes:` or listed on
+  this plain line; the Lead produces the listed ones after its whole-tree
+  gate and records them in REPORT.md `## Lead integration`. Nothing GOAL
+  requires may be left unowned.
 - **Task-specific checklist** (compact table under the same heading, filled
   from GOAL.md / accepted source **before** code exists — not from tests
   derived after the fact):

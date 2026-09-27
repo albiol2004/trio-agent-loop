@@ -302,3 +302,49 @@ def test_canonical_and_generated_leads_retire_append_only() -> None:
         assert APPEND_ONLY in flat and GREP_CHECK in flat, path
     schema = _flat((ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8"))
     assert "the committer time of `sha` (`git log -1 --format=%cI <sha>`)" in schema
+
+
+# ------------------------------------------- G4 whole-goal deliverables
+
+LEAD_INTEGRATION_PLAN = (
+    "Every whole-goal deliverable that is not inside a slice (smoke evidence, "
+    "an `evidence/` dir, a generated report) MUST be assigned either to a "
+    "slice's `writes:` or to a `lead_integration:` line in the same section"
+)
+EVIDENCE_GAP = ("evidence that does not meet the declared standard is an ITERATE "
+                "whose failure scope is the evidence gap itself")
+
+
+def test_plan_template_requires_lead_integration() -> None:
+    canonical = _flat((CANONICAL / "lead.md").read_text(encoding="utf-8"))
+    assert LEAD_INTEGRATION_PLAN in canonical
+    assert "the deliverables the Lead produces itself after the gate" in canonical
+    assert "nothing GOAL requires may be left unowned" in canonical
+    for path, flat in _generated_role("lead"):
+        assert LEAD_INTEGRATION_PLAN in flat, path
+    config = _flat((ROLES / "lead" / "config.yaml").read_text(encoding="utf-8"))
+    assert ("Assign every whole-goal deliverable not inside a slice (smoke evidence, "
+            "an `evidence/` dir) to a slice's `writes:` or to a `lead_integration:` "
+            "line there, which you produce after the whole-tree gate") in config
+    schema = _flat((ROOT / "MAILBOX-SCHEMA.md").read_text(encoding="utf-8"))
+    assert "**`lead_integration:`** (required when any exist)" in schema
+
+
+def test_open_loop_lead_does_lead_integration_after_gate(tmp_path: Path) -> None:
+    block = _flat(_block(_lead_prompt(tmp_path)))
+    step6 = block[block.index("6. Whole-tree gate"): block.index("7. REPORT.md")]
+    assert "Then produce each PLAN.md `lead_integration:` deliverable" in step6
+    assert step6.index(GATE_GIVEUP) < step6.index("`lead_integration:` deliverable")
+    assert "`## Lead integration` (each `lead_integration:` deliverable" in block
+    canonical = (CANONICAL / "lead.md").read_text(encoding="utf-8")
+    assert "Then produce each PLAN.md `lead_integration:`" in _flat(
+        _section(canonical, "## Open-loop mode"))
+    output = canonical[canonical.index("## Output"): canonical.index("## Rules")]
+    assert "## Lead integration" in output.split("Open-loop (`loop/QUEUE.md` exists)", 1)[1]
+
+
+def test_evaluator_keeps_unverified_evidence_iterate(tmp_path: Path) -> None:
+    prompt = _flat(_integration_eval_prompt(tmp_path))
+    assert EVIDENCE_GAP in prompt
+    for path, flat in _generated_role("evaluator"):
+        assert "Verification standard" in flat, path
