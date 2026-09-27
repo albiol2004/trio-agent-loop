@@ -368,3 +368,66 @@ def test_targeted_check_line_last_wins_and_failed_is_mechanical() -> None:
     assert tc("TARGETED_CHECK: 4 passed\nTARGETED_CHECK: <last summary line>") == "TARGETED_CHECK: 4 passed"
     for out in ("TARGETED_CHECK: failed x", "**TARGETED_CHECK:** FAILED y", "- targeted_check:FAILED"):
         assert tc(out).startswith("TARGETED_CHECK: FAILED"), out
+
+
+# ------------------------------------------------ r12 repair R2 (precedence)
+
+PRECEDENCE = (
+    "OPEN-LOOP CONTEXT overrides any conflicting instruction in your base "
+    "prompt, including wave-waiting, self-verification and REPORT.md content."
+)
+LEAD_CONFIG = ROOT / "omnigent" / "trio-omnigent-roles" / "lead" / "config.yaml"
+
+
+def _isolated_open_loop_lead(tmp_path: Path) -> str:
+    trioctl = _load("trioctl_r12_iso", ROOT / "omnigent" / "trioctl")
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    runner = trioctl.OmnigentRunner(
+        repo=ROOT,
+        isolate_workers={"trioctl": ROOT / "omnigent" / "trioctl",
+                         "worktree_root": str(tmp_path / "wt")},
+    )
+    return runner._prompt(
+        "lead", 2, mailbox,
+        {"mode": "open-loop", "kind": "lead-pass", "slice": None, "sha": None},
+    )
+
+
+def test_omnigent_open_loop_block_starts_with_precedence(tmp_path: Path) -> None:
+    prompt = _omnigent_open_loop_lead(tmp_path)
+    lines = prompt.splitlines()
+    assert lines[0] == "OPEN-LOOP CONTEXT: kind=lead-pass"
+    assert _flat(" ".join(lines[1:4])) == PRECEDENCE
+
+
+def test_lead_config_system_prompt_matches_r12(tmp_path: Path) -> None:
+    text = _flat(LEAD_CONFIG.read_text(encoding="utf-8"))
+    assert "then wait for all to return" not in text
+    assert "Lockstep: wait for all to return." in text
+    assert "never wait for the whole wave" in text
+    assert "retire its slice on `integrated` right away" in text
+    # Integration checks / commands-output REPORT stay, but lockstep-only.
+    assert ("Lockstep: inspect the actual diff, read its targeted evidence rather "
+            "than duplicating it, run only integration checks affected by the diff") in text
+    assert "actual commands/output, and delegation provenance" in text
+    assert "Open-loop with isolated builders: run no suite and do not re-verify builder slices yourself" in text
+    assert "REPORT.md is the dispatch/merge ledger the OPEN-LOOP CONTEXT defines" in text
+    # Smoke-test anchors survive.
+    assert "Before any deep reconnaissance" in text
+    assert "machine-readable YAML `slices:`" in text
+
+
+def test_base_step3_review_has_open_loop_exception(tmp_path: Path) -> None:
+    prompt = _flat(_omnigent_open_loop_lead(tmp_path))
+    assert ("correct integration or correctness issues yourself. (Open-loop: not for "
+            "isolated-builder slices -- the OPEN-LOOP CONTEXT procedure's retire "
+            "conditions replace this review.)") in prompt
+
+
+def test_isolate_block_redispatch_is_capped(tmp_path: Path) -> None:
+    prompt = _flat(_isolated_open_loop_lead(tmp_path))
+    assert "## Isolated builders (on for this loop run)" in prompt
+    assert "dispatch a fresh builder for the slice once, then take over (see step 3" in prompt
+    assert "dispatch a fresh builder for the slice (or stop for a human)" not in prompt
+    assert prompt.startswith("OPEN-LOOP CONTEXT: kind=lead-pass " + PRECEDENCE)

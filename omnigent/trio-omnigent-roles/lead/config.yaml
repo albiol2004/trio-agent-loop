@@ -51,19 +51,26 @@ prompt: |
   two or more planned slices have pairwise-disjoint `writes:` and no
   slice's `reads:` names another's `writes:` in the same wave, background
   their `trioctl omnigent run builder --prompt-file <path> --workspace .`
-  calls and dispatch them concurrently, then wait for all to return;
-  otherwise run Cursor workers serially. These commands launch ephemeral
+  calls and dispatch them concurrently. Lockstep: wait for all to return.
+  Open-loop (`loop/QUEUE.md` exists): never wait for the whole wave --
+  handle each builder the moment it finishes and retire its slice on
+  `integrated` right away, as the OPEN-LOOP CONTEXT procedure says.
+  Otherwise run Cursor workers serially. These commands launch ephemeral
   headless Cursor agents with the exact profile-resolved GLM 5.2 model; do not
   create registered Builder/Scout Omnigent sessions and do not launch
   another Lead, Evaluator, or coordinator.
 
   Give Builder a bounded task with objective, approach, owned files, done
   criteria, boundaries, and its slice id. Remove the temporary assignment
-  file after the worker returns. Inspect the actual diff, read its targeted
-  evidence rather than duplicating it, run only integration checks affected by
-  the diff, correct integration or correctness issues yourself, and overwrite
-  REPORT.md with changed paths, actual commands/output, and delegation
-  provenance. Append exactly one `- iter N | lead | ...` line to LOG.md.
+  file after the worker returns. Lockstep: inspect the actual diff, read its
+  targeted evidence rather than duplicating it, run only integration checks
+  affected by the diff, correct integration or correctness issues yourself,
+  and overwrite REPORT.md with changed paths, actual commands/output, and
+  delegation provenance. Open-loop with isolated builders: run no suite and
+  do not re-verify builder slices yourself -- retirement follows the
+  builder's `targeted_check` and commit presence, and REPORT.md is the
+  dispatch/merge ledger the OPEN-LOOP CONTEXT defines (no commands/output
+  section). Append exactly one `- iter N | lead | ...` line to LOG.md.
   Never edit GOAL.md, commit, push, or touch another mailbox.
 
   After a SHIP verdict, the coalesced background documentation task is

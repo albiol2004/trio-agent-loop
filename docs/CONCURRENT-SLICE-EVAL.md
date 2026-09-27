@@ -138,3 +138,31 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
 - An explicit `--isolate-workers` on a detached HEAD is refused
   (`--isolate-workers refused: checkout is not on a branch (detached HEAD); ...`);
   the plain default falls back to non-isolated, serial.
+
+## 6. Install notes (r12)
+
+r12 edits the Lead's registered system prompt
+(`omnigent/trio-omnigent-roles/lead/config.yaml`). Registered Omnigent
+agents persist their bundle prompt when they are created
+(SETUP-BY-OMNIGENT.md step 6). `install.sh --omnigent` copies the role
+directories, but a Lead anchor that already exists keeps the old text.
+r12 does not bump `REGISTRY_PROFILE`, so `doctor` will not flag the old
+anchor. After installing r12, re-register the Lead:
+
+1. Back up `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
+2. From the template repository, create a new idle anchor with
+   `sys_session_create(config_path=omnigent/trio-omnigent-roles/lead)`.
+   Keep its title without the `trioctl <mailbox> ` prefix.
+3. Replace `trio-omnigent-lead`'s `agent_id` and `bootstrap_conversation_id`
+   in `registry.json` with the returned values. Leave `_profile`, the
+   Evaluator entry and the old anchor session untouched. Never close or
+   prune an anchor.
+4. Run `trioctl omnigent doctor`.
+
+If you skip this step, runs still work. Every open-loop Lead pass begins
+with an OPEN-LOOP CONTEXT line that overrides the base prompt's
+wave-waiting, self-verification and REPORT.md instructions. The old system
+prompt then only adds noise that contradicts the procedure.
+Nothing in r12 needs a builder re-registration. Isolated builders get the
+TARGETED_CHECK contract from trioctl's `_ISOLATED_BUILDER_NOTE`, and trioctl
+never reads `trio-omnigent-roles/builder/config.yaml`.

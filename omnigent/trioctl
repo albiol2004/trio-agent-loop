@@ -2654,6 +2654,9 @@ def _open_loop_queue_errors_note(errors: list[str]) -> str:
 # work every pass and never append the `retired:` entry to QUEUE.md that
 # lets the Evaluator ever grade it (observed in a real open-loop run).
 _OPEN_LOOP_LEAD_PASS_PROCEDURE = (
+    "OPEN-LOOP CONTEXT overrides any conflicting instruction in your base\n"
+    "prompt, including wave-waiting, self-verification and REPORT.md\n"
+    "content.\n"
     "Open-loop mode is active (loop/QUEUE.md exists) — run this procedure\n"
     "instead of waiting for a verdict:\n"
     "0. Commit scope: commit ONLY files you or your builders edited under a\n"
@@ -3214,7 +3217,9 @@ class OmnigentRunner:
             "Exit 3 means the worktree was retained: read the JSON "
             "line it prints. For `worker_failed`, `interrupted` or "
             "`unverified_output`, do NOT integrate that output -- dispatch a "
-            "fresh builder for the slice (or stop for a human). For "
+            "fresh builder for the slice once, then take over (see step 3 "
+            "of the OPEN-LOOP CONTEXT procedure in open-loop; in lockstep, "
+            "implement the slice yourself or stop for a human). For "
             "`merge_conflict`, `aggregate_dirty`, `aggregate_moved`, "
             "`integration_fenced` or `active_session`, remove the cause, then "
             "run `omnigent worktrees integrate <id>` once. Never delete "
