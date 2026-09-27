@@ -3695,12 +3695,43 @@ class OmnigentRunner:
                 role="evaluator",
                 detach_at=str(context["sha"]),
             )
+        except (worker_worktrees.WorktreeError, OSError, subprocess.SubprocessError) as exc:
+            raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
+        try:
             # Live owner for the whole dispatch: this process (session id
             # is appended once created).
             worker_worktrees.mark_running(self.repo, record, None)
-            return record
-        except (worker_worktrees.WorktreeError, OSError, subprocess.SubprocessError) as exc:
-            raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
+        except Exception as exc:
+            # Created but not bound: the degraded eval never uses it, so
+            # retire it now (recorded, never an orphan) before degrading.
+            self._discard_eval_worktree(record, exc)
+            raise TrioctlError(
+                f"cannot bind slice-eval worktree: {type(exc).__name__}: {exc}"
+            ) from exc
+        return record
+
+    def _discard_eval_worktree(self, record: dict[str, Any], exc: BaseException) -> None:
+        """Remove (or record as retained) a created-but-unbound eval worktree."""
+        worker_id = record.get("id")
+        try:
+            result = worker_worktrees.discard_eval(
+                self.repo, str(worker_id), f"{type(exc).__name__}: {exc}"
+            )
+            state = result.get("state")
+            detail = (
+                "" if state == "removed"
+                else f" ({result.get('retained_reason')}: {result.get('retained_detail')})"
+            )
+            print(
+                f"trioctl: unbound slice-eval worktree {worker_id}: {state}{detail}",
+                file=sys.stderr,
+            )
+        except Exception as cleanup_exc:  # noqa: BLE001 - the eval still degrades
+            print(
+                f"trioctl: could not discard unbound slice-eval worktree {worker_id} "
+                f"({record.get('path')}): {type(cleanup_exc).__name__}: {cleanup_exc}",
+                file=sys.stderr,
+            )
 
     def _bind_slice_eval(
         self,
@@ -3721,14 +3752,15 @@ class OmnigentRunner:
         """
         try:
             return self._slice_eval_worktree(role, mailbox, context), None
-        except TrioctlError as exc:
-            reason = str(exc)
+        except Exception as exc:  # noqa: BLE001 - any bind failure degrades
+            error_class = type(exc).__name__
+            reason = str(exc) if isinstance(exc, TrioctlError) else f"{error_class}: {exc}"
         slice_id = (context or {}).get("slice") or "?"
         sha = str((context or {}).get("sha") or "")[:12]
         note = f"eval_isolation: degraded ({reason})"
         print(
-            f"trioctl: slice-eval {slice_id}@{sha}: {note}; grading on the "
-            "root-bound (non-isolated) path",
+            f"trioctl: slice-eval {slice_id}@{sha}: {note} [{error_class}]; "
+            "grading on the root-bound (non-isolated) path",
             file=sys.stderr,
         )
         dispatch["meta"]["eval_isolation"] = f"degraded ({reason})"

@@ -2227,6 +2227,25 @@ def mark_finished(repo: Path, worker_id: str) -> dict[str, Any]:
         return record
 
 
+def discard_eval(repo: Path, worker_id: str, reason: str) -> dict[str, Any]:
+    """A just-created evaluator worktree whose bind failed: never an orphan.
+
+    Recorded as ``retained`` (``bind_failed`` + *reason*) and finished, with
+    no live dispatcher, then removed through the normal ownership-checked
+    :func:`cleanup_one`. Anything that blocks removal leaves the retained
+    record in the ledger with its reason. Evaluator records only.
+    """
+    with repo_lock(repo):
+        record = load_record(repo, worker_id)
+        if record.get("kind") != "eval":
+            raise WorktreeError(f"{worker_id} is not an evaluator worktree")
+        record["finished"] = True
+        record["dispatcher"] = None
+        record["worker"] = None
+        _retain(repo, record, "bind_failed", reason)
+    return cleanup_one(repo, worker_id)
+
+
 def summarize(record: dict[str, Any]) -> str:
     state = record.get("state")
     reason = record.get("retained_reason")
