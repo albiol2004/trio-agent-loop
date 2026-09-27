@@ -51,7 +51,13 @@ said one thing, the screen showed another.
 Before implementing, declare the iteration's `## Verification standard` in
 PLAN.md: the mode (`test-first` | `implement-then-smoke` | `human-gate`) and
 the exact evidence that will count as verified (commands + expected outputs;
-reconciliation/integrity/idempotent re-runs for `profile: data`). Fold
+reconciliation/integrity/idempotent re-runs for `profile: data`). The
+section MUST include a `full_check:` line: the exact whole-tree command(s)
+that are the full check (the full test command plus the typecheck/lint
+when the repository has one). It may add `full_check_budget_s: <n>` when
+that check needs more than the default 120 s. Both are plain lines under
+the heading, never keys in the `slices:` block; Open-loop step 6 runs
+`full_check:` once as the Lead's whole-tree gate. Fold
 GOAL.md's `## Verification floor` section into it when present. Also fill a
 compact **task-specific checklist** from GOAL.md (and any accepted
 decisions/receipts) **before** implementation — not from tests written after
@@ -214,22 +220,33 @@ extension"), run this loop instead of waiting for a verdict:
 5. **Backpressure**: while 2 or more faults are `open` or `taken`, take no
    new slice — drain faults first. This replaces the two-consecutive-ITERATE
    drain rule while `QUEUE.md` exists.
-6. **No Lead self-check for isolated-builder slices.** For a slice an
-   isolated builder implemented (its run printed `integrated`), do NOT run
-   the project suite and do NOT re-verify the integrated tree — the
-   Evaluator's own full-suite run is the sole authoritative verification.
-   Your only checks are the builder's reported targeted test result and
-   commit presence (`git log --grep="^slice(<id>):"`). Step 3's retire
-   conditions apply: `merge_commit` equal to `base` (empty integration)
-   or a missing/FAILED `TARGETED_CHECK:` line means no retirement and one
-   re-dispatch. A slice you implemented yourself still gets the targeted checks its
-   change affects. This step replaces the Quality bar's lockstep
-   build/tests/linters bullet and the lockstep REPORT.md template:
-   REPORT.md is the open-loop dispatch/merge ledger shown under Output.
+6. **Whole-tree gate — your ONE verification.** Per slice, your only
+   checks are step 3's retire conditions (the builder's `targeted_check`
+   plus a real `slice(<id>):` merge), plus your one targeted-check run
+   for a `worktrees integrate` recovery (step 3); do not re-run checks
+   per slice otherwise. After the LAST builder of the wave has integrated and every
+   slice is retired, run the repository's whole-tree verification ONCE on
+   HEAD: exactly the `full_check:` command(s) PLAN.md's `## Verification
+   standard` names as the full check (typically the full test command
+   plus the typecheck), with a wall-clock budget of 120 s by default —
+   PLAN.md may override it with a `full_check_budget_s:` line there —
+   e.g. `timeout <budget> sh -c '<full_check>'`. If PLAN.md names no
+   `full_check:`, add that line first. Slice-evals may still be grading
+   the last retirements meanwhile; do not wait for them. On failure, fix
+   ONLY within the failing paths: a `slice(<id>): fix …` commit plus a
+   NEW `retired:` entry at the fix sha (step 3's post-retirement rule),
+   then re-run the gate once. If it still fails, or it exceeds the
+   budget, write the failure (command, failing tests/errors) into
+   REPORT.md `## Known weaknesses` and end the pass — the Evaluator
+   decides. No other Lead verification: no per-slice re-review, no
+   open-ended self-review. A slice you implemented yourself still gets
+   its `## Targeted check` run. This step replaces the Quality
+   bar's lockstep build/tests/linters bullet and the lockstep REPORT.md
+   template: REPORT.md is the open-loop ledger shown under Output.
    **Never weaken verification** still applies in full.
 
 ## Quality bar
-- Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6 replaces this bullet.)
+- Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6's one whole-tree gate replaces this bullet.)
 - **Never weaken verification to pass it**: no deleting/skipping tests, no loosening assertions, no hardcoding expected outputs — the Evaluator audits test diffs and treats it as an automatic fail. A genuinely wrong test may be fixed, with justification in the report.
 - Smallest diff that satisfies the increment; match existing style; stay inside your own out-of-scope fence.
 
@@ -241,7 +258,8 @@ per role:
   you.
 - You read builder evidence instead of re-executing their runs; during
   review, run only the checks the changes actually affect. In open-loop
-  mode you run none for isolated-builder slices (Open-loop step 6).
+  mode you run no per-slice checks for isolated-builder slices — only the
+  one whole-tree gate after the last retirement (Open-loop step 6).
 - The Evaluator owns the full suite once per iteration as the authoritative
   run and does not trust a green result it did not produce or verify.
 
@@ -268,11 +286,13 @@ Lockstep:
 - Primary builder(s): task, files changed, result
 - Lead corrective edits: files changed and why direct correction was needed ("None" if none)
 ```
-Open-loop (`loop/QUEUE.md` exists) — a dispatch/merge ledger, not a
+Open-loop (`loop/QUEUE.md` exists) — a dispatch/merge ledger plus the
+one whole-tree gate result (Open-loop step 6), which is your only
 verification claim; no "How I verified it" section:
 ```markdown
 # Report — iteration N (open-loop dispatch ledger)
 ## Slices                 (one row per slice: slice id | builder id | merge sha | files | builder-reported targeted test result line — the `TARGETED_CHECK:` line (JSON `targeted_check`), verbatim, or "not reported" (then not retired; see step 3) | one-line status)
+## Whole-tree gate        (the exact full_check command(s); each one's last summary line — the line stating the pass/fail counts, for a typecheck its exit code and error count; PASS or FAIL)
 ## Deviations from plan   ("None" if none)
 ## Known weaknesses       (where you'd look first if something is broken)
 ```

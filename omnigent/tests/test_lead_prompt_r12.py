@@ -118,12 +118,20 @@ def test_omnigent_open_loop_lead_prompt_carries_early_retire(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------- commit B
+# r13 G1 dropped B's "no Lead self-check" in favour of one bounded
+# whole-tree gate; these tests now pin B's absence and the gate's presence
+# (the full r13 contract lives in test_lead_prompt_r13.py).
 
 SUITE_MANDATE = "Run the project's build/tests/linters before reporting"
 NO_SELF_CHECK = "do NOT run the project suite"
-LEDGER_EVAL = (
+B_LEDGER_EVAL = (
     "REPORT.md is a dispatch ledger, not a verification claim; your own "
     "full-suite run is the sole authoritative verification"
+)
+LEDGER_EVAL = (
+    "REPORT.md is the Lead's dispatch/merge ledger plus one "
+    "`## Whole-tree gate` result — a claim to check, not evidence; your own "
+    "full-suite run is the authoritative verification"
 )
 
 
@@ -140,14 +148,16 @@ def _output_templates(text: str) -> tuple[str, str]:
 
 
 def test_canonical_open_loop_section_drops_lead_self_check() -> None:
+    # r13 G1: B's "no self-check" is gone; one whole-tree gate replaces it.
     section = _flat(_section(_canonical(), "## Open-loop mode"))
     assert SUITE_MANDATE.lower() not in section.lower()
-    assert NO_SELF_CHECK in section
-    assert "do NOT re-verify the integrated tree" in section
-    assert "sole authoritative verification" in section
-    assert 'git log --grep="^slice(<id>):"' in section
+    assert NO_SELF_CHECK not in section
+    assert "do NOT re-verify the integrated tree" not in section
+    assert "Whole-tree gate — your ONE verification" in section
+    assert "run the repository's whole-tree verification ONCE on HEAD" in section
     assert "Never weaken verification" in section
-    assert "`merge_commit` equal to `base`" in section
+    # B's step-6 restatement of the retire conditions is gone; step 3 keeps them.
+    assert "`merge_commit` differs from its `base`" in section
 
 
 def test_canonical_lockstep_keeps_suite_mandate_and_verified_section() -> None:
@@ -175,21 +185,24 @@ def test_generated_leads_and_evaluators_carry_commit_b() -> None:
         flat = _flat(_flat(text).replace('\\"', '"').replace("\\n", " "))
         if "lead" in path.name and "## Open-loop mode" in text:
             leads += 1
-            assert NO_SELF_CHECK in flat, path
+            assert NO_SELF_CHECK not in flat, path
+            assert "Whole-tree gate — your ONE verification" in flat, path
             assert "Lockstep: " + SUITE_MANDATE in flat, path
             assert "open-loop dispatch ledger" in flat, path
         if "evaluator" in path.name and "## Open-loop mode" in text:
             evaluators += 1
             assert LEDGER_EVAL in flat, path
+            assert B_LEDGER_EVAL not in flat, path
     assert leads and evaluators
 
 
 def test_omnigent_open_loop_lead_prompt_drops_self_check(tmp_path: Path) -> None:
     prompt = _omnigent_open_loop_lead(tmp_path)
     block = _flat(_open_loop_block(prompt))
-    assert NO_SELF_CHECK in block
+    assert NO_SELF_CHECK not in block
+    assert "sole authoritative verification" not in block
     assert "replaces the base prompt's step 4 in open-loop" in block
-    assert "sole authoritative verification" in block
+    assert "Whole-tree gate — your ONE verification" in block
     assert "dispatch/merge ledger" in block
     assert "not reported" in block
     assert "REPORT.md" in block
@@ -224,6 +237,7 @@ def test_omnigent_integration_eval_prompt_names_ledger(tmp_path: Path) -> None:
     block = _flat(prompt.split("\n\n", 1)[0])
     assert block.startswith("OPEN-LOOP CONTEXT: kind=integration-eval")
     assert LEDGER_EVAL in block
+    assert B_LEDGER_EVAL not in block
 
 
 # ---------------------------------------------------------------- commit C
@@ -425,8 +439,12 @@ def test_lead_config_system_prompt_matches_r12(tmp_path: Path) -> None:
     assert ("Lockstep: inspect the actual diff, read its targeted evidence rather "
             "than duplicating it, run only integration checks affected by the diff") in text
     assert "actual commands/output, and delegation provenance" in text
-    assert "Open-loop with isolated builders: run no suite and do not re-verify builder slices yourself" in text
-    assert "REPORT.md is the dispatch/merge ledger the OPEN-LOOP CONTEXT defines" in text
+    # r13 G1: "run no suite" replaced by the one whole-tree gate.
+    assert "run no suite" not in text
+    assert ("Open-loop with isolated builders: do not re-verify builder slices "
+            "one by one") in text
+    assert "run the PLAN's `full_check:` once on HEAD as the OPEN-LOOP CONTEXT's whole-tree gate" in text
+    assert "REPORT.md is the dispatch/merge ledger plus its `## Whole-tree gate` section" in text
     # Smoke-test anchors survive.
     assert "Before any deep reconnaissance" in text
     assert "machine-readable YAML `slices:`" in text

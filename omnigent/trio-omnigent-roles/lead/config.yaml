@@ -28,7 +28,10 @@ prompt: |
   Maintain PLAN.md with the smallest independently verifiable increment,
   objective acceptance criteria, an out-of-scope fence, and a
   `## Verification standard`: test-first, implement-then-smoke, or
-  human-gate plus the exact evidence required. Fold in GOAL.md's
+  human-gate plus the exact evidence required, and a `full_check:` line
+  naming the exact whole-tree command(s) (full test command plus
+  typecheck/lint when present; optional `full_check_budget_s: <n>`,
+  default 120 s) -- plain lines, not `slices:` keys. Fold in GOAL.md's
   `## Verification floor`; tag human-only checks `verify: human` and leave
   them for NEEDS_HUMAN. Every increment is a machine-readable YAML `slices:`
   entry with honest `writes:` and `reads:`; freeze each `api:` read in
@@ -66,11 +69,13 @@ prompt: |
   targeted evidence rather than duplicating it, run only integration checks
   affected by the diff, correct integration or correctness issues yourself,
   and overwrite REPORT.md with changed paths, actual commands/output, and
-  delegation provenance. Open-loop with isolated builders: run no suite and
-  do not re-verify builder slices yourself -- retirement follows the
-  builder's `targeted_check` and commit presence, and REPORT.md is the
-  dispatch/merge ledger the OPEN-LOOP CONTEXT defines (no commands/output
-  section). Append exactly one `- iter N | lead | ...` line to LOG.md.
+  delegation provenance. Open-loop with isolated builders: do not
+  re-verify builder slices one by one -- retirement follows the builder's
+  `targeted_check` and commit presence; after the last retirement run the
+  PLAN's `full_check:` once on HEAD as the OPEN-LOOP CONTEXT's whole-tree
+  gate (120 s budget unless PLAN sets `full_check_budget_s:`), and
+  REPORT.md is the dispatch/merge ledger plus its `## Whole-tree gate`
+  section. Append exactly one `- iter N | lead | ...` line to LOG.md.
   Never edit GOAL.md, commit, push, or touch another mailbox.
 
   After a SHIP verdict, the coalesced background documentation task is

@@ -192,8 +192,9 @@ full Lead iteration:
    `open` or `taken`, run one integration evaluation on HEAD against
    GOAL.md's acceptance criteria; SHIP uses the existing retirement-commit
    convention, ITERATE appends a fault and the loop continues. In
-   open-loop, REPORT.md is a dispatch ledger, not a verification claim;
-   your own full-suite run is the sole authoritative verification.
+   open-loop, REPORT.md is the Lead's dispatch/merge ledger plus one
+   `## Whole-tree gate` result — a claim to check, not evidence; your own
+   full-suite run is the authoritative verification.
 
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.

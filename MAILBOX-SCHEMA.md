@@ -147,6 +147,14 @@ for the iteration:
 - **Evidence**: what will count as verified — exact commands, the outputs
   they must produce, and the data/ground-truth checks (reconciliation,
   integrity, idempotent re-runs for `profile: data`).
+- **`full_check:`** (required): one plain line naming the exact whole-tree
+  command(s) that are the full check — the full test command plus the
+  typecheck/lint when the repository has one, e.g.
+  `full_check: cd api && npm test && npm run typecheck`. Optional
+  `full_check_budget_s: <n>` overrides the default 120 s wall-clock budget.
+  In open-loop the Lead runs it once on HEAD after the last retirement
+  (its whole-tree gate). Plain lines under this heading — never keys in
+  the `slices:` block.
 - **Task-specific checklist** (compact table under the same heading, filled
   from GOAL.md / accepted source **before** code exists — not from tests
   derived after the fact):

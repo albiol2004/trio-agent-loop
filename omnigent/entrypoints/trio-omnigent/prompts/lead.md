@@ -20,7 +20,7 @@ mailbox `{mailbox}` at iteration {iteration}.
 4. Run the checks promised by the plan. Write `{mailbox}/REPORT.md` with the
    changed paths, deviations, exact commands and outputs, and known weaknesses.
    (Open-loop: the OPEN-LOOP CONTEXT procedure replaces this step with a
-   dispatch/merge ledger and no Lead suite run.)
+   dispatch/merge ledger and ONE whole-tree gate after the last retirement.)
 5. Commit every code-changing slice as its own commit
    `slice(<id>): <summary>`. Add no commit trailers unless the task or
    the user's instructions explicitly ask for one. Leave the
