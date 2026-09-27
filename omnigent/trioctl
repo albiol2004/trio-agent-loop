@@ -3360,6 +3360,11 @@ class OmnigentRunner:
         self._inflight: set[str] = set()
         # {session_id: {role, kind, slice, sha}} for in-flight dispatches.
         self._inflight_meta: dict[str, dict[str, Any]] = {}
+        # Degraded (root-bound) slice-evals of THIS run still in flight:
+        # {token: {slice, sha, started}}. Their cursor-agent runs at the
+        # root; `_release_root` treats them as known occupants and waits
+        # for them (bounded by the role timeout) instead of refusing.
+        self._degraded_root_evals: dict[str, dict[str, Any]] = {}
         # Integration-fence tokens this runner holds: acquired per evaluator
         # dispatch; only tokens of FINISHED evaluator dispatches are released
         # at the next Lead/repair dispatch; all are released at loop end.
@@ -3752,6 +3757,55 @@ class OmnigentRunner:
 
     ROOT_RELEASE_WAIT = 30.0
 
+    def _wait_known_root_occupants(self) -> float:
+        """Wait for this run's in-flight degraded root-bound slice-evals.
+
+        Such an eval is a known occupant of the root, not a stranger: its
+        cursor-agent legitimately runs there until the dispatch ends. The
+        wait is bounded by each dispatch's own role timeout (plus
+        ROOT_RELEASE_WAIT for its teardown); past that the caller's normal
+        stranger check decides. Returns the seconds waited.
+        """
+        start = time.monotonic()
+        announced: set[str] = set()
+        while True:
+            with self._dict_lock():
+                known = dict(self.__dict__.get("_degraded_root_evals") or {})
+            if not known:
+                break
+            timeout = float(self._timeout or 0.0)
+            deadline = max(
+                float(entry.get("started") or start) for entry in known.values()
+            ) + timeout + self.ROOT_RELEASE_WAIT
+            if time.monotonic() >= deadline:
+                print(
+                    "trioctl: degraded slice-eval(s) "
+                    f"{sorted(str(e.get('slice') or '?') for e in known.values())} "
+                    "outlived their role timeout; checking the root as usual",
+                    file=sys.stderr,
+                )
+                break
+            for token, entry in known.items():
+                if token not in announced:
+                    announced.add(token)
+                    print(
+                        "trioctl: root busy with degraded slice-eval "
+                        f"{entry.get('slice') or '?'}; Lead pass waits",
+                        file=sys.stderr,
+                    )
+            time.sleep(0.5 if self._interval else 0.02)
+        waited = time.monotonic() - start
+        if announced:
+            with self._dict_lock():
+                current = self.__dict__.get("driver_meta")
+                current = dict(current) if isinstance(current, dict) else {}
+                current["root_wait_s"] = round(
+                    float(current.get("root_wait_s") or 0.0) + waited, 3
+                )
+                # Rebind, never mutate (the loop core may be serialising it).
+                self.driver_meta = current
+        return waited
+
     def _release_root(self, mailbox: Path) -> None:
         """Before a root-bound dispatch: prove no earlier session owns the root.
 
@@ -3761,12 +3815,47 @@ class OmnigentRunner:
         earlier session is never touched: the dispatch is refused. Others
         are archived and deleted through the normal id-scoped prune, then
         no cursor-agent may remain with its cwd at the root.
+
+        A degraded (root-bound) slice-eval of this run that is still in
+        flight is a known occupant: it is waited for first (bounded by its
+        role timeout), then its finished session is released like any
+        other. Only unknown cursor-agents at the root refuse the dispatch.
         """
+        self._wait_known_root_occupants()
         with self._own_lock:
-            previous = [
-                entry["session_id"] for entry in self._root_finished
+            # Claimed atomically: a concurrent release (the degraded eval's
+            # own post-dispatch release) never prunes the same session.
+            claimed = [
+                entry for entry in self._root_finished
                 if entry["session_id"] not in self._inflight
             ]
+            previous = [entry["session_id"] for entry in claimed]
+            self._root_finished = [
+                e for e in self._root_finished if e["session_id"] not in previous
+            ]
+        try:
+            self._end_previous_root_sessions(mailbox, previous)
+        except BaseException:
+            with self._own_lock:
+                known = {e["session_id"] for e in self._root_finished}
+                self._root_finished[:0] = [
+                    e for e in claimed if e["session_id"] not in known
+                ]
+            raise
+        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
+        while True:
+            live = worker_worktrees.cursor_processes_at(self.repo)
+            if not live:
+                return
+            if time.monotonic() >= deadline:
+                raise TrioctlError(
+                    f"cursor-agent process(es) {live[:10]} still run at the "
+                    f"aggregate root {self.repo}; not reusing its Cursor config"
+                )
+            time.sleep(0.5 if self._interval else 0.0)
+
+    def _end_previous_root_sessions(self, mailbox: Path, previous: list[str]) -> None:
+        """Prune the claimed finished root sessions (refuses held ones)."""
         if previous:
             held = set(self.held_session_ids) | {
                 str(r.get("session_id")) for _p, r in _held_records(mailbox)
@@ -3791,21 +3880,6 @@ class OmnigentRunner:
                 f"reusing the aggregate root: {counts}",
                 file=sys.stderr,
             )
-            with self._own_lock:
-                self._root_finished = [
-                    e for e in self._root_finished if e["session_id"] not in previous
-                ]
-        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
-        while True:
-            live = worker_worktrees.cursor_processes_at(self.repo)
-            if not live:
-                return
-            if time.monotonic() >= deadline:
-                raise TrioctlError(
-                    f"cursor-agent process(es) {live[:10]} still run at the "
-                    f"aggregate root {self.repo}; not reusing its Cursor config"
-                )
-            time.sleep(0.5 if self._interval else 0.0)
 
     def _root_owned_ids(self, mailbox: Path) -> set[str]:
         """Root sessions this task provably launched and that no longer run.
@@ -3902,7 +3976,11 @@ class OmnigentRunner:
         if not self._end_root_sessions:
             return
         with self._own_lock:
-            busy = bool(self._inflight)
+            # A degraded eval registered before its session id exists is
+            # in flight too (never wait for it here: the Lead does).
+            busy = bool(self._inflight) or bool(
+                self.__dict__.get("_degraded_root_evals")
+            )
         if busy:
             return
         try:
@@ -4570,6 +4648,19 @@ class OmnigentRunner:
         root_bound = eval_wt is None and self._manages_root_config()
         if root_bound:
             dispatch["root_mailbox"] = mailbox
+        degraded_token = None
+        if eval_degraded is not None:
+            # A known root occupant until it ends (registered right before
+            # the launch, dropped in the same critical section that records
+            # its finished session): the Lead's next `_release_root` waits
+            # for it instead of refusing an unknown cursor-agent.
+            degraded_token = uuid.uuid4().hex
+            with self._own_lock:
+                self.__dict__.setdefault("_degraded_root_evals", {})[degraded_token] = {
+                    "slice": (context or {}).get("slice"),
+                    "sha": (context or {}).get("sha"),
+                    "started": started,
+                }
         try:
             code = self._run_dispatch(
                 client, agent_id, model, prompt, title, role, iteration,
@@ -4597,6 +4688,10 @@ class OmnigentRunner:
                 if root_bound and session_id:
                     self._root_finished.append(
                         {"session_id": session_id, "role": role, "workspace": workspace}
+                    )
+                if degraded_token is not None:
+                    self.__dict__.setdefault("_degraded_root_evals", {}).pop(
+                        degraded_token, None
                     )
             if eval_wt is not None:
                 self._release_eval_worktree(eval_wt, session_id)
