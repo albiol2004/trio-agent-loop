@@ -20,8 +20,10 @@ from pathlib import Path
 # Contract version metrics/trio_loop.py (and trioctl, before loading it)
 # relies on: 2 = read_queue / parse_slice_verdicts / parse_verdict_scope;
 # 3 = plain fault `scope:` values, lenient read_queue `errors` and
-# `malformed_slices`. A copy without this constant predates it.
-METRICS_API = 3
+# `malformed_slices`; 4 = `find_queue_block(..., errors=)` with CommonMark
+# fence closing and orphan `- id:`/`- slice:` entry errors (r11h F-FENCE).
+# A copy without this constant predates it.
+METRICS_API = 4
 
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
@@ -611,48 +613,104 @@ class QueueParseError(ValueError):
     """QUEUE.md is present but does not match the restricted shape."""
 
 
+def _fence_marker(raw: str) -> tuple[str, int, str] | None:
+    """(char, run length, info string) when `raw` is a fence line.
+
+    CommonMark: indent of at most 3 spaces (a tab in the indent counts as
+    4+, so never), then a run of at least three ``` ` ``` or ``~`` chars;
+    the rest of the line (stripped) is the info string. A backtick fence
+    whose info string contains a backtick is not a fence line."""
+    body = raw.rstrip("\r\n")
+    indent = len(body) - len(body.lstrip(" "))
+    if indent > 3:
+        return None
+    rest = body[indent:]
+    if not rest or rest[0] not in "`~":
+        return None
+    ch = rest[0]
+    run = len(rest) - len(rest.lstrip(ch))
+    if run < 3:
+        return None
+    info = rest[run:].strip()
+    if ch == "`" and "`" in info:
+        return None
+    return ch, run, info
+
+
 def find_queue_block(
     queue_text: str, key: str, errors: list[str] | None = None
 ) -> list[str] | None:
-    """Return the body lines of the fenced yaml block whose only top-level
-    key is `key` ("retired" or "faults"), or None when absent.
+    """Return the body lines of the fenced yaml block whose top-level key
+    is `key` ("retired" or "faults"), or None when absent.
 
     Unlike find_slices_block, absence is not an error: a missing block means
     an empty queue for that key (MAILBOX-SCHEMA.md: "Either block may be
     absent ... absent always means an empty queue, never an error").
 
-    Only the FIRST fence opened with exactly ```` ```yaml ```` (or
-    ```` ```yml ````) that carries a `key:` line is returned. Any OTHER
-    fence carrying a `key:` line is a violation (r11g P1), since its
-    entries would otherwise be invisible to the gate: a second ```yaml
-    block with the key, or the key inside an untagged fence, a ``~~~``
-    fence, or a fence with a different/extra info string (```` ```yaml
-    title ````). `errors` None (strict): the first such violation raises
-    QueueParseError. `errors` a list (lenient): each is appended to it and
-    the first ```yaml block (if any) is still returned.
+    Fences follow CommonMark (r11h F-FENCE): an opener is a line indented
+    at most 3 spaces with a run of at least three ``` ` ``` or ``~`` chars
+    and an optional info string; the fence closes ONLY on a line indented
+    at most 3 spaces with the same char, a run at least as long as the
+    opener's and no info string. A deeper-indented ```` ``` ```` (a code
+    block quoted inside `reason:`) or a ```` ```python ```` line is fence
+    content, never a close.
+
+    A fence "carries" the key only when a body line is exactly `key:` at
+    column 0 (its top level, r11h P4b): an indented `retired:` inside a
+    `reason:` continuation never selects that fence.
+
+    Only the FIRST fence opened with ```` ```yaml ```` (or ```` ```yml ````)
+    that carries the key is returned. Violations (each is reported, so for
+    `faults` the open-loop gate holds):
+    - any OTHER fence carrying the key (r11g P1): a second ```yaml block,
+      or the key inside an untagged, ``~~~`` or info-string fence;
+    - an orphan entry header (r11h F-FENCE): a `- id:` (faults) or
+      `- slice:` (retired) line inside a fence that does NOT carry the key
+      (a typo'd `fault:`/`Faults:` key, a missing key, a second fence
+      continuing the list, a stray fence line closing the block early), or
+      outside every fence.
+    `errors` None (strict): the first violation raises QueueParseError.
+    `errors` a list (lenient): each is appended to it and the first ```yaml
+    block (if any) is still returned.
     """
-    key_re = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*)$")
+    key_re = re.compile(rf"^{re.escape(key)}\s*:\s*(.*)$")
+    entry_re = RETIRED_ENTRY_RE if key == "retired" else FAULT_ENTRY_RE
+    header = "- slice:" if key == "retired" else "- id:"
     found: list[str] | None = None
-    fence: str | None = None  # "```" or "~~~" while inside a fence
+    fence: tuple[str, int] | None = None  # (char, run) while inside a fence
     fence_line = 0
+    opener_text = ""
     info = ""
-    buf: list[str] = []
+    buf: list[tuple[int, str]] = []
 
     def _fail(msg: str) -> None:
         if errors is None:
             raise QueueParseError(msg)
         errors.append(msg)
 
+    def _orphan(lineno: int, raw: str, where: str) -> None:
+        _fail(
+            f"line {lineno}: `{header}` entry {_junk_prefix(raw.strip())!r} "
+            f"is outside the `{key}:` block ({where}) and is ignored; put it "
+            f"under the column-0 `{key}:` key of the ```yaml block"
+        )
+
     def _close() -> None:
         nonlocal found
-        if not any(key_re.match(ln) for ln in buf):
+        if not any(key_re.match(ln) for _, ln in buf):
+            where = (
+                f"in the {_junk_prefix(opener_text)!r} fence opened at line "
+                f"{fence_line}, which has no column-0 `{key}:` key"
+            )
+            for n, ln in buf:
+                if entry_re.match(ln):
+                    _orphan(n, ln, where)
             return
-        yaml_fence = fence == "```" and info.lower() in ("yaml", "yml")
-        opener = f"{fence}{info}"
+        yaml_fence = fence[0] == "`" and info.lower() in ("yaml", "yml")
         if not yaml_fence:
             _fail(
                 f"line {fence_line}: a `{key}:` block in a "
-                f"{_junk_prefix(opener)!r} fence is ignored; the queue "
+                f"{_junk_prefix(opener_text)!r} fence is ignored; the queue "
                 f"only reads a fence opened with exactly ```yaml -- move "
                 f"its entries into the ```yaml `{key}:` block"
             )
@@ -663,25 +721,27 @@ def find_queue_block(
                 "block"
             )
         else:
-            found = list(buf)
+            found = [ln for _, ln in buf]
 
     for lineno, raw in enumerate(queue_text.splitlines(), 1):
-        stripped = raw.strip()
-        opener = (
-            "```" if stripped.startswith("```")
-            else "~~~" if stripped.startswith("~~~")
-            else None
-        )
+        marker = _fence_marker(raw)
         if fence is None:
-            if opener is not None:
-                fence, fence_line, buf = opener, lineno, []
-                info = stripped.lstrip(opener[0]).strip()
+            if marker is not None:
+                fence, info = (marker[0], marker[1]), marker[2]
+                fence_line, opener_text, buf = lineno, raw.strip(), []
+            elif entry_re.match(raw):
+                _orphan(lineno, raw, "outside every fenced block")
             continue
-        if opener == fence:
+        if (
+            marker is not None
+            and marker[0] == fence[0]
+            and marker[1] >= fence[1]
+            and not marker[2]
+        ):
             _close()
             fence, info, buf = None, "", []
             continue
-        buf.append(raw)
+        buf.append((lineno, raw))
     if fence is not None:
         _close()
     return found

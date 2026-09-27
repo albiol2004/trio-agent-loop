@@ -4170,7 +4170,7 @@ REQUIRED_LOOP_CORE_API = 2
 
 
 #: The sibling module trio_loop.py imports by path (``METRICS_API``).
-REQUIRED_METRICS_API = 3
+REQUIRED_METRICS_API = 4
 
 
 def _api_marker(path: Path, name: str) -> int:

@@ -485,6 +485,57 @@ problem; lenient mode reports and continues):
   once per turn; if the Lead makes no change, the 3-no-op stall guard
   ends the run with `status: error`.
 
+#### Fences, top-level keys, and the integration gate
+
+The reader finds each block by its fence, following CommonMark:
+
+- **Opener:** a line indented **at most 3 spaces** (a tab in the indent
+  never opens a fence) with a run of at least three `` ` `` or `~`
+  characters, optionally followed by an info string. Only a fence opened
+  with exactly ```` ```yaml ```` (or ```` ```yml ````, any case, any run
+  of 3+ backticks) is read as a queue block.
+- **Closer:** a fence closes **only** on a line indented at most 3
+  spaces, made of the **same** fence character, with a run **at least as
+  long** as the opener's, and **no info string**. Anything else is fence
+  content: a code block quoted inside a wrapped `reason:` (```` ```python ````
+  at col 6 and its closing ```` ``` ````), a `~~~` line inside a
+  ```` ``` ```` fence, or a ```` ```sh ```` line never closes the block.
+  An unterminated fence runs to the end of the file.
+- **Top-level key:** a fence carries `retired:`/`faults:` only when a
+  body line is exactly that key at **column 0**. An indented
+  `  faults:`, or a `retired:` line inside a `reason:` continuation, does
+  not select the fence (so a fault fence placed before the retired fence
+  whose reason quotes a retired entry can never be taken as the
+  `retired:` block).
+
+Reported (strict mode raises; lenient mode adds a
+`` `faults:` block: `` / `` `retired:` block: `` error):
+
+- a second ```` ```yaml ```` fence with the same top-level key, or the key
+  inside an untagged, `~~~`, or info-string (```` ```yaml title ````)
+  fence — "a second fenced ... block is ignored" / "... fence is ignored";
+- an **orphan entry header**: any `- id:` line (for `faults:`) or
+  `- slice:` line (for `retired:`) that is inside a fence **without** the
+  column-0 key, or outside every fence — "`- id:` entry ... is outside the
+  `faults:` block (...) and is ignored". This covers a typo'd or missing
+  top key (`fault:`, `Faults:`, `faults` without a colon), a second
+  ```` ```yaml ```` fence that continues the list without repeating the
+  key, and a stray col 0–3 ```` ``` ```` line that closes the block early.
+  Line numbers in these messages are `QUEUE.md` line numbers.
+
+**Gate hold.** While `queue["errors"]` contains any `` `faults:` block: ``
+error, the open-loop driver does **not** start the integration eval, even
+when every slice is retired and no parsed fault is live — a fault the
+reader could not see must never be SHIPped over. It logs
+`- iter N | loop | gate held: QUEUE.md faults block has parse errors: <first error>`
+once per iteration and passes the errors to the next Lead pass
+(`queue_errors`, rendered as a "QUEUE.md PARSE ERRORS" note in the
+OPEN-LOOP CONTEXT). The Lead repairs the entry (moves it under the
+```` ```yaml ```` `faults:` key); a Lead that makes no change ends the run
+through the 3-no-op stall guard (`status: error`, exit 3). There are no
+exemptions. `` `retired:` block: `` errors are logged but do not hold the
+gate (an ignored retired entry only leaves its slice un-retired).
+
 A fault whose `status` is not one of `open`, `taken`, `done`, `stale`
 counts as **live** for the open-loop integration gate (fail-closed, like
 `open`); the driver logs
@@ -674,6 +725,17 @@ absence is never a violation.
 
 ## Changelog
 
+- **METRICS_API 4** (r11h fence-fix): `find_queue_block(text, key,
+  errors=)` closes a fence only on a CommonMark closer (indent <= 3, same
+  character, run >= the opener's, no info string), matches the top-level
+  key only at column 0, and reports orphan `- id:`/`- slice:` entry
+  headers outside the selected block; any `faults:` block error holds the
+  integration gate (see "Fences, top-level keys, and the integration
+  gate"). `trioctl` (`REQUIRED_METRICS_API = 4`) and `trio-check.py`
+  (`REQUIRED_METRICS_API = 4`, checked before any call into its sibling)
+  both refuse an older copy with "METRICS_API 3, this ... requires 4
+  (mixed metrics/ versions)"; trio-check exits 2 with that message on
+  stderr instead of a TypeError.
 - **METRICS_API 3, r11 fold-fix** (no API bump; stricter reader, same
   shape): only `reason:` folds a continuation line; a continuation after
   any other key and a duplicate key inside an entry are reported and the

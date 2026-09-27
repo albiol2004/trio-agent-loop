@@ -63,6 +63,16 @@ FAULT_ID_RE = re.compile(r"^f\d+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+#: The sibling trio-metrics.py contract this checker calls into
+#: (``METRICS_API``; 4 = ``find_queue_block(..., errors=)``, r11h). Must
+#: equal omnigent/trioctl ``REQUIRED_METRICS_API``.
+REQUIRED_METRICS_API = 4
+
+
+class MetricsApiMismatch(ImportError):
+    """The sibling trio-metrics.py is from a different metrics/ release."""
+
+
 def load_trio_metrics():
     """Load metrics/trio-metrics.py as a module.
 
@@ -70,6 +80,10 @@ def load_trio_metrics():
     it from source keeps this checker's format detection consistent with
     trio-metrics.py: we reuse discover_loops(), parse_state(), parse_verdict()
     and VERDICT_RE instead of duplicating them.
+
+    A sibling whose ``METRICS_API`` differs from REQUIRED_METRICS_API (a
+    partially vendored metrics/ set) raises MetricsApiMismatch before any
+    call into it, instead of a TypeError deep in the queue check.
     """
     path = Path(__file__).resolve().parent / "trio-metrics.py"
     spec = importlib.util.spec_from_file_location("trio_metrics", path)
@@ -77,6 +91,14 @@ def load_trio_metrics():
         raise ImportError(f"cannot load trio-metrics.py from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    found = getattr(module, "METRICS_API", 1)
+    if found != REQUIRED_METRICS_API:
+        raise MetricsApiMismatch(
+            f"sibling {path.name} has METRICS_API {found}, this trio-check "
+            f"requires {REQUIRED_METRICS_API} (mixed metrics/ versions); "
+            f"refresh metrics/ as a set (trio_loop.py, trio-metrics.py, "
+            f"trio-shadow.py, trio-check.py) from one release"
+        )
     return module
 
 
@@ -484,7 +506,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    tm = load_trio_metrics()
+    try:
+        tm = load_trio_metrics()
+    except MetricsApiMismatch as exc:
+        print(f"trio-check: {exc}", file=sys.stderr)
+        return 2
     root = Path(args.path).expanduser().resolve()
     loops = [inspect_loop(p, tm) for p in tm.discover_loops(root)]
     summary = summarize(loops)

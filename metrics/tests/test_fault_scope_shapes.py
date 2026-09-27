@@ -468,7 +468,7 @@ def test_plain_scope_unterminated_quote_names_plain_value() -> None:
     assert "quote in bracketed list" in q["errors"][0]
 
 
-# --- r11 queue-harden F3: METRICS_API 3 ---------------------------------------
+# --- r11 queue-harden F3 / r11h API-4: METRICS_API 4 ----------------------
 
 TRIOCTL = Path(__file__).parents[2] / "omnigent" / "trioctl"
 
@@ -484,11 +484,11 @@ def _load_trioctl():
     return module
 
 
-def test_metrics_api_is_3_and_matches_trioctl() -> None:
-    assert TM.METRICS_API == 3
+def test_metrics_api_is_4_and_matches_trioctl() -> None:
+    assert TM.METRICS_API == 4
     trioctl = _load_trioctl()
     assert trioctl.REQUIRED_METRICS_API == TM.METRICS_API
-    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 3
+    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 4
 
 
 def test_too_old_vendored_metrics_is_refused_with_clear_message(
@@ -500,11 +500,28 @@ def test_too_old_vendored_metrics_is_refused_with_clear_message(
     core_src = Path(__file__).parents[1] / "trio_loop.py"
     (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
     (metrics_dir / "trio-metrics.py").write_text(
-        METRICS_PATH.read_text().replace("METRICS_API = 3\n", "METRICS_API = 2\n")
+        METRICS_PATH.read_text().replace("METRICS_API = 4\n", "METRICS_API = 2\n")
     )
     with pytest.raises(
         trioctl.TrioctlError,
-        match=r"METRICS_API 2, this trioctl requires 3 \(mixed metrics/ versions\)",
+        match=r"METRICS_API 2, this trioctl requires 4 \(mixed metrics/ versions\)",
+    ):
+        trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
+
+
+def test_same_api3_vendored_metrics_is_refused(tmp_path: Path) -> None:
+    """r11h API-4: a c25eba0/7c28f8a-era trio-metrics (API 3) is refused."""
+    trioctl = _load_trioctl()
+    metrics_dir = tmp_path / "metrics"
+    metrics_dir.mkdir()
+    core_src = Path(__file__).parents[1] / "trio_loop.py"
+    (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
+    (metrics_dir / "trio-metrics.py").write_text(
+        METRICS_PATH.read_text().replace("METRICS_API = 4\n", "METRICS_API = 3\n")
+    )
+    with pytest.raises(
+        trioctl.TrioctlError,
+        match=r"METRICS_API 3, this trioctl requires 4 \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
 

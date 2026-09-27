@@ -907,7 +907,7 @@ def _queue_text(sha: str, faults_body: str) -> str:
 
 
 def _raw_faults_scenario(tmp_path: Path, faults_body: str, later_passes=None,
-                         integration_actions=None):
+                         integration_actions=None, queue_text=None):
     """solo@s1 retired; its (final) slice-eval SHIPs and rewrites QUEUE.md
     with `faults_body` verbatim (fences included). Default: 3 no-op Lead
     passes and no scripted integration eval (running it fails the test)."""
@@ -930,7 +930,8 @@ def _raw_faults_scenario(tmp_path: Path, faults_body: str, later_passes=None,
         verdict.append_slice_section("solo", sha1, "SHIP")
         with lock:
             (mb / "QUEUE.md").write_text(
-                _queue_text(sha1, faults_body), encoding="utf-8"
+                (queue_text or _queue_text)(sha1, faults_body),
+                encoding="utf-8",
             )
 
     evaluator = ScriptedEvalRunner(
@@ -1074,6 +1075,114 @@ def test_p1_misfenced_fault_holds_the_gate(
     assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
     _assert_gate_held_lines(mailbox, needle)
     assert any(needle in e for e in lead.calls[-1]["context"]["queue_errors"])
+
+
+# --- r11h F-FENCE / verify 29: fence-level shapes hold the gate -----------
+
+FENCE_F0 = (
+    "  - id: f0\n    slice: solo\n    observed_at: abc\n    scope: design\n"
+    "    status: done\n"
+)
+FENCE_F1 = (
+    "  - id: f1\n    slice: solo\n    observed_at: abc\n"
+    "    scope: local:src/solo.py\n    reason: real bug\n    status: open\n"
+)
+
+
+def _x1_body(inner_open: str, inner_close: str) -> str:
+    return (
+        "```yaml\nfaults:\n" + FENCE_F0 + "    reason: see this snippet\n"
+        f"      {inner_open}\n      x = 1\n      {inner_close}\n"
+        + FENCE_F1 + "```\n"
+    )
+
+
+@pytest.mark.parametrize("inner_open,inner_close", [
+    ("```python", "```"), ("```", "```"), ("~~~", "~~~"),
+])
+def test_x1_inner_code_block_fault_blocks_integration(
+    tmp_path: Path, inner_open: str, inner_close: str
+) -> None:
+    """r11h X1: a code block quoted in f0's `reason:` used to close the
+    yaml fence and hide the open f1 -- integration dispatched, exit 0
+    `shipped`. Now f1 is live: no integration eval, exit 3."""
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(
+        tmp_path, _x1_body(inner_open, inner_close)
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert [f["id"] for f in trio_loop._live_faults(parsed)] == ["f1"]
+    assert code == 3
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    assert re.search(r"^status: error", (mailbox / "STATE.md").read_text(
+        encoding="utf-8"), re.M)
+
+
+@pytest.mark.parametrize("body,needle", [
+    # X2: a stray fence line (col 0-3) inside the block closes it early
+    ("```yaml\nfaults:\n```\n" + FENCE_F1 + "```\n",
+     "outside every fenced block"),
+    ("```yaml\nfaults:\n   ```\n" + FENCE_F1 + "```\n",
+     "outside every fenced block"),
+    # X3: a second ```yaml fence continues the list without the key
+    ("```yaml\nfaults:\n" + FENCE_F0 + "    reason: r\n```\n\n```yaml\n"
+     + FENCE_F1 + "```\n", "no column-0 `faults:` key"),
+    # X4: a typo'd / missing top key
+    ("```yaml\nfault:\n" + FENCE_F1 + "```\n", "no column-0 `faults:` key"),
+    ("```yaml\nFaults:\n" + FENCE_F1 + "```\n", "no column-0 `faults:` key"),
+    ("```yaml\n" + FENCE_F1 + "```\n", "no column-0 `faults:` key"),
+])
+def test_x2_x4_fence_shapes_hold_the_gate(
+    tmp_path: Path, body: str, needle: str
+) -> None:
+    """r11h X2-X4: the open f1 is outside the selected block. It used to be
+    silently ignored (live=[], errors=[], exit 0 SHIP); now it is a
+    `faults:` block error: gate held, no integration eval, exit 3."""
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(tmp_path, body)
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert trio_loop._live_faults(parsed) == []
+    assert any(needle in e for e in trio_loop._queue_fault_errors(parsed))
+    assert code == 3
+    assert _eval_sequence(evaluator) == [("slice-eval", "solo", sha1)]
+    _assert_gate_held_lines(mailbox, "is outside the `faults:` block")
+    assert any(needle in e for e in lead.calls[-1]["context"]["queue_errors"])
+
+
+def test_p4b_quoted_retired_entry_in_reason_does_not_trigger_a_slice_eval(
+    tmp_path: Path,
+) -> None:
+    """r11h P4b / verify 31: a faults fence placed BEFORE the retired fence
+    whose f0 reason quotes a whole retired entry used to be taken as the
+    retired block -- a slice-eval ran at the quoted (bogus) sha. Now the
+    top key matches only at column 0: the real retired block is used, the
+    integration eval runs over the real tree, and no eval sees the bogus
+    sha."""
+    bogus = "b" * 40
+
+    def faults_first(sha: str, _body: str) -> str:
+        return (
+            "```yaml\nfaults:\n" + FENCE_F0 + "    reason: quoting\n"
+            "      retired:\n      - slice: solo\n"
+            f"        sha: {bogus}\n        at: 2026-01-02T00:00:00Z\n```\n\n"
+            "```yaml\nretired:\n  - slice: solo\n"
+            f"    sha: {sha}\n    at: 2026-01-01T00:00:00Z\n```\n"
+        )
+
+    def integration_ship(mb):
+        VerdictModel(mb, threading.Lock()).set_integration_verdict(
+            "VERDICT: SHIP"
+        )
+
+    code, mailbox, lead, evaluator, sha1 = _raw_faults_scenario(
+        tmp_path, "", later_passes=lambda sha: [],
+        integration_actions=[integration_ship], queue_text=faults_first,
+    )
+    parsed = trio_loop._METRICS.read_queue(mailbox)
+    assert [e["sha"] for e in parsed["retired"]] == [sha1]
+    assert trio_loop._queue_fault_errors(parsed) == []
+    assert code == 0
+    assert _eval_sequence(evaluator) == [
+        ("slice-eval", "solo", sha1), ("integration-eval", None, None)]
+    assert all(c["context"].get("sha") != bogus for c in evaluator.calls)
 
 
 def test_integration_gate_held_helper(tmp_path: Path) -> None:

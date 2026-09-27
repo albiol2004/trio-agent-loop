@@ -684,3 +684,271 @@ def test_trio_check_reports_fence_level_violation(tmp_path) -> None:
         e.startswith("QUEUE.md `faults:` block: line 1:") and "fence" in e
         for e in errors
     )
+
+
+# --- r11h F-FENCE: CommonMark fence close + orphan entry headers -----------
+
+FENCE_F0_DONE = (
+    "  - id: f0\n    slice: s1\n    observed_at: abc\n    scope: design\n"
+    "    status: done\n"
+)
+FENCE_F1_OPEN = (
+    "  - id: f1\n    slice: s1\n    observed_at: abc\n"
+    "    scope: local:a.py\n    reason: real bug\n    status: open\n"
+)
+EMPTY_RETIRED = "```yaml\nretired:\n```\n\n"
+
+
+def _x1(inner_open: str, inner_close: str, snippet: str = "x = 1") -> str:
+    """The r11h verbatim X1 shape: a code block quoted inside f0's
+    `reason:` (col 6), then the open f1."""
+    body = "".join(f"      {ln}\n" for ln in snippet.splitlines())
+    return (
+        EMPTY_RETIRED + "```yaml\nfaults:\n" + FENCE_F0_DONE
+        + f"    reason: see this snippet\n      {inner_open}\n{body}"
+        + (f"      {inner_close}\n" if inner_close is not None else "")
+        + FENCE_F1_OPEN + "```\n"
+    )
+
+
+X1_VERBATIM = """\
+```yaml
+retired:
+```
+
+```yaml
+faults:
+  - id: f0
+    slice: s1
+    observed_at: abc
+    scope: design
+    status: done
+    reason: see this snippet
+      ```python
+      x = 1
+      ```
+  - id: f1
+    slice: s1
+    observed_at: abc
+    scope: local:a.py
+    reason: real bug
+    status: open
+```
+"""
+
+
+def _live_ids(queue: dict) -> list[str]:
+    return [f["id"] for f in queue["faults"]
+            if f["status"] not in TM.QUEUE_CLOSED_STATUSES]
+
+
+def _fault_errors(queue: dict) -> list[str]:
+    return [e for e in queue["errors"] if e.startswith("`faults:` block:")]
+
+
+def test_x1_verbatim_inner_code_block_does_not_close_the_fence() -> None:
+    """r11h X1 verbatim: the col-6 ```python used to close the yaml fence
+    and hide the open f1 (live=[], errors=[])."""
+    assert X1_VERBATIM == _x1("```python", "```")
+    queue = TM.parse_queue_block(X1_VERBATIM)
+    assert queue["errors"] == []
+    assert [(f["id"], f["status"]) for f in queue["faults"]] == [
+        ("f0", "done"), ("f1", "open")]
+    assert "```python" in queue["faults"][0]["reason"]
+    strict = TM.parse_faults(TM.find_queue_block(X1_VERBATIM, "faults"))
+    assert [f["id"] for f in strict] == ["f0", "f1"]
+
+
+@pytest.mark.parametrize("inner_open,inner_close,snippet", [
+    ("```python", "```", "x = 1"),
+    ("```", "```", "x = 1"),
+    ("~~~", "~~~", "x = 1"),
+    ("~~~yaml", "~~~", "x = 1"),
+    ("```text", None, "x = 1"),               # unterminated inner block
+    ("```yaml", "```", "faults:\n  - id: f99"),  # quoted faults snippet
+    ("```yaml", "```", "retired:\n  - slice: s1\n    sha: " + "b" * 40),
+])
+def test_x1_variants_keep_the_open_fault_or_report(
+    inner_open, inner_close, snippet
+) -> None:
+    text = _x1(inner_open, inner_close, snippet)
+    queue = TM.parse_queue_block(text)
+    assert "f1" in _live_ids(queue) or _fault_errors(queue), text
+    if "- id:" not in snippet:
+        assert _live_ids(queue) == ["f1"]
+        assert _fault_errors(queue) == []
+        assert queue["retired"] == []  # the quoted retired entry never counts
+
+
+@pytest.mark.parametrize("col", [0, 1, 2, 3])
+def test_x2_stray_fence_line_at_cols_0_to_3_is_an_error(col: int) -> None:
+    """A stray ``` at col 0-3 closes the fence; the entries after it are
+    outside every fence -> reported (the gate holds)."""
+    text = (EMPTY_RETIRED + "```yaml\nfaults:\n" + " " * col + "```\n"
+            + FENCE_F1_OPEN + "```\n")
+    queue = TM.parse_queue_block(text)
+    assert queue["faults"] == []
+    errs = _fault_errors(queue)
+    assert errs and "`- id:` entry '- id: f1' is outside the `faults:` block" \
+        in errs[0]
+    assert "outside every fenced block" in errs[0]
+    assert errs[0].startswith("`faults:` block: line 8:")
+    with pytest.raises(TM.QueueParseError, match="outside the `faults:` block"):
+        TM.find_queue_block(text, "faults")
+
+
+@pytest.mark.parametrize("col", [4, 6, 8])
+def test_x2_stray_fence_line_at_col_4_plus_is_content(col: int) -> None:
+    """r11h X2 (seed 1): a col-8 ``` is fence content, not a close."""
+    text = (EMPTY_RETIRED + "```yaml\nfaults:\n" + " " * col + "```\n"
+            + FENCE_F1_OPEN + "```\n")
+    queue = TM.parse_queue_block(text)
+    assert _live_ids(queue) == ["f1"]
+
+
+def test_x2_verbatim_seed1() -> None:
+    text = (
+        "```yaml\nretired:\n```\n\n```yaml\nfaults:\n        ```\n"
+        "  - id: f1\n    slice: s1\n    observed_at: deadbeef\n"
+        "    scope: [a.py]\n    reason: x: y z\n    status: taken\n"
+        "    status: stale\n```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert _live_ids(queue) == ["f1"]
+
+
+def test_x3_second_fence_without_key_is_an_error() -> None:
+    text = (
+        EMPTY_RETIRED + "```yaml\nfaults:\n" + FENCE_F0_DONE
+        + "    reason: r\n```\n\n```yaml\n" + FENCE_F1_OPEN + "```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert [f["id"] for f in queue["faults"]] == ["f0"]
+    errs = _fault_errors(queue)
+    assert len(errs) == 1
+    assert "'- id: f1' is outside the `faults:` block (in the '```yaml' " \
+        "fence opened at line 15, which has no column-0 `faults:` key)" in errs[0]
+    with pytest.raises(TM.QueueParseError, match="no column-0 `faults:` key"):
+        TM.find_queue_block(text, "faults")
+
+
+@pytest.mark.parametrize("top", [
+    "fault:", "Faults:", "faults", "  faults:", "", "falts:",
+])
+def test_x4_typod_or_missing_top_key_is_an_error(top: str) -> None:
+    body = (top + "\n" if top else "") + FENCE_F1_OPEN
+    for opener, closer in (("```yaml", "```"), ("~~~", "~~~"), ("```", "```")):
+        text = EMPTY_RETIRED + f"{opener}\n{body}{closer}\n"
+        queue = TM.parse_queue_block(text)
+        assert queue["faults"] == []
+        errs = _fault_errors(queue)
+        assert errs and "is outside the `faults:` block" in errs[0], text
+        with pytest.raises(TM.QueueParseError):
+            TM.find_queue_block(text, "faults")
+
+
+def test_x4_entries_with_no_fence_at_all_are_an_error() -> None:
+    queue = TM.parse_queue_block("faults:\n" + FENCE_F1_OPEN)
+    assert _fault_errors(queue)
+
+
+def test_fence_close_needs_a_long_enough_run_and_no_info_string() -> None:
+    """A ````yaml opener is closed only by a run of >= 4 backticks; a
+    ```sh line inside is content."""
+    text = (
+        EMPTY_RETIRED + "````yaml\nfaults:\n" + FENCE_F0_DONE
+        + "    reason: r\n```\n```sh\n" + FENCE_F1_OPEN + "````\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert "f1" in _live_ids(queue) or _fault_errors(queue)
+    # a ~~~ never closes a ``` fence and vice versa
+    text2 = (EMPTY_RETIRED + "```yaml\nfaults:\n~~~\n" + FENCE_F1_OPEN
+             + "```\n")
+    queue2 = TM.parse_queue_block(text2)
+    assert "f1" in _live_ids(queue2) or _fault_errors(queue2)
+
+
+def test_four_space_opener_is_not_a_fence() -> None:
+    text = "    ```yaml\nfaults:\n" + FENCE_F1_OPEN + "    ```\n"
+    queue = TM.parse_queue_block(text)
+    assert _fault_errors(queue)
+
+
+def test_unrelated_prose_fences_and_leading_space_opener_still_parse() -> None:
+    text = (
+        "Notes:\n\n```sh\necho hi\n```\n\n"
+        "   ```yaml\nretired:\n```\n\n  ```yaml\nfaults:\n"
+        + FENCE_F1_OPEN + "   ```\n\n~~~\nprose ``` inside\n~~~\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert queue["errors"] == []
+    assert _live_ids(queue) == ["f1"]
+
+
+# --- r11h P4b: the top key matches only at column 0 -------------------------
+
+def test_p4b_indented_retired_in_reason_does_not_select_the_faults_fence() -> None:
+    """A faults fence BEFORE the retired fence whose reason quotes a whole
+    retired entry used to be selected as the retired block (the quoted
+    sha was trusted, the real retired fence ignored)."""
+    text = (
+        "```yaml\nfaults:\n" + FENCE_F0_DONE + "    reason: quoting\n"
+        "      retired:\n      - slice: solo\n        sha: " + "b" * 40 + "\n"
+        "        at: 2026-01-01T00:00:00Z\n```\n\n"
+        "```yaml\nretired:\n  - slice: solo\n    sha: " + "a" * 40 + "\n"
+        "    at: 2026-01-01T00:00:00Z\n```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert queue["retired"] == [
+        {"slice": "solo", "sha": "a" * 40, "at": "2026-01-01T00:00:00Z"}]
+    assert [f["id"] for f in queue["faults"]] == ["f0"]
+    assert _fault_errors(queue) == []
+    # the quoted `- slice:` inside the faults fence is reported (retired)
+    assert any(e.startswith("`retired:` block:") and "- slice: solo" in e
+               for e in queue["errors"])
+    strict = TM.parse_retired(TM.find_queue_block(text.replace(
+        "      - slice: solo", "      slice solo"), "retired"))
+    assert [e["sha"] for e in strict] == ["a" * 40]
+
+
+def test_p4a_reason_line_retired_does_not_steal_the_retired_block() -> None:
+    text = (
+        "```yaml\nfaults:\n" + FENCE_F0_DONE
+        + "    reason: wrapped\n      retired: no entry yet\n```\n\n"
+        "```yaml\nretired:\n  - slice: solo\n    sha: " + "a" * 40 + "\n"
+        "    at: t\n```\n"
+    )
+    queue = TM.parse_queue_block(text)
+    assert queue["errors"] == []
+    assert [e["slice"] for e in queue["retired"]] == ["solo"]
+
+
+# --- r11h API-4: trio-check refuses a mixed metrics/ set --------------------
+
+@pytest.mark.parametrize("api_line", ["METRICS_API = 3\n", "METRICS_API = 2\n", ""])
+def test_trio_check_refuses_mismatched_sibling_metrics(tmp_path, api_line) -> None:
+    mdir = tmp_path / "metrics"
+    mdir.mkdir()
+    (mdir / "trio-check.py").write_text(CHECKER.read_text(encoding="utf-8"))
+    (mdir / "trio-metrics.py").write_text(
+        METRICS_PATH.read_text(encoding="utf-8").replace(
+            "METRICS_API = 4\n", api_line)
+    )
+    mailbox = tmp_path / "proj" / "loop"
+    mailbox.mkdir(parents=True)
+    (mailbox / "STATE.md").write_text("schema: 1\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(mdir / "trio-check.py"), str(tmp_path / "proj")],
+        capture_output=True, text=True,
+        env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"},
+    )
+    found = api_line.split("=")[1].strip() if api_line else "1"
+    assert proc.returncode == 2
+    assert "Traceback" not in proc.stderr + proc.stdout
+    assert (f"sibling trio-metrics.py has METRICS_API {found}, this "
+            "trio-check requires 4 (mixed metrics/ versions)") in proc.stderr
+
+
+def test_trio_check_requires_the_current_metrics_api() -> None:
+    checker = _load(CHECKER, "trio_check_api4")
+    assert checker.REQUIRED_METRICS_API == TM.METRICS_API == 4
