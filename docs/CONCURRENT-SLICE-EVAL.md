@@ -166,3 +166,24 @@ prompt then only adds noise that contradicts the procedure.
 Nothing in r12 needs a builder re-registration. Isolated builders get the
 TARGETED_CHECK contract from trioctl's `_ISOLATED_BUILDER_NOTE`, and trioctl
 never reads `trio-omnigent-roles/builder/config.yaml`.
+
+## 7. Choosing `full_check_budget_s` (r13)
+
+The open-loop Lead runs PLAN.md's `full_check:` once, as its whole-tree gate,
+under `timeout <budget>`. The budget is 120 s unless PLAN.md's
+`## Verification standard` has a `full_check_budget_s: <n>` line. If the gate
+runs over budget, the failure is recorded under `## Known weaknesses` and the
+Evaluator gets the pass. That brings back the round trip the gate exists to
+remove, so set the budget from measurement:
+
+- Measure the full `full_check:` command on the run host, including any
+  typecheck or lint it chains.
+- Set `full_check_budget_s` to at least 1.3× that time, rounded up. The gate
+  runs while slice-evals are still grading, so the box is loaded.
+- Add the line whenever 1.3× the measured time exceeds 120 s. Also add it when
+  the suite comes within about 40 s of 120 s, because load and suite growth
+  eat that margin.
+
+Examples: a 220 s suite needs about 300 (1.3 × 220 = 286). An 84 s suite is
+under 120 s by the 1.3× rule (109 s), but it leaves only about 36 s of slack,
+so 150 is the safer value.
