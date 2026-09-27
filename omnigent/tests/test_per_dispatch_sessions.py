@@ -126,7 +126,7 @@ def _isolation_not_a_factor(trioctl, monkeypatch) -> None:
     off. These tests exercise the slice-eval drain/cleanup plumbing in a
     plain tmp dir (no git checkout), so stub the isolation resolver to
     "no isolate config, not switched off" -- the pre-r11 call shape."""
-    monkeypatch.setattr(trioctl, "_resolve_isolation", lambda args, repo: (None, None))
+    monkeypatch.setattr(trioctl, "_resolve_isolation", lambda args, repo, *a, **kw: (None, None))
 
 
 

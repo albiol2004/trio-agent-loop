@@ -4342,13 +4342,25 @@ def _isolation_default_unavailable(reason: str) -> None:
     )
 
 
+#: Off reason (and notice) of the lockstep carve-out: a lockstep mailbox (no
+#: QUEUE.md) keeps worker isolation OFF unless `--isolate-workers` is given.
+LOCKSTEP_ISOLATION_OFF = "lockstep mode"
+LOCKSTEP_ISOLATION_NOTICE = (
+    "trioctl: lockstep mode: worker isolation stays off by default "
+    "(open-loop is the fast path; pass --isolate-workers to opt in)"
+)
+
+
 def _resolve_isolation(
-    args: argparse.Namespace, repo: Path
+    args: argparse.Namespace, repo: Path, mailbox: Path | None = None
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Resolve worker isolation: ``(isolate config or None, off reason)``.
 
-    Default ON. ``--no-isolate-workers`` turns it off; ``--isolate-workers``
-    (accepted for compatibility) makes every prerequisite a hard refusal.
+    Default ON for an open-loop mailbox (QUEUE.md present). A lockstep
+    *mailbox* (no QUEUE.md; lockstep+isolation was never qualified live)
+    keeps it OFF with one stderr notice unless ``--isolate-workers`` is
+    explicit. ``--no-isolate-workers`` turns it off; ``--isolate-workers``
+    makes every prerequisite (including a branch checkout) a hard refusal.
     When it is only the default, a missing prerequisite (worktree module,
     git branch checkout, `--observe-workers`, inherited session-bound Cursor
     bindings) degrades to the pre-r11 non-isolated run with one stderr line.
@@ -4363,6 +4375,9 @@ def _resolve_isolation(
     if raw is False:
         return None, "--no-isolate-workers"
     explicit = raw is True
+    if not explicit and mailbox is not None and _loop_is_lockstep(mailbox):
+        print(LOCKSTEP_ISOLATION_NOTICE, file=sys.stderr)
+        return None, LOCKSTEP_ISOLATION_OFF
     if worker_worktrees is None:
         if explicit:
             _require_worktrees()
@@ -4522,9 +4537,19 @@ def _command_loop(args: argparse.Namespace) -> int:
     loop_core = _load_trio_loop(repo)
     # r11: worker isolation and concurrent slice-eval are default ON; the
     # --no-isolate-workers / --slice-eval-concurrency 1 flags disable them.
-    isolate, isolation_off = _resolve_isolation(args, repo)
+    # A lockstep mailbox keeps isolation (and so concurrency) off unless
+    # --isolate-workers is explicit (the lockstep carve-out).
+    isolate, isolation_off = _resolve_isolation(args, repo, mailbox)
+    concurrency_off = isolation_off
+    if (
+        isolation_off == LOCKSTEP_ISOLATION_OFF
+        and getattr(args, "slice_eval_concurrency", None) is not None
+    ):
+        # An explicit N in lockstep keeps its pre-carve-out meaning:
+        # accepted, and reported "not applicable" below.
+        concurrency_off = None
     loop_kwargs = _slice_eval_concurrency_kwargs(
-        loop_core, args, isolation_off=isolation_off
+        loop_core, args, isolation_off=concurrency_off
     )
     if (
         loop_kwargs.get("slice_eval_concurrency", 1) > 1
@@ -5189,7 +5214,9 @@ def parser() -> argparse.ArgumentParser:
             "Disable with --no-isolate-workers (also serial slice-evals) or\n"
             "--slice-eval-concurrency 1; --worktree-root DIR relocates the\n"
             "worktrees. Defaults fall back (with a stderr line) when a\n"
-            "prerequisite is missing; explicit flags are refused instead."
+            "prerequisite is missing; explicit flags are refused instead.\n"
+            "Lockstep mailboxes (no QUEUE.md) keep isolation off (serial)\n"
+            "unless --isolate-workers is given."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -5303,7 +5330,8 @@ def parser() -> argparse.ArgumentParser:
         action="store_const",
         const=False,
         default=None,
-        help="disable worker isolation (default ON: builders run in "
+        help="disable worker isolation (default ON for open-loop, OFF in "
+        "lockstep: builders run in "
         "task-owned worktrees merged back on exit, open-loop slice-evals "
         "are bound to a detached worktree at their pin, and accepted/idle/"
         "clean worktrees are removed before and after the loop). Also "
@@ -5315,9 +5343,11 @@ def parser() -> argparse.ArgumentParser:
         dest="isolate_workers",
         action="store_const",
         const=True,
-        help="compatibility no-op (isolation is the default); when given, "
-        "an unmet isolation prerequisite is a refusal instead of a "
-        "fallback to a non-isolated run",
+        help="opt in to isolation in lockstep mode (no QUEUE.md), where it "
+        "is off by default; a no-op for open-loop (isolation is the "
+        "default). When given, an unmet isolation prerequisite is a "
+        "refusal instead of a fallback to a "
+        "non-isolated run",
     )
     loop.add_argument(
         "--worktree-root",

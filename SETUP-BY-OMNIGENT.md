@@ -228,7 +228,10 @@ Plain `trioctl omnigent loop --mailbox <m>` is the fast path: worker
 isolation (each builder in a task-owned git worktree merged back on exit,
 each open-loop slice-eval in a detached worktree at its pin, accepted
 worktrees removed before and after the loop) and up to 4 concurrent
-slice-evals are ON by default. Worktrees live outside the repository under
+slice-evals are ON by default for open-loop mailboxes (`QUEUE.md`
+present). A lockstep mailbox (no `QUEUE.md`) keeps isolation OFF and
+slice-evals serial unless `--isolate-workers` is given (lockstep with
+isolation has not been qualified live). Worktrees live outside the repository under
 `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`)
 `/trio-agent-loop/worktrees/<repo>-<hash>`; the loop prints
 `trioctl: worktree root <path>` once. Disable with:
@@ -243,9 +246,17 @@ A default whose prerequisite is missing falls back with one stderr line
 bindings in the user's Cursor config: non-isolated; a vendored
 `metrics/trio_loop.py` older than r10: serial slice-evals, refresh
 `metrics/` to enable). An explicit flag never falls back: `--isolate-workers`
-(accepted, otherwise a no-op) and `--slice-eval-concurrency N>1` are refused
-instead. In lockstep (no `QUEUE.md`) slice-eval concurrency does not apply
-and the loop says so. Design and speed evidence:
+(the lockstep opt-in, otherwise a no-op) and `--slice-eval-concurrency N>1`
+are refused instead.
+
+Resolution by mailbox mode:
+
+| mailbox | plain `loop` | `--isolate-workers` | `--no-isolate-workers` |
+|---|---|---|---|
+| open-loop (`QUEUE.md` present) | isolated, N=4 | isolated, N=4; unmet prerequisite refused | not isolated, N=1 |
+| lockstep (no `QUEUE.md`) | not isolated, N=1, one line `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)` | isolated (opt-in; concurrency not applicable, the loop says so); unmet prerequisite refused | not isolated, N=1 |
+
+Design and speed evidence:
 `docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
 
 ## Session and anchor hygiene

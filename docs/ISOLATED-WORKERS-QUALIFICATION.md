@@ -122,13 +122,18 @@ installed** — the installed `CURRENT` remains `8a19a8cc`.
 
 ## 6. Defaults
 
-Since r11 (branch `r11-defaults-on`) isolation is no longer opt-in: a plain
-`trioctl omnigent loop --mailbox <m>` isolates workers and runs up to 4
-slice-evals concurrently (`docs/CONCURRENT-SLICE-EVAL.md`).
+Since r11 (branch `r11-defaults-on`) isolation is no longer opt-in for
+open-loop: a plain `trioctl omnigent loop --mailbox <m>` on an open-loop
+mailbox (`QUEUE.md` present) isolates workers and runs up to 4 slice-evals
+concurrently (`docs/CONCURRENT-SLICE-EVAL.md`). Lockstep mailboxes (no
+`QUEUE.md`) are carved out: lockstep with isolation has never been
+qualified live (all qualification runs above were open-loop), so there
+isolation stays OFF unless `--isolate-workers` is explicit.
 
 | setting | default | disable / override |
 |---|---|---|
-| worker isolation | ON | `--no-isolate-workers` (`--isolate-workers` is an accepted no-op) |
+| worker isolation (open-loop) | ON | `--no-isolate-workers` (`--isolate-workers` is an accepted no-op) |
+| worker isolation (lockstep) | OFF, one stderr line `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)` | `--isolate-workers` opts in |
 | worktree root | `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` or `~/.local/state` + `/trio-agent-loop/worktrees/<repo>-<sha256(git common dir)[:12]>` | `--worktree-root DIR` |
 | slice-eval concurrency | 4 | `--slice-eval-concurrency 1` |
 

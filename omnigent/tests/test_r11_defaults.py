@@ -366,14 +366,71 @@ def test_no_isolate_loop_is_serial_and_explicit_n_refused(
                   ["--no-isolate-workers", "--slice-eval-concurrency", "2"], queue=True)
 
 
-def test_lockstep_notice_without_behaviour_change(
+LOCKSTEP_NOTICE_TEXT = (
+    "trioctl: lockstep mode: worker isolation stays off by default "
+    "(open-loop is the fast path; pass --isolate-workers to opt in)"
+)
+
+
+def test_plain_lockstep_loop_is_not_isolated_and_serial(
     trioctl, repo: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
+    """F1 carve-out: lockstep (no QUEUE.md) keeps isolation off, N=1."""
+    assert trioctl.LOCKSTEP_ISOLATION_NOTICE == LOCKSTEP_NOTICE_TEXT
     calls = _run_loop(trioctl, monkeypatch, repo, NewCore, [], queue=False)
-    assert calls["run_loop"] == {"repo": repo.resolve(), "slice_eval_concurrency": 4}
+    assert calls["run_loop"] == {"repo": repo.resolve()}  # serial: no kwarg
+    assert "isolate_workers" not in calls["runner"]
+    assert calls["cleanup"] == 0
     err = capsys.readouterr().err.splitlines()
+    assert err == [LOCKSTEP_NOTICE_TEXT]
+
+
+def test_lockstep_with_explicit_isolate_workers_is_isolated(
+    trioctl, repo: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    calls = _run_loop(trioctl, monkeypatch, repo, NewCore,
+                      ["--isolate-workers"], queue=False)
+    assert calls["run_loop"] == {"repo": repo.resolve(), "slice_eval_concurrency": 4}
+    assert calls["runner"]["isolate_workers"]["worktree_root"]
+    assert calls["cleanup"] == 2
+    err = capsys.readouterr().err
+    assert LOCKSTEP_NOTICE_TEXT not in err
+    assert err.count(trioctl.LOCKSTEP_CONCURRENCY_NOTICE) == 1
+    assert err.count("trioctl: worktree root ") == 1
+
+
+def test_lockstep_no_isolate_workers_unchanged(
+    trioctl, repo: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    calls = _run_loop(trioctl, monkeypatch, repo, NewCore,
+                      ["--no-isolate-workers"], queue=False)
+    assert calls["run_loop"] == {"repo": repo.resolve()}
+    assert "isolate_workers" not in calls["runner"]
+    assert capsys.readouterr().err == ""
+
+
+def test_lockstep_explicit_concurrency_keeps_notice(
+    trioctl, repo: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """An explicit N in lockstep is still accepted and "not applicable"."""
+    calls = _run_loop(trioctl, monkeypatch, repo, NewCore,
+                      ["--slice-eval-concurrency", "4"], queue=False)
+    assert "isolate_workers" not in calls["runner"]
+    err = capsys.readouterr().err.splitlines()
+    assert err.count(LOCKSTEP_NOTICE_TEXT) == 1
     assert err.count(trioctl.LOCKSTEP_CONCURRENCY_NOTICE) == 1
     shutil.rmtree(repo / "mailbox")
     _run_loop(trioctl, monkeypatch, repo, NewCore,
               ["--slice-eval-concurrency", "1"], queue=False)
     assert trioctl.LOCKSTEP_CONCURRENCY_NOTICE not in capsys.readouterr().err
+
+
+def test_resolve_isolation_lockstep_carve_out(trioctl, repo: Path, capsys) -> None:
+    lockstep = repo / "loop"
+    lockstep.mkdir()
+    isolate, off = trioctl._resolve_isolation(parse(trioctl), repo, lockstep)
+    assert isolate is None and off == trioctl.LOCKSTEP_ISOLATION_OFF
+    assert capsys.readouterr().err.splitlines() == [LOCKSTEP_NOTICE_TEXT]
+    (lockstep / "QUEUE.md").write_text("# queue\n")  # open-loop: unchanged
+    isolate, off = trioctl._resolve_isolation(parse(trioctl), repo, lockstep)
+    assert off is None and isolate["worktree_root"]

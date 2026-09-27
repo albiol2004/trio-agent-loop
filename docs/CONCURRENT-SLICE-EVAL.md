@@ -114,9 +114,9 @@ ignoring the flag.
 
 | flag | not given (default) | disable / override |
 |---|---|---|
-| worker isolation | ON | `--no-isolate-workers` |
+| worker isolation | ON for open-loop; OFF for lockstep (no `QUEUE.md`) | `--no-isolate-workers`; `--isolate-workers` opts lockstep in |
 | `--worktree-root` | `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`) `/trio-agent-loop/worktrees/<repo>-<sha256(git common dir)[:12]>` | `--worktree-root DIR` |
-| `--slice-eval-concurrency` | 4 | `--slice-eval-concurrency 1` |
+| `--slice-eval-concurrency` | 4 for open-loop; 1 for lockstep without `--isolate-workers` | `--slice-eval-concurrency 1` |
 | `--slice-eval-drain-seconds` | `$TRIO_SLICE_EVAL_DRAIN_SECONDS`, else `min(--wait-timeout, 120)` | `--slice-eval-drain-seconds S` |
 
 Fallbacks apply only to defaults; an explicit flag is never downgraded:
@@ -127,5 +127,11 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
   explicit N > 1 is refused. Isolation is trioctl-only and stays on.
 - Isolation off (`--no-isolate-workers`, or an unmet default prerequisite):
   default N is 1; explicit N > 1 is refused.
-- Lockstep mailbox (no `QUEUE.md`): `trioctl: lockstep mode: slice-eval concurrency not applicable`,
-  no behaviour change.
+- Lockstep mailbox (no `QUEUE.md`), plain `loop`: isolation stays off and
+  N is 1, with one line
+  `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)`.
+  Lockstep with isolation was never qualified live, hence the carve-out.
+- Lockstep with an explicit `--isolate-workers` (isolated, default N=4) or
+  an explicit `--slice-eval-concurrency N>1`:
+  `trioctl: lockstep mode: slice-eval concurrency not applicable`; the
+  lockstep core does not use N.
