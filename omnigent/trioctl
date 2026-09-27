@@ -3096,6 +3096,66 @@ def _session_chat_binding(client: Any, session_id: str) -> str | None:
     return None
 
 
+def _same_lock_inode(fh: Any, path: Path) -> bool:
+    """Whether the locked description *fh* is still the file at *path*."""
+    try:
+        held = os.fstat(fh.fileno())
+        current = os.stat(path)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+
+def _prune_same_cwd_locks(directory: Path | None = None) -> list[Path]:
+    """Loop start: unlink lock files whose workspace no longer exists (r14.1 F3).
+
+    Each isolated slice-eval worktree has a unique path, so without this one
+    lock file per dispatch accumulates. A file is removed only while THIS
+    process holds its flock (non-blocking; a held lock is skipped) and its
+    recorded workspace is gone. Unlinking under the lock is race-free
+    because :meth:`_SameCwdGate.acquire` re-checks after every acquisition
+    that its locked inode is still the one at the path and re-opens
+    otherwise: a waiter that queued on the unlinked inode never treats that
+    lock as exclusive, so it can never overlap a holder of a fresh file.
+    Never raises; returns the removed paths.
+    """
+    import fcntl
+
+    directory = directory or _same_cwd_lock_dir()
+    removed: list[Path] = []
+    try:
+        candidates = sorted(directory.glob("*.lock"))
+    except OSError:
+        return removed
+    for path in candidates:
+        try:
+            fh = open(path, "r+", encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # held (or unlockable): in use, keep it
+            if not _same_lock_inode(fh, path):
+                continue  # already replaced/removed by someone else
+            fh.seek(0)
+            parts = fh.readline().strip().split(" ", 1)
+            workspace = parts[1] if len(parts) == 2 else ""
+            if not workspace or os.path.lexists(workspace):
+                continue  # unknown owner or live workspace: keep
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(path)
+        except (OSError, ValueError):
+            continue
+        finally:
+            fh.close()
+    return removed
+
+
 class _SameCwdGate:
     """Per-workspace create serialisation (see SAME_CWD_BIND_WAIT_ENV).
 
@@ -3104,6 +3164,8 @@ class _SameCwdGate:
     Released by whichever comes first: the bind watcher seeing the bound
     chat, the bounded wait, or a failed create. Never raises into the
     dispatch. A client without ``session_chat_binding`` is not gated.
+    A lock acquired on an inode that is no longer at the path (unlinked by
+    :func:`_prune_same_cwd_locks`) is dropped and the path re-opened.
     """
 
     def __init__(self, client: Any, workspace: str) -> None:
@@ -3148,7 +3210,18 @@ class _SameCwdGate:
         while True:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                if _same_lock_inode(fh, path):
+                    break
+                # The file was pruned while we queued on it: this lock
+                # excludes nobody. Re-open the path (a fresh file) and retry.
+                fh.close()
+                try:
+                    fh = open(path, "a+", encoding="utf-8")
+                except OSError as exc:
+                    print(f"trioctl: same-cwd lock unavailable for {self.workspace}: "
+                          f"{exc}; continuing", file=sys.stderr)
+                    return
+                continue
             except BlockingIOError:
                 self.contended = True
             except OSError as exc:
@@ -5522,6 +5595,8 @@ def _command_loop(args: argparse.Namespace) -> int:
         _ensure_mailbox_gitignore(mailbox)
     except OSError as exc:
         print(f"trioctl: could not update {mailbox / '.gitignore'}: {exc}", file=sys.stderr)
+    # r14.1 F3: same-cwd lock files of workspaces that no longer exist.
+    _prune_same_cwd_locks()
     loop_core = _load_trio_loop(repo)
     # r11: worker isolation and concurrent slice-eval are default ON; the
     # --no-isolate-workers / --slice-eval-concurrency 1 flags disable them.
