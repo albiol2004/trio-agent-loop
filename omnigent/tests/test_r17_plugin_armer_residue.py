@@ -74,6 +74,52 @@ def _write(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+# ------------------------------------- N9: is_plugin_stop_armer shape parity
+#
+# Omnigent's own recognizer of the same name (omnigent/harnesses/cursor_native
+# /bridge.py, commit da6045a2e) additionally tolerates an explicit
+# `"type": "command"` key next to `"command"`. Trio's predicate must accept
+# every shape Omnigent's writer can produce, and stay fail-closed on anything
+# else (a different command string, a user hook, or an unknown key).
+
+
+@pytest.mark.parametrize("entry", [
+    {"command": "true # omnigent-plugin-stop-armer"},
+    {"command": "true # omnigent-plugin-stop-armer", "type": "command"},
+])
+def test_n9_armer_shapes_omnigent_can_write_are_recognized(wt, entry):
+    assert wt.is_plugin_stop_armer(entry)
+
+
+@pytest.mark.parametrize("entry", [
+    {"command": "true # omnigent-plugin-stop-armer", "timeout": 5},
+    {"command": "true # omnigent-plugin-stop-armer", "type": "prompt"},
+    {"command": "true  # omnigent-plugin-stop-armer"},
+    {"command": "true # omnigent-plugin-stop-armer", "type": "command", "timeout": 5},
+    USER_HOOK,
+    {"type": "command"},
+    "true # omnigent-plugin-stop-armer",
+    None,
+    {},
+])
+def test_n9_non_armer_shapes_stay_refused(wt, entry):
+    assert not wt.is_plugin_stop_armer(entry)
+
+
+def test_n9_armer_with_type_key_is_owned_residue(wt, tmp_path):
+    """The `type: command` shape is treated exactly like the plain shape
+    everywhere `is_plugin_stop_armer` gates behavior, not just in isolation."""
+    repo = _repo(tmp_path)
+    typed = {"command": "true # omnigent-plugin-stop-armer", "type": "command"}
+    _write(repo / ".cursor" / "hooks.json", _hooks(typed))
+    assert wt.owned_residue(repo, ".cursor/hooks.json")
+    user, residue = wt._split_status(repo, wt.status_entries(repo))
+    assert user == [] and residue == [".cursor/hooks.json"]
+    # next to a user hook: user content, not residue (same as the plain shape).
+    _write(repo / ".cursor" / "hooks.json", _hooks(typed, USER_HOOK))
+    assert not wt.owned_residue(repo, ".cursor/hooks.json")
+
+
 # ------------------------------------------------ T1 _owned_hooks / owned_residue
 
 

@@ -378,12 +378,32 @@ PLUGIN_STOP_ARMER_COMMAND = "true # omnigent-plugin-stop-armer"
 
 
 def is_plugin_stop_armer(entry: object) -> bool:
-    """Whether a hooks.json entry is exactly the plugin stop armer."""
-    return (
-        isinstance(entry, dict)
-        and set(entry) == {"command"}
-        and entry["command"] == PLUGIN_STOP_ARMER_COMMAND
-    )
+    """Whether a hooks.json entry is exactly the plugin stop armer.
+
+    Omnigent's own writer (``write_plugin_stop_armer`` in
+    ``omnigent/harnesses/cursor_native/bridge.py``, commit da6045a2e) writes
+    ``{"command": PLUGIN_STOP_ARMER_COMMAND}``; its own recognizer of the
+    same name additionally tolerates an explicit ``"type": "command"`` key
+    (bridge.py:176-180 there):
+
+        return (
+            isinstance(entry, dict)
+            and entry.get("command") == PLUGIN_STOP_ARMER_COMMAND
+            and entry.get("type", "command") == "command"
+        )
+
+    This mirrors that shape (an optional ``"type"`` key equal to
+    ``"command"``) but stays fail-closed on any other key -- a different
+    command string, a user hook, or an unknown key such as ``timeout`` --
+    which Omnigent's own version does not itself write (eval-r17 N9).
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("command") != PLUGIN_STOP_ARMER_COMMAND:
+        return False
+    if set(entry) - {"command", "type"}:
+        return False
+    return entry.get("type", "command") == "command"
 
 
 def _without_armers(data: object) -> object:
