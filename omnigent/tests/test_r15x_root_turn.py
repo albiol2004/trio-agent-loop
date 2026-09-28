@@ -282,6 +282,93 @@ def _oneshot_works(tmp_path, home) -> None:
     assert "scouted" in out
 
 
+def test_i2_oneshot_at_root_waits_for_a_live_loops_turn_and_runs_in_workspace(
+    env, resolvable, monkeypatch
+):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")]})
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    # Without a live loop at the root: no lock, and cwd = --workspace.
+    _oneshot_works(tmp_path, home)
+    assert (tmp_path / "oneshot-cwds.txt").read_text().split() == [str(home.resolve())]
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "a")
+    lock = trioctl._RootTurnLock(home, who={"mailbox": str(home / "loop" / "a"), "role": "lead",
+                                             "kind": "lead-pass"})
+    lock.acquire(5)
+    try:
+        t0 = time.monotonic()
+        proc = _run_oneshot(tmp_path, home, cwd=other_cwd,
+                            extra_env={"TRIO_ROOT_TURN_PROGRESS_S": "0.5"})
+        threading.Timer(2.0, lock.release).start()
+        out, err = proc.communicate(timeout=60)
+        took = time.monotonic() - t0
+    finally:
+        lock.release()
+        holder.kill()
+        holder.wait()
+    assert proc.returncode == 0, err
+    assert "scouted" in out
+    assert took >= 1.9
+    assert f"root turn at {home.resolve()} held by {home / 'loop' / 'a'} lead" in err
+    assert (tmp_path / "oneshot-cwds.txt").read_text().split()[-1] == str(home.resolve())
+
+
+def test_i2_oneshot_waits_bounded_then_fails_naming_the_holder(env, resolvable):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")]})
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "a")
+    lock = trioctl._RootTurnLock(home, who={"mailbox": str(home / "loop" / "a"),
+                                             "role": "evaluator", "kind": "integration-eval"})
+    lock.acquire(5)
+    try:
+        proc = _run_oneshot(tmp_path, home, cwd=tmp_path,
+                            extra_env={"TRIO_ROOT_TURN_ONESHOT_WAIT_S": "0.6"})
+        out, err = proc.communicate(timeout=60)
+    finally:
+        lock.release()
+        holder.kill()
+        holder.wait()
+    assert proc.returncode == 1
+    assert "is still held by" in err and "evaluator" in err
+    assert not (tmp_path / "oneshot-cwds.txt").exists()  # cursor-agent never started
+
+
+def test_oneshot_inside_the_holders_root_session_shares_its_turn(env, resolvable):
+    """A Lead's own scout (a cursor-agent at the root is its ancestor) joins."""
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")]})
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "a")
+    lock = trioctl._RootTurnLock(home, who={"mailbox": str(home / "loop" / "a"), "role": "lead"})
+    lock.acquire(5)
+    bindir = tmp_path / "session-bin"
+    bindir.mkdir()
+    session = bindir / "cursor-agent-session"
+    prompt = tmp_path / "task.md"
+    prompt.write_text("look\n")
+    session.write_text(
+        f"#!/bin/sh\n# cursor-agent (the Lead's session)\n"
+        f"exec {sys.executable} {SCRIPT} omnigent run scout --workspace . "
+        f"--prompt-file {prompt}\n"
+    )
+    session.chmod(0o755)
+    env_vars = dict(os.environ, PATH=f"{_fake_cursor_bin(tmp_path)}:{os.environ['PATH']}",
+                    TRIO_ROOT_TURN_ONESHOT_WAIT_S="0.5")
+    try:
+        # /bin/sh <path containing "cursor-agent"> with cwd = the root: the
+        # same detection the driver uses finds it as the one-shot's ancestor.
+        wrapper = subprocess.run(
+            ["/bin/sh", "-c", f"/bin/sh {session}; true"], cwd=home, env=env_vars,
+            capture_output=True, text=True, timeout=60,
+        )
+    finally:
+        lock.release()
+        holder.kill()
+        holder.wait()
+    assert "shares its root turn" in wrapper.stderr, wrapper.stderr
+    assert "scouted" in wrapper.stdout
+
+
 # ------------------------------------------------------------ I4 stranger
 
 
@@ -557,6 +644,74 @@ def test_isolated_slice_eval_never_takes_the_root_turn(env, monkeypatch):
 
 
 # ------------------------------------------------------------ I7 overlap
+
+
+def test_i7_overlapping_writes_with_a_live_loop_refuse_start_then_override(env):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/shared/x.py")], "b": [("b1", "src/shared")]})
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "b")
+    timeline = tmp_path / "timeline.jsonl"
+    try:
+        proc = _spawn_loop(tmp_path, home, "a", [("a1", "src/shared/x.py")], timeline)
+        code = proc.wait(timeout=60)
+        out = _harness_log(tmp_path, "a")
+        assert code == 2, out
+        assert f"writes overlap with live loop {home / 'loop' / 'b'}" in out
+        assert "src/shared/x.py overlaps src/shared" in out
+        assert f"refusing to start {home / 'loop' / 'a'}" in out
+        box = home / "loop" / "a"
+        assert "refused to start" in (box / "LOG.md").read_text()
+        assert (box / "STATE.md").read_text().count("status: ready") == 1
+        assert not [e for e in _events(timeline) if e["event"] == "lead-start"]
+        # Override: proceeds, with a LOG warning.
+        proc = _spawn_loop(tmp_path, home, "a", [("a1", "src/shared/x.py")], timeline,
+                           env={"TRIO_ALLOW_OVERLAPPING_LOOPS": "1"})
+        assert proc.wait(timeout=120) == 0, _harness_log(tmp_path, "a")
+        log = (box / "LOG.md").read_text()
+        assert "warning: writes overlap with live loop" in log
+        assert "TRIO_ALLOW_OVERLAPPING_LOOPS=1 proceeds" in log
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_disjoint_writes_and_dead_registrations_do_not_refuse(env):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")], "b": [("b1", "src/shared")]})
+    reg = trioctl._LoopRegistration(home, home / "loop" / "b")
+    reg.register()
+    entry = json.loads(reg.path.read_text())
+    entry.update(pid=999999, pid_start="1")  # dead driver
+    reg.path.write_text(json.dumps(entry))
+    assert trioctl._writes_overlap_problems(Path(os.path.realpath(home)), home / "loop" / "a") == []
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "b")
+    try:
+        assert trioctl._writes_overlap_problems(
+            Path(os.path.realpath(home)), home / "loop" / "a") == []
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_i7_overlap_appearing_mid_run_stops_the_lead_pass_needs_human(env, monkeypatch):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")], "b": [("b1", "src/a1.py")]})
+    runner = trioctl.OmnigentRunner(repo=home, config={}, interval=0)
+    runner.loop_registry = {"root": os.path.realpath(home), "allow": False}
+    monkeypatch.setattr(runner, "_agent_id", lambda role: "agent")
+    monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
+    monkeypatch.setattr(runner, "_prompt", lambda *a, **k: "p\n")
+    monkeypatch.setattr(runner, "_run_dispatch",
+                        lambda *a, **k: pytest.fail("the pass must not be dispatched"))
+    holder = _registered_live_loop(home, trioctl, home / "loop" / "b")
+    try:
+        with pytest.raises(trioctl.WritesOverlapError, match="src/a1.py"):
+            runner.run("lead", 2, home / "loop" / "a", {"mode": "open-loop", "kind": "lead-pass"})
+    finally:
+        holder.kill()
+        holder.wait()
+    assert runner.driver_stop["exit"] == 5 and runner.driver_stop["phase"] == "writes-overlap"
+    assert not trioctl._RootTurnLock(home, who={}).held_by_other()
 
 
 # ------------------------------------------------------------ I8 regression

@@ -773,10 +773,11 @@ def run_cursor_worker(
     preserves historical behavior and writes no files. Telemetry must
     not change exit codes, exceptions, or process cleanup.
 
-    ``isolated`` binds the process itself to *workspace* (cwd as well as
-    ``--workspace``, since cursor-agent derives its project ``.cursor``
-    config root from the physical cwd) and starts it as its own process
-    group so every descendant is tracked and killed with it. ``on_spawn``
+    The process runs with cwd = *workspace* as well as ``--workspace``
+    (cursor-agent derives its project ``.cursor`` config root from the
+    physical cwd; r15.x: never the caller's cwd). ``isolated`` also starts
+    it as its own process group so every descendant is tracked and killed
+    with it (and drained after it exits). ``on_spawn``
     receives the Popen right after launch (ledger bookkeeping).
     """
     if role not in CURSOR_WORKER_ROLES:
@@ -819,11 +820,10 @@ def run_cursor_worker(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                **(
-                    {"cwd": str(workspace.resolve()), "start_new_session": True}
-                    if isolated
-                    else {}
-                ),
+                # r15.x: the physical cwd is always the workspace (it picks
+                # the project `.cursor` root), never the caller's cwd.
+                cwd=str(workspace.resolve()),
+                **({"start_new_session": True} if isolated else {}),
             )
         except OSError as exc:
             _emit_worker_event(events, "spawn_failed", role, pid=None)
@@ -979,14 +979,26 @@ def command_run(args: argparse.Namespace) -> int:
             ) from exc
     if getattr(args, "isolate", False):
         return _command_run_isolated(args, config, prompt)
-    output = run_cursor_worker(
-        args.role,
-        config,
-        prompt=prompt,
-        workspace=Path(args.workspace),
-        timeout=args.timeout,
-        events=_worker_event_ctx(args) or None,
-    )
+    # r15.x: cwd = --workspace (never inherited). A workspace whose Cursor
+    # project root is the aggregate root of a live Trio loop shares that
+    # root's single `.cursor` slot: the one-shot takes the root turn for its
+    # whole run (own process group, drained after it exits) unless it runs
+    # inside the turn holder's own session.
+    workspace = Path(args.workspace).expanduser().resolve()
+    turn = _one_shot_root_turn(args, workspace)
+    try:
+        output = run_cursor_worker(
+            args.role,
+            config,
+            prompt=prompt,
+            workspace=workspace,
+            timeout=args.timeout,
+            events=_worker_event_ctx(args) or None,
+            **({"isolated": True} if turn is not None else {}),
+        )
+    finally:
+        if turn is not None:
+            turn.release()
     print(output)
     return 0
 
@@ -3748,6 +3760,8 @@ DEFAULT_ROOT_STRANGER_WAIT = 300.0
 ROOT_STRANGER_PROGRESS = 30.0
 #: A foreign cursor-agent kept the aggregate root after the bounded wait.
 ROOT_OCCUPIED_EXIT = 9
+ALLOW_OVERLAPPING_LOOPS_ENV = "TRIO_ALLOW_OVERLAPPING_LOOPS"
+LOOP_REGISTRY_DIR = "loops"
 
 
 class RootBusyError(TrioctlError):
@@ -3761,6 +3775,10 @@ class RootOccupiedError(TrioctlError):
         super().__init__(message)
         self.pids = pids
         self.details = details
+
+
+class WritesOverlapError(TrioctlError):
+    """This mailbox's `writes:` overlap a live loop's in the same repo."""
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -3933,6 +3951,183 @@ def _root_turn_slot(key: str) -> dict[str, Any]:
         )
 
 
+def aggregate_for(mailbox: Path, repo_name: str | None, home: Path) -> Path:
+    """The aggregate checkout of *repo_name* for *mailbox* (r16 indirection).
+
+    Today: the home root for the mailbox repo (``None``/``home``/``.``), the
+    declared clone's path for a PLAN.md `repos:` entry. r16 swaps this for
+    the per-loop Lead worktree; callers must not assume the root.
+    """
+    if not repo_name or repo_name in ("home", "."):
+        return Path(home)
+    declared = _declared_repos(mailbox).get(repo_name)
+    return Path(declared["path"]) if declared else Path(home)
+
+
+def _loop_registry_dir(root: Path) -> Path | None:
+    """``<git common dir>/trio-worktrees/loops`` of *root*, or None (no git)."""
+    if worker_worktrees is None:
+        return None
+    try:
+        return worker_worktrees.ledger_dir(Path(root)) / LOOP_REGISTRY_DIR
+    except Exception:  # noqa: BLE001 - not a git checkout: no registry
+        return None
+
+
+def _loop_writes(mailbox: Path, root: Path) -> dict[str, list[str]]:
+    """``{aggregate realpath: [writes...]}`` of *mailbox*'s PLAN.md slices."""
+    out: dict[str, list[str]] = {}
+    try:
+        names = ["home", *_declared_repos(mailbox)]
+        for name in names:
+            writes = _repo_declared_writes(mailbox, name)
+            if writes:
+                key = os.path.realpath(str(aggregate_for(mailbox, name, root)))
+                out.setdefault(key, []).extend(writes)
+    except Exception:  # noqa: BLE001 - an unparseable PLAN declares nothing
+        if worker_worktrees is not None:
+            writes = worker_worktrees.declared_product_paths(mailbox)
+            if writes:
+                out[os.path.realpath(str(root))] = writes
+    return out
+
+
+def _live_loops(root: Path, *, exclude_mailbox: Path | None = None) -> list[dict[str, Any]]:
+    """Registered live `omnigent loop` drivers whose aggregate root is *root*."""
+    directory = _loop_registry_dir(root)
+    if directory is None or not directory.is_dir():
+        return []
+    here = os.path.realpath(str(root))
+    skip = os.path.realpath(str(exclude_mailbox)) if exclude_mailbox else None
+    live: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get("root") != here:
+            continue
+        ident = {"pid": entry.get("pid"), "start": entry.get("pid_start")}
+        if not worker_worktrees.identity_alive(ident):
+            continue
+        if skip and os.path.realpath(str(entry.get("mailbox") or "")) == skip:
+            continue
+        entry["_path"] = str(path)
+        live.append(entry)
+    return live
+
+
+def _writes_overlaps(mine: dict[str, list[str]], theirs: dict[str, list[str]]) -> list[str]:
+    """``"<a> overlaps <b>"`` for every pair covering each other (per repo)."""
+    covered = worker_worktrees._covered
+    pairs: list[str] = []
+    for repo_key, paths in mine.items():
+        other = theirs.get(repo_key) or []
+        for a in paths:
+            for b in other:
+                if covered(a, [b]) or covered(b, [a]):
+                    item = f"{a} overlaps {b}" if a != b else a
+                    if len(mine) > 1:
+                        item += f" (repo {repo_key})"
+                    if item not in pairs:
+                        pairs.append(item)
+    return pairs
+
+
+def _writes_overlap_problems(root: Path, mailbox: Path) -> list[str]:
+    """One line per live loop in *root* whose `writes:` overlap *mailbox*'s."""
+    mine = _loop_writes(mailbox, root)
+    if not mine:
+        return []
+    problems: list[str] = []
+    for entry in _live_loops(root, exclude_mailbox=mailbox):
+        other_box = Path(str(entry.get("mailbox")))
+        theirs = _loop_writes(other_box, root) if other_box.is_dir() else (
+            entry.get("writes_by_repo") or {}
+        )
+        pairs = _writes_overlaps(mine, theirs)
+        if pairs:
+            problems.append(
+                f"writes overlap with live loop {other_box} (pid {entry.get('pid')}) "
+                f"in {root}: {', '.join(pairs)}"
+            )
+    return problems
+
+
+def _allow_overlapping_loops(args: Any = None) -> bool:
+    if getattr(args, "allow_overlapping_writes", False):
+        return True
+    return os.environ.get(ALLOW_OVERLAPPING_LOOPS_ENV, "").strip() in ("1", "true", "yes")
+
+
+class _LoopRegistration:
+    """This driver's live-loop registry entry (`<common>/trio-worktrees/loops/`)."""
+
+    def __init__(self, root: Path, mailbox: Path) -> None:
+        self.root = Path(os.path.realpath(str(root)))
+        self.mailbox = Path(mailbox)
+        self.path: Path | None = None
+
+    def register(self) -> None:
+        directory = _loop_registry_dir(self.root)
+        if directory is None:
+            return
+        try:
+            rel = self.mailbox.relative_to(self.root).as_posix()
+        except ValueError:
+            rel = self.mailbox.name
+        slug = re.sub(r"[^A-Za-z0-9._-]", "_", rel.replace("/", "--")) or "mailbox"
+        ident = worker_worktrees.process_identity(os.getpid())
+        entry = {
+            "mailbox": str(self.mailbox),
+            "mailbox_rel": rel,
+            "root": str(self.root),
+            "pid": ident["pid"],
+            "pid_start": ident["start"],
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "writes_by_repo": _loop_writes(self.mailbox, self.root),
+        }
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{slug}-{os.getpid()}.json"
+            tmp = directory / f".{path.name}.tmp"
+            tmp.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            self.path = path
+        except OSError as exc:
+            print(f"trioctl: could not register live loop: {exc}", file=sys.stderr)
+
+    def unregister(self) -> None:
+        path, self.path = self.path, None
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _loop_registry_guard(root: Path) -> Iterator[None]:
+    """Serialise overlap check + registration across starting drivers."""
+    import fcntl
+
+    directory = _loop_registry_dir(root)
+    if directory is None:
+        yield
+        return
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        fh = open(directory / ".registry.lock", "a+", encoding="utf-8")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fh.close()
+
+
 def _set_state_reason(state_path: Path, reason: str | None) -> None:
     """Set (or with None drop) STATE.md's `reason:` line; other lines untouched."""
     try:
@@ -3948,7 +4143,46 @@ def _set_state_reason(state_path: Path, reason: str | None) -> None:
 
 
 #: STATE.md `reason:` values this driver writes (cleared again on resume).
-DRIVER_STOP_REASONS = ("root-occupied", "driver-exception")
+DRIVER_STOP_REASONS = ("root-occupied", "writes-overlap", "driver-exception")
+
+
+def _one_shot_root_turn(args: Any, workspace: Path) -> "_RootTurnLock | None":
+    """A non-isolated one-shot's root turn (None = no lock needed / joined).
+
+    Taken only when *workspace*'s Cursor project root is the aggregate root
+    of a live registered loop. A one-shot started from inside a root
+    session (a cursor-agent at that root is its ancestor: the turn holder's
+    own scouts/builders), or naming the holder's mailbox, shares that turn.
+    """
+    if worker_worktrees is None:
+        return None
+    root = worker_worktrees.cursor_project_root(workspace)
+    if not (root / ".git").exists():
+        return None
+    root = Path(os.path.realpath(str(root)))
+    if not _live_loops(root):
+        return None
+    parent = worker_worktrees.cursor_agent_ancestor(root)
+    if parent:
+        print(
+            f"trioctl: one-shot inside root session (cursor-agent pid {parent}) "
+            f"at {root}: shares its root turn",
+            file=sys.stderr,
+        )
+        return None
+    mailbox_arg = getattr(args, "worker_events_mailbox", None)
+    mailbox = str(Path(str(mailbox_arg)).expanduser().resolve()) if mailbox_arg else None
+    lock = _RootTurnLock(root, who={"mailbox": None, "role": args.role, "kind": "one-shot",
+                                    "worker_mailbox": mailbox})
+    holder = lock.holder() or {}
+    if mailbox and holder.get("mailbox") == mailbox and lock.held_by_other():
+        print(f"trioctl: one-shot for {mailbox}: shares its loop's root turn", file=sys.stderr)
+        return None
+    lock.acquire(
+        _env_seconds(ROOT_TURN_ONESHOT_WAIT_ENV, DEFAULT_ROOT_TURN_ONESHOT_WAIT),
+        label=f"one-shot {args.role}",
+    )
+    return lock
 
 
 # Prompts of this process's dispatches, per mailbox, so a first-prompt hold
@@ -4095,6 +4329,8 @@ class OmnigentRunner:
         # Set when a dispatch stops the loop for a human (root-occupied,
         # writes-overlap): `_command_loop` maps it to STATE + exit code.
         self.driver_stop: dict[str, Any] | None = None
+        # {root, allow}: set by `_command_loop` (live-loop registry checks).
+        self.loop_registry: dict[str, Any] | None = None
         # The loop core driving this runner (set by `loop`); None = unknown.
         self.loop_core: Any = None
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
@@ -4752,6 +4988,34 @@ class OmnigentRunner:
         mine = self._turn_state()
         mine["sticky"] = 0
         self._exit_root_turn(mine["count"])
+
+    def _check_writes_overlap(self, mailbox: Path, iteration: int) -> None:
+        """Lead-pass start: refuse (needs_human) when a live loop's writes overlap."""
+        registry = self.__dict__.get("loop_registry")
+        if not registry:
+            return
+        problems = _writes_overlap_problems(Path(registry["root"]), mailbox)
+        if not problems:
+            return
+        if registry.get("allow"):
+            logged = registry.setdefault("logged", set())
+            for problem in problems:
+                if problem in logged:
+                    continue
+                logged.add(problem)
+                _append_mailbox_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | warning: {problem}; "
+                    f"{ALLOW_OVERLAPPING_LOOPS_ENV}=1 proceeds (one shared aggregate: unsafe)",
+                )
+            return
+        message = "; ".join(problems)
+        error = WritesOverlapError(message)
+        error.stop = {
+            "status": "needs_human", "phase": "writes-overlap", "reason": "writes-overlap",
+            "message": message, "exit": 5,
+        }
+        raise error
 
     ROOT_RELEASE_WAIT = 30.0
 
@@ -5661,11 +5925,12 @@ class OmnigentRunner:
                 # sticky turns (held through `_finalize_ship`) end here, with
                 # their integration fences.
                 self._release_sticky_root_turns()
+                self._check_writes_overlap(mailbox, iteration)
             return self._run_bound(
                 role, iteration, mailbox, context, agent_id, model, prompt, title,
                 dispatch, eval_wt, eval_degraded, nonce,
             )
-        except RootOccupiedError as exc:
+        except (RootOccupiedError, WritesOverlapError) as exc:
             self.driver_stop = getattr(exc, "stop", None)
             raise
         finally:
@@ -6748,6 +7013,13 @@ def _command_loop(args: argparse.Namespace) -> int:
     # r15: a Lead pass that adds `repos:` to PLAN.md on an old core is
     # refused like any other out-of-repo slice (see OmnigentRunner._run).
     runner.loop_core = loop_core
+    # r15.x: live-loop registry + cross-loop writes check (one shared
+    # aggregate per repo until r16: overlapping writes are refused).
+    registration, refused_code = _register_live_loop(args, repo, mailbox, loop_core, runner)
+    if refused_code is not None:
+        if observe:
+            _finish_observation(observe)
+        return refused_code
     _clear_driver_stop_reason(loop_core, mailbox)
     keep_sessions = getattr(args, "keep_sessions", False)
     ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
@@ -6900,6 +7172,8 @@ def _command_loop(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
         _release_root_turns_of(runner)
+        if registration is not None:
+            registration.unregister()
         if observe:
             _finish_observation(observe)
 
@@ -6912,6 +7186,68 @@ def _release_root_turns_of(runner: Any) -> None:
             release()
         except Exception as exc:  # noqa: BLE001 - never change the exit code
             print(f"trioctl: could not release the root turn: {exc}", file=sys.stderr)
+
+
+def _register_live_loop(
+    args: argparse.Namespace, repo: Path, mailbox: Path, loop_core: Any, runner: Any,
+) -> tuple["_LoopRegistration | None", int | None]:
+    """r15.x loop start: refuse overlapping `writes:` with live loops, register.
+
+    Returns ``(registration or None, refusal exit code or None)``. The check
+    and the registration happen under one registry flock, so two drivers
+    starting together cannot both miss each other.
+    """
+    if worker_worktrees is None:
+        return None, None
+    root = Path(os.path.realpath(str(worker_worktrees.cursor_project_root(repo))))
+    if _loop_registry_dir(root) is None:
+        return None, None
+    allow = _allow_overlapping_loops(args)
+    registration = _LoopRegistration(root, mailbox)
+    with _loop_registry_guard(root):
+        problems = _writes_overlap_problems(root, mailbox)
+        if problems and not allow:
+            _refuse_overlap_at_start(loop_core, mailbox, problems)
+            return None, REPO_SCOPE_REFUSED_EXIT
+        registration.register()
+    try:
+        runner.loop_registry = {"root": str(root), "allow": allow, "logged": set(problems)}
+    except AttributeError:
+        pass
+    iteration = _state_iteration(mailbox)
+    for problem in problems:
+        print(f"trioctl: warning: {problem}; {ALLOW_OVERLAPPING_LOOPS_ENV}=1 proceeds",
+              file=sys.stderr)
+        _append_mailbox_log(
+            mailbox,
+            f"- iter {iteration} | loop | warning: {problem}; "
+            f"{ALLOW_OVERLAPPING_LOOPS_ENV}=1 proceeds (one shared aggregate: unsafe)",
+        )
+    return registration, None
+
+
+def _refuse_overlap_at_start(loop_core: Any, mailbox: Path, problems: list[str]) -> None:
+    """stderr + one LOG line (under the mailbox lock when free); STATE untouched."""
+    for problem in problems:
+        print(
+            f"trioctl: refusing to start {mailbox}: {problem} (both loops share one "
+            f"aggregate checkout; set {ALLOW_OVERLAPPING_LOOPS_ENV}=1 to override)",
+            file=sys.stderr,
+        )
+    acquire = getattr(loop_core, "_acquire_lock", None)
+    release = getattr(loop_core, "_release_lock", None)
+    lock = acquire(mailbox) if callable(acquire) else None
+    if callable(acquire) and lock is None:
+        return  # a live driver owns this mailbox: leave it byte-identical
+    try:
+        _append_mailbox_log(
+            mailbox,
+            f"- iter {_state_iteration(mailbox)} | loop | refused to start: "
+            + "; ".join(problems),
+        )
+    finally:
+        if callable(release):
+            release(lock)
 
 
 def _clear_driver_stop_reason(loop_core: Any, mailbox: Path) -> None:
@@ -7518,6 +7854,13 @@ def parser() -> argparse.ArgumentParser:
     )
     loop.add_argument("--mailbox", type=Path, default=Path("loop"))
     loop.add_argument("--max-iterations", type=int, default=10)
+    loop.add_argument(
+        "--allow-overlapping-writes",
+        action="store_true",
+        help="r15.x: start/continue even when another live loop in this repo "
+        "declares overlapping `writes:` (same as TRIO_ALLOW_OVERLAPPING_LOOPS=1; "
+        "logged as a warning -- both loops share one aggregate checkout)",
+    )
     loop.add_argument(
         "--wait-timeout",
         type=float,

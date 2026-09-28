@@ -877,6 +877,26 @@ lines are never rewritten. The `.gitignore` may itself stay untracked
 until the next mailbox commit: files inside the active mailbox never block
 the dirty-checkout gate or the untracked-product scan.
 
+## Driver exit codes (`trioctl omnigent loop`)
+
+| Exit | STATE.md `status` | Meaning |
+|---|---|---|
+| 0 | `shipped` | SHIP accepted (retirement complete) |
+| 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error; a dispatch exception is recorded in STATE/LOG first (r15.x) |
+| 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop in the same repo (r15.x; STATE untouched, one LOG line) |
+| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict) |
+| 4 | unchanged | `--max-iterations` reached |
+| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x); or the mailbox is owned by a live driver (left byte-identical) |
+| 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
+| 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
+| 9 | `needs_human`, `phase: root-occupied`, `reason: root-occupied` | a cursor-agent Trio does not own kept the aggregate root's `.cursor` slot past `TRIO_ROOT_STRANGER_WAIT_S` (r15.x); the LOG line names pid, cwd, start, parents, cmd |
+| 130 | unchanged | interrupted (SIGINT/SIGTERM) |
+
+`reason:` (r15.x) is a driver-owned STATE.md line written with a driver
+stop (`root-occupied`, `writes-overlap`, `driver-exception`) and removed
+when the loop is resumed. See docs/CONCURRENT-SLICE-EVAL.md "Many loops
+per repo (interim, r15.x)".
+
 ## Context economics
 
 Mailbox files are split into hot and cold files so fresh-context roles stay
@@ -922,6 +942,10 @@ absence is never a violation.
 
 ## Changelog
 
+- **r15.x root-turn lock** (no METRICS_API bump; trioctl and
+  worker_worktrees only): exit 9 `root-occupied`, STATE `reason:`, the
+  live-loop registry under `<git common dir>/trio-worktrees/loops/`, and
+  the cross-loop `writes:` refusal (exit 2 at start, exit 5 mid-run).
 - **METRICS_API 5** (r15 multi-repo slices): `trio-metrics.py` gains
   `parse_repos_block`/`read_repos`/`mailbox_repo_root`, `slice_repo_name`,
   `parse_repo_pins` and `parse_full_check`; `retired:` entries may carry
