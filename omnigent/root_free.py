@@ -580,6 +580,55 @@ def _undo_create(wt: Any, made: list[tuple[Path, Path, str]], branch: str, seed:
             _git(wt, repo, "update-ref", "-d", f"refs/heads/{branch}", tip, check=False)
 
 
+def progress(wt: Any, record: dict[str, Any]) -> str | None:
+    """Why *record*'s loop has progress worth keeping, or None (pristine).
+
+    Pristine = every branch tip is still where :func:`begin` left it (the
+    target base, or home's ``loop: seed`` commit) and every existing
+    worktree of the loop has no tracked or untracked change: nothing but
+    the seeded copy of the root mailbox, which the root still has.
+    """
+    home = Path(record["repo"])
+    branch = record["branch"]
+    todo = [(home, Path(record["path"]), {record.get("target_base"), record.get("seed")})] + [
+        (Path(info["main"]), Path(info["path"]), {info.get("target_base")})
+        for info in (record.get("repos") or {}).values()
+    ]
+    for repo, path, allowed in todo:
+        tip = wt.rev(repo, f"refs/heads/{branch}")
+        if tip is not None and tip not in allowed:
+            return f"branch {branch} in {repo} has commits past its seed"
+        if path.is_dir():
+            status = _git(
+                wt, path, "status", "--porcelain=v1", "--untracked-files=all", check=False
+            )
+            if status.returncode != 0 or status.stdout.strip():
+                return f"Lead worktree {path} has uncommitted or untracked changes"
+    return None
+
+
+def discard_pristine(wt: Any, record: dict[str, Any], why: str) -> bool:
+    """Remove a loop's Lead worktree(s) and ``trio/<slug>`` branch(es) when it
+    has no progress (:func:`progress`), so the next start re-seeds from the
+    target's current tip (eval-r16rc F1). False (nothing done) otherwise."""
+    home = Path(record["repo"])
+    with wt.repo_lock(home, "lead"):
+        current = load_record(wt, home, record["slug"]) or record
+        if not active(current) or current.get("state") == "landed" or progress(wt, current):
+            return False
+        made = [(home, Path(current["path"]), str(current.get("target_base") or ""))] + [
+            (Path(info["main"]), Path(info["path"]), str(info.get("target_base") or ""))
+            for info in (current.get("repos") or {}).values()
+        ]
+        _undo_create(wt, made, current["branch"], current.get("seed"))
+        for repo, _path, _start in made:
+            _git(wt, repo, "worktree", "prune", check=False)
+        current["state"] = "removed"
+        current["discarded"] = why
+        save_record(wt, home, current)
+    return True
+
+
 def _reattach(wt: Any, home: Path, record: dict[str, Any], owner: str) -> None:
     """Resume: the Lead worktree (and declared aggregates) exist, or are
     re-created from their ``trio/<slug>`` branches; never re-seeded."""

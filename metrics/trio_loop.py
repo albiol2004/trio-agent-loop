@@ -2792,7 +2792,8 @@ def run_open_loop(
     (``phase``/``detail``; STATE ``needs_land``, exit 8), ``reverify`` (the
     target moved and the merge needs a new integration-eval; the pin is
     cleared and one is dispatched, at most MAX_LAND_REVERIFY_ROUNDS times,
-    then ``needs_land``/``land-starved``) or ``error`` (exit 3). A run that
+    then ``needs_land``/``land-starved``) or ``error`` (a raising hook
+    likewise: STATE ``needs_land``/``land-error``, exit 8). A run that
     starts on a ``needs_land`` (or shipped but not ``landed``) mailbox
     retries the land before anything else and dispatches no Lead (an
     interrupted land -- ``shipped`` in phase ``landing`` -- likewise).
@@ -3051,11 +3052,21 @@ def run_open_loop(
                     file=sys.stderr,
                 )
                 return 8
-            _update_state(state_path, {"status": "error", "phase": "land-error"})
+            # eval-r16rc F2: the SHIP is verified; a land that failed (hook
+            # error, git failure) is resumable like any other unlanded SHIP
+            # (`trioctl omnigent land`, or `loop` again: land first, no Lead).
+            _update_state(state_path, {"status": "needs_land", "phase": "land-error"})
             _append_log(
-                mailbox, f"- iter {iteration_now} | loop | land failed: {detail}"
+                mailbox,
+                f"- iter {iteration_now} | loop | needs_land (land-error): land "
+                f"failed: {detail}",
             )
-            return 3
+            print(
+                f"trio_loop: iteration {iteration_now} SHIP verified but not "
+                f"landed (land-error): {detail}",
+                file=sys.stderr,
+            )
+            return 8
 
         wake_event = threading.Event()
         # r11g Q1: iterations whose `gate held` LOG line is written, shared
@@ -3097,6 +3108,8 @@ def run_open_loop(
                 and start_state["phase"].strip() == "landing"
                 and not start_state["landed"].strip()
             )
+            # rc before eval-r16rc F2 recorded a failed land as an error.
+            or (start_status == "error" and start_state["phase"].strip() == "land-error")
         )
         if resume_land:
             # r16: a verified SHIP that has not landed yet -- land first;

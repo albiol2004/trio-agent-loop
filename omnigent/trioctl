@@ -7651,14 +7651,32 @@ def _root_free_wanted(args: argparse.Namespace, mailbox: Path) -> tuple[bool, st
 
 
 def _target_metrics_api(home: Path, target: str) -> int | None:
-    """METRICS_API of `metrics/trio-metrics.py` at the tip of *target* (None = absent)."""
-    proc = subprocess.run(
-        ["git", "-C", str(home), "cat-file", "blob", f"refs/heads/{target}:metrics/trio-metrics.py"],
-        capture_output=True,
+    """METRICS_API the metrics/ set committed at the tip of *target* honours
+    (None = no trio-metrics.py or trio_loop.py there).
+
+    The lower of the two markers, as `_core_metrics_api` rules for a loaded
+    core (eval-r16rc F1): trio-metrics.py's `METRICS_API`, and the core
+    trio_loop.py's own marker (unmarked = predates r15 = at most 4). Read
+    with `git cat-file` before anything is created.
+    """
+    blobs: dict[str, bytes] = {}
+    for name in ("trio-metrics.py", "trio_loop.py"):
+        proc = subprocess.run(
+            ["git", "-C", str(home), "cat-file", "blob", f"refs/heads/{target}:metrics/{name}"],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            return None
+        blobs[name] = proc.stdout
+    metrics_api = _api_marker_source(
+        blobs["trio-metrics.py"], "METRICS_API", f"{target}:metrics/trio-metrics.py"
     )
-    if proc.returncode != 0:
-        return None
-    return _api_marker_source(proc.stdout, "METRICS_API", f"{target}:metrics/trio-metrics.py")
+    core_api = _api_marker_source(
+        blobs["trio_loop.py"], "METRICS_API", f"{target}:metrics/trio_loop.py"
+    )
+    if core_api == 1:  # unmarked core: predates r15
+        core_api = min(metrics_api, MULTI_REPO_METRICS_API - 1)
+    return min(metrics_api, core_api)
 
 
 def _root_free_declared(mailbox: Path) -> list[dict[str, Any]]:
@@ -7717,6 +7735,35 @@ def _root_free_info(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _discard_pristine_lead(mailbox: Path, why: str, *, land_only: bool = False) -> bool:
+    """Drop *mailbox*'s root-free Lead worktree + branch when it made no
+    progress (eval-r16rc F1); True when it was removed (message printed)."""
+    if land_only or root_free is None or worker_worktrees is None:
+        return False
+    try:
+        home, rel = root_free.locate(worker_worktrees, mailbox)
+    except root_free.RootFreeError:
+        return False
+    record = root_free.load_record(worker_worktrees, home, root_free.loop_slug(rel))
+    if not root_free.active(record) or record.get("mailbox_rel") != rel:
+        return False
+    if _live_driver_of(home, rel) is not None:
+        return False
+    try:
+        done = root_free.discard_pristine(worker_worktrees, record, why)
+    except (root_free.RootFreeError, worker_worktrees.WorktreeError, OSError) as exc:
+        print(f"trioctl: root-free: could not remove the unused Lead worktree: {exc}",
+              file=sys.stderr)
+        return False
+    if done:
+        print(
+            f"trioctl: root-free: {rel}: Lead worktree {record['path']} and branch "
+            f"{record['branch']} had no loop progress; removed ({why})",
+            file=sys.stderr,
+        )
+    return done
+
+
 def _root_lock_refused(root_box: Path, rel: str, *, clear_stale: bool) -> bool:
     """True (message printed) when a live driver holds *root_box*'s `.lock`."""
     holder = root_free.root_lock_holder(
@@ -7750,6 +7797,10 @@ def _root_free_begin(
     wanted, why = _root_free_wanted(args, mailbox)
     if not wanted and root_free is not None and worker_worktrees is not None:
         live = root_free.live_mailbox(worker_worktrees, mailbox)
+        if live is not None and _discard_pristine_lead(
+            mailbox, why or "--root-bound", land_only=land_only,
+        ):
+            live = None  # nothing of the root-free attempt was worth keeping
         if live is not None:
             print(
                 f"trioctl: {mailbox} belongs to a root-free loop (live mailbox {live}); "
@@ -7797,6 +7848,17 @@ def _root_free_begin(
     root_box = Path(home) / rel
     if _root_lock_refused(root_box, rel, clear_stale=False):
         return 5
+    if root_free.active(record) and record.get("state") == "active" and not land_only:
+        # eval-r16rc F1: a Lead worktree that never made progress (refused
+        # after it was seeded, e.g. an old metrics/ set on the target) is
+        # re-seeded once the target moved on (`metrics refresh --commit`).
+        base = str(record.get("target_base") or "")
+        now = wt.rev(home, f"refs/heads/{record.get('target_ref')}")
+        if now and base and now != base and _discard_pristine_lead(
+            mailbox, f"{record.get('target_ref')} moved {base[:12]}..{now[:12]}",
+            land_only=land_only,
+        ):
+            record = root_free.load_record(wt, home, slug)
     if not root_free.active(record) and not land_only:
         # r15 guard before anything exists: a refused PLAN never gets a Lead
         # worktree, and the root stays untouched (stderr only).
@@ -7882,17 +7944,30 @@ def _root_free_begin(
     )
     try:
         core = _load_trio_loop(lead)
+        refusal = None
     except TrioctlError as exc:
-        print(f"trioctl: {exc}", file=sys.stderr)
-        return 3
-    if _core_metrics_api(core) < ROOT_FREE_METRICS_API:
-        print(
-            f"trioctl: the loop core in {lead} predates root-free open-loop "
+        core, refusal = None, str(exc)
+    if core is not None and _core_metrics_api(core) < ROOT_FREE_METRICS_API:
+        refusal = (
+            f"the loop core in {lead} predates root-free open-loop "
             f"(METRICS_API {_core_metrics_api(core)}); refresh metrics/ on "
             f"{record['target_ref']} (`{METRICS_REFRESH_COMMAND}` with it checked "
-            "out) or pass --root-bound",
-            file=sys.stderr,
+            "out) or pass --root-bound"
         )
+    if refusal is not None:
+        print(f"trioctl: {refusal}", file=sys.stderr)
+        if _discard_pristine_lead(mailbox, "refused: loop core", land_only=land_only):
+            print(f"trioctl: root-free: removed the unused Lead worktree {lead} and "
+                  f"branch {record['branch']} (no loop progress); the next start "
+                  "re-seeds from the target's tip", file=sys.stderr)
+        else:
+            print(
+                f"trioctl: root-free: Lead worktree {lead} kept (it has loop progress); "
+                f"after fixing metrics/ merge {record['target_ref']} into "
+                f"{record['branch']} there, or `trioctl omnigent abandon --mailbox "
+                f"{rel}` and `git branch -D {record['branch']}` to start over",
+                file=sys.stderr,
+            )
         return 3
     state_path = live / "STATE.md"
     core._read_state(state_path)  # creates a missing STATE.md
@@ -8250,7 +8325,9 @@ def command_land(args: argparse.Namespace) -> int:
         phase_word = phase.group(1).lower() if phase else ""
     except OSError:
         phase_word = ""
-    if status != "needs_land" and not (status == "shipped" and phase_word == "landing"):
+    if status != "needs_land" and not (status == "shipped" and phase_word == "landing") and not (
+        status == "error" and phase_word == "land-error"  # rc before eval-r16rc F2
+    ):
         print(
             f"trioctl: {rel} is {status or 'not started'!r}, not waiting to land "
             f"(`trioctl omnigent loop --mailbox {rel}` continues it)",

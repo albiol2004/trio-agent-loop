@@ -56,7 +56,7 @@ root mailbox loop/<x> (QUEUE.md)
 | Flag | Meaning |
 |---|---|
 | `--root-free` | Default for open-loop. Given explicitly, an unmet prerequisite is a refusal (exit 2) instead of a root-bound fallback. |
-| `--root-bound` | Pre-r16 behaviour at the root. Refused (exit 2) on a mailbox that already has a root-free Lead worktree: continue it root-free or `abandon` it. |
+| `--root-bound` | Pre-r16 behaviour at the root. Refused (exit 2) on a mailbox that already has a root-free Lead worktree with loop progress: continue it root-free or `abandon` it (an unused one, branch still at its seed and worktree clean, is removed instead). |
 | `--target <branch>` | Branch the loop forks from and lands onto. |
 | `--keep-branch` | Keep `trio/<slug>` after a successful land. |
 | `--worktree-root <dir>` | Where the Lead and worker worktrees live. |
@@ -241,6 +241,19 @@ Do that only between runs, never while an old driver is live.
 - **`land-starved` (exit 8).** Two re-verification rounds did not reach a
   stable land (the target kept moving under this loop's paths). Wait for
   the other work to settle, then `trioctl omnigent land`.
+- **`land-error` (exit 8).** The land itself failed (a git error, the
+  aggregate or target branch gone, the land-record commit failed; LOG has
+  the error). The SHIP stays verified: fix the cause, then
+  `trioctl omnigent land --mailbox loop/<x>` (exit 0 once landed). Running
+  `trioctl omnigent loop` again does the same: a `needs_land` mailbox goes
+  straight to the land, with no Lead pass and no new integration-eval.
+- **Old metrics/ set on the target (exit 3, nothing created).** The
+  pre-check takes the lower of `metrics/trio-metrics.py`'s and
+  `metrics/trio_loop.py`'s `METRICS_API` (unmarked core = 4) at the target
+  tip. Run `trioctl omnigent metrics refresh --commit` on the target, then
+  start again. A Lead worktree left by an earlier refused start (no loop
+  progress: branch at its seed, worktree clean) is removed and re-seeded
+  from the moved target; `--root-bound` removes such an unused one too.
 - **`worktree-setup` (exit 3).** Fix the setup command (`worktree_setup`
   or `.cursor/worktrees.json`) and rerun the loop; it re-attaches.
 - **`eval_isolation_failed` in LOG.** A slice-eval worktree could not be
@@ -251,7 +264,8 @@ Do that only between runs, never while an old driver is live.
   LOG/status). Inspect it; to drop it without landing use
   `trioctl omnigent abandon --mailbox loop/<x>` (the branch is kept).
 - **`--root-bound` refused (exit 2).** The mailbox already has a root-free
-  Lead worktree: continue root-free, or `abandon` first.
+  Lead worktree with loop progress: continue root-free, or `abandon` first
+  (one without progress is removed and the run goes root-bound).
 
 ## 13. Known r16a limits
 
