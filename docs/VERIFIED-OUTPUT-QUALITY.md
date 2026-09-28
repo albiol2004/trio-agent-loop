@@ -35,3 +35,17 @@ mailbox (and `quality` in `--json`): free-text accepts without an oracle
 (WARN), and a `full_check:` made only of artifact readers (WARN). The exit
 code is unchanged unless `--strict-quality` is passed (a REJECT is then a
 violation) -- r18b makes that the default.
+
+## Base-revert kill check (L2a, shadow)
+
+After an isolated builder's targeted check passes, trioctl reverts the
+slice's non-test product files to the base inside the builder's worktree,
+re-runs the brief's `## Targeted check`, and restores the tree (sha256
+proof). `killed` / `killed-by-import` / `survived` / `n/a` / `error` land in
+the builder JSON (`kill_check`), the worktree ledger, the driver's
+`retired slice ... | kill_check: <outcome> (shadow)` LOG line, the
+slice-eval's `BASE-REVERT:` context line, `.driver.json` `quality` and
+trio-shadow. It never changes a retire decision in r18a. Off switches:
+`run builder --isolate --no-kill-check`, `TRIO_KILL_CHECK=0` (propagated by
+the loop driver through `.driver.json`). Budget: 120 s, PLAN.md
+`full_check_budget_s:`, or `TRIO_KILL_CHECK_BUDGET_S`.

@@ -1490,13 +1490,32 @@ def _command_run_isolated(
             signal.signal(sig, handler)
     record = wt.load_record(repo, record["id"])
     wt.mark_exited(repo, record, returncode)
+    targeted = _targeted_check_line(output)
+    kill_check = None
+    if _kill_check_enabled(args):
+        kill_check = _isolated_kill_check(wt, repo, record, prompt, mailbox, targeted)
+        if kill_check is not None and kill_check.get("restored") is False:
+            # Safety net, never a quality gate: the worktree no longer holds
+            # exactly what the builder left, so it is not integrated.
+            record = wt._retain(
+                repo, wt.load_record(repo, record["id"]), "kill_check_restore_failed",
+                f"base-revert kill check could not restore: {kill_check.get('restore_mismatch')}",
+            )
+            view = _worktree_view(record)
+            view["targeted_check"] = targeted
+            view["kill_check"] = kill_check
+            print(output)
+            print(json.dumps(view, sort_keys=True))
+            return ISOLATED_RETAINED_EXIT
     summary = getattr(args, "summary", None) or f"isolated builder {record['id']}"
     record = wt.integrate(repo, record["id"], summary=summary)
     print(output)
     view = _worktree_view(record)
     # The builder's `TARGETED_CHECK: ` line, surfaced so the open-loop Lead
     # can copy it into its REPORT.md ledger mechanically (None = missing).
-    view["targeted_check"] = _targeted_check_line(output)
+    view["targeted_check"] = targeted
+    if kill_check is not None:
+        view["kill_check"] = kill_check
     print(json.dumps(view, sort_keys=True))
     print(f"trioctl: {wt.summarize(record)}", file=sys.stderr)
     return 0 if record.get("state") == "integrated" else ISOLATED_RETAINED_EXIT
@@ -1586,6 +1605,435 @@ def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
         view["repo_name"] = record["repo_name"]
         view["repo"] = record.get("repo")
     return {"worker_worktree": view}
+
+
+# --- r18a L2a: base-revert kill check (shadow) ------------------------------
+# After an isolated builder exits 0 with a passing TARGETED_CHECK line, and
+# BEFORE its worktree is committed and merged, trioctl reverts the slice's
+# non-test product files to the worktree's base, re-runs the brief's
+# `## Targeted check` command under a budget, and restores the tree
+# byte-identically (sha256 over every tracked and untracked, non-ignored
+# file, before vs after). The outcome is recorded (`kill_check` in the
+# builder JSON, the worktree ledger record, the driver's LOG line,
+# `.driver.json`, trio-shadow); in r18a it NEVER changes the retire
+# decision. `--no-kill-check` / TRIO_KILL_CHECK=0 (or the driver's
+# `.driver.json` `kill_check: false`) disable it.
+
+KILL_CHECK_ENV = "TRIO_KILL_CHECK"
+KILL_CHECK_BUDGET_ENV = "TRIO_KILL_CHECK_BUDGET_S"
+#: The targeted-check budget: the whole-tree gate's default wall clock
+#: (PLAN.md `full_check_budget_s:` overrides it, the env var overrides both).
+KILL_CHECK_DEFAULT_BUDGET_S = 120.0
+KILL_CHECK_OUTCOMES = ("killed", "killed-by-import", "survived", "n/a", "error")
+
+# Test files are never reverted: the slice's tests must run against the
+# base product. Globs per MAILBOX-SCHEMA "Base-revert kill check".
+_KILL_TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__|__snapshots__|spec|specs)/"
+    r"|(?:^|/)test_[^/]*\.py$|(?:^|/)[^/]*_test\.(?:py|go)$|(?:^|/)conftest\.py$"
+    r"|\.(?:test|spec)\.[cm]?[jt]sx?$"
+)
+# Receipts and evidence are never product.
+_KILL_NON_PRODUCT_RE = re.compile(r"(?:^|/)(?:results|evidence)/")
+_KILL_ASSERTION_RE = re.compile(
+    r"\b[1-9]\d* failed\b|^FAILED |AssertionError|assert .* ==|--- FAIL"
+    r"|Tests\s+[1-9]\d* failed|✕|× |^not ok \d",
+    re.MULTILINE,
+)
+_KILL_IMPORT_RE = re.compile(
+    r"ImportError|ModuleNotFoundError|error(?:s)? during collection|ERROR collecting"
+    r"|Cannot find module|Failed to (?:load|resolve)|does not provide an export"
+    r"|error TS2305|error TS2307|error TS2614|error TS2724|SyntaxError"
+    r"|cannot import name|has no attribute|undefined: ",
+)
+_KILL_NOT_RUNNABLE_RE = re.compile(r"command not found|No such file or directory|not recognized as")
+
+
+def _kill_check_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_kill_check", False):
+        return False
+    if os.environ.get(KILL_CHECK_ENV, "").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    mailbox_arg = getattr(args, "worker_events_mailbox", None)
+    if mailbox_arg:
+        try:
+            mailbox = _live_mailbox_or(Path(str(mailbox_arg)).expanduser().resolve())
+            data = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("kill_check") is False:
+                return False
+        except (OSError, ValueError):
+            pass
+    return True
+
+
+def _kill_check_budget(mailbox: Path | None) -> float:
+    env = os.environ.get(KILL_CHECK_BUDGET_ENV, "").strip()
+    if env:
+        try:
+            return max(1.0, float(env))
+        except ValueError:
+            pass
+    if mailbox is not None:
+        try:
+            plan = (mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            plan = ""
+        m = re.search(r"^\s*full_check_budget_s\s*:\s*(\d+(?:\.\d+)?)", plan, re.MULTILINE)
+        if m:
+            return max(1.0, float(m.group(1)))
+    return KILL_CHECK_DEFAULT_BUDGET_S
+
+
+def _brief_targeted_command(brief: str) -> str | None:
+    """The brief's `## Targeted check` command (a fenced block, else the
+    first inline-code command, else the first plain line), or None."""
+    try:
+        lines = _load_trio_check()[0].targeted_check_lines(brief)
+    except TrioctlError:
+        return None
+    fenced: list[str] = []
+    inside = False
+    for ln in lines:
+        if ln.strip().startswith(("```", "~~~")):
+            if inside:
+                break
+            inside = True
+            continue
+        if inside and ln.strip() and not ln.strip().startswith("#"):
+            fenced.append(ln.rstrip())
+    if fenced:
+        return "\n".join(fenced)
+    for ln in lines:
+        for span in re.findall(r"`([^`]+)`", ln):
+            span = span.strip()
+            if "TARGETED_CHECK" in span or " " not in span:
+                continue
+            return span
+    for ln in lines:
+        text = re.sub(r"^\s*(?:[-*+]\s+|\$\s+)", "", ln).strip()
+        if text and "TARGETED_CHECK" not in text and not text.lower().startswith("print"):
+            return text
+    return None
+
+
+def _kill_ls_files(path: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(path), "ls-files", "-z", "--cached", "--others",
+         "--exclude-standard"],
+        capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape")
+    return sorted({p for p in out.split("\0") if p})
+
+
+def _kill_file_state(path: Path, rel: str) -> tuple[str, bytes] | None:
+    """(kind+mode, content) of one worktree file; None when absent."""
+    full = path / rel
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        return None
+    if os.path.islink(full):
+        return ("link", os.readlink(full).encode("utf-8", "surrogateescape"))
+    if not os.path.isfile(full):
+        return ("other", b"")
+    with open(full, "rb") as fh:
+        return (f"file:{st.st_mode & 0o777:o}", fh.read())
+
+
+def _kill_tree_state(path: Path) -> dict[str, tuple[str, str] | None]:
+    """rel -> (kind+mode, sha256) for every tracked or untracked, non-ignored file."""
+    state: dict[str, tuple[str, str] | None] = {}
+    for rel in _kill_ls_files(path):
+        got = _kill_file_state(path, rel)
+        state[rel] = None if got is None else (got[0], hashlib.sha256(got[1]).hexdigest())
+    return state
+
+
+def _kill_tree_digest(state: dict[str, tuple[str, str] | None]) -> str:
+    digest = hashlib.sha256()
+    for rel in sorted(state):
+        entry = state[rel]
+        digest.update(rel.encode("utf-8", "surrogateescape") + b"\0")
+        digest.update(b"-" if entry is None else f"{entry[0]}:{entry[1]}".encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _kill_write(path: Path, rel: str, state: tuple[str, bytes] | None) -> None:
+    full = path / rel
+    if full.is_symlink() or full.exists():
+        if full.is_dir() and not full.is_symlink():
+            shutil.rmtree(full)
+        else:
+            full.unlink()
+    if state is None:
+        return
+    full.parent.mkdir(parents=True, exist_ok=True)
+    kind, data = state
+    if kind == "link":
+        os.symlink(data.decode("utf-8", "surrogateescape"), full)
+        return
+    with open(full, "wb") as fh:
+        fh.write(data)
+    if kind.startswith("file:"):
+        os.chmod(full, int(kind[5:], 8))
+
+
+def _kill_base_state(path: Path, base: str, rel: str) -> tuple[str, bytes] | None:
+    """(kind+mode, content) of *rel* at *base*; None when *base* lacks it."""
+    listed = subprocess.run(
+        ["git", "-C", str(path), "ls-tree", "-z", base, "--", rel],
+        capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape").strip("\0")
+    if not listed:
+        return None
+    meta, _name = listed.split("\t", 1)
+    mode, kind, sha = meta.split()
+    if kind != "blob":
+        return None
+    data = subprocess.run(
+        ["git", "-C", str(path), "cat-file", "blob", sha],
+        capture_output=True, check=True,
+    ).stdout
+    if mode == "120000":
+        return ("link", data)
+    return (f"file:{int(mode[-3:], 8):o}", data)
+
+
+def _kill_changed_paths(path: Path, base: str) -> list[str]:
+    tracked = subprocess.run(
+        ["git", "-C", str(path), "diff", "--no-renames", "--name-only", "-z", base],
+        capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape")
+    untracked = subprocess.run(
+        ["git", "-C", str(path), "ls-files", "-z", "--others", "--exclude-standard"],
+        capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape")
+    return sorted({p for p in (tracked + "\0" + untracked).split("\0") if p})
+
+
+def _kill_classify(returncode: int | None, output: str) -> tuple[str, str]:
+    """(outcome, reason) of the re-run against the reverted product."""
+    lines = [ln for ln in output.strip().splitlines() if ln.strip()]
+    last = lines[-1].strip()[:200] if lines else ""
+    if returncode == 0:
+        return "survived", f"targeted check still passes without the slice's product change ({last})"
+    if returncode in (126, 127) or (
+        _KILL_NOT_RUNNABLE_RE.search(output) and not _KILL_ASSERTION_RE.search(output)
+        and not _KILL_IMPORT_RE.search(output)
+    ):
+        return "error", f"targeted check not runnable (exit {returncode}: {last})"
+    if _KILL_ASSERTION_RE.search(output):
+        return "killed", last or f"exit {returncode}"
+    if _KILL_IMPORT_RE.search(output):
+        return "killed-by-import", last or f"exit {returncode}"
+    return "killed", last or f"exit {returncode}"
+
+
+def _kill_run(
+    command: str, path: Path, env: dict[str, str], budget: float,
+    result: dict[str, Any],
+) -> tuple[str, str]:
+    """Run the targeted check in its own process group; kill the whole group
+    on timeout so nothing keeps writing into the worktree during restore."""
+    try:
+        proc = subprocess.Popen(
+            ["sh", "-c", command], cwd=str(path), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            text=True, errors="replace", start_new_session=True,
+        )
+    except OSError as exc:
+        return ("error", f"cannot run the targeted check: {exc}")
+    try:
+        output, _ = proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=10)
+        return ("error", f"timeout after {budget:g}s")
+    finally:
+        # Grandchildren left behind by the check must not outlive it.
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    result["exit"] = proc.returncode
+    return _kill_classify(proc.returncode, output or "")
+
+
+_KILL_SKIP_DIRS = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".next", ".turbo",
+})
+
+
+def _kill_dirs(path: Path) -> set[str]:
+    """Every directory under *path* (heavy dependency/cache dirs pruned)."""
+    found: set[str] = set()
+    for top, dirs, _files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in _KILL_SKIP_DIRS]
+        found.update(os.path.join(top, d) for d in dirs)
+    return found
+
+
+def _kill_prune_dirs(path: Path, existed: set[str]) -> None:
+    """Remove directories the revert or the check created that are empty
+    again (deepest first); pre-existing directories are never touched."""
+    for d in sorted(_kill_dirs(path) - existed, key=len, reverse=True):
+        with contextlib.suppress(OSError):
+            os.rmdir(d)
+
+
+def _kill_restore(
+    path: Path,
+    before: dict[str, tuple[str, str] | None],
+    saved: dict[str, tuple[str, bytes] | None],
+) -> list[str]:
+    """Put every file back as *before* recorded it; return paths still off."""
+    after = _kill_tree_state(path)
+    for rel in sorted(set(before) | set(after)):
+        if before.get(rel) == after.get(rel) and rel in before:
+            continue
+        if rel in saved:
+            _kill_write(path, rel, saved[rel])
+        elif rel not in before or before[rel] is None:
+            _kill_write(path, rel, None)  # created by the check
+        else:
+            # A clean tracked file the check modified: its index copy is it.
+            blob = subprocess.run(
+                ["git", "-C", str(path), "show", f":{rel}"], capture_output=True,
+            )
+            if blob.returncode == 0:
+                kind = before[rel][0]
+                _kill_write(path, rel, (kind, blob.stdout))
+    final = _kill_tree_state(path)
+    return sorted(
+        rel for rel in set(before) | set(final) if before.get(rel) != final.get(rel)
+    )
+
+
+def run_kill_check(
+    path: Path,
+    base: str,
+    command: str | None,
+    *,
+    mailbox_rel: str | None = None,
+    budget: float = KILL_CHECK_DEFAULT_BUDGET_S,
+) -> dict[str, Any]:
+    """Base-revert kill check of one builder worktree (see the block comment)."""
+    started = time.monotonic()
+    result: dict[str, Any] = {"mode": "shadow"}
+    if not command:
+        result.update(outcome="n/a", reason="no `## Targeted check` command in the brief")
+        return result
+    result["command"] = command
+    try:
+        changed = _kill_changed_paths(path, base)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        result.update(outcome="error", reason=f"cannot diff against base: {exc}")
+        return result
+    if mailbox_rel:
+        prefix = mailbox_rel.rstrip("/") + "/"
+        changed = [p for p in changed if not (p + "/").startswith(prefix)]
+    tests = [p for p in changed if _KILL_TEST_PATH_RE.search(p)]
+    product = [p for p in changed
+               if not _KILL_TEST_PATH_RE.search(p) and not _KILL_NON_PRODUCT_RE.search(p)]
+    result["reverted"] = product
+    result["tests"] = tests
+    if not product:
+        result.update(outcome="n/a", reason="no non-test product file changed")
+        return result
+    if not tests:
+        result.update(outcome="n/a", reason="the slice changed no test file")
+        return result
+    try:
+        before = _kill_tree_state(path)
+        saved = {rel: _kill_file_state(path, rel) for rel in product}
+        base_states = {rel: _kill_base_state(path, base, rel) for rel in product}
+        existed = _kill_dirs(path)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        result.update(outcome="error", reason=f"cannot snapshot the worktree: {exc}")
+        return result
+    result["tree_sha256"] = _kill_tree_digest(before)
+    outcome: tuple[str, str]
+    try:
+        for rel, state in base_states.items():
+            _kill_write(path, rel, state)
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        outcome = _kill_run(command, path, env, budget, result)
+    finally:
+        try:
+            off = _kill_restore(path, before, saved)
+            _kill_prune_dirs(path, existed)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            off = [f"<restore failed: {exc}>"]
+    after = _kill_tree_state(path)
+    result["tree_sha256_after"] = _kill_tree_digest(after)
+    result["restored"] = not off and result["tree_sha256_after"] == result["tree_sha256"]
+    if not result["restored"]:
+        result["restore_mismatch"] = off[:20]
+    result.update(outcome=outcome[0], reason=outcome[1])
+    result["seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def _isolated_kill_check(
+    wt: Any,
+    repo: Path,
+    record: dict[str, Any],
+    brief: str,
+    mailbox: Path,
+    targeted: str | None,
+) -> dict[str, Any] | None:
+    """Run the shadow kill check for one exited builder; persist it in the
+    worktree record (read back by the driver) and return it."""
+    if not record.get("worker_ok"):
+        return None
+    if not targeted or targeted.startswith(TARGETED_CHECK_PREFIX + "FAILED"):
+        result: dict[str, Any] = {
+            "mode": "shadow", "outcome": "n/a",
+            "reason": "targeted check not passed (not run)",
+        }
+    else:
+        path = Path(record["path"])
+        mailbox_rel = None
+        try:
+            mailbox_rel = wt._mailbox_rel(repo, mailbox)
+        except Exception:  # noqa: BLE001 - best effort; the mailbox is never product
+            mailbox_rel = None
+        try:
+            result = run_kill_check(
+                path, str(record["base"]), _brief_targeted_command(brief),
+                mailbox_rel=mailbox_rel, budget=_kill_check_budget(mailbox),
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow: never break a dispatch
+            result = {"mode": "shadow", "outcome": "error",
+                      "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        fresh = wt.load_record(repo, record["id"])
+        fresh["kill_check"] = result
+        wt.save_record(repo, fresh)
+    except Exception as exc:  # noqa: BLE001
+        print(f"trioctl: could not record kill_check: {exc}", file=sys.stderr)
+    outcome = result.get("outcome")
+    print(
+        f"trioctl: kill_check (shadow): {outcome}"
+        + (f" -- {result.get('reason')}" if result.get("reason") else ""),
+        file=sys.stderr,
+    )
+    return result
+
+def _num(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def kill_check_suffix(kill_check: dict[str, Any] | None) -> str:
+    """`kill_check: <outcome>` for LOG lines (empty when not run)."""
+    if not isinstance(kill_check, dict) or not kill_check.get("outcome"):
+        return ""
+    return f"kill_check: {kill_check['outcome']}"
 
 
 def _held_session_ids(mailbox: Path | None) -> set[str]:
@@ -4779,6 +5227,10 @@ class OmnigentRunner:
         self.driver_meta: dict[str, Any] = (
             {"config_path": str(self._config_path)} if config is None else {}
         )
+        if os.environ.get(KILL_CHECK_ENV, "").strip().lower() in ("0", "false", "off", "no"):
+            # r18a: isolated builders of this loop read it back from
+            # `.driver.json` (the Lead's shell may not carry the env var).
+            self.driver_meta["kill_check"] = False
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -4909,6 +5361,9 @@ class OmnigentRunner:
             procedure += OmnigentRunner._multi_repo_note(
                 kind, context, repos, home, mailbox
             )
+        if kind == "slice-eval" and context.get("quality_note"):
+            # r18a: the builder run's base-revert outcome and authorship.
+            procedure += str(context["quality_note"])
         queue_errors = [str(e) for e in context.get("queue_errors") or []]
         if queue_errors:
             # r11g Q1: the driver holds the integration gate while the
@@ -6375,6 +6830,7 @@ class OmnigentRunner:
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
         mailbox = Path(mailbox).resolve()
+        self._quality_before_dispatch(role, iteration, mailbox, context)
         try:
             return self._run_observed(role, iteration, mailbox, context)
         except _EvalBindSkipped:
@@ -6382,6 +6838,111 @@ class OmnigentRunner:
             # dispatched (logged); the loop core sees no verdict section and
             # retries it (status error after 3 attempts).
             return 0
+
+    # --- r18a shadow quality telemetry (never gates) -----------------------
+
+    def _record_quality(self, key: str, values: dict[str, Any]) -> None:
+        """Merge *values* into ``driver_meta['quality'][key]`` (`.driver.json`)."""
+        with self._dict_lock():
+            current = self.__dict__.get("driver_meta")
+            current = dict(current) if isinstance(current, dict) else {}
+            quality = dict(current.get("quality") or {})
+            entry = dict(quality.get(key) or {})
+            entry.update(values)
+            quality[key] = entry
+            current["quality"] = quality
+            self.driver_meta = current  # rebind: the core may be serialising it
+
+    def _slice_builder_record(
+        self, mailbox: Path, context: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """(ledger readable, the builder run whose merge is this slice sha)."""
+        if worker_worktrees is None:
+            return False, None
+        slice_id = str(context.get("slice") or "")
+        sha = str(context.get("sha") or context.get("pinned_sha") or "").lower()
+        if not slice_id or not sha:
+            return False, None
+        repo: Path = self.repo
+        name = str(context.get("repo") or "").strip()
+        if name and name != "home":
+            declared = _declared_repos(mailbox) or {}
+            if name in declared:
+                repo = Path(declared[name]["path"])
+        try:
+            repo = worker_worktrees.repo_toplevel(repo)
+            records = worker_worktrees.list_records(repo)
+        except Exception:  # noqa: BLE001 - shadow telemetry never raises
+            return False, None
+        best = None
+        for _wid, rec in records:
+            if not isinstance(rec, dict) or rec.get("slice") != slice_id:
+                continue
+            merge = str(rec.get("merge_commit") or "").lower()
+            if merge and (merge == sha or merge.startswith(sha) or sha.startswith(merge)):
+                if best is None or _num(rec.get("created_at")) >= _num(best.get("created_at")):
+                    best = rec
+        return True, best
+
+    def _quality_before_dispatch(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+    ) -> None:
+        """Slice-eval: surface the builder run's kill check (or the Lead's
+        authorship) in the OPEN-LOOP CONTEXT, log it once, record it."""
+        if role != "evaluator" or not isinstance(context, dict):
+            return
+        if context.get("kind") != "slice-eval" or not self._isolate:
+            return
+        try:
+            readable, rec = self._slice_builder_record(mailbox, context)
+            if not readable:
+                return
+            slice_id = str(context.get("slice"))
+            sha = str(context.get("sha") or context.get("pinned_sha"))
+            if rec is None:
+                facts: dict[str, Any] = {
+                    "authored_by": "lead",
+                    "kill_check": {"mode": "shadow", "outcome": "n/a",
+                                   "reason": "no builder run merged this sha (Lead take-over or fix)"},
+                }
+            else:
+                facts = {"authored_by": "builder", "worker": rec.get("id"),
+                         "kill_check": rec.get("kill_check") or {
+                             "mode": "shadow", "outcome": "n/a",
+                             "reason": "not recorded (kill check off or pre-r18a trioctl)"}}
+                if rec.get("verification_flags"):
+                    facts["verification_flags"] = rec.get("verification_flags")
+            kc = facts["kill_check"]
+            lines = [
+                "SLICE QUALITY (r18a shadow; informs your grading, gates nothing):",
+                f"BASE-REVERT: {kc.get('outcome')}"
+                + (f" -- {kc.get('reason')}" if kc.get("reason") else ""),
+                f"AUTHORED-BY: {facts['authored_by']}",
+            ]
+            flags = facts.get("verification_flags") or []
+            if flags:
+                lines.append(
+                    "PRE-GATE FLAGS (advisory AST lint; the following tests look "
+                    "tautological -- grade them explicitly):"
+                )
+                lines.extend(f"- {f}" for f in flags[:20])
+            context["quality_note"] = "\n".join(lines) + "\n"
+            key = f"{slice_id}@{sha[:12]}"
+            meta = self.__dict__.get("driver_meta")
+            seen = isinstance(meta, dict) and key in (meta.get("quality") or {})
+            self._record_quality(key, {"slice": slice_id, "sha": sha, **facts})
+            if not seen:
+                _append_mailbox_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | retired slice {slice_id} @{sha[:12]} "
+                    f"by {facts['authored_by']} | {kill_check_suffix(kc)} (shadow)",
+                )
+        except Exception as exc:  # noqa: BLE001 - shadow telemetry never raises
+            print(f"trioctl: slice quality telemetry skipped: {exc}", file=sys.stderr)
 
     def _run_observed(
         self,
@@ -9530,6 +10091,9 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--summary", default=None,
                      help="with --isolate: slice commit summary")
+    run.add_argument("--no-kill-check", action="store_true",
+                     help="with --isolate: skip the r18a base-revert kill check "
+                     "(shadow; also TRIO_KILL_CHECK=0)")
     run.add_argument("--worktree-root", default=None,
                      help="with --isolate: directory for worker worktrees "
                      f"(default ${'{'}{'TRIO_WORKTREE_ROOT'}{'}'} or XDG state)")

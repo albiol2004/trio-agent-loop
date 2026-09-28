@@ -767,6 +767,42 @@ criterion unverified (NEEDS_HUMAN, never SHIP). In r18a a missing section
 is only logged by the Omnigent driver (`probe: missing`); r18b makes
 `probe: PASS` a SHIP condition.
 
+### Base-revert kill check (r18a L2a, shadow)
+
+`trioctl omnigent run builder --isolate`, after the builder exits 0 with a
+passing `TARGETED_CHECK:` line and **before** its worktree is committed
+and merged: reverts the slice's non-test product files (changed vs the
+worktree base, tracked or untracked; excluding test paths — `tests/`,
+`test/`, `__tests__/`, `spec/`, `test_*.py`, `*_test.py`, `*_test.go`,
+`conftest.py`, `*.test.*`, `*.spec.*` — the mailbox, `results/` and
+`evidence/`) to the base, re-runs the brief's `## Targeted check` command
+from the worktree root under the targeted-check budget (120 s, PLAN.md
+`full_check_budget_s:`, or `TRIO_KILL_CHECK_BUDGET_S`), and restores the
+tree byte-identically — proven by a sha256 over every tracked and
+untracked non-ignored file (`tree_sha256` == `tree_sha256_after`,
+`restored: true`). Outcomes:
+
+| outcome | meaning |
+|---|---|
+| `killed` | the re-run failed with at least one assertion failure: the tests depend on the slice's code |
+| `killed-by-import` | only import/collection/type-resolution errors: the tests touch new code, weak evidence |
+| `survived` | still green without the product change: the tests do not exercise it |
+| `n/a` | no product file changed, the slice changed no test file, no targeted check in the brief, or the check did not pass |
+| `error` | timeout or the check could not run |
+
+Recorded as `kill_check:` in the builder's JSON line and its worktree
+ledger record; the Omnigent driver logs `- iter N | loop | retired slice
+<id> @<sha12> by builder|lead | kill_check: <outcome> (shadow)` when it
+first dispatches the slice-eval, shows `BASE-REVERT:` / `AUTHORED-BY:`
+lines in that slice-eval's OPEN-LOOP CONTEXT, and records it under
+`quality` in `.driver.json` (trio-shadow prints it). **Shadow in r18a**: it
+never changes the retire decision (r18b: `survived` blocks the retire).
+The one exception is a safety net, not a gate: if the restore cannot be
+proven byte-identical the worktree is retained as
+`kill_check_restore_failed` instead of integrating an altered tree.
+Disable with `--no-kill-check`, `TRIO_KILL_CHECK=0` (the loop driver then
+writes `kill_check: false` to `.driver.json`, which its builders honour).
+
 ### Lead loop (open-loop mode)
 
 1. Take `open` faults first: mark the fault `taken`, fix strictly within
@@ -1177,7 +1213,9 @@ under `quality` in `--json`.
   the `accepts:` grammar with oracles, `goal_acceptance:`/`goal_probe:`,
   enforced `mode:`, evidence kinds and the per-accept table in slice
   sections, `## Independent probe` in whole-goal verdicts; advisory
-  `trio-check.py` quality lints.
+  `trio-check.py` quality lints; the base-revert kill check in shadow
+  (builder JSON, ledger record, driver LOG line, `.driver.json`
+  `quality`, trio-shadow).
 
 - **r16-rc** (merge of r15-fixes, r15.x and r16a): one live-loop
   registry record for every mode ("Live-loop registry"; replaces r15.x's
