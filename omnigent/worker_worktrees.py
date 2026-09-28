@@ -1827,8 +1827,21 @@ def _accepting_revision(
 # counts as held (fail closed).
 
 
+#: Aggregate branches of a root-free (r16) loop: ``trio/<mailbox-slug>``.
+#: Their integration fences live in a per-branch subdirectory, so one loop's
+#: integration-eval never retains another loop's builder merges (C9). Any
+#: other aggregate (the root checkout of a lockstep or root-bound loop)
+#: keeps the flat, repo-wide ``fences/`` directory exactly as before.
+LOOP_BRANCH_PREFIX = "trio/"
+
+
 def _fence_dir(repo: Path) -> Path:
-    return ledger_dir(repo) / "fences"
+    base = ledger_dir(repo) / "fences"
+    branch = git(repo, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+    prefix = "refs/heads/" + LOOP_BRANCH_PREFIX
+    if branch.startswith(prefix):
+        return base / _SAFE.sub("-", branch[len("refs/heads/"):]).strip("-")
+    return base
 
 
 def acquire_fence(repo: Path, *, reason: str, mailbox: Path | None = None) -> str:
@@ -2032,7 +2045,9 @@ def cleanup_one(
     """Advance one record toward removal; idempotent and restart-safe."""
     record = load_record(repo, worker_id)
     state = record.get("state")
-    if state == "removed":
+    if state == "removed" or record.get("kind") == "lead":
+        # A root-free loop's Lead worktree (r16) is removed only by its
+        # own land/abandon path (omnigent/root_free.py), never here.
         return record
     if state == "removing" or record.get("worktree_removed"):
         # Resume an interrupted removal: finish the branch step once the

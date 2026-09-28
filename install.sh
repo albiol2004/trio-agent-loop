@@ -219,6 +219,8 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     cp "$ROOT/omnigent/broker_http.py" "$TRIOCTL_BIN_DIR/broker_http.py"
     cp "$ROOT/omnigent/reconcile.py" "$TRIOCTL_BIN_DIR/reconcile.py"
     cp "$ROOT/omnigent/worker_worktrees.py" "$TRIOCTL_BIN_DIR/worker_worktrees.py"
+    # r16 root-free open-loop (Lead worktree lifecycle, registry, land).
+    cp "$ROOT/omnigent/root_free.py" "$TRIOCTL_BIN_DIR/root_free.py"
     cp "$ROOT/omnigent/worker_events.py" "$TRIOCTL_BIN_DIR/worker_events.py"
     # The r15 repo-scope guard: trioctl loads its own release's checker
     # (sibling first), never a repository's vendored metrics/.
