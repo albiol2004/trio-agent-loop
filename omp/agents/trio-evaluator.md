@@ -61,6 +61,7 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   UI/screen-frame or data-reconciliation work is proportionate and
   only where the criterion is about those surfaces.
 - Run the acceptance checks yourself, from scratch. Then go beyond them: edge cases, error paths, anything the criteria imply but weren't tested.
+- **Suites outside the targeted check:** when the slice changes a shared module (a function, type, component or query used outside the slice's own files), also run the existing suites that exercise it — the brief's targeted check covers only the slice's own tests, and a stale suite elsewhere (snapshots, `toEqual` fixtures, callers' tests) failing on the change is a FAIL of this slice.
 - **Screen-frame verification (mandatory):** any acceptance criterion
   about user-visible behavior (controls, direction, visibility, layout) is
   verified in projected screen coordinates / screenshots, never via
@@ -97,9 +98,17 @@ evidence behind the grade:
   notes, a JSON pass flag, a REPORT.md or LOG.md claim). A receipt alone
   is never PASS: grade that accept `unverified` until you re-run or
   probe it.
+- `UNAVAILABLE(<reason>)` — the accept needs an environment you cannot
+  reach (warehouse, live service, credentials, device); `<reason>` names
+  it. Grade it `unverified` and count it under `unverified=`. In a slice
+  section this environment gap alone is not an ITERATE (the builder
+  cannot close it): SHIP on the other accepts and list each such accept
+  on an `unavailable:` line. The integration evaluation must attempt every
+  `UNAVAILABLE` accept itself; any it still cannot reach makes the verdict
+  NEEDS_HUMAN, listed under `## Human check` — never ITERATE.
 Reject these tests by name — they prove nothing, the accept they back
 stays `unverified`, and the slice is ITERATE with the evidence gap as its
-scope:
+scope (an environment gap is `UNAVAILABLE`, above, not this):
 - string-presence checks on files the slice or the Lead wrote (grepping
   SQL, DDL, source or receipt text instead of executing it);
 - `in` checks of a one- or two-character literal (`assert "4" in t`) and

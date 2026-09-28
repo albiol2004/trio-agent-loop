@@ -92,7 +92,7 @@ def test_integration_procedure_spells_out_its_method(tmp_path: Path) -> None:
     block = _flat(_eval_prompt(tmp_path, dict(INTEGRATION)).split("\n\n", 1)[0])
     for needle in (
         "check GOAL.md completeness against PLAN.md",
-        "run the full check and every acceptance check yourself at the pin",
+        "run the repo's full check yourself at the pin",
         "REPORT.md and receipts are claims, never evidence",
         "PASS, FAIL or unverified",
         "list what you actively tried to break",
@@ -106,11 +106,14 @@ def test_rigor_block_is_generated_from_canonical_not_copied() -> None:
     gen = _load("trio_generate_r18a_l0", ROOT / "prompts" / "generate.py")
     content = gen.rigor_content()
     canonical = (ROOT / "prompts" / "canonical" / "evaluator.md").read_text(encoding="utf-8")
-    # Every non-heading line of the block (after its intro) is canonical text.
+    # Every non-heading line of the block (after its intro) is canonical text
+    # (modulo the one declared rewrite: the test-integrity bullet's plain git diff).
     body = content.split("\n\n", 1)[1]
     for line in body.splitlines():
         if not line.strip() or line.startswith("### "):
             continue
+        for old, new in gen._RIGOR_REWRITES.values():
+            line = line.replace(new, old)
         assert line in canonical, line
     outputs = gen.all_outputs()
     for path in (CONFIG, ENTRY):
@@ -136,3 +139,29 @@ def test_protocol_essentials_carry_rigor_bullet_everywhere() -> None:
         if path.is_file():
             flat = _flat(path.read_text(encoding="utf-8"))
             assert "Verification rigor — run every check yourself" in flat, relpath
+
+
+# ----------------------------------------------- eval-r18a prompt gaps
+
+def test_rigor_block_carries_test_integrity_severity_without_a_backticked_git_diff():
+    gen = _load("gen_r18a_fix", ROOT / "prompts" / "generate.py")
+    block = gen.rigor_content()
+    bullet = next(ln for ln in block.splitlines() if ln.startswith("- **Test-integrity audit"))
+    assert "automatic ITERATE" in bullet
+    assert "git diff -- <test paths>" in bullet and "`git diff`" not in bullet
+    assert "**Suites outside the targeted check:**" in block
+    assert "`UNAVAILABLE(<reason>)`" in block and "NEEDS_HUMAN" in block
+    for rel in ("omnigent/trio-omnigent-roles/evaluator/config.yaml",
+                "omnigent/entrypoints/trio-omnigent/prompts/evaluator.md"):
+        text = (ROOT / rel).read_text()
+        assert "automatic ITERATE" in text and "Suites outside the targeted check" in text, rel
+
+
+def test_open_loop_procedures_carry_unavailable_and_outside_suites():
+    t = _load("trioctl_r18a_fix_proc", ROOT / "omnigent" / "trioctl")
+    slice_eval = t._OPEN_LOOP_SLICE_EVAL_PROCEDURE
+    assert "`UNAVAILABLE(<reason>)`" in slice_eval and "not an ITERATE" in slice_eval
+    assert "existing suites" in slice_eval
+    integ = t._OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE
+    assert "repo's full check" in integ and "whole test" in integ
+    assert "UNAVAILABLE(<reason>)" in integ and "NEEDS_HUMAN" in integ

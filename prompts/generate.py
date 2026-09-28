@@ -99,6 +99,8 @@ RIGOR_SITES = [
 RIGOR_PIECES = [
     ("section", "Data-work profile", None),
     ("bullet", "Method", "Run the acceptance checks yourself"),
+    ("bullet", "Method", "**Suites outside the targeted check:**"),
+    ("bullet", "Method", "**Test-integrity audit (mandatory):**"),
     ("bullet", "Method", "No SHIP — whole-goal verdict or open-loop slice section"),
     ("bullet", "Method", "Prefer executing code over reading it"),
     ("bullet", "Anti-rubber-stamp rules", "If you did not run a criterion's check yourself"),
@@ -339,6 +341,27 @@ def _canonical_bullet(section: str, heading: str, prefix: str) -> str:
     return "\n".join(found[0])
 
 
+# The Omnigent evaluator's SHIP-retirement check runs every backticked
+# `git ...` command of its effective prompt; the test-integrity bullet's
+# `git diff` is a read, not a retirement step, so it is written plain there.
+_RIGOR_REWRITES = {
+    "**Test-integrity audit (mandatory):**": (
+        "`git diff` on test files.",
+        "diff the test files against the base (git diff -- <test paths>).",
+    ),
+}
+
+
+def _rigor_bullet_text(bullet: str, prefix: str) -> str:
+    rewrite = _RIGOR_REWRITES.get(prefix)
+    if rewrite is None:
+        return bullet
+    old, new = rewrite
+    if old not in bullet:
+        raise ValueError(f"evaluator rigor: {prefix!r} bullet no longer contains {old!r}")
+    return bullet.replace(old, new)
+
+
 def rigor_content() -> str:
     """The Omnigent evaluator's `## Verification rigor` block (r18a L0)."""
     canonical = (CANONICAL_DIR / "evaluator.md").read_text(encoding="utf-8")
@@ -355,7 +378,8 @@ def rigor_content() -> str:
             if key not in bullets_by_heading:
                 order.append(("bullets", heading))
                 bullets_by_heading[key] = []
-            bullets_by_heading[key].append(_canonical_bullet(section, heading, prefix))
+            bullets_by_heading[key].append(
+                _rigor_bullet_text(_canonical_bullet(section, heading, prefix), prefix))
     for kind, heading in order:
         if kind == "section":
             body = bullets_by_heading[f"section:{heading}"][0]

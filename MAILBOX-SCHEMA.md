@@ -745,7 +745,15 @@ Each per-slice section grades every `accepts:` item PASS, FAIL or
 (its own check against the public surface), `implementer-test` (a
 builder/Lead test it ran — PASS only when not tautological and, for a
 `value`/`property` accept, shown to fail without the change) or `receipt`
-(a file someone else wrote — never PASS on its own). The section carries
+(a file someone else wrote — never PASS on its own). An accept that needs
+an environment the Evaluator cannot reach is graded `unverified` with
+`UNAVAILABLE(<reason>)` in its evidence column and listed on an
+`unavailable:` line: at slice level that gap alone is not an ITERATE (SHIP
+on the other accepts); the integration evaluation attempts every such
+accept itself or returns NEEDS_HUMAN listing them under `## Human check`
+(eval-r18a). When a slice changes a shared module the slice-eval also runs
+the existing suites that exercise it, and the integration evaluation runs
+the repo's full check. The section carries
 
 ```markdown
 | # | accept | PASS / FAIL / unverified | evidence | command | key output |
