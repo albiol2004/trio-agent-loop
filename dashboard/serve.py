@@ -1211,7 +1211,24 @@ def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
     Reads ``git log`` of the coordination repo (the mailbox's parent root)
     and keeps subjects matching the conventional ``slice(<id>): `` prefix
     (MAILBOX-SCHEMA.md). Not a git repo / git missing / any failure -> [].
+    r15: a mailbox whose PLAN.md declares `repos:` also gets each declared
+    repo's slice commits, tagged ``"repo": <name>`` (home commits carry no
+    ``repo`` key, so single-repo payloads are unchanged).
     """
+    commits = _repo_slice_commits(root)
+    try:
+        info = load_metrics_module().read_repos(loop_dir)
+    except Exception:  # noqa: BLE001 - the dashboard never fails on a mailbox
+        info = {"repos": []}
+    for repo in info.get("repos") or []:
+        for commit in _repo_slice_commits(Path(repo["path"])):
+            commit["repo"] = repo["name"]
+            commits.append(commit)
+    return commits
+
+
+def _repo_slice_commits(root: Path) -> list[dict]:
+    """`_loop_commits` for one repository."""
     try:
         out = subprocess.run(
             ["git", "-C", str(root), "log", "--format=%H%x09%h%x09%s", "-n", "200"],

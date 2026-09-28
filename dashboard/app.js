@@ -860,6 +860,14 @@ function renderSlices(detail) {
     const row = document.createElement("div");
     row.className = "slice-row";
     row.appendChild(span("slice-id mono", String(s.id ?? "")));
+    // r15: the declared repo a slice belongs to (absent/"."/"home" = the
+    // mailbox repo, shown as nothing, as before).
+    const repo = typeof s.repo === "string" ? s.repo.trim() : "";
+    if (repo && repo !== "." && repo !== "home") {
+      const chip = span("meta-chip slice-repo mono", repo);
+      chip.title = "repo: " + repo;
+      row.appendChild(chip);
+    }
     row.appendChild(lifecycleChipFor(s.lifecycle));
     if (s.retired_sha) {
       const sha = span("slice-sha mono", String(s.retired_sha).slice(0, 7));

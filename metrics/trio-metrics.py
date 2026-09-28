@@ -1776,7 +1776,7 @@ def analyze_loop(loop_dir: Path, root: Path | None = None) -> dict:
 
     parsed = any(not s["unparsed"] for s in segment_summaries)
 
-    return {
+    result = {
         "name": name,
         "final_verdict": final_verdict,
         "state_status": state.get("status"),
@@ -1786,6 +1786,28 @@ def analyze_loop(loop_dir: Path, root: Path | None = None) -> dict:
         "parsed": parsed,
         "path": str(loop_dir),
     }
+    repos = loop_repos(loop_dir)
+    if repos is not None:
+        result["repos"] = repos  # r15: only for a mailbox that declares repos:
+    return result
+
+
+def loop_repos(loop_dir: Path) -> dict | None:
+    """r15: ``{repo name: [slice ids]}`` (home first) for a mailbox whose
+    PLAN.md declares `repos:`, else None. A slice whose `repo:` names no
+    declared repo is listed under ``"?"``. Never raises."""
+    try:
+        info = read_repos(loop_dir)
+        if not info["repos"]:
+            return None
+        text = (Path(loop_dir) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - metrics never fail on a mailbox
+        return None
+    names = [r["name"] for r in info["repos"]]
+    out: dict = {HOME_REPO: [], **{n: [] for n in names}}
+    for sl in parse_slices_block(text) or []:
+        out.setdefault(slice_repo_name(sl, names) or "?", []).append(sl["id"])
+    return out
 
 
 MAILBOX_MARKERS = ("LOG.md", "GOAL.md", "STATE.md", "VERDICT.md", "PLAN.md")
@@ -1907,6 +1929,10 @@ def render(loops: list[dict], agg: dict) -> str:
         lines.append(
             f"  state: {fmt_value(loop['state_status'])} "
             f"(iteration {fmt_value(loop['state_iteration'])}/{fmt_value(loop['state_max_iterations'])})")
+        if loop.get("repos"):
+            lines.append("  repos: " + "; ".join(
+                f"{name} ({', '.join(ids) or '-'})" for name, ids in loop["repos"].items()
+            ))
         lines.append(f"  segments: {len(loop['segments'])}")
         for i, seg in enumerate(loop["segments"], 1):
             prefix = f"    segment {i}: " if len(loop["segments"]) > 1 else "    "
