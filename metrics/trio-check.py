@@ -1284,6 +1284,9 @@ TEST_FILE_RE = re.compile(
     r"(?:^|/)test_[^/]*\.py$|(?:^|/)[^/]*_test\.py$|\.(?:test|spec)\.[cm]?[jt]sx?$"
 )
 _RECEIPT_DIR_RE = re.compile(r"(?:^|/)(?:results|evidence)(?:/|$)")
+_PANDAS_RECEIPT_READER_RE = re.compile(
+    r"^read_(?:csv|json|excel|parquet|table|pickle|feather|orc|html|xml|sql)$"
+)
 
 
 def _py_open_handles(tree) -> set[str]:
@@ -1528,6 +1531,38 @@ def python_test_findings(
             verify_only = True
         if isinstance(node, ast.Assign) and any(receipt_const(x) for x in ast.walk(node.value)):
             receipt_names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+
+    # r17-rc L-1 fix (regression vs 84d55e5): `open(<receipt path>)` counts
+    # as a receipt read even when nothing calls `.read()`/`.read_text()` on
+    # the handle -- `json.load(open(p))`, `with open(p) as fh: json.load(fh)`
+    # and a pandas `read_csv`/`read_json`/... reader over a receipts path.
+    # `_is_file_read` intentionally stays narrow (HTTP response bodies must
+    # not count as file text), so this is a separate, receipts-only check.
+    def _open_is_write(call) -> bool:
+        """`open(p, "w"/"a"/"x"/...)`: writing a receipt is not reading it."""
+        mode = None
+        if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+            mode = call.args[1].value
+        else:
+            for kw in call.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = kw.value.value
+        return isinstance(mode, str) and any(c in mode for c in "wax") and "r" not in mode
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_receipt_reader = (_is_open_call(node) and not _open_is_write(node)) or (
+            isinstance(func, ast.Attribute) and bool(_PANDAS_RECEIPT_READER_RE.match(func.attr)))
+        if not is_receipt_reader:
+            continue
+        for sub in ast.walk(node):
+            if receipt_const(sub) or (isinstance(sub, ast.Name) and (
+                    sub.id in receipt_names or any(
+                        receipt_const(ast.Constant(value=c)) for c in name_consts.get(sub.id, ())))):
+                receipts = True
+                break
     for scope, nodes in scopes:
         files, static, other = bound(nodes)
         if scope is not scopes[0][0]:
