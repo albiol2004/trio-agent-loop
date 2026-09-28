@@ -206,6 +206,9 @@ time.sleep(60)
     def test_start_omnigent_builds_the_native_loop_command(self):
         process = Mock()
         process.pid = 987654321
+        # Alive through the startup grace, then exits for the reaper.
+        process.wait.side_effect = [
+            serve.subprocess.TimeoutExpired("trioctl", 1), 0]
         try:
             with patch.object(
                 serve.subprocess, "Popen", return_value=process
@@ -220,17 +223,26 @@ time.sleep(60)
                 )
             self.assertEqual(status, 202, payload)
             command = popen.call_args.args[0]
+            # The driver runs from the dashboard checkout, not the workspace.
             self.assertEqual(command, [
-                "python3", "omnigent/trioctl", "omnigent", "loop",
+                "python3", str(serve.REPO_ROOT / "omnigent" / "trioctl"),
+                "omnigent", "loop",
                 "--mailbox", str(self.mailbox),
                 "--max-iterations", "3",
             ])
             self.assertEqual(popen.call_args.kwargs["cwd"], self.tmp_workspace)
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertIs(
-                popen.call_args.kwargs["stdout"], serve.subprocess.DEVNULL)
+                popen.call_args.kwargs["stdin"], serve.subprocess.DEVNULL)
             self.assertIs(
-                popen.call_args.kwargs["stderr"], serve.subprocess.DEVNULL)
+                popen.call_args.kwargs["stderr"], serve.subprocess.STDOUT)
+            log = Path(payload["log"])
+            self.assertTrue(log.is_relative_to(
+                Path(self.home.name) / ".local" / "state" / "trio-dash"))
+            state = json.loads(
+                (self.mailbox / ".driver.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["pid"], process.pid)
+            self.assertEqual(state["phase"], "starting")
         finally:
             with serve._LOOP_PROCESSES_LOCK:
                 serve._LOOP_PROCESSES.pop(process.pid, None)

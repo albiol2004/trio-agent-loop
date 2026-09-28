@@ -20,6 +20,8 @@ const state = {
   workspace: "",
   query: "",
   sort: { key: "activity", dir: "desc" },
+  actionNotes: new Map(),
+  broker: "disabled",
 
   /* drawer */
   activeLoop: null,
@@ -188,6 +190,9 @@ function loopKey(root, name) {
 }
 
 function isNeedsItem(item, loop) {
+  // A low-severity "interrupted" means liveness was not fully checked
+  // (broker unknown), so it is a note, not a call to act.
+  if (item.severity === "low" && item.kind === "interrupted") return false;
   if (NEEDS_KINDS.has(item.kind) || item.severity === "high") return true;
   return Boolean(loop && loop.running);
 }
@@ -261,7 +266,10 @@ function iterationText(loop) {
     : String(loop.iteration);
 }
 
+/* The driver phase is only current while the loop is live; a stale
+ * sidecar's phase ("lead done", "blocked") would contradict the badge. */
 function phaseText(loop) {
+  if (!loop.running) return "";
   const phase = String(loop.driver_phase || "").trim();
   const sub = loop.running_substate;
   const parts = [];
@@ -314,6 +322,7 @@ function ingestOverview(data) {
   }
   state.workspaces = workspaces;
   state.scanned = data.scanned || workspaces.length;
+  state.broker = data.broker || "disabled";
   state.loops = loops;
   state.inbox = inbox;
   state.byKey = new Map(loops.map((loop) => [loop.key, loop]));
@@ -347,7 +356,19 @@ async function refreshBoard() {
     );
     renderLive();
   }
-  state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
+  schedulePoll();
+}
+
+/* Poll every 5 s while visible; hidden tabs stop polling (the server only
+ * rebuilds when someone asks). A build older than the server's rebuild
+ * interval means a fresh one is on its way, so look again sooner, once. */
+function schedulePoll() {
+  clearTimeout(state.boardTimer);
+  if (document.hidden) return;
+  const age = ageMs(state.updatedAt);
+  const soon = state.loaded && age != null && age > 12000 && !state.quickRepoll;
+  state.quickRepoll = soon;
+  state.boardTimer = setTimeout(refreshBoard, soon ? 1500 : BOARD_POLL_MS);
 }
 
 function resolveHashLoop(hash) {
@@ -446,18 +467,27 @@ function renderSummary(groups) {
     verdict = "No loop mailboxes found yet.";
   } else if (needsLoops.length) {
     verdict = plural(needsLoops.length, "loop") + (needsLoops.length === 1 ? " needs" : " need") + " you" +
-      (running.length ? "; " + plural(running.length, "loop") + " running." : "; nothing is running.");
+      (running.length ? "; " + plural(running.length, "loop") + " running." : "; none running.");
   } else if (running.length) {
     verdict = "All clear: " + plural(running.length, "loop") + " running, nothing needs you.";
   } else {
-    verdict = "All clear. Nothing is running and nothing needs you.";
+    verdict = "All clear. No loop is running and nothing needs you.";
   }
   el("verdict").textContent = verdict;
   const latest = loops.slice().sort((a, b) =>
     String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
-  el("verdict-sub").textContent = latest
-    ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + "."
-    : "Start a loop with /trio-init in a project; it appears here on the next poll.";
+  const coverage = "Covers " + plural(wsCount, "workspace") + " with loops (" + state.scanned + " scanned).";
+  el("verdict-sub").textContent = (latest
+    ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + ". "
+    : "Start a loop with /trio-init in a project; it appears here on the next poll. ") + coverage;
+  const brokerNote = el("broker-note");
+  const brokerText = {
+    disabled: "Broker liveness is not configured, so loops driven only through Omnigent broker sessions cannot show as running.",
+    unreachable: "The Omnigent broker did not answer; loops driven only through broker sessions may be running but show as not running.",
+    truncated: "The Omnigent broker session list was too long to read in full; some broker-only loops may not show as running.",
+  }[state.broker];
+  brokerNote.hidden = !brokerText;
+  brokerNote.textContent = brokerText || "";
 
   const partial = state.workspaces.filter((w) => w.error);
   el("board-partial").hidden = partial.length === 0;
@@ -601,7 +631,7 @@ function renderNotes(groups) {
   details.hidden = groups.notes.length === 0;
   const count = groups.notes.reduce((n, g) => n + g.items.length, 0);
   el("notes-count").textContent = String(count);
-  el("notes-sub").textContent = "Drift, overlap and repair notes on " + plural(groups.notes.length, "loop") + " that are not running";
+  el("notes-sub").textContent = "Drift, overlap, repair and unconfirmed-stop notes on " + plural(groups.notes.length, "loop") + " that are not running";
   const list = el("notes-list");
   list.textContent = "";
   for (const group of groups.notes) list.appendChild(attentionRow(group));
@@ -929,13 +959,33 @@ function renderDrawerInbox() {
   }
 }
 
+/* Action feedback survives polls: a local note (in flight, or refused
+ * before the server recorded anything) wins until the server's own record
+ * for the mailbox is newer. */
+function actionNote(loop) {
+  const local = state.actionNotes.get(loop.key);
+  const server = loop.last_action;
+  if (local && (!server || !server.updated_at ||
+      Date.parse(server.updated_at) < local.at || local.pending)) {
+    return local;
+  }
+  if (!server) return null;
+  const tone = { failed: "error", exited: "error", running: "ok", finished: "ok", stopped: "ok", stopping: "pending" }[server.outcome] || "ok";
+  const when = server.updated_at ? " · " + relTime(server.updated_at) : "";
+  return { text: (server.message || server.outcome) + when, tone };
+}
+
 async function controlLoop(action) {
   const loop = state.byKey.get(state.activeLoop);
   if (!loop) return;
-  const driver = loop.driver === "omnigent" ? "omnigent" : "portable";
-  if (action === "stop" && !window.confirm("Stop " + loopTitle(loop) + "? The running " + driver + " driver receives SIGTERM.")) return;
-  const note = el("loop-control-note");
-  note.textContent = action === "start" ? "Starting…" : "Stopping…";
+  const controls = loop.controls || {};
+  const driver = controls.driver || "portable";
+  if (!(controls[action] && controls[action].enabled)) return;
+  if (action === "stop" && !window.confirm("Stop " + loopTitle(loop) + "? " + controls.stop.reason)) return;
+  const key = loop.key;
+  state.actionNotes.set(key, { text: action === "start" ? "Starting the " + driver + " driver…" : "Stopping…", tone: "pending", pending: true, at: Date.now() });
+  renderDrawerControls(loop);
+  let note;
   try {
     const res = await fetch("/api/loop/" + action, {
       method: "POST",
@@ -944,15 +994,16 @@ async function controlLoop(action) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
-    note.textContent = action === "start" ? "Start requested (pid " + (data.pid ?? "?") + ")." : "Stop requested.";
-    await refreshBoard();
+    note = { text: action === "start" ? "Started (PID " + data.pid + ")." : "Stop requested for PID " + data.pid + ".", tone: "ok", at: Date.now() };
   } catch (err) {
-    note.textContent = "Loop " + action + " failed: " + err.message;
+    note = { text: "Loop " + action + " failed: " + err.message, tone: "error", at: Date.now() };
   }
+  state.actionNotes.set(key, note);
+  renderDrawerControls(state.byKey.get(key) || loop);
+  await refreshBoard();
 }
 
-/* Start/Stop act on the workspace's `loop/` mailbox only (the API has no
- * mailbox parameter), so they are offered for that mailbox alone. */
+/* Capabilities come from the server (`controls`), which also enforces them. */
 function renderDrawerControls(loop) {
   const wrap = el("drawer-controls");
   if (!loop) {
@@ -960,17 +1011,29 @@ function renderDrawerControls(loop) {
     return;
   }
   wrap.hidden = false;
-  const controllable = loop.name === "loop";
+  const controls = loop.controls || {
+    start: { enabled: false, reason: "Controls unavailable." },
+    stop: { enabled: false, reason: "Controls unavailable." },
+  };
+  const pending = Boolean(state.actionNotes.get(loop.key)?.pending);
   const start = el("loop-start");
   const stop = el("loop-stop");
-  start.disabled = !controllable || Boolean(loop.running);
-  stop.disabled = !controllable || !loop.running;
-  const why = !controllable
-    ? "Start and stop work on a workspace's loop/ mailbox only; run this one from its session."
-    : loop.running ? "Loop is live; stop sends SIGTERM to its driver." : "Starts the " + (loop.driver === "omnigent" ? "omnigent" : "portable") + " driver for this mailbox.";
-  start.title = why;
-  stop.title = why;
-  if (!el("loop-control-note").dataset.busy) el("loop-control-note").textContent = controllable ? "" : why;
+  start.disabled = pending || !controls.start.enabled;
+  stop.disabled = pending || !controls.stop.enabled;
+  start.title = controls.start.reason;
+  stop.title = controls.stop.reason || controls.start.reason;
+  const note = el("loop-control-note");
+  const status = actionNote(loop);
+  if (status) {
+    note.textContent = status.text;
+    note.className = "control-note control-" + status.tone;
+    note.setAttribute("role", status.tone === "error" ? "alert" : "status");
+  } else {
+    note.textContent = controls.start.enabled ? "" : controls.start.reason;
+    if (!controls.start.enabled && controls.stop.enabled) note.textContent = controls.stop.reason;
+    note.className = "control-note caption";
+    note.setAttribute("role", "status");
+  }
 }
 
 function markActiveCard() {
@@ -2690,6 +2753,10 @@ function init() {
     const loop = state.loaded ? resolveHashLoop(target) : null;
     if (loop) openDrawer(loop.key);
     else pendingLoopHash = target;
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearTimeout(state.boardTimer);
+    else refreshBoard();
   });
   el("board-retry").addEventListener("click", refreshBoard);
   el("loop-start").addEventListener("click", () => controlLoop("start"));

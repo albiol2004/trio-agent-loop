@@ -40,6 +40,7 @@
         <button id="board-retry" class="btn btn-secondary" type="button">Retry now</button>
       </div>
       <div id="board-partial" class="banner banner-warning" hidden></div>
+      <div id="broker-note" class="banner banner-warning" role="note" hidden></div>
       <div id="kpis" class="kpis" aria-label="Loop totals">
         <div class="kpi skeleton"></div><div class="kpi skeleton"></div>
         <div class="kpi skeleton"></div><div class="kpi skeleton"></div>
@@ -129,7 +130,7 @@
         <div id="drawer-controls" class="drawer-controls" hidden>
           <button id="loop-start" class="btn btn-secondary" type="button">Start loop</button>
           <button id="loop-stop" class="btn btn-destructive" type="button">Stop loop</button>
-          <span id="loop-control-note" class="caption"></span>
+          <span id="loop-control-note" class="control-note caption" role="status"></span>
         </div>
 
         <section id="drawer-inbox-section" class="drawer-section"

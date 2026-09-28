@@ -119,18 +119,25 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(loops["loop"]["title"], "Ship the widget")
         self.assertEqual(loops["loop-review"]["title"], "")
 
-    def test_state_running_with_nothing_live_is_flagged_interrupted(self):
+    def test_state_running_with_nothing_live_is_a_note_without_broker(self):
+        # No broker URL: a broker-only run cannot be ruled out, so the
+        # contradiction is a low-severity note, not a call to act.
         workspaces = {ws["root"]: ws for ws in self.overview()["workspaces"]}
         inbox = workspaces[str(Path(self.a.name).resolve())]["inbox"]
         kinds = {item["kind"]: item for item in inbox}
         self.assertIn("interrupted", kinds)
         item = kinds["interrupted"]
-        self.assertEqual(item["severity"], "medium")
+        self.assertEqual(item["severity"], "low")
         self.assertIn("running", item["headline"])
-        self.assertIn("broker not checked", item["detail"])
+        self.assertIn("not configured", item["detail"])
         other = workspaces[str(Path(self.b.name).resolve())]["inbox"]
         self.assertNotIn("interrupted", {item["kind"] for item in other})
         self.assertIn("needs_human", {item["kind"] for item in other})
+
+    def test_titles_strip_dash_prefixes(self):
+        goal = Path(self.a.name) / "loop" / "GOAL.md"
+        goal.write_text("# GOAL — cp-cy1 readiness\n", encoding="utf-8")
+        self.assertEqual(serve._goal_title(goal), "Cp-cy1 readiness")
 
     def test_live_driver_suppresses_interrupted(self):
         mailbox = Path(self.a.name) / "loop"
@@ -201,14 +208,15 @@ class ScanRootsTests(unittest.TestCase):
 class ProcSnapshotTests(unittest.TestCase):
     def test_snapshot_scans_the_process_table_once(self):
         calls = []
-        real = serve._live_cmdlines
+        real = serve._live_processes
 
         def counting():
             calls.append(1)
             return real()
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(serve, "_live_cmdlines", counting):
+            with patch.object(serve, "_live_processes", counting), \
+                    patch.object(serve, "BROKER_BASE_URL", ""):
                 with serve._proc_snapshot():
                     for _ in range(5):
                         serve._proc_matches_mailbox(Path(tmp))

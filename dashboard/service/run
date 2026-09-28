@@ -17,6 +17,20 @@ read -r -a WORKSPACE_ARGS <<< "${TRIO_DASH_WORKSPACE_ARGS:-}"
 
 log() { printf '%s trio-dash: %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
+# Accept the tailnet URL this wrapper publishes (Host and Origin checks in
+# serve.py refuse every other name besides localhost and IP literals).
+identity=/etc/agent-platform/identity
+ws_host="${WORKSPACE_HOSTNAME:-$(sed -n 's/^WORKSPACE_HOSTNAME=//p' "$identity" 2>/dev/null | head -1)}"
+ts_domain="${TAILNET_DOMAIN:-$(sed -n 's/^TAILNET_DOMAIN=//p' "$identity" 2>/dev/null | head -1)}"
+if [ -n "$ws_host" ]; then
+  case "$ws_host" in
+    *.*) fqdn="$ws_host" ;;
+    *) fqdn="$ws_host${ts_domain:+.$ts_domain}" ;;
+  esac
+  export TRIO_DASH_ALLOWED_HOSTS="${TRIO_DASH_ALLOWED_HOSTS:+$TRIO_DASH_ALLOWED_HOSTS,}$fqdn"
+  export TRIO_DASH_ALLOWED_ORIGINS="${TRIO_DASH_ALLOWED_ORIGINS:+$TRIO_DASH_ALLOWED_ORIGINS,}https://$fqdn:$PORT"
+fi
+
 child=""
 # TERM, resume (a stopped process cannot act on TERM), then KILL after 5 s.
 end_child() {
