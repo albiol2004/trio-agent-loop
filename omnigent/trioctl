@@ -1663,12 +1663,23 @@ _KILL_NOT_RUNNABLE_RE = re.compile(
     r"|^usage: |no tests ran|no tests collected|No tests? (?:files )?found",
     re.MULTILINE | re.IGNORECASE,
 )
-# `cd` / `pushd` to an absolute (or ~) path: the re-run would leave the
-# worktree (eval-r18a N2), so the outcome is `n/a (absolute cd)`.
-_KILL_ABS_CD_RE = re.compile(
-    r"""(?:^|[;&|(]|\bthen|\bdo|\belse)\s*(?:cd|pushd)\s+(?:--\s+)?["']?((?:/|~)[^\s"';&|)]*)""",
+# r17-rc L-4: a relative `cd ../x` that resolves outside the worktree, or
+# `pushd`, also leave it -- catch any cd/pushd target, not just abs/~, so
+# `_kill_abs_cd` can resolve it against the worktree root itself.
+_KILL_CD_RE = re.compile(
+    r"""(?:^|[;&|(]|\bthen|\bdo|\belse)\s*(?:cd|pushd)\s+(?:--\s+)?["']?([^\s"';&|)]+)""",
     re.MULTILINE,
 )
+# `env -C <dir> ...` changes the subprocess's working directory before the
+# command even starts -- the same escape as an absolute cd (eval-r17rc L-4).
+_KILL_ENV_C_RE = re.compile(
+    r"""(?:^|[;&|(]|\bthen|\bdo|\belse)\s*env\s+(?:[A-Za-z_]\w*=\S*\s+)*-C\s*["']?([^\s"';&|)]+)""",
+    re.MULTILINE,
+)
+# A cd/pushd/env -C target built from a subshell or backtick (`` `cmd` `` /
+# `$(cmd)`) cannot be resolved statically; treat it as leaving the worktree
+# (the fail-safe direction: `n/a` over a false `survived`).
+_KILL_DYNAMIC_CD_RE = re.compile(r"[`$]")
 
 
 def _kill_check_enabled(args: argparse.Namespace) -> bool:
@@ -1960,20 +1971,36 @@ def _kill_restore(
     return sorted(off)
 
 
-def _kill_abs_cd(command: str, path: Path) -> str | None:
-    """The first absolute `cd`/`pushd` target outside *path*, else None."""
+def _kill_abs_cd(command: str, path: Path) -> tuple[str, str] | None:
+    """(target, kind) for the first `cd`/`pushd`/`env -C` that leaves *path*.
+
+    `kind` is `"absolute cd"` for an absolute or `~` cd/pushd target
+    (eval-r18a N2, wording kept for `kill_check_suffix` compatibility), or
+    `"leaves worktree"` for the eval-r17rc L-4 forms: a relative
+    `cd ../x` (or deeper) that resolves outside the worktree, `env -C
+    <dir>`, or a backtick/`$(...)` target that cannot be resolved
+    statically at all (the fail-safe direction: `n/a`, not a false
+    `survived`)."""
     try:
         root = path.resolve()
     except OSError:
         root = path
-    for m in _KILL_ABS_CD_RE.finditer(command):
-        target = m.group(1)
-        try:
-            resolved = Path(os.path.expanduser(target)).resolve()
-        except (OSError, RuntimeError):
-            return target
-        if resolved != root and root not in resolved.parents:
-            return target
+    for regex in (_KILL_CD_RE, _KILL_ENV_C_RE):
+        for m in regex.finditer(command):
+            target = m.group(1)
+            if not target or target == "-":
+                continue
+            is_abs_form = bool(regex is _KILL_CD_RE and (target.startswith("/") or target.startswith("~")))
+            kind = "absolute cd" if is_abs_form else "leaves worktree"
+            if _KILL_DYNAMIC_CD_RE.search(target):
+                return target, kind
+            try:
+                expanded = os.path.expanduser(target)
+                resolved = (Path(expanded) if os.path.isabs(expanded) else root / expanded).resolve()
+            except (OSError, RuntimeError):
+                return target, kind
+            if resolved != root and root not in resolved.parents:
+                return target, kind
     return None
 
 
@@ -1994,7 +2021,8 @@ def run_kill_check(
     result["command"] = command
     outside = _kill_abs_cd(command, path)
     if outside:
-        result.update(outcome="n/a", reason=f"absolute cd: the check leaves the worktree ({outside})")
+        target, kind = outside
+        result.update(outcome="n/a", reason=f"{kind}: the check leaves the worktree ({target})")
         return result
     try:
         all_changed = _kill_changed_paths(path, base)
@@ -2275,6 +2303,8 @@ def kill_check_suffix(kill_check: dict[str, Any] | None) -> str:
         tag = " (restore)"
     elif str(kill_check.get("reason") or "").startswith("absolute cd"):
         tag = " (absolute cd)"
+    elif str(kill_check.get("reason") or "").startswith("leaves worktree"):
+        tag = " (leaves worktree)"
     return f"kill_check: {kill_check['outcome']}{tag}"
 
 

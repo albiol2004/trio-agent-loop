@@ -13,6 +13,9 @@ fixed semantics asserted instead of xfail'd:
   collection errors are `error`.
 - N1: a slice that edits `.gitignore` keeps its newly ignored files.
 - N2: an absolute `cd` out of the worktree is `n/a (absolute cd)`.
+- r17-rc L-4: a relative `cd ../x` that resolves outside the worktree,
+  `env -C <dir>`, `pushd`, and a backtick/`$(...)` cd target are also
+  `n/a (leaves worktree)`.
 """
 from __future__ import annotations
 
@@ -179,6 +182,72 @@ def test_absolute_cd_into_the_worktree_runs(tmp_path):
                    "--rootdir=. -o pythonpath=.")
     assert res["_identical"] and res["restored"] and res["outcome"] == "killed", res
     assert not (r / "legacy.py").exists()
+
+
+# ---------------------------------------- r17-rc L-4: more ways to leave it
+
+def test_relative_cd_dotdot_out_of_the_worktree_is_na(tmp_path):
+    agg = tmp_path / "agg"
+    old = {**CALC, "tests/test_old.py": "def test_x():\n    assert True\n"}
+    init_repo(agg, "main", old, metrics=False)
+    r, b = repo_at(tmp_path, old)
+    w(r, "calc.py", "def add(a, b):\n    return a + b\n")
+    w(r, "tests/test_calc.py", "def test_x():\n    assert True\n")
+    for cmd in (f"cd ../{agg.name} && {PYT} tests", f"cd ../../{tmp_path.name}/{agg.name} && {PYT} tests"):
+        res = kc(r, b, cmd)
+        assert res["outcome"] == "n/a" and res["reason"].startswith("leaves worktree"), res
+        assert T.kill_check_suffix(res) == "kill_check: n/a (leaves worktree)"
+        assert "tree_sha256" not in res
+
+
+def test_relative_cd_into_a_worktree_subdir_runs(tmp_path):
+    # A single relative `cd` that stays inside the worktree (resolved
+    # against the worktree root, since the kill check never tracks a
+    # sequence of `cd`s as real shell state) still runs the check.
+    r, b = repo_at(tmp_path, CALC)
+    w(r, "calc.py", "def add(a, b):\n    return a + b\n")
+    w(r, "tests/test_calc.py", "import sys; sys.path.insert(0, '.')\nfrom calc import add\n\n"
+      "def test_add():\n    assert add(2, 3) == 5\n")
+    res = kc(r, b, f"cd . && {PYT} tests/test_calc.py")
+    assert res["_identical"] and res["outcome"] == "killed", res
+
+
+def test_env_dash_c_out_of_the_worktree_is_na(tmp_path):
+    agg = tmp_path / "agg"
+    old = {**CALC, "tests/test_old.py": "def test_x():\n    assert True\n"}
+    init_repo(agg, "main", old, metrics=False)
+    r, b = repo_at(tmp_path, old)
+    w(r, "calc.py", "def add(a, b):\n    return a + b\n")
+    w(r, "tests/test_calc.py", "def test_x():\n    assert True\n")
+    for cmd in (f"env -C {agg} {PYT} tests", f"env -C ../{agg.name} {PYT} tests"):
+        res = kc(r, b, cmd)
+        assert res["outcome"] == "n/a" and res["reason"].startswith("leaves worktree"), res
+        assert T.kill_check_suffix(res) == "kill_check: n/a (leaves worktree)"
+
+
+def test_pushd_relative_out_of_the_worktree_is_na(tmp_path):
+    agg = tmp_path / "agg"
+    old = {**CALC, "tests/test_old.py": "def test_x():\n    assert True\n"}
+    init_repo(agg, "main", old, metrics=False)
+    r, b = repo_at(tmp_path, old)
+    w(r, "calc.py", "def add(a, b):\n    return a + b\n")
+    w(r, "tests/test_calc.py", "def test_x():\n    assert True\n")
+    res = kc(r, b, f"pushd ../{agg.name} && {PYT} tests; popd")
+    assert res["outcome"] == "n/a" and res["reason"].startswith("leaves worktree"), res
+
+
+def test_backtick_cd_target_is_na_not_survived(tmp_path):
+    r, b = repo_at(tmp_path, CALC)
+    w(r, "calc.py", "def add(a, b):\n    return a - b\n")  # still-broken product
+    w(r, "tests/test_calc.py", "import sys; sys.path.insert(0, '.')\nfrom calc import add\n\n"
+      "def test_add():\n    assert add(2, 3) == 5\n")
+    for cmd in (f"cd `pwd` && {PYT} tests/test_calc.py", f"cd $(pwd) && {PYT} tests/test_calc.py"):
+        res = kc(r, b, cmd)
+        # A dynamic target can't be verified to stay inside -- fail-safe
+        # `n/a`, never a false `survived`, even though `pwd` here happens
+        # to stay inside the worktree.
+        assert res["outcome"] == "n/a" and res["reason"].startswith("leaves worktree"), res
+        assert "tree_sha256" not in res
 
 
 def test_git_rm_deleted_product_file(tmp_path):
