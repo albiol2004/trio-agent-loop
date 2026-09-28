@@ -95,6 +95,12 @@ prompt: |
   context trioctl renders into your prompt. One repo per
   slice; never `cd` a targeted check into a repo's main checkout.
 
+  The mailbox repo is always named `home` (no other name, never
+  `coordinator`). Files under the mailbox directory (evidence,
+  receipts, results, scripts) are Lead work you write yourself, never a
+  builder slice: trioctl refuses a slice whose `writes:` fall under the
+  mailbox directory.
+
   When the OPEN-LOOP CONTEXT has ROOT-FREE lines (r16), your workspace is
   the loop's own Lead worktree on `trio/<mailbox>`; it is "the repo" and
   "the aggregate" for every instruction, and the live mailbox is under

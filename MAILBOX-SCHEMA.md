@@ -848,6 +848,18 @@ yields exactly:
 slice <id> writes outside the mailbox repo (<path>); declare it in PLAN.md repos: (r15) or move the mailbox into that repo
 ```
 
+The mailbox repo is always named `home` (`repo:` omitted, `.` or `home`;
+there is no other alias, e.g. `coordinator`). Files under the mailbox
+directory itself (evidence, receipts, `results/`, `scripts/`) are Lead
+work, never a builder slice: a `home` slice any of whose `writes:` resolve
+at or under the mailbox directory is refused (eval-r16rc G1; not when the
+mailbox is the repo root; a declared clone nested there writes relative to
+its own root and is unaffected):
+
+```text
+slice <id> writes under the mailbox directory (<path>); files under <mailbox> (evidence, receipts, results, scripts) are Lead work the Lead writes and commits itself, never a builder slice: drop the slice from PLAN.md slices: (the mailbox repo is always `home`)
+```
+
 The brief scan covers every targeted-check section (`##`-`######
 Targeted check[s][ (...)]` headings, and a `**Targeted check:**`,
 `__Targeted check__` or plain `Targeted check:` label line together with

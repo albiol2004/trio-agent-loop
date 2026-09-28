@@ -3453,8 +3453,9 @@ _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
 _OPEN_LOOP_MULTI_REPO_LEAD_NOTE = (
     "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 0-7:\n"
     "{repos}"
-    "- A slice's `repo:` (default `home`) is the repo its `writes:` are\n"
-    "  relative to, its builder worktree is created from, its\n"
+    "- A slice's `repo:` (default `home`, the mailbox repo's only name) is\n"
+    "  the repo its `writes:` are relative to, its builder worktree is\n"
+    "  created from, its\n"
     "  `slice(<id>):` commits and merge land in (on that repo's base\n"
     "  branch), and its slice-eval grades. One repo per slice (split a slice\n"
     "  that would touch two; `depends_on:` across repos is fine);\n"
@@ -3525,8 +3526,9 @@ _OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE = (
 _LOCKSTEP_MULTI_REPO_LEAD_NOTE = (
     "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 3-5:\n"
     "{repos}"
-    "- A slice's `repo:` (default `home`) is the repo its `writes:` are\n"
-    "  relative to, its builder works in, and its `slice(<id>):` commits\n"
+    "- A slice's `repo:` (default `home`, the mailbox repo's only name) is\n"
+    "  the repo its `writes:` are relative to, its builder works in, and\n"
+    "  its `slice(<id>):` commits\n"
     "  land in (on that repo's checked-out base branch). One repo per slice\n"
     "  (split a slice that would touch two).\n"
     "- Dispatch a declared-repo slice's builder with `--workspace <repo path>`\n"
@@ -8137,24 +8139,20 @@ def _release_metrics_source() -> tuple[Path, str] | None:
 
 
 def _metrics_refresh_targets(args: argparse.Namespace) -> list[Path]:
-    """The repositories `metrics refresh` writes: --repo (default: the cwd's
-    repository), or with --mailbox the mailbox's repository plus every repo
-    its PLAN.md `repos:` declares."""
+    """The repository `metrics refresh` writes: --repo (default: the cwd's
+    repository), or with --mailbox the mailbox's (home) repository only.
+
+    Only home's committed set is ever checked (the root-free pre-check,
+    the repo-local trio-check/trio-shadow the models run); declared product
+    clones never need a vendored loop core (eval-r16rc N3). Refresh another
+    repository explicitly with --repo <path>.
+    """
     if getattr(args, "mailbox", None) is not None:
         mailbox = Path(args.mailbox).expanduser()
         if not mailbox.is_absolute():
             mailbox = Path.cwd() / mailbox
-        mailbox = mailbox.resolve()
-        home = worker_worktrees.repo_toplevel(mailbox)
-        _module, metrics = _load_trio_check()
-        info = metrics.read_repos(mailbox)
-        if info["errors"]:
-            raise TrioctlError(
-                "PLAN.md repos: does not validate: " + "; ".join(info["errors"])
-            )
-        targets = [home] + [
-            Path(r.get("main_path") or r["path"]).resolve() for r in info["repos"]
-        ]
+        targets = [worker_worktrees.repo_toplevel(root_free._existing_ancestor(mailbox.resolve())
+                                                  if root_free is not None else mailbox.resolve())]
     else:
         repo = Path(getattr(args, "repo", None) or Path.cwd()).expanduser().resolve()
         targets = [worker_worktrees.repo_toplevel(repo)]
@@ -8190,8 +8188,8 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
 
     Copies the release's four `metrics/` files (trio_loop.py,
     trio-metrics.py, trio-shadow.py, trio-check.py) into the repository
-    (`--repo`, default the current one), or into the mailbox's repository
-    and every repo its PLAN.md `repos:` declares (`--mailbox`), and prints a
+    (`--repo`, default the current one), or into the mailbox's home
+    repository (`--mailbox`; never its declared product repos), and prints a
     per-file diff summary. With `--commit` each changed repository gets
     one commit `chore: vendor trio loop core (<pin>)` of exactly those files
     on its current branch. Refuses (exit 2, nothing written anywhere) when
@@ -9709,14 +9707,15 @@ def parser() -> argparse.ArgumentParser:
     metrics_commands = metrics_cmd.add_subparsers(dest="metrics_command", required=True)
     metrics_refresh = metrics_commands.add_parser(
         "refresh",
-        help="copy this release's four metrics/ files into the repo (or every "
-        "repo of a `repos:` PLAN with --mailbox); --commit commits them",
+        help="copy this release's four metrics/ files into the repo (--repo, "
+        "default the current one; --mailbox: the mailbox's home repo only, never "
+        "its declared product repos); --commit commits them",
     )
     metrics_target = metrics_refresh.add_mutually_exclusive_group()
     metrics_target.add_argument("--repo", type=Path, default=None,
                                 help="repository to refresh (default: the current one)")
     metrics_target.add_argument("--mailbox", type=Path, default=None,
-                                help="refresh the mailbox's repo and every declared repo")
+                                help="refresh the mailbox's (home) repo only")
     metrics_refresh.add_argument(
         "--commit", action="store_true",
         help="commit `chore: vendor trio loop core (<pin>)` on each repo's current branch",

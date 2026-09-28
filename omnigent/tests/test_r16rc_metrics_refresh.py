@@ -108,7 +108,8 @@ def test_refresh_commit_refuses_a_detached_head(world, tmp_path):
     assert not _same_as_release(repo)
 
 
-def test_refresh_mailbox_covers_home_and_every_declared_repo(world, tmp_path):
+def test_refresh_mailbox_refreshes_home_only_never_declared_clones(world, tmp_path):
+    """eval-r16rc N3: declared product clones are never written or checked."""
     home = _old_repo(tmp_path / "home")
     (home / ".gitignore").write_text("loop/x/app/\n")
     git(home, "add", ".gitignore")
@@ -124,13 +125,24 @@ def test_refresh_mailbox_covers_home_and_every_declared_repo(world, tmp_path):
         repos_block=(f"  - name: app\n    path: loop/x/app\n    base: dev\n"
                      f"  - name: svc\n    path: {svc}\n    base: feat/s\n"),
     )
+    # A dirty metrics/ in a clone does not block the home refresh.
+    (svc / "metrics").mkdir()
+    (svc / "metrics" / "mine.txt").write_text("x\n")
+    heads = {r: git(r, "rev-parse", "HEAD") for r in (app, svc)}
     code, out, err = _refresh(world, "--mailbox", str(box), "--commit")
     assert code == 0, err
-    for repo in (home, app, svc):
-        assert _same_as_release(repo), repo
-        assert git(repo, "log", "-1", "--format=%s").startswith("chore: vendor trio loop core (")
-        assert f"{repo.resolve()}:" in out
-    assert "metrics/trio_loop.py: added" in out  # the clones had no metrics/
+    assert _same_as_release(home)
+    assert git(home, "log", "-1", "--format=%s").startswith("chore: vendor trio loop core (")
+    assert f"{home.resolve()}:" in out
+    for repo in (app, svc):
+        assert git(repo, "rev-parse", "HEAD") == heads[repo]
+        assert f"{repo.resolve()}:" not in out
+        assert not (repo / "metrics" / "trio_loop.py").exists()
+    # A clone is refreshed only when named explicitly.
+    (svc / "metrics" / "mine.txt").unlink()
+    code, out, err = _refresh(world, "--repo", str(svc), "--commit")
+    assert code == 0, err
+    assert _same_as_release(svc)
 
 
 def test_root_free_old_core_refusal_names_the_refresh_command(world, tmp_path, capsys):

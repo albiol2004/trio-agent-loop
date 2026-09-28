@@ -37,6 +37,11 @@ mailbox `{mailbox}` at iteration {iteration}.
    undeclared nested clone with its own `.git` or a path elsewhere is
    not a workaround —
    trioctl refuses such a plan (loop `status: error`).
+   The mailbox repo is always named `home` (no other name, never
+   `coordinator`). Files under the mailbox directory (evidence,
+   receipts, results, scripts) are Lead work you write yourself, never
+   a builder slice: trioctl refuses a slice whose `writes:` fall under
+   the mailbox directory.
 6. Append one Format-A line to `{mailbox}/LOG.md`:
    `- iter {iteration} | lead | <one-line summary>`.
 

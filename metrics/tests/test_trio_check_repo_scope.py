@@ -173,7 +173,9 @@ def test_repo_value_naming_no_directory_refused(tmp_path):
 
 
 def test_single_repo_mailbox_unchanged(tmp_path):
-    slices = OK_SLICE + "  - id: api\n    repo: .\n    writes: [src/, \"api:Thing\", loop/PLAN.md]\n    reads: []\n"
+    # (a `writes:` under the mailbox dir, e.g. loop/PLAN.md, is refused
+    # since eval-r16rc G1: mailbox files are Lead work)
+    slices = OK_SLICE + "  - id: api\n    repo: .\n    writes: [src/, \"api:Thing\", docs/PLAN.md]\n    reads: []\n"
     home = make_home(tmp_path, plan(slices), {"home-ok": "## Targeted check\n\npython3 -m pytest -q\n"})
     proc = check(home)
     assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -212,8 +212,10 @@ aggregate and is refused by the r15 guard.
   `metrics/` files (trio_loop.py, trio-metrics.py, trio-shadow.py,
   trio-check.py) into the repository, prints a per-file diff summary, and
   with `--commit` commits exactly those files as `chore: vendor trio loop
-  core (<pin>)` on the current branch. `--mailbox <mb>` covers the
-  mailbox's repository and every repo its PLAN.md `repos:` declares. A
+  core (<pin>)` on the current branch. `--mailbox <mb>` refreshes the
+  mailbox's own (home) repository only: declared product clones (PLAN.md
+  `repos:`) never get a vendored loop core (only home's set is checked);
+  refresh any other repository explicitly with `--repo <path>`. A
   dirty or untracked `metrics/` (or `--commit` on a detached HEAD) is
   refused with exit 2 and nothing written. The installed trioctl reads the
   set from `trio-release-metrics/` next to it (install.sh; `PIN` = release

@@ -454,6 +454,37 @@ def repo_scope_message(slice_id: str, path) -> str:
     )
 
 
+def mailbox_dir_message(slice_id: str, path, loop_dir) -> str:
+    """A home slice writes under the mailbox directory (eval-r16rc G1)."""
+    return (
+        f"slice {slice_id} writes under the mailbox directory ({path}); files "
+        f"under {loop_dir} (evidence, receipts, results, scripts) are Lead work "
+        "the Lead writes and commits itself, never a builder slice: drop the "
+        "slice from PLAN.md slices: (the mailbox repo is always `home`)"
+    )
+
+
+def _mailbox_dir_write(
+    sl: dict, loop_dir: Path, root: Path, named: dict[str, Path], tm
+) -> Path | None:
+    """First `writes:` path of a home slice at or under *loop_dir*, or None."""
+    if loop_dir == root:
+        return None
+    if named:
+        if tm.slice_repo_name(sl, named) != HOME_REPO:
+            return None
+    elif str(sl.get("repo") or ".").strip() not in (".", HOME_REPO):
+        return None
+    for write in sl.get("writes") or []:
+        write = str(write).strip()
+        if not write or write.startswith("api:"):
+            continue
+        for target in _expand_write(root, write):
+            if target == loop_dir or loop_dir in target.parents:
+                return target
+    return None
+
+
 def repo_escape_message(slice_id: str, repo: str, path) -> str:
     """A slice of declared repo *repo* writes (or cds) outside that repo."""
     return (
@@ -910,6 +941,10 @@ def repo_scope_refusals(
             problems.append(repo_scope_message(slice_id, path))
     for sl in slices:
         if slice_id is not None and sl["id"] != slice_id:
+            continue
+        inside = _mailbox_dir_write(sl, loop_dir, root, named, tm)
+        if inside is not None:
+            problems.append(mailbox_dir_message(sl["id"], inside, loop_dir))
             continue
         brief = brief_text if slice_id is not None else None
         if brief is None:

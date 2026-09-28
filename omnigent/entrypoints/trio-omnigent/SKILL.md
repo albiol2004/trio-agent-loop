@@ -131,6 +131,15 @@ Use the requested mailbox, default `loop/`. Initialize it if absent with
 `GOAL.md`, `STATE.md`, `PLAN.md`, `REPORT.md`, `VERDICT.md`, and `LOG.md`.
 Preserve an existing matching mission. Refuse to repurpose an active mailbox.
 
+PLAN.md slices: the mailbox repo (the git repo containing the mailbox) is
+always named `home` — `repo:` omitted, `.` or `home`; never another name
+(do not invent `coordinator`). Other repos a slice writes must be declared
+in a PLAN.md `repos:` block, and a brief's targeted-check `cd`s are
+relative to the slice's repo root. Files under the mailbox directory
+(evidence, receipts, `results/`, `scripts/`) are Lead or coordinator work,
+never a builder slice: trioctl and trio-check refuse a slice whose
+`writes:` fall under the mailbox directory.
+
 ## One iteration
 
 1. Read GOAL, STATE, and the previous verdict. Enforce the iteration cap.

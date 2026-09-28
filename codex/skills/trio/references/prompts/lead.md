@@ -109,6 +109,7 @@ slices:
 
 `repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `home` — the mailbox repo, also written `.` — `false`, `in_progress`, the entry's iteration number, and `[]`); a `repo:` other than `home`/`.` must name a PLAN.md `repos:` entry. A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
 Every slice's `writes:` and its brief's `## Targeted check` `cd` must stay inside the slice's repo: the mailbox repo (the git repo containing `loop/`, `repo:` omitted, `.` or `home`), or the PLAN.md `repos:` entry its `repo:` names — one repo per slice; an undeclared nested clone with its own `.git` or a path elsewhere is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
+The mailbox repo is always named `home` (no other name, never `coordinator`). Files under the mailbox directory (evidence, receipts, results, scripts) are Lead work you write yourself, never a builder slice: trioctl and trio-check refuse a slice whose `writes:` fall under the mailbox directory.
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review
