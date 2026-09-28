@@ -861,7 +861,14 @@ def parse_repo_pins(values) -> list[tuple[str, str]]:
 
 def _full_check_section(plan_text: str) -> list[str]:
     """PLAN.md lines from a column-0 `full_check:` key to the next column-0
-    line (or heading/fence), inclusive of the key line; [] when absent."""
+    line (or heading/fence), inclusive of the key line; [] when absent.
+
+    A block mapping (`full_check:` alone on its line, then indented
+    `<repo>: <cmd>` lines) continues across blank lines while the next
+    non-blank line is another indented `<repo>: <cmd>` item (eval-r15 N4:
+    a repo after a blank line was neither parsed nor scope-checked). A
+    string command still ends at its first blank line (unchanged).
+    """
     lines = plan_text.splitlines()
     in_fence = False
     for index, raw in enumerate(lines):
@@ -870,9 +877,21 @@ def _full_check_section(plan_text: str) -> list[str]:
             continue
         if in_fence or not FULL_CHECK_KEY_RE.match(raw):
             continue
+        block_mapping = not FULL_CHECK_KEY_RE.match(raw).group(1).strip()
         out = [raw]
-        for follow in lines[index + 1:]:
+        follow_lines = lines[index + 1:]
+        for pos, follow in enumerate(follow_lines):
             if not follow.strip():
+                if not block_mapping:
+                    break
+                nxt = next((ln for ln in follow_lines[pos + 1:] if ln.strip()), "")
+                if (
+                    nxt[:1].isspace()
+                    and FULL_CHECK_ITEM_RE.match(nxt.strip())
+                    and len(out) > 1
+                    and all(FULL_CHECK_ITEM_RE.match(ln.strip()) for ln in out[1:])
+                ):
+                    continue
                 break
             if not follow[:1].isspace():
                 break

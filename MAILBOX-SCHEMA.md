@@ -153,8 +153,9 @@ for the iteration:
   `full_check: cd api && npm test && npm run typecheck`. With declared
   `repos:` (r15) it may instead be a per-repo mapping -- flow
   `full_check: { app-backend: "pytest -q", home: "make test" }` or
-  indented `<repo>: <command>` lines -- each command run from its repo's
-  root; a plain string stays the home repo's command. Optional
+  indented `<repo>: <command>` lines (blank lines between them are
+  allowed) -- each command run from its repo's root; a plain string stays
+  the home repo's command. Optional
   `full_check_budget_s: <n>` overrides the default 120 s wall-clock budget.
   In open-loop the Lead's whole-tree gate after the last retirement is
   proportional: skipped when no product code changed since the last
@@ -232,7 +233,7 @@ code block whose top-level key is `slices:`:
 ```yaml
 slices:
   - id: provider-config
-    repo: .                         # target repo relative to the mailbox root; default .
+    repo: home                      # optional; `home` (the mailbox repo; also `.`, the default) or a PLAN.md `repos:` name (r15)
     writes: [omp/configure-models.sh, "api:ProviderConfig"]
     reads:  []                      # dispatchable immediately
     gate: false                     # optional; default false
@@ -423,12 +424,17 @@ Each entry has exactly these three keys, in this order: `slice:`, `sha:`,
 `at:`. The key is `sha:` — never `merge_commit:` (that is the builder JSON
 field the value comes from); any other key makes the entry malformed.
 **r15**: an entry for a slice of a declared `repos:` repo carries a fourth
-key, `repo: <name>`, between `slice:` and `sha:`; its `sha` is a commit of
+key, `repo: <name>`, written between `slice:` and `sha:` (the parser also
+accepts it after `sha:`; the three-key order above is otherwise fixed); its `sha` is a commit of
 that repo and `at:` its committer time there (`git -C <repo> log -1
 --format=%cI <sha>`). Omitted means `home`, so existing mailboxes parse
-unchanged; trio-check flags a `repo:` that is undeclared or differs from
-the slice's PLAN.md `repo:`. `faults:` entries are unchanged (the slice id
-implies the repo).
+unchanged. PLAN.md is authoritative: trio-check flags a `repo:` that is
+undeclared or differs from the slice's PLAN.md `repo:`, and the open-loop
+driver holds such an entry -- and one whose `sha` is not a commit of its
+declared repo -- like any other malformed entry (logged as a QUEUE.md
+parse error, never gated as retired, never graded) until it is re-retired
+correctly. `faults:` entries are unchanged (the slice id implies the
+repo).
 
 `retired:` is **append-only, Lead only**: the Lead is the only role that
 appends an entry, and no role ever edits or removes an existing one. The
@@ -759,8 +765,9 @@ releases. Keys may come in any order or as a flow map (`- {name: a, path:
 b}`); only `~` expands in `path:` (never `$VARS`); every path must be an
 existing git repo, no two names may share one, and no non-`home` name may
 point at the mailbox repo. `base:` defaults to the checkout's current
-branch; when given, a builder dispatch refuses a repo whose checkout is on
-another branch.
+branch; when given it must be an existing branch of that repo (trio-check
+refuses one that is not), and a builder dispatch refuses a repo whose
+checkout is on another branch.
 
 - **Slice ↔ repo**: `repo: <name>` (default `home`); `writes:` are relative
   to that repo's root; one repo per slice (`depends_on:` across repos is
@@ -768,7 +775,8 @@ another branch.
 - **Isolation per repo**: a slice's builder (and slice-eval) worktree is
   created from its repo (`git -C <path> worktree add`) under
   `<state>/worktrees/<name>-<sha256(git common dir)[:12]>/`, a sibling of the
-  home repo's root; its ledger record lives in that repo's
+  home repo's root (with `--worktree-root X` the declared repos' roots are
+  siblings of `X`: `<parent of X>/<name>-<hash>/`); its ledger record lives in that repo's
   `.git/trio-worktrees/` with `repo_name`, and its merge lands on the repo's
   `base` branch. `.cursor` neutralisation, rebuildable/retention/cleanup
   rules are unchanged. The builder's targeted check runs from its worktree
@@ -798,8 +806,21 @@ another branch.
   when every repo's pin is recorded, its product tree is unchanged since
   the pin, its `commit:` lines are reachable, and its retirement commit
   descends from the pin; post-SHIP cleanup removes each repo's worktrees
-  against that repo's pin.
-- **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`;
+  against that repo's pin. The check starts from the STATE.md
+  `evaluated_repos` pins, not from the current PLAN.md: a pinned repo that
+  is no longer declared (dropped, moved or deleted) or a `repos:` block
+  that no longer validates makes the SHIP final (never accepted on the
+  home checks alone), and an integration pin is reused on resume only
+  under the same rule.
+- **Lockstep**: the same pins and per-repo retirement apply. trioctl
+  renders a MULTI-REPO procedure into the lockstep prompts too (the Lead's
+  per-repo dispatch and `slice(<id>):` commits; the Evaluator's pin list,
+  `evaluated:` line and empty per-repo SHIP commits), only when PLAN.md
+  declares `repos:`; single-repo lockstep prompts are unchanged.
+- **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`
+  -- in the loop core itself (`trio_loop.py` `METRICS_API = 5`) and in its
+  `trio-metrics.py`; trioctl takes the lower of the two, so a partial
+  refresh (an older core next to a newer trio-metrics.py) is refused too;
   `trioctl` still drives a METRICS_API 4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it (loop `status: error`, nothing
   dispatched).
@@ -825,10 +846,14 @@ slice <id> writes outside the mailbox repo (<path>); declare it in PLAN.md repos
 ```
 
 The brief scan covers every targeted-check section (`##`-`######
-Targeted check[s][ (...)]` headings and a bold `**Targeted check:**`
-label, each up to the next heading), `cd`/`pushd` in plain lines, fenced
-blocks and inline code, and the directories named by `git -C`, `make -C`,
-`--rootdir`, `--prefix` and `--cwd`; shell comments are ignored. A glob in
+Targeted check[s][ (...)]` headings, and a `**Targeted check:**`,
+`__Targeted check__` or plain `Targeted check:` label line together with
+the text after the label, each up to the next heading), `cd`/`pushd`
+(also `cd -- <dir>`, `cd -P <dir>`) in plain lines, fenced blocks and
+inline code, and the directories named by `git`/`make`/`env`/`npm`/
+`pnpm`/`poetry` `-C`, `pnpm --dir`, `--rootdir`, `--prefix`, `--cwd`,
+`--directory` (`uv run --directory`) and `--chdir`; shell comments are
+ignored. A glob in
 `writes:` is checked against every existing match of each path prefix.
 PLAN.md's own targeted-check sections and `full_check:` commands are
 scanned from the repo root (refusal line `PLAN.md targeted/full check runs
@@ -955,7 +980,11 @@ absence is never a violation.
   5)`) still drives a vendored API-4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it; `trio-check.py` requires 5. The r15
   guard's "not supported" refusal is lifted; the undeclared-path refusal
-  stays.
+  stays. eval-r15 fixes: `trio_loop.py` carries its own `METRICS_API = 5`
+  (trioctl takes the lower of core and metrics); SHIP retirement and pin
+  reuse verify from the STATE.md pins; the driver holds retired entries
+  whose `repo:` disagrees with PLAN.md or whose sha is not a commit of
+  their repo.
 - **r15 guard** (no METRICS_API bump; lives in `trio-check.py` and
   `trioctl`, not the loop core): slices writing outside the mailbox repo
   and any PLAN.md `repos:` block are refused ("Repo scope (r15 guard)").

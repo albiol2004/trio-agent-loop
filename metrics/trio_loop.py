@@ -34,9 +34,17 @@ from typing import Protocol
 # this constant predates that contract (treated as 1). Bump on any change
 # a caller must not silently run against. (r15 multi-repo is additive --
 # a `repo` key in slice-eval contexts, `pins` in integration contexts, the
-# `evaluated_repos` STATE.md key -- and is gated by the sibling
-# trio-metrics.py METRICS_API 5, so this stays 2.)
+# `evaluated_repos` STATE.md key -- and is gated by METRICS_API 5, so
+# this stays 2.)
 LOOP_CORE_API = 2
+
+# The METRICS_API contract this core itself implements (eval-r15 N3). 5 =
+# r15 multi-repo: per-repo pins, retire checks and SHIP retirement. The
+# sibling trio-metrics.py carries its own METRICS_API; trioctl takes the
+# lower of the two, so a partial refresh (an older core next to a newer
+# trio-metrics.py) is never trusted with a `repos:` mailbox. A core without
+# this constant predates r15.
+METRICS_API = 5
 
 def _load_metrics_module():
     path = Path(__file__).resolve().with_name("trio-metrics.py")
@@ -1111,22 +1119,71 @@ def _log_untracked_product_blockers(
 # any of this (`_declared_repos` is []).
 
 
-def _declared_repos(mailbox: Path) -> list[tuple[str, Path]]:
-    """(name, path) of PLAN.md's declared `repos:` (r15), in PLAN order.
+def _declared_repos_checked(
+    mailbox: Path,
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """``(valid declared repos, errors)`` of PLAN.md's `repos:` block (r15).
 
-    [] in single-repo mode and when the block does not validate (trioctl
-    and trio-check refuse such a PLAN before any dispatch).
+    The valid entries survive an error in another entry (a clone that
+    vanished mid-run is an error of that entry only). ``([], [])`` in
+    single-repo mode and with a metrics module that predates `repos:`;
+    a reader that raises is an error, never single-repo.
     """
     reader = getattr(_METRICS, "read_repos", None)
     if reader is None:
-        return []
+        return [], []
     try:
         info = reader(Path(mailbox))
-    except Exception:  # noqa: BLE001 - an unreadable block is single-repo here
-        return []
-    if info.get("errors"):
-        return []
-    return [(r["name"], Path(r["path"])) for r in info.get("repos") or []]
+    except Exception as exc:  # noqa: BLE001 - reported, never single-repo
+        return [], [f"PLAN.md repos: unreadable ({type(exc).__name__}: {exc})"]
+    repos = [(r["name"], Path(r["path"])) for r in info.get("repos") or []]
+    return repos, [str(e) for e in info.get("errors") or []]
+
+
+def _declared_repos(mailbox: Path) -> list[tuple[str, Path]]:
+    """(name, path) of PLAN.md's declared `repos:` (r15), in PLAN order.
+
+    [] in single-repo mode and when the block does not validate. Only the
+    pinning and snapshot helpers use this; the SHIP retirement gate and
+    pin reuse verify from STATE.md ``evaluated_repos`` and treat an invalid
+    block as final (eval-r15 B1), see ``_declared_repos_retirement_problem``.
+    """
+    repos, errors = _declared_repos_checked(mailbox)
+    return [] if errors else repos
+
+
+def _pinned_repos_problem(
+    mailbox: Path, pins: dict[str, str]
+) -> tuple[list[tuple[str, Path]], str | None]:
+    """``(declared repos, why the pins cannot be verified or None)``.
+
+    The per-repo gates verify from STATE.md ``evaluated_repos``, never
+    from whatever PLAN.md says now (eval-r15 B1): a present but invalid
+    `repos:` block, or a pinned repo that is no longer declared (dropped
+    from PLAN.md, moved or deleted: a missing path is a block error), is a
+    problem -- the pinned tree can no longer be checked, so it must never
+    ship on the home checks alone.
+    """
+    declared, errors = _declared_repos_checked(mailbox)
+    if errors:
+        return [], (
+            "PLAN.md repos: block does not validate, so the per-repo pins "
+            f"cannot be verified: {errors[0]}"
+        )
+    if pins and getattr(_METRICS, "read_repos", None) is None:
+        return [], (
+            "STATE.md evaluated_repos pins declared repos but this metrics "
+            "module cannot read PLAN.md repos:"
+        )
+    names = {name for name, _path in declared}
+    for name, sha in pins.items():
+        if name not in names:
+            return declared, (
+                f"repo {name} is pinned in STATE.md evaluated_repos "
+                f"({name}@{sha[:12]}) but is no longer declared in PLAN.md "
+                "repos:"
+            )
+    return declared, None
 
 
 def _repos_with_slices(mailbox: Path, declared: list[tuple[str, Path]]) -> list[str]:
@@ -1181,7 +1238,9 @@ def _declared_repos_retirement_problem(
 ) -> tuple[str, str] | None:
     """Per-repo SHIP retirement of a `repos:` mailbox (r15), or None.
 
-    For every declared repo: STATE.md ``evaluated_repos`` pins it, the
+    Verified from the STATE.md pins (eval-r15 B1): an invalid `repos:`
+    block, or a pinned repo no longer declared, is final. Then for every
+    declared repo: STATE.md ``evaluated_repos`` pins it, the
     integration verdict records ``evaluated: <repo>@<pin>``, and the repo's
     product tree is unchanged since that pin (final otherwise). Every
     ``commit: <repo>@<sha>`` line must be a commit reachable from that
@@ -1189,10 +1248,12 @@ def _declared_repos_retirement_problem(
     iteration N — SHIP`` retirement commit after the pin (pending
     otherwise: the Evaluator may still be committing).
     """
-    declared = _declared_repos(mailbox)
+    pins = _state_repo_pins(state)
+    declared, unverifiable = _pinned_repos_problem(mailbox, pins)
+    if unverifiable is not None:
+        return RETIREMENT_FINAL, unverifiable
     if not declared:
         return None
-    pins = _state_repo_pins(state)
     integration = _integration_verdict_text(text)
     with_slices = set(_repos_with_slices(mailbox, declared))
     pending: tuple[str, str] | None = None
@@ -1704,11 +1765,19 @@ def _lockstep_eval_context(
     declared = _declared_repos(mailbox)
     repo_pins = {} if fresh else _state_repo_pins(state)
     if declared:
+        # Resume keeps every persisted pin, also one whose repo is no
+        # longer declared: the retirement gate verifies from these pins
+        # and refuses such a SHIP (eval-r15 B1).
         repo_pins = {
-            name: repo_pins.get(name) or _git_head(path) or ""
-            for name, path in declared
+            **repo_pins,
+            **{
+                name: repo_pins.get(name) or _git_head(path) or ""
+                for name, path in declared
+            },
         }
         updates["evaluated_repos"] = _format_repo_pins(repo_pins)
+    elif fresh:
+        updates["evaluated_repos"] = ""  # clears a stale pin, never adds one
     _update_state(state_path, updates)
     context = {
         "pinned_sha": pinned,
@@ -1747,8 +1816,11 @@ def _open_loop_integration_context(
     reuse = bool(attempt and pinned)
     if reuse and git_root is not None:
         reuse = _evaluated_product_intact(git_root, state_path.parent, pinned)
-    if reuse and declared:
-        reuse = all(
+    if reuse and (declared or repo_pins):
+        # eval-r15 B1: reuse is verified from the persisted pins; an
+        # invalid block or a pinned repo no longer declared never reuses.
+        _checked, unverifiable = _pinned_repos_problem(mailbox, repo_pins)
+        reuse = unverifiable is None and all(
             repo_pins.get(name)
             and _evaluated_product_intact(path, mailbox, repo_pins[name])
             for name, path in declared
@@ -1758,7 +1830,9 @@ def _open_loop_integration_context(
         pinned = head or ""
         repo_pins = {name: _git_head(path) or "" for name, path in declared}
     updates = {"evaluated_sha": pinned, "evaluator_attempt": attempt}
-    if declared:
+    if declared or not reuse:
+        # A fresh pin always rewrites the key (an empty value clears a
+        # stale pin of a repo no longer declared; never adds one).
         updates["evaluated_repos"] = _format_repo_pins(
             {name: repo_pins.get(name, "") for name, _path in declared}
         )
@@ -2116,6 +2190,116 @@ def _malformed_retired_slices(queue: dict) -> set[str]:
     return set(queue.get("malformed_slices") or [])
 
 
+RETIRED_REPO_ERROR_PREFIX = "`retired:` block:"
+
+#: (repo path, sha) pairs already proven to be commits (they stay commits).
+_KNOWN_REPO_COMMITS: set[tuple[str, str]] = set()
+
+
+def _plan_slice_repos(mailbox: Path) -> dict[str, str] | None:
+    """``{slice id: PLAN.md repo:}`` with `.`/`home`/omitted as ``home``;
+    None when PLAN.md is missing or its slices block does not parse."""
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    slices = _METRICS.parse_slices_block(text)
+    if slices is None:
+        return None
+    return {sl["id"]: _repo_value(sl.get("repo")) for sl in slices}
+
+
+def _repo_value(value) -> str:
+    """A `repo:` value with the home spellings (omitted, `.`, `./`, `home`)
+    folded to ``home``; MAILBOX-SCHEMA.md: an omitted `repo:` is home."""
+    value = str(value or "").strip()
+    return "home" if value in ("", ".", "./", "home") else value
+
+
+def _retired_repo_problems(mailbox: Path, queue: dict) -> list[tuple[dict, str]]:
+    """Retired entries whose `repo:`/`sha:` the driver must not grade (r15).
+
+    PLAN.md is authoritative (eval-r15 N1): an entry's `repo:` (omitted =
+    home) must equal its slice's PLAN.md `repo:`, and a declared repo must
+    still be declared and valid. Its sha must be a commit of that repo
+    (eval-r15 N6: a wrong-repo or phantom sha fails at retire parse, not
+    three dispatches later). A single-repo mailbox whose entries carry no
+    `repo:` is never affected. Returns ``[(entry, message)]``.
+    """
+    retired = queue.get("retired") or []
+    declared, errors = _declared_repos_checked(mailbox)
+    tagged = [e for e in retired if _repo_value(e.get("repo")) != "home"]
+    if not declared and not errors and not tagged:
+        return []
+    plan = _plan_slice_repos(mailbox)
+    if plan is None:
+        return []  # the per-slice commit gate reports an unreadable PLAN
+    paths = {name: path for name, path in declared}
+    problems: list[tuple[dict, str]] = []
+    for entry in retired:
+        slice_id = entry.get("slice", "")
+        if slice_id not in plan:
+            continue  # unknown slice: the per-slice commit gate exits 2
+        sha = str(entry.get("sha", "")).strip()
+        entry_repo = _repo_value(entry.get("repo"))
+        plan_repo = plan[slice_id]
+        where = f"entry for slice {slice_id} (sha {sha[:12]})"
+        if entry_repo != plan_repo:
+            problems.append((entry, (
+                f"{where} has repo: {entry_repo} but PLAN.md puts slice "
+                f"{slice_id} in repo {plan_repo} (an omitted repo: is home); "
+                "PLAN.md is authoritative -- re-retire it with the PLAN repo"
+            )))
+            continue
+        if entry_repo == "home":
+            continue
+        path = paths.get(entry_repo)
+        if path is None:
+            problems.append((entry, (
+                f"{where} names repo {entry_repo}, which is not a valid "
+                "declared PLAN.md repos: entry"
+                + (f" ({errors[0]})" if errors else "")
+            )))
+            continue
+        key = (str(path), sha)
+        if key in _KNOWN_REPO_COMMITS:
+            continue
+        if _git_commit_sha(path, sha) is None:
+            problems.append((entry, (
+                f"{where}: sha {sha} is not a commit of repo {entry_repo} "
+                f"({path}); retire the slice's merge commit in its own repo"
+            )))
+            continue
+        _KNOWN_REPO_COMMITS.add(key)
+    return problems
+
+
+def _read_queue(mailbox: Path) -> dict:
+    """``read_queue`` plus the r15 retired `repo:`/`sha:` checks.
+
+    An entry of ``_retired_repo_problems`` is held exactly like any other
+    malformed `retired:` entry: dropped from ``retired``, its slice listed
+    in ``malformed_slices`` (never gated as retired, never dispatched), and
+    its message appended to ``errors`` (logged once per iteration).
+    """
+    queue = _METRICS.read_queue(mailbox)
+    problems = _retired_repo_problems(mailbox, queue)
+    if not problems:
+        return queue
+    bad = {id(entry) for entry, _msg in problems}
+    queue = dict(queue)
+    queue["retired"] = [e for e in queue["retired"] if id(e) not in bad]
+    queue["malformed_slices"] = sorted(
+        set(queue.get("malformed_slices") or [])
+        | {entry.get("slice", "") for entry, _msg in problems}
+    )
+    queue["errors"] = [
+        *(queue.get("errors") or []),
+        *(f"{RETIRED_REPO_ERROR_PREFIX} {msg}" for _entry, msg in problems),
+    ]
+    return queue
+
+
 def _gate_retired_ids(queue: dict) -> set[str]:
     """Slice ids `_slices_fully_retired` may count as retired: every slice
     with a valid `retired:` entry, minus `_malformed_retired_slices`."""
@@ -2354,7 +2538,7 @@ def _lead_thread_body(
                 return
             if not (first and force_first_pass):
                 slice_ids = _read_plan_slice_ids(mailbox)
-                queue = _METRICS.read_queue(mailbox)
+                queue = _read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
                 open_or_taken = _live_faults(queue)
                 if _slices_fully_retired(
@@ -2385,7 +2569,7 @@ def _lead_thread_body(
             # r11g Q1: a held gate's error text reaches the Lead through
             # its OPEN-LOOP CONTEXT (the Lead never reads LOG.md). The key
             # is only present when there is something to repair.
-            queue_errors = _queue_fault_errors(_METRICS.read_queue(mailbox))
+            queue_errors = _queue_fault_errors(_read_queue(mailbox))
             if queue_errors:
                 context["queue_errors"] = queue_errors
             snapshot_before = _lead_pass_snapshot(mailbox, repo)
@@ -2846,7 +3030,7 @@ def run_open_loop(
         while True:
             lead_alive = not lead_result.get("finished", False)
 
-            queue = _METRICS.read_queue(mailbox)
+            queue = _read_queue(mailbox)
             _log_queue_errors(
                 mailbox, current_iteration(), queue, queue_errors_logged
             )
@@ -3046,7 +3230,7 @@ def run_open_loop(
                 # trusting it -- a slice-eval just above may have opened a
                 # fault after the Lead thread already decided it was done.
                 slice_ids = _read_plan_slice_ids(mailbox)
-                queue = _METRICS.read_queue(mailbox)
+                queue = _read_queue(mailbox)
                 # Log parse errors / malformed slices / unknown statuses in
                 # THIS turn: the final slice-eval may have just written a
                 # malformed fault, and the integration eval must never be

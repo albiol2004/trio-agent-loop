@@ -1117,21 +1117,55 @@ def _repo_scope_refusals(
     )
 
 
-def _declared_repos(mailbox: Path) -> dict[str, dict[str, Any]]:
-    """PLAN.md `repos:` of *mailbox*: ``{name: {"path": Path, "base": str|None}}``.
+def _declared_repos_checked(
+    mailbox: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """``(valid declared repos, block errors)`` of *mailbox*'s PLAN.md `repos:`.
 
-    ``{}`` in single-repo mode (no block, `repos: []`, missing PLAN.md) and
-    when the block does not validate (the r15 guard refuses that PLAN).
+    Each valid entry survives an error in another one (eval-r15 N5: one
+    vanished clone must not send the healthy repos' slice-evals home).
     Parsed with this release's trio-metrics (never a vendored copy).
     """
     _module, metrics = _load_trio_check()
     info = metrics.read_repos(Path(mailbox))
-    if info["errors"]:
-        return {}
-    return {
+    repos = {
         r["name"]: {"path": Path(r["path"]), "base": r.get("base")}
         for r in info["repos"]
     }
+    return repos, [str(e) for e in info["errors"]]
+
+
+def _declared_repos(mailbox: Path) -> dict[str, dict[str, Any]]:
+    """PLAN.md `repos:` of *mailbox*: ``{name: {"path": Path, "base": str|None}}``.
+
+    ``{}`` in single-repo mode (no block, `repos: []`, missing PLAN.md).
+    When another entry does not validate (the r15 guard refuses that PLAN
+    before any Lead pass), the valid entries are still returned, so a
+    slice-eval or a cleanup of a healthy repo never falls back to home;
+    the SHIP gates verify from STATE.md pins instead (``_ship_acceptance``).
+    """
+    return _declared_repos_checked(mailbox)[0]
+
+
+def _pinned_repos_unverifiable(mailbox: Path, pins: dict[str, str]) -> str | None:
+    """Why STATE.md ``evaluated_repos`` *pins* cannot be verified, or None.
+
+    eval-r15 B1: an invalid `repos:` block, or a pinned repo that is no
+    longer declared (dropped, moved, deleted), is never accepted.
+    """
+    repos, errors = _declared_repos_checked(mailbox)
+    if errors:
+        return (
+            "PLAN.md repos: block does not validate, so the per-repo pins "
+            f"cannot be verified: {errors[0]}"
+        )
+    for name, sha in pins.items():
+        if name not in repos:
+            return (
+                f"repo {name} is pinned in STATE.md evaluated_repos "
+                f"({name}@{sha[:12]}) but is no longer declared in PLAN.md repos:"
+            )
+    return None
 
 
 def _plan_slices(mailbox: Path) -> list[dict[str, Any]]:
@@ -1590,6 +1624,23 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
         return {"pending": "SHIP is not bound to an evaluator attempt"}
     if not re.fullmatch(r"[0-9a-f]{40}", evaluated):
         return {"pending": "SHIP is not bound to a full evaluated sha"}
+    pins = str(state.get("evaluated_repos", "")).strip()
+    repo_pins = {
+        name: sha
+        for name, sha in (
+            item.split("@", 1) for item in pins.replace(",", " ").split()
+            if "@" in item
+        )
+    }
+    # eval-r15 B1: verify from the STATE.md pins with this release's
+    # parser, whatever the loaded core does with a vanished repo.
+    try:
+        unverifiable = _pinned_repos_unverifiable(mailbox, repo_pins)
+    except TrioctlError as exc:
+        # Single-repo acceptance never depended on the r15 parser.
+        unverifiable = f"repo-scope parser unavailable: {exc}" if repo_pins else None
+    if unverifiable is not None:
+        return {"pending": f"retirement not verified: {unverifiable}"}
     problem = core._ship_retirement_problem(mailbox, iteration, repo)
     if problem is not None:
         return {"pending": f"retirement not verified: {problem[1]}"}
@@ -1609,17 +1660,10 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
     accepted: dict[str, Any] = {
         "evaluated": evaluated, "iteration": iteration, "attempt": attempt,
     }
-    pins = str(state.get("evaluated_repos", "")).strip()
-    if pins:
+    if repo_pins:
         # r15: one verified pin per declared repo (the loop core's
         # retirement check above already verified each of them).
-        accepted["evaluated_repos"] = {
-            name: sha
-            for name, sha in (
-                item.split("@", 1) for item in pins.replace(",", " ").split()
-                if "@" in item
-            )
-        }
+        accepted["evaluated_repos"] = repo_pins
     return accepted
 
 
@@ -3415,6 +3459,46 @@ _OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE = (
 )
 
 
+# r15 multi-repo in LOCKSTEP (eval-r15 N2): rendered only when PLAN.md
+# declares `repos:`, so single-repo lockstep prompts stay byte-identical.
+_LOCKSTEP_MULTI_REPO_LEAD_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 3-5:\n"
+    "{repos}"
+    "- A slice's `repo:` (default `home`) is the repo its `writes:` are\n"
+    "  relative to, its builder works in, and its `slice(<id>):` commits\n"
+    "  land in (on that repo's checked-out base branch). One repo per slice\n"
+    "  (split a slice that would touch two).\n"
+    "- Dispatch a declared-repo slice's builder with `--workspace <repo path>`\n"
+    "  (with `## Isolated builders` the command is unchanged: trioctl creates\n"
+    "  the worktree from the slice's repo). A brief's `## Targeted check`\n"
+    "  `cd`s only to paths relative to the repo root, never to an absolute one.\n"
+    "- Step 4: run each repo's checks from that repo's root (`full_check:` is\n"
+    "  a string = home's command, or a `<repo>: <command>` mapping).\n"
+    "- Step 5: commit each slice in ITS repo (`git -C <repo path> commit ...`);\n"
+    "  the commit gate resolves every slice in its own repo, and every\n"
+    "  declared repo's tree must be clean.\n"
+)
+
+_LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`): the LOCKSTEP CONTEXT pins one sha\n"
+    "per repo --\n"
+    "{pins}"
+    "- Grade every repo at its pin. Step 4's `evaluated:` is ONE field line\n"
+    "  naming every pin instead of the bare sha: `evaluated: {evaluated}`.\n"
+    "- Run each repo's `full_check:` from that repo's root (a bare-string\n"
+    "  `full_check:` is home's command).\n"
+    "- Step 5 SHIP retirement is per repo. First, in each declared repo that\n"
+    "  has slices, on its checked-out base branch, make ONE empty retirement\n"
+    "  commit (no product edits -- any product change after the pin fails\n"
+    "  the driver's gate):\n"
+    "  `git -C <repo path> commit --allow-empty -m \"loop: iteration {iteration} — SHIP ({mailbox_name})\"`\n"
+    "  and record it in VERDICT.md as `commit: <repo>@<full sha>`; home's\n"
+    "  `commit:` line stays the bare sha. Then make the home mailbox commit\n"
+    "  exactly as step 5 says. These empty per-repo commits are the one\n"
+    "  exception to \"the SHIP mailbox retirement commit is your only commit\";\n"
+    "  never commit product edits.\n"
+)
+
 def _multi_repo_listing(
     repos: dict[str, dict[str, Any]], home: Path | None, pins: dict[str, str] | None = None
 ) -> str:
@@ -4608,11 +4692,49 @@ class OmnigentRunner:
                 " pins=" + ",".join(f"{n}@{v}" for n, v in pins.items())
                 if pins else ""
             )
+            note = ""
+            repos = _declared_repos(mailbox) if pins else {}
+            if repos:
+                # eval-r15 N2: the lockstep Evaluator's multi-repo procedure.
+                note = self._lockstep_multi_repo_note(
+                    "evaluator", iteration, mailbox, repos, context
+                )
             result = (
-                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n\n"
-                + result
+                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n"
+                + note + "\n" + result
             )
+        elif role in ("lead", "repair") and not (context or {}).get("mode"):
+            repos = _declared_repos(mailbox)
+            if repos:
+                # eval-r15 N2: the lockstep Lead's multi-repo procedure.
+                result = self._lockstep_multi_repo_note(
+                    role, iteration, mailbox, repos, context
+                ) + "\n" + result
         return result
+
+    def _lockstep_multi_repo_note(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        repos: dict[str, dict[str, Any]],
+        context: dict[str, Any] | None,
+    ) -> str:
+        """The r15 MULTI-REPO procedure of a LOCKSTEP prompt (eval-r15 N2)."""
+        if role in ("lead", "repair"):
+            return _LOCKSTEP_MULTI_REPO_LEAD_NOTE.format(
+                repos="Repos:\n" + _multi_repo_listing(repos, self.repo)
+            )
+        context = context or {}
+        pins = dict(context.get("pins") or {})
+        pins.setdefault("home", str(context.get("pinned_sha") or ""))
+        order = ["home", *repos]
+        return _LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE.format(
+            pins=_multi_repo_listing(repos, self.repo, pins),
+            evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
+            iteration=iteration,
+            mailbox_name=mailbox.name,
+        )
 
     def _observe_block(self, iteration: int, mailbox: Path) -> str:
         """Explicit worker-dispatch CLI for an observed Lead/repair pass.
@@ -4749,17 +4871,25 @@ class OmnigentRunner:
     ) -> tuple[str, dict[str, Any] | None]:
         """(repo name, declared repo or None) a slice-eval grades in (r15).
 
-        The loop core names it in the context (``repo``); a context without
-        it (an older core) falls back to the slice's PLAN.md `repo:`.
+        PLAN.md is authoritative (eval-r15 N1): the slice's PLAN.md `repo:`
+        (omitted = home, as in trio-check's check_queue) names the repo.
+        The loop core's context ``repo`` (set only for a declared repo; its
+        retire parse already holds an entry that disagrees with PLAN.md) is
+        a cross-check: a disagreement raises, so the bind degrades loudly
+        instead of grading another repo's tree.
         """
         context = context or {}
         repos = _declared_repos(mailbox)
         if not repos:
             return "home", None
-        name = str(context.get("repo") or "").strip()
-        if name:
-            return (name, repos[name]) if name in repos else ("home", None)
-        return _slice_repo(mailbox, context.get("slice"))
+        name, declared = _slice_repo(mailbox, context.get("slice"))
+        claimed = str(context.get("repo") or "").strip()
+        if claimed and claimed != name:
+            raise TrioctlError(
+                f"slice-eval context names repo {claimed!r} but PLAN.md puts "
+                f"slice {context.get('slice')!r} in repo {name!r}"
+            )
+        return name, declared
 
     def _discard_eval_worktree(self, record: dict[str, Any], exc: BaseException) -> None:
         """Remove (or record as retained) a created-but-unbound eval worktree."""
@@ -6116,7 +6246,16 @@ class OmnigentRunner:
                 self._fence_tokens.pop(token, None)
             repos = {token: self._fence_repos.pop(token, self.repo) for token in tokens}
         for token in tokens:
-            worker_worktrees.release_fence(repos[token], token)
+            # eval-r15 N5: each token on its own -- one vanished repo must
+            # not leak the fences of the others.
+            try:
+                worker_worktrees.release_fence(repos[token], token)
+            except Exception as exc:  # noqa: BLE001 - release the rest
+                print(
+                    f"trioctl: could not release merge fence {token} in "
+                    f"{repos[token]}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     def release_all_fences(self) -> None:
         """Loop end: no evaluation of this runner can still be running."""
@@ -6420,6 +6559,23 @@ def _loop_core_api(path: Path) -> int:
     return _api_marker(path, "LOOP_CORE_API")
 
 
+def _bundled_metrics_hint() -> str:
+    """Where a matching metrics/ set comes from (eval-r15 N9).
+
+    A release tree (RELEASE/omnigent/trioctl) has RELEASE/metrics next to
+    it; the plain install.sh layout (~/.local/bin/trioctl) has no loop core
+    beside it, so it names the source checkout instead of a path that does
+    not exist (~/.local/metrics).
+    """
+    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    if (bundled / "trio_loop.py").is_file():
+        return f"{bundled} (the release this trioctl belongs to)"
+    return (
+        "the metrics/ directory of the Trio release or checkout this trioctl "
+        "was installed from"
+    )
+
+
 def _refuse_core(path: Path, what: str) -> TrioctlError:
     import hashlib
 
@@ -6427,11 +6583,10 @@ def _refuse_core(path: Path, what: str) -> TrioctlError:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except OSError:
         digest = "unreadable"
-    bundled = Path(__file__).resolve().parent.parent / "metrics"
     return TrioctlError(
         f"incompatible loop core {path} (sha256 {digest}…): {what}. Refresh the "
         f"repository's metrics/ as a set (trio_loop.py, trio-metrics.py, trio-shadow.py, "
-        f"trio-check.py) from {bundled} (the release this trioctl belongs to) "
+        f"trio-check.py) from {_bundled_metrics_hint()} "
         "and commit it, or run the trioctl release that matches the vendored "
         "copy. Nothing was changed."
     )
@@ -6465,9 +6620,19 @@ def _check_loop_core_api(path: Path) -> None:
 
 
 def _core_metrics_api(loop_core: Any) -> int:
-    """METRICS_API of the metrics module a loaded loop core runs on (1 = unmarked)."""
+    """METRICS_API a loaded loop core can honour (1 = unmarked).
+
+    The lower of the core's own ``METRICS_API`` marker and its sibling
+    metrics module's (eval-r15 N3): a core that predates r15 carries no
+    marker and counts as below ``MULTI_REPO_METRICS_API`` even next to a
+    refreshed trio-metrics.py.
+    """
     value = getattr(getattr(loop_core, "_METRICS", None), "METRICS_API", 1)
-    return value if isinstance(value, int) else 1
+    metrics_api = value if isinstance(value, int) else 1
+    core_api = getattr(loop_core, "METRICS_API", None)
+    if not isinstance(core_api, int):
+        core_api = min(metrics_api, MULTI_REPO_METRICS_API - 1)
+    return min(metrics_api, core_api)
 
 
 def _old_core_repos_refusal(mailbox: Path, loop_core: Any) -> str | None:
@@ -6479,12 +6644,14 @@ def _old_core_repos_refusal(mailbox: Path, loop_core: Any) -> str | None:
     if not metrics.read_repos(Path(mailbox))["declared"]:
         return None
     where = getattr(loop_core, "__file__", None) or "metrics/trio_loop.py"
-    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    # Used before any dispatch and after a Lead/repair pass alike: say what
+    # holds in both (eval-r15 N9), never "nothing was dispatched".
     return (
         f"PLAN.md declares repos: (r15 multi-repo slices) but the loop core "
         f"{where} runs on METRICS_API {api}; multi-repo needs "
         f"{MULTI_REPO_METRICS_API}: refresh the repository's metrics/ as a set "
-        f"from {bundled} and commit it (nothing was dispatched)"
+        f"from {_bundled_metrics_hint()} and commit it (no further role is "
+        "dispatched)"
     )
 
 
