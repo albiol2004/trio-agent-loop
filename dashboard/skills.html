@@ -4,158 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Skills Registry · Trio Loops</title>
+<meta name="description" content="Browse, edit and install agent skills across every harness.">
+<title>Skills registry · Trio loops</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230B1214'/%3E%3Crect%20x='3' y='6' width='4' height='4' rx='1' fill='%233FBF8F'/%3E%3Crect%20x='9' y='6' width='4' height='4' rx='1' fill='%23E8A33D'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script src="/nav.js" defer></script>
 <script src="/skills.js" defer></script>
-<style>
-  .skills-topbar { position: sticky; top: 0; z-index: 10; }
-  .skills-topbar a { color: var(--blue); text-decoration: none; }
-  .skills-topbar a:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
-  .skills-topbar .page-state { color: var(--faint); }
-  .skills-topbar .page-state.is-error { color: var(--red); }
-  .skills-shell { min-height: 100vh; display: flex; flex-direction: column; }
-  .skills-layout {
-    width: 100%; max-width: 1680px; margin: 0 auto; padding: 18px 22px 42px;
-    display: grid; grid-template-columns: 220px minmax(250px, 0.8fr) minmax(390px, 1.75fr);
-    gap: 1px; flex: 1; min-height: 0;
-  }
-  .skills-pane { background: var(--surface); border: 1px solid var(--border); min-width: 0; min-height: 600px; }
-  .skills-pane + .skills-pane { border-left: 0; }
-  .pane-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 18px 16px 14px; border-bottom: 1px solid var(--border); }
-  .pane-heading h2 { margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; }
-  .pane-count { color: var(--faint); font: 12px var(--mono); }
-  .quiet-button, .action-button, .tree-all, .tree-item, .entry-row {
-    appearance: none; font: inherit; border: 0; background: none; color: inherit; cursor: pointer;
-  }
-  .quiet-button { color: var(--muted); font: 12px var(--mono); padding: 3px 0; }
-  .quiet-button:hover { color: var(--text); }
-  .tree-wrap { padding: 12px 10px 20px; overflow: auto; max-height: calc(100vh - 150px); }
-  .tree-all { width: 100%; padding: 8px 8px 9px; text-align: left; border-bottom: 1px solid var(--border); color: var(--muted); font: 12px var(--mono); }
-  .tree-all:hover, .tree-all.is-active { color: var(--amber); }
-  .tree-group { margin: 11px 0 0; }
-  .tree-group summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; padding: 4px 8px; color: var(--text); font: 12px var(--mono); }
-  .tree-group summary::-webkit-details-marker { display: none; }
-  .tree-group summary::before { content: '›'; color: var(--faint); width: 10px; display: inline-block; }
-  .tree-group[open] > summary::before { content: '⌄'; color: var(--amber); }
-  .tree-group summary:hover { color: var(--amber); }
-  .tree-group summary .tree-count { margin-left: auto; color: var(--faint); font-size: 12px; }
-  .tree-children { margin-left: 11px; border-left: 1px solid var(--border); padding-left: 5px; }
-  .tree-surface { display: block; width: 100%; padding: 5px 8px; text-align: left; color: var(--muted); font: 12px var(--mono); }
-  .tree-surface:hover, .tree-surface.is-active { color: var(--amber); background: var(--surface-2); }
-  .tree-surface .tree-count { float: right; color: var(--faint); }
-  .list-filter { padding: 10px 16px; border-bottom: 1px solid var(--border); color: var(--faint); font: 12px var(--mono); min-height: 37px; }
-  .entry-list { overflow: auto; max-height: calc(100vh - 195px); }
-  .entry-row { display: block; width: 100%; text-align: left; padding: 12px 16px 11px; border-bottom: 1px solid var(--border); }
-  .entry-row:hover { background: var(--surface-2); }
-  .entry-row.is-active { background: var(--surface-3); box-shadow: inset 2px 0 0 var(--amber); }
-  .entry-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-  .entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 13px; font-weight: 650; }
-  .entry-size { flex: 0 0 auto; color: var(--faint); font: 12px var(--mono); }
-  .entry-meta { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--faint); font: 12px var(--mono); }
-  .status-badge { display: inline-block; font: 12px var(--mono); letter-spacing: .03em; }
-  .status-in-sync { color: var(--green); } .status-stale { color: var(--red); }
-  .status-unknown { color: var(--faint); } .status-canonical { color: var(--blue); }
-  .status-managed { color: var(--muted); }
-  .editor-empty { padding: 40px 24px; color: var(--muted); font-size: 13px; line-height: 1.5; }
-  .editor-empty strong { display: block; color: var(--text); font-size: 14px; margin-bottom: 6px; }
-  .editor-header { padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
-  .editor-kicker { color: var(--faint); font: 12px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
-  .editor-title-row { display: flex; align-items: baseline; gap: 10px; margin-top: 4px; }
-  .editor-title { margin: 0; font-size: 20px; font-weight: 700; }
-  .editor-path { margin: 4px 0 0; color: var(--faint); font: 12px var(--mono); }
-  .editor-actions { display: flex; gap: 8px; margin-top: 12px; }
-  .action-button { padding: 5px 12px; font: 12px var(--mono); border: 1px solid var(--border); border-radius: 3px; color: var(--muted); background: var(--surface-2); }
-  .action-button:hover { color: var(--text); border-color: var(--muted); }
-  .action-button.primary { color: var(--green); border-color: var(--green); }
-  .action-button.primary:hover { background: var(--green); color: var(--bg); }
-  .action-button.danger { color: var(--red); border-color: var(--red); }
-  .action-button.danger:hover { background: var(--red); color: var(--bg); }
-  .import-panel { margin-top: 12px; padding: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; }
-  .managed-source {
-    margin-top: 12px; padding: 12px; background: var(--surface-2);
-    border: 1px solid var(--border); border-radius: 4px;
-  }
-  .managed-source .subheading { margin-bottom: 9px; }
-  .managed-source-grid { display: grid; gap: 7px; }
-  .managed-source-label {
-    display: block; color: var(--faint); font: 12px var(--mono);
-    text-transform: uppercase;
-  }
-  .managed-source-value {
-    display: block; overflow-wrap: anywhere; color: var(--text);
-    font: 12px var(--mono);
-  }
-  .managed-source-open { display: inline-block; margin-top: 10px; text-decoration: none; }
-  .import-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .field-label { display: block; color: var(--muted); font: 12px var(--mono); margin-bottom: 4px; }
-  .field-control { width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font: 12px var(--mono); }
-  .field-control:focus { outline: none; border-color: var(--amber); }
-  .field-control.field-offlist { border-color: var(--amber); }
-  .field-help.field-offlist-help { color: var(--amber); }
-  .field-control.field-error { border-color: var(--red); }
-  .field-help.field-error { color: var(--red); }
-  .import-footer { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
-  .frontmatter { padding: 14px 20px; border-bottom: 1px solid var(--border); }
-  .subheading { margin: 0 0 8px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
-  .frontmatter-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-  .frontmatter-head .subheading { margin-bottom: 0; }
-  .raw-toggle-label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font: 12px var(--mono); cursor: pointer; }
-  .raw-toggle-label input { cursor: pointer; }
-  .managed-note { color: var(--amber); margin: 0 0 10px; }
-  .frontmatter-form { display: flex; flex-direction: column; gap: 10px; }
-  .field-group { display: flex; flex-direction: column; gap: 6px; }
-  .destination-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; color: var(--faint); font: 12px var(--mono); }
-  .destination-list li { overflow-wrap: anywhere; }
-  .field-row { display: block; }
-  .field-help { margin: 3px 0 0; color: var(--faint); font: 12px var(--mono); }
-  .field-tag { display: inline-block; margin-top: 3px; color: var(--faint); font: 12px var(--mono); text-transform: uppercase; letter-spacing: .04em; }
-  .field-textarea { min-height: 56px; resize: vertical; }
-  .field-raw { min-height: 90px; resize: vertical; white-space: pre; }
-  .permission-grid { margin-top: 4px; border: 1px solid var(--border); }
-  .permission-grid-head, .permission-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px; gap: 8px; align-items: center; }
-  .permission-grid-head { padding: 5px 8px; color: var(--faint); font: 12px var(--mono); text-transform: uppercase; }
-  .permission-row { padding: 3px 8px; border-top: 1px solid var(--border); }
-  .permission-pattern { overflow-wrap: anywhere; color: var(--text); font: 12px var(--mono); }
-  .permission-group .permission-pattern { color: var(--muted); }
-  .permission-value { width: 100%; }
-  .frontmatter-raw textarea { width: 100%; }
-  .field-unknown-note { color: var(--amber-dim); margin: 2px 0 8px; }
-  .body-editor { display: block; padding: 14px 20px; flex: 1; min-height: 0; }
-  .body-editor textarea { width: 100%; min-height: 300px; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font: 12px/1.5 var(--mono); resize: vertical; }
-  .body-editor textarea:focus { outline: none; border-color: var(--amber); }
-  .editor-footer { display: flex; justify-content: space-between; padding: 10px 20px; border-top: 1px solid var(--border); color: var(--faint); font: 12px var(--mono); }
-  .message.is-ok { color: var(--green); }
-  .message.is-error { color: var(--red); }
-  #new-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 0; }
-  #new-dialog::backdrop { background: rgba(0,0,0,.6); }
-  .dialog-inner { padding: 24px; min-width: 340px; }
-  .dialog-inner h2 { margin: 0 0 16px; font-size: 16px; font-weight: 700; }
-  .dialog-inner .field-label { margin-top: 10px; }
-  .dialog-footer { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
-</style>
 </head>
 <body>
 <div id="app" class="skills-shell">
-  <header class="topbar skills-topbar">
-    <div class="brand">
-      <h1><a href="/">Trio Loops</a> · Skills Registry</h1>
-      <p class="brand-sub">browse and manage agent skills across harnesses</p>
-    </div>
-    <div class="topbar-meta">
-      <a href="/agents.html" style="color: var(--blue); text-decoration: none;" aria-label="Open agent install matrix">Agents</a>
-      <a href="/topology.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open harness topology">Topology</a>
-      <a href="/models.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open model registry">Models</a>
-      <a href="/health.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open registry health">Health</a>
-      <span id="page-state" class="page-state">loading registry…</span>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="appbar">
+    <a class="brand" href="/" aria-label="Trio loops home">
+      <span class="brand-mark" aria-hidden="true"></span>Trio loops
+    </a>
+    <nav class="primary-nav" aria-label="Sections">
+      <a href="/">Loops</a>
+      <a href="/skills.html" aria-current="page">Skills</a>
+      <a href="/agents.html" aria-label="Agents: install matrix">Agents</a>
+      <a href="/topology.html" aria-label="Topology: harness wiring">Topology</a>
+      <a href="/models.html" aria-label="Models: model registry">Models</a>
+      <a href="/health.html" aria-label="Health: registry health">Health</a>
+    </nav>
+    <div id="topbar-meta" class="topbar-meta appbar-tools">
+      <span id="page-state" class="page-state" role="status" aria-live="polite">loading registry…</span>
     </div>
   </header>
 
-  <main class="skills-layout" aria-label="Skills workspace">
+  <main id="main" class="page registry-page" aria-label="Skills workspace">
+    <section class="summary">
+      <h1 class="verdict">Skills registry</h1>
+      <p class="verdict-sub">Browse, edit and install agent skills across every harness.</p>
+    </section>
+  <div class="skills-layout">
 
     <aside class="skills-pane tree-pane" aria-label="Skill locations">
       <div class="pane-heading">
@@ -195,7 +76,7 @@
           <div class="editor-actions">
             <button id="import-toggle" class="action-button" type="button">Import to harness…</button>
             <button id="save-file" class="action-button primary" type="button">Save</button>
-            <button id="regen-file" class="action-button primary" type="button"
+            <button id="regen-file" class="action-button" type="button"
                     hidden>Regenerate &amp; re-install</button>
             <button id="delete-file" class="action-button danger" type="button">Delete</button>
           </div>
@@ -208,7 +89,7 @@
                 <select id="import-surface" class="field-control"></select>
               </label>
             </div>
-            <label class="field-label" style="margin-top:9px">Name
+            <label class="field-label import-name">Name
               <input id="import-name" class="field-control" type="text" autocomplete="off">
             </label>
             <div class="import-footer">
@@ -258,6 +139,7 @@
       </div>
     </section>
 
+  </div>
   </main>
 
   <dialog id="new-dialog" aria-labelledby="new-dialog-title">

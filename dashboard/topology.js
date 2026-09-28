@@ -133,9 +133,13 @@
       }));
     });
     topologySvg.append(edgeGroup);
-    LAYERS.forEach((kind) => topologySvg.append(svgText(TITLES[kind], {
-      class: "topology-layer-label", x: 16, y: Y[kind] - 46
-    })));
+    // Label only layers that have nodes: model and warning share a row.
+    LAYERS.forEach((kind, index) => {
+      if (!layers[index].length) return;
+      topologySvg.append(svgText(TITLES[kind], {
+        class: "topology-layer-label", x: 16, y: Y[kind] - 46
+      }));
+    });
     graph.nodes.forEach((node) => drawNode(node, positions.get(node.name)));
     $("topology-count").textContent = `${graph.nodes.length} nodes`;
     $("topology-summary").textContent = currentHarness;

@@ -37,6 +37,7 @@ const state = {
   es: null,
   offset: 0,
   size: null,
+  records: 0,
   follow: true,
   pendingLines: [],
   rafPending: false,
@@ -1129,6 +1130,10 @@ async function openDrawer(key) {
   el("drawer-timeline").appendChild(span("timeline-empty", "Loading…"));
   el("session-list").textContent = "";
   setPaneStatus("idle", "loading…");
+  state.offset = 0;
+  state.size = null;
+  state.records = 0;
+  setOffsetHint();
   renderTranscript();
 
   el("drawer").hidden = false;
@@ -1175,9 +1180,11 @@ async function refreshDetail({ quiet }) {
     if (state.activeLoop !== key) return;
     const detail = await res.json();
     state.detail = detail;
+    const before = sessionSignature(state.sessions);
     state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
     renderDetail(detail);
-    if (!quiet) renderSessionList();
+    if (!quiet || sessionSignature(state.sessions) !== before) renderSessionList();
+    if (state.drawerTab === "transcripts") openDefaultSession();
   } catch (err) {
     if (!quiet) {
       el("drawer-timeline").textContent = "";
@@ -1231,7 +1238,8 @@ function iterLifecycle(n) {
  * chips go through lifecycleChip(n), which delegates here). */
 function lifecycleChipFor(st) {
   const s = String(st || "");
-  return span("lifecycle-chip lifecycle-" + s, s.replace("_", " "));
+  const label = s.replace("_", " ");
+  return span("lifecycle-chip lifecycle-" + s, label.charAt(0).toUpperCase() + label.slice(1));
 }
 
 function lifecycleChip(n) {
@@ -1479,7 +1487,7 @@ function renderDrawerTabs() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "drawer-tab" + (state.drawerTab === tab ? " active" : "");
-    btn.textContent = tab;
+    btn.textContent = tab.charAt(0).toUpperCase() + tab.slice(1);
     btn.setAttribute("aria-pressed", String(state.drawerTab === tab));
     btn.addEventListener("click", () => {
       state.drawerTab = tab;
@@ -1500,6 +1508,7 @@ function showDrawerTab() {
   renderTimelineView();
   renderFilesView();
   renderGraphView();
+  if (state.drawerTab === "transcripts") openDefaultSession();
 }
 
 function appendEmpty(view, msg) {
@@ -1559,16 +1568,6 @@ function tlRole(entry) {
   return String(entry.role || "?").toLowerCase();
 }
 
-function tickStep(rangeMs, plotW) {
-  const steps = [
-    30e3, 60e3, 120e3, 300e3, 600e3, 900e3, 1800e3, 3600e3, 7200e3,
-    10800e3, 21600e3, 43200e3, 86400e3,
-  ];
-  for (const s of steps) {
-    if (s / Math.max(1, rangeMs) * plotW >= 80) return s;
-  }
-  return steps[steps.length - 1];
-}
 
 function scopeLabel(scope) {
   const s = String(scope);
@@ -1582,33 +1581,46 @@ function scopeLabel(scope) {
   return s.length > 18 ? s.slice(0, 17) + "…" : s;
 }
 
-function shortSlice(id) {
-  const s = String(id);
-  return s.length > 16 ? s.slice(0, 15) + "…" : s;
-}
 
-function fitText(text, px) {
-  const max = Math.max(1, Math.floor(px / 5.6));
-  const s = String(text);
-  return s.length > max ? s.slice(0, Math.max(1, max - 1)) + "…" : s;
-}
 
 /* --------------------------- Timeline view --------------------------- */
 
-/* Iteration-centric swimlane: one row per iteration, entries in seq order
- * as role-colored blocks (wall-clock positioned when timings exist), the
- * row's last verdict at the right edge, and PLAN.md slice pills beneath. */
+/* Iteration cards in the board's vocabulary: a header with verdict badge,
+ * lifecycle and a Compare toggle; a proportional time track when entries
+ * carry timings (legend above, tooltip per segment); one row per LOG entry
+ * with a right-aligned duration; PLAN.md slice chips that open the graph. */
+const TL_ROLES = ["lead", "builder", "evaluator", "repair"];
+
+function verdictTone(v) {
+  return { ship: "positive", needs_human: "warning", blocked: "negative" }[v] || "neutral";
+}
+
+function verdictBadge(raw) {
+  const v = normVerdict(raw);
+  const tone = verdictTone(v);
+  const b = span("badge badge-" + tone, "");
+  b.appendChild(span("badge-icon", { positive: "✓", warning: "!", negative: "✕", neutral: "↻" }[tone]));
+  b.appendChild(document.createTextNode(
+    { ship: "Ship", iterate: "Iterate", blocked: "Blocked", needs_human: "Needs human" }[v] ||
+    String(raw)));
+  return b;
+}
+
+function tlRoleClass(role) {
+  return TL_ROLES.includes(role) ? role : "other";
+}
+
 function renderTimelineView() {
   const view = el("view-timeline");
   if (view.hidden) return;
   view.textContent = "";
   if (!state.detail) {
-    appendEmpty(view, "Loading…");
+    appendEmpty(view, "Loading timeline…");
     return;
   }
   const entries = Array.isArray(state.detail.timeline) ? state.detail.timeline : [];
   if (!entries.length) {
-    appendEmpty(view, "No log entries yet.");
+    appendEmpty(view, "No LOG.md entries yet. Each role appends one line per pass; they appear here as iterations.");
     return;
   }
   const slices = Array.isArray(state.detail.slices) ? state.detail.slices : [];
@@ -1623,35 +1635,6 @@ function renderTimelineView() {
     }
   }
   iters.sort((x, y) => (x == null ? 1e9 : x) - (y == null ? 1e9 : y));
-
-  const timed = entries.some((e) => tlSpan(e));
-  const W = Math.max(360, view.clientWidth - 2);
-  const ML = 148;
-  const MR = 100;
-  const MT = 8;
-  const MB = timed ? 24 : 10;
-  const BLOCK_H = 22;
-  const PILL_H = 12;
-  const ROW_GAP = 12;
-  const plotW = W - ML - MR;
-
-  let minT = Infinity;
-  let maxT = -Infinity;
-  if (timed) {
-    for (const e of entries) {
-      const sp = tlSpan(e);
-      if (sp) {
-        minT = Math.min(minT, sp.start);
-        maxT = Math.max(maxT, sp.end);
-      }
-    }
-    if (!(maxT > minT)) {
-      minT = 0;
-      maxT = 1;
-    }
-  }
-  const xTime = (t) => ML + ((t - minT) / (maxT - minT)) * plotW;
-
   const rows = iters.map((it) => ({
     it,
     entries: entries.filter(
@@ -1661,210 +1644,27 @@ function renderTimelineView() {
       (sl) => sl && sl.iteration != null && Number(sl.iteration) === it
     ),
   }));
-  const maxCount = Math.max(1, ...rows.map((r) => r.entries.length));
-  const seqW = Math.max(28, Math.min(110, plotW / maxCount - 6));
+  const timed = entries.some((e) => tlSpan(e));
 
-  let totalH = 0;
-  const yOf = rows.map((r) => {
-    const y = totalH;
-    totalH += BLOCK_H + (r.slices.length ? PILL_H + 5 : 0) + ROW_GAP;
-    return y;
-  });
-  const H = MT + totalH + MB;
-  const svg = svgEl("svg", {
-    class: "tl-svg",
-    viewBox: "0 0 " + W + " " + H,
-    width: W,
-    height: H,
-    role: "img",
-    "aria-label": "Loop timeline",
-  });
-
-  rows.forEach((row, ri) => {
-    const y = MT + yOf[ri];
-    if (ri > 0) {
-      svg.appendChild(
-        svgEl("line", {
-          class: "tl-rowline",
-          x1: 0, x2: W, y1: y - ROW_GAP / 2, y2: y - ROW_GAP / 2,
-        })
-      );
-    }
-    if (row.it == null) {
-      const lab = svgEl("text", {
-        class: "tl-lane",
-        x: ML - 8,
-        y: y + BLOCK_H / 2 + 3.5,
-        "text-anchor": "end",
-      });
-      lab.textContent = "—";
-      svg.appendChild(lab);
-    } else {
-      const fo = svgEl("foreignObject", {
-        x: 0, y: y, width: ML - 8, height: BLOCK_H,
-      });
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "tl-lanebtn" +
-        (state.compare.includes(row.it) ? " selected" : "");
-      btn.setAttribute("aria-pressed", String(state.compare.includes(row.it)));
-      btn.title = "Click to compare iteration " + row.it;
-      btn.appendChild(span("tl-lanebtn-label", "iter " + row.it));
-      btn.appendChild(lifecycleChip(row.it));
-      btn.addEventListener("click", () => toggleCompare(row.it));
-      fo.appendChild(btn);
-      svg.appendChild(fo);
-    }
-
-    let untimedN = 0;
-    row.entries.forEach((entry, i) => {
-      const role = tlRole(entry);
-      const sp = timed ? tlSpan(entry) : null;
-      if (timed && !sp) {
-        /* Untimed entries in a timed chart: gutter markers right of the plot. */
-        const mx = ML + plotW + 6 + untimedN * 8;
-        untimedN++;
-        const m = svgEl("rect", {
-          class: "tl-untimed",
-          x: mx, y: y + BLOCK_H / 2 - 3, width: 6, height: 6,
-        });
-        const tip = svgEl("title", {});
-        tip.textContent = entryTitle(entry) + " · no timestamps";
-        m.appendChild(tip);
-        svg.appendChild(m);
-        return;
-      }
-      let bx;
-      let bw;
-      if (timed) {
-        bx = xTime(sp.start);
-        bw = Math.max(3, xTime(sp.end) - bx);
-      } else {
-        bx = ML + i * (seqW + 6);
-        bw = seqW;
-      }
-      const g = svgEl("g", {});
-      const seg = svgEl("rect", {
-        class: "tl-seg tl-role-" + cssClass(role),
-        x: bx, y: y, width: bw, height: BLOCK_H, rx: 4,
-      });
-      const tip = svgEl("title", {});
-      tip.textContent = entryTitle(entry);
-      seg.appendChild(tip);
-      g.appendChild(seg);
-      if (bw >= 44) {
-        const t = svgEl("text", {
-          class: "tl-block-label",
-          x: bx + 5,
-          y: y + BLOCK_H / 2 + 3.5,
-        });
-        t.textContent = fitText(entry.slice ? "bld " + shortSlice(entry.slice) : role, bw - 10);
-        g.appendChild(t);
-        if (entry.duration_sec != null && bw >= 92) {
-          const d = svgEl("text", {
-            class: "tl-block-dur",
-            x: bx + bw - 5,
-            y: y + BLOCK_H / 2 + 3.5,
-            "text-anchor": "end",
-          });
-          d.textContent = fmtDuration(entry.duration_sec);
-          g.appendChild(d);
-        }
-      }
-      if (entry.scope) {
-        const sc = svgEl("text", {
-          class: "tl-scope",
-          x: bx + bw + 5,
-          y: y + BLOCK_H / 2 + 3.5,
-        });
-        sc.textContent = scopeLabel(entry.scope);
-        const stip = svgEl("title", {});
-        stip.textContent = String(entry.scope);
-        sc.appendChild(stip);
-        g.appendChild(sc);
-      }
-      svg.appendChild(g);
-    });
-
-    /* Last verdict of the iteration at the right edge. */
-    const vEntry = [...row.entries].reverse().find((e) => e.verdict);
-    if (vEntry) {
-      const vc = normVerdict(vEntry.verdict);
-      const v = svgEl("text", {
-        class: "tl-verdict tl-verdict-" + vc,
-        x: W - 4,
-        y: y + BLOCK_H / 2 + 3.5,
-        "text-anchor": "end",
-      });
-      v.textContent = String(vEntry.verdict).toUpperCase();
-      const vtip = svgEl("title", {});
-      vtip.textContent = entryTitle(vEntry);
-      v.appendChild(vtip);
-      svg.appendChild(v);
-    }
-
-    /* Slice pills beneath the row; click jumps to the graph node. */
-    if (row.slices.length) {
-      let px = ML;
-      const py = y + BLOCK_H + 5;
-      for (const sl of row.slices) {
-        const id = String(sl.id ?? "");
-        const st = normSliceStatus(sl.status);
-        const wpx = Math.min(190, Math.max(44, id.length * 5.6 + 14));
-        if (px + wpx > ML + plotW + 30) break;
-        const pill = svgEl("g", { class: "tl-pill", cursor: "pointer" });
-        pill.appendChild(
-          svgEl("rect", {
-            class: "tl-pill-rect tl-pill-" + st,
-            x: px, y: py, width: wpx, height: PILL_H, rx: 6,
-          })
-        );
-        const pt = svgEl("text", {
-          class: "tl-pill-label",
-          x: px + 7,
-          y: py + PILL_H / 2 + 3,
-        });
-        pt.textContent = fitText(id, wpx - 12);
-        pill.appendChild(pt);
-        const ptip = svgEl("title", {});
-        ptip.textContent =
-          id + " · " + st.replace("_", " ") +
-          " · writes: " + (Array.isArray(sl.writes) ? sl.writes.length : 0) +
-          " · reads: " + (Array.isArray(sl.reads) ? sl.reads.length : 0);
-        pill.appendChild(ptip);
-        pill.addEventListener("click", () => {
-          state.graphSel = id;
-          state.drawerTab = "graph";
-          renderDrawerTabs();
-          showDrawerTab();
-        });
-        svg.appendChild(pill);
-        px += wpx + 6;
-      }
-    }
-  });
-
+  const head = document.createElement("div");
+  head.className = "tl-head";
+  head.appendChild(span("caption",
+    rows.length + (rows.length === 1 ? " iteration · " : " iterations · ") +
+    entries.length + (entries.length === 1 ? " entry" : " entries") +
+    (rows.some((r) => r.it != null) ? " · select two iterations to compare" : "")));
   if (timed) {
-    const step = tickStep(maxT - minT, plotW);
-    for (let t = Math.floor(minT / step) * step; t <= maxT; t += step) {
-      const gx = xTime(t);
-      svg.appendChild(
-        svgEl("line", { class: "tl-grid", x1: gx, y1: MT, x2: gx, y2: MT + totalH })
-      );
-      const lab = svgEl("text", {
-        class: "tl-axis-label",
-        x: gx,
-        y: MT + totalH + 14,
-        "text-anchor": "middle",
-      });
-      lab.textContent = fmtHm(t);
-      svg.appendChild(lab);
+    const legend = document.createElement("div");
+    legend.className = "tl-legend";
+    legend.setAttribute("aria-label", "Role colours");
+    for (const role of [...TL_ROLES, "other"]) {
+      const item = span("tl-legend-item", "");
+      item.appendChild(span("tl-swatch tl-role-" + role, ""));
+      item.appendChild(document.createTextNode(role));
+      legend.appendChild(item);
     }
+    head.appendChild(legend);
   }
-
-  const wrap = document.createElement("div");
-  wrap.className = "tl-wrap";
-  wrap.appendChild(svg);
+  view.appendChild(head);
 
   const overlaps =
     state.detail && Array.isArray(state.detail.overlaps) ? state.detail.overlaps : [];
@@ -1888,11 +1688,139 @@ function renderTimelineView() {
     view.appendChild(bar);
   }
 
-  if (state.compare.length) {
-    view.appendChild(comparePanel());
-  }
+  if (state.compare.length) view.appendChild(comparePanel());
 
-  view.appendChild(wrap);
+  for (const row of rows) view.appendChild(timelineIteration(row));
+}
+
+function timelineIteration(row) {
+  const card = document.createElement("section");
+  card.className = "tl-iter";
+  const selected = row.it != null && state.compare.includes(row.it);
+  if (selected) card.classList.add("is-selected");
+
+  const head = document.createElement("header");
+  head.className = "tl-iter-head";
+  const title = document.createElement("h3");
+  title.className = "tl-iter-title";
+  title.textContent = row.it == null ? "Unattributed" : "Iteration " + row.it;
+  head.appendChild(title);
+  const vEntry = [...row.entries].reverse().find((e) => e.verdict);
+  if (vEntry) head.appendChild(verdictBadge(vEntry.verdict));
+  if (row.it != null) head.appendChild(lifecycleChip(row.it));
+  const spans = row.entries.map(tlSpan).filter(Boolean);
+  const total = row.entries.reduce(
+    (acc, e) => acc + (Number.isFinite(Number(e.duration_sec)) ? Number(e.duration_sec) : 0), 0);
+  const meta = [row.entries.length + (row.entries.length === 1 ? " entry" : " entries")];
+  if (total > 0) meta.push(fmtDuration(total) + " logged");
+  head.appendChild(span("tl-iter-meta", meta.join(" · ")));
+  if (row.it != null) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-ghost btn-small tl-compare";
+    btn.textContent = selected ? "Comparing" : "Compare";
+    btn.setAttribute("aria-pressed", String(selected));
+    btn.setAttribute("aria-label", "Compare iteration " + row.it);
+    btn.title = "Select up to two iterations to compare side by side";
+    btn.addEventListener("click", () => toggleCompare(row.it));
+    head.appendChild(btn);
+  }
+  card.appendChild(head);
+
+  if (spans.length) card.appendChild(timelineTrack(row.entries, spans));
+
+  const list = document.createElement("ol");
+  list.className = "tl-entries";
+  for (const entry of row.entries) {
+    const li = document.createElement("li");
+    li.className = "tl-entry";
+    const role = tlRole(entry);
+    li.appendChild(span("tl-role tl-role-" + tlRoleClass(role), role));
+    const text = document.createElement("div");
+    text.className = "tl-entry-text";
+    let summary = String(entry.summary || "");
+    if (entry.verdict) {
+      summary = summary.replace(
+        /^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i, "");
+    }
+    if (entry.slice) text.appendChild(span("chip", String(entry.slice)));
+    if (entry.scope) {
+      const sc = span("chip chip-warning", scopeLabel(entry.scope));
+      sc.title = "Repair scope: " + String(entry.scope);
+      text.appendChild(sc);
+    }
+    const body = span("tl-summary", summary || "—");
+    body.title = summary;
+    text.appendChild(body);
+    li.appendChild(text);
+    const side = document.createElement("div");
+    side.className = "tl-entry-side";
+    if (entry.verdict) side.appendChild(verdictBadge(entry.verdict));
+    side.appendChild(span("tl-dur", entry.duration_sec != null ? fmtDuration(entry.duration_sec) : "—"));
+    li.appendChild(side);
+    list.appendChild(li);
+  }
+  card.appendChild(list);
+
+  if (row.slices.length) {
+    const chips = document.createElement("div");
+    chips.className = "tl-slices";
+    chips.appendChild(span("caption", "Slices"));
+    for (const sl of row.slices) {
+      const id = String(sl.id ?? "");
+      const st = normSliceStatus(sl.status);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip chip-btn chip-" + st;
+      chip.textContent = id;
+      chip.title =
+        id + " · " + st.replace("_", " ") +
+        " · writes: " + (Array.isArray(sl.writes) ? sl.writes.length : 0) +
+        " · reads: " + (Array.isArray(sl.reads) ? sl.reads.length : 0) +
+        " · open in graph";
+      chip.addEventListener("click", () => {
+        state.graphSel = id;
+        state.drawerTab = "graph";
+        renderDrawerTabs();
+        showDrawerTab();
+      });
+      chips.appendChild(chip);
+    }
+    card.appendChild(chips);
+  }
+  return card;
+}
+
+/* One horizontal track for an iteration: each timed entry is a segment
+ * positioned by wall clock; start/end clock labels underneath. */
+function timelineTrack(entries, spans) {
+  const minT = Math.min(...spans.map((sp) => sp.start));
+  const maxT = Math.max(...spans.map((sp) => sp.end));
+  const range = Math.max(1, maxT - minT);
+  const wrap = document.createElement("div");
+  wrap.className = "tl-track-wrap";
+  const track = document.createElement("div");
+  track.className = "tl-track";
+  track.setAttribute("role", "img");
+  track.setAttribute("aria-label", "Wall-clock span of each timed entry");
+  for (const entry of entries) {
+    const sp = tlSpan(entry);
+    if (!sp) continue;
+    const seg = document.createElement("span");
+    seg.className = "tl-seg tl-role-" + tlRoleClass(tlRole(entry));
+    seg.style.left = ((sp.start - minT) / range) * 100 + "%";
+    seg.style.width = Math.max(0.8, ((sp.end - sp.start) / range) * 100) + "%";
+    seg.title = entryTitle(entry);
+    track.appendChild(seg);
+  }
+  wrap.appendChild(track);
+  const axis = document.createElement("div");
+  axis.className = "tl-axis";
+  axis.appendChild(span("", fmtHm(minT)));
+  axis.appendChild(span("", fmtDuration((maxT - minT) / 1000)));
+  axis.appendChild(span("", fmtHm(maxT)));
+  wrap.appendChild(axis);
+  return wrap;
 }
 
 /* Side-by-side compare of up to two selected iterations. */
@@ -1905,7 +1833,7 @@ function comparePanel() {
   head.appendChild(span("section-label", "Compare iterations"));
   const clear = document.createElement("button");
   clear.type = "button";
-  clear.className = "follow-btn";
+  clear.className = "btn btn-ghost btn-small";
   clear.textContent = "Clear selection";
   clear.addEventListener("click", () => {
     state.compare = [];
@@ -2061,6 +1989,24 @@ function renderFilesView() {
     }
   }
 
+  const head0 = document.createElement("div");
+  head0.className = "tl-head";
+  head0.appendChild(span("caption",
+    rowKeys.length + (rowKeys.length === 1 ? " file" : " files") +
+    " written by PLAN.md slices, per iteration"));
+  const legend = document.createElement("div");
+  legend.className = "tl-legend";
+  const more = span("tl-legend-item", "");
+  more.appendChild(span("tl-swatch heat-swatch", ""));
+  more.appendChild(document.createTextNode("darker = more slices"));
+  legend.appendChild(more);
+  const drift = span("tl-legend-item", "");
+  drift.appendChild(span("tl-swatch heat-swatch-drift", ""));
+  drift.appendChild(document.createTextNode("written but undeclared"));
+  legend.appendChild(drift);
+  head0.appendChild(legend);
+  view.appendChild(head0);
+
   const wrap = document.createElement("div");
   wrap.className = "heat-wrap";
   const grid = document.createElement("div");
@@ -2068,17 +2014,18 @@ function renderFilesView() {
   grid.setAttribute("role", "table");
   grid.setAttribute("aria-label", "Slice file writes per iteration");
   grid.style.gridTemplateColumns =
-    "minmax(110px, 1fr) repeat(" + iterCols.length + ", 34px)";
+    "minmax(160px, 480px) repeat(" + iterCols.length + ", 40px)";
 
   const head = document.createElement("div");
   head.className = "heat-file heat-hdr";
   head.setAttribute("role", "columnheader");
-  head.textContent = "file";
+  head.textContent = "File";
   grid.appendChild(head);
   for (const it of iterCols) {
     const h = document.createElement("div");
     h.className = "heat-hdr";
-    h.textContent = it;
+    h.textContent = it === "—" ? "—" : "It " + it;
+    h.title = it === "—" ? "Unplanned" : "Iteration " + it;
     h.setAttribute("role", "columnheader");
     grid.appendChild(h);
   }
@@ -2099,7 +2046,7 @@ function renderFilesView() {
         (c && c.drift ? " drift" : "");
       if (c) {
         const a = 0.1 + 0.65 * (c.count / maxCount);
-        cell.style.background = "rgba(232, 163, 61, " + a.toFixed(3) + ")";
+        cell.style.setProperty("--heat", (a * 100).toFixed(1) + "%");
         cell.title = label + (it === "—" ? " · unplanned" : " · iter " + it) +
           " — " + c.ids.join(", ") +
           (c.drift ? " (undeclared)" : "");
@@ -2341,10 +2288,36 @@ function renderGraphView() {
 
 /* --------------------------- sessions --------------------- */
 
+function sessionSignature(sessions) {
+  return sessions.map((s) => s.path + ":" + s.size).join("|");
+}
+
+/* Transcripts tab with nothing selected: open the newest session so the
+ * tab never opens onto a blank pane. */
+function openDefaultSession() {
+  if (state.activePath || !state.detail) {
+    if (!state.detail) showTranscriptNotice("Loading sessions…");
+    return;
+  }
+  if (!state.sessions.length) {
+    showTranscriptNotice(
+      "No session transcripts for this loop. Omnigent drivers export each " +
+      "role session to the mailbox's .sessions/ folder and omp runs keep " +
+      "theirs under ~/.omp; this loop's driver recorded neither."
+    );
+    return;
+  }
+  const first = state.sessions.find((s) => s.kind !== "subagent") || state.sessions[0];
+  openSession(first.path);
+}
+
 function renderSessionList() {
   const list = el("session-list");
   list.textContent = "";
-  if (!state.sessions.length) return;
+  if (!state.sessions.length) {
+    list.appendChild(span("session-empty", state.detail ? "No sessions recorded" : "Loading…"));
+    return;
+  }
 
   if (!state.sessions.some((s) => s.kind === "subagent")) {
     const frag = document.createDocumentFragment();
@@ -2410,6 +2383,7 @@ function sessionItem(s, depth = 0, subCount = 0) {
 
   const label = s.label ? String(s.label).replace(/\.jsonl$/, "") : s.id;
   const meta = [relTime(s.timestamp), fmtSize(s.size)];
+  if (s.agent) meta.unshift(String(s.agent).replace(/^trio-omnigent-/, ""));
   if (isSub) {
     meta.push("sub");
   } else if (subCount > 0) {
@@ -2431,6 +2405,7 @@ function openSession(path) {
   state.activePath = path;
   state.offset = 0;
   state.size = null;
+  state.records = 0;
   state.follow = true;
   updateFollowBtn();
   setOffsetHint();
@@ -2455,6 +2430,7 @@ function openSession(path) {
       state.offset = Number(data.offset) || 0;
       state.size = data.size != null ? Number(data.size) : null;
       setOffsetHint();
+      showTranscriptNotice(state.size ? "Loading transcript…" : "This session file is empty so far; new records appear here as they are written.");
     } catch { /* malformed init — ignore */ }
   });
 
@@ -2517,17 +2493,31 @@ function flushLines() {
   if (!lines.length) return;
   const view = el("transcript-view");
   for (const rec of lines) appendRecord(view, rec);
+  state.records += lines.length;
+  if (!view.childElementCount) {
+    showTranscriptNotice(state.records + " records read, none of them messages yet.");
+  }
   if (state.follow) view.scrollTop = view.scrollHeight;
 }
 
+function recordTime(rec) {
+  if (!rec) return null;
+  if (rec.timestamp) return rec.timestamp;
+  const epoch = Number(rec.created_at);
+  return Number.isFinite(epoch) && epoch > 0 ? new Date(epoch * 1000).toISOString() : null;
+}
+
 function timeEl(rec) {
-  const t = fmtClock(rec && rec.timestamp);
+  const t = fmtClock(recordTime(rec));
   return t ? span("tr-time", t) : null;
 }
 
+/* omp writes `text` parts; Omnigent exports `input_text` / `output_text`. */
+const TEXT_PARTS = new Set(["text", "input_text", "output_text"]);
+
 function textOf(parts) {
   return (Array.isArray(parts) ? parts : [])
-    .filter((p) => p && p.type === "text" && typeof p.text === "string")
+    .filter((p) => p && TEXT_PARTS.has(p.type) && typeof p.text === "string")
     .map((p) => p.text)
     .join("\n")
     .trim();
@@ -2537,6 +2527,26 @@ function textOf(parts) {
 function appendRecord(view, rec) {
   if (!rec || typeof rec !== "object") return;
   hideTranscriptNotice();
+
+  /* Omnigent session header: the first line, with no `type`. */
+  if (!rec.type && (rec.agent_name || rec.title)) {
+    const who = rec.agent_name ? String(rec.agent_name) : "";
+    metaRow(view, rec, "session", [who, rec.title].filter(Boolean).join(" · "));
+    return;
+  }
+  if (rec.type === "resource_event") {
+    const kind = String(rec.event_type || "").split(".").pop();
+    const res = rec.resource || {};
+    const name = res.name || rec.resource_id || rec.resource_type || "";
+    metaRow(view, rec, (rec.resource_type || "resource") + " " + (kind || "event"), name);
+    return;
+  }
+  /* Omnigent messages carry role and content at the top level. */
+  if (rec.type === "message" && !rec.message && rec.role) {
+    const text = textOf(rec.content);
+    if (text) view.appendChild(msgBlock(rec, rec.role === "user" ? "user" : "assistant", rec.role, text));
+    return;
+  }
 
   if (rec.type === "message") {
     const msg = rec.message || {};
@@ -2552,7 +2562,7 @@ function appendRecord(view, rec) {
     if (role === "assistant") {
       for (const part of parts) {
         if (!part || typeof part !== "object") continue;
-        if (part.type === "text" && part.text && part.text.trim()) {
+        if (TEXT_PARTS.has(part.type) && part.text && part.text.trim()) {
           view.appendChild(msgBlock(rec, "assistant", "assistant", part.text.trim()));
         } else if (part.type === "thinking" && part.thinking) {
           view.appendChild(thinkingBlock(rec, part.thinking));
@@ -2602,7 +2612,9 @@ function appendRecord(view, rec) {
     return;
   }
   if (rec.type === "compaction") {
-    metaRow(view, rec, "compacted", oneLine(rec.summary || "", 120));
+    const n = Array.isArray(rec.compacted_messages) ? rec.compacted_messages.length : 0;
+    const text = rec.summary ? oneLine(rec.summary, 120) : n ? n + " earlier messages folded" : "";
+    metaRow(view, rec, "compacted", text);
     return;
   }
 
@@ -2737,6 +2749,13 @@ function updateFollowBtn() {
 }
 
 function setOffsetHint() {
+  const follow = el("follow-btn");
+  follow.disabled = !state.activePath;
+  follow.title = state.activePath ? "" : "Open a session to follow it";
+  if (!state.activePath) {
+    el("offset-hint").textContent = "";
+    return;
+  }
   const parts = ["offset " + state.offset];
   if (state.size != null) parts.push("size " + fmtSize(state.size));
   el("offset-hint").textContent = parts.join(" · ");

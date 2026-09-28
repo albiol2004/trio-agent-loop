@@ -6,13 +6,13 @@
   if (!meta) return;
   const holder = document.createElement("label");
   holder.className = "workspace-nav";
-  holder.style.cssText = "display:inline-flex;align-items:center;gap:6px;color:var(--muted);font: 12px var(--mono);";
-  holder.textContent = "Workspace";
+  const caption = document.createElement("span");
+  caption.className = "workspace-nav-label";
+  caption.textContent = "Workspace";
   const select = document.createElement("select");
-  select.className = "field-control";
-  select.style.cssText = "min-height:26px;padding:3px 7px;width:auto;max-width:260px;";
+  select.className = "select";
   select.setAttribute("aria-label", "Workspace");
-  holder.append(select);
+  holder.append(caption, select);
   meta.prepend(holder);
 
   function announce(path) {

@@ -55,7 +55,9 @@ Sessions:
     The loop's absolute path is mapped to an omp session slug ("-" +
     path-relative-to-$HOME with "/" -> "-"); if that slug directory does
     not exist, the project root's slug is used as a fallback (sessions
-    are keyed by the cwd of the omp run).
+    are keyed by the cwd of the omp run). Omnigent session exports in the
+    loop's own ``.sessions/`` directory are listed as parents too, with
+    "source": "mailbox", "agent" and "status" from their header line.
 
 Transcript tail (SSE):
     GET /api/transcript?path=<absolute-path>&offset=<bytes>
@@ -64,7 +66,8 @@ Transcript tail (SSE):
         event: init   data: {"offset": <int>, "size": <int>}
         event: line   data: {"offset": <byte-offset-after-line>, "record": <obj>}
         event: error  data: {"error": "<message>"}   (then the stream closes)
-    Path is validated to resolve under ~/.omp/agent/sessions/. Incomplete
+    Path is validated to resolve under ~/.omp/agent/sessions/ or to be a
+    ``.sessions/*.jsonl`` export inside a loop mailbox of `root`. Incomplete
     final lines are buffered until more bytes arrive. The stream polls the
     file every ~500 ms and emits a ":heartbeat" comment every ~15 s.
 
@@ -278,6 +281,11 @@ _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
 SESSIONS_ROOT = HOME / ".omp" / "agent" / "sessions"
+
+MAILBOX_SESSIONS_DIR = ".sessions"
+"""Per-mailbox directory where the Omnigent drivers (trioctl) export each
+role session as ``<epoch>-<slug>-<id>.jsonl``: line 1 is the session
+header, then ``message`` / ``resource_event`` / ``compaction`` records."""
 
 # Keep handles for children started by this server so stop can reap a child
 # after sending SIGTERM without ever signalling its process group.
@@ -2262,6 +2270,85 @@ def _parse_session_file(path: Path) -> dict:
         "size": path.stat().st_size,
     }
 
+def _mailbox_session_files(loop_dir: Path) -> list[Path]:
+    """``.jsonl`` files directly inside ``<loop>/.sessions/``.
+
+    Symlinks that resolve outside that directory are skipped, so the
+    transcript endpoint only ever tails files that really live there.
+    """
+    directory = Path(loop_dir) / MAILBOX_SESSIONS_DIR
+    try:
+        real_dir = directory.resolve()
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    files = []
+    for entry in entries:
+        if entry.name.startswith(".") or entry.suffix != ".jsonl":
+            continue
+        try:
+            if entry.is_file() and entry.resolve().parent == real_dir:
+                files.append(entry)
+        except OSError:
+            continue
+    return files
+
+
+def _epoch_iso(value) -> str | None:
+    """ISO-8601 UTC for an epoch-seconds value, or None."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace(
+            "+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
+    """Describe one exported Omnigent session from its header line.
+
+    The label drops the driver's ``trioctl <loop> `` title prefix so the
+    list reads ``evaluator:iteration 1``. A missing or malformed header
+    falls back to the file name, its leading epoch, then the mtime, so the
+    file is never hidden.
+    """
+    stem = path.name[: -len(".jsonl")]
+    header: dict = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            first = json.loads(fh.readline() or "null")
+        if isinstance(first, dict) and "type" not in first:
+            header = first
+    except (OSError, ValueError):
+        header = {}
+    stat = path.stat()
+    title = str(header.get("title") or "").strip()
+    # trioctl titles name the loop by its full name or, for nested
+    # ``loop/<name>`` mailboxes, by the last segment only.
+    short_name = loop_name.rsplit("/", 1)[-1]
+    for prefix in (f"trioctl {loop_name} ", f"trioctl {short_name} ", "trioctl "):
+        if title.startswith(prefix):
+            title = title[len(prefix):]
+            break
+    stem_epoch = re.match(r"^(\d{9,11})-", stem)
+    timestamp = (_epoch_iso(header.get("created_at"))
+                 or (_epoch_iso(stem_epoch.group(1)) if stem_epoch else None)
+                 or _epoch_iso(stat.st_mtime))
+    return {
+        "id": str(header.get("id") or stem),
+        "label": title or stem,
+        "timestamp": timestamp,
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "source": "mailbox",
+        "agent": str(header.get("agent_name") or "") or None,
+        "status": str(header.get("status") or "") or None,
+    }
+
+
 def _resolve_registry_path(value) -> Path:
     """Resolve an API path, raising ``ValueError`` for malformed values."""
     if not isinstance(value, str) or not value.strip():
@@ -3908,8 +3995,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # -- /api/sessions -----------------------------------------------------
 
     def _session_list(self, loop_dir: Path, root: Path) -> list[dict]:
-        """Parents first (newest first), then subagents, for one loop."""
+        """Parents first (newest first), then subagents, for one loop.
+
+        Parents are omp sessions keyed by cwd plus the Omnigent session
+        exports in the mailbox's own ``.sessions/`` directory.
+        """
         sessions = []
+        loop_name = self.server.metrics.loop_name(root, loop_dir)
+        for path in _mailbox_session_files(loop_dir):
+            try:
+                session = _parse_mailbox_session_file(path, loop_name)
+            except OSError:
+                continue
+            session["kind"] = "parent"
+            session["parent_id"] = None
+            session["parent_path"] = None
+            sessions.append(session)
         for desc in _session_files_for_loop(loop_dir, root):
             try:
                 session = _parse_session_file(desc["path"])
@@ -4222,9 +4323,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
 
-    def _validate_transcript_params(self, query: dict) -> tuple[int, Path]:
+    def _is_mailbox_session(self, target: Path, root: Path) -> bool:
+        """True when `target` sits in ``.sessions/`` of one of root's loops."""
+        if target.suffix != ".jsonl" or target.parent.name != MAILBOX_SESSIONS_DIR:
+            return False
+        loop_dir = target.parent.parent
+        try:
+            loops = self.server.metrics.discover_loops(root)
+        except Exception:
+            return False
+        for candidate in loops:
+            try:
+                if Path(candidate).resolve() == loop_dir:
+                    return target in {
+                        p.resolve() for p in _mailbox_session_files(candidate)}
+            except OSError:
+                continue
+        return False
+
+    def _validate_transcript_params(self, query: dict,
+                                    root: Path | None = None) -> tuple[int, Path]:
         """Validate `path`/`offset` for the transcript endpoint.
 
+        The path must resolve under the omp sessions root or be a session
+        export inside a loop mailbox of the request's workspace root.
         Raises ValueError with a client-safe message when invalid.
         """
         offset = 0
@@ -4246,7 +4368,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             target.relative_to(SESSIONS_ROOT.resolve())
         except ValueError:
-            raise ValueError("invalid session path")
+            if root is None or not self._is_mailbox_session(target, root):
+                raise ValueError("invalid session path")
         if not target.is_file():
             raise ValueError("session file not found")
         return offset, target
@@ -4316,9 +4439,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     next_heartbeat = now + HEARTBEAT_SECONDS
                 time.sleep(POLL_SECONDS)
 
-    def _handle_transcript(self, query: dict) -> None:
+    def _handle_transcript(self, query: dict, root: Path | None = None) -> None:
         try:
-            offset, target = self._validate_transcript_params(query)
+            offset, target = self._validate_transcript_params(query, root)
         except ValueError as exc:
             return self._sse_error({"error": str(exc)})
         except Exception:
@@ -4441,9 +4564,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             return self._api(lambda: self._handle_sessions(query, root))
         if path == "/api/transcript":
-            if self._request_root(query) is None:
+            root = self._request_root(query)
+            if root is None:
                 return
-            return self._handle_transcript(query)
+            return self._handle_transcript(query, root)
         if path.startswith("/api/"):
             return self._send_json(404, {"error": "not found"})
         return self._send_text(404, "not found")
