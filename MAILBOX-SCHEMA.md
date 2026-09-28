@@ -798,7 +798,12 @@ another branch.
   when every repo's pin is recorded, its product tree is unchanged since
   the pin, its `commit:` lines are reachable, and its retirement commit
   descends from the pin; post-SHIP cleanup removes each repo's worktrees
-  against that repo's pin.
+  against that repo's pin. The check starts from the STATE.md
+  `evaluated_repos` pins, not from the current PLAN.md: a pinned repo that
+  is no longer declared (dropped, moved or deleted) or a `repos:` block
+  that no longer validates makes the SHIP final (never accepted on the
+  home checks alone), and an integration pin is reused on resume only
+  under the same rule.
 - **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`;
   `trioctl` still drives a METRICS_API 4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it (loop `status: error`, nothing

@@ -1111,22 +1111,71 @@ def _log_untracked_product_blockers(
 # any of this (`_declared_repos` is []).
 
 
-def _declared_repos(mailbox: Path) -> list[tuple[str, Path]]:
-    """(name, path) of PLAN.md's declared `repos:` (r15), in PLAN order.
+def _declared_repos_checked(
+    mailbox: Path,
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """``(valid declared repos, errors)`` of PLAN.md's `repos:` block (r15).
 
-    [] in single-repo mode and when the block does not validate (trioctl
-    and trio-check refuse such a PLAN before any dispatch).
+    The valid entries survive an error in another entry (a clone that
+    vanished mid-run is an error of that entry only). ``([], [])`` in
+    single-repo mode and with a metrics module that predates `repos:`;
+    a reader that raises is an error, never single-repo.
     """
     reader = getattr(_METRICS, "read_repos", None)
     if reader is None:
-        return []
+        return [], []
     try:
         info = reader(Path(mailbox))
-    except Exception:  # noqa: BLE001 - an unreadable block is single-repo here
-        return []
-    if info.get("errors"):
-        return []
-    return [(r["name"], Path(r["path"])) for r in info.get("repos") or []]
+    except Exception as exc:  # noqa: BLE001 - reported, never single-repo
+        return [], [f"PLAN.md repos: unreadable ({type(exc).__name__}: {exc})"]
+    repos = [(r["name"], Path(r["path"])) for r in info.get("repos") or []]
+    return repos, [str(e) for e in info.get("errors") or []]
+
+
+def _declared_repos(mailbox: Path) -> list[tuple[str, Path]]:
+    """(name, path) of PLAN.md's declared `repos:` (r15), in PLAN order.
+
+    [] in single-repo mode and when the block does not validate. Only the
+    pinning and snapshot helpers use this; the SHIP retirement gate and
+    pin reuse verify from STATE.md ``evaluated_repos`` and treat an invalid
+    block as final (eval-r15 B1), see ``_declared_repos_retirement_problem``.
+    """
+    repos, errors = _declared_repos_checked(mailbox)
+    return [] if errors else repos
+
+
+def _pinned_repos_problem(
+    mailbox: Path, pins: dict[str, str]
+) -> tuple[list[tuple[str, Path]], str | None]:
+    """``(declared repos, why the pins cannot be verified or None)``.
+
+    The per-repo gates verify from STATE.md ``evaluated_repos``, never
+    from whatever PLAN.md says now (eval-r15 B1): a present but invalid
+    `repos:` block, or a pinned repo that is no longer declared (dropped
+    from PLAN.md, moved or deleted: a missing path is a block error), is a
+    problem -- the pinned tree can no longer be checked, so it must never
+    ship on the home checks alone.
+    """
+    declared, errors = _declared_repos_checked(mailbox)
+    if errors:
+        return [], (
+            "PLAN.md repos: block does not validate, so the per-repo pins "
+            f"cannot be verified: {errors[0]}"
+        )
+    if pins and getattr(_METRICS, "read_repos", None) is None:
+        return [], (
+            "STATE.md evaluated_repos pins declared repos but this metrics "
+            "module cannot read PLAN.md repos:"
+        )
+    names = {name for name, _path in declared}
+    for name, sha in pins.items():
+        if name not in names:
+            return declared, (
+                f"repo {name} is pinned in STATE.md evaluated_repos "
+                f"({name}@{sha[:12]}) but is no longer declared in PLAN.md "
+                "repos:"
+            )
+    return declared, None
 
 
 def _repos_with_slices(mailbox: Path, declared: list[tuple[str, Path]]) -> list[str]:
@@ -1181,7 +1230,9 @@ def _declared_repos_retirement_problem(
 ) -> tuple[str, str] | None:
     """Per-repo SHIP retirement of a `repos:` mailbox (r15), or None.
 
-    For every declared repo: STATE.md ``evaluated_repos`` pins it, the
+    Verified from the STATE.md pins (eval-r15 B1): an invalid `repos:`
+    block, or a pinned repo no longer declared, is final. Then for every
+    declared repo: STATE.md ``evaluated_repos`` pins it, the
     integration verdict records ``evaluated: <repo>@<pin>``, and the repo's
     product tree is unchanged since that pin (final otherwise). Every
     ``commit: <repo>@<sha>`` line must be a commit reachable from that
@@ -1189,10 +1240,12 @@ def _declared_repos_retirement_problem(
     iteration N — SHIP`` retirement commit after the pin (pending
     otherwise: the Evaluator may still be committing).
     """
-    declared = _declared_repos(mailbox)
+    pins = _state_repo_pins(state)
+    declared, unverifiable = _pinned_repos_problem(mailbox, pins)
+    if unverifiable is not None:
+        return RETIREMENT_FINAL, unverifiable
     if not declared:
         return None
-    pins = _state_repo_pins(state)
     integration = _integration_verdict_text(text)
     with_slices = set(_repos_with_slices(mailbox, declared))
     pending: tuple[str, str] | None = None
@@ -1704,11 +1757,19 @@ def _lockstep_eval_context(
     declared = _declared_repos(mailbox)
     repo_pins = {} if fresh else _state_repo_pins(state)
     if declared:
+        # Resume keeps every persisted pin, also one whose repo is no
+        # longer declared: the retirement gate verifies from these pins
+        # and refuses such a SHIP (eval-r15 B1).
         repo_pins = {
-            name: repo_pins.get(name) or _git_head(path) or ""
-            for name, path in declared
+            **repo_pins,
+            **{
+                name: repo_pins.get(name) or _git_head(path) or ""
+                for name, path in declared
+            },
         }
         updates["evaluated_repos"] = _format_repo_pins(repo_pins)
+    elif fresh:
+        updates["evaluated_repos"] = ""  # clears a stale pin, never adds one
     _update_state(state_path, updates)
     context = {
         "pinned_sha": pinned,
@@ -1747,8 +1808,11 @@ def _open_loop_integration_context(
     reuse = bool(attempt and pinned)
     if reuse and git_root is not None:
         reuse = _evaluated_product_intact(git_root, state_path.parent, pinned)
-    if reuse and declared:
-        reuse = all(
+    if reuse and (declared or repo_pins):
+        # eval-r15 B1: reuse is verified from the persisted pins; an
+        # invalid block or a pinned repo no longer declared never reuses.
+        _checked, unverifiable = _pinned_repos_problem(mailbox, repo_pins)
+        reuse = unverifiable is None and all(
             repo_pins.get(name)
             and _evaluated_product_intact(path, mailbox, repo_pins[name])
             for name, path in declared
@@ -1758,7 +1822,9 @@ def _open_loop_integration_context(
         pinned = head or ""
         repo_pins = {name: _git_head(path) or "" for name, path in declared}
     updates = {"evaluated_sha": pinned, "evaluator_attempt": attempt}
-    if declared:
+    if declared or not reuse:
+        # A fresh pin always rewrites the key (an empty value clears a
+        # stale pin of a repo no longer declared; never adds one).
         updates["evaluated_repos"] = _format_repo_pins(
             {name: repo_pins.get(name, "") for name, _path in declared}
         )

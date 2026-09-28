@@ -1105,21 +1105,55 @@ def _repo_scope_refusals(
     )
 
 
-def _declared_repos(mailbox: Path) -> dict[str, dict[str, Any]]:
-    """PLAN.md `repos:` of *mailbox*: ``{name: {"path": Path, "base": str|None}}``.
+def _declared_repos_checked(
+    mailbox: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """``(valid declared repos, block errors)`` of *mailbox*'s PLAN.md `repos:`.
 
-    ``{}`` in single-repo mode (no block, `repos: []`, missing PLAN.md) and
-    when the block does not validate (the r15 guard refuses that PLAN).
+    Each valid entry survives an error in another one (eval-r15 N5: one
+    vanished clone must not send the healthy repos' slice-evals home).
     Parsed with this release's trio-metrics (never a vendored copy).
     """
     _module, metrics = _load_trio_check()
     info = metrics.read_repos(Path(mailbox))
-    if info["errors"]:
-        return {}
-    return {
+    repos = {
         r["name"]: {"path": Path(r["path"]), "base": r.get("base")}
         for r in info["repos"]
     }
+    return repos, [str(e) for e in info["errors"]]
+
+
+def _declared_repos(mailbox: Path) -> dict[str, dict[str, Any]]:
+    """PLAN.md `repos:` of *mailbox*: ``{name: {"path": Path, "base": str|None}}``.
+
+    ``{}`` in single-repo mode (no block, `repos: []`, missing PLAN.md).
+    When another entry does not validate (the r15 guard refuses that PLAN
+    before any Lead pass), the valid entries are still returned, so a
+    slice-eval or a cleanup of a healthy repo never falls back to home;
+    the SHIP gates verify from STATE.md pins instead (``_ship_acceptance``).
+    """
+    return _declared_repos_checked(mailbox)[0]
+
+
+def _pinned_repos_unverifiable(mailbox: Path, pins: dict[str, str]) -> str | None:
+    """Why STATE.md ``evaluated_repos`` *pins* cannot be verified, or None.
+
+    eval-r15 B1: an invalid `repos:` block, or a pinned repo that is no
+    longer declared (dropped, moved, deleted), is never accepted.
+    """
+    repos, errors = _declared_repos_checked(mailbox)
+    if errors:
+        return (
+            "PLAN.md repos: block does not validate, so the per-repo pins "
+            f"cannot be verified: {errors[0]}"
+        )
+    for name, sha in pins.items():
+        if name not in repos:
+            return (
+                f"repo {name} is pinned in STATE.md evaluated_repos "
+                f"({name}@{sha[:12]}) but is no longer declared in PLAN.md repos:"
+            )
+    return None
 
 
 def _plan_slices(mailbox: Path) -> list[dict[str, Any]]:
@@ -1561,6 +1595,23 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
         return {"pending": "SHIP is not bound to an evaluator attempt"}
     if not re.fullmatch(r"[0-9a-f]{40}", evaluated):
         return {"pending": "SHIP is not bound to a full evaluated sha"}
+    pins = str(state.get("evaluated_repos", "")).strip()
+    repo_pins = {
+        name: sha
+        for name, sha in (
+            item.split("@", 1) for item in pins.replace(",", " ").split()
+            if "@" in item
+        )
+    }
+    # eval-r15 B1: verify from the STATE.md pins with this release's
+    # parser, whatever the loaded core does with a vanished repo.
+    try:
+        unverifiable = _pinned_repos_unverifiable(mailbox, repo_pins)
+    except TrioctlError as exc:
+        # Single-repo acceptance never depended on the r15 parser.
+        unverifiable = f"repo-scope parser unavailable: {exc}" if repo_pins else None
+    if unverifiable is not None:
+        return {"pending": f"retirement not verified: {unverifiable}"}
     problem = core._ship_retirement_problem(mailbox, iteration, repo)
     if problem is not None:
         return {"pending": f"retirement not verified: {problem[1]}"}
@@ -1580,17 +1631,10 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
     accepted: dict[str, Any] = {
         "evaluated": evaluated, "iteration": iteration, "attempt": attempt,
     }
-    pins = str(state.get("evaluated_repos", "")).strip()
-    if pins:
+    if repo_pins:
         # r15: one verified pin per declared repo (the loop core's
         # retirement check above already verified each of them).
-        accepted["evaluated_repos"] = {
-            name: sha
-            for name, sha in (
-                item.split("@", 1) for item in pins.replace(",", " ").split()
-                if "@" in item
-            )
-        }
+        accepted["evaluated_repos"] = repo_pins
     return accepted
 
 
