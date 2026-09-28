@@ -515,6 +515,59 @@ def _seed(wt: Any, home: Path, lead: Path, rel: str) -> str | None:
     return _out(wt, lead, "rev-parse", "HEAD")
 
 
+#: Mailbox protocol files a loop reads and commits (seeded, landed): never
+#: gitignored. Runtime files (lock, sessions, sidecars) are meant to be.
+MAILBOX_PROTOCOL_FILES = (
+    "STATE.md", "PLAN.md", "GOAL.md", "QUEUE.md", "LOG.md", "VERDICT.md", "REPORT.md",
+)
+_RUNTIME_NAMES = (*RUNTIME_COPY, *RUNTIME_SKIP, ".gitignore")
+
+
+def ignored_mailbox_files(wt: Any, home: Path, rel: str) -> list[str]:
+    """Mailbox files the ``loop: seed`` commit could not add (gitignored).
+
+    The protocol files (present or not: STATE.md is always created) and
+    every file under ``briefs/`` present at the root (eval-r16rc N6 probed
+    STATE.md only; eval-r16rc-b L3: an ignored PLAN.md or brief seeded
+    nothing and the run failed mid-way). Runtime files (``.lock``,
+    ``.sessions/``, sidecars) and other ignored files such as
+    ``results/*.json`` may stay ignored. Read-only: git only.
+    """
+    prefix = "" if rel in ("", ".") else rel.rstrip("/") + "/"
+    found: list[str] = []
+    probe = [f"{prefix}{name}" for name in MAILBOX_PROTOCOL_FILES]
+    checked = subprocess.run(
+        ["git", "-C", str(home), "check-ignore", "--no-index", "--stdin"],
+        input="\n".join(probe) + "\n", capture_output=True, text=True,
+    )
+    found += [line.strip() for line in checked.stdout.splitlines() if line.strip()]
+    listed = _git(
+        wt, home, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
+        prefix or ".", check=False,
+    ).stdout.split("\0")
+    for item in listed:
+        inner = item[len(prefix):] if prefix and item.startswith(prefix) else item
+        if not item or item in found:
+            continue
+        head = inner.split("/", 1)[0]
+        if head in _RUNTIME_NAMES or head.startswith(".lock.stale-"):
+            continue
+        if head == "briefs" or inner in MAILBOX_PROTOCOL_FILES:
+            found.append(item)
+    return found
+
+
+def ignored_mailbox_message(rel: str, ignored: list[str]) -> str:
+    shown = ", ".join(ignored[:6]) + (f" (+{len(ignored) - 6} more)" if len(ignored) > 6 else "")
+    return (
+        f"mailbox {rel} is ignored by git: {shown} (`git check-ignore -v {ignored[0]}` "
+        "names the rule); a root-free loop seeds and lands its mailbox as commits on the "
+        "loop branch: un-ignore the mailbox's protocol files and briefs/ (keep ignoring "
+        "its runtime files: .lock/, .sessions/, .driver.json, .session.json). "
+        "Nothing was created"
+    )
+
+
 def write_aggregates(record: dict[str, Any]) -> None:
     """The per-run declared-repo map ``read_repos`` applies (r16 ``aggregate_for``)."""
     live = Path(record["live_mailbox"])
@@ -601,16 +654,9 @@ def begin(
             raise RootFreeError(f"Lead worktree path {path} already exists; remove it first")
         if path == home or str(path).startswith(str(home) + os.sep):
             raise RootFreeError(f"worktree root {worktree_root} is inside {home}")
-        ignored = _git(wt, home, "check-ignore", "-q", "--no-index", "--",
-                       f"{mailbox_rel}/STATE.md", check=False)
-        if ignored.returncode == 0:  # eval-r16rc N6: the seed commit could not add it
-            raise RootFreeError(
-                f"mailbox {mailbox_rel} is ignored by git (`git check-ignore -v "
-                f"{mailbox_rel}/STATE.md` names the rule); a root-free loop seeds and "
-                "lands its mailbox as commits on the loop branch: un-ignore the mailbox "
-                "directory (keep ignoring its runtime files), or pass --root-bound. "
-                "Nothing was created"
-            )
+        ignored = ignored_mailbox_files(wt, home, mailbox_rel)
+        if ignored:  # eval-r16rc N6 / eval-r16rc-b L3 (trioctl checks it first)
+            raise RootFreeError(ignored_mailbox_message(mailbox_rel, ignored))
         repos_plan: dict[str, dict[str, Any]] = {}
         for repo in declared or []:
             main = wt.repo_toplevel(Path(repo["path"]))

@@ -76,7 +76,7 @@ def test_n6_gitignored_mailbox_is_refused_with_a_remedy(world, tmp_path, capsys)
     capsys.readouterr()
     assert world.run_loop(spec) == 3
     err = capsys.readouterr().err
-    assert "is ignored by git" in err and "--root-bound" in err and "Nothing was created" in err
+    assert "is ignored by git" in err and "Nothing was created" in err
     assert "git add" not in err
     assert git(home, "branch", "--list", "trio/*") == ""
     assert len(git(home, "worktree", "list").splitlines()) == 1

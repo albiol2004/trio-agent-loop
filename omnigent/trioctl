@@ -7971,6 +7971,15 @@ def _root_free_begin(
         else wt.default_worktree_root(wt.repo_toplevel(home))
     )
     declared = [] if root_free.active(record) else _root_free_declared(mailbox)
+    if not root_free.active(record):
+        # eval-r16rc N6 / eval-r16rc-b L2+L3: a gitignored mailbox (any
+        # protocol file or brief) is refused before the root lock is taken,
+        # so the refusal leaves even a stale lock exactly as it was.
+        ignored = root_free.ignored_mailbox_files(wt, home, rel)
+        if ignored:
+            print(f"trioctl: root-free: {root_free.ignored_mailbox_message(rel, ignored)}",
+                  file=sys.stderr)
+            return 3
     # Committed to proceed (eval-r16rc-b M1): TAKE the root mailbox's
     # `.lock` with the loop core's own protocol and hold it for the whole
     # run (released after `_root_free_finish`), so a lock-only driver
