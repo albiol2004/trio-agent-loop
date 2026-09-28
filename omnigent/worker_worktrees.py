@@ -183,16 +183,27 @@ def ledger_dir(repo: Path) -> Path:
     return common_dir(repo) / LEDGER_DIR_NAME
 
 
-def default_worktree_root(repo: Path) -> Path:
-    env = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
-    if env:
-        base = Path(env).expanduser()
-    else:
-        state = os.environ.get("XDG_STATE_HOME", "").strip()
-        base = (Path(state) if state else Path.home() / ".local" / "state")
-        base = base / "trio-agent-loop" / "worktrees"
+def default_worktree_root(
+    repo: Path, *, name: str | None = None, base: Path | None = None
+) -> Path:
+    """``<base>/<name>-<sha256(git common dir)[:12]>`` for *repo*.
+
+    *base* defaults to ``$TRIO_WORKTREE_ROOT``, else ``$XDG_STATE_HOME`` (or
+    ``~/.local/state``) ``/trio-agent-loop/worktrees``; *name* to the repo
+    directory's name. A declared PLAN.md ``repos:`` repo (r15) passes its
+    declared name, and the parent of the home repo's root as *base*, so
+    every repo of one loop gets its own sibling root.
+    """
+    if base is None:
+        env = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
+        if env:
+            base = Path(env).expanduser()
+        else:
+            state = os.environ.get("XDG_STATE_HOME", "").strip()
+            base = (Path(state) if state else Path.home() / ".local" / "state")
+            base = base / "trio-agent-loop" / "worktrees"
     key = hashlib.sha256(str(common_dir(repo)).encode()).hexdigest()[:12]
-    return (base / f"{repo.name}-{key}").resolve()
+    return (Path(base) / f"{name or repo.name}-{key}").resolve()
 
 
 def _record_path(repo: Path, worker_id: str) -> Path:
@@ -1078,7 +1089,9 @@ def _foreign_mailbox(repo: Path, path: str) -> str | None:
     return None
 
 
-def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]:
+def classify_aggregate(
+    repo: Path, mailbox: Path | None, declared: list[str] | None = None
+) -> dict[str, list[str]]:
     """Classify aggregate status entries outside this mailbox.
 
     - ``product``: modified or untracked files under a declared product path
@@ -1096,9 +1109,14 @@ def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]
     A tracked ``.cursor/{mcp,hooks}.json`` modified only by session-bound
     Omnigent entries (the root Lead launch's merge,
     :func:`omnigent_only_change`) is ``ignored`` too, never a blocker.
+
+    *declared* (r15) overrides the PLAN.md-derived product paths: for a
+    declared ``repos:`` repo the caller passes the ``writes:`` of that
+    repo's slices only (relative to its root).
     """
     rel = _mailbox_rel(repo, mailbox)
-    declared = declared_product_paths(mailbox)
+    if declared is None:
+        declared = declared_product_paths(mailbox)
     out: dict[str, list[str]] = {"product": [], "foreign": [], "ignored": []}
     user, _residue = _split_status(repo, status_entries(repo))
     for line in user:
@@ -1127,7 +1145,9 @@ def classify_aggregate(repo: Path, mailbox: Path | None) -> dict[str, list[str]]
     return out
 
 
-def aggregate_blockers(repo: Path, mailbox: Path | None) -> list[str]:
+def aggregate_blockers(
+    repo: Path, mailbox: Path | None, declared: list[str] | None = None
+) -> list[str]:
     """Aggregate status entries that block an isolated dispatch/integration.
 
     A worker branches from committed HEAD, so uncommitted product edits in
@@ -1136,7 +1156,7 @@ def aggregate_blockers(repo: Path, mailbox: Path | None) -> list[str]:
     Untracked non-product files and other mailboxes do not block
     (:func:`classify_aggregate`).
     """
-    found = classify_aggregate(repo, mailbox)
+    found = classify_aggregate(repo, mailbox, declared)
     return found["product"] + found["foreign"]
 
 
@@ -1180,17 +1200,38 @@ def create(
     run_id: str | None = None,
     detach_at: str | None = None,
     home: Path | None = None,
+    repo_name: str | None = None,
+    base_branch: str | None = None,
+    declared: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create one task-owned worktree.
 
     Builders get a fresh ``trio-worker/<id>`` branch at aggregate HEAD.
     With *detach_at* (an Evaluator grading a pinned sha) the worktree is
     detached at that commit, carries no branch and is never integrated.
+
+    r15 multi-repo: *repo* may be a declared PLAN.md ``repos:`` repo (not
+    the mailbox repo); *repo_name* records its declared name in the ledger
+    (``repo_name``; absent for the mailbox repo, so single-repo records are
+    unchanged), *base_branch* (its ``base:``) must be the branch its
+    checkout is on -- builders branch from it and merge back onto it --
+    and *declared* are that repo's slices' ``writes:`` (the product paths
+    of :func:`classify_aggregate`, also kept for :func:`integrate`).
     """
     repo = repo_toplevel(repo)
     branch_ref = git(repo, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
     if not branch_ref.startswith("refs/heads/"):
-        raise WorktreeError("aggregate repository is not on a branch (detached HEAD)")
+        raise WorktreeError(
+            (f"repo {repo_name} ({repo})" if repo_name else "aggregate repository")
+            + " is not on a branch (detached HEAD)"
+        )
+    if base_branch and branch_ref != f"refs/heads/{base_branch}":
+        raise WorktreeError(
+            f"repo {repo_name or repo.name} ({repo}) is on "
+            f"{branch_ref[len('refs/heads/'):]}, not its PLAN.md repos: base "
+            f"{base_branch!r}; check out {base_branch} there first (builders "
+            "branch from it and merge back onto it)"
+        )
     base = rev(repo, detach_at or "HEAD")
     if base is None:
         raise WorktreeError(f"no commit to create the worktree at: {detach_at or 'HEAD'}")
@@ -1203,7 +1244,7 @@ def create(
             "config first; trioctl never edits it: " + "; ".join(inherited)
         )
     if not detach_at:
-        found = classify_aggregate(repo, mailbox)
+        found = classify_aggregate(repo, mailbox, declared)
         refusal = aggregate_refusal(found)
         if refusal:
             raise WorktreeError(refusal)
@@ -1234,6 +1275,8 @@ def create(
         "base": base,
         "kind": "eval" if detach_at else "worker",
         "state": "created",
+        **({"repo_name": repo_name} if repo_name and repo_name != "home" else {}),
+        **({"declared_writes": list(declared)} if declared is not None else {}),
         "created_at": time.time(),
         "creator": process_identity(os.getpid()),
     }
@@ -1675,7 +1718,11 @@ def integrate(
                 repo, record, "aggregate_moved",
                 f"aggregate is on {head_ref or 'detached HEAD'}, expected {record['aggregate_ref']}",
             )
-        blockers = aggregate_blockers(repo, Path(record["mailbox"]) if record.get("mailbox") else None)
+        blockers = aggregate_blockers(
+            repo,
+            Path(record["mailbox"]) if record.get("mailbox") else None,
+            record.get("declared_writes"),
+        )
         if blockers:
             return _retain(repo, record, "aggregate_dirty", "; ".join(blockers[:5]))
         if (common_dir(repo) / "MERGE_HEAD").exists():
@@ -1742,9 +1789,19 @@ def _accepting_revision(
         pending = acceptance.get("pending") if isinstance(acceptance, dict) else None
         record["acceptance_pending"] = pending or "no verified retired SHIP"
         return None
-    evaluated = rev(repo, str(acceptance.get("evaluated") or ""))
+    pinned = acceptance.get("evaluated")
+    if record.get("repo_name"):
+        # r15: a declared repo's record is covered by that repo's own pin.
+        pins = acceptance.get("evaluated_repos")
+        pinned = pins.get(record["repo_name"]) if isinstance(pins, dict) else None
+        if not pinned:
+            record["acceptance_pending"] = (
+                f"verified SHIP has no evaluated pin for repo {record['repo_name']}"
+            )
+            return None
+    evaluated = rev(repo, str(pinned or ""))
     aggregate = rev(repo, record["aggregate_ref"])
-    if evaluated is None or aggregate is None or evaluated != acceptance.get("evaluated"):
+    if evaluated is None or aggregate is None or evaluated != pinned:
         record["acceptance_pending"] = "evaluated sha is not a full commit on this repo"
         return None
     # The graded revision must contain the exact integrated merge and be

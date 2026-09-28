@@ -1022,13 +1022,26 @@ _ISOLATED_BUILDER_NOTE = (
     "slice only on a TARGETED_CHECK line that is present and not FAILED."
 )
 
+#: Appended to the isolated-builder note for a slice of a declared PLAN.md
+#: `repos:` repo (r15); single-repo notes are unchanged.
+_ISOLATED_BUILDER_REPO_NOTE = (
+    "\n\nREPO: this slice belongs to the declared repo `{name}` (main "
+    "checkout `{repo}`, base branch `{branch}`); your worktree is a checkout "
+    "of THAT repo and its root is the slice's repo root. The slice's "
+    "`writes:` are relative to it; run the targeted check from the worktree "
+    "root (a `cd` in it is relative to that root). Never `cd` into or edit "
+    "the main checkout `{repo}` or the Trio home repo."
+)
 
-# --- r15 guard: refuse slices that write outside the mailbox repo -----------
-# The check lives in metrics/trio-check.py (`repo_scope_refusals`) so the
-# loop core and METRICS_API are untouched; trioctl loads the copy from its
-# own release (never a repository's vendored metrics/). Enforced before the
-# loop dispatches anything, around every Lead/repair pass, and by
-# `run builder --isolate` before it creates a worktree.
+
+# --- r15: slices stay inside their repo; declared product repos -----------
+# The check lives in metrics/trio-check.py (`repo_scope_refusals`, parsers in
+# trio-metrics.py); trioctl loads the copy from its own release (never a
+# repository's vendored metrics/). Enforced before the loop dispatches
+# anything, around every Lead/repair pass, and by `run builder --isolate`
+# before it creates a worktree. A PLAN.md `repos:` block (r15 multi-repo)
+# makes each slice's `repo:` the repo its worktrees, retire shas, gates and
+# eval pins resolve in.
 
 #: `run builder --isolate` exit when the r15 guard refuses the slice.
 REPO_SCOPE_REFUSED_EXIT = 2
@@ -1090,6 +1103,89 @@ def _repo_scope_refusals(
     return module.repo_scope_refusals(
         Path(mailbox), metrics, slice_id=slice_id, brief_text=brief_text
     )
+
+
+def _declared_repos(mailbox: Path) -> dict[str, dict[str, Any]]:
+    """PLAN.md `repos:` of *mailbox*: ``{name: {"path": Path, "base": str|None}}``.
+
+    ``{}`` in single-repo mode (no block, `repos: []`, missing PLAN.md) and
+    when the block does not validate (the r15 guard refuses that PLAN).
+    Parsed with this release's trio-metrics (never a vendored copy).
+    """
+    _module, metrics = _load_trio_check()
+    info = metrics.read_repos(Path(mailbox))
+    if info["errors"]:
+        return {}
+    return {
+        r["name"]: {"path": Path(r["path"]), "base": r.get("base")}
+        for r in info["repos"]
+    }
+
+
+def _plan_slices(mailbox: Path) -> list[dict[str, Any]]:
+    _module, metrics = _load_trio_check()
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return metrics.parse_slices_block(text) or []
+
+
+def _slice_repo(mailbox: Path, slice_id: str | None) -> tuple[str, dict[str, Any] | None]:
+    """(repo name, declared repo or None) of *slice_id* (r15).
+
+    ``("home", None)`` in single-repo mode, for an unknown slice, and for a
+    slice of the mailbox repo itself.
+    """
+    repos = _declared_repos(mailbox)
+    if not repos or not slice_id:
+        return "home", None
+    _module, metrics = _load_trio_check()
+    for sl in _plan_slices(mailbox):
+        if sl.get("id") == slice_id:
+            name = metrics.slice_repo_name(sl, repos)
+            if name and name in repos:
+                return name, repos[name]
+            return "home", None
+    return "home", None
+
+
+def _repo_declared_writes(mailbox: Path, name: str) -> list[str]:
+    """Every `writes:` path (``api:`` dropped) of the slices of repo *name*."""
+    _module, metrics = _load_trio_check()
+    repos = _declared_repos(mailbox)
+    out: list[str] = []
+    for sl in _plan_slices(mailbox):
+        if metrics.slice_repo_name(sl, repos) != name:
+            continue
+        for write in sl.get("writes") or []:
+            write = str(write).strip()
+            if not write or write.startswith("api:"):
+                continue
+            if write.startswith("./"):
+                write = write[2:]
+            out.append(write.rstrip("/"))
+    return out
+
+
+def _repo_worktree_root(
+    repo_path: Path, name: str, home_root: str | Path | None
+) -> Path:
+    """Worktree root of declared repo *name*: ``<state>/worktrees/<name>-<hash>``.
+
+    Sibling of the home repo's root (`--worktree-root` / the derived
+    default) so every repo of one loop keeps its worktrees side by side;
+    the default base when no home root is known.
+    """
+    wt = _require_worktrees()
+    base = Path(home_root).expanduser().resolve().parent if home_root else None
+    return wt.default_worktree_root(repo_path, name=name, base=base)
+
+
+def _ledger_repo(record: dict[str, Any], default: Path) -> Path:
+    """The repository whose ledger holds *record* (its ``repo`` field)."""
+    value = record.get("repo") if isinstance(record, dict) else None
+    return Path(value) if value else default
 
 
 def _state_iteration(mailbox: Path) -> str:
@@ -1189,17 +1285,28 @@ def _command_run_isolated(
         for line in refusals:
             print(f"trioctl: {line}", file=sys.stderr)
         return REPO_SCOPE_REFUSED_EXIT
+    home_root = getattr(args, "worktree_root", None)
+    root = Path(home_root).expanduser() if home_root else None
+    repo_name, declared = _slice_repo(mailbox, slice_id)
+    create_kwargs: dict[str, Any] = {}
+    if declared is not None:
+        # r15: the slice's own repo -- its worktree, branch base, merge
+        # target and ledger -- never the mailbox (home) checkout.
+        repo = wt.repo_toplevel(declared["path"])
+        root = _repo_worktree_root(repo, repo_name, home_root)
+        create_kwargs = {
+            "repo_name": repo_name,
+            "base_branch": declared.get("base"),
+            "declared": _repo_declared_writes(mailbox, repo_name),
+        }
     try:
         record = wt.create(
             repo,
             slice_id=slice_id,
             mailbox=mailbox,
-            root=(
-                Path(args.worktree_root).expanduser()
-                if getattr(args, "worktree_root", None)
-                else None
-            ),
+            root=root,
             run_id=getattr(args, "worker_run_id", None),
+            **create_kwargs,
         )
     except wt.WorktreeError as exc:
         raise TrioctlError(str(exc)) from exc
@@ -1213,6 +1320,11 @@ def _command_run_isolated(
         path=path, branch=record["branch"], base=record["base"][:12],
         repo=repo, slice=slice_id, mailbox=mailbox,
     )
+    if declared is not None:
+        note += _ISOLATED_BUILDER_REPO_NOTE.format(
+            name=repo_name, repo=repo,
+            branch=record["aggregate_ref"][len("refs/heads/"):],
+        )
 
     def on_spawn(proc: subprocess.Popen[str]) -> None:
         wt.mark_running(repo, record, proc.pid, pgid=proc.pid)
@@ -1352,7 +1464,13 @@ def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
         "acceptance_pending", "path", "branch", "base", "worker_commit",
         "merge_commit", "accepted_by",
     )
-    return {"worker_worktree": {k: record.get(k) for k in keys if k in record}}
+    view = {k: record.get(k) for k in keys if k in record}
+    if record.get("repo_name"):
+        # r15: a declared repo's worktree -- its merge sha lives in `repo`
+        # (recover with `omnigent worktrees integrate <id> --repo <repo>`).
+        view["repo_name"] = record["repo_name"]
+        view["repo"] = record.get("repo")
+    return {"worker_worktree": view}
 
 
 def _held_session_ids(mailbox: Path | None) -> set[str]:
@@ -1451,7 +1569,21 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
         return {"pending": "VERDICT.md is not committed"}
     if dirty.returncode != 0 or dirty.stdout.strip():
         return {"pending": "VERDICT.md has uncommitted edits after retirement"}
-    return {"evaluated": evaluated, "iteration": iteration, "attempt": attempt}
+    accepted: dict[str, Any] = {
+        "evaluated": evaluated, "iteration": iteration, "attempt": attempt,
+    }
+    pins = str(state.get("evaluated_repos", "")).strip()
+    if pins:
+        # r15: one verified pin per declared repo (the loop core's
+        # retirement check above already verified each of them).
+        accepted["evaluated_repos"] = {
+            name: sha
+            for name, sha in (
+                item.split("@", 1) for item in pins.replace(",", " ").split()
+                if "@" in item
+            )
+        }
+    return accepted
 
 
 # Upper bound on waiting for torn-down sessions' runners to leave their
@@ -1472,6 +1604,10 @@ def _run_worktree_cleanup(
     worktree retained only because those sessions' processes are still
     exiting is re-checked once they have exited (bounded by
     ``WORKTREE_SETTLE_SECONDS``); every guard runs again unchanged.
+
+    r15: the mailbox's declared PLAN.md `repos:` keep their own ledgers;
+    each is cleaned the same way, accepted against the same verified SHIP
+    (its per-repo pin, see ``_ship_acceptance``).
     """
     wt = _require_worktrees()
     if _has_unreadable_hold(mailbox):
@@ -1481,6 +1617,26 @@ def _run_worktree_cleanup(
         )
         return []
     acceptance_for = lambda box: _ship_acceptance(box, repo, loop_core)  # noqa: E731
+    results: list[dict[str, Any]] = []
+    ledgers = [repo]
+    if mailbox is not None:
+        try:
+            ledgers += [
+                d["path"] for d in _declared_repos(mailbox).values()
+                if (d["path"] / ".git").exists()
+            ]
+        except TrioctlError as exc:
+            print(f"trioctl: declared repos unreadable ({exc}); cleaning the home repo only",
+                  file=sys.stderr)
+    for ledger in ledgers:
+        results += _cleanup_ledger(wt, ledger, mailbox, acceptance_for, torn_down)
+    return results
+
+
+def _cleanup_ledger(
+    wt: Any, repo: Path, mailbox: Path | None, acceptance_for: Any, torn_down: Any
+) -> list[dict[str, Any]]:
+    """`_run_worktree_cleanup` for one repository's ledger."""
     results = wt.cleanup(
         repo,
         mailbox=mailbox,
@@ -1536,6 +1692,12 @@ def command_worktrees(args: argparse.Namespace) -> int:
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0
         if args.worktrees_command == "integrate":
+            if mailbox is not None and not (wt.ledger_dir(repo) / f"{args.id}.json").is_file():
+                # r15: a declared repo's worktree lives in that repo's ledger.
+                for declared in _declared_repos(mailbox).values():
+                    if (wt.ledger_dir(declared["path"]) / f"{args.id}.json").is_file():
+                        repo = wt.repo_toplevel(declared["path"])
+                        break
             record = wt.integrate(repo, args.id, summary=args.summary)
             print(json.dumps(_worktree_view(record), indent=2, sort_keys=True))
             return 0 if record.get("state") in ("integrated", "accepted", "removed") else ISOLATED_RETAINED_EXIT
@@ -3582,6 +3744,11 @@ class OmnigentRunner:
         # dispatch; only tokens of FINISHED evaluator dispatches are released
         # at the next Lead/repair dispatch; all are released at loop end.
         self._fence_tokens: dict[str, bool] = {}
+        # r15: fence token -> the repository whose ledger holds it (tokens
+        # absent here are the home repo's).
+        self._fence_repos: dict[str, Path] = {}
+        # The loop core driving this runner (set by `loop`); None = unknown.
+        self.loop_core: Any = None
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
         # that implement the completion-receipt contract.
@@ -3899,21 +4066,31 @@ class OmnigentRunner:
         if not context or context.get("kind") != "slice-eval" or not context.get("sha"):
             return None
         root = self._isolate.get("worktree_root")
+        repo = self.repo
+        kwargs: dict[str, Any] = {}
+        name, declared = self._eval_repo(mailbox, context)
+        if declared is not None:
+            # r15: the pinned sha lives in the slice's declared repo; bind
+            # the detached worktree there (its own ledger and root).
+            repo = declared["path"]
+            root = str(_repo_worktree_root(repo, name, root))
+            kwargs = {"repo_name": name}
         try:
             record = worker_worktrees.create(
-                self.repo,
+                repo,
                 slice_id=f"eval-{context.get('slice') or 'slice'}",
                 mailbox=mailbox,
                 root=Path(root) if root else None,
                 role="evaluator",
                 detach_at=str(context["sha"]),
+                **kwargs,
             )
         except (worker_worktrees.WorktreeError, OSError, subprocess.SubprocessError) as exc:
             raise TrioctlError(f"cannot bind slice-eval worktree: {exc}") from exc
         try:
             # Live owner for the whole dispatch: this process (session id
             # is appended once created).
-            worker_worktrees.mark_running(self.repo, record, None)
+            worker_worktrees.mark_running(_ledger_repo(record, self.repo), record, None)
         except Exception as exc:
             # Created but not bound: the degraded eval never uses it, so
             # retire it now (recorded, never an orphan) before degrading.
@@ -3923,12 +4100,30 @@ class OmnigentRunner:
             ) from exc
         return record
 
+    @staticmethod
+    def _eval_repo(
+        mailbox: Path, context: dict[str, Any] | None
+    ) -> tuple[str, dict[str, Any] | None]:
+        """(repo name, declared repo or None) a slice-eval grades in (r15).
+
+        The loop core names it in the context (``repo``); a context without
+        it (an older core) falls back to the slice's PLAN.md `repo:`.
+        """
+        context = context or {}
+        repos = _declared_repos(mailbox)
+        if not repos:
+            return "home", None
+        name = str(context.get("repo") or "").strip()
+        if name:
+            return (name, repos[name]) if name in repos else ("home", None)
+        return _slice_repo(mailbox, context.get("slice"))
+
     def _discard_eval_worktree(self, record: dict[str, Any], exc: BaseException) -> None:
         """Remove (or record as retained) a created-but-unbound eval worktree."""
         worker_id = record.get("id")
         try:
             result = worker_worktrees.discard_eval(
-                self.repo, str(worker_id), f"{type(exc).__name__}: {exc}"
+                _ledger_repo(record, self.repo), str(worker_id), f"{type(exc).__name__}: {exc}"
             )
             state = result.get("state")
             detail = (
@@ -4857,15 +5052,31 @@ class OmnigentRunner:
                 dispatch["fence"] = token
                 with self._own_lock:
                     self._fence_tokens[token] = False
+                # r15: every declared repo is graded (and retired) too; no
+                # worker merge may land in any of them meanwhile.
+                dispatch["repo_fences"] = []
+                for declared in _declared_repos(mailbox).values():
+                    extra = worker_worktrees.acquire_fence(
+                        declared["path"], reason=f"{role} iteration {iteration}",
+                        mailbox=mailbox,
+                    )
+                    dispatch["repo_fences"].append(extra)
+                    with self._own_lock:
+                        self._fence_tokens[extra] = False
+                        self._fence_repos[extra] = Path(declared["path"])
             else:
                 self._release_fences(finished_only=True)
         elif self._restore_root_nonisolated and worker_worktrees is not None and eval_wt is None:
             self._snapshot_root_config()
         if eval_wt is not None:
             workspace = eval_wt["path"]
+            of_repo = (
+                f" (a checkout of the declared repo `{eval_wt['repo_name']}`)"
+                if eval_wt.get("repo_name") else ""
+            )
             prompt = (
                 "ISOLATED EVALUATOR WORKSPACE: this session's workspace is "
-                f"the task-owned detached worktree `{eval_wt['path']}` at "
+                f"the task-owned detached worktree `{eval_wt['path']}`{of_repo} at "
                 f"`{eval_wt['base']}`. For step 2 grade inside it and do NOT "
                 "run `git worktree add`/`remove`. Leave it clean. Write "
                 f"VERDICT.md/QUEUE.md only under the absolute mailbox "
@@ -4935,6 +5146,8 @@ class OmnigentRunner:
                     self._delivery.pop(session_id, None)
                 if dispatch.get("fence"):
                     self._fence_tokens[dispatch["fence"]] = True  # finished
+                for extra in dispatch.get("repo_fences") or ():
+                    self._fence_tokens[extra] = True
                 if root_bound and session_id:
                     self._root_finished.append(
                         {"session_id": session_id, "role": role, "workspace": workspace}
@@ -4966,8 +5179,9 @@ class OmnigentRunner:
             ]
             for token in tokens:
                 self._fence_tokens.pop(token, None)
+            repos = {token: self._fence_repos.pop(token, self.repo) for token in tokens}
         for token in tokens:
-            worker_worktrees.release_fence(self.repo, token)
+            worker_worktrees.release_fence(repos[token], token)
 
     def release_all_fences(self) -> None:
         """Loop end: no evaluation of this runner can still be running."""
@@ -4979,11 +5193,12 @@ class OmnigentRunner:
     ) -> None:
         """Record this dispatch's own session and end its claim."""
         try:
-            record = worker_worktrees.load_record(self.repo, eval_wt["id"])
+            ledger = _ledger_repo(eval_wt, self.repo)
+            record = worker_worktrees.load_record(ledger, eval_wt["id"])
             if session_id:
                 record.setdefault("session_ids", []).append(session_id)
-            worker_worktrees.save_record(self.repo, record)
-            worker_worktrees.mark_finished(self.repo, eval_wt["id"])
+            worker_worktrees.save_record(ledger, record)
+            worker_worktrees.mark_finished(ledger, eval_wt["id"])
         except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
             print(
                 f"trioctl: could not update evaluator worktree record "
