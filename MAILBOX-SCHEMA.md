@@ -748,6 +748,28 @@ header, asserting the literal the code writes, `--verify-only`/pass-flag
 readers, presence-only checks, a typecheck over `files: []`, tests that
 read the mailbox, `results/` or `evidence/`) are rejected by name.
 
+The Omnigent driver parses each slice section after the slice-eval returns
+(the `evidence:` line, else the table's evidence cells; the `attacks:`
+items) and logs `- iter N | loop | slice <id> @<sha12> SHIP|ITERATE
+evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n>
+unverified=<n> attacks=<n> (shadow)` (`evidence: missing` when neither is
+present), records it under `quality` in `.driver.json`, and trio-shadow
+prints it. Telemetry only; nothing is gated in r18a.
+
+**Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
+builder, trioctl runs a deterministic AST/regex lint (no model call) over
+the slice's changed test files: `in` checks of a one- or two-character
+literal, `or`-chains of `in` checks, string presence on text read from a
+file, presence-only `is_file()`/`exists()` asserts, tests that read
+`results/`/`evidence/` or run `--verify-only`, tests that import none of
+the slice's product modules, TypeScript `toContain` over `readFileSync`
+text, and a `tsc -p` over a tsconfig with `files: []`. The flags are
+`verification_flags` in the builder JSON and ledger record and a
+`PRE-GATE FLAGS` block ("the following tests look tautological; grade
+them explicitly") in the slice-eval's OPEN-LOOP CONTEXT. `trio-check.py`
+applies the same lint to the mailbox's own test files and the test files
+slices declare in `writes:` (`quality: WARN test looks tautological`).
+
 ### `## Independent probe` (whole-goal verdicts, r18a)
 
 The lockstep verdict and the open-loop integration verdict carry:
@@ -763,9 +785,11 @@ observed: <verbatim output excerpt>
 
 The probe is written by the Evaluator against the public surface; it
 never imports implementer tests or Lead scripts. `UNAVAILABLE` leaves the
-criterion unverified (NEEDS_HUMAN, never SHIP). In r18a a missing section
-is only logged by the Omnigent driver (`probe: missing`); r18b makes
-`probe: PASS` a SHIP condition.
+criterion unverified (NEEDS_HUMAN, never SHIP). In r18a the Omnigent
+driver only logs it after each integration-eval (`- iter N | loop |
+integration-eval @<sha12> probe: PASS|FAIL|UNAVAILABLE|missing (shadow)`)
+and records it under `quality` in `.driver.json` (lockstep verdicts:
+`.driver.json` only); r18b makes `probe: PASS` a SHIP condition.
 
 ### Base-revert kill check (r18a L2a, shadow)
 

@@ -49,3 +49,18 @@ trio-shadow. It never changes a retire decision in r18a. Off switches:
 `run builder --isolate --no-kill-check`, `TRIO_KILL_CHECK=0` (propagated by
 the loop driver through `.driver.json`). Budget: 120 s, PLAN.md
 `full_check_budget_s:`, or `TRIO_KILL_CHECK_BUDGET_S`.
+
+## Evidence telemetry and pre-gate flags (L1, L7)
+
+After each slice-eval the driver parses the section's `evidence:` line (or
+the per-accept table) and `attacks:` items and logs
+`slice <id> @<sha12> SHIP evidence: re-run=.. probe=.. implementer-test=..
+receipt=.. unverified=.. attacks=.. (shadow)`; after each integration-eval
+it logs `probe: PASS|FAIL|UNAVAILABLE|missing (shadow)`. Both land in
+`.driver.json` `quality` and trio-shadow. The deterministic tautology lint
+(trio-check.py; AST for Python, regex for TypeScript) flags the slice's
+test files before integration: `verification_flags` in the builder JSON,
+`PRE-GATE FLAGS` in the slice-eval context. Advisory only; the Evaluator
+adjudicates. Note: a grep over the product file itself is *killed* by the
+base-revert check (the text changes), so W1-style tests are the lint's
+job, W3-style receipt tests the kill check's.

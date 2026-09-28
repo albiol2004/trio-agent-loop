@@ -1491,6 +1491,7 @@ def _command_run_isolated(
     record = wt.load_record(repo, record["id"])
     wt.mark_exited(repo, record, returncode)
     targeted = _targeted_check_line(output)
+    flags = _isolated_verification_flags(wt, repo, record, prompt)
     kill_check = None
     if _kill_check_enabled(args):
         kill_check = _isolated_kill_check(wt, repo, record, prompt, mailbox, targeted)
@@ -1504,6 +1505,8 @@ def _command_run_isolated(
             view = _worktree_view(record)
             view["targeted_check"] = targeted
             view["kill_check"] = kill_check
+            if flags:
+                view["verification_flags"] = flags
             print(output)
             print(json.dumps(view, sort_keys=True))
             return ISOLATED_RETAINED_EXIT
@@ -1516,6 +1519,8 @@ def _command_run_isolated(
     view["targeted_check"] = targeted
     if kill_check is not None:
         view["kill_check"] = kill_check
+    if flags:
+        view["verification_flags"] = flags
     print(json.dumps(view, sort_keys=True))
     print(f"trioctl: {wt.summarize(record)}", file=sys.stderr)
     return 0 if record.get("state") == "integrated" else ISOLATED_RETAINED_EXIT
@@ -1976,6 +1981,46 @@ def run_kill_check(
     return result
 
 
+def _isolated_verification_flags(
+    wt: Any, repo: Path, record: dict[str, Any], brief: str
+) -> list[str]:
+    """r18a L7: advisory tautology flags over the slice's changed test files
+    (deterministic AST/regex lint from trio-check.py; no model call).
+    Persisted in the worktree record for the slice-eval dispatch context."""
+    if not record.get("worker_ok"):
+        return []
+    try:
+        check = _load_trio_check()[0]
+        path = Path(record["path"])
+        changed = _kill_changed_paths(path, str(record["base"]))
+        tests = [p for p in changed if check.TEST_FILE_RE.search(p)]
+        modules = {
+            Path(p).stem for p in changed
+            if p.endswith(".py") and not _KILL_TEST_PATH_RE.search(p)
+            and not _KILL_NON_PRODUCT_RE.search(p) and Path(p).stem != "__init__"
+        }
+        flags: list[str] = []
+        for rel in tests:
+            try:
+                text = (path / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            flags.extend(check.test_file_flags(rel, text, modules or None))
+        flags.extend(check.empty_tsconfig_flag(path, _brief_targeted_command(brief)))
+    except Exception as exc:  # noqa: BLE001 - advisory: never break a dispatch
+        print(f"trioctl: verification lint skipped: {exc}", file=sys.stderr)
+        return []
+    if flags:
+        try:
+            fresh = wt.load_record(repo, record["id"])
+            fresh["verification_flags"] = flags
+            wt.save_record(repo, fresh)
+        except Exception as exc:  # noqa: BLE001
+            print(f"trioctl: could not record verification_flags: {exc}", file=sys.stderr)
+        print(f"trioctl: verification lint (advisory): {len(flags)} flag(s)", file=sys.stderr)
+    return flags
+
+
 def _isolated_kill_check(
     wt: Any,
     repo: Path,
@@ -2021,6 +2066,118 @@ def _isolated_kill_check(
         file=sys.stderr,
     )
     return result
+
+EVIDENCE_KINDS = ("re-run", "probe", "implementer-test", "receipt", "unverified")
+_EVIDENCE_LINE_RE = re.compile(r"^\s*[-*]?\s*`?evidence:\s*(.*?)`?\s*$", re.IGNORECASE)
+_EVIDENCE_PAIR_RE = re.compile(r"([a-z][a-z-]*)\s*=\s*(\d+)", re.IGNORECASE)
+_EVIDENCE_ALIASES = {"rerun": "re-run", "impl-test": "implementer-test",
+                     "implementer": "implementer-test", "impl": "implementer-test"}
+
+
+def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None:
+    """(verdict word, body) of the LAST `## slice <id> @<sha> — ...` section."""
+    want = sha.strip().lower()
+    found = None
+    lines = text.splitlines()
+    for i, raw in enumerate(lines):
+        m = _SLICE_VERDICT_HEADING_RE.match(raw.strip())
+        if not m or m.group(1) != slice_id:
+            continue
+        got = m.group(2).lower()
+        if want and not (got == want or want.startswith(got) or got.startswith(want)):
+            continue
+        end = next((j for j in range(i + 1, len(lines))
+                    if lines[j].startswith("## ")), len(lines))
+        found = (m.group(3), "\n".join(lines[i + 1:end]))
+    return found
+
+
+def slice_evidence(text: str, slice_id: str, sha: str) -> dict[str, Any] | None:
+    """Evidence kinds and attack count of one slice section (r18a L1).
+
+    The `evidence: re-run=<n> ...` summary line wins; otherwise the kinds
+    named in the per-accept table rows are counted. None when the section
+    is absent.
+    """
+    found = _slice_section(text, slice_id, sha)
+    if found is None:
+        return None
+    verdict, body = found
+    counts: dict[str, int] = {}
+    for ln in body.splitlines():
+        m = _EVIDENCE_LINE_RE.match(ln)
+        if not m:
+            continue
+        pairs = _EVIDENCE_PAIR_RE.findall(m.group(1))
+        if pairs:
+            counts = {}
+            for key, value in pairs:
+                key = _EVIDENCE_ALIASES.get(key.lower(), key.lower())
+                if key in EVIDENCE_KINDS:
+                    counts[key] = counts.get(key, 0) + int(value)
+    source = "summary" if counts else None
+    if not counts:
+        for ln in body.splitlines():
+            if not ln.lstrip().startswith("|") or set(ln.strip()) <= set("|-: "):
+                continue
+            cells = [c.strip().strip("`").lower() for c in ln.strip().strip("|").split("|")]
+            kinds = [_EVIDENCE_ALIASES.get(c, c) for c in cells]
+            hit = next((k for k in kinds if k in EVIDENCE_KINDS[:4]), None)
+            if hit:
+                counts[hit] = counts.get(hit, 0) + 1
+            if any(c == "unverified" for c in cells):
+                counts["unverified"] = counts.get("unverified", 0) + 1
+        source = "table" if counts else "missing"
+    attacks = 0
+    inside = False
+    for ln in body.splitlines():
+        if re.match(r"^\s*`?attacks\s*:", ln, re.IGNORECASE):
+            inside = True
+            continue
+        if inside:
+            if re.match(r"^\s*[-*]\s+\S", ln):
+                attacks += 1
+            elif ln.strip():
+                inside = False
+    ordered = {k: counts.get(k, 0) for k in EVIDENCE_KINDS} if counts else {}
+    return {"verdict": verdict, "evidence": ordered, "evidence_source": source,
+            "attacks": attacks}
+
+
+_PROBE_LINE_RE = re.compile(
+    r"^\s*`?probe\s*:\s*(PASS|FAIL|UNAVAILABLE)\b\s*(.*?)`?\s*$", re.IGNORECASE
+)
+
+
+def independent_probe(text: str) -> dict[str, Any] | None:
+    """`## Independent probe` of a whole-goal verdict (r18a L3, logged only).
+
+    None when *text* holds no verdict line yet; `missing` when the section
+    or its `probe:` line is absent.
+    """
+    if not re.search(r"^\s*VERDICT:", text, re.MULTILINE):
+        return None
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if re.match(r"^##\s+Independent probe\s*$", ln.strip(), re.IGNORECASE)), None)
+    if start is None:
+        return {"status": "missing"}
+    fields: dict[str, Any] = {}
+    for ln in lines[start + 1:]:
+        if ln.startswith("## "):
+            break
+        m = _PROBE_LINE_RE.match(ln)
+        if m and "status" not in fields:
+            fields["status"] = m.group(1).upper()
+            if m.group(2).strip():
+                fields["reason"] = m.group(2).strip()[:200]
+            continue
+        f = re.match(r"^\s*(probe_cmd|probe_src)\s*:\s*(.+)$", ln)
+        if f:
+            fields[f.group(1)] = f.group(2).strip()[:300]
+    fields.setdefault("status", "missing")
+    return fields
+
 
 def _num(value: Any) -> float:
     try:
@@ -6832,12 +6989,69 @@ class OmnigentRunner:
         mailbox = Path(mailbox).resolve()
         self._quality_before_dispatch(role, iteration, mailbox, context)
         try:
-            return self._run_observed(role, iteration, mailbox, context)
+            code = self._run_observed(role, iteration, mailbox, context)
         except _EvalBindSkipped:
             # r16: a slice-eval whose worktree could not be bound was not
             # dispatched (logged); the loop core sees no verdict section and
             # retries it (status error after 3 attempts).
             return 0
+        self._quality_after_dispatch(role, iteration, mailbox, context)
+        return code
+
+    def _quality_after_dispatch(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+    ) -> None:
+        """r18a L1 telemetry: the slice section's evidence kinds, or the
+        whole-goal verdict's `## Independent probe` line (logged, recorded
+        under `quality` in `.driver.json`; never gates)."""
+        if role != "evaluator":
+            return
+        try:
+            text = _mailbox_text(mailbox / "VERDICT.md")
+            ctx = context or {}
+            if ctx.get("kind") == "slice-eval":
+                slice_id = str(ctx.get("slice") or "")
+                sha = str(ctx.get("sha") or ctx.get("pinned_sha") or "")
+                parsed = slice_evidence(text, slice_id, sha)
+                if parsed is None:
+                    return
+                key = f"{slice_id}@{sha[:12]}"
+                self._record_quality(key, {"slice": slice_id, "sha": sha, **parsed})
+                ev = parsed.get("evidence")
+                summary = (
+                    " ".join(f"{k}={v}" for k, v in ev.items()) if ev else "missing"
+                )
+                _append_mailbox_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | slice {slice_id} @{sha[:12]} "
+                    f"{parsed.get('verdict', '?')} evidence: {summary} "
+                    f"attacks={parsed.get('attacks', 0)} (shadow)",
+                )
+                return
+            pin = str(ctx.get("pinned_sha") or ctx.get("expected_sha") or ctx.get("sha") or "")
+            probe = independent_probe(_integration_verdict_text(text))
+            if probe is None:
+                return
+            kind = ctx.get("kind") or "lockstep"
+            self._record_quality(
+                f"{kind}@{pin[:12] or iteration}",
+                {"kind": kind, "sha": pin, "iteration": iteration, "probe": probe},
+            )
+            if kind != "integration-eval":
+                return  # lockstep: `.driver.json` only (LOG stays as before)
+            _append_mailbox_log(
+                mailbox,
+                f"- iter {iteration} | loop | {kind} @{pin[:12]} probe: "
+                f"{probe.get('status')}"
+                + (f" -- {probe['reason']}" if probe.get("reason") else "")
+                + " (shadow)",
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow telemetry never raises
+            print(f"trioctl: verdict quality telemetry skipped: {exc}", file=sys.stderr)
 
     # --- r18a shadow quality telemetry (never gates) -----------------------
 

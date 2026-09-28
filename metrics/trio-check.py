@@ -1134,6 +1134,8 @@ def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
             code = [w for w in sl.get("writes") or [] if not str(w).startswith("api:")]
             if code and not sl.get("accepts"):
                 out.append(("WARN", f"slice {sl['id']} changes code but has no `accepts:`"))
+    for flag in mailbox_test_flags(loop_dir, tm):
+        out.append(("WARN", f"test looks tautological: {flag}"))
     for cmd in full_check_reader_only(plan_text, loop_dir):
         out.append((
             "WARN",
@@ -1147,6 +1149,182 @@ def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
 def _clip(text: str, width: int = 70) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= width else text[: width - 3] + "..."
+
+
+# --- r18a L7: deterministic tautology lint over test files (advisory) ------
+# Free (no model call). Flags the canonical evaluator's tautology list where
+# a static reading can see it; the evaluator adjudicates (false positives:
+# legitimate static-property and snapshot tests).
+
+TEST_FILE_RE = re.compile(
+    r"(?:^|/)test_[^/]*\.py$|(?:^|/)[^/]*_test\.py$|\.(?:test|spec)\.[cm]?[jt]sx?$"
+)
+_RECEIPT_DIR_RE = re.compile(r"(?:^|/)(?:results|evidence)(?:/|$)")
+
+
+def _py_file_reader_funcs(tree) -> set[str]:
+    """Module functions whose return value is a file's text (`_text(p)`)."""
+    import ast
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Return) and _is_file_read(sub.value, set()):
+                    names.add(node.name)
+    return names
+
+
+def _is_file_read(node, readers: set[str]) -> bool:
+    import ast
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in ("read_text", "read_bytes", "read"):
+        return True
+    if isinstance(func, ast.Name) and func.id in readers:
+        return True
+    return False
+
+
+def python_test_flags(rel: str, text: str, product_modules: set[str] | None = None) -> list[str]:
+    """Advisory tautology flags for one Python test file (`<rel>:<line> why`)."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    readers = _py_file_reader_funcs(tree)
+    file_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_file_read(node.value, readers):
+            file_vars.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    flags: list[str] = []
+
+    def flag(node, why: str) -> None:
+        flags.append(f"{rel}:{getattr(node, 'lineno', 0)} {why}")
+
+    def in_checks(expr) -> list:
+        return [expr] if (
+            isinstance(expr, ast.Compare) and len(expr.ops) == 1
+            and isinstance(expr.ops[0], (ast.In, ast.NotIn))
+        ) else []
+
+    receipts = False
+    verify_only = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _RECEIPT_DIR_RE.search(node.value.strip("/")) or node.value in ("results", "evidence"):
+                receipts = True
+            if "--verify-only" in node.value:
+                verify_only = True
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+            if sum(1 for v in test.values if in_checks(v)) >= 2:
+                flag(node, "or-chain of `in` checks (one disjunct may be satisfied by a header or constant)")
+            continue
+        for cmp_ in in_checks(test):
+            left, right = cmp_.left, cmp_.comparators[0]
+            if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                if len(left.value) <= 2:
+                    flag(node, f"`{left.value!r} in ...` checks a {len(left.value)}-character literal")
+                elif isinstance(right, ast.Name) and right.id in file_vars:
+                    flag(node, f"string presence {left.value[:40]!r} on file text (`{right.id}`), not behaviour")
+        if isinstance(test, ast.Call) and isinstance(test.func, ast.Attribute) \
+                and test.func.attr in ("is_file", "exists", "is_dir"):
+            flag(node, f"presence-only check (`.{test.func.attr}()`)")
+    if receipts:
+        flags.append(f"{rel}:1 reads receipts under results/ or evidence/ (a receipt is a claim, not an oracle)")
+    if verify_only:
+        flags.append(f"{rel}:1 runs a `--verify-only` pass-flag reader")
+    if product_modules:
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+                imported.update(f"{node.module}.{a.name}" for a in node.names)
+        parts = {seg for name in imported for seg in name.split(".")}
+        if not parts & product_modules:
+            flags.append(
+                f"{rel}:1 imports none of the slice's product modules "
+                f"({', '.join(sorted(product_modules))})"
+            )
+    return flags
+
+
+_TS_READFILE_RE = re.compile(r"readFileSync\s*\(")
+_TS_TOCONTAIN_RE = re.compile(r"\.toContain\(\s*(['\"`])(.{0,2}?)\1\s*\)")
+
+
+def ts_test_flags(rel: str, text: str) -> list[str]:
+    """Regex equivalent for TypeScript/JavaScript tests."""
+    flags: list[str] = []
+    reads = bool(_TS_READFILE_RE.search(text))
+    for n, line in enumerate(text.splitlines(), 1):
+        m = _TS_TOCONTAIN_RE.search(line)
+        if m and len(m.group(2)) <= 2:
+            flags.append(f"{rel}:{n} toContain of a {len(m.group(2))}-character literal")
+        if reads and ".toContain(" in line:
+            flags.append(f"{rel}:{n} toContain over file text read with readFileSync, not behaviour")
+        if _RECEIPT_DIR_RE.search(line) and ("readFileSync" in line or "readFile(" in line):
+            flags.append(f"{rel}:{n} reads a receipt under results/ or evidence/")
+    return flags
+
+
+def test_file_flags(rel: str, text: str, product_modules: set[str] | None = None) -> list[str]:
+    if rel.endswith(".py"):
+        return python_test_flags(rel, text, product_modules)
+    if re.search(r"\.[cm]?[jt]sx?$", rel):
+        return ts_test_flags(rel, text)
+    return []
+
+
+def empty_tsconfig_flag(root: Path, command: str | None) -> list[str]:
+    """`tsc ... -p <dir>` over a tsconfig with `"files": []` and no include."""
+    out: list[str] = []
+    for m in re.finditer(r"\btsc\b[^&|;]*?-p\s+(\S+)", command or ""):
+        cfg = root / m.group(1)
+        cfg = cfg / "tsconfig.json" if cfg.is_dir() or not cfg.suffix else cfg
+        try:
+            data = cfg.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if re.search(r'"files"\s*:\s*\[\s*\]', data) and '"include"' not in data:
+            out.append(f"{cfg.relative_to(root) if root in cfg.parents else cfg}:1 "
+                       "typecheck over `files: []` (a no-op, not a build)")
+    return out
+
+
+def mailbox_test_flags(loop_dir: Path, tm) -> list[str]:
+    """L7 flags over the mailbox's own test files and the test files the
+    slices declare in `writes:` (resolved in the mailbox repo)."""
+    root = mailbox_repo_root(loop_dir) or loop_dir
+    files: list[Path] = [
+        p for p in sorted(loop_dir.rglob("*"))
+        if p.is_file() and TEST_FILE_RE.search(p.as_posix())
+        and "node_modules" not in p.parts and not any(part.startswith(".") for part in p.relative_to(loop_dir).parts)
+    ]
+    plan_text = _plan_text(loop_dir) or ""
+    for sl in tm.parse_slices_block(plan_text) or []:
+        for write in sl.get("writes") or []:
+            w = str(write)
+            if w.startswith("api:") or not TEST_FILE_RE.search(w):
+                continue
+            cand = (root / w)
+            if cand.is_file() and cand not in files:
+                files.append(cand)
+    flags: list[str] = []
+    for path in files[:200]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = path.relative_to(root).as_posix() if root in path.parents else str(path)
+        flags.extend(test_file_flags(rel, text))
+    return flags
 
 
 def check_prompt_sync(root: Path) -> tuple[bool, list[str]]:
