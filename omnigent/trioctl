@@ -4976,6 +4976,11 @@ class OmnigentRunner:
                 block = block.rstrip("\n") + "\n" + self._root_free_note(
                     context, mailbox, repos
                 ) + "\n"
+                # eval-r16rc N9: a root-free aggregate is on the loop branch.
+                block = block.replace(
+                    "on its checked-out base branch, make ONE",
+                    "in its aggregate (on the loop branch), make ONE",
+                )
             result = block + result
         elif context and (
             context.get("evaluator_attempt") or context.get("pinned_sha")
@@ -7768,7 +7773,9 @@ def _root_free_info(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _discard_pristine_lead(mailbox: Path, why: str, *, land_only: bool = False) -> bool:
+def _discard_pristine_lead(
+    mailbox: Path, why: str, *, land_only: bool = False, branches_only: bool = False,
+) -> bool:
     """Drop *mailbox*'s root-free Lead worktree + branch when it made no
     progress (eval-r16rc F1); True when it was removed (message printed)."""
     if land_only or root_free is None or worker_worktrees is None:
@@ -7783,7 +7790,9 @@ def _discard_pristine_lead(mailbox: Path, why: str, *, land_only: bool = False) 
     if _live_driver_of(home, rel) is not None:
         return False
     try:
-        done = root_free.discard_pristine(worker_worktrees, record, why)
+        done = root_free.discard_pristine(
+            worker_worktrees, record, why, branches_only=branches_only
+        )
     except (root_free.RootFreeError, worker_worktrees.WorktreeError, OSError) as exc:
         print(f"trioctl: root-free: could not remove the unused Lead worktree: {exc}",
               file=sys.stderr)
@@ -8024,7 +8033,7 @@ def _root_free_begin(
     # (the one writer, every mode) once the runner exists.
     return {
         "home": home, "repo": lead, "mailbox": live, "record": record, "slug": slug,
-        "core": core, "info": _root_free_info(record),
+        "core": core, "info": _root_free_info(record), "created": created,
     }
 
 
@@ -8132,7 +8141,12 @@ def _release_metrics_source() -> tuple[Path, str] | None:
 
     A release/source tree has `<root>/metrics/` next to `<root>/omnigent/`;
     the install.sh layout has `trio-release-metrics/` next to trioctl
-    (with a PIN file naming the release commit).
+    (with a PIN file naming the release commit). The pin is that PIN file,
+    else the git commit of a source checkout, else (a release bundle made
+    with `git archive` and no PIN file, e.g. the installed adapter's
+    `releases/<sha>/metrics`) `sha256:<12 hex>` of the four files --
+    accepted, and written into the refresh commit message as is. Release
+    bundles should write `<release>/metrics/PIN` (the 12-char release sha).
     """
     here = Path(__file__).resolve().parent
     for directory in (here.parent / "metrics", here / INSTALLED_METRICS_SET_DIR):
@@ -8271,6 +8285,9 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
         print("trioctl: nothing was changed", file=sys.stderr)
         return 2
     print(f"release metrics set: {directory} ({pin})")
+    if pin.startswith("sha256:"):
+        print(f"  (no PIN file in {directory} and not a git checkout: the pin is the "
+              "files' sha256; a release bundle should write metrics/PIN)")
     for repo in targets:
         (repo / "metrics").mkdir(exist_ok=True)
         changed: list[str] = []
@@ -8623,6 +8640,13 @@ def _command_loop(args: argparse.Namespace) -> int:
     if refused_code is not None:
         if observe:
             _finish_observation(observe)
+        if rf is not None and rf.get("created"):
+            # eval-r16rc N5: a racing overlapping start lost at registration:
+            # nothing was dispatched, so the Lead worktree it just made goes.
+            _discard_pristine_lead(
+                Path(rf["home"]) / rf["info"]["mailbox_rel"], "refused at registration",
+                branches_only=True,
+            )
         return refused_code
     _clear_driver_stop_reason(loop_core, mailbox)
     keep_sessions = getattr(args, "keep_sessions", False)

@@ -156,3 +156,24 @@ def test_root_free_old_core_refusal_names_the_refresh_command(world, tmp_path, c
     code, _out, refresh_err = _refresh(world, "--repo", str(home), "--commit")
     assert code == 0, refresh_err
     assert world.run_loop(spec) == 0
+
+
+def test_refresh_from_a_bundle_without_pin_uses_the_sha256_pin(world, tmp_path, monkeypatch):
+    """The installed adapter's release dir (`git archive`, no PIN, no .git)."""
+    import shutil
+
+    bundle = tmp_path / "releases" / "abc"
+    (bundle / "omnigent").mkdir(parents=True)
+    shutil.copytree(REPO_ROOT / "metrics", bundle / "metrics",
+                    ignore=shutil.ignore_patterns("tests", "__pycache__", "PIN"))
+    monkeypatch.setattr(world.trioctl, "__file__", str(bundle / "omnigent" / "trioctl"))
+    directory, pin = world.trioctl._release_metrics_source()
+    assert directory == bundle / "metrics"
+    assert re.fullmatch(r"sha256:[0-9a-f]{12}, METRICS_API 6", pin), pin
+    repo = _old_repo(tmp_path / "repo")
+    code, out, err = _refresh(world, "--repo", str(repo), "--commit")
+    assert code == 0, err
+    assert "no PIN file" in out
+    assert git(repo, "log", "-1", "--format=%s") == f"chore: vendor trio loop core ({pin})"
+    (bundle / "metrics" / "PIN").write_text("0123456789ab\n")
+    assert world.trioctl._release_metrics_source()[1] == "0123456789ab, METRICS_API 6"

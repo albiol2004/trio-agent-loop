@@ -483,6 +483,16 @@ def begin(
             raise RootFreeError(f"Lead worktree path {path} already exists; remove it first")
         if path == home or str(path).startswith(str(home) + os.sep):
             raise RootFreeError(f"worktree root {worktree_root} is inside {home}")
+        ignored = _git(wt, home, "check-ignore", "-q", "--no-index", "--",
+                       f"{mailbox_rel}/STATE.md", check=False)
+        if ignored.returncode == 0:  # eval-r16rc N6: the seed commit could not add it
+            raise RootFreeError(
+                f"mailbox {mailbox_rel} is ignored by git (`git check-ignore -v "
+                f"{mailbox_rel}/STATE.md` names the rule); a root-free loop seeds and "
+                "lands its mailbox as commits on the loop branch: un-ignore the mailbox "
+                "directory (keep ignoring its runtime files), or pass --root-bound. "
+                "Nothing was created"
+            )
         repos_plan: dict[str, dict[str, Any]] = {}
         for repo in declared or []:
             main = wt.repo_toplevel(Path(repo["path"]))
@@ -580,7 +590,7 @@ def _undo_create(wt: Any, made: list[tuple[Path, Path, str]], branch: str, seed:
             _git(wt, repo, "update-ref", "-d", f"refs/heads/{branch}", tip, check=False)
 
 
-def progress(wt: Any, record: dict[str, Any]) -> str | None:
+def progress(wt: Any, record: dict[str, Any], *, branches_only: bool = False) -> str | None:
     """Why *record*'s loop has progress worth keeping, or None (pristine).
 
     Pristine = every branch tip is still where :func:`begin` left it (the
@@ -598,7 +608,7 @@ def progress(wt: Any, record: dict[str, Any]) -> str | None:
         tip = wt.rev(repo, f"refs/heads/{branch}")
         if tip is not None and tip not in allowed:
             return f"branch {branch} in {repo} has commits past its seed"
-        if path.is_dir():
+        if path.is_dir() and not branches_only:
             status = _git(
                 wt, path, "status", "--porcelain=v1", "--untracked-files=all", check=False
             )
@@ -607,14 +617,20 @@ def progress(wt: Any, record: dict[str, Any]) -> str | None:
     return None
 
 
-def discard_pristine(wt: Any, record: dict[str, Any], why: str) -> bool:
+def discard_pristine(
+    wt: Any, record: dict[str, Any], why: str, *, branches_only: bool = False
+) -> bool:
     """Remove a loop's Lead worktree(s) and ``trio/<slug>`` branch(es) when it
     has no progress (:func:`progress`), so the next start re-seeds from the
-    target's current tip (eval-r16rc F1). False (nothing done) otherwise."""
+    target's current tip (eval-r16rc F1). False (nothing done) otherwise.
+    *branches_only*: the caller created the worktree in this run and
+    dispatched nothing, so only its driver files changed (eval-r16rc N5)."""
     home = Path(record["repo"])
     with wt.repo_lock(home, "lead"):
         current = load_record(wt, home, record["slug"]) or record
-        if not active(current) or current.get("state") == "landed" or progress(wt, current):
+        if not active(current) or current.get("state") == "landed" or progress(
+            wt, current, branches_only=branches_only
+        ):
             return False
         made = [(home, Path(current["path"]), str(current.get("target_base") or ""))] + [
             (Path(info["main"]), Path(info["path"]), str(info.get("target_base") or ""))
@@ -905,7 +921,8 @@ def land(
             stack.enter_context(wt.repo_lock(path, "land"))
         if pre_land is not None:
             pre_land()
-        notes: list[str] = []
+        # eval-r16rc N8: merge notes survive a needs_land + `land` resume.
+        notes: list[str] = list(record.get("land_notes") or [])
         for _attempt in range(3):
             # Phase 1: verified tips, targets merged in where they moved.
             for agg in aggs:
@@ -968,6 +985,8 @@ def land(
                 verified[agg["name"]] = merged
                 save_record(wt, home, record)
                 notes.append(f"merged {agg['name']}:{target}@{target_sha[:12]} ({why})")
+                record["land_notes"] = notes
+                save_record(wt, home, record)
                 emit(f"land: merged {target}@{target_sha[:12]} into {record['branch']} in repo {agg['name']}: {why}")
             record["verified"] = verified
             # Phase 2: land, declared repos first, home last.
@@ -979,6 +998,11 @@ def land(
                 if result == "moved":
                     moved = True
                     break
+                done = {n: str(v)[:12] for n, v in (record.get("landed") or {}).items()
+                        if n != agg["name"]}
+                if isinstance(result, dict) and result.get("status") == "needs_land" and done:
+                    result = dict(result, detail=f"{result.get('detail', '')} (already landed: "
+                                  + ", ".join(f"{n}@{v}" for n, v in done.items()) + ")")
                 return result
             if not moved:
                 record["state"] = "landed"

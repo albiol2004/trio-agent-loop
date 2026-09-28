@@ -225,7 +225,12 @@ aggregate and is refused by the r15 guard.
   dirty or untracked `metrics/` (or `--commit` on a detached HEAD) is
   refused with exit 2 and nothing written. The installed trioctl reads the
   set from `trio-release-metrics/` next to it (install.sh; `PIN` = release
-  commit), a release tree from its own `metrics/`.
+  commit), a release tree from its own `metrics/` (its `metrics/PIN`, else
+  the checkout's commit). A release bundle unpacked with `git archive` and
+  no PIN file (the installed adapter's `releases/<sha>/`) is accepted: the
+  pin is `sha256:<12 hex>` of the four files and goes into the commit
+  message as is. Bundles should write `<release>/metrics/PIN` (12-char
+  release sha) so the commit names the release.
 
 ## 11. Migrating mailboxes started before r16a
 
