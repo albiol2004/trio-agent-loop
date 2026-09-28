@@ -7717,6 +7717,25 @@ def _root_free_info(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _root_lock_refused(root_box: Path, rel: str, *, clear_stale: bool) -> bool:
+    """True (message printed) when a live driver holds *root_box*'s `.lock`."""
+    holder = root_free.root_lock_holder(
+        root_box, clear_stale=clear_stale,
+        log=lambda line: print(f"trioctl: {line}", file=sys.stderr),
+    )
+    if holder is None:
+        return False
+    who = f"pid {holder}" if holder else "a driver taking the lock (no pid yet)"
+    print(
+        f"trioctl: mailbox {rel} is owned by a live driver ({who}, {root_box}/.lock; "
+        "a root-bound, lockstep or older-release loop): not starting it root-free; "
+        "nothing was created or changed. Wait for that driver to finish (or stop it) "
+        "and start again",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _root_free_begin(
     args: argparse.Namespace, cwd: Path, mailbox: Path, *, land_only: bool = False
 ) -> dict[str, Any] | int | None:
@@ -7770,6 +7789,13 @@ def _root_free_begin(
             + ")",
             file=sys.stderr,
         )
+        return 5
+    # eval-r16rc B1: a root-bound, lockstep, native or pre-r16 driver never
+    # registers; its only mark is the ROOT mailbox's `.lock` (the loop
+    # core's mailbox lock). A live holder owns the mailbox: refuse before
+    # anything is created or written (as 9a224c1 does: exit 5).
+    root_box = Path(home) / rel
+    if _root_lock_refused(root_box, rel, clear_stale=False):
         return 5
     if not root_free.active(record) and not land_only:
         # r15 guard before anything exists: a refused PLAN never gets a Lead
@@ -7831,6 +7857,10 @@ def _root_free_begin(
         else wt.default_worktree_root(wt.repo_toplevel(home))
     )
     declared = [] if root_free.active(record) else _root_free_declared(mailbox)
+    # Committed to proceed: re-check the root lock and clear a stale one the
+    # way the loop core's `_acquire_lock` does (dead pid / old pid-less lock).
+    if _root_lock_refused(root_box, rel, clear_stale=True):
+        return 5
     try:
         record, created = root_free.begin(
             wt, home=home, mailbox_rel=rel, worktree_root=worktree_root,

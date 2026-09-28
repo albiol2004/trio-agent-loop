@@ -220,6 +220,77 @@ def live_mailbox(wt: Any, mailbox: Path) -> Path | None:
     return live if live.is_dir() else None
 
 
+# ------------------------------------------------------------------ root lock
+
+#: The loop core's mailbox lock protocol (metrics/trio_loop.py
+#: ``_acquire_lock``): ``<mailbox>/.lock/pid``; a pid-less lock is an
+#: acquirer between mkdir and pid and only stale after this many seconds.
+ROOT_LOCK_EMPTY_GRACE_SECONDS = 60.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def root_lock_holder(
+    mailbox: Path, *, clear_stale: bool = True, log: Callable[[str], None] | None = None,
+) -> int | None:
+    """The pid of a live driver holding the ROOT mailbox's ``.lock``, else None.
+
+    Root-bound, lockstep, native ``metrics/trio_loop.py`` and pre-r16
+    (9a224c1) drivers never write the live-loop registry; the mailbox lock
+    is their only mark (eval-r16rc B1). Same rule as the core's
+    ``_acquire_lock``, under the same flock on the mailbox directory: a
+    live pid owns it; a pid-less lock younger than the grace is being
+    acquired (returned as 0: owned); a dead pid or an old pid-less lock is
+    stale and, with *clear_stale*, moved aside and deleted exactly as the
+    core does before it takes the lock over.
+    """
+    mailbox = Path(mailbox)
+    lock = mailbox / ".lock"
+    if not lock.exists() or not mailbox.is_dir():
+        return None
+    import fcntl
+    import uuid
+
+    fd = os.open(mailbox, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if not lock.exists():
+            return None
+        try:
+            pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = 0
+        if pid > 0 and _pid_alive(pid):
+            return pid
+        if pid <= 0:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except FileNotFoundError:
+                return None
+            if age < ROOT_LOCK_EMPTY_GRACE_SECONDS:
+                return 0
+        if clear_stale:
+            if log is not None:
+                log(f"Removing stale lock on {mailbox}/ (pid {pid or 'unknown'} is gone).")
+            tomb = mailbox / f".lock.stale-{os.getpid()}-{uuid.uuid4().hex}"
+            with contextlib.suppress(FileNotFoundError):
+                os.rename(lock, tomb)
+                shutil.rmtree(tomb, ignore_errors=True)
+        return None
+    finally:
+        os.close(fd)
+
+
 # ------------------------------------------------------------------ registry
 
 

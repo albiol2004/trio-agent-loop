@@ -142,7 +142,7 @@ SHIP-not-landed; `trioctl omnigent land` resumes it.
 | 2 | blocked (also: refused flag combination) |
 | 3 | error (incl. `worktree-setup`, `driver-exception`, METRICS_API refusal) |
 | 4 | iteration cap |
-| 5 | needs_human / mailbox owned by a live driver |
+| 5 | needs_human / mailbox owned by a live driver: a registered driver, or a live pid in the ROOT mailbox's `.lock` (root-bound, lockstep, native or pre-r16 drivers never register; eval-r16rc B1) — refused before anything is created, root mailbox byte-identical. A stale `.lock` (dead pid, or pid-less for 60 s) is removed as the loop core does and the start proceeds |
 | 6 | needs_retirement |
 | 7 | held dispatch |
 | 8 | **needs_land** — verified but not landed; resumable with `trioctl omnigent land` |

@@ -966,7 +966,7 @@ the dirty-checkout gate or the untracked-product scan.
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository, any mode (STATE untouched; root-bound: one LOG line; root-free: stderr only, nothing created); or a refused flag combination (`--root-free` unmet, `--root-bound` on a root-free mailbox) |
 | 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
-| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x); or the mailbox is owned by a live driver (left byte-identical) |
+| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x); or the mailbox is owned by a live driver (left byte-identical; root-free also reads the root mailbox's `.lock`, eval-r16rc B1) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
 | 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
 | 8 | `needs_land` | root-free (r16): the verified loop branch could not land (`phase: land-blocked`, `land-conflict`, `land-starved`, `land-error`); resume with `trioctl omnigent land --mailbox <x>` |
