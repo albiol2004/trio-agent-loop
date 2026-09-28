@@ -32,7 +32,10 @@ from typing import Protocol
 # open-loop integration-eval binds evaluated_sha/evaluator_attempt and
 # `_evaluated_product_problem` gates SHIP finalization. A core without
 # this constant predates that contract (treated as 1). Bump on any change
-# a caller must not silently run against.
+# a caller must not silently run against. (r15 multi-repo is additive --
+# a `repo` key in slice-eval contexts, `pins` in integration contexts, the
+# `evaluated_repos` STATE.md key -- and is gated by the sibling
+# trio-metrics.py METRICS_API 5, so this stays 2.)
 LOOP_CORE_API = 2
 
 def _load_metrics_module():
@@ -57,9 +60,12 @@ SCOPE_RE = re.compile(r"^scope=(design|local:[^\s]+)$", re.IGNORECASE)
 # evaluated_sha / evaluator_attempt are lockstep pin keys: they bind a
 # resume to the revision and attempt that were dispatched, not merely
 # the iteration number leftover in VERDICT.md.
+# evaluated_repos (r15) is the per-repo pin of a mailbox that declares
+# PLAN.md `repos:`: `<repo>@<sha>` items for every declared repo (home stays
+# in evaluated_sha); never written for a single-repo mailbox.
 STATE_RE = re.compile(
     r"^\s*(?:-\s+)?(iteration|status|phase|evaluated_sha|"
-    r"evaluator_attempt)\s*:\s*(.*)$",
+    r"evaluator_attempt|evaluated_repos)\s*:\s*(.*)$",
     re.IGNORECASE,
 )
 ROLE_LOG_RE = re.compile(
@@ -116,6 +122,7 @@ def _read_state(path: Path) -> dict[str, str]:
         "phase": "idle",
         "evaluated_sha": "",
         "evaluator_attempt": "",
+        "evaluated_repos": "",
     }
     lines = path.read_text(
         encoding="utf-8", errors="replace"
@@ -146,7 +153,10 @@ def _update_state(path: Path, updates: dict[str, str]) -> None:
         "phase",
         "evaluated_sha",
         "evaluator_attempt",
+        "evaluated_repos",
     ):
+        if key == "evaluated_repos" and not updates.get(key):
+            continue  # never add an empty per-repo pin (single-repo STATE.md)
         if key in updates and key not in found:
             result.append(f"{key}: {updates[key]}")
     path.write_text(
@@ -602,15 +612,26 @@ def _restore_clobbered_verdict_sections(
     )
     return len(missing)
 
-def _verdict_commit_shas(text: str) -> list[str]:
-    """Return ``commit: <sha>`` values recorded in VERDICT.md."""
+def _verdict_commit_shas(text: str, repo: str | None = None) -> list[str]:
+    """Return ``commit: <sha>`` values recorded in VERDICT.md.
+
+    r15: *repo* None (the default) keeps the historical meaning -- bare
+    shas only, the home repo's (``commit: <repo>@<sha>`` lines of declared
+    repos never count). With *repo*, the shas of ``commit:`` lines pinned to
+    it (``<repo>@<sha>``; ``home`` also takes bare shas).
+    """
     shas: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         if line.lower().startswith("commit:"):
             got = line.split(":", 1)[1].strip().lower()
-            if re.fullmatch(r"[0-9a-f]{7,40}", got):
-                shas.append(got)
+            if repo is None:
+                if re.fullmatch(r"[0-9a-f]{7,40}", got):
+                    shas.append(got)
+                continue
+            for name, sha in _METRICS.parse_repo_pins([got]):
+                if name == repo:
+                    shas.append(sha)
     return shas
 
 
@@ -699,12 +720,24 @@ def _sha_matches(got: str, want: str) -> bool:
     return a == b or b.startswith(a) or a.startswith(b)
 
 
-def _verdict_records_evaluated(text: str, sha: str) -> bool:
-    """True when ``evaluated:`` records the graded revision (not ``commit:``)."""
+def _verdict_records_evaluated(text: str, sha: str, repo: str = "home") -> bool:
+    """True when ``evaluated:`` records the graded revision (not ``commit:``).
+
+    r15: a multi-repo pin is recorded as ``<repo>@<sha>`` items (one line or
+    several); the home repo's sha may also be bare, exactly as before.
+    """
     want = sha.strip()
     if not want:
         return False
-    return any(_sha_matches(got, want) for got in _verdict_field_values(text, "evaluated"))
+    values = _verdict_field_values(text, "evaluated")
+    if repo == "home" and any(_sha_matches(got, want) for got in values):
+        return True
+    pins = getattr(_METRICS, "parse_repo_pins", None)
+    if pins is None:
+        return False
+    return any(
+        name == repo and _sha_matches(got, want) for name, got in pins(values)
+    )
 
 
 def _verdict_records_sha(text: str, sha: str) -> bool:
@@ -1072,6 +1105,136 @@ def _log_untracked_product_blockers(
     )
 
 
+# --- r15: declared product repos (PLAN.md `repos:`) -------------------------
+# The mailbox repo (`repo` of the driver) is `home`; each declared repo is
+# pinned, verified and retired on its own. Single-repo mailboxes never reach
+# any of this (`_declared_repos` is []).
+
+
+def _declared_repos(mailbox: Path) -> list[tuple[str, Path]]:
+    """(name, path) of PLAN.md's declared `repos:` (r15), in PLAN order.
+
+    [] in single-repo mode and when the block does not validate (trioctl
+    and trio-check refuse such a PLAN before any dispatch).
+    """
+    reader = getattr(_METRICS, "read_repos", None)
+    if reader is None:
+        return []
+    try:
+        info = reader(Path(mailbox))
+    except Exception:  # noqa: BLE001 - an unreadable block is single-repo here
+        return []
+    if info.get("errors"):
+        return []
+    return [(r["name"], Path(r["path"])) for r in info.get("repos") or []]
+
+
+def _repos_with_slices(mailbox: Path, declared: list[tuple[str, Path]]) -> list[str]:
+    """Declared repo names that at least one PLAN.md slice belongs to."""
+    names = [name for name, _path in declared]
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return names
+    slices = _METRICS.parse_slices_block(text)
+    if slices is None:
+        return names
+    used = {_METRICS.slice_repo_name(sl, names) for sl in slices}
+    return [name for name in names if name in used]
+
+
+def _state_repo_pins(state: dict[str, str]) -> dict[str, str]:
+    """STATE.md ``evaluated_repos`` as ``{repo: sha}``."""
+    value = str(state.get("evaluated_repos", "") or "").strip()
+    if not value:
+        return {}
+    return {name: sha for name, sha in _METRICS.parse_repo_pins([value])}
+
+
+def _format_repo_pins(pins: dict[str, str]) -> str:
+    return " ".join(f"{name}@{sha}" for name, sha in pins.items())
+
+
+def _repo_retirement_commit(repo: Path, iteration: int, pin: str) -> str | None:
+    """The declared repo's SHIP retirement commit: a ``loop: iteration N —
+    SHIP`` commit that descends from the repo's evaluated *pin* and is an
+    ancestor of its HEAD (r15 per-repo retirement), or None."""
+    needle = f"loop: iteration {iteration} — SHIP"
+    result = _git(repo, "log", "--grep", needle, "--format=%H")
+    head = _git_head(repo)
+    resolved_pin = _git_commit_sha(repo, pin)
+    if result.returncode != 0 or head is None or resolved_pin is None:
+        return None
+    for sha in result.stdout.split():
+        resolved = _git_commit_sha(repo, sha)
+        if resolved is None or resolved == resolved_pin:
+            continue
+        if _git_is_ancestor(repo, resolved, head) and _git_is_ancestor(
+            repo, resolved_pin, resolved
+        ):
+            return resolved
+    return None
+
+
+def _declared_repos_retirement_problem(
+    mailbox: Path, iteration: int, text: str, state: dict[str, str]
+) -> tuple[str, str] | None:
+    """Per-repo SHIP retirement of a `repos:` mailbox (r15), or None.
+
+    For every declared repo: STATE.md ``evaluated_repos`` pins it, the
+    integration verdict records ``evaluated: <repo>@<pin>``, and the repo's
+    product tree is unchanged since that pin (final otherwise). Every
+    ``commit: <repo>@<sha>`` line must be a commit reachable from that
+    repo's HEAD, and each repo that has slices needs its own ``loop:
+    iteration N — SHIP`` retirement commit after the pin (pending
+    otherwise: the Evaluator may still be committing).
+    """
+    declared = _declared_repos(mailbox)
+    if not declared:
+        return None
+    pins = _state_repo_pins(state)
+    integration = _integration_verdict_text(text)
+    with_slices = set(_repos_with_slices(mailbox, declared))
+    pending: tuple[str, str] | None = None
+    for name, path in declared:
+        pin = pins.get(name, "")
+        if not pin:
+            return RETIREMENT_FINAL, (
+                f"STATE.md evaluated_repos has no pin for repo {name}"
+            )
+        if not _verdict_records_evaluated(integration, pin, name):
+            return RETIREMENT_FINAL, (
+                f"VERDICT.md does not record evaluated: {name}@{pin}"
+            )
+        if _git_root(path) is None:
+            return RETIREMENT_FINAL, f"repo {name} ({path}) is not a git repository"
+        product = _evaluated_product_problem(path, mailbox, pin)
+        if product is not None:
+            return RETIREMENT_FINAL, (
+                f"product tree changed in repo {name}: {product}"
+            )
+        if pending is not None:
+            continue
+        head = _git_head(path)
+        claimed = _verdict_commit_shas(text, name)
+        for raw in claimed:
+            sha = _git_commit_sha(path, raw)
+            if sha is None or head is None or not _git_is_ancestor(path, sha, head):
+                pending = (RETIREMENT_PENDING, (
+                    f"VERDICT.md commit: {name}@{raw} is not a commit "
+                    f"reachable from repo {name}'s HEAD"
+                ))
+                break
+        if pending is None and name in with_slices and (
+            _repo_retirement_commit(path, iteration, pin) is None
+        ):
+            pending = (RETIREMENT_PENDING, (
+                f"no 'loop: iteration {iteration} — SHIP' retirement commit "
+                f"after pin {pin[:12]} in repo {name} ({path})"
+            ))
+    return pending
+
+
 def _evaluated_product_problem(
     repo: Path,
     mailbox: Path,
@@ -1177,6 +1340,13 @@ def _retirement_snapshot(mailbox: Path, repo: Path | None) -> tuple:
 
     git_root = _git_root(repo)
     head = status = None
+    repos: list = []
+    for _name, path in _declared_repos(mailbox):
+        # r15: each declared repo's HEAD and tree are retirement inputs too.
+        repos.append((str(path), _git_head(path), _git(
+            path, "--no-optional-locks", "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout))
     if git_root is not None:
         head = _git_head(git_root)
         # --no-optional-locks: a status index refresh must not take
@@ -1200,6 +1370,8 @@ def _retirement_snapshot(mailbox: Path, repo: Path | None) -> tuple:
             status = result.stdout if result.returncode == 0 else None
         except OSError:
             status = None
+    if repos:
+        return raw("VERDICT.md"), raw("STATE.md"), head, status, tuple(repos)
     return raw("VERDICT.md"), raw("STATE.md"), head, status
 
 
@@ -1281,6 +1453,11 @@ def _ship_retirement_problem_once(
     product = _evaluated_product_problem(git_root, mailbox, evaluated)
     if product is not None:
         return RETIREMENT_FINAL, f"product tree changed: {product}"
+    repos_problem = _declared_repos_retirement_problem(
+        mailbox, iteration, text, state
+    )
+    if repos_problem is not None and repos_problem[0] == RETIREMENT_FINAL:
+        return repos_problem
     verified = _verified_verdict_commit_shas(git_root, text)
     mailbox_ok = _mailbox_retirement_commit_present(
         git_root, mailbox, iteration
@@ -1292,10 +1469,9 @@ def _ship_retirement_problem_once(
             "VERDICT.md commit: lines are not commits reachable from "
             f"HEAD: {', '.join(claimed)}"
         )
-    if verified and mailbox_ok:
-        return None
-    if mailbox_ok and evaluated and not claimed:
-        return None
+    if (verified and mailbox_ok) or (mailbox_ok and evaluated and not claimed):
+        # r15: every declared repo must be retired too (None single-repo).
+        return repos_problem
     if not mailbox_ok:
         mailbox_rel = _mailbox_rel(git_root, mailbox) or str(mailbox)
         return RETIREMENT_PENDING, (
@@ -1513,6 +1689,7 @@ def _lockstep_eval_context(
     attempt = state.get("evaluator_attempt", "").strip()
     pinned = state.get("evaluated_sha", "").strip()
     git_root = _git_root(repo)
+    fresh = not pinned
     # Resume reuses evaluated_sha; never recapture HEAD as a
     # new product baseline (untracked files are not a pin).
     if not pinned and git_root is not None:
@@ -1523,12 +1700,24 @@ def _lockstep_eval_context(
         "evaluated_sha": pinned,
         "evaluator_attempt": attempt,
     }
+    # r15: pin every declared repo alongside (reused on resume).
+    declared = _declared_repos(mailbox)
+    repo_pins = {} if fresh else _state_repo_pins(state)
+    if declared:
+        repo_pins = {
+            name: repo_pins.get(name) or _git_head(path) or ""
+            for name, path in declared
+        }
+        updates["evaluated_repos"] = _format_repo_pins(repo_pins)
     _update_state(state_path, updates)
-    return {
+    context = {
         "pinned_sha": pinned,
         "expected_sha": pinned,
         "evaluator_attempt": attempt,
     }
+    if declared:
+        context["pins"] = {"home": pinned, **repo_pins}
+    return context
 
 
 def _open_loop_integration_context(
@@ -1547,22 +1736,34 @@ def _open_loop_integration_context(
     the retirement do not count); otherwise HEAD is pinned with a new
     attempt, so an earlier ITERATE's pin can never be reused.
     """
-    del mailbox
     state = _read_state(state_path)
     attempt = state.get("evaluator_attempt", "").strip()
     pinned = state.get("evaluated_sha", "").strip()
     git_root = _git_root(repo)
     head = _git_head(git_root) if git_root is not None else None
+    # r15: a `repos:` mailbox pins one sha per declared repo as well.
+    declared = _declared_repos(mailbox)
+    repo_pins = _state_repo_pins(state)
     reuse = bool(attempt and pinned)
     if reuse and git_root is not None:
         reuse = _evaluated_product_intact(git_root, state_path.parent, pinned)
+    if reuse and declared:
+        reuse = all(
+            repo_pins.get(name)
+            and _evaluated_product_intact(path, mailbox, repo_pins[name])
+            for name, path in declared
+        )
     if not reuse:
         attempt = uuid.uuid4().hex
         pinned = head or ""
-    _update_state(
-        state_path, {"evaluated_sha": pinned, "evaluator_attempt": attempt}
-    )
-    return {
+        repo_pins = {name: _git_head(path) or "" for name, path in declared}
+    updates = {"evaluated_sha": pinned, "evaluator_attempt": attempt}
+    if declared:
+        updates["evaluated_repos"] = _format_repo_pins(
+            {name: repo_pins.get(name, "") for name, _path in declared}
+        )
+    _update_state(state_path, updates)
+    context = {
         "mode": "open-loop",
         "slice": None,
         "sha": pinned or None,
@@ -1572,6 +1773,12 @@ def _open_loop_integration_context(
         "evaluator_attempt": attempt,
         "iteration": iteration,
     }
+    if declared:
+        context["pins"] = {
+            "home": pinned,
+            **{name: repo_pins.get(name, "") for name, _path in declared},
+        }
+    return context
 
 
 def _run_lockstep(
@@ -1704,6 +1911,7 @@ def _run_lockstep(
                     "phase": f"{role}-running",
                     "evaluator_attempt": "",
                     "evaluated_sha": "",
+                    "evaluated_repos": "",
                 },
             )
             _write_driver_state(mailbox, runner, iteration, f"{role}-running")
@@ -2089,13 +2297,21 @@ def _lead_pass_snapshot(mailbox: Path, repo: Path | None) -> tuple:
     fault_status = frozenset(
         (fault["id"], fault["status"]) for fault in queue["faults"]
     )
-    return (
+    snapshot = (
         plan_bytes,
         retired,
         fault_status,
         _git_head_sha(target),
         _git_slice_commit_shas(target),
     )
+    declared = _declared_repos(mailbox)
+    if declared:
+        # r15: a pass that only commits in a declared repo did something.
+        snapshot += tuple(
+            (name, _git_head_sha(path), _git_slice_commit_shas(path))
+            for name, path in declared
+        )
+    return snapshot
 
 
 def _lead_thread_body(
@@ -2751,6 +2967,10 @@ def run_open_loop(
                     "sha": sha,
                     "kind": "slice-eval",
                 }
+                entry_repo = str(entry.get("repo") or "").strip()
+                if entry_repo and entry_repo != "home":
+                    # r15: the sha is a commit of this declared repo.
+                    context["repo"] = entry_repo
                 verdict_snapshot = (
                     verdict_path.read_text(encoding="utf-8", errors="replace")
                     if verdict_path.is_file()
@@ -2976,7 +3196,11 @@ def run_open_loop(
                     # the next integration-eval must bind a fresh one.
                     _update_state(
                         state_path,
-                        {"evaluator_attempt": "", "evaluated_sha": ""},
+                        {
+                            "evaluator_attempt": "",
+                            "evaluated_sha": "",
+                            "evaluated_repos": "",
+                        },
                     )
                     # ITERATE: wake the Lead for another pass, forcing at
                     # least one even if the queue currently looks "done"

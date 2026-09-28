@@ -176,8 +176,22 @@ def covers(declared: str, actual: str) -> bool:
     return a == d or a.startswith(d + "/")
 
 
-def analyze_slice(sl: dict, base: Path) -> dict:
-    repo_path = (base / sl["repo"]).resolve()
+def analyze_slice(sl: dict, base: Path, repos: dict | None = None) -> dict:
+    """Declared-vs-actual writes of one slice, from its repo's git log.
+
+    *repos* (r15) maps declared PLAN.md `repos:` names to their paths; a
+    slice whose `repo:` names one is resolved there (its `slice(<id>):`
+    commits live in that repo), `home`/`.` in the mailbox repo. Without
+    *repos* a `repo:` value is a path relative to the mailbox dir (pre-r15).
+    """
+    repos = repos or {}
+    name = _METRICS.slice_repo_name(sl, repos) if repos else None
+    if name is not None and name != _METRICS.HOME_REPO:
+        repo_path = Path(repos[name]).resolve()
+    elif name == _METRICS.HOME_REPO:
+        repo_path = base.resolve()
+    else:
+        repo_path = (base / sl["repo"]).resolve()
     entry: dict = {
         "id": sl["id"],
         "repo": sl["repo"],
@@ -241,7 +255,11 @@ def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
                 f"unknown --slice id {slice_filter!r}; available slice id(s): "
                 f"{', '.join(available) if available else '(none)'}"
             )
-    entries = [analyze_slice(sl, mailbox) for sl in slices]
+    repos, _errors = _METRICS.parse_repos_block(
+        text, _METRICS.mailbox_repo_root(plan_path.parent)
+    )
+    named = {r["name"]: r["path"] for r in repos}
+    entries = [analyze_slice(sl, mailbox, named) for sl in slices]
     summary = {
         "total_slices": len(entries),
         "slices_with_undeclared_touches": sum(
@@ -313,6 +331,10 @@ def mailbox_pairwise_hazards(entries: list[dict]) -> list[dict]:
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 a, b = group[i], group[j]
+                if a.get("repo_path") != b.get("repo_path"):
+                    # r15: disjointness is per repo; the same relative path
+                    # in two repos is two different files.
+                    continue
                 overlap = sorted(set(a["actual_touched"]) & set(b["actual_touched"]))
                 if not overlap:
                     continue
