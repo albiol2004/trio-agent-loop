@@ -71,6 +71,11 @@ def trioctl(monkeypatch: pytest.MonkeyPatch):
 
 
 def parse(trioctl, *argv: str):
+    # These tests pin the r11 isolation/concurrency defaults of a loop at
+    # the repository root; r16 root-free open-loop is covered by
+    # test_r16_root_free_*.py.
+    if "--root-free" not in argv:
+        argv = ["--root-bound", *argv]
     return trioctl.parser().parse_args(["omnigent", "loop", *argv])
 
 

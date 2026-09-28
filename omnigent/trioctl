@@ -75,6 +75,27 @@ class TrioctlError(RuntimeError):
     """A user-actionable configuration or discovery failure."""
 
 
+class _EvalBindSkipped(TrioctlError):
+    """r16: a root-free slice-eval that could not bind its worktree (not dispatched)."""
+
+
+def _append_mailbox_log(mailbox: Path, line: str) -> None:
+    """Append one LOG.md line (newline-safe, like the loop core's `_append_log`)."""
+    log = Path(mailbox) / "LOG.md"
+    try:
+        prefix = ""
+        if log.is_file():
+            with open(log, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell():
+                    fh.seek(-1, os.SEEK_END)
+                    prefix = "" if fh.read(1) == b"\n" else "\n"
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(prefix + line.rstrip("\n") + "\n")
+    except OSError as exc:
+        print(f"trioctl: could not append to {log}: {exc}", file=sys.stderr)
+
+
 def _load_broker_http() -> Any:
     """Load the sibling client without importing this directory as a package."""
     path = Path(__file__).with_name("broker_http.py")
@@ -133,6 +154,23 @@ def _load_worker_worktrees() -> Any:
 
 
 worker_worktrees = _load_worker_worktrees()
+
+
+def _load_root_free() -> Any:
+    """Load sibling root-free open-loop support (r16), or None when absent."""
+    path = Path(__file__).with_name("root_free.py")
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader("trioctl_root_free", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"cannot load root-free support: {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+root_free = _load_root_free()
 
 
 def _load_reconcile() -> Any:
@@ -919,6 +957,7 @@ def _driver_config_path(mailbox_arg: Any) -> Path | None:
     mailbox = Path(str(mailbox_arg)).expanduser()
     if not mailbox.is_absolute():
         mailbox = Path.cwd() / mailbox
+    mailbox = _live_mailbox_or(mailbox)
     try:
         data = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1549,7 +1588,9 @@ def _ship_acceptance(
 def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any]:
     state = core._read_state(mailbox / "STATE.md")
     status = str(state.get("status", "")).strip()
-    if status != "shipped":
+    if status not in ("shipped", "needs_land"):
+        # r16: `needs_land` is a finalized SHIP whose land onto the target is
+        # still pending; the retirement checks below are unchanged.
         return {"pending": f"loop status is {status or 'unset'!r}, not a driver-finalized 'shipped'"}
     evaluated = str(state.get("evaluated_sha", "")).strip()
     attempt = str(state.get("evaluator_attempt", "")).strip()
@@ -1626,7 +1667,7 @@ def _run_worktree_cleanup(
         return []
     acceptance_for = lambda box: _ship_acceptance(box, repo, loop_core)  # noqa: E731
     results: list[dict[str, Any]] = []
-    ledgers = [repo]
+    ledgers: list[Path] = []
     if mailbox is not None:
         try:
             ledgers += [
@@ -1636,6 +1677,9 @@ def _run_worktree_cleanup(
         except TrioctlError as exc:
             print(f"trioctl: declared repos unreadable ({exc}); cleaning the home repo only",
                   file=sys.stderr)
+    # Declared repos first: a root-free integration-eval checks their pins
+    # out INSIDE its home worktree, which is removable only after them.
+    ledgers.append(repo)
     for ledger in ledgers:
         results += _cleanup_ledger(wt, ledger, mailbox, acceptance_for, torn_down)
     return results
@@ -1685,6 +1729,23 @@ def command_worktrees(args: argparse.Namespace) -> int:
     mailbox = (
         _resolve_mailbox(args.mailbox, repo) if getattr(args, "mailbox", None) else None
     )
+    literal = (
+        Path(args.mailbox).expanduser() if getattr(args, "mailbox", None) else None
+    )
+    if literal is not None and not literal.is_absolute():
+        literal = repo / literal
+    if (
+        mailbox is not None
+        and literal is not None
+        and mailbox != literal.resolve()
+        and getattr(args, "repo", ".") in (None, ".")
+    ):
+        # r16: a root mailbox resolved to its root-free live copy -- that
+        # loop's aggregate is its Lead worktree, not this checkout.
+        try:
+            repo = wt.repo_toplevel(mailbox)
+        except wt.WorktreeError:
+            pass
     try:
         if args.worktrees_command == "create":
             record = wt.create(
@@ -3386,6 +3447,67 @@ _OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE = (
 )
 
 
+# r16 root-free open-loop: rendered only when the run is root-free (every
+# other prompt stays byte-identical). Sourced from prompts/canonical/lead.md
+# and evaluator.md ("Root-free open-loop (r16)").
+_ROOT_FREE_LEAD_NOTE = (
+    "ROOT-FREE (this loop runs in its own Lead worktree) -- extends steps 0-7:\n"
+    "- Your workspace `{lead}` is this loop's private aggregate: a checkout\n"
+    "  on branch `{branch}`, forked from `{target}` @ `{base}`. HEAD, \"the\n"
+    "  aggregate\", \"the repo root\", every relative path, every check and\n"
+    "  every `git` command in these instructions mean THIS checkout; the live\n"
+    "  mailbox is `{mailbox}`.\n"
+    "- The repository root `{home}` belongs to the user and to other loops:\n"
+    "  never cd into it, read or edit files there, or run git against it\n"
+    "  (no `git -C {home}`); its copy of the mailbox is stale until this loop\n"
+    "  lands. Builders keep `--workspace {lead}` (the `## Isolated builders`\n"
+    "  command already says so).\n"
+    "- Commit only on `{branch}`: never check out, merge, rebase, reset,\n"
+    "  push or pull another branch, and never touch `{target}`. After the\n"
+    "  integration SHIP the driver lands `{branch}` onto `{target}` itself (a\n"
+    "  fast-forward, or a merge of the moved target plus a re-check).\n"
+)
+
+_ROOT_FREE_SLICE_EVAL_NOTE = (
+    "ROOT-FREE: this loop's aggregate is its Lead worktree `{lead}` (branch\n"
+    "`{branch}`); the repository root `{home}` is not part of this loop --\n"
+    "never read, grade or run anything there. Write only under the absolute\n"
+    "mailbox `{mailbox}`.\n"
+)
+
+_ROOT_FREE_INTEGRATION_NOTE = (
+    "ROOT-FREE (this loop runs in its own Lead worktree):\n"
+    "- Grade in your detached worktree at the pin (ISOLATED EVALUATOR\n"
+    "  WORKSPACE). The loop's aggregate is the Lead worktree `{lead}` on\n"
+    "  branch `{branch}`; the repository root `{home}` is not part of this\n"
+    "  loop -- never read, grade, commit or run anything there.\n"
+    "- Step 2's SHIP retirement happens in the Lead worktree: run every git\n"
+    "  command of it as `git -C {lead} ...`, e.g.\n"
+    "  `git -C {lead} add -f -- {mailbox}/VERDICT.md {mailbox}/LOG.md`,\n"
+    "  `git -C {lead} add -u -- {mailbox}` and\n"
+    "  `git -C {lead} commit -m \"loop: iteration {iteration} — SHIP\" -- {mailbox}`.\n"
+    "  Never commit in your detached worktree and never touch `{target}`:\n"
+    "  after accepting your SHIP the driver lands `{branch}` onto `{target}`.\n"
+)
+
+_ROOT_FREE_INTEGRATION_REPOS_NOTE = (
+    "- MULTI-REPO: each declared repo's aggregate is the path the MULTI-REPO\n"
+    "  lines list (a worktree on `{branch}`); its empty retirement commit is\n"
+    "  made there with `git -C <that path>`.\n"
+)
+
+
+def _root_free_repo_rows(
+    rf: dict[str, Any], repos: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Declared repos of a root-free run: aggregate path + land target."""
+    targets = rf.get("repo_targets") or {}
+    return {
+        name: {"path": d["path"], "target": targets.get(name)}
+        for name, d in repos.items()
+    }
+
+
 def _multi_repo_listing(
     repos: dict[str, dict[str, Any]], home: Path | None, pins: dict[str, str] | None = None
 ) -> str:
@@ -3784,6 +3906,7 @@ class OmnigentRunner:
         isolate_workers: dict[str, Any] | None = None,
         end_root_sessions: bool = True,
         restore_root_config: bool = False,
+        root_free: dict[str, Any] | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -3848,6 +3971,12 @@ class OmnigentRunner:
         self._fence_repos: dict[str, Path] = {}
         # The loop core driving this runner (set by `loop`); None = unknown.
         self.loop_core: Any = None
+        # r16 root-free open-loop: {home, lead, branch, target, target_base}.
+        # Every session runs in the Lead worktree (``repo``/``workspace``)
+        # or a task-owned worktree; none of the root machinery below
+        # (release/snapshot/restore/record) applies, and no eval ever falls
+        # back to the aggregate root.
+        self._root_free = root_free
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
         # that implement the completion-receipt contract.
@@ -4103,11 +4232,18 @@ class OmnigentRunner:
         if context and context.get("mode") == "open-loop":
             repos = _declared_repos(mailbox)
             if repos:
-                result = self._open_loop_context_block(
+                block = self._open_loop_context_block(
                     context, repos, self.repo, mailbox
-                ) + result
+                )
             else:
-                result = self._open_loop_context_block(context) + result
+                block = self._open_loop_context_block(context)
+            if self.__dict__.get("_root_free") is not None:
+                # r16: rendered only for root-free runs (every other prompt
+                # stays byte-identical).
+                block = block.rstrip("\n") + "\n" + self._root_free_note(
+                    context, mailbox, repos
+                ) + "\n"
+            result = block + result
         elif context and (
             context.get("evaluator_attempt") or context.get("pinned_sha")
         ):
@@ -4128,6 +4264,43 @@ class OmnigentRunner:
                 + result
             )
         return result
+
+    def _root_free_note(
+        self,
+        context: dict[str, Any],
+        mailbox: Path,
+        repos: dict[str, dict[str, Any]] | None,
+    ) -> str:
+        """The ROOT-FREE addendum of a root-free OPEN-LOOP CONTEXT (r16)."""
+        rf = self._root_free or {}
+        values = {
+            "lead": rf.get("lead") or str(self.repo),
+            "branch": rf.get("branch") or "trio/<mailbox>",
+            "target": rf.get("target") or "<target>",
+            "base": str(rf.get("target_base") or "")[:12] or "<sha>",
+            "home": rf.get("home") or "<root>",
+            "mailbox": str(mailbox),
+            "iteration": context.get("iteration") or "N",
+        }
+        kind = context.get("kind")
+        if kind == "lead-pass":
+            text = _ROOT_FREE_LEAD_NOTE.format(**values)
+            if repos:
+                text += "".join(
+                    f"  - `{name}`: aggregate `{d['path']}` on `{values['branch']}`"
+                    + (f" (lands onto `{d['target']}`)" if d.get("target") else "")
+                    + "\n"
+                    for name, d in _root_free_repo_rows(rf, repos).items()
+                )
+            return text
+        if kind == "slice-eval":
+            return _ROOT_FREE_SLICE_EVAL_NOTE.format(**values)
+        if kind == "integration-eval":
+            text = _ROOT_FREE_INTEGRATION_NOTE.format(**values)
+            if repos:
+                text += _ROOT_FREE_INTEGRATION_REPOS_NOTE.format(**values)
+            return text
+        return _ROOT_FREE_SLICE_EVAL_NOTE.format(**values)
 
     def _observe_block(self, iteration: int, mailbox: Path) -> str:
         """Explicit worker-dispatch CLI for an observed Lead/repair pass.
@@ -4315,7 +4488,11 @@ class OmnigentRunner:
         in LOG.md, and the slice-eval runs on the root-bound non-isolated
         path (the evaluator grades in its own ``git worktree add`` at the
         pin, as with ``--no-isolate-workers``).
+
+        Root-free runs (r16) never degrade: see `_bind_root_free_eval`.
         """
+        if self.__dict__.get("_root_free") is not None:
+            return self._bind_root_free_eval(role, iteration, mailbox, context, dispatch)
         try:
             return self._slice_eval_worktree(role, mailbox, context), None
         except Exception as exc:  # noqa: BLE001 - any bind failure degrades
@@ -4551,6 +4728,8 @@ class OmnigentRunner:
 
     def _manages_root_config(self) -> bool:
         """Whether root-bound dispatches baseline/restore the root ``.cursor``."""
+        if self.__dict__.get("_root_free") is not None:
+            return False  # r16: no session ever runs at the root
         return worker_worktrees is not None and bool(
             self._isolate or self._restore_root_nonisolated
         )
@@ -5112,6 +5291,21 @@ class OmnigentRunner:
         if role not in {"lead", "evaluator", "repair"}:
             raise TrioctlError(f"unknown Omnigent loop role: {role}")
         mailbox = Path(mailbox).resolve()
+        try:
+            return self._run_observed(role, iteration, mailbox, context)
+        except _EvalBindSkipped:
+            # r16: a slice-eval whose worktree could not be bound was not
+            # dispatched (logged); the loop core sees no verdict section and
+            # retries it (status error after 3 attempts).
+            return 0
+
+    def _run_observed(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+    ) -> int:
         if not self._observe or worker_events is None:
             return self._run(role, iteration, mailbox, context)
         phase_id = worker_events.new_invocation_id()
@@ -5188,7 +5382,10 @@ class OmnigentRunner:
             role, iteration, mailbox, context, dispatch
         )
         workspace = self._workspace
-        if eval_degraded is not None and worker_worktrees is not None:
+        if self.__dict__.get("_root_free") is not None:
+            # r16: nothing at the root to release or restore.
+            self._root_free_prepare(role, iteration, mailbox, context, dispatch)
+        elif eval_degraded is not None and worker_worktrees is not None:
             # Degraded slice-eval: the non-isolated path. The Lead may be
             # live at the root, so never wait for / release the root and
             # hold no integration fence (the evaluator grades its own
@@ -5228,18 +5425,7 @@ class OmnigentRunner:
             self._snapshot_root_config()
         if eval_wt is not None:
             workspace = eval_wt["path"]
-            of_repo = (
-                f" (a checkout of the declared repo `{eval_wt['repo_name']}`)"
-                if eval_wt.get("repo_name") else ""
-            )
-            prompt = (
-                "ISOLATED EVALUATOR WORKSPACE: this session's workspace is "
-                f"the task-owned detached worktree `{eval_wt['path']}`{of_repo} at "
-                f"`{eval_wt['base']}`. For step 2 grade inside it and do NOT "
-                "run `git worktree add`/`remove`. Leave it clean. Write "
-                f"VERDICT.md/QUEUE.md only under the absolute mailbox "
-                f"`{mailbox}`.\n\n" + prompt
-            )
+            prompt = self._eval_workspace_preface(eval_wt, mailbox) + prompt
         client = self._client()
         started = time.monotonic()
         if role == "lead":
@@ -5328,6 +5514,189 @@ class OmnigentRunner:
             _refuse_repo_scope(mailbox, role, iteration, self.loop_core)
         return code
 
+    def _eval_workspace_preface(self, eval_wt: dict[str, Any], mailbox: Path) -> str:
+        """The ISOLATED EVALUATOR WORKSPACE line of a worktree-bound eval."""
+        rf = self.__dict__.get("_root_free")
+        if eval_wt.get("integration") and rf is not None:
+            declared = "".join(
+                f" The declared repo `{d['repo_name']}` is checked out at its pin "
+                f"`{d['base']}` in `{d['path']}`."
+                for d in eval_wt.get("declared_evals") or []
+            )
+            return (
+                "ISOLATED EVALUATOR WORKSPACE: this session's workspace is the "
+                f"task-owned detached worktree `{eval_wt['path']}` at the "
+                f"integration pin `{eval_wt['base']}`.{declared} Grade inside it and "
+                "do NOT run `git worktree add`/`remove`; never commit in it and "
+                "leave it clean. Write VERDICT.md/QUEUE.md only under the absolute "
+                f"mailbox `{mailbox}`, and make the SHIP retirement commit(s) in "
+                f"the loop's Lead worktree `{rf['lead']}` with `git -C` (see the "
+                "ROOT-FREE lines of the OPEN-LOOP CONTEXT).\n\n"
+            )
+        of_repo = (
+            f" (a checkout of the declared repo `{eval_wt['repo_name']}`)"
+            if eval_wt.get("repo_name") else ""
+        )
+        return (
+            "ISOLATED EVALUATOR WORKSPACE: this session's workspace is "
+            f"the task-owned detached worktree `{eval_wt['path']}`{of_repo} at "
+            f"`{eval_wt['base']}`. For step 2 grade inside it and do NOT "
+            "run `git worktree add`/`remove`. Leave it clean. Write "
+            f"VERDICT.md/QUEUE.md only under the absolute mailbox "
+            f"`{mailbox}`.\n\n"
+        )
+
+    # ---------------------------------------------------- r16 root-free
+
+    def _bind_root_free_eval(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+        dispatch: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Root-free eval binding: a worktree, or no dispatch -- never the root.
+
+        Slice-eval: a detached worktree at its pin; integration-eval: a
+        detached worktree at the integration pin (declared repos at theirs,
+        nested ones inside it). The bind is tried twice. A slice-eval that
+        still cannot bind is logged (`eval_isolation_failed`) and not
+        dispatched (`_EvalBindSkipped`: the loop core retries it, then stops
+        with `status: error`); an integration-eval raises (the driver ends
+        with a terminal STATE).
+        """
+        kind = (context or {}).get("kind")
+        if role != "evaluator" or kind not in ("slice-eval", "integration-eval"):
+            return None, None
+        last: BaseException | None = None
+        for _attempt in range(2):
+            try:
+                if kind == "slice-eval":
+                    return self._slice_eval_worktree(role, mailbox, context), None
+                return self._integration_eval_worktree(mailbox, context or {}), None
+            except Exception as exc:  # noqa: BLE001 - retried once, then refused
+                last = exc
+        reason = str(last) if isinstance(last, TrioctlError) else f"{type(last).__name__}: {last}"
+        reason = " ".join(reason.split())
+        if kind == "integration-eval":
+            raise TrioctlError(
+                "cannot bind the integration-eval worktree (root-free runs never "
+                f"grade at the repository root): {reason}"
+            )
+        slice_id = (context or {}).get("slice") or "?"
+        sha = str((context or {}).get("sha") or "")[:12]
+        dispatch["meta"]["eval_isolation"] = f"failed ({reason})"
+        print(
+            f"trioctl: slice-eval {slice_id}@{sha}: eval_isolation_failed ({reason}); "
+            "not dispatched (no root fallback)",
+            file=sys.stderr,
+        )
+        _append_mailbox_log(
+            mailbox,
+            f"- iter {iteration} | loop | slice-eval {slice_id} @{sha} "
+            f"eval_isolation_failed ({reason}); not graded, retried by the loop",
+        )
+        raise _EvalBindSkipped(reason)
+
+    def _integration_eval_worktree(
+        self, mailbox: Path, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Detached worktree(s) at the integration pin(s) (root-free, r16)."""
+        wt = _require_worktrees()
+        root = (self._isolate or {}).get("worktree_root")
+        pin = str(context.get("pinned_sha") or context.get("sha") or "").strip()
+        if not pin:
+            raise TrioctlError("integration-eval context has no pinned sha")
+        try:
+            record = wt.create(
+                self.repo, slice_id="integration", mailbox=mailbox,
+                root=Path(root) if root else None, role="evaluator", detach_at=pin,
+            )
+        except (wt.WorktreeError, OSError, subprocess.SubprocessError) as exc:
+            raise TrioctlError(f"cannot bind integration-eval worktree: {exc}") from exc
+        record["integration"] = True
+        record["declared_evals"] = []
+        try:
+            wt.mark_running(self.repo, record, None)
+            pins = dict(context.get("pins") or {})
+            for name, declared in _declared_repos(mailbox).items():
+                agg = Path(declared["path"])
+                rpin = pins.get(name) or wt.rev(agg, "HEAD")
+                try:
+                    nested = agg.resolve().relative_to(self.repo)
+                except ValueError:
+                    nested = None
+                if nested is not None:
+                    sub = root_free.add_detached_eval(
+                        wt, agg, Path(record["path"]) / nested, str(rpin),
+                        mailbox=mailbox, repo_name=name,
+                    )
+                else:
+                    sub = wt.create(
+                        agg, slice_id=f"integration-{name}", mailbox=mailbox,
+                        root=_repo_worktree_root(agg, name, root), role="evaluator",
+                        detach_at=str(rpin), repo_name=name,
+                    )
+                wt.mark_running(agg, sub, None)
+                record["declared_evals"].append(sub)
+        except Exception as exc:
+            self._discard_eval_worktree(record, exc)
+            for sub in record.get("declared_evals") or []:
+                self._discard_eval_worktree(sub, exc)
+            raise TrioctlError(
+                f"cannot bind integration-eval worktree: {type(exc).__name__}: {exc}"
+            ) from exc
+        return record
+
+    def _root_free_prepare(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+        dispatch: dict[str, Any],
+    ) -> None:
+        """Per-dispatch bookkeeping of a root-free run (no root access).
+
+        Lead/repair: release the fences of finished integration-evals.
+        Integration-eval: fence this loop's own aggregate(s) (per-branch
+        fences: other loops' builders are never retained) and log how far the
+        target advanced since the fork (the land merges it).
+        """
+        if role in ("lead", "repair"):
+            self._release_fences(finished_only=True)
+            return
+        if role != "evaluator" or (context or {}).get("kind") != "integration-eval":
+            return
+        token = worker_worktrees.acquire_fence(
+            self.repo, reason=f"{role} iteration {iteration}", mailbox=mailbox,
+        )
+        dispatch["fence"] = token
+        with self._own_lock:
+            self._fence_tokens[token] = False
+        dispatch["repo_fences"] = []
+        for declared in _declared_repos(mailbox).values():
+            extra = worker_worktrees.acquire_fence(
+                declared["path"], reason=f"{role} iteration {iteration}", mailbox=mailbox,
+            )
+            dispatch["repo_fences"].append(extra)
+            with self._own_lock:
+                self._fence_tokens[extra] = False
+                self._fence_repos[extra] = Path(declared["path"])
+        rf = self._root_free or {}
+        target = rf.get("target")
+        if target:
+            ahead = worker_worktrees.git(
+                self.repo, "rev-list", "--count", f"HEAD..refs/heads/{target}", check=False,
+            ).stdout.strip()
+            if ahead.isdigit() and int(ahead) > 0:
+                _append_mailbox_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | target {target} advanced by {ahead} "
+                    f"commit(s) since {rf.get('branch')} forked; the land merges it",
+                )
+
     def _release_fences(self, *, finished_only: bool) -> None:
         """Release this runner's fence tokens (finished evaluations only, or all)."""
         with self._own_lock:
@@ -5357,6 +5726,8 @@ class OmnigentRunner:
                 record.setdefault("session_ids", []).append(session_id)
             worker_worktrees.save_record(ledger, record)
             worker_worktrees.mark_finished(ledger, eval_wt["id"])
+            for sub in eval_wt.get("declared_evals") or ():
+                worker_worktrees.mark_finished(_ledger_repo(sub, self.repo), sub["id"])
         except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
             print(
                 f"trioctl: could not update evaluator worktree record "
@@ -5597,16 +5968,23 @@ REQUIRED_LOOP_CORE_API = 2
 
 
 #: The sibling module trio_loop.py imports by path (``METRICS_API``): this
-#: release's metrics/ set (5 = declared product repos, r15).
-REQUIRED_METRICS_API = 5
+#: release's metrics/ set (5 = declared product repos, r15; 6 = root-free
+#: open-loop, r16).
+REQUIRED_METRICS_API = 6
 
 #: Vendored metrics/ sets this trioctl still drives. A repository whose
 #: copy predates r15 (4) runs single-repo mailboxes unchanged; a PLAN.md
-#: `repos:` block is refused with it (see ``_old_core_repos_refusal``).
-COMPATIBLE_METRICS_APIS = (4, 5)
+#: `repos:` block is refused with it (see ``_old_core_repos_refusal``). A
+#: copy before r16 (4, 5) runs lockstep and `--root-bound` open-loop
+#: unchanged; a root-free open-loop run is refused with it
+#: (``_old_core_root_free_refusal``).
+COMPATIBLE_METRICS_APIS = (4, 5, 6)
 
 #: First METRICS_API whose loop core pins, retires and verifies per repo.
 MULTI_REPO_METRICS_API = 5
+
+#: First METRICS_API whose loop core takes the root-free `land=` hook (r16).
+ROOT_FREE_METRICS_API = 6
 
 
 def _api_marker(path: Path, name: str) -> int:
@@ -5616,12 +5994,21 @@ def _api_marker(path: Path, name: str) -> int:
     module level (a second assignment, an annotated, augmented or
     non-literal one) makes the marker ambiguous: 0, which never matches.
     """
+    try:
+        source = path.read_bytes()
+    except OSError as exc:
+        raise TrioctlError(f"cannot read {path}: {exc}") from exc
+    return _api_marker_source(source, name, str(path))
+
+
+def _api_marker_source(source: bytes, name: str, filename: str) -> int:
+    """`_api_marker` of module source bytes (e.g. a file at a git revision)."""
     import ast
 
     try:
-        tree = ast.parse(path.read_bytes(), filename=str(path))
-    except (OSError, SyntaxError, ValueError) as exc:
-        raise TrioctlError(f"cannot read {path}: {exc}") from exc
+        tree = ast.parse(source, filename=filename)
+    except (SyntaxError, ValueError) as exc:
+        raise TrioctlError(f"cannot read {filename}: {exc}") from exc
     values: list[int] = []
     for node in tree.body:
         if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [name]:
@@ -5681,9 +6068,9 @@ def _check_loop_core_api(path: Path) -> None:
     if found not in COMPATIBLE_METRICS_APIS:
         raise _refuse_core(
             path, f"sibling {metrics.name} has METRICS_API {found}, this trioctl "
-            f"requires {REQUIRED_METRICS_API} (or "
-            f"{', '.join(str(v) for v in COMPATIBLE_METRICS_APIS if v != REQUIRED_METRICS_API)}"
-            " without PLAN.md repos:) (mixed metrics/ versions)"
+            f"requires {REQUIRED_METRICS_API} (or {MULTI_REPO_METRICS_API} without "
+            f"root-free open-loop, {min(COMPATIBLE_METRICS_APIS)} also without "
+            "PLAN.md repos:) (mixed metrics/ versions)"
         )
 
 
@@ -6106,6 +6493,555 @@ def _ensure_mailbox_gitignore(mailbox: Path) -> list[str]:
     return missing
 
 
+# --------------------------------------------------------------------------
+# r16a root-free open-loop (see omnigent/root_free.py and
+# docs/ROOT-FREE-OPEN-LOOP.md). `_command_loop` calls `_root_free_begin`
+# first: None keeps today's root-bound path byte-identical.
+
+#: A verified SHIP whose land onto the target is blocked, conflicted or
+#: starved (resumable with `trioctl omnigent land --mailbox ...`).
+NEEDS_LAND_EXIT = 8
+
+ROOT_FREE_BOUND_NOTICE = (
+    "trioctl: {why}: running this open-loop at the repository root "
+    "(pre-r16 root-bound mode)"
+)
+
+
+def _root_free_wanted(args: argparse.Namespace, mailbox: Path) -> tuple[bool, str | None]:
+    """(root-free?, why not). Default ON for open-loop; flags only disable it."""
+    raw = getattr(args, "root_free", None)
+    if raw is False:
+        return False, None
+    if root_free is None or worker_worktrees is None:
+        return False, "root_free.py/worker_worktrees.py are not installed next to trioctl"
+    probe = root_free._existing_ancestor(Path(mailbox))
+    if worker_worktrees.git(probe, "rev-parse", "--show-toplevel", check=False).returncode != 0:
+        return False, None  # not a git checkout: nothing to fork (isolation says why)
+    open_loop = (mailbox / "QUEUE.md").is_file() or (
+        root_free.live_mailbox(worker_worktrees, mailbox) is not None
+    )
+    if not open_loop:
+        return False, None  # lockstep stays root-bound (r16b)
+    if getattr(args, "isolate_workers", None) is False:
+        # An explicit opt-out of isolation is root-bound, as before (silent
+        # unless --root-free was asked for too: refused below).
+        return False, ("--no-isolate-workers (root-free needs isolated builders)"
+                       if raw is True else None)
+    if getattr(args, "observe_workers", False):
+        return False, "--observe-workers prescribes its own (non-isolated) worker command"
+    inherited = worker_worktrees.inherited_cursor_problems()
+    if inherited:
+        return False, (
+            "Cursor user/system config carries session-bound Omnigent bindings "
+            "(worker isolation unavailable): " + "; ".join(inherited)
+        )
+    return True, None
+
+
+def _target_metrics_api(home: Path, target: str) -> int | None:
+    """METRICS_API of `metrics/trio-metrics.py` at the tip of *target* (None = absent)."""
+    proc = subprocess.run(
+        ["git", "-C", str(home), "cat-file", "blob", f"refs/heads/{target}:metrics/trio-metrics.py"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return _api_marker_source(proc.stdout, "METRICS_API", f"{target}:metrics/trio-metrics.py")
+
+
+def _root_free_declared(mailbox: Path) -> list[dict[str, Any]]:
+    """The ROOT mailbox's declared repos (their own checkouts), PLAN order."""
+    _module, metrics = _load_trio_check()
+    info = metrics.read_repos(Path(mailbox))
+    if info["errors"]:
+        return []
+    return [
+        {"name": r["name"], "path": Path(r.get("main_path") or r["path"]),
+         "raw_path": r.get("raw_path"), "base": r.get("base")}
+        for r in info["repos"]
+    ]
+
+
+def _root_free_plan_facts(mailbox: Path) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """({repo: writes+reads paths}, {repo: full_check}) of the live PLAN.md."""
+    _module, metrics = _load_trio_check()
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}, {}
+    repos = _declared_repos(mailbox)
+    watched: dict[str, list[str]] = {}
+    for sl in metrics.parse_slices_block(text) or []:
+        name = metrics.slice_repo_name(sl, repos) or "home"
+        for key in ("writes", "reads"):
+            for item in sl.get(key) or []:
+                item = str(item).strip()
+                if not item or item.startswith("api:"):
+                    continue
+                if item.startswith("./"):
+                    item = item[2:]
+                watched.setdefault(name, []).append(item.rstrip("/"))
+    checks, _errors = metrics.parse_full_check(text)
+    return watched, checks
+
+
+def _root_free_writes(mailbox: Path) -> dict[str, list[str]]:
+    _module, metrics = _load_trio_check()
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    repos = _declared_repos(mailbox)
+    out: dict[str, list[str]] = {}
+    for sl in metrics.parse_slices_block(text) or []:
+        name = metrics.slice_repo_name(sl, repos) or "home"
+        out.setdefault(name, []).extend(
+            str(w).strip().rstrip("/") for w in sl.get("writes") or []
+            if str(w).strip() and not str(w).strip().startswith("api:")
+        )
+    return out
+
+
+def _root_free_info(record: dict[str, Any]) -> dict[str, Any]:
+    """The OmnigentRunner `root_free=` view of a Lead record."""
+    return {
+        "home": record["repo"],
+        "lead": record["path"],
+        "branch": record["branch"],
+        "target": record["target_ref"],
+        "target_base": record.get("target_base"),
+        "mailbox_rel": record["mailbox_rel"],
+        "slug": record["slug"],
+        "repo_targets": {
+            name: info.get("target_ref") for name, info in (record.get("repos") or {}).items()
+        },
+    }
+
+
+def _root_free_begin(
+    args: argparse.Namespace, cwd: Path, mailbox: Path, *, land_only: bool = False
+) -> dict[str, Any] | int | None:
+    """Enter root-free mode for `loop` (r16a), or None for the root-bound path.
+
+    Creates/re-attaches the loop's Lead worktree (never touching the root's
+    tree, index or `.cursor`), installs dependencies once, records the
+    target in the live STATE.md and announces the loop in the registry.
+    Returns the context dict, an exit code (refused: nothing changed), or
+    None when the run is not root-free (lockstep, `--root-bound`, ...).
+    """
+    wanted, why = _root_free_wanted(args, mailbox)
+    if not wanted and root_free is not None and worker_worktrees is not None:
+        live = root_free.live_mailbox(worker_worktrees, mailbox)
+        if live is not None:
+            print(
+                f"trioctl: {mailbox} belongs to a root-free loop (live mailbox {live}); "
+                f"it cannot run root-bound ({why or '--root-bound'}): continue it "
+                "root-free, or `trioctl omnigent abandon` it first",
+                file=sys.stderr,
+            )
+            return 2
+    if not wanted:
+        explicit = getattr(args, "root_free", None) is True
+        if why and explicit:
+            print(f"trioctl: --root-free refused: {why}", file=sys.stderr)
+            return 2
+        if why:
+            print(ROOT_FREE_BOUND_NOTICE.format(why=why), file=sys.stderr)
+        return None
+    wt = worker_worktrees
+    try:
+        home, rel = root_free.locate(wt, mailbox)
+    except root_free.RootFreeError as exc:
+        print(f"trioctl: {exc}", file=sys.stderr)
+        return 3
+    # This driver loads the loop core (and runs its gate scripts) from the
+    # Lead worktree: never leave bytecode caches behind in it (they would
+    # be untracked product paths unless the repository ignores them).
+    sys.dont_write_bytecode = True
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    slug = root_free.loop_slug(rel)
+    record = root_free.load_record(wt, home, slug)
+    for entry in root_free.registry_entries(wt, home):
+        if entry.get("mailbox_rel") == rel and entry.get("pid") != os.getpid():
+            print(
+                f"trioctl: mailbox {rel} is owned by a live root-free driver "
+                f"(pid {entry.get('pid')}, Lead worktree {entry.get('lead_worktree')})",
+                file=sys.stderr,
+            )
+            return 5
+    if not root_free.active(record) and not land_only:
+        # r15 guard before anything exists: a refused PLAN never gets a Lead
+        # worktree, and the root stays untouched (stderr only).
+        refused = _repo_scope_refusals(mailbox) if (mailbox / "PLAN.md").is_file() else []
+        if refused:
+            for line in refused:
+                print(f"trioctl: {line}", file=sys.stderr)
+            print("trioctl: root-free: nothing was created; fix PLAN.md at "
+                  f"{mailbox} and start again", file=sys.stderr)
+            return 3
+    if not root_free.active(record):
+        if land_only:
+            print(f"trioctl: {rel} has no root-free loop to land", file=sys.stderr)
+            return 2
+        target = getattr(args, "target", None) or root_free._branch_of(wt, home)
+        if not target:
+            why = (
+                f"{home} is not on a branch (detached HEAD) and no --target "
+                "names the branch this loop lands onto"
+            )
+            if getattr(args, "root_free", None) is True:
+                print(f"trioctl: --root-free refused: {why}", file=sys.stderr)
+                return 2
+            print(ROOT_FREE_BOUND_NOTICE.format(why=why), file=sys.stderr)
+            return None
+        api = _target_metrics_api(home, target)
+        if api is None or api < ROOT_FREE_METRICS_API:
+            bundled = Path(__file__).resolve().parent.parent / "metrics"
+            found = "no committed metrics/ set" if api is None else f"METRICS_API {api}"
+            print(
+                f"trioctl: root-free open-loop (r16) needs the loop core committed on "
+                f"{target} with METRICS_API >= {ROOT_FREE_METRICS_API} ({found}): refresh "
+                f"the repository's metrics/ as a set from {bundled} and commit it to "
+                f"{target}, or pass --root-bound to run this loop at the repository "
+                "root as before. Nothing was changed.",
+                file=sys.stderr,
+            )
+            return 3
+    worktree_root = (
+        Path(args.worktree_root).expanduser().resolve()
+        if getattr(args, "worktree_root", None)
+        else wt.default_worktree_root(wt.repo_toplevel(home))
+    )
+    declared = [] if root_free.active(record) else _root_free_declared(mailbox)
+    try:
+        record, created = root_free.begin(
+            wt, home=home, mailbox_rel=rel, worktree_root=worktree_root,
+            target=getattr(args, "target", None), declared=declared,
+            repo_roots=lambda main, name: _repo_worktree_root(main, name, worktree_root),
+        )
+    except (root_free.RootFreeError, wt.WorktreeError) as exc:
+        print(f"trioctl: root-free: {exc}", file=sys.stderr)
+        return 3
+    lead = Path(record["path"])
+    live = Path(record["live_mailbox"])
+    live.mkdir(parents=True, exist_ok=True)
+    args.worktree_root = str(worktree_root)
+    print(
+        f"trioctl: root-free: {'created' if created else 're-attached'} Lead worktree "
+        f"{lead} (branch {record['branch']} from {record['target_ref']}"
+        f"@{str(record.get('target_base'))[:12]}); live mailbox {live}",
+        file=sys.stderr,
+    )
+    try:
+        core = _load_trio_loop(lead)
+    except TrioctlError as exc:
+        print(f"trioctl: {exc}", file=sys.stderr)
+        return 3
+    if _core_metrics_api(core) < ROOT_FREE_METRICS_API:
+        print(
+            f"trioctl: the loop core in {lead} predates root-free open-loop "
+            f"(METRICS_API {_core_metrics_api(core)}); refresh metrics/ on "
+            f"{record['target_ref']} or pass --root-bound",
+            file=sys.stderr,
+        )
+        return 3
+    state_path = live / "STATE.md"
+    core._read_state(state_path)  # creates a missing STATE.md
+    core._update_state(state_path, {
+        "target_ref": record["target_ref"],
+        "target_base": str(record.get("target_base") or ""),
+    })
+    if not record.get("setup_done") and not land_only:
+        failure = _root_free_setup(record, args)
+        if failure is not None:
+            core._update_state(state_path, {"status": "error", "phase": "worktree-setup"})
+            core._append_log(
+                live, f"- iter {_state_iteration(live)} | loop | Lead worktree setup "
+                f"failed: {' '.join(failure.split())[:600]}",
+            )
+            print(f"trioctl: root-free: Lead worktree setup failed:\n{failure}", file=sys.stderr)
+            return 3
+        record["setup_done"] = True
+        root_free.save_record(wt, home, record)
+    writes = _root_free_writes(live)
+    for line in root_free.writes_overlap(writes, root_free.registry_entries(wt, home), rel):
+        print(f"trioctl: warning: {line}", file=sys.stderr)
+    root_free.registry_write(wt, home, record, writes_by_repo=writes)
+    return {
+        "home": home, "repo": lead, "mailbox": live, "record": record, "slug": slug,
+        "core": core, "info": _root_free_info(record),
+    }
+
+
+def _root_free_setup(record: dict[str, Any], args: argparse.Namespace) -> str | None:
+    """Install dependencies once in a new Lead worktree (and declared
+    aggregates): the profile's `worktree_setup`, else `.cursor/worktrees.json`.
+    None = done/nothing to do; else the failure (command + output tail)."""
+    try:
+        profile = load_config(_run_config_path(args)).get("worktree_setup")
+    except Exception:  # noqa: BLE001 - no readable profile: repository setup only
+        profile = None
+    home = Path(record["repo"])
+    targets = [(Path(record["path"]), profile)] + [
+        (Path(info["path"]), None) for info in (record.get("repos") or {}).values()
+    ]
+    for path, prof in targets:
+        commands = root_free.setup_commands(path, prof)
+        if not commands:
+            continue
+        cmds, source = commands
+        print(f"trioctl: root-free: setting up {path} ({source}): {'; '.join(cmds)}",
+              file=sys.stderr)
+        ok, tail = root_free.run_setup(
+            path, cmds, home=home, timeout=getattr(args, "wait_timeout", None),
+        )
+        if not ok:
+            return f"{path} ({source}): {tail}"
+    return None
+
+
+def _root_free_land_hook(rf: dict[str, Any], args: argparse.Namespace) -> Any:
+    """The loop core's `land=` hook of a root-free run."""
+    wt = worker_worktrees
+    home, slug, core = rf["home"], rf["slug"], rf["core"]
+
+    def land(mailbox: Path, iteration: int) -> dict[str, Any]:
+        record = root_free.load_record(wt, home, slug)
+        if not root_free.active(record):
+            return {"status": "error", "detail": f"Lead worktree record lead-{slug} is gone"}
+        state = core._read_state(Path(mailbox) / "STATE.md")
+        pins = {"home": str(state.get("evaluated_sha") or "").strip()}
+        pins.update(core._state_repo_pins(state))
+        watched, checks = _root_free_plan_facts(Path(mailbox))
+
+        def pre_land() -> None:
+            try:
+                _run_worktree_cleanup(Path(record["path"]), Path(mailbox), core)
+            except Exception as exc:  # noqa: BLE001 - cleanup never blocks a land
+                print(f"trioctl: pre-land worktree cleanup failed: {exc}", file=sys.stderr)
+
+        return root_free.land(
+            wt, record, core=core, iteration=iteration, pins=pins, watched=watched,
+            full_checks=checks, timeout=getattr(args, "wait_timeout", None),
+            pre_land=pre_land,
+            log=lambda line: print(f"trioctl: {line}", file=sys.stderr),
+        )
+
+    return land
+
+
+def _run_loop_guarded(
+    loop_core: Any, mailbox: Path, max_iterations: int, runner: Any, repo: Path,
+    loop_kwargs: dict[str, Any], rf: dict[str, Any] | None,
+) -> int:
+    """`run_loop`; in root-free mode any driver exception (e.g. an
+    integration-eval worktree that cannot bind -- there is no root fallback)
+    leaves a terminal STATE.md (`error`/`driver-exception`), never `running`."""
+    if rf is None:
+        return loop_core.run_loop(mailbox, max_iterations, runner, repo=repo, **loop_kwargs)
+    try:
+        return loop_core.run_loop(mailbox, max_iterations, runner, repo=repo, **loop_kwargs)
+    except (RepoScopeRefusal, KeyboardInterrupt):
+        raise
+    except Exception as exc:  # noqa: BLE001 - recorded, then a clean exit 3
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:800]
+        try:
+            state_path = Path(mailbox) / "STATE.md"
+            core_state = loop_core._read_state(state_path)
+            if core_state["status"].strip().lower() not in loop_core.TERMINAL_CODES:
+                loop_core._update_state(
+                    state_path, {"status": "error", "phase": "driver-exception"}
+                )
+            loop_core._append_log(
+                Path(mailbox),
+                f"- iter {_state_iteration(Path(mailbox))} | loop | driver exception: {detail}",
+            )
+        except Exception as write_exc:  # noqa: BLE001
+            print(f"trioctl: could not record the driver exception: {write_exc}", file=sys.stderr)
+        print(f"trioctl: {detail}", file=sys.stderr)
+        return 3
+
+
+def _root_free_finish(rf: dict[str, Any], args: argparse.Namespace) -> None:
+    """Loop end (after prune, fences, worker cleanup): leave the registry;
+    after a successful land, remove the Lead worktree(s) and branches."""
+    wt = worker_worktrees
+    home, slug = rf["home"], rf["slug"]
+    try:
+        root_free.registry_remove(wt, home, slug)
+    except Exception as exc:  # noqa: BLE001
+        print(f"trioctl: could not update the loop registry: {exc}", file=sys.stderr)
+    record = root_free.load_record(wt, home, slug)
+    if not record or record.get("state") != "landed":
+        if record and root_free.active(record):
+            print(
+                f"trioctl: root-free: Lead worktree {record['path']} (branch "
+                f"{record['branch']}) kept; live mailbox {record['live_mailbox']}",
+                file=sys.stderr,
+            )
+        return
+    try:
+        result = root_free.teardown(
+            wt, record, keep_branch=bool(getattr(args, "keep_branch", False)),
+            log=lambda line: print(f"trioctl: root-free: {line}", file=sys.stderr),
+        )
+    except Exception as exc:  # noqa: BLE001 - the land already succeeded
+        print(f"trioctl: root-free: Lead worktree teardown failed: {exc}", file=sys.stderr)
+        return
+    for name, why in result["retained"].items():
+        print(f"trioctl: root-free: kept the {name} Lead worktree ({why}); "
+              f"`trioctl omnigent abandon --mailbox {record['mailbox_rel']}` removes "
+              "it once you checked it", file=sys.stderr)
+    for name, why in result["branches_kept"].items():
+        print(f"trioctl: root-free: kept branch {record['branch']} in {name} ({why})",
+              file=sys.stderr)
+    if not result["retained"]:
+        print(f"trioctl: root-free: landed and removed Lead worktree {record['path']}",
+              file=sys.stderr)
+
+
+def command_land(args: argparse.Namespace) -> int:
+    """`trioctl omnigent land`: finish landing a root-free loop (r16a).
+
+    For a `needs_land` loop (blocked by local changes at the target's
+    checkout, a merge conflict you resolved in the Lead worktree, or a
+    starved land) this re-runs the land -- and, when the target moved under
+    this loop's paths, the integration re-verification -- through the same
+    driver as `loop`; a landed loop whose Lead worktree is still there is
+    only cleaned up. Nothing is dispatched to a Lead.
+    """
+    repo = Path.cwd().resolve()
+    mailbox = Path(args.mailbox).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = repo / mailbox
+    if root_free is None or worker_worktrees is None:
+        raise TrioctlError("root_free.py/worker_worktrees.py are not installed next to trioctl")
+    home, rel = root_free.locate(worker_worktrees, mailbox)
+    record = root_free.load_record(worker_worktrees, home, root_free.loop_slug(rel))
+    if not root_free.active(record):
+        print(f"trioctl: {rel} has no root-free loop waiting to land", file=sys.stderr)
+        return 2
+    if record.get("state") == "landed":
+        _root_free_finish({"home": home, "slug": record["slug"]}, args)
+        return 0
+    live = Path(record["live_mailbox"])
+    status = ""
+    try:
+        text = (live / "STATE.md").read_text(encoding="utf-8")
+        match = re.search(r"^\s*(?:-\s+)?status\s*:\s*(\S+)", text, re.M | re.I)
+        status = match.group(1).lower() if match else ""
+        phase = re.search(r"^\s*(?:-\s+)?phase\s*:\s*(\S+)", text, re.M | re.I)
+        phase_word = phase.group(1).lower() if phase else ""
+    except OSError:
+        phase_word = ""
+    if status != "needs_land" and not (status == "shipped" and phase_word == "landing"):
+        print(
+            f"trioctl: {rel} is {status or 'not started'!r}, not waiting to land "
+            f"(`trioctl omnigent loop --mailbox {rel}` continues it)",
+            file=sys.stderr,
+        )
+        return 2
+    loop_argv = [
+        "omnigent", "loop", "--mailbox", str(args.mailbox),
+        "--max-iterations", str(args.max_iterations),
+        "--wait-timeout", str(args.wait_timeout), "--root-free",
+    ]
+    if args.base_url:
+        loop_argv += ["--base-url", args.base_url]
+    if args.keep_sessions:
+        loop_argv.append("--keep-sessions")
+    if args.keep_branch:
+        loop_argv.append("--keep-branch")
+    loop_args = parser().parse_args(loop_argv)
+    loop_args.land_only = True
+    return command_loop(loop_args)
+
+
+def command_abandon(args: argparse.Namespace) -> int:
+    """`trioctl omnigent abandon`: retire a root-free loop without landing it.
+
+    Removes its Lead worktree(s) through the owner-verified guards (retained
+    when unsafe) and KEEPS the `trio/<slug>` branch(es), so no commit is
+    lost; refuses while a driver runs the loop.
+    """
+    if root_free is None or worker_worktrees is None:
+        raise TrioctlError("root_free.py/worker_worktrees.py are not installed next to trioctl")
+    repo = Path.cwd().resolve()
+    mailbox = Path(args.mailbox).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = repo / mailbox
+    home, rel = root_free.locate(worker_worktrees, mailbox)
+    slug = root_free.loop_slug(rel)
+    record = root_free.load_record(worker_worktrees, home, slug)
+    if not record or record.get("state") == "removed":
+        print(f"trioctl: {rel} has no root-free Lead worktree", file=sys.stderr)
+        return 2
+    for entry in root_free.registry_entries(worker_worktrees, home):
+        if entry.get("mailbox_rel") == rel:
+            print(f"trioctl: a driver (pid {entry.get('pid')}) still runs {rel}", file=sys.stderr)
+            return 5
+    result = root_free.teardown(
+        worker_worktrees, record, abandon=True,
+        log=lambda line: print(f"trioctl: {line}", file=sys.stderr),
+    )
+    payload = {"mailbox": rel, "branch": record["branch"], **result}
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if not result["retained"] else ISOLATED_RETAINED_EXIT
+
+
+def command_status(args: argparse.Namespace) -> int:
+    """`trioctl omnigent status`: where a mailbox's loop lives and its STATE (r16)."""
+    repo = Path.cwd().resolve()
+    mailbox = Path(args.mailbox).expanduser()
+    if not mailbox.is_absolute():
+        mailbox = repo / mailbox
+    payload: dict[str, Any] = {"mailbox": str(mailbox.resolve()), "root_free": False}
+    if root_free is not None and worker_worktrees is not None:
+        try:
+            home, rel = root_free.locate(worker_worktrees, mailbox)
+            record = root_free.load_record(worker_worktrees, home, root_free.loop_slug(rel))
+        except root_free.RootFreeError:
+            record, rel, home = None, None, None
+        if record:
+            live_entries = [
+                e for e in root_free.registry_entries(worker_worktrees, home)
+                if e.get("mailbox_rel") == rel
+            ]
+            payload.update({
+                "root_free": True,
+                "record_state": record.get("state"),
+                "live_mailbox": record.get("live_mailbox"),
+                "lead_worktree": record.get("path"),
+                "branch": record.get("branch"),
+                "target_ref": record.get("target_ref"),
+                "target_base": record.get("target_base"),
+                "landed": record.get("landed") or {},
+                "driver": live_entries[0] if live_entries else None,
+            })
+    live = Path(payload.get("live_mailbox") or payload["mailbox"])
+    state: dict[str, str] = {}
+    try:
+        for line in (live / "STATE.md").read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip() and not key.startswith(" "):
+                state[key.strip().lstrip("- ").strip()] = value.strip()
+    except OSError:
+        pass
+    payload["state"] = state
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        for key in ("mailbox", "root_free", "live_mailbox", "lead_worktree", "branch",
+                    "target_ref", "record_state"):
+            if key in payload:
+                print(f"{key}: {payload[key]}")
+        for key in ("status", "phase", "iteration", "landed"):
+            if key in state:
+                print(f"state.{key}: {state[key]}")
+    return 0
+
+
 def _command_loop(args: argparse.Namespace) -> int:
     """Run loop-core with the Omnigent role runner.
 
@@ -6120,6 +7056,14 @@ def _command_loop(args: argparse.Namespace) -> int:
     if not mailbox.is_absolute():
         mailbox = repo / mailbox
     mailbox = mailbox.resolve()
+    # r16a: an open-loop runs root-free (its own Lead worktree) unless
+    # `--root-bound`; from here on `repo`/`mailbox` are that worktree and
+    # its live mailbox, and the root is never touched until the land.
+    rf = _root_free_begin(args, repo, mailbox, land_only=getattr(args, "land_only", False))
+    if isinstance(rf, int):
+        return rf
+    if rf is not None:
+        repo, mailbox = rf["repo"], rf["mailbox"]
     mailbox.mkdir(parents=True, exist_ok=True)
     if getattr(args, "reconcile_held", False) and _held_records(mailbox):
         # Opt-in (default OFF): one bounded reconcile before the refusal.
@@ -6196,6 +7140,8 @@ def _command_loop(args: argparse.Namespace) -> int:
     loop_kwargs = _slice_eval_concurrency_kwargs(
         loop_core, args, isolation_off=concurrency_off
     )
+    if rf is not None:
+        loop_kwargs["land"] = _root_free_land_hook(rf, args)
     if (
         loop_kwargs.get("slice_eval_concurrency", 1) > 1
         and _loop_is_lockstep(mailbox)
@@ -6219,6 +7165,8 @@ def _command_loop(args: argparse.Namespace) -> int:
         # Restart-safe: finish removals an earlier run left half done and
         # retire anything already accepted before new work starts.
         _run_worktree_cleanup(repo, mailbox)
+    if rf is not None:
+        runner_kwargs["root_free"] = rf["info"]
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
@@ -6250,12 +7198,8 @@ def _command_loop(args: argparse.Namespace) -> int:
     previous_sigint = signal.signal(signal.SIGINT, _loop_signal_handler)
     previous_sigterm = signal.signal(signal.SIGTERM, _loop_signal_handler)
     try:
-        exit_code = loop_core.run_loop(
-            mailbox,
-            args.max_iterations,
-            runner,
-            repo=repo,
-            **loop_kwargs,
+        exit_code = _run_loop_guarded(
+            loop_core, mailbox, args.max_iterations, runner, repo, loop_kwargs, rf,
         )
         return exit_code
     except RepoScopeRefusal:
@@ -6362,6 +7306,8 @@ def _command_loop(args: argparse.Namespace) -> int:
                 runner.restore_root_config_final(mailbox)
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
+        if rf is not None:
+            _root_free_finish(rf, args)
         if observe:
             _finish_observation(observe)
 
@@ -6370,7 +7316,23 @@ def _resolve_mailbox(value: Any, repo: Path) -> Path:
     mailbox = Path(value).expanduser()
     if not mailbox.is_absolute():
         mailbox = repo / mailbox
-    return mailbox.resolve()
+    return _live_mailbox_or(mailbox.resolve())
+
+
+def _live_mailbox_or(mailbox: Path) -> Path:
+    """r16: the live copy of a root mailbox a root-free loop owns, else *mailbox*.
+
+    The user (and coordinators) keep naming the root path (`--mailbox
+    loop/<x>` from the repository root); while the loop runs -- or has not
+    landed yet -- its mailbox lives in the Lead worktree.
+    """
+    if root_free is None or worker_worktrees is None:
+        return mailbox
+    try:
+        live = root_free.live_mailbox(worker_worktrees, mailbox)
+    except Exception:  # noqa: BLE001 - resolution is best effort
+        live = None
+    return live.resolve() if live is not None else mailbox
 
 
 def _reconcile_decision(
@@ -6747,6 +7709,40 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0 if all(item["ok"] for item in checks) else 1
 
 
+def _add_root_free_arguments(loop: argparse.ArgumentParser) -> None:
+    """r16a root-free open-loop flags of `loop` (default ON for open-loop)."""
+    mode = loop.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--root-free",
+        dest="root_free",
+        action="store_const",
+        const=True,
+        default=None,
+        help="open-loop (default): run every role in this loop's own Lead "
+        "worktree on branch trio/<mailbox>, never at the repository root, and "
+        "land it onto the target branch after SHIP; given explicitly, an "
+        "unmet prerequisite is a refusal instead of a root-bound run",
+    )
+    mode.add_argument(
+        "--root-bound",
+        dest="root_free",
+        action="store_const",
+        const=False,
+        help="run this open-loop at the repository root (pre-r16 behaviour)",
+    )
+    loop.add_argument(
+        "--target",
+        default=None,
+        help="root-free: the branch the loop forks from and lands onto "
+        "(default: the branch checked out at the repository root)",
+    )
+    loop.add_argument(
+        "--keep-branch",
+        action="store_true",
+        help="root-free: keep the trio/<mailbox> branch(es) after a successful land",
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="trioctl")
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -7037,7 +8033,45 @@ def parser() -> argparse.ArgumentParser:
         "slice-evals before abandoning (and holding) them (default: "
         "$TRIO_SLICE_EVAL_DRAIN_SECONDS, else min(--wait-timeout, 120))",
     )
+    _add_root_free_arguments(loop)
     loop.set_defaults(func=command_loop)
+
+    land = commands.add_parser(
+        "land",
+        help="finish landing a root-free open-loop (needs_land, exit 8)",
+        description=(
+            "Retry the land of a root-free loop whose SHIP is verified on its\n"
+            "trio/<mailbox> branch but not yet on the target branch (local\n"
+            "changes at the target's checkout, a merge conflict you resolved\n"
+            "in the Lead worktree, or a starved land). Re-verifies with an\n"
+            "integration-eval when the target moved under this loop's paths;\n"
+            "never dispatches a Lead. A landed loop is only cleaned up."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    land.add_argument("--mailbox", type=Path, default=Path("loop"))
+    land.add_argument("--max-iterations", type=int, default=10)
+    land.add_argument("--wait-timeout", type=float, default=DEFAULT_LOOP_WAIT_TIMEOUT)
+    land.add_argument("--base-url", default=None)
+    land.add_argument("--keep-sessions", action="store_true")
+    land.add_argument("--keep-branch", action="store_true",
+                      help="keep the trio/<mailbox> branch(es) after a successful land")
+    land.set_defaults(func=command_land)
+
+    abandon = commands.add_parser(
+        "abandon",
+        help="remove a root-free loop's Lead worktree without landing (branch kept)",
+    )
+    abandon.add_argument("--mailbox", type=Path, default=Path("loop"))
+    abandon.set_defaults(func=command_abandon)
+
+    status = commands.add_parser(
+        "status",
+        help="where a mailbox's loop runs (root-free Lead worktree) and its STATE",
+    )
+    status.add_argument("--mailbox", type=Path, default=Path("loop"))
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=command_status)
 
     recon = commands.add_parser(
         "reconcile",

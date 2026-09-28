@@ -122,7 +122,7 @@ class NoLoop:
 
 def _loop_args(box: Path) -> argparse.Namespace:
     return trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3"]
+        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3"]
     )
 
 
@@ -198,7 +198,7 @@ def test_old_core_single_repo_still_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     assert args.func(args) == 0
@@ -224,7 +224,7 @@ def test_loop_start_single_repo_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     before = (box / "LOG.md").read_text()
@@ -303,7 +303,7 @@ def test_lockstep_lead_refusal_exits_3_via_command_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: trio_loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     assert args.func(args) == 3
