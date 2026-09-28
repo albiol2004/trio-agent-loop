@@ -5,13 +5,20 @@ session's workspace is the root, cursor-native left ``.cursor/{mcp,hooks}.json``
 there, and ``_finalize_ship`` refused the bound SHIP (exit 6, "untracked
 product paths: .cursor/hooks.json, .cursor/mcp.json").
 
-Two layers: trioctl baselines/restores the root config in non-isolated runs
-too, and the loop core does not count EXACT generated residue as product.
-A user file (any other ``.cursor`` path or user-edited content) still blocks
-and is never removed. Offline, real git, real loop core.
+Since r16b there is no trioctl-level root-config baseline/restore any more
+(the root machinery is gone; every git-checkout loop runs in its own Lead
+worktree instead) -- these tests now cover the one remaining layer: the
+loop core (`_evaluated_product_problem`/`owned_residue_check`) does not
+count EXACT Omnigent-generated `.cursor/{mcp,hooks}.json` residue as
+product, wherever it lands. A user file (any other `.cursor` path or
+user-edited content) still blocks, and nothing removes it -- there is no
+restore any more. Offline, real git, real loop core, a raw `OmnigentRunner`
+(no `isolate_workers`/`root_free`: dispatches land straight in `repo`, as a
+mailbox outside any Lead-worktree plumbing does).
 """
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
@@ -91,9 +98,10 @@ def _lockstep_repo(repo: Path) -> Path:
     return mailbox
 
 
-def _runner(trioctl, repo, monkeypatch, client, *, restore=True, isolate=None,
+def _runner(trioctl, repo, monkeypatch, client, *, isolate=None,
             evaluator_drops=()):
-    """Non-isolated runner (as `trioctl loop --no-isolate-workers` builds it).
+    """Non-isolated runner (no `isolate_workers`/`root_free`: r16b has no
+    trioctl-level root-config management left to configure).
 
     Every session launches at the root (the fake client writes Omnigent's
     exact generated config there). The Lead commits the product itself.
@@ -101,7 +109,7 @@ def _runner(trioctl, repo, monkeypatch, client, *, restore=True, isolate=None,
     """
     runner = trioctl.OmnigentRunner(
         repo=repo, broker_client=client, config={}, interval=0,
-        isolate_workers=isolate, restore_root_config=restore,
+        isolate_workers=isolate,
     )
     monkeypatch.setattr(runner, "_agent_id", lambda role: role)
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
@@ -177,9 +185,13 @@ def _setup(mode, repo):
 
 
 @pytest.mark.parametrize("mode", ["open-loop", "lockstep"])
-def test_nonisolated_root_residue_is_restored_and_ship_finalizes(
+def test_root_residue_does_not_block_ship_finalizing(
     trioctl, wt, repo, loop_core, monkeypatch, mode
 ):
+    """r16b: no trioctl-level restore any more -- the loop core alone must
+    not count the sessions' exact generated `.cursor/{mcp,hooks}.json` as
+    product, so SHIP still finalizes and the residue is simply left behind
+    (nothing manages or removes it)."""
     mailbox = _setup(mode, repo)
     client = _LaunchingClient()
     runner, ended = _runner(trioctl, repo, monkeypatch, client)
@@ -187,28 +199,9 @@ def test_nonisolated_root_residue_is_restored_and_ship_finalizes(
     state = loop_core._read_state(mailbox / "STATE.md")
     assert state["status"] == "shipped"
     assert all(Path(ws) == repo for _s, _t, ws in client.created)
-    # trioctl layer: the finished root sessions were ended and the root restored.
-    assert set(ended) == {sid for sid, _t, _ws in client.created}
+    assert ended == []  # no root_free: nothing ends a session behind the dispatch
     for rel in OWNED:
-        assert not (repo / rel).exists(), rel
-    assert runner.restore_root_config_final(mailbox) == []
-    assert not (wt.ledger_dir(repo) / "root-cursor").exists()   # baseline dropped
-    assert git(repo, "status", "--porcelain", "--", ".", ":!loop") == ""
-
-
-@pytest.mark.parametrize("mode", ["open-loop", "lockstep"])
-def test_loop_core_alone_accepts_exact_generated_residue(
-    trioctl, wt, repo, loop_core, monkeypatch, mode
-):
-    """Layer 2 only (restore off, as in the live S run): SHIP still finalizes."""
-    mailbox = _setup(mode, repo)
-    runner, ended = _runner(trioctl, repo, monkeypatch, _LaunchingClient(), restore=False)
-    assert _drive(loop_core, mailbox, repo, runner, mode) == 0
-    assert loop_core._read_state(mailbox / "STATE.md")["status"] == "shipped"
-    assert ended == []
-    assert all((repo / rel).is_file() for rel in OWNED)          # untouched
-    assert not (wt.ledger_dir(repo) / "root-cursor").exists()   # no baseline taken
-    assert runner.restore_root_config_final(mailbox) == []       # nothing managed
+        assert (repo / rel).is_file(), rel  # left in place, never restored
 
 
 # ---------------------------------------------------------------- (b)
@@ -224,10 +217,9 @@ def test_user_cursor_file_is_kept_and_still_blocks(
     runner, _ended = _runner(trioctl, repo, monkeypatch, _LaunchingClient())
     assert _drive(loop_core, mailbox, repo, runner, mode) == 6   # needs_retirement
     assert (repo / ".cursor" / "other.json").read_text() == '{"mine": true}\n'
-    runner.restore_root_config_final(mailbox)
-    assert (repo / ".cursor" / "other.json").read_text() == '{"mine": true}\n'
-    for rel in OWNED:                                            # only ours removed
-        assert not (repo / rel).exists(), rel
+    # r16b: nothing restores or removes any of it any more.
+    for rel in OWNED:
+        assert (repo / rel).is_file(), rel
 
 
 def test_user_cursor_file_dropped_by_evaluator_session_still_blocks(
@@ -243,17 +235,21 @@ def test_user_cursor_file_dropped_by_evaluator_session_still_blocks(
     assert problem == "untracked product paths: .cursor/other.json"
 
 
-def test_preexisting_user_mcp_is_restored_byte_identical_and_blocks(
+def test_preexisting_user_mcp_still_blocks(
     trioctl, wt, repo, loop_core, monkeypatch
 ):
+    """A preexisting user server in `.cursor/mcp.json` (merged, not replaced,
+    by cursor-native's own launch) is still product -- r16b has no restore
+    to make it disappear or go back to its original bytes."""
     user = '{"mcpServers": {"docs": {"command": "docs-mcp"}}}\n'
     mailbox = _open_loop_repo(repo)
     (repo / ".cursor").mkdir()
     (repo / ".cursor" / "mcp.json").write_text(user)
     runner, _ended = _runner(trioctl, repo, monkeypatch, _LaunchingClient())
     assert _drive(loop_core, mailbox, repo, runner, "open-loop") == 6
-    assert (repo / ".cursor" / "mcp.json").read_text() == user   # user file, product
-    assert not (repo / ".cursor" / "hooks.json").exists()
+    merged = json.loads((repo / ".cursor" / "mcp.json").read_text())
+    servers = merged["mcpServers"]
+    assert "docs" in servers and "omnigent" in servers   # merged, not restored
 
 
 def test_user_edited_generated_config_is_product(repo, loop_core, wt):
@@ -285,38 +281,7 @@ def test_trioctl_injects_its_fingerprint_into_the_loop_core(trioctl, wt, repo):
     core = trioctl._load_trio_loop(REPO_ROOT)
     assert core.owned_residue_check is wt.owned_residue
 
-
-# ---------------------------------------------------------------- (c)
-
-
-def test_isolated_runner_is_unchanged(trioctl, wt, repo, tmp_path, monkeypatch):
-    iso = {"trioctl": SCRIPT, "worktree_root": str(tmp_path / "worktrees")}
-    runner = trioctl.OmnigentRunner(repo=repo, broker_client=object(), config={},
-                                    interval=0, isolate_workers=iso,
-                                    restore_root_config=True)
-    assert runner._restore_root_nonisolated is False
-    calls = []
-    monkeypatch.setattr(runner, "_end_root_evaluator", lambda m, s: calls.append(("iso", s)))
-    monkeypatch.setattr(runner, "_end_root_sessions_nonisolated",
-                        lambda m: calls.append(("non", m)))
-    monkeypatch.setattr(runner, "_release_root", lambda m: None)
-    monkeypatch.setattr(runner, "_prepare_root_config", lambda m: None)
-    monkeypatch.setattr(runner, "_slice_eval_worktree", lambda *a: None)
-    monkeypatch.setattr(runner, "_agent_id", lambda role: role)
-    monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
-    monkeypatch.setattr(runner, "_prompt", lambda *a, **k: "p\n")
-    monkeypatch.setattr(trioctl.worker_worktrees, "acquire_fence", lambda *a, **k: "tok")
-
-    def run_dispatch(*args):
-        args[-2]["session_id"] = "s-eval"
-        return 0
-
-    monkeypatch.setattr(runner, "_run_dispatch", run_dispatch)
-    assert runner._run("evaluator", 1, repo / "loop", {"kind": "integration-eval"}) == 0
-    assert calls == [("iso", "s-eval")]
-
-
-def test_default_runner_without_flag_manages_nothing(trioctl, wt, repo):
-    runner = trioctl.OmnigentRunner(repo=repo, broker_client=object(), config={}, interval=0)
-    assert runner._manages_root_config() is False
-    assert runner.restore_root_config_final(repo / "loop") == []
+# (c) isolated-vs-default root-config management is gone with r16b (deleted:
+# `_manages_root_config`, `restore_root_config_final`, `_restore_root_nonisolated`,
+# `_end_root_evaluator`, `_end_root_sessions_nonisolated`, `_release_root`,
+# `_prepare_root_config` -- no root to manage or release any more).

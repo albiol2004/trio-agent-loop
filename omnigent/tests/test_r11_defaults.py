@@ -71,11 +71,12 @@ def trioctl(monkeypatch: pytest.MonkeyPatch):
 
 
 def parse(trioctl, *argv: str):
-    # These tests pin the r11 isolation/concurrency defaults of a loop at
-    # the repository root; r16 root-free open-loop is covered by
-    # test_r16_root_free_*.py.
-    if "--root-free" not in argv:
-        argv = ["--root-bound", *argv]
+    # These tests pin the r11 isolation/concurrency defaults, which are
+    # mode-independent (`_resolve_isolation` / `_slice_eval_concurrency_kwargs`
+    # never consult root-free-ness); r16b removed `--root-bound` (refused),
+    # so end-to-end cases below run their mailbox outside any git checkout
+    # instead, which still runs in place (non-root-free). r16 root-free
+    # open-loop itself is covered by test_r16_root_free_*.py.
     return trioctl.parser().parse_args(["omnigent", "loop", *argv])
 
 
@@ -281,8 +282,15 @@ def test_real_new_core_takes_default(trioctl) -> None:
 
 
 def _run_loop(trioctl, monkeypatch, repo: Path, core, argv: list[str], *, queue: bool):
-    """Drive `omnigent loop` with a recording core and stub runner."""
-    mailbox = make_mailbox(repo)
+    """Drive `omnigent loop` with a recording core and stub runner.
+
+    The mailbox sits beside the git checkout, not inside it: r16b runs
+    every mailbox inside a git checkout root-free (its own Lead worktree),
+    which is out of scope here -- a mailbox outside any git checkout still
+    runs in place, exercising the isolation/concurrency resolution this
+    file covers without forking anything.
+    """
+    mailbox = make_mailbox(repo.parent)
     if queue:
         (mailbox / "QUEUE.md").write_text("# queue\n")
     calls: dict = {"cleanup": 0}
@@ -365,7 +373,7 @@ def test_no_isolate_loop_is_serial_and_explicit_n_refused(
     assert "isolate_workers" not in calls["runner"]
     assert calls["cleanup"] == 0
     assert capsys.readouterr().err == ""
-    shutil.rmtree(repo / "mailbox")
+    shutil.rmtree(repo.parent / "mailbox")
     with pytest.raises(trioctl.TrioctlError, match="need worker isolation"):
         _run_loop(trioctl, monkeypatch, repo, NewCore,
                   ["--no-isolate-workers", "--slice-eval-concurrency", "2"], queue=True)
@@ -424,7 +432,7 @@ def test_lockstep_explicit_concurrency_keeps_notice(
     err = capsys.readouterr().err.splitlines()
     assert err.count(LOCKSTEP_NOTICE_TEXT) == 1
     assert err.count(trioctl.LOCKSTEP_CONCURRENCY_NOTICE) == 1
-    shutil.rmtree(repo / "mailbox")
+    shutil.rmtree(repo.parent / "mailbox")
     _run_loop(trioctl, monkeypatch, repo, NewCore,
               ["--slice-eval-concurrency", "1"], queue=False)
     assert trioctl.LOCKSTEP_CONCURRENCY_NOTICE not in capsys.readouterr().err
@@ -463,7 +471,13 @@ def test_explicit_isolate_workers_detached_head_exits_1_via_cli(
     for name in ("trio_loop.py", "trio-metrics.py"):
         shutil.copy(ROOT / "metrics" / name, repo / "metrics")
     git(repo, "checkout", "-q", "--detach")
-    mailbox = make_mailbox(repo)
+    # The mailbox sits outside the git checkout: r16b's detached-root
+    # refusal ("a detached root without --target is refused exit 2") is a
+    # different, root-free-only refusal -- a mailbox outside any git
+    # checkout still runs in place, so this exercises the isolation
+    # refusal ("--isolate-workers refused: ... detached HEAD") this test
+    # pins, unchanged since before r16b.
+    mailbox = make_mailbox(env)
     (mailbox / "QUEUE.md").write_text("# queue\n")
     run_env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     proc = subprocess.run(

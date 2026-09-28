@@ -1,16 +1,23 @@
 """r15.x test harness: one `trioctl omnigent loop` process with a fake role runner.
 
 Run as ``python3 r15x_loop_harness.py <config.json>`` (a separate OS process,
-like a real driver). The real `_command_loop` runs: registry, root-turn lock,
-isolation, the vendored loop core of the fixture repo, real git. Only the
-broker side is faked (`_run_dispatch`, client, prune): the scripted Lead
-commits one product file per slice and retires it, slice-evals SHIP their
-section, the integration-eval SHIPs and makes the mailbox retirement commit.
-Every role turn is appended to the shared timeline file as JSON lines.
+like a real driver). The real `_command_loop` runs: registry, isolation, the
+vendored loop core of the fixture repo, real git -- root-free, in its own
+Lead worktree (r16b: every loop, open-loop and lockstep, runs this way; the
+r15.x root-turn lock this harness used to pin `--root-bound` for is deleted).
+Only the broker side is faked (`_run_dispatch`, client, prune): the scripted
+Lead commits one product file per slice and retires it into its OWN
+workspace (the Lead worktree, or an isolated builder's worktree), slice-evals
+SHIP their section into the live mailbox, and the integration-eval SHIPs and
+makes the mailbox retirement commit in the Lead worktree. Every role turn is
+appended to the shared timeline file as JSON lines.
 
 config keys: trioctl, worktrees, home, mailbox, timeline, lead_sleep,
 eval_sleep, integration ("ship" | "raise"), retire_delay (seconds the
-retirement commit lags the SHIP verdict), args (extra loop argv).
+retirement commit lags the SHIP verdict), args (extra loop argv). `home`
+needs the loop core committed on its target branch with METRICS_API >= 6
+(see r16_harness.init_repo(metrics=True)): root-free needs it to fork at
+all.
 """
 from __future__ import annotations
 
@@ -71,61 +78,67 @@ def main() -> int:
     Runner._new_dispatch_nonce = lambda self: None
     Runner._prompt = lambda self, *a, **k: "prompt\n"
 
-    def lead(iteration: int) -> None:
+    def lead(workspace: Path, mailbox: Path, iteration: int) -> None:
+        """Commits into *workspace* -- the Lead worktree (lockstep, or an
+        open-loop Lead's own launch dir), or an isolated builder's worktree
+        -- never `home` directly: r16b runs every role root-free."""
         event("lead-start", iteration=iteration)
         time.sleep(float(cfg.get("lead_sleep", 1.0)))
-        plan = (box / "PLAN.md").read_text()
+        plan = (mailbox / "PLAN.md").read_text()
         entries, gate = [], None
         for sid, write in cfg["slices"]:
             planned = f"  - id: {sid}\n    writes: [{write}]\n    reads: []\n    status: planned\n"
             if planned not in plan:
                 continue
-            target = home / write
+            target = workspace / write
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"# {sid}\n")
-            git(home, "add", "--", write)
-            git(home, "commit", "-q", "-m", f"slice({sid}): {sid} work")
-            sha = git(home, "rev-parse", "HEAD")
+            git(workspace, "add", "--", write)
+            git(workspace, "commit", "-q", "-m", f"slice({sid}): {sid} work")
+            sha = git(workspace, "rev-parse", "HEAD")
             event("lead-commit", sha=sha)
-            at = git(home, "log", "-1", "--format=%cI", sha)
+            at = git(workspace, "log", "-1", "--format=%cI", sha)
             entries.append(f"  - slice: {sid}\n    sha: {sha}\n    at: {at}\n")
             plan = plan.replace(planned, planned.replace("status: planned", "status: complete"))
             gate = sha
-        (box / "PLAN.md").write_text(plan)
-        queue = (box / "QUEUE.md").read_text()
-        (box / "QUEUE.md").write_text(
+        (mailbox / "PLAN.md").write_text(plan)
+        queue = (mailbox / "QUEUE.md").read_text()
+        (mailbox / "QUEUE.md").write_text(
             queue.replace("retired:\n```", "retired:\n" + "".join(entries) + "```", 1)
         )
-        with (box / "LOG.md").open("a") as fh:
+        with (mailbox / "LOG.md").open("a") as fh:
             fh.write(f"- iter {iteration} | lead | retired {len(entries)} slice(s); "
                      f"gate: PASS @{gate}\n")
         event("lead-end", iteration=iteration)
 
-    def slice_eval(ctx: dict) -> None:
+    def slice_eval(mailbox: Path, ctx: dict) -> None:
         time.sleep(float(cfg.get("eval_sleep", 0.2)))
-        with (box / "VERDICT.md").open("a") as fh:
+        with (mailbox / "VERDICT.md").open("a") as fh:
             fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n")
 
-    def integration(ctx: dict) -> None:
+    def integration(lead_workspace: Path, mailbox: Path, ctx: dict) -> None:
+        """The retirement commit always lands in *lead_workspace* -- the
+        Lead worktree the live mailbox lives in -- never the
+        integration-eval's own (possibly different, detached) workspace."""
         event("integration-start", pin=ctx["pinned_sha"])
         if cfg.get("integration") == "raise":
             raise RuntimeError("integration-eval dispatch blew up (injected)")
         time.sleep(float(cfg.get("eval_sleep", 0.2)))
-        text = (box / "VERDICT.md").read_text()
-        (box / "VERDICT.md").write_text(
+        text = (mailbox / "VERDICT.md").read_text()
+        (mailbox / "VERDICT.md").write_text(
             "VERDICT: SHIP\n\n"
             f"iteration: {ctx['iteration']}\nattempt: {ctx['evaluator_attempt']}\n"
             f"evaluated: {ctx['pinned_sha']}\n\n" + text
         )
-        with (box / "LOG.md").open("a") as fh:
+        with (mailbox / "LOG.md").open("a") as fh:
             fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP\n")
-        rel = box.relative_to(home).as_posix()
+        rel = mailbox.relative_to(lead_workspace).as_posix()
 
         def retire() -> None:
             time.sleep(float(cfg.get("retire_delay", 0.0)))
-            git(home, "add", "-f", "--", f"{rel}/VERDICT.md")
-            git(home, "commit", "-q", "-m", f"loop: iteration {ctx['iteration']} — SHIP")
-            event("retired", sha=git(home, "rev-parse", "HEAD"))
+            git(lead_workspace, "add", "-f", "--", f"{rel}/VERDICT.md")
+            git(lead_workspace, "commit", "-q", "-m", f"loop: iteration {ctx['iteration']} — SHIP")
+            event("retired", sha=git(lead_workspace, "rev-parse", "HEAD"))
 
         if cfg.get("retire_delay"):
             # The SHIP lands before the retirement commit (the live race the
@@ -140,12 +153,15 @@ def main() -> int:
         ctx = ctx or {}
         kind = ctx.get("kind") or role
         dispatch["session_id"] = f"sess-{name}-{role}-{iteration}-{ctx.get('slice') or kind}"
+        mailbox = Path(mailbox)
+        rf = self.__dict__.get("_root_free")
+        lead_workspace = Path(rf["lead"]) if rf else home
         if role == "lead":
-            lead(iteration)
+            lead(Path(workspace), mailbox, iteration)
         elif kind == "slice-eval":
-            slice_eval(ctx)
+            slice_eval(mailbox, ctx)
         elif kind == "integration-eval":
-            integration(ctx)
+            integration(lead_workspace, mailbox, ctx)
         return 0
 
     Runner._run_dispatch = run_dispatch
@@ -167,10 +183,18 @@ def main() -> int:
         return core
 
     trioctl._load_trio_loop = load_core
-    # The r15.x root-turn lock is a root-bound mechanism: since r16a an
-    # open-loop mailbox runs root-free by default, so pin the root-bound path.
+    # r16b: `--root-bound` is refused outright (the r15.x root-turn lock it
+    # used to pin is deleted -- every loop, open-loop and lockstep, runs
+    # root-free in its own Lead worktree by default now). `cfg["home"]`
+    # needs the loop core committed on its target branch with
+    # METRICS_API >= 6 (see r16_harness.init_repo(metrics=True)) for a
+    # root-free run to fork at all; `cfg["mailbox"]` is the ROOT mailbox
+    # (its live copy is resolved via `root_free.live_mailbox`), and the
+    # scripted lead/slice_eval/integration roles above write real product
+    # commits into `home` regardless of which worktree the loop core
+    # actually dispatches them in.
     argv = ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "5",
-            *([] if cfg.get("root_free") else ["--root-bound"]), *cfg.get("args", [])]
+            *cfg.get("args", [])]
     args = trioctl.parser().parse_args(argv)
     os.chdir(home)
     event("start")

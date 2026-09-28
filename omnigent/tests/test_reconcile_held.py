@@ -1440,13 +1440,22 @@ def test_loop_reconcile_evaluator_applies_verdict_without_redispatch(
 def test_evaluator_ship_without_retirement_is_not_shipped(tmp_path,
                                                          monkeypatch):
     """With a git repo the reconciled SHIP still needs its retirement
-    commit: the loop's full SHIP gate is preserved (exit 6)."""
+    commit: the loop's full SHIP gate is preserved (exit 6).
+
+    r16b: this lockstep mailbox sits inside a real git checkout, so it
+    runs root-free by default -- which needs the loop core committed on
+    the target branch with METRICS_API >= 6 before it will fork the Lead
+    worktree this reconcile-held run then operates in.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
     (repo / "README").write_text("x")
+    (repo / "metrics").mkdir()
+    for name in ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py"):
+        shutil.copy2(TREE / "metrics" / name, repo / "metrics" / name)
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "seed"],
                    check=True, env=env)
@@ -1463,7 +1472,13 @@ def test_evaluator_ship_without_retirement_is_not_shipped(tmp_path,
     code = _loop(monkeypatch, repo, mailbox, broker, core_ok(monkeypatch),
                  "--reconcile-held")
     assert code == 6
-    assert rc.read_state(mailbox)["status"].startswith("needs_retirement")
+    # r16b: this lockstep loop ran root-free, in its own Lead worktree --
+    # the root's own copy of the mailbox stays exactly as `make_held` left
+    # it (never touched mid-run); the live STATE.md is the one the loop
+    # core actually wrote the SHIP-gate outcome to.
+    live = trioctl.root_free.live_mailbox(trioctl.worker_worktrees, mailbox)
+    assert live is not None, "no live Lead-worktree mailbox found"
+    assert rc.read_state(live)["status"].startswith("needs_retirement")
     assert [c for r in FakeLoopRunner.instances for c in r.calls] == []
 
 

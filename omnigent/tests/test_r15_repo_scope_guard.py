@@ -12,6 +12,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -74,9 +75,18 @@ REPOS = (
 )
 
 
-def make_home(tmp_path: Path, plan_text: str, *, queue: bool = True) -> tuple[Path, Path]:
+def make_home(
+    tmp_path: Path, plan_text: str, *, queue: bool = True, in_repo: bool = True
+) -> tuple[Path, Path]:
+    """*in_repo*: the mailbox sits inside `home`'s git checkout (default,
+    needed for the r15 repo-scope guard's own git-root detection) or
+    beside it, outside any git checkout (r16b: a mailbox outside any git
+    checkout still runs in place, non-root-free -- for cases that are
+    mode-independent and would otherwise need `home`'s target committed
+    with a real metrics/ set to run root-free by default)."""
     home = tmp_path / "home"
-    box = home / "loop"
+    box = (home / "loop") if in_repo else (tmp_path / "loop")
+    home.mkdir(parents=True, exist_ok=True)
     (box / "briefs").mkdir(parents=True)
     git(home, "init", "-q", "-b", "main")
     (home / ".gitignore").write_text("app-backend/\n")
@@ -121,12 +131,21 @@ class NoLoop:
 
 
 def _loop_args(box: Path) -> argparse.Namespace:
+    # r16b: every loop in a git checkout is root-free by default (no
+    # --root-bound any more, refused outright); a git-checkout mailbox
+    # runs its Lead worktree fork, whose own root-free pre-check
+    # (`_root_free_begin`, before any worktree is created) repeats this
+    # same r15 guard against the ROOT's mailbox and refuses first.
     return trioctl.parser().parse_args(
-        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3"]
+        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3"]
     )
 
 
 def test_loop_start_refuses_offending_plan(tmp_path, monkeypatch, capsys):
+    """r16b: the root-free pre-check refuses the same offending PLAN
+    before any Lead worktree exists -- stderr only, the root's own
+    mailbox untouched (see test_r16_root_free_e2e.py::
+    test_r15_guard_refuses_before_any_lead_worktree_exists)."""
     home, box = make_home(tmp_path, plan(OK + BAD))
     monkeypatch.chdir(home)
     monkeypatch.setattr(trioctl, "OmnigentRunner", NoRunner)
@@ -134,9 +153,13 @@ def test_loop_start_refuses_offending_plan(tmp_path, monkeypatch, capsys):
     args = _loop_args(box)
     assert args.func(args) == 3
     line = message("bridge", home / "app-backend" / "app" / "x.py")
-    assert f"- iter 1 | loop | {line}" in (box / "LOG.md").read_text().splitlines()
-    assert "status: error" in (box / "STATE.md").read_text().splitlines()
-    assert f"trioctl: {line}" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"trioctl: {line}" in err
+    assert "root-free: nothing was created" in err
+    # Root-free: a refused PLAN never gets a Lead worktree, and the root's
+    # own mailbox is never written.
+    assert (box / "LOG.md").read_text() == "# Trio loop log\n"
+    assert "status: error" not in (box / "STATE.md").read_text().splitlines()
     assert len(worktrees(home)) == 1
 
 
@@ -149,9 +172,12 @@ def test_loop_start_refuses_home_slice_writing_into_declared_repo(
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: NoLoop)
     args = _loop_args(box)
     assert args.func(args) == 3
-    log = (box / "LOG.md").read_text().splitlines()
-    assert any("slice bridge of repo home touches repo app-backend" in ln for ln in log)
-    assert "one repo per slice" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "slice bridge of repo home touches repo app-backend" in err
+    assert "one repo per slice" in err
+    # Root-free: nothing was created or written at the root for the refusal.
+    assert (box / "LOG.md").read_text() == "# Trio loop log\n"
+    assert len(worktrees(home)) == 1
 
 
 class OldCore:
@@ -166,7 +192,13 @@ class OldCore:
 
 
 def test_loop_start_refuses_declared_repos_on_old_core(tmp_path, monkeypatch, capsys):
-    home, box = make_home(tmp_path, plan(OK + REPO_SLICE, REPOS))
+    # r16b: an old vendored core (METRICS_API 4) is strictly below the
+    # root-free-by-default gate (needs >= 6), so a git-checkout mailbox
+    # would be refused there first, for a different reason, before this
+    # multi-repo-specific message is ever reached; a mailbox outside any
+    # git checkout still runs in place (non-root-free), exercising this
+    # `_old_core_repos_refusal` check unchanged.
+    home, box = make_home(tmp_path, plan(OK + REPO_SLICE, REPOS), in_repo=False)
     (box / "briefs" / "bridge.md").write_text(BRIEF_OK)
     monkeypatch.chdir(home)
     monkeypatch.setattr(trioctl, "OmnigentRunner", NoRunner)
@@ -180,7 +212,11 @@ def test_loop_start_refuses_declared_repos_on_old_core(tmp_path, monkeypatch, ca
 
 
 def test_old_core_single_repo_still_runs(tmp_path, monkeypatch):
-    home, box = make_home(tmp_path, plan(OK))
+    # r16b: a mailbox outside any git checkout still runs in place
+    # (non-root-free) -- this single-repo-mode pass-through is
+    # mode-independent and would otherwise need `home`'s target committed
+    # with a real metrics/ set to run root-free by default.
+    home, box = make_home(tmp_path, plan(OK), in_repo=False)
     monkeypatch.chdir(home)
     calls = []
 
@@ -198,7 +234,7 @@ def test_old_core_single_repo_still_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     assert args.func(args) == 0
@@ -206,7 +242,7 @@ def test_old_core_single_repo_still_runs(tmp_path, monkeypatch):
 
 
 def test_loop_start_single_repo_unchanged(tmp_path, monkeypatch):
-    home, box = make_home(tmp_path, plan(OK))
+    home, box = make_home(tmp_path, plan(OK), in_repo=False)
     monkeypatch.chdir(home)
     calls = []
 
@@ -224,7 +260,7 @@ def test_loop_start_single_repo_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     before = (box / "LOG.md").read_text()
@@ -295,20 +331,50 @@ def test_lead_pass_not_dispatched_over_offending_plan(tmp_path, monkeypatch):
 
 
 def test_lockstep_lead_refusal_exits_3_via_command_loop(tmp_path, monkeypatch):
+    """r16b: lockstep runs root-free too by default -- the Lead's first
+    pass runs for real in the loop's own (forked) Lead worktree; its
+    offending PLAN is refused on the *next* pass (eval-r15a F8) the same
+    way, `status: error`, exit 3, but in the live Lead worktree's mailbox
+    (the root's own copy stays untouched mid-run, r16 DESIGN)."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
     home, box = make_home(tmp_path, plan(OK), queue=False)
+    # Real committed metrics/ (METRICS_API >= 6): root-free's own gate needs
+    # it on the target branch before it will fork a Lead worktree at all.
+    (home / "metrics").mkdir()
+    for name in ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py"):
+        shutil.copy2(ROOT.parent / "metrics" / name, home / "metrics" / name)
+    git(home, "add", "-A", "--", "metrics")
+    git(home, "commit", "-q", "-m", "metrics")
     seen: list[str] = []
-    runner = _runner(home, monkeypatch, seen, _lead_writes_bad_plan)
+
+    def on_lead(mailbox: Path, iteration: int) -> None:
+        # An absolute path outside `home` altogether: flagged the same way
+        # regardless of which worktree copy of the repo evaluates it
+        # (unlike a path that depends on an untracked nested checkout).
+        bad = (
+            "  - id: bridge\n"
+            f"    writes: [{outside}/x.py]\n    reads: []\n    status: planned\n"
+        )
+        (mailbox / "PLAN.md").write_text(plan(OK + bad))
+        with (mailbox / "LOG.md").open("a") as fh:
+            fh.write(f"- iter {iteration} | lead | planned bridge\n")
+
+    runner = _runner(home, monkeypatch, seen, on_lead)
     monkeypatch.chdir(home)
     monkeypatch.setattr(trioctl, "OmnigentRunner", lambda **kw: runner)
-    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: trio_loop)
     monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
     args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--root-bound", "--mailbox", str(box), "--max-iterations", "3",
+        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
          "--keep-sessions"]
     )
     assert args.func(args) == 3
     assert seen == ["lead"]
-    assert "status: error" in (box / "STATE.md").read_text().splitlines()
+    live = trioctl.root_free.live_mailbox(trioctl.worker_worktrees, box)
+    assert live is not None, "no live Lead-worktree mailbox found"
+    assert "status: error" in (live / "STATE.md").read_text().splitlines()
+    line = message("bridge", outside / "x.py")
+    assert any(ln.endswith(f"| loop | {line}") for ln in (live / "LOG.md").read_text().splitlines())
 
 
 def test_single_repo_lead_pass_unaffected(tmp_path, monkeypatch):

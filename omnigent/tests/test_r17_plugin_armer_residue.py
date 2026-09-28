@@ -194,50 +194,6 @@ def test_t2_gitignored_cursor_dir_with_the_armer_is_disposable(wt, tmp_path):
     assert wt._owned_ignored_cursor(repo, ".cursor/") is None
 
 
-# ------------------------------------------------ T3 _strip_owned / restore_root_cursor
-
-
-def test_t3_strip_owned_drops_the_armer_for_any_session(wt):
-    data = _hooks(_usage(wt, "k" * 32), ARMER, USER_HOOK)
-    assert wt._strip_owned(".cursor/hooks.json", data, {"k" * 32})["hooks"]["stop"] == [USER_HOOK]
-    assert wt._strip_owned(".cursor/hooks.json", data, set())["hooks"]["stop"] == [
-        _usage(wt, "k" * 32), USER_HOOK,
-    ]
-
-
-@pytest.mark.parametrize("baseline", ["absent", "user", "user+armer"])
-def test_t3_restore_root_cursor_restores_over_an_armer(wt, tmp_path, baseline):
-    repo = _repo(tmp_path)
-    hooks = repo / ".cursor" / "hooks.json"
-    before = {"absent": None, "user": _hooks(USER_HOOK), "user+armer": _hooks(USER_HOOK, ARMER)}
-    if before[baseline] is not None:
-        _write(hooks, before[baseline])
-    original = hooks.read_bytes() if hooks.exists() else None
-    assert wt.snapshot_root_cursor(repo)
-    session = "sess-plugin-1"
-    # What a plugin-route launch leaves: the user's hooks + armer (+ usage hook
-    # of this session when the project route also ran).
-    current = json.loads(original) if original else {"version": 1, "hooks": {}}
-    stop = current["hooks"].setdefault("stop", [])
-    if ARMER not in stop:
-        stop.append(ARMER)
-    stop.append(_usage(wt, wt.bridge_key(session)))
-    _write(hooks, current)
-    assert wt.restore_root_cursor(repo, {session}, final=True) == []
-    assert (hooks.read_bytes() if hooks.exists() else None) == original
-
-
-def test_t3_user_edit_next_to_the_armer_is_still_left_in_place(wt, tmp_path):
-    repo = _repo(tmp_path)
-    hooks = repo / ".cursor" / "hooks.json"
-    _write(hooks, _hooks(USER_HOOK))
-    wt.snapshot_root_cursor(repo)
-    _write(hooks, _hooks(USER_HOOK, ARMER, {"command": "./another-user-hook"}))
-    problems = wt.restore_root_cursor(repo, set())
-    assert problems and "beyond the owned sessions' Omnigent entries" in problems[0]
-    assert {"command": "./another-user-hook"} in json.loads(hooks.read_text())["hooks"]["stop"]
-
-
 # ------------------------------------------------ T4 inherited_cursor_problems
 
 
@@ -271,29 +227,10 @@ def test_untracked_empty_mcp_servers_is_owned_residue(wt, rf, tmp_path):
     assert not wt.owned_residue(repo, ".cursor/mcp.json")
     _write(mcp, {"mcpServers": {}, "note": 1})
     assert not wt.owned_residue(repo, ".cursor/mcp.json")
-    # Restore: a file that is only the emptied map is "back to baseline".
-    fresh = _repo(tmp_path / "rs")
-    wt.snapshot_root_cursor(fresh)
-    _write(fresh / ".cursor" / "mcp.json", {"mcpServers": {}})
-    assert wt.restore_root_cursor(fresh, set(), final=True) == []
-    assert not (fresh / ".cursor" / "mcp.json").exists()
-    # root_free Lead-worktree removal is not retained by it.
+    # root_free Lead-worktree removal is not retained by it (r16b: every
+    # loop's Lead runs in its own worktree; there is no root to restore).
     lead = tmp_path / "lead-mcp"
     git(repo, "worktree", "add", "-q", "-b", "trio/m", str(lead))
     rf._mark_owner(wt, lead, "own")
     _write(lead / ".cursor" / "mcp.json", {"mcpServers": {}})
     assert rf.remove_worktree(wt, repo, lead, owner="own", branch="trio/m") is None
-
-
-def test_tracked_mcp_emptied_by_omnigent_is_an_omnigent_only_change(wt, tmp_path):
-    served = {"mcpServers": {"omnigent": {"command": "omnigent", "args": [
-        "serve-mcp", "--bridge-dir", "/tmp/omnigent-1000/cursor-native/" + "d" * 32]}}}
-    repo = _repo(tmp_path, {".cursor/mcp.json": json.dumps(served, indent=2) + "\n"})
-    _write(repo / ".cursor" / "mcp.json", {"mcpServers": {}})
-    assert git(repo, "status", "--porcelain") == "M .cursor/mcp.json"
-    assert wt.omnigent_only_change(repo, ".cursor/mcp.json")
-    # A tracked user server that disappears is a real change.
-    user = {"mcpServers": {"mine": {"command": "x"}}}
-    repo2 = _repo(tmp_path / "u", {".cursor/mcp.json": json.dumps(user) + "\n"})
-    _write(repo2 / ".cursor" / "mcp.json", {"mcpServers": {}})
-    assert not wt.omnigent_only_change(repo2, ".cursor/mcp.json")

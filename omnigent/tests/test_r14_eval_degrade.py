@@ -1,10 +1,15 @@
-"""r14 E-1: a slice-eval worktree bind failure never kills the driver.
+"""r14 E-1 (r16b): a slice-eval worktree bind failure never kills the driver.
 
 Live defect (release 4680b7e): `_slice_eval_worktree` raised TrioctlError
 ("cannot bind slice-eval worktree: ...") out of `OmnigentRunner.run`, which
-ended `trioctl omnigent loop` fatally. It now logs once, records
-`eval_isolation: degraded (<reason>)` in the dispatch's session bookkeeping
-and LOG.md, and runs that slice-eval on the root-bound non-isolated path.
+ended `trioctl omnigent loop` fatally. Since r16b there is no root fallback
+(the root machinery is gone): a bind that still fails after one retry logs
+`eval_isolation_failed (<reason>)` once (stderr + LOG.md) and is not
+dispatched at all (`_EvalBindSkipped`, caught by `OmnigentRunner.run` ->
+0; the loop core sees no verdict section and retries it, then stops with
+`status: error` after enough attempts -- see
+`test_r16_root_free_acceptance.py::test_slice_eval_bind_failure_never_grades_at_root`
+for the full-loop version).
 
 Offline: real git scratch repo, fake broker client and dispatch.
 """
@@ -94,10 +99,7 @@ def test_bind_failure_degrades_to_root_bound_eval(trioctl, wt, repo, tmp_path, m
 
     monkeypatch.setattr(wt, "create", refuse)
     runner, seen = _runner(trioctl, repo, tmp_path / "worktrees", monkeypatch)
-    # The open-loop Lead is live at the root: a degraded eval must never
-    # wait for / release the root, nor prune anything.
-    monkeypatch.setattr(runner, "_release_root",
-                        lambda *_a, **_k: pytest.fail("degraded eval must not release the root"))
+    # r16b: nothing is pruned for a bind that is never dispatched.
     monkeypatch.setattr(trioctl, "_prune_broker_sessions",
                         lambda *_a, **_k: pytest.fail("nothing may be pruned"))
     runner._inflight.add("lead-session")
@@ -106,29 +108,24 @@ def test_bind_failure_degrades_to_root_bound_eval(trioctl, wt, repo, tmp_path, m
 
     assert runner.run("evaluator", 1, repo / "loop", ctx) == 0
 
-    (dispatched,) = seen
-    assert dispatched["workspace"] == str(repo)
-    assert runner._client().workspaces == [str(repo)]
-    assert "ISOLATED EVALUATOR WORKSPACE" not in dispatched["prompt"]
-    assert dispatched["fence"] is None
-    meta = dispatched["inflight"]["s1"]
-    assert meta["kind"] == "slice-eval" and meta["slice"] == "A"
-    assert meta["eval_isolation"].startswith("degraded (cannot bind slice-eval worktree: ")
-    assert runner.eval_isolation_degraded == [
-        {"slice": "A", "sha": sha, "reason": meta["eval_isolation"][len("degraded ("):-1]}
-    ]
+    # Never dispatched: no session, no root/eval workspace used.
+    assert seen == []
+    assert runner._client().workspaces == []
+    assert set(runner.inflight_sessions()) == {"lead-session"}
     log = (repo / "loop" / "LOG.md").read_text()
     assert log.startswith("# Trio loop log\n- iter 1 | lead | x\n")
     last = log.splitlines()[-1]
-    assert last.startswith(f"- iter 1 | loop | slice-eval A @{sha[:12]} eval_isolation: degraded (")
+    assert last.startswith(
+        f"- iter 1 | loop | slice-eval A @{sha[:12]} eval_isolation_failed (cannot bind "
+        "slice-eval worktree: "
+    )
+    assert last.endswith("; not graded, retried by the loop")
     err = capsys.readouterr().err
-    assert err.count("eval_isolation: degraded") == 1
-    assert "root-bound (non-isolated)" in err
-    # Recorded as a root session (ownership evidence for the root restore).
-    assert "s1" in wt.root_owned_sessions(repo)
+    assert err.count("eval_isolation_failed") == 1
+    assert "not dispatched (no root fallback)" in err
 
 
-def test_bind_failure_of_unexpected_os_error_also_degrades(trioctl, wt, repo, tmp_path, monkeypatch):
+def test_bind_failure_of_unexpected_os_error_also_degrades(trioctl, wt, repo, tmp_path, monkeypatch, capsys):
     def boom(*_a, **_k):
         raise PermissionError("worktree root not writable")
 
@@ -137,8 +134,10 @@ def test_bind_failure_of_unexpected_os_error_also_degrades(trioctl, wt, repo, tm
     ctx = {"mode": "open-loop", "kind": "slice-eval", "slice": "B",
            "sha": git(repo, "rev-parse", "HEAD")}
     assert runner.run("evaluator", 2, repo / "loop", ctx) == 0
-    assert seen[0]["workspace"] == str(repo)
-    assert "not writable" in seen[0]["inflight"]["s1"]["eval_isolation"]
+    assert seen == []
+    log = (repo / "loop" / "LOG.md").read_text()
+    assert "not writable" in log.splitlines()[-1]
+    assert "eval_isolation_failed" in log.splitlines()[-1]
 
 
 def test_tracked_session_config_binds_isolated_eval_without_degrading(

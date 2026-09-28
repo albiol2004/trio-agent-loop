@@ -199,9 +199,16 @@ def test_isolated_run_cli_refuses_with_contaminated_home(repo, root, tmp_path):
 def test_loop_refuses_isolation_with_contaminated_home_and_observe_combo(
     trioctl, repo, home, tmp_path
 ):
+    # r16b: `repo/loop` is lockstep (no QUEUE.md), which runs root-free by
+    # default too; its own pre-fork gate needs the metrics/ set *committed*
+    # on the target branch (METRICS_API >= 6) before it will fork a Lead
+    # worktree -- the contaminated-home refusal this test pins is checked
+    # by `_resolve_isolation` once inside that (forked) Lead worktree.
     (repo / "metrics").mkdir()
     for name in ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py"):
         (repo / "metrics" / name).write_text((REPO_ROOT / "metrics" / name).read_text())
+    git(repo, "add", "-A", "--", "metrics")
+    git(repo, "commit", "-q", "-m", "metrics")
     (home / ".cursor").mkdir()
     (home / ".cursor" / "mcp.json").write_text(json.dumps(SESSION_MCP))
     import argparse
@@ -492,63 +499,20 @@ def _runner(trioctl, repo, root, monkeypatch):
     return runner, seen
 
 
-def test_root_reuse_ends_previous_session_and_fences_evaluation(
-    trioctl, repo, root, monkeypatch
-):
-    pruned = []
-    # r5 (N6): bookkeeping is dropped only for a session the prune deleted.
-    monkeypatch.setattr(trioctl, "_prune_broker_sessions",
-                        lambda client, mailbox, **kw: pruned.append(kw["session_ids"])
-                        or {"deleted": len(kw["session_ids"])})
-    runner, seen = _runner(trioctl, repo, root, monkeypatch)
-    assert runner.run("lead", 1, repo / "loop", None) == 0
-    assert runner.run("evaluator", 1, repo / "loop", None) == 0
-    # The Lead's session ended before root reuse; since r4 the finished root
-    # evaluator's own session (s2) is ended right after it, before the loop
-    # core grades acceptance, so its root Cursor config can be restored.
-    assert pruned == [["s1"], ["s2"]]
-    assert seen[0]["fence"] is None and seen[1]["fence"] is not None
-    assert runner.run("lead", 2, repo / "loop", None) == 0
-    # r15.x: the Lead's own session (s3) ends at its turn end; nothing else.
-    assert pruned == [["s1"], ["s2"], ["s3"]]
-    assert seen[2]["fence"] is None  # released at the next Lead pass
-
-
-def test_held_previous_root_session_blocks_root_reuse(trioctl, repo, root, monkeypatch):
-    monkeypatch.setattr(trioctl, "_prune_broker_sessions",
-                        lambda *a, **k: pytest.fail("held session must not be pruned"))
-    runner, _seen = _runner(trioctl, repo, root, monkeypatch)
-    dispatch = runner._run_dispatch
-
-    def held_during_dispatch(*a, **k):
-        code = dispatch(*a, **k)
-        runner.held_session_ids.append("s1")  # held while its turn ran (r15.x)
-        return code
-
-    monkeypatch.setattr(runner, "_run_dispatch", held_during_dispatch)
-    runner.run("lead", 1, repo / "loop", None)
-    monkeypatch.setattr(runner, "_run_dispatch", dispatch)
-    with pytest.raises(trioctl.TrioctlError, match="held session"):
-        runner.run("evaluator", 1, repo / "loop", None)
-
-
-def test_live_cursor_at_root_blocks_root_reuse(trioctl, repo, root, monkeypatch, tmp_path):
-    bindir = tmp_path / "bin2"
-    bindir.mkdir()
-    fake = bindir / "cursor-agent"
-    fake.write_text("#!/bin/sh\nexec sleep 60\n")
-    fake.chmod(0o755)
-    squatter = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)", "cursor-agent"], cwd=repo)
-    try:
-        runner, _seen = _runner(trioctl, repo, root, monkeypatch)
-        runner.ROOT_RELEASE_WAIT = 0.2
-        runner.ROOT_STRANGER_WAIT = 0.2  # r15.x: bounded stranger wait (default 300 s)
-        with pytest.raises(trioctl.TrioctlError, match="still run at the aggregate root"):
-            runner.run("lead", 1, repo / "loop", None)
-    finally:
-        squatter.kill()
-        squatter.wait()
+# r16b deleted the r15.x "root turn" machinery these three tests pinned:
+# `_RootTurnLock`/`_enter_root_turn` & co. (one root Cursor session slot
+# reused sequentially between the Lead and Evaluator dispatched at a
+# shared aggregate root), `_end_previous_root_sessions`, `held_session_ids`
+# blocking reuse, and the `ROOT_RELEASE_WAIT`/`ROOT_STRANGER_WAIT` cursor-
+# squatter detection at that root (RootBusyError/RootOccupiedError, exit
+# 9). Since every role now runs in its own Lead worktree (root-free, both
+# open-loop and lockstep), there is no shared root session slot to reuse,
+# hold or squat on any more -- `OmnigentRunner` carries none of these
+# symbols or messages (grep confirms), so the property itself is gone, not
+# just its old CLI trigger. Deleted rather than adapted:
+#   test_root_reuse_ends_previous_session_and_fences_evaluation
+#   test_held_previous_root_session_blocks_root_reuse
+#   test_live_cursor_at_root_blocks_root_reuse
 
 
 # ------------------------------------------------------------------ L1/L3

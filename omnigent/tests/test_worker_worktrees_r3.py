@@ -119,10 +119,24 @@ class _BlockingClient:
         return []
 
 
-def _runner(trioctl, repo, root, monkeypatch, client):
+def _runner(trioctl, repo, root, monkeypatch, client, *, root_free: bool = False):
+    kwargs: dict = {}
+    if root_free:
+        # r16b: per-turn session ending (`_end_finished_session`) and the
+        # Lead/repair finished-fence release (`_root_free_prepare`) are
+        # both gated on a root-free runner; a real fork is not needed here
+        # (neither touches the ledger for a plain "lead"/non-isolated
+        # "evaluator" dispatch), just this informational view of it.
+        kwargs["root_free"] = {
+            "home": str(repo), "lead": str(repo), "branch": "trio/loop",
+            "target": "main", "target_base": git(repo, "rev-parse", "HEAD"),
+            "mailbox_rel": "loop", "slug": "loop",
+            "repo_targets": {}, "repo_aggregates": {},
+        }
     runner = trioctl.OmnigentRunner(
         repo=repo, broker_client=client, config={}, interval=0,
         isolate_workers={"trioctl": SCRIPT, "worktree_root": str(root)},
+        **kwargs,
     )
     monkeypatch.setattr(runner, "_agent_id", lambda role: role)
     monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
@@ -141,13 +155,21 @@ def _runner(trioctl, repo, root, monkeypatch, client):
 def test_n1_running_slice_eval_is_never_pruned_by_next_lead_pass(
     trioctl, wt, repo, root, monkeypatch
 ):
+    """r16b: the r15.x "root reuse" pruning this test pinned (a later
+    dispatch's cleanup retrying a still-unconfirmed earlier root session)
+    is gone -- `_end_finished_session` ends a finished dispatch's OWN
+    session synchronously at its own turn end (root-free runner only), so
+    there is no shared state a later pass could touch. What survives is
+    the property this test cares about: a concurrent slice-eval's session
+    is never ended by this per-turn mechanism (it is released instead,
+    with the eval worktree, once the eval itself finishes)."""
     pruned: list[list[str]] = []
     monkeypatch.setattr(
         trioctl, "_prune_broker_sessions",
         lambda client, mailbox, **kw: pruned.append(list(kw["session_ids"])) or {},
     )
     client = _BlockingClient()
-    runner = _runner(trioctl, repo, root, monkeypatch, client)
+    runner = _runner(trioctl, repo, root, monkeypatch, client, root_free=True)
     mailbox = repo / "loop"
     sha = git(repo, "rev-parse", "HEAD")
 
@@ -160,12 +182,10 @@ def test_n1_running_slice_eval_is_never_pruned_by_next_lead_pass(
     evaluator.start()
     assert client.started.setdefault("s2", threading.Event()).wait(10)  # eval s2 in flight
 
-    # Next Lead pass while s2 is alive: only the FINISHED root session s1
-    # may be ended; s2 (running, other role, other workspace) never.
-    assert runner.run("lead", 2, mailbox, None) == 0            # s3
-    # r15.x: each Lead session is ended at its own turn end (this fake prune
-    # deletes nothing, so s1 is retried once at the next root reuse).
-    assert pruned == [["s1"], ["s1"], ["s3"]]
+    # Next Lead pass while s2 is alive: its own session (s3) ends at its own
+    # turn end; s2 (running, other role, other workspace) is never touched.
+    assert runner.run("lead", 2, mailbox, None) == 0            # s3, ended at once
+    assert pruned == [["s1"], ["s3"]]
     assert all("s2" not in call for call in pruned)
     client.hold["s2"].set()
     evaluator.join(10)
@@ -173,9 +193,10 @@ def test_n1_running_slice_eval_is_never_pruned_by_next_lead_pass(
     # The eval worktree records only its own session.
     (rec,) = [r for _i, r in wt.list_records(repo) if r.get("kind") == "eval"]
     assert rec["session_ids"] == ["s2"]
-    # A later root reuse ends s3 only; s2 (slice-eval) is never a root session.
+    # s2 (slice-eval) never goes through this per-turn ending, even after
+    # the eval itself has finished.
     assert runner.run("lead", 3, mailbox, None) == 0
-    assert pruned[-2:] == [["s3"], ["s4"]]  # s3 retried at reuse; s4 at its turn end
+    assert pruned == [["s1"], ["s3"], ["s4"]]
     assert all("s2" not in call for call in pruned)
 
 
@@ -244,9 +265,11 @@ def test_m4_crashed_holder_is_recovered_unreadable_stays_held(wt, repo):
 
 
 def test_m4_lead_releases_only_finished_evaluator_fences(trioctl, wt, repo, root, monkeypatch):
+    # r16b: a non-isolated evaluator's fence is acquired by
+    # `_root_free_prepare`, gated on a root-free runner (see `_runner`).
     monkeypatch.setattr(trioctl, "_prune_broker_sessions", lambda *a, **k: {})
     client = _BlockingClient()
-    runner = _runner(trioctl, repo, root, monkeypatch, client)
+    runner = _runner(trioctl, repo, root, monkeypatch, client, root_free=True)
     mailbox = repo / "loop"
     client.hold["s1"] = threading.Event()
     t = threading.Thread(target=lambda: runner.run("evaluator", 1, mailbox, None))

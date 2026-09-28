@@ -204,17 +204,18 @@ def test_tracked_symlinked_cursor_dir_is_still_refused(wt, repo, root, tmp_path)
     assert entry["retained_reason"] == "unsafe_cursor_config"
 
 
-def test_root_omnigent_merge_into_tracked_config_does_not_block_dispatch(wt, repo, root):
-    # The Lead's own root launch merges its entries into the tracked files.
-    omnigent_merge(repo, "/tmp/omnigent-1000/cursor-native/lead")
-    found = wt.classify_aggregate(repo, repo / "loop")
-    assert found["product"] == [] and found["foreign"] == []
-    assert ".cursor/mcp.json" in found["ignored"] and ".cursor/hooks.json" in found["ignored"]
-    record = wt.create(repo, slice_id="api", mailbox=repo / "loop", root=root)
-    assert Path(record["path"]).is_dir()
-    # A real user edit to the tracked config is still a foreign change.
-    data = json.loads((repo / ".cursor" / "mcp.json").read_text())
-    data["mcpServers"]["docs"]["args"] = ["changed"]
-    (repo / ".cursor" / "mcp.json").write_text(json.dumps(data))
-    found = wt.classify_aggregate(repo, repo / "loop")
-    assert [wt._status_path(line) for line in found["foreign"]] == [".cursor/mcp.json"]
+# r16b deleted (r16 DESIGN §1.11) the root-specific recognizer this test
+# pinned -- `classify_aggregate`'s own branch that treated an omnigent
+# merge INTO the repository root's tracked `.cursor/{mcp,hooks}.json` as
+# ignorable (`omnigent_only_change` + `_normal_cursor`, and the root
+# stranger detection with it). It existed only because the Lead used to
+# launch a Cursor session directly at the aggregate root; since r16b every
+# role runs in its own Lead worktree (root-free, both open-loop and
+# lockstep) and the root never runs a Cursor session at all, so this
+# scenario -- "the Lead's own root launch merges its entries into the
+# tracked files" -- can no longer arise, and `classify_aggregate` now
+# correctly reports such a change as `foreign` like any other, matching
+# the grep confirming both symbols are gone from worker_worktrees.py.
+# `omnigent_merge` itself stays: the worker/eval-worktree tests above
+# still exercise real, current neutralisation of a session's own merge
+# into an ISOLATED worktree's tracked config.

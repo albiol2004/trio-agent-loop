@@ -70,9 +70,13 @@ def test_root_free_record_is_the_unified_schema_and_every_reader_uses_it(world, 
         files = sorted(_registry(home).glob("*.json"))
         seen["files"] = [p.name for p in files]
         seen["record"] = json.loads(files[0].read_text())
-        # Root-free: nothing at the root, so no root turn is held.
-        seen["turns"] = runner._turn_state()["count"]
-        seen["one_shot_loops"] = t._live_loops(home, root_bound_only=True)
+        # r16b dropped `_live_loops`' `root_bound_only` param (root-bound
+        # mode itself is gone, save for a mailbox outside any git checkout
+        # or an older record); filter its unfiltered listing by `mode` for
+        # the same "no legacy one-shot loop is registered" check.
+        seen["one_shot_loops"] = [
+            e for e in t._live_loops(home) if e.get("mode") == "root-bound"
+        ]
         seen["aggregate"] = t.aggregate_for(box, "home", home)
         out = io.StringIO()
         with redirect_stdout(out):
@@ -98,7 +102,10 @@ def test_root_free_record_is_the_unified_schema_and_every_reader_uses_it(world, 
     assert record["aggregates"] == {"home": str(lead)}
     assert record["writes_by_repo"] == {os.path.realpath(home): ["src/uni.py"]}
     assert record["pid"] == os.getpid()
-    assert seen["turns"] == 0 and seen["one_shot_loops"] == []
+    # r16b deleted the r15.x root-turn lock (`_RootTurnLock`/`_turn_state`
+    # & co.) entirely -- there is no root turn to count any more, root-free
+    # or not; only "no legacy one-shot loop is registered" still applies.
+    assert seen["one_shot_loops"] == []
     assert seen["aggregate"] == lead
     assert seen["status"]["driver"]["pid"] == os.getpid()
     assert seen["status"]["driver"]["mode"] == "root-free"
@@ -122,7 +129,9 @@ def test_root_bound_record_has_the_same_keys_and_same_repo_identity(world, tmp_p
         assert record["aggregates"] == {"home": os.path.realpath(home)}
         # Same key a root-free loop of this repository uses.
         assert record["writes_by_repo"] == {os.path.realpath(home): ["src/rb.py"]}
-        assert t._live_loops(home, root_bound_only=True)[0]["mailbox_rel"] == "loop/rb"
+        # r16b dropped `root_bound_only`; this is the only live loop of
+        # `home` here, so the unfiltered listing is equivalent.
+        assert t._live_loops(home)[0]["mailbox_rel"] == "loop/rb"
     finally:
         reg.unregister()
     assert not reg.file().exists()

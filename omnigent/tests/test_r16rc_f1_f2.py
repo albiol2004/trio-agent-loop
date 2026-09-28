@@ -100,19 +100,31 @@ def test_f1_stale_seeded_branch_is_reseeded_after_refresh(world, tmp_path, monke
     _nothing_created(world, home, spec)
 
 
-def test_f1_root_bound_on_an_unused_seeded_worktree(world, tmp_path, monkeypatch, capsys):
+def test_f1_root_bound_refused_even_on_an_unused_seeded_worktree(
+    world, tmp_path, monkeypatch, capsys
+):
+    """r16b: `--root-bound` is refused outright (exit 2, pointing at
+    `land`/`abandon`) instead of discarding a pristine, unused Lead
+    worktree and falling back to running root-bound -- that mode, and the
+    fallback, are both gone (r16 DESIGN)."""
     home = _mixed_home(tmp_path)
     spec = world.add_loop(home, "loop/mix", [{"id": "m1", "write": "src/m.py"}])
     with monkeypatch.context() as m:
         m.setattr(world.trioctl, "_target_metrics_api", lambda home, target: 6)
         m.setattr(world.rf, "discard_pristine", lambda *a, **k: False)
         assert world.run_loop(spec) == 3
+    before = world.rf.load_record(world.wt, home, spec["slug"])
+    assert world.rf.active(before)  # the refused run's pristine worktree
     t = world.trioctl
     args = world.loop_args(spec, "--root-bound")
     capsys.readouterr()
-    assert t._root_free_begin(args, home, spec["root_box"]) is None  # runs root-bound
-    assert "had no loop progress; removed" in capsys.readouterr().err
-    _nothing_created(world, home, spec)
+    assert t._root_free_begin(args, home, spec["root_box"]) == 2
+    err = capsys.readouterr().err
+    assert "root-bound mode was removed in r16b" in err
+    assert "land --mailbox" in err and "abandon --mailbox" in err
+    # Nothing changed: not even the pristine worktree from the refused run
+    # (never examined, let alone discarded).
+    assert world.rf.load_record(world.wt, home, spec["slug"]) == before
 
 
 def test_f1_root_bound_still_refused_with_loop_progress(world, tmp_path, monkeypatch, capsys):

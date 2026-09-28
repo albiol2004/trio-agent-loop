@@ -80,6 +80,13 @@ def test_installed_layout_without_checker_names_every_candidate(tmp_path):
 def test_loop_start_refusal_leaves_a_live_drivers_mailbox_untouched(
     tmp_path, monkeypatch, capsys
 ):
+    # r16b: root-free's own `.lock`-owner check (`_root_lock_refused`) now
+    # runs before it even looks at PLAN.md, so a mailbox a live driver
+    # owns is refused (exit 5) without ever reaching the repo-scope guard
+    # -- still left byte-identical, still under the same `.lock`. (A
+    # non-git mailbox cannot exercise this instead: its repo-scope guard
+    # never fires at all -- see test_r15_repo_scope_guard.py's `in_repo`
+    # cases -- so `OmnigentRunner` would actually be constructed here.)
     home, box = guard.make_home(tmp_path, guard.plan(guard.OK + guard.BAD))
     (box / ".lock").mkdir()
     (box / ".lock" / "pid").write_text(f"{os.getpid()}\n")  # a live owner
@@ -92,10 +99,14 @@ def test_loop_start_refusal_leaves_a_live_drivers_mailbox_untouched(
     assert {name: (box / name).read_bytes() for name in before} == before
     assert (box / ".lock" / "pid").read_text() == f"{os.getpid()}\n"
     err = capsys.readouterr().err
-    assert "owned by a live driver" in err and "slice bridge" in err
+    assert "owned by a live driver" in err
 
 
 def test_loop_start_refusal_takes_and_releases_the_lock(tmp_path, monkeypatch):
+    # r16b: this offending PLAN is refused by root-free's own pre-check
+    # (before any Lead worktree, or its `.lock`, ever exists) -- stderr
+    # only, the root's own mailbox never written (see
+    # test_r15_repo_scope_guard.py::test_loop_start_refuses_offending_plan).
     home, box = guard.make_home(tmp_path, guard.plan(guard.OK + guard.BAD))
     monkeypatch.chdir(home)
     monkeypatch.setattr(guard.trioctl, "OmnigentRunner", guard.NoRunner)
@@ -103,7 +114,7 @@ def test_loop_start_refusal_takes_and_releases_the_lock(tmp_path, monkeypatch):
     args = guard._loop_args(box)
     assert args.func(args) == 3
     assert not (box / ".lock").exists()
-    assert "status: error" in (box / "STATE.md").read_text().splitlines()
+    assert "status: error" not in (box / "STATE.md").read_text().splitlines()
 
 
 def test_open_loop_refusal_labels_never_run_ahead(tmp_path, monkeypatch):

@@ -162,33 +162,18 @@ class _PruneClient:
 def test_d1_loop_end_removes_eval_worktree_once_torn_down_runner_exits(
     trioctl, wt, repo, root, holders, monkeypatch, capsys
 ):
-    state: dict = {}
-
-    class Runner:
-        def __init__(self, **kwargs):
-            self.created_session_ids = ["s-eval"]
-            self.held_session_ids: list[str] = []
-
-        def release_all_fences(self):
-            pass
-
-        def restore_root_config_final(self, mailbox):
-            return []
-
-    class Loop:
-        @staticmethod
-        def run_loop(mailbox, max_iterations, runner, *, repo):
-            rec = _eval_worktree(wt, repo, root)
-            state["rec"] = rec
-            # The session's runner outlives the prune's DELETE briefly.
-            state["holder"] = holders(Path(rec["path"]), 1.5)
-            return 0
-
+    """D1 at the real post-loop `finally`: `_run_post_loop_session_prune`
+    (broker archive+DELETE) then `_run_worktree_cleanup` (id-scoped,
+    recheck-on-settle), called directly as `_command_loop`'s own `finally`
+    block does (r16b: driving the full `omnigent loop` CLI here would also
+    need a real root-free Lead worktree, land and SHIP -- machinery this
+    D1 race has nothing to do with)."""
+    mailbox = repo / "loop"
+    rec = _eval_worktree(wt, repo, root)
+    # The session's runner outlives the prune's DELETE briefly.
+    holder = holders(Path(rec["path"]), 1.5)
     client = _PruneClient([{"id": "s-eval", "status": "idle",
                             "title": "trioctl loop evaluator:iteration 1"}])
-    monkeypatch.chdir(repo)
-    monkeypatch.setattr(trioctl, "OmnigentRunner", Runner)
-    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
     monkeypatch.setattr(trioctl, "_session_client", lambda base_url=None: client)
     monkeypatch.setattr(trioctl, "WORKTREE_SETTLE_SECONDS", 20.0)
     real_cleanup = wt.cleanup
@@ -196,29 +181,26 @@ def test_d1_loop_end_removes_eval_worktree_once_torn_down_runner_exits(
 
     def cleanup(*a, **k):
         results = real_cleanup(*a, **k)
-        first_pass.extend(r for r in results if r.get("id") == state.get("rec", {}).get("id"))
+        first_pass.extend(r for r in results if r.get("id") == rec["id"])
         return results
 
     monkeypatch.setattr(wt, "cleanup", cleanup)
-    removals = _guard_removal(wt, monkeypatch, lambda: state["holder"])
-    args = trioctl.parser().parse_args(
-        ["omnigent", "loop", "--mailbox", "loop", "--max-iterations", "1",
-         "--isolate-workers", "--worktree-root", str(root)]
-    )
+    removals = _guard_removal(wt, monkeypatch, holder)
     started = time.monotonic()
-    assert args.func(args) == 0
+    torn_down = trioctl._run_post_loop_session_prune(mailbox, None, ["s-eval"])
+    trioctl._run_worktree_cleanup(repo, mailbox, torn_down=torn_down)
     elapsed = time.monotonic() - started
 
     assert client.deleted == ["s-eval"]
     # Without the recheck this is where D1 stopped: retained, active_session.
     assert [r["retained_reason"] for r in first_pass] == ["active_session"]
-    record = wt.load_record(repo, state["rec"]["id"])
+    record = wt.load_record(repo, rec["id"])
     assert record["state"] == "removed" and record["worktree_removed"] is True
     assert record["owner_exit"]["outcome"] == "exited"
-    assert removals == [state["rec"]["path"]]
-    assert not _registered(repo, state["rec"]["path"])
+    assert removals == [rec["path"]]
+    assert not _registered(repo, rec["path"])
     assert elapsed < 15  # waited for the exit, not the whole bound
-    assert f"worktree {state['rec']['id']}: removed" in capsys.readouterr().err
+    assert f"worktree {rec['id']}: removed" in capsys.readouterr().err
 
 
 def test_prune_reports_exactly_the_deleted_ids(trioctl, tmp_path, monkeypatch):
