@@ -3743,10 +3743,24 @@ ROOT_TURN_LOCK_DIR_ENV = "TRIO_ROOT_TURN_LOCK_DIR"
 ROOT_TURN_POLL_ENV = "TRIO_ROOT_TURN_POLL_S"
 ROOT_TURN_PROGRESS_ENV = "TRIO_ROOT_TURN_PROGRESS_S"
 DEFAULT_ROOT_TURN_PROGRESS = 60.0
+ROOT_STRANGER_WAIT_ENV = "TRIO_ROOT_STRANGER_WAIT_S"
+DEFAULT_ROOT_STRANGER_WAIT = 300.0
+ROOT_STRANGER_PROGRESS = 30.0
+#: A foreign cursor-agent kept the aggregate root after the bounded wait.
+ROOT_OCCUPIED_EXIT = 9
 
 
 class RootBusyError(TrioctlError):
     """Another Trio actor kept the root turn past the bounded wait."""
+
+
+class RootOccupiedError(TrioctlError):
+    """A cursor-agent Trio does not own still loads the root's project slot."""
+
+    def __init__(self, message: str, *, pids: list[int], details: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.pids = pids
+        self.details = details
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -3919,6 +3933,24 @@ def _root_turn_slot(key: str) -> dict[str, Any]:
         )
 
 
+def _set_state_reason(state_path: Path, reason: str | None) -> None:
+    """Set (or with None drop) STATE.md's `reason:` line; other lines untouched."""
+    try:
+        lines = state_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    pattern = re.compile(r"^\s*(?:-\s+)?reason\s*:", re.IGNORECASE)
+    kept = [line for line in lines if not pattern.match(line)]
+    if reason is not None:
+        kept.append(f"reason: {reason}")
+    if kept != lines:
+        state_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+#: STATE.md `reason:` values this driver writes (cleared again on resume).
+DRIVER_STOP_REASONS = ("root-occupied", "driver-exception")
+
+
 # Prompts of this process's dispatches, per mailbox, so a first-prompt hold
 # can tell a cross-wired mirror (the only saved user row is a SIBLING
 # dispatch's prompt) from a generic uncertain delivery.
@@ -4060,6 +4092,9 @@ class OmnigentRunner:
         # (finished root-bound evaluators still holding it with their
         # fence)}; see `_enter_root_turn` / `_root_turn_slot`.
         self._root_turn: dict[str, Any] = {"key": None, "count": 0, "sticky": 0}
+        # Set when a dispatch stops the loop for a human (root-occupied,
+        # writes-overlap): `_command_loop` maps it to STATE + exit code.
+        self.driver_stop: dict[str, Any] | None = None
         # The loop core driving this runner (set by `loop`); None = unknown.
         self.loop_core: Any = None
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
@@ -4569,6 +4604,8 @@ class OmnigentRunner:
 
     # ------------------------------------------------ r15.x root-turn lock
 
+    ROOT_STRANGER_WAIT = DEFAULT_ROOT_STRANGER_WAIT
+
     def _turn_state(self) -> dict[str, Any]:
         """This runner's share of the root turn (lazy for __new__-built runners):
         {key (lock path), count (its holders), sticky (finished evaluators)}."""
@@ -4767,7 +4804,7 @@ class OmnigentRunner:
                 self.driver_meta = current
         return waited
 
-    def _release_root(self, mailbox: Path) -> None:
+    def _release_root(self, mailbox: Path, *, stranger_wait: float | None = None) -> None:
         """Before a root-bound dispatch: prove no earlier session owns the root.
 
         Cursor-native writes the aggregate root's project ``.cursor``
@@ -4781,6 +4818,13 @@ class OmnigentRunner:
         flight is a known occupant: it is waited for first (bounded by its
         role timeout), then its finished session is released like any
         other. Only unknown cursor-agents at the root refuse the dispatch.
+
+        r15.x: every Trio actor at this root holds the root-turn lock, so a
+        cursor-agent still found here (at the root or in a subdirectory
+        that loads its slot) is not Trio's: the user's own session, an older
+        Trio, or a leaked process. It is waited for up to
+        TRIO_ROOT_STRANGER_WAIT_S (default 300 s, progress every 30 s), then
+        :class:`RootOccupiedError` names it (pid, cwd, start, parents, cmd).
         """
         self._wait_known_root_occupants()
         with self._own_lock:
@@ -4803,17 +4847,50 @@ class OmnigentRunner:
                     e for e in claimed if e["session_id"] not in known
                 ]
             raise
-        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
+        if stranger_wait is None:
+            stranger_wait = _env_seconds(ROOT_STRANGER_WAIT_ENV, float(self.ROOT_STRANGER_WAIT))
+        start = time.monotonic()
+        deadline = start + stranger_wait
+        next_note = start + min(ROOT_STRANGER_PROGRESS, max(stranger_wait, 0.0))
         while True:
             live = worker_worktrees.cursor_processes_at(self.repo)
             if not live:
                 return
-            if time.monotonic() >= deadline:
-                raise TrioctlError(
-                    f"cursor-agent process(es) {live[:10]} still run at the "
-                    f"aggregate root {self.repo}; not reusing its Cursor config"
+            now = time.monotonic()
+            if now >= deadline:
+                raise self._root_occupied(mailbox, live, now - start)
+            if now >= next_note and stranger_wait > self.ROOT_RELEASE_WAIT:
+                print(
+                    f"trioctl: cursor-agent process(es) {live[:10]} not owned by Trio "
+                    f"at the aggregate root {self.repo}; waited {now - start:.0f}s/"
+                    f"<={stranger_wait:.0f}s",
+                    file=sys.stderr,
                 )
+                next_note = now + ROOT_STRANGER_PROGRESS
             time.sleep(0.5 if self._interval else 0.0)
+
+    def _root_occupied(self, mailbox: Path, live: list[int], waited: float) -> RootOccupiedError:
+        """The clean root-occupied abort (recorded for `_command_loop`)."""
+        details = []
+        for pid in live[:10]:
+            try:
+                details.append(worker_worktrees.process_detail(pid))
+            except Exception:  # noqa: BLE001 - a vanished pid keeps its number
+                details.append({"pid": pid})
+        described = "; ".join(worker_worktrees.describe_process(d) for d in details)
+        message = (
+            f"cursor-agent process(es) {live[:10]} still run at the aggregate root "
+            f"{self.repo} after {waited:.0f}s: root {self.repo} is in use by a process "
+            f"Trio does not own: {described}; Trio would overwrite its "
+            ".cursor/hooks.json and mcp.json. Close it or run this loop after it ends; "
+            f"resume with: trioctl omnigent loop --mailbox {mailbox}"
+        )
+        error = RootOccupiedError(message, pids=list(live), details=details)
+        error.stop = {
+            "status": "needs_human", "phase": "root-occupied", "reason": "root-occupied",
+            "message": message, "exit": ROOT_OCCUPIED_EXIT,
+        }
+        return error
 
     def _end_previous_root_sessions(self, mailbox: Path, previous: list[str]) -> None:
         """Prune the claimed finished root sessions (refuses held ones)."""
@@ -4945,7 +5022,7 @@ class OmnigentRunner:
         if busy:
             return
         try:
-            self._release_root(mailbox)
+            self._release_root(mailbox, stranger_wait=self.ROOT_RELEASE_WAIT)
         except Exception as exc:  # noqa: BLE001 - config stays; acceptance decides
             print(f"trioctl: root Cursor config left in place: {exc}", file=sys.stderr)
             return
@@ -5588,6 +5665,9 @@ class OmnigentRunner:
                 role, iteration, mailbox, context, agent_id, model, prompt, title,
                 dispatch, eval_wt, eval_degraded, nonce,
             )
+        except RootOccupiedError as exc:
+            self.driver_stop = getattr(exc, "stop", None)
+            raise
         finally:
             if at_root:
                 if role == "evaluator" and eval_degraded is None:
@@ -6668,6 +6748,7 @@ def _command_loop(args: argparse.Namespace) -> int:
     # r15: a Lead pass that adds `repos:` to PLAN.md on an old core is
     # refused like any other out-of-repo slice (see OmnigentRunner._run).
     runner.loop_core = loop_core
+    _clear_driver_stop_reason(loop_core, mailbox)
     keep_sessions = getattr(args, "keep_sessions", False)
     ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
     previous_ids_env = os.environ.get(SESSION_IDS_ENV_VAR)
@@ -6691,6 +6772,11 @@ def _command_loop(args: argparse.Namespace) -> int:
             repo=repo,
             **loop_kwargs,
         )
+        stop = getattr(runner, "driver_stop", None)
+        if stop:
+            # A Lead-thread stop (root-occupied, writes-overlap): the core
+            # recorded `status: error`; it is a human's call, not an error.
+            return _apply_driver_stop(loop_core, mailbox, stop)
         return exit_code
     except RepoScopeRefusal:
         # Lockstep propagates runner errors; the refusal is already in
@@ -6699,6 +6785,22 @@ def _command_loop(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         # SIGINT/SIGTERM arrived: prune first (in finally), then exit 130.
         return 130
+    except Exception as exc:  # noqa: BLE001 - r15.x: never leave STATE running
+        # e.g. the integration-eval dispatch raising out of the loop core:
+        # STATE.md said `running`, `.driver.json` `eval_alive: true`.
+        stop = getattr(runner, "driver_stop", None)
+        if stop:
+            return _apply_driver_stop(loop_core, mailbox, stop)
+        # Anything else keeps propagating (exit 1 from `main`, as before),
+        # after STATE/LOG/sidecars say so. A held dispatch already set
+        # `status: needs_human` (exit 7 on resume): only its sidecars change.
+        _apply_driver_stop(
+            loop_core, mailbox,
+            {"status": "error", "phase": "driver-exception", "reason": "driver-exception",
+             "message": f"{type(exc).__name__}: {exc}", "exit": 3},
+            state=not _held_records(mailbox),
+        )
+        raise
     finally:
         # Restore the prior handlers and env, then prune this run's created
         # sessions. Prune lives in `finally` (not after the try) so a
@@ -6810,6 +6912,85 @@ def _release_root_turns_of(runner: Any) -> None:
             release()
         except Exception as exc:  # noqa: BLE001 - never change the exit code
             print(f"trioctl: could not release the root turn: {exc}", file=sys.stderr)
+
+
+def _clear_driver_stop_reason(loop_core: Any, mailbox: Path) -> None:
+    """Resume: drop a `reason:` this driver wrote at an earlier stop."""
+    state_path = mailbox / "STATE.md"
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    match = re.search(r"^\s*(?:-\s+)?reason\s*:\s*(\S+)", text, re.M | re.I)
+    if not match or match.group(1) not in DRIVER_STOP_REASONS:
+        return
+    acquire = getattr(loop_core, "_acquire_lock", None)
+    release = getattr(loop_core, "_release_lock", None)
+    lock = acquire(mailbox) if callable(acquire) else None
+    if callable(acquire) and lock is None:
+        return
+    try:
+        _set_state_reason(state_path, None)
+    finally:
+        if callable(release):
+            release(lock)
+
+
+def _apply_driver_stop(
+    loop_core: Any, mailbox: Path, stop: dict[str, Any], *, state: bool = True
+) -> int:
+    """Record a driver stop: STATE status/phase/reason, one LOG line, sidecars.
+
+    Written under the mailbox lock (a live driver that took the mailbox over
+    meanwhile is left alone); `.driver.json`/`.session.json` get
+    ``lead_alive``/``eval_alive`` false, so nothing reads as still running.
+    Returns the stop's exit code.
+    """
+    message = str(stop.get("message") or "")
+    if state:
+        print(f"trioctl: {stop.get('phase')}: {message}", file=sys.stderr)
+    acquire = getattr(loop_core, "_acquire_lock", None)
+    release = getattr(loop_core, "_release_lock", None)
+    lock = acquire(mailbox) if callable(acquire) else None
+    if callable(acquire) and lock is None:
+        print(f"trioctl: {mailbox} is owned by another driver now; STATE.md left as is",
+              file=sys.stderr)
+        return int(stop.get("exit") or 3)
+    try:
+        state_path = mailbox / "STATE.md"
+        update = getattr(loop_core, "_update_state", None)
+        if state:
+            try:
+                if callable(update) and state_path.is_file():
+                    update(state_path, {"status": str(stop["status"]),
+                                        "phase": str(stop["phase"])})
+                _set_state_reason(state_path, str(stop.get("reason") or stop["phase"]))
+            except (OSError, KeyError) as exc:
+                print(f"trioctl: could not update {state_path}: {exc}", file=sys.stderr)
+            _append_mailbox_log(
+                mailbox,
+                f"- iter {_state_iteration(mailbox)} | loop | {stop.get('status')} "
+                f"({stop.get('phase')}): {message}",
+            )
+        for name in (".driver.json", ".session.json"):
+            path = mailbox / name
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            payload.update({"lead_alive": False, "eval_alive": False, "phase": "done"})
+            if name == ".driver.json" and state:
+                payload["stop"] = {k: stop.get(k) for k in ("status", "phase", "reason")}
+            try:
+                path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+    finally:
+        if callable(release):
+            release(lock)
+    return int(stop.get("exit") or 3)
 
 
 def _resolve_mailbox(value: Any, repo: Path) -> Path:

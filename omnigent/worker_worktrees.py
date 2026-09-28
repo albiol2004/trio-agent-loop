@@ -363,22 +363,166 @@ def processes_using(path: Path, *, exclude: tuple[int, ...] = ()) -> list[int]:
     return users
 
 
-def cursor_processes_at(root: Path) -> list[int]:
-    """Live cursor-agent processes whose project root cwd is exactly *root*."""
-    target = str(root.resolve())
-    found: list[int] = []
+def _list_processes() -> Iterator[tuple[int, str, bytes]]:
+    """``(pid, cwd, cmdline)`` of every same-user process whose cwd is readable.
+
+    Module-level seam: tests replace it to inject a process table.
+    """
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if os.readlink(entry / "cwd") != target:
-                continue
-            cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            cwd = os.readlink(entry / "cwd")
+            cmd = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if b"cursor-agent" in cmd:
-            found.append(int(entry.name))
+        yield int(entry.name), cwd, cmd
+
+
+def _is_cursor_agent(cmdline: bytes) -> bool:
+    return b"cursor-agent" in cmdline.replace(b"\0", b" ")
+
+
+def _loads_root_slot(cwd: str, target: str) -> bool:
+    """Whether a cursor-agent with *cwd* reads the project config of *target*.
+
+    cursor-agent's project root is the nearest ancestor of its physical cwd
+    holding ``.git`` (:func:`cursor_project_root`), so a session started in
+    a subdirectory of *target* loads *target*'s ``.cursor`` slot too, while
+    one inside a nested checkout (a worktree or clone with its own ``.git``,
+    e.g. a Trio-owned worktree placed under the root) has its own slot.
+    """
+    if cwd == target:
+        return True  # the historical exact match
+    if not cwd.startswith(target.rstrip(os.sep) + os.sep):
+        return False
+    return str(cursor_project_root(Path(cwd))) == target
+
+
+def _proc_parent(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    fields = stat.rsplit(")", 1)[-1].split()
+    try:
+        return int(fields[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_cmd(pid: int, limit: int = 160) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return "?"
+    text = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip() or "?"
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _proc_started(pid: int) -> str | None:
+    """Wall-clock start time (local ``YYYY-mm-dd HH:MM:SS``) of *pid*, or None."""
+    ticks = _proc_start(pid)
+    if ticks is None:
+        return None
+    try:
+        btime = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, StopIteration, ValueError):
+        return None
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(btime + int(ticks) / hz))
+
+
+def parent_chain(pid: int, depth: int = 3) -> list[dict[str, Any]]:
+    """Up to *depth* ancestors of *pid*: ``[{pid, cmd}, ...]`` nearest first."""
+    chain: list[dict[str, Any]] = []
+    current = pid
+    for _ in range(depth):
+        parent = _proc_parent(current)
+        if not parent or parent <= 1:
+            break
+        chain.append({"pid": parent, "cmd": _proc_cmd(parent, 80)})
+        current = parent
+    return chain
+
+
+def process_detail(pid: int, cwd: str | None = None) -> dict[str, Any]:
+    """pid, cwd, cmd (truncated), start time and parent chain of *pid*."""
+    if cwd is None:
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = "?"
+    return {
+        "pid": pid,
+        "cwd": cwd,
+        "cmd": _proc_cmd(pid),
+        "started": _proc_started(pid),
+        "parents": parent_chain(pid),
+    }
+
+
+def describe_process(detail: dict[str, Any]) -> str:
+    """One line: ``cursor-agent pid N (cwd C, started T, parent P <- Q, cmd X)``."""
+    parents = " <- ".join(
+        f"{p.get('cmd')} (pid {p.get('pid')})" for p in detail.get("parents") or []
+    ) or "?"
+    return (
+        f"cursor-agent pid {detail.get('pid')} (cwd {detail.get('cwd')}, "
+        f"started {detail.get('started') or '?'}, parent {parents}, "
+        f"cmd {detail.get('cmd')})"
+    )
+
+
+def cursor_processes_detail(root: Path) -> list[dict[str, Any]]:
+    """Live cursor-agent processes that load *root*'s project ``.cursor`` config.
+
+    Matches a cwd equal to *root* or inside it whose nearest ``.git``
+    ancestor is *root* (r15.x: a session started in a subdirectory loads
+    the root slot too; nested worktrees/clones are excluded). Each entry is
+    :func:`process_detail`.
+    """
+    target = str(root.resolve())
+    found: list[dict[str, Any]] = []
+    for pid, cwd, cmd in _list_processes():
+        if pid == os.getpid() or not _is_cursor_agent(cmd):
+            continue
+        if _loads_root_slot(cwd, target):
+            found.append(process_detail(pid, cwd))
     return found
+
+
+def cursor_processes_at(root: Path) -> list[int]:
+    """Pids of :func:`cursor_processes_detail` (the historical list form)."""
+    return [entry["pid"] for entry in cursor_processes_detail(root)]
+
+
+def cursor_agent_ancestor(root: Path, pid: int | None = None, depth: int = 16) -> int | None:
+    """The nearest ancestor of *pid* (default: this process) that is a
+    cursor-agent loading *root*'s project slot, or None.
+
+    A headless one-shot started from inside a root session (the Lead's own
+    scouts/builders) is part of that session's root turn.
+    """
+    target = str(root.resolve())
+    current = os.getpid() if pid is None else pid
+    for _ in range(depth):
+        parent = _proc_parent(current)
+        if not parent or parent <= 1:
+            return None
+        try:
+            cmd = Path(f"/proc/{parent}/cmdline").read_bytes()
+            cwd = os.readlink(f"/proc/{parent}/cwd")
+        except OSError:
+            cmd, cwd = b"", ""
+        if cmd and _is_cursor_agent(cmd) and _loads_root_slot(cwd, target):
+            return parent
+        current = parent
+    return None
 
 
 # ------------------------------------------------- owned generated content

@@ -543,6 +543,7 @@ def test_live_cursor_at_root_blocks_root_reuse(trioctl, repo, root, monkeypatch,
     try:
         runner, _seen = _runner(trioctl, repo, root, monkeypatch)
         runner.ROOT_RELEASE_WAIT = 0.2
+        runner.ROOT_STRANGER_WAIT = 0.2  # r15.x: bounded stranger wait (default 300 s)
         with pytest.raises(trioctl.TrioctlError, match="still run at the aggregate root"):
             runner.run("lead", 1, repo / "loop", None)
     finally:

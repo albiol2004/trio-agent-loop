@@ -289,7 +289,134 @@ def _stranger_env(**extra) -> dict:
     return {"TRIO_ROOT_STRANGER_WAIT_S": "1.5", **extra}
 
 
+@pytest.mark.parametrize("where", ["root", "subdir"])
+def test_i4_foreign_cursor_agent_at_root_exits_9_needs_human(env, where):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")]})
+    (home / ".cursor").mkdir()
+    user_mcp = json.dumps({"mcpServers": {"user": {"command": "x"}}}) + "\n"
+    (home / ".cursor" / "mcp.json").write_text(user_mcp)
+    git(home, "add", ".cursor/mcp.json")
+    git(home, "commit", "-q", "-m", "user cursor config")
+    cwd = home if where == "root" else home / "src"
+    stranger = _fake_cursor_agent(tmp_path, cwd)
+    timeline = tmp_path / "timeline.jsonl"
+    try:
+        time.sleep(0.2)
+        proc = _spawn_loop(tmp_path, home, "a", [("a1", "src/a1.py")], timeline,
+                           env=_stranger_env())
+        code = proc.wait(timeout=120)
+    finally:
+        _kill(stranger)
+    log_out = _harness_log(tmp_path, "a")
+    assert code == 9, log_out
+    box = home / "loop" / "a"
+    state = (box / "STATE.md").read_text()
+    assert "status: needs_human" in state and "phase: root-occupied" in state
+    assert "reason: root-occupied" in state
+    assert "status: running" not in state
+    log = (box / "LOG.md").read_text().splitlines()[-1]
+    for needle in (f"pid {stranger.pid}", f"cwd {cwd.resolve()}", "cursor-agent", "parent ",
+                   "started ", "needs_human (root-occupied)"):
+        assert needle in log, (needle, log)
+    for needle in (f"pid {stranger.pid}", f"cwd {cwd.resolve()}", "resume with: trioctl omnigent loop"):
+        assert needle in log_out
+    driver = json.loads((box / ".driver.json").read_text())
+    assert driver["lead_alive"] is False and driver["eval_alive"] is False
+    assert driver["stop"]["reason"] == "root-occupied"
+    # Lock released, root .cursor restored byte-identical, registry empty.
+    assert not trioctl._RootTurnLock(home, who={}).held_by_other()
+    assert (home / ".cursor" / "mcp.json").read_text() == user_mcp
+    assert not (home / ".cursor" / "hooks.json").exists()
+    assert _registry_entries(home) == []
+    # Resume after the stranger is gone clears the stop reason and ships.
+    proc = _spawn_loop(tmp_path, home, "a", [("a1", "src/a1.py")], timeline)
+    assert proc.wait(timeout=120) == 0, _harness_log(tmp_path, "a")
+    state = (box / "STATE.md").read_text()
+    assert "status: shipped" in state and "reason:" not in state
+
+
+def test_stranger_detection_matches_subdirs_not_nested_checkouts(env):
+    tmp_path, wt, _trioctl = env
+    home = _fixture(tmp_path, {})
+    nested = home / "src" / "clone"
+    nested.mkdir(parents=True)
+    git(nested, "init", "-q")
+    procs = [_fake_cursor_agent(tmp_path, home / "src"), _fake_cursor_agent(tmp_path, nested)]
+    other = subprocess.Popen(["sleep", "30"], cwd=home, start_new_session=True)
+    try:
+        time.sleep(0.3)
+        found = wt.cursor_processes_detail(home)
+        pids = wt.cursor_processes_at(home)
+    finally:
+        for p in (*procs, other):
+            _kill(p)
+    assert [d["pid"] for d in found] == [procs[0].pid]
+    detail = found[0]
+    assert detail["cwd"] == str((home / "src").resolve())
+    assert "cursor-agent" in detail["cmd"] and detail["started"]
+    assert detail["parents"] and detail["parents"][0]["pid"] > 1
+    assert pids == [procs[0].pid]
+
+
+def test_stranger_detection_uses_the_injected_process_lister(env, monkeypatch):
+    tmp_path, wt, _trioctl = env
+    home = _fixture(tmp_path, {})
+    table = [
+        (4242, str(home / "src"), b"node\0/x/cursor-agent/index.js\0-p"),
+        (4243, str(home), b"sleep\0100"),
+        (4244, str(tmp_path), b"cursor-agent\0"),
+    ]
+    monkeypatch.setattr(wt, "_list_processes", lambda: iter(table))
+    assert wt.cursor_processes_at(home) == [4242]
+
+
+def test_release_root_waits_bounded_for_a_stranger_then_raises_root_occupied(
+    env, monkeypatch, capsys
+):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": []})
+    runner = trioctl.OmnigentRunner(repo=home, config={}, interval=0,
+                                    isolate_workers={"trioctl": SCRIPT, "worktree_root": "x"})
+    monkeypatch.setattr(runner, "ROOT_STRANGER_WAIT", 0.4)
+    seen = iter([[77], [77], []])
+    monkeypatch.setattr(wt, "cursor_processes_at", lambda root: next(seen, []))
+    runner._release_root(home / "loop" / "a")  # left within the bound: proceeds
+    monkeypatch.setattr(wt, "cursor_processes_at", lambda root: [os.getpid()])
+    t0 = time.monotonic()
+    with pytest.raises(trioctl.RootOccupiedError) as info:
+        runner._release_root(home / "loop" / "a")
+    assert 0.35 <= time.monotonic() - t0 < 5
+    assert info.value.pids == [os.getpid()]
+    assert f"cursor-agent pid {os.getpid()}" in str(info.value)
+    assert info.value.stop["exit"] == 9
+
+
 # ------------------------------------------------------------ I5 dispatch error
+
+
+def test_i5_integration_eval_dispatch_raising_sets_state_error_not_running(env):
+    tmp_path, wt, trioctl = env
+    home = _fixture(tmp_path, {"a": [("a1", "src/a1.py")]})
+    timeline = tmp_path / "timeline.jsonl"
+    proc = _spawn_loop(tmp_path, home, "a", [("a1", "src/a1.py")], timeline,
+                       integration="raise")
+    code = proc.wait(timeout=120)
+    out = _harness_log(tmp_path, "a")
+    assert code != 0, out
+    assert "injected" in out
+    box = home / "loop" / "a"
+    state = (box / "STATE.md").read_text()
+    assert "status: error" in state and "phase: driver-exception" in state
+    assert "status: running" not in state
+    assert "integration-eval dispatch blew up" in (box / "LOG.md").read_text().splitlines()[-1]
+    driver = json.loads((box / ".driver.json").read_text())
+    assert driver["eval_alive"] is False and driver["lead_alive"] is False
+    assert json.loads((box / ".session.json").read_text())["eval_alive"] is False
+    # Sessions/fences/locks released.
+    assert not trioctl._RootTurnLock(home, who={}).held_by_other()
+    assert wt.active_fences(home) == []
+    assert not (box / ".lock").exists()
 
 
 # ------------------------------------------------------------ I6 crash

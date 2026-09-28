@@ -48,6 +48,7 @@ def test_next_lead_pass_waits_for_degraded_eval_then_proceeds(
     _degraded(wt, monkeypatch)
     runner, seen = _runner(trioctl, repo, tmp_path / "worktrees", monkeypatch)
     monkeypatch.setattr(runner, "ROOT_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(runner, "ROOT_STRANGER_WAIT", 0.2)  # r15.x stranger bound
     pruned: list[str] = []
     prune_lock = threading.Lock()
 
@@ -96,6 +97,7 @@ def test_next_lead_pass_waits_for_degraded_eval_then_proceeds(
 def test_unknown_root_cursor_agent_still_refuses(trioctl, wt, repo, tmp_path, monkeypatch, capsys):
     runner, _seen = _runner(trioctl, repo, tmp_path / "worktrees", monkeypatch)
     monkeypatch.setattr(runner, "ROOT_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(runner, "ROOT_STRANGER_WAIT", 0.2)  # r15.x stranger bound
     monkeypatch.setattr(wt, "cursor_processes_at", lambda root: [999])
     t0 = time.monotonic()
     with pytest.raises(trioctl.TrioctlError, match="still run at the aggregate root"):
@@ -111,6 +113,7 @@ def test_degraded_eval_wait_is_bounded_by_its_role_timeout(
     _degraded(wt, monkeypatch)
     runner, _seen = _runner(trioctl, repo, tmp_path / "worktrees", monkeypatch)
     monkeypatch.setattr(runner, "ROOT_RELEASE_WAIT", 0.2)
+    monkeypatch.setattr(runner, "ROOT_STRANGER_WAIT", 0.2)  # r15.x stranger bound
     monkeypatch.setattr(wt, "cursor_processes_at", lambda root: [424242])
     started, release = _slow_eval(runner, monkeypatch)
     ctx = {"mode": "open-loop", "kind": "slice-eval", "slice": "A",
