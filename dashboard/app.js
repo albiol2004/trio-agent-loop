@@ -31,6 +31,7 @@ const state = {
   graphSel: null,
   compare: [],
   tlOpen: new Set(),
+  tlSignature: null,
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -1109,6 +1110,7 @@ async function openDrawer(key) {
   state.detail = null;
   state.compare = [];
   state.tlOpen.clear();
+  state.tlSignature = null;
   state.sessions = [];
   state.activePath = null;
   state.drawerTab = "overview";
@@ -1155,6 +1157,7 @@ function closeDrawer() {
   state.detail = null;
   state.compare = [];
   state.tlOpen.clear();
+  state.tlSignature = null;
   state.sessions = [];
   state.activePath = null;
   state.pendingLines = [];
@@ -1616,6 +1619,26 @@ function tlRoleClass(role) {
 function renderTimelineView() {
   const view = el("view-timeline");
   if (view.hidden) return;
+  /* The detail poll re-renders every 5 s. Skip when nothing the timeline
+   * shows has changed, so focused controls are not replaced; when it has,
+   * focus returns to the same control (by data-focus-key) without scrolling. */
+  const signature = JSON.stringify([state.detail, state.compare]);
+  if (signature === state.tlSignature && view.childElementCount) {
+    requestAnimationFrame(() => syncSummaryToggles(view));
+    return;
+  }
+  state.tlSignature = signature;
+  const focused = view.contains(document.activeElement)
+    ? document.activeElement.dataset.focusKey : null;
+  renderTimelineContent(view);
+  if (focused) {
+    const again = [...view.querySelectorAll("[data-focus-key]")]
+      .find((n) => n.dataset.focusKey === focused);
+    if (again) again.focus({ preventScroll: true });
+  }
+}
+
+function renderTimelineContent(view) {
   view.textContent = "";
   if (!state.detail) {
     appendEmpty(view, "Loading timeline…");
@@ -1712,6 +1735,7 @@ function timelineSummary(text, key) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "btn btn-ghost btn-small tl-more";
+  btn.dataset.focusKey = "more:" + key;
   btn.setAttribute("aria-controls", body.id);
   const setOpen = (open) => {
     body.classList.toggle("is-open", open);
@@ -1769,6 +1793,7 @@ function timelineIteration(row) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn btn-ghost btn-small tl-compare";
+    btn.dataset.focusKey = "compare:" + row.it;
     btn.textContent = selected ? "Comparing" : "Compare";
     btn.setAttribute("aria-pressed", String(selected));
     btn.setAttribute("aria-label", "Compare iteration " + row.it);
@@ -1822,6 +1847,7 @@ function timelineIteration(row) {
       const chip = document.createElement("button");
       chip.type = "button";
       chip.className = "chip chip-btn chip-" + st;
+      chip.dataset.focusKey = "slice:" + row.it + ":" + id;
       chip.textContent = id;
       chip.title =
         id + " · " + st.replace("_", " ") +
@@ -2351,10 +2377,10 @@ function openDefaultSession() {
   }
   if (!state.sessions.length) {
     showTranscriptNotice(
-      "No session transcripts for this loop yet. Omnigent drivers export " +
-      "role sessions to the mailbox's .sessions/ folder when trioctl archives " +
-      "them at the end of a run, and omp runs keep theirs under ~/.omp; " +
-      "neither exists for this loop so far."
+      "No session transcripts for this loop yet. Sessions appear when " +
+      "archived, usually after a role finishes; active sessions are not " +
+      "listed yet. Omnigent drivers export them to the mailbox's .sessions/ " +
+      "folder and omp runs keep theirs under ~/.omp."
     );
     return;
   }

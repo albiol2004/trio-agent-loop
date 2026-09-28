@@ -589,9 +589,12 @@ html, body {
 .session-subagent .session-label { color: var(--muted); }
 .session-empty { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-label); color: var(--faint); }
 .sessions-note {
-  margin: 0; padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--border);
+  margin: 0; border-bottom: 1px solid var(--border);
   font-size: var(--fs-caption); line-height: 1.4; color: var(--muted);
 }
+.sessions-note summary { padding: var(--sp-2) var(--sp-4); cursor: pointer; }
+.sessions-note summary:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sessions-note p { margin: 0; padding: 0 var(--sp-4) var(--sp-2); }
 
 .transcript-view {
   overflow-y: auto;
@@ -878,9 +881,19 @@ html, body {
 
 .stream-status { font-size: var(--fs-caption); letter-spacing: 0; text-transform: none; }
 
+/* Phones: the session list keeps about three rows whatever the note does
+ * (the note is one 44px line until opened), and the transcript keeps its
+ * height by trimming the header, gap and footer instead. */
 @media (max-width: 900px) {
-  .chat-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(360px, 1fr); }
-  .chat-sessions { max-height: 200px; }
+  .chat-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: max-content minmax(360px, 1fr); gap: var(--sp-2); }
+  .chat-sessions-head { min-height: 36px; }
+  .chat-sessions .session-list { flex: none; max-height: 140px; }
+  .sessions-note summary {
+    padding: var(--sp-3) var(--sp-4); line-height: 20px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sessions-note[open] summary { white-space: normal; }
+  .chat-main .pane-footer { min-height: 44px; }
   .transcript-view { padding: var(--sp-3) var(--sp-4); }
 }
 
