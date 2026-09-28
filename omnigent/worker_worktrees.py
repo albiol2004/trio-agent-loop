@@ -532,12 +532,46 @@ OWNED_CURSOR_FILES = (".cursor/mcp.json", ".cursor/hooks.json")
 #: Ignored, regenerable caches that may be discarded with a worktree.
 DISPOSABLE_IGNORED = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
 _USAGE_HOOK_ARGS = ("-I", "-m", "omnigent.harnesses.cursor_native.usage", "record-usage", "--bridge-dir")
+#: The project ``stop`` hook Omnigent's cursor plugin route (r17
+#: ``OMNIGENT_CURSOR_PLUGIN_DIR``) writes so cursor-agent fires the plugin's
+#: own stop hook: a no-op command carrying this exact marker, bound to no
+#: session. Omnigent-owned residue like the usage hook (eval-r17 T1-T4).
+PLUGIN_STOP_ARMER_COMMAND = "true # omnigent-plugin-stop-armer"
+
+
+def is_plugin_stop_armer(entry: object) -> bool:
+    """Whether a hooks.json entry is exactly the plugin stop armer."""
+    return (
+        isinstance(entry, dict)
+        and set(entry) == {"command"}
+        and entry["command"] == PLUGIN_STOP_ARMER_COMMAND
+    )
+
+
+def _without_armers(data: object) -> object:
+    """A copy of hooks.json *data* with every plugin stop armer dropped
+    (an event left empty is dropped too); anything else unchanged."""
+    data = json.loads(json.dumps(data))
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if isinstance(hooks, dict):
+        for event, entries in list(hooks.items()):
+            if isinstance(entries, list) and any(is_plugin_stop_armer(e) for e in entries):
+                kept = [e for e in entries if not is_plugin_stop_armer(e)]
+                if kept:
+                    hooks[event] = kept
+                else:
+                    del hooks[event]
+    return data
 
 
 def _owned_mcp(data: object) -> bool:
     if not isinstance(data, dict) or set(data) != {"mcpServers"}:
         return False
     servers = data["mcpServers"]
+    if servers == {}:
+        # What Omnigent's stale-entry cleanup (r17 B2 fix) leaves when its
+        # own entry was the only content: never user content.
+        return True
     if not isinstance(servers, dict) or set(servers) != {"omnigent"}:
         return False
     args = servers["omnigent"].get("args") if isinstance(servers["omnigent"], dict) else None
@@ -556,6 +590,9 @@ def _owned_hooks(data: object) -> bool:
     if not isinstance(entries, list) or not entries:
         return False
     for entry in entries:
+        if is_plugin_stop_armer(entry):
+            # eval-r17 T1: the plugin route's stop armer is Omnigent's too.
+            continue
         if not isinstance(entry, dict) or set(entry) != {"command"}:
             return False
         try:
@@ -570,8 +607,12 @@ def _owned_hooks(data: object) -> bool:
 def owned_residue(path: Path, rel: str) -> bool:
     """Whether untracked *rel* in *path* is exactly Omnigent-generated config.
 
-    Anything else -- a symlink, extra servers/hooks, unreadable JSON --
-    is user content and is never treated as disposable.
+    A ``hooks.json`` counts when its only ``stop`` entries are Omnigent usage
+    hooks and/or the plugin stop armer (:data:`PLUGIN_STOP_ARMER_COMMAND`,
+    eval-r17 T1); an ``mcp.json`` when it is Omnigent's own server or exactly
+    ``{"mcpServers": {}}`` (left by Omnigent's stale-entry cleanup). Anything else -- a symlink, extra servers/hooks (a user
+    hook next to the armer), unreadable JSON -- is user content and is never
+    treated as disposable.
     """
     if rel not in OWNED_CURSOR_FILES:
         return False
@@ -903,7 +944,12 @@ def _strip_owned(rel: str, data: object, keys: set[str]) -> object:
     if isinstance(hooks, dict):
         for event, entries in hooks.items():
             if isinstance(entries, list):
-                hooks[event] = [e for e in entries if _usage_hook_bridge(e) not in keys]
+                # The plugin stop armer is bound to no session: owned by any
+                # (eval-r17 T3), stripped with the owned sessions' hooks.
+                hooks[event] = [
+                    e for e in entries
+                    if _usage_hook_bridge(e) not in keys and not is_plugin_stop_armer(e)
+                ]
     return data
 
 
@@ -935,9 +981,13 @@ def _omnigent_base(rel: str, source: bytes | None) -> object:
     base.setdefault("version", 1)
     stop = hooks.get("stop")
     stop = stop if isinstance(stop, list) else []
+    # The plugin route (r17) re-adds its stop armer idempotently, so a
+    # baseline armer is Omnigent's too (eval-r17 T3); `_strip_owned` drops
+    # it from the current file, and the restore puts the baseline back.
     hooks["stop"] = [
         e for e in stop
         if not (isinstance(e, dict) and _USAGE_HOOK_MODULE in str(e.get("command", "")))
+        and not is_plugin_stop_armer(e)
     ]
     return base
 
@@ -1504,7 +1554,9 @@ def _omnigent_hooks(path: Path) -> list[str]:
         return []
     except (OSError, ValueError):
         return [f"{path} is unreadable or not JSON (cannot prove it is safe)"]
-    if _marked(data):
+    # The plugin stop armer (a no-op bound to no session) is not an
+    # inherited session binding (eval-r17 T4); every other marker is.
+    if _marked(_without_armers(data)):
         return [f"{path} carries an Omnigent session hook"]
     return []
 

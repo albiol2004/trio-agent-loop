@@ -1102,6 +1102,9 @@ def remove_worktree(
     ignored = _ignored_blockers(wt, path, home_copy, allow)
     if ignored:
         return "ignored_content: " + "; ".join(ignored[:5])
+    # Omnigent residue (usage hook/MCP server, the plugin stop armer and an
+    # emptied `{"mcpServers": {}}`, eval-r17 T1) is rebuildable: dropped
+    # here, never a retention reason; a user hook next to it is kept above.
     for rel in residue:
         if wt.owned_residue(path, rel):
             (path / rel).unlink()
