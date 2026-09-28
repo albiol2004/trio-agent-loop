@@ -925,14 +925,14 @@ def test_p4a_reason_line_retired_does_not_steal_the_retired_block() -> None:
 
 # --- r11h API-4: trio-check refuses a mixed metrics/ set --------------------
 
-@pytest.mark.parametrize("api_line", ["METRICS_API = 4\n", "METRICS_API = 3\n", "METRICS_API = 2\n", ""])
+@pytest.mark.parametrize("api_line", ["METRICS_API = 5\n", "METRICS_API = 4\n", "METRICS_API = 3\n", "METRICS_API = 2\n", ""])
 def test_trio_check_refuses_mismatched_sibling_metrics(tmp_path, api_line) -> None:
     mdir = tmp_path / "metrics"
     mdir.mkdir()
     (mdir / "trio-check.py").write_text(CHECKER.read_text(encoding="utf-8"))
     (mdir / "trio-metrics.py").write_text(
         METRICS_PATH.read_text(encoding="utf-8").replace(
-            "METRICS_API = 5\n", api_line)
+            "METRICS_API = 6\n", api_line)
     )
     mailbox = tmp_path / "proj" / "loop"
     mailbox.mkdir(parents=True)
@@ -946,9 +946,9 @@ def test_trio_check_refuses_mismatched_sibling_metrics(tmp_path, api_line) -> No
     assert proc.returncode == 2
     assert "Traceback" not in proc.stderr + proc.stdout
     assert (f"sibling trio-metrics.py has METRICS_API {found}, this "
-            "trio-check requires 5 (mixed metrics/ versions)") in proc.stderr
+            "trio-check requires 6 (mixed metrics/ versions)") in proc.stderr
 
 
 def test_trio_check_requires_the_current_metrics_api() -> None:
     checker = _load(CHECKER, "trio_check_api4")
-    assert checker.REQUIRED_METRICS_API == TM.METRICS_API == 5
+    assert checker.REQUIRED_METRICS_API == TM.METRICS_API == 6

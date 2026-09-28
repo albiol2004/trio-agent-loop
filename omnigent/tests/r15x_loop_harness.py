@@ -167,8 +167,10 @@ def main() -> int:
         return core
 
     trioctl._load_trio_loop = load_core
+    # The r15.x root-turn lock is a root-bound mechanism: since r16a an
+    # open-loop mailbox runs root-free by default, so pin the root-bound path.
     argv = ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "5",
-            *cfg.get("args", [])]
+            *([] if cfg.get("root_free") else ["--root-bound"]), *cfg.get("args", [])]
     args = trioctl.parser().parse_args(argv)
     os.chdir(home)
     event("start")

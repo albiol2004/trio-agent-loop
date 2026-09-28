@@ -505,7 +505,14 @@ def test_n3_old_core_next_to_new_metrics_is_refused_for_repos(env, tmp_path):
     _tmp, _wt, trioctl, core = env
     layout = E._layout(tmp_path, "B")
     box = layout["box"]
-    assert core.METRICS_API == 5 and trioctl._core_metrics_api(core) == 5
+    # r16-rc: the core marker is 6 (root-free), in step with trio-metrics.py.
+    assert core.METRICS_API == 6 and trioctl._core_metrics_api(core) == 6
+    # An r15 core (marker 5) next to an API-6 trio-metrics.py: the lower of
+    # the two -- multi-repo yes, root-free open-loop no.
+    r15_core = type("R15Core", (), {"METRICS_API": 5, "_METRICS": core._METRICS})()
+    assert trioctl._core_metrics_api(r15_core) == 5
+    assert trioctl._old_core_repos_refusal(box, r15_core) is None
+    assert trioctl._core_metrics_api(r15_core) < trioctl.ROOT_FREE_METRICS_API
     assert trioctl._old_core_repos_refusal(box, core) is None
     # repro test_q2_oldcore.py::test_mixed_old_loop_new_metrics_accepts_repos:
     # a pre-r15 trio_loop.py (no core marker) next to a METRICS_API 5

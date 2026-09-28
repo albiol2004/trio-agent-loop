@@ -6,6 +6,10 @@ version = 1
 # in place, or run `trioctl omnigent sessions prune --mailbox <dir>` by
 # hand for the manual/bulk form that matches by title prefix instead.
 
+# r16 root-free open-loop: dependency setup run once per run in the loop's
+# Lead worktree (default: the repo's .cursor/worktrees.json setup-worktree).
+# worktree_setup = ["npm ci"]
+
 # Cursor exposes account-entitled model IDs through `cursor-agent models`.
 # Effort is encoded in Cursor's model ID, so no separate reasoning override is
 # sent to Omnigent for these roles.

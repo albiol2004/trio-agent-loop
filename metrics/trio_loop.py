@@ -35,16 +35,20 @@ from typing import Protocol
 # a caller must not silently run against. (r15 multi-repo is additive --
 # a `repo` key in slice-eval contexts, `pins` in integration contexts, the
 # `evaluated_repos` STATE.md key -- and is gated by METRICS_API 5, so
-# this stays 2.)
+# this stays 2. r16 root-free open-loop is additive too -- the optional
+# `land=` hook of `run_loop`/`run_open_loop`, the `landed`/`target_ref`/
+# `target_base` STATE.md keys and the resumable `needs_land` status
+# (exit 8) -- and is gated by METRICS_API 6.)
 LOOP_CORE_API = 2
 
 # The METRICS_API contract this core itself implements (eval-r15 N3). 5 =
-# r15 multi-repo: per-repo pins, retire checks and SHIP retirement. The
+# r15 multi-repo: per-repo pins, retire checks and SHIP retirement; 6 =
+# r16 root-free open-loop: the `land=` hook and `needs_land`. The
 # sibling trio-metrics.py carries its own METRICS_API; trioctl takes the
 # lower of the two, so a partial refresh (an older core next to a newer
 # trio-metrics.py) is never trusted with a `repos:` mailbox. A core without
 # this constant predates r15.
-METRICS_API = 5
+METRICS_API = 6
 
 def _load_metrics_module():
     path = Path(__file__).resolve().with_name("trio-metrics.py")
@@ -71,11 +75,19 @@ SCOPE_RE = re.compile(r"^scope=(design|local:[^\s]+)$", re.IGNORECASE)
 # evaluated_repos (r15) is the per-repo pin of a mailbox that declares
 # PLAN.md `repos:`: `<repo>@<sha>` items for every declared repo (home stays
 # in evaluated_sha); never written for a single-repo mailbox.
+# landed / target_ref / target_base (r16) belong to a root-free open-loop
+# run: the branch it lands onto, that branch's sha when the loop forked from
+# it, and the verified loop-branch commit that was landed; never written for
+# a lockstep or root-bound run.
 STATE_RE = re.compile(
     r"^\s*(?:-\s+)?(iteration|status|phase|evaluated_sha|"
-    r"evaluator_attempt|evaluated_repos)\s*:\s*(.*)$",
+    r"evaluator_attempt|evaluated_repos|landed|target_ref|target_base)"
+    r"\s*:\s*(.*)$",
     re.IGNORECASE,
 )
+#: Keys `_update_state` never adds with an empty value (they are absent
+#: from a mailbox that does not use them).
+_OPTIONAL_STATE_KEYS = ("evaluated_repos", "landed", "target_ref", "target_base")
 ROLE_LOG_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*"
     r"(lead|repair)\s*\|",
@@ -92,7 +104,13 @@ TERMINAL_CODES = {
     "needs_human": 5,
     "error": 3,
     "needs_retirement": 6,
+    # r16 root-free open-loop: SHIP verified on the loop branch but the land
+    # onto the target branch is blocked/conflicted/starved (resumable).
+    "needs_land": 8,
 }
+#: At most this many re-verifications (new integration-evals after the
+#: target moved and the merge touched this loop's paths) per land (r16).
+MAX_LAND_REVERIFY_ROUNDS = 2
 
 # A valid SHIP can land in VERDICT.md seconds before the Evaluator's
 # retirement commit (observed live: verdict 16:39:12Z, commit 16:39:27Z).
@@ -131,6 +149,9 @@ def _read_state(path: Path) -> dict[str, str]:
         "evaluated_sha": "",
         "evaluator_attempt": "",
         "evaluated_repos": "",
+        "landed": "",
+        "target_ref": "",
+        "target_base": "",
     }
     lines = path.read_text(
         encoding="utf-8", errors="replace"
@@ -162,9 +183,12 @@ def _update_state(path: Path, updates: dict[str, str]) -> None:
         "evaluated_sha",
         "evaluator_attempt",
         "evaluated_repos",
+        "landed",
+        "target_ref",
+        "target_base",
     ):
-        if key == "evaluated_repos" and not updates.get(key):
-            continue  # never add an empty per-repo pin (single-repo STATE.md)
+        if key in _OPTIONAL_STATE_KEYS and not updates.get(key):
+            continue  # never add an empty per-repo pin / r16 land key
         if key in updates and key not in found:
             result.append(f"{key}: {updates[key]}")
     path.write_text(
@@ -2019,8 +2043,12 @@ def run_loop(
     mode: str = "auto",
     slice_eval_concurrency: int = 1,
     slice_eval_drain_seconds: float | None = None,
+    land=None,
 ) -> int:
     """Dispatch to open-loop or lockstep (api: engine entry points).
+
+    ``land`` (r16 root-free open-loop only; ignored by lockstep) is passed
+    through to `run_open_loop`.
 
     ``slice_eval_concurrency`` (open-loop only; default 1 = the serial
     slice-eval loop) and ``slice_eval_drain_seconds`` (None = default
@@ -2051,6 +2079,8 @@ def run_loop(
         extra["slice_eval_concurrency"] = slice_eval_concurrency
     if slice_eval_drain_seconds is not None:
         extra["slice_eval_drain_seconds"] = slice_eval_drain_seconds
+    if land is not None:
+        extra["land"] = land
     return run_open_loop(
         mailbox,
         max_iterations,
@@ -2511,6 +2541,7 @@ def _lead_thread_body(
     repo: Path | None = None,
     gate_held_logged: set | None = None,
     gate_held_lock: threading.Lock | None = None,
+    empty_passes: dict | None = None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
@@ -2529,9 +2560,14 @@ def _lead_thread_body(
     treat `finished` as the authoritative "thread has ended" signal instead
     of racing `Thread.is_alive()`).
     """
+    # r16: consecutive no-op passes are counted across Lead-thread respawns
+    # (an integration ITERATE respawns the thread with a forced pass; a Lead
+    # that never changes anything must still end `stalled`, not re-dispatch
+    # the integration-eval forever).
+    counter = empty_passes if empty_passes is not None else {}
+    counter.setdefault("n", 0)
     try:
         first = True
-        empty_attempts = 0
         while True:
             if stop_event.is_set():
                 result_holder["outcome"] = "stopped"
@@ -2577,7 +2613,8 @@ def _lead_thread_body(
             if result != 0:
                 raise RuntimeError(f"lead runner failed with exit {result}")
             if _lead_pass_snapshot(mailbox, repo) == snapshot_before:
-                empty_attempts += 1
+                counter["n"] += 1
+                empty_attempts = counter["n"]
                 _append_log(
                     mailbox,
                     f"- iter {iteration} | loop | open-loop: lead pass made "
@@ -2593,7 +2630,7 @@ def _lead_thread_body(
                     result_holder["outcome"] = "stalled"
                     return
                 continue
-            empty_attempts = 0
+            counter["n"] = 0
             _update_state(
                 state_path, {"iteration": str(iteration), "status": "running"}
             )
@@ -2726,6 +2763,7 @@ def run_open_loop(
     poll_seconds: float = 30,
     slice_eval_concurrency: int = 1,
     slice_eval_drain_seconds: float | None = None,
+    land=None,
 ) -> int:
     """Run the open-loop Lead+Evaluator state machine against a QUEUE.md
     mailbox: one stdlib Lead thread plus an Evaluator poll loop on the
@@ -2746,6 +2784,18 @@ def run_open_loop(
     else min(eval runner role timeout, 120 s)). A slice-eval still running
     after that is abandoned: logged, and held (``held-<sid>.json``, hold
     ``abandoned_on_exit``) when its session id is known.
+
+    ``land`` (r16 root-free runs; None = unchanged behaviour) is called as
+    ``land(mailbox, iteration)`` after an integration SHIP is finalized on
+    the loop branch and must return a dict whose ``status`` is ``landed``
+    (the hook recorded STATE.md/LOG.md itself; exit 0), ``needs_land``
+    (``phase``/``detail``; STATE ``needs_land``, exit 8), ``reverify`` (the
+    target moved and the merge needs a new integration-eval; the pin is
+    cleared and one is dispatched, at most MAX_LAND_REVERIFY_ROUNDS times,
+    then ``needs_land``/``land-starved``) or ``error`` (exit 3). A run that
+    starts on a ``needs_land`` (or shipped but not ``landed``) mailbox
+    retries the land before anything else and dispatches no Lead (an
+    interrupted land -- ``shipped`` in phase ``landing`` -- likewise).
     """
     if not isinstance(slice_eval_concurrency, int) or slice_eval_concurrency < 1:
         raise ValueError(
@@ -2936,11 +2986,83 @@ def run_open_loop(
             write_sidecar("done", current_iteration(), False, False)
             return code
 
+        def stop_lead() -> None:
+            stop_event.set()
+            wake_event.set()
+            if lead_thread is not None:
+                lead_thread.join(timeout=5)
+
+        land_rounds = [0]
+
+        def land_after_ship(iteration_now: int) -> int | None:
+            """r16: land a finalized SHIP; an exit code, or None to re-verify."""
+            _update_state(state_path, {"phase": "landing"})
+            try:
+                result = land(mailbox, iteration_now)
+            except Exception as exc:  # noqa: BLE001 - a land failure is terminal, never `running`
+                result = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+            if not isinstance(result, dict):
+                result = {"status": "error", "detail": f"land hook returned {result!r}"}
+            status = str(result.get("status") or "error")
+            detail = " ".join(str(result.get("detail") or "").split())
+            if status == "landed":
+                land_rounds[0] = 0
+                return 0
+            if status == "reverify":
+                land_rounds[0] += 1
+                if land_rounds[0] > MAX_LAND_REVERIFY_ROUNDS:
+                    _update_state(
+                        state_path, {"status": "needs_land", "phase": "land-starved"}
+                    )
+                    _append_log(
+                        mailbox,
+                        f"- iter {iteration_now} | loop | needs_land (land-starved): "
+                        f"target kept moving after {MAX_LAND_REVERIFY_ROUNDS} "
+                        f"re-verification round(s): {detail}",
+                    )
+                    return 8
+                _update_state(
+                    state_path,
+                    {
+                        "status": "running",
+                        "phase": "land-reverify",
+                        "evaluator_attempt": "",
+                        "evaluated_sha": "",
+                        "evaluated_repos": "",
+                    },
+                )
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration_now} | loop | land: {detail}; re-verifying "
+                    f"with a new integration-eval (round {land_rounds[0]}/"
+                    f"{MAX_LAND_REVERIFY_ROUNDS})",
+                )
+                return None
+            if status == "needs_land":
+                phase = str(result.get("phase") or "land-blocked")
+                _update_state(state_path, {"status": "needs_land", "phase": phase})
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration_now} | loop | needs_land ({phase}): {detail}",
+                )
+                print(
+                    f"trio_loop: iteration {iteration_now} SHIP verified but not "
+                    f"landed ({phase}): {detail}",
+                    file=sys.stderr,
+                )
+                return 8
+            _update_state(state_path, {"status": "error", "phase": "land-error"})
+            _append_log(
+                mailbox, f"- iter {iteration_now} | loop | land failed: {detail}"
+            )
+            return 3
+
         wake_event = threading.Event()
         # r11g Q1: iterations whose `gate held` LOG line is written, shared
         # by the Lead thread and the done re-check below.
         gate_held_logged: set = set()
         gate_held_lock = threading.Lock()
+        lead_empty_passes: dict = {"n": 0}
 
         def spawn_lead(force_first_pass: bool = False) -> tuple[threading.Thread, dict]:
             holder: dict = {}
@@ -2959,18 +3081,38 @@ def run_open_loop(
                     repo,
                     gate_held_logged,
                     gate_held_lock,
+                    lead_empty_passes,
                 ),
                 daemon=True,
             )
             thread.start()
             return thread, holder
 
-        write_sidecar("lead", current_iteration(), True, True)
-        # First-ever Lead spawn of the run always runs a pass: on a fresh
-        # mailbox PLAN.md is empty/missing, so the "all slices retired"
-        # check has nothing to compare against yet, and the Lead is the
-        # one who writes the plan in the first place.
-        lead_thread, lead_result = spawn_lead(force_first_pass=True)
+        start_state = _read_state(state_path)
+        start_status = start_state["status"].strip().lower()
+        resume_land = land is not None and (
+            start_status == "needs_land"
+            or (
+                start_status == "shipped"
+                and start_state["phase"].strip() == "landing"
+                and not start_state["landed"].strip()
+            )
+        )
+        if resume_land:
+            # r16: a verified SHIP that has not landed yet -- land first;
+            # never re-run the Lead over a shipped loop branch.
+            write_sidecar("evaluator", current_iteration(), False, True)
+            code = land_after_ship(current_iteration())
+            if code is not None:
+                return finish(code)
+            lead_result: dict = {"finished": True, "outcome": "done"}
+        else:
+            write_sidecar("lead", current_iteration(), True, True)
+            # First-ever Lead spawn of the run always runs a pass: on a fresh
+            # mailbox PLAN.md is empty/missing, so the "all slices retired"
+            # check has nothing to compare against yet, and the Lead is the
+            # one who writes the plan in the first place.
+            lead_thread, lead_result = spawn_lead(force_first_pass=True)
 
         graded: set[tuple[str, str]] = set()
         # (slice_id, sha) pairs whose per-slice commit gate exited 1
@@ -3090,9 +3232,7 @@ def run_open_loop(
                     f"section (attempt {attempts})",
                 )
                 if attempts >= 3:
-                    stop_event.set()
-                    wake_event.set()
-                    lead_thread.join(timeout=5)
+                    stop_lead()
                     _update_state(state_path, {"status": "error"})
                     _append_log(
                         mailbox,
@@ -3135,9 +3275,7 @@ def run_open_loop(
                     continue
                 gate_blocked.discard(key)
                 if gate_code == 2:
-                    stop_event.set()
-                    wake_event.set()
-                    lead_thread.join(timeout=5)
+                    stop_lead()
                     _update_state(state_path, {"status": "error"})
                     _append_log(
                         mailbox,
@@ -3374,6 +3512,14 @@ def run_open_loop(
                         scope,
                         repo=repo,
                     )
+                    if land is not None and verdict == "SHIP" and code == 0:
+                        code = land_after_ship(iteration_now)
+                        if code is None:
+                            # r16: the target moved under a merge that needs
+                            # a fresh integration-eval of the loop branch.
+                            continue
+                    elif land is not None and verdict != "SHIP":
+                        land_rounds[0] = 0
                     if code is not None:
                         return finish(code)
                     # The graded pin/attempt belong to that verdict only;

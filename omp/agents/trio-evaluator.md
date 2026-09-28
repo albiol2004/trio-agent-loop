@@ -222,6 +222,15 @@ full Lead iteration:
    product edits) and record `commit: <repo>@<full sha>`, then make the
    home mailbox commit as usual; VERDICT.md lists every
    `commit: <repo>@<sha>`.
+9. **Root-free (trioctl `omnigent loop`, r16; the OPEN-LOOP CONTEXT
+   carries ROOT-FREE lines).** The integration evaluation grades in a
+   task-owned detached worktree at the pin (declared nested repos are
+   checked out at their pins inside it). The SHIP retirement commits are
+   made in the Lead worktree the ROOT-FREE lines name, with `git -C
+   <lead-wt> ...`: the mailbox commit there, and each declared repo's
+   empty commit in its aggregate. Never commit in the detached worktree,
+   never touch the repository root or the target branch — the driver
+   lands the loop branch after it accepts the SHIP.
 
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.

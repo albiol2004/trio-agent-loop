@@ -699,6 +699,45 @@ def _process_cmdline(pid: int) -> str:
     return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
 
 
+def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
+    """(root mailbox, directory to read) per discovered loop.
+
+    A root-free open-loop (r16) keeps its live mailbox in its Lead worktree
+    until it lands; the board reads that copy under the root mailbox's name.
+    """
+    live_fn = getattr(metrics, "live_mailbox", None)
+    pairs = []
+    for loop_dir in metrics.discover_loops(root):
+        live = None
+        if live_fn is not None:
+            try:
+                live = live_fn(loop_dir)
+            except Exception:  # noqa: BLE001 - the root copy still renders
+                live = None
+        pairs.append((loop_dir, live or loop_dir))
+    return pairs
+
+
+def _live_driver_summary(metrics, root_dir: Path) -> dict | None:
+    """The live-loop registry record of a root mailbox, trimmed for the board.
+
+    One record per running driver in every mode (r16-rc unified registry,
+    `trio-metrics.py:live_driver`); None when no driver runs the loop.
+    """
+    fn = getattr(metrics, "live_driver", None)
+    if fn is None:
+        return None
+    try:
+        entry = fn(root_dir)
+    except Exception:  # noqa: BLE001 - the card renders without it
+        return None
+    if not entry:
+        return None
+    keys = ("mode", "pid", "started_at", "live_mailbox", "lead_worktree",
+            "branch", "target_ref")
+    return {key: entry.get(key) for key in keys}
+
+
 def _read_driver_state(loop_dir: Path) -> dict | None:
     """Read the loop driver's private state file when it is valid JSON."""
     try:
@@ -2990,11 +3029,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_board(self, root: Path) -> None:
         metrics = self.server.metrics
-        loop_dirs = list(metrics.discover_loops(root))
+        pairs = _live_loop_dirs(metrics, root)
+        loop_dirs = [read for _root_dir, read in pairs]
         loops = []
-        for loop_dir in loop_dirs:
+        for root_dir, loop_dir in pairs:
             try:
-                loops.append(self._loop_card(loop_dir, metrics, root))
+                card = self._loop_card(loop_dir, metrics, root)
+                if loop_dir != root_dir:
+                    # r16 root-free: read the live copy, keep the root name.
+                    card["name"] = card["path"] = metrics.loop_name(root, root_dir)
+                    card["live_mailbox"] = str(loop_dir)
+                driver = _live_driver_summary(metrics, root_dir)
+                if driver is not None:
+                    card["live_driver"] = driver
+                loops.append(card)
             except Exception:
                 traceback.print_exc()
                 # Keep the board alive even if one loop's mailbox is broken.
@@ -3062,7 +3110,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         ):
             return None
         return next(
-            (p for p in metrics.discover_loops(root)
+            (read for p, read in _live_loop_dirs(metrics, root)
              if metrics.loop_name(root, p) == name),
             None,
         )
@@ -3086,6 +3134,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
         card = self._loop_card(loop_dir, self.server.metrics, root)
+        card["name"] = card["path"] = name  # r16: a live copy keeps the root name
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
         card["commits"] = _loop_commits(loop_dir, root)

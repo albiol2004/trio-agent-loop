@@ -320,13 +320,16 @@ loop's SHIP acceptance (`needs_retirement`, exit 6).
   never leave STATE `running`: `status: error`, `phase: driver-exception`,
   `reason: driver-exception`, one LOG line, sidecars not alive; sessions,
   fences, the root turn and the mailbox lock are released; the exception
-  still exits 1 as before. A held dispatch keeps its `needs_human` STATE.
+  still exits 1 as before (a root-free run exits 3 through the same
+  mechanism). A held dispatch keeps its `needs_human` STATE.
 - **Overlapping `writes:` across live loops are refused.** Each driver
-  registers in `<git common dir>/trio-worktrees/loops/<mailbox-slug>-<pid>.json`
-  (removed at exit; stale when the pid identity is dead). At loop start and
-  at every Lead/repair pass, this mailbox's PLAN.md `writes:` are compared
-  per aggregate repo with every other live loop's (prefix-covering either
-  way). Start: refused with exit 2, naming the other mailbox and the exact
+  writes one record `<git common dir>/trio-worktrees/loops/<mailbox-slug>.json`
+  (removed at exit; stale when the pid identity is dead; one schema for
+  root-bound, lockstep and root-free loops -- MAILBOX-SCHEMA "Live-loop
+  registry"). At loop start and at every Lead/repair pass, this mailbox's
+  PLAN.md `writes:` are compared per repository (every worktree of a repo
+  counts as that repo, so root-free loops are compared too) with every
+  other live loop's (prefix-covering either way). Start: refused with exit 2, naming the other mailbox and the exact
   overlapping paths (one LOG line, STATE untouched). Mid-run: the pass is
   not dispatched; STATE `needs_human` / `writes-overlap`, exit 5.
   `TRIO_ALLOW_OVERLAPPING_LOOPS=1` (or `--allow-overlapping-writes`)
