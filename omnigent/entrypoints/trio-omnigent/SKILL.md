@@ -328,18 +328,30 @@ The Lead commits only files it or its builders edited under declared
 Design and speed evidence:
 `docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
 
+Root-free (r16): an open-loop `loop` runs in the loop's own Lead worktree
+on branch `trio/<mailbox>` and lands onto the root's branch only after
+SHIP, so the root `loop/<x>` holds the pre-land copy while it runs. Watch
+an open-loop run with `trioctl omnigent status --mailbox loop/<x>` (or
+read STATE.md/LOG.md at the live mailbox path it prints), not the root
+mailbox. `--root-bound` keeps the pre-r16 behaviour. Guide:
+`docs/ROOT-FREE-OPEN-LOOP.md`.
+
 The command owns the mailbox lock and manages verdict parsing, repairs (max 2
 consecutive scoped repairs), resume state, and exit codes. `--wait-timeout`
 defaults to 3600 seconds. Session `wait` is not role completion: a pass
 finishes only after a `running`→`idle` edge held for
 `TRIO_OMNIGENT_IDLE_DWELL` (default 30s; skip with interval `0` in tests)
 and the mailbox artifact above exists, or `--wait-timeout` expiry.
-Distinct outcomes: exit 0 (SHIP), 2 (BLOCKED), 3 (bad verdict), 4
-(iteration cap), 5 (NEEDS_HUMAN or mailbox lock held). Env/flag
+Distinct outcomes: exit 0 (SHIP; root-free: verified and landed), 2
+(BLOCKED), 3 (bad verdict / error), 4 (iteration cap), 5 (NEEDS_HUMAN or
+mailbox lock held), 6 (needs_retirement), 7 (held dispatch), 8
+(needs_land: SHIP verified but not landed — surface STATE `phase:` and
+the LOG reason to the user; after the user fixes the cause, run
+`trioctl omnigent land --mailbox loop/<x>`). Env/flag
 precedence: `--host-id` over `TRIO_OMNIGENT_HOST_ID`, `--runner-id`
 over `TRIO_OMNIGENT_RUNNER_ID`.
 
-`trioctl omnigent loop` writes `loop/.driver.json` with the PID, iteration
+`trioctl omnigent loop` writes `.driver.json` in the (live) mailbox with the PID, iteration
 count, phase (`idle` / `lead-done` / `eval-done`), and Lead/Evaluator session
 IDs. This is the authoritative resume cursor; killing the process and re-running
 continues where it left off.

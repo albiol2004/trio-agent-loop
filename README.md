@@ -121,6 +121,14 @@ after a `running` to `idle` edge (held briefly so the post-bind idle
 blip is ignored) or a completed assistant message. A new turn item or
 an idle flicker after runner bind is not enough.
 
+Root-free (r16): on an open-loop mailbox (`QUEUE.md` present)
+`trioctl omnigent loop` runs every role in the loop's own Lead worktree on
+branch `trio/<mailbox>` and lands the verified result onto the root's
+branch only after SHIP (exit 8 `needs_land` when the land needs you;
+retry with `trioctl omnigent land --mailbox loop/<x>`). Watch it with
+`trioctl omnigent status --mailbox loop/<x>`; `--root-bound` restores the
+pre-r16 behaviour. See `docs/ROOT-FREE-OPEN-LOOP.md`.
+
 The dashboard board also provides Start and Stop controls for portable and
 Omnigent loop drivers. It exposes the same controls through
 `/api/loop/start`, `/api/loop/stop`, and `/api/loop/status`.
@@ -338,7 +346,8 @@ it is product code the target project owns, not part of the Omnigent bundle).
 Wait semantics: session `wait` defaults to 3600 seconds and completes
 on a `running` to `idle` edge (dwell ignores bind flicker), a completed assistant message,
 or timeout; exit 0 (SHIP), 2 (BLOCKED), 3 (bad verdict), 4 (iteration cap), 5
-(NEEDS_HUMAN or locked). `trioctl omnigent session create|wait|read`
+(NEEDS_HUMAN or locked), 6 (needs_retirement), 7 (held dispatch), 8
+(needs_land, root-free open-loop). `trioctl omnigent session create|wait|read`
 uses the local broker at
 `http://127.0.0.1:6767` by default. Auth prefers `OMNIGENT_TOKEN` or
 `OMNIGENT_REMOTE_AUTH_TOKEN`, then the server-keyed

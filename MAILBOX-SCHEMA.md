@@ -48,7 +48,10 @@ In addition to `schema: 1`, a v1 STATE.md must define these top-level fields
 
 - `iteration` — current iteration number (0 at initialization).
 - `max_iterations` — hard budget cap for the loop.
-- `status` — current loop status (e.g. `ready`, `running`).
+- `status` — current loop status (e.g. `ready`, `running`; driver-set
+  terminal values include `shipped`, `blocked`, `error`, `needs_human`,
+  `needs_retirement` and, for root-free open-loop runs, `needs_land` —
+  see "Root-free open-loop (r16)").
 - `mission` — the first sentence of GOAL.md's mission, verbatim; the
   orchestrator halts if it ever stops matching GOAL.md.
 
@@ -858,6 +861,54 @@ per-repo `full_check:` command that leaves its repo is refused too. A home
 slice that writes into an undeclared nested clone still gets the exact
 single-repo line above. `repos: []` equals no block.
 
+### Root-free open-loop (r16)
+
+`trioctl omnigent loop` on an open-loop mailbox (QUEUE.md present) runs
+**root-free** by default (`--root-bound` restores pre-r16 behaviour;
+lockstep mailboxes stay root-bound). Operator guide:
+`docs/ROOT-FREE-OPEN-LOOP.md`.
+
+- **Live mailbox.** The driver creates (or re-attaches) the loop's Lead
+  worktree `<worktree_root>/lead-<slug>` on branch `trio/<slug>`, forked
+  from the target branch tip (`slug` = mailbox path relative to the repo
+  root, `/` → `--`, other chars outside `[A-Za-z0-9_-]` → `-`). The root
+  mailbox's tracked and untracked non-ignored files are committed there
+  as `loop: seed <mailbox>`; for the whole run the live mailbox is
+  `<lead-wt>/<mailbox>`, and the root copy is not touched until land.
+- **Files.** Ledger record `<git common dir>/trio-worktrees/lead-<slug>.json`
+  (`kind: "lead"`, state `creating|active|landed|retained|removed`; lets
+  `--mailbox loop/<x>` from the root resolve the live mailbox); registry
+  entry `<common>/trio-worktrees/loops/<slug>.json` while a driver runs
+  (pid identity, live mailbox, Lead worktree, branch, target, per-repo
+  `writes:`); `<live mailbox>/.sessions/aggregates.json` maps each
+  declared `repos:` entry to its per-run aggregate on `trio/<slug>`.
+  Integration fences live under `<common>/trio-worktrees/fences/<branch-slug>/`.
+- **STATE.md keys** (driver-owned, root-free runs only): `target_ref:`
+  (branch it lands onto), `target_base:` (target sha at fork), `landed:`
+  (verified loop-branch sha that landed). Status `needs_land`. Phases:
+  `landing`, `landed`, `land-blocked`, `land-conflict`, `land-starved`,
+  `land-reverify`, `land-error`, `worktree-setup`, `driver-exception`.
+- **Land (SHIP only).** Under the repo-wide land lock, per aggregate
+  (declared repos first, home last): a moved target is *merged* into the
+  loop branch (never rebased); a conflict aborts → `needs_land` /
+  `land-conflict`. A clean merge touching none of PLAN's `writes:`/`reads:`
+  runs `full_check:`; otherwise (or on failure) one new integration-eval
+  of the merged branch (`land-reverify`), at most 2 rounds, then
+  `land-starved`. The home land commits the live mailbox as `loop: land
+  <mailbox> (iteration N)` (`status: shipped`, `phase: landed`) and
+  advances the target (`git merge --ff-only` where it is checked out, else
+  a compare-and-swap `update-ref`); a refused fast-forward →
+  `land-blocked`. Then runtime files are copied to the root mailbox, the
+  worktrees removed (retained with a reason when unsafe) and `trio/<slug>`
+  deleted unless `--keep-branch`.
+- **Exit codes** (`trioctl omnigent loop`): 0 shipped (verified AND
+  landed), 2 blocked, 3 error, 4 iteration cap, 5 needs_human / mailbox
+  owned by a live driver, 6 needs_retirement, 7 held dispatch, **8
+  needs_land** (resumable with `trioctl omnigent land --mailbox <x>`).
+- **Compat**: root-free needs METRICS_API 6 in the repository's committed
+  `metrics/` at the target tip; an older set is refused (exit 3, nothing
+  changed). Lockstep and `--root-bound` keep working with API 4/5.
+
 ## Session sidecar
 
 `loop/.session.json` is the harness-owned session sidecar (see
@@ -922,6 +973,16 @@ absence is never a violation.
 
 ## Changelog
 
+- **METRICS_API 6** (r16a root-free open-loop): the open-loop driver
+  runs in a per-loop Lead worktree on `trio/<slug>` and lands it onto the
+  target after the integration SHIP ("Root-free open-loop (r16)"). New
+  driver-owned STATE.md keys `target_ref`/`target_base`/`landed`, status
+  `needs_land` (loop exit 8), phases `landing`, `landed`, `land-*`,
+  `worktree-setup`, `driver-exception`; the core gains an additive
+  `land=` hook (`LOOP_CORE_API` stays 2). `trioctl` (`REQUIRED_METRICS_API
+  = 6`, `COMPATIBLE_METRICS_APIS = (4, 5, 6)`) refuses root-free open-loop
+  on an older committed set but still drives it for lockstep and
+  `--root-bound`; `trio-check.py` requires 6.
 - **METRICS_API 5** (r15 multi-repo slices): `trio-metrics.py` gains
   `parse_repos_block`/`read_repos`/`mailbox_repo_root`, `slice_repo_name`,
   `parse_repo_pins` and `parse_full_check`; `retired:` entries may carry
