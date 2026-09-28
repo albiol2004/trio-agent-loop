@@ -6,7 +6,7 @@
   if (!meta) return;
   const holder = document.createElement("label");
   holder.className = "workspace-nav";
-  holder.style.cssText = "display:inline-flex;align-items:center;gap:6px;color:var(--muted);font:11px var(--mono);";
+  holder.style.cssText = "display:inline-flex;align-items:center;gap:6px;color:var(--muted);font: 12px var(--mono);";
   holder.textContent = "Workspace";
   const select = document.createElement("select");
   select.className = "field-control";
@@ -23,7 +23,8 @@
     workspaces.forEach((workspace) => {
       const option = document.createElement("option");
       option.value = workspace.path;
-      option.textContent = (workspace.has_loop ? "● " : "○ ") + (workspace.id || workspace.path);
+      const label = String(workspace.path || workspace.id || "").split("/").filter(Boolean).pop();
+      option.textContent = (label || workspace.path) + (workspace.has_loop ? " (loop/)" : "");
       option.title = workspace.path;
       select.append(option);
     });

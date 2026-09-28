@@ -2,15 +2,24 @@
 
 /* Trio Loop Dashboard — frontend.
  * No build step, no external dependencies. Talks to the backend at
- * /api/board, /api/loop, /api/transcript (SSE), and loop controls. */
+ * /api/overview (every workspace's board), /api/loop, /api/transcript (SSE),
+ * and loop controls. Loops are keyed by workspace root + mailbox name. */
 
 const state = {
   boardTimer: null,
   loops: [],
   inbox: [],
+  workspaces: [],
+  scanned: 0,
+  byKey: new Map(),
   showReadInbox: false,
   updatedAt: null,
+  lastOk: null,
+  loaded: false,
   tab: "all",
+  workspace: "",
+  query: "",
+  sort: { key: "activity", dir: "desc" },
 
   /* drawer */
   activeLoop: null,
@@ -31,20 +40,16 @@ const state = {
   rafPending: false,
 };
 
-/* Loop name to auto-open via `#loop=<name>` once board data confirms it
- * exists (set in init(), consumed once by refreshBoard()). */
+/* Loop to auto-open via `#loop=<name>` or `#root=<path>&loop=<name>` once
+ * board data confirms it exists (set in init(), consumed by refreshBoard()). */
 let pendingLoopHash = null;
 
+/* Workspace of the loop open in the drawer; detail requests carry it. */
 let currentRoot = "";
 function withRoot(url) {
   if (!currentRoot) return url;
   return url + (url.includes("?") ? "&" : "?") + "root=" + encodeURIComponent(currentRoot);
 }
-window.addEventListener("trio:workspace", (event) => {
-  currentRoot = event.detail && event.detail.path ? event.detail.path : "";
-  clearTimeout(state.boardTimer);
-  refreshBoard();
-});
 
 const BOARD_POLL_MS = 5000;
 const TABS = ["running", "attention", "all", "archived"];
@@ -166,76 +171,328 @@ function latestVerdict(loop) {
   return seq.length ? String(seq[seq.length - 1]).toUpperCase() : null;
 }
 
-function loopTagElements(loop) {
-  const tags = [
-    span("status-label status-status", statusWord(loop)),
-  ];
-  const verdict = latestVerdict(loop);
-  if (verdict) {
-    // Map SHIP onto the existing .status-shipped color, not a missing .status-ship.
-    const tone = {
-      ship: "shipped",
-      iterate: "iterate",
-      blocked: "blocked",
-      needs_human: "needs_human",
-    }[normVerdict(verdict)];
-    tags.push(
-      span(
-        "status-label status-verdict" + (tone ? " status-" + tone : ""),
-        verdict
-      )
-    );
-  }
-  if (Boolean(loop.running)) {
-    const running = span("status-label status-running", "RUNNING");
-    running.title = (loop.running_sources || []).join(", ");
-    tags.push(running);
-  }
-  if (isArchived(loop)) {
-    tags.push(span("status-label status-archived", "ARCHIVED"));
-  }
-  return tags;
-}
-
-function appendLoopTags(container, loop) {
-  container.textContent = "";
-  for (const tag of loopTagElements(loop)) container.appendChild(tag);
-}
-
-/* Segmented verdict bar: one hairline segment per verdict. */
-function segbarEl(seq, large) {
-  const bar = document.createElement("div");
-  bar.className = "segbar" + (large ? " segbar-large" : "");
-  if (!seq.length) {
-    const empty = document.createElement("div");
-    empty.className = "segbar-empty";
-    bar.appendChild(empty);
-    return bar;
-  }
-  for (const v of seq) {
-    bar.appendChild(span("seg seg-" + v, ""));
-  }
-  return bar;
-}
-
-/* Mono sequence legend: S→I→S with per-verdict coloring. */
-function seqLegendEl(seq) {
-  const legend = document.createElement("span");
-  legend.className = "seg-seq";
-  const letter = { ship: "S", iterate: "I", blocked: "B" };
-  seq.forEach((v, i) => {
-    if (i > 0) legend.appendChild(document.createTextNode("→"));
-    legend.appendChild(span("seq-" + v, letter[v]));
-  });
-  return legend;
-}
-
 /* ------------------------------ board ------------------------------ */
+
+/* Attention kinds that ask for a decision now; everything else on a
+ * finished loop is a review note (still listed, just not at the top). */
+const NEEDS_KINDS = new Set([
+  "needs_human", "blocked", "interrupted", "orphaned", "queue_fault",
+]);
+const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
+const STORE_KEY = "trio.board.v2";
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const STALE_AFTER_MS = 30 * 1000;
+
+function loopKey(root, name) {
+  return root + "::" + name;
+}
+
+function isNeedsItem(item, loop) {
+  if (NEEDS_KINDS.has(item.kind) || item.severity === "high") return true;
+  return Boolean(loop && loop.running);
+}
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (TABS.includes(saved.tab)) state.tab = saved.tab;
+    if (typeof saved.workspace === "string") state.workspace = saved.workspace;
+    if (saved.sort && typeof saved.sort.key === "string") state.sort = saved.sort;
+  } catch (err) {
+    /* private window or blocked storage: defaults are fine */
+  }
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      tab: state.tab, workspace: state.workspace, sort: state.sort,
+    }));
+  } catch (err) {
+    /* ignore */
+  }
+}
+
+/* GOAL.md heading, else the mission's first clause, else the mailbox name. */
+function loopTitle(loop) {
+  if (loop.title) return loop.title;
+  const mission = String(loop.mission || "").split(/(?<=[.;:])\s/)[0].trim();
+  return mission ? oneLine(mission, 90) : loop.name;
+}
+
+/* One state word per loop, from facts only: live evidence first, then the
+ * latest verdict, then the STATE.md status word. */
+function stateBadge(loop) {
+  const badge = document.createElement("span");
+  let tone = "neutral";
+  let text = statusWord(loop);
+  const verdict = normVerdict(latestVerdict(loop));
+  if (loop.running) {
+    tone = "live";
+    text = "Running";
+  } else if (verdict === "ship") {
+    tone = "positive";
+    text = "Shipped";
+  } else if (verdict === "needs_human") {
+    tone = "warning";
+    text = "Needs human";
+  } else if (verdict === "blocked") {
+    tone = "negative";
+    text = "Blocked";
+  } else if (verdict === "iterate") {
+    text = "Iterating";
+  }
+  badge.className = "badge badge-" + tone;
+  badge.appendChild(span("badge-icon", { live: "●", positive: "✓", warning: "!", negative: "✕", neutral: "○" }[tone]));
+  badge.appendChild(document.createTextNode(text));
+  const facts = ["STATE.md: " + statusWord(loop)];
+  if (latestVerdict(loop)) facts.push("verdict: " + latestVerdict(loop));
+  if (loop.running) facts.push("live via " + (loop.running_sources || []).join(", "));
+  badge.title = facts.join(" · ");
+  return badge;
+}
+
+function iterationText(loop) {
+  if (loop.iteration == null) return "—";
+  return loop.max_iterations != null
+    ? loop.iteration + " of " + loop.max_iterations
+    : String(loop.iteration);
+}
+
+function phaseText(loop) {
+  const phase = String(loop.driver_phase || "").trim();
+  const sub = loop.running_substate;
+  const parts = [];
+  if (phase && phase.toLowerCase() !== "idle") parts.push(phase.replace(/[-_]/g, " "));
+  if (sub) parts.push(sub === "both" ? "lead and evaluator active" : sub + " active");
+  return parts.join(" · ");
+}
+
+function historyEl(loop) {
+  const seq = verdictSeq(loop);
+  const wrap = document.createElement("span");
+  wrap.className = "hist";
+  if (!seq.length) {
+    wrap.appendChild(span("hist-none", "—"));
+    wrap.title = "No evaluator verdicts parsed from LOG.md";
+    return wrap;
+  }
+  const letter = { ship: "S", iterate: "I", blocked: "B", needs_human: "H" };
+  const shown = seq.slice(-12);
+  for (const v of shown) wrap.appendChild(span("hist-cell hist-" + v, letter[v] || "?"));
+  wrap.title = "Verdicts, oldest to newest: " + seq.map((v) => letter[v]).join(" ");
+  wrap.setAttribute("aria-label", wrap.title);
+  return wrap;
+}
+
+function ageMs(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isNaN(t) ? null : Date.now() - t;
+}
+
+/* ---------------------------- data ---------------------------- */
+
+function ingestOverview(data) {
+  const loops = [];
+  const inbox = [];
+  const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+  for (const ws of workspaces) {
+    for (const loop of ws.loops || []) {
+      loop.root = ws.root;
+      loop.workspace = ws.name;
+      loop.key = loopKey(ws.root, loop.name);
+      loops.push(loop);
+    }
+    for (const item of ws.inbox || []) {
+      item.root = ws.root;
+      item.workspace = ws.name;
+      item.key = loopKey(ws.root, item.loop);
+      inbox.push(item);
+    }
+  }
+  state.workspaces = workspaces;
+  state.scanned = data.scanned || workspaces.length;
+  state.loops = loops;
+  state.inbox = inbox;
+  state.byKey = new Map(loops.map((loop) => [loop.key, loop]));
+  state.updatedAt = data.updated_at || null;
+}
+
+async function refreshBoard() {
+  clearTimeout(state.boardTimer);
+  try {
+    const res = await fetch("/api/overview", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    ingestOverview(data);
+    state.lastOk = Date.now();
+    state.loaded = true;
+    hideBoardError();
+    renderAll();
+    if (pendingLoopHash) {
+      const target = resolveHashLoop(pendingLoopHash);
+      if (target) {
+        pendingLoopHash = null;
+        openDrawer(target.key);
+      }
+    }
+    if (state.activeLoop) refreshDetail({ quiet: true });
+  } catch (err) {
+    showBoardError(
+      state.loaded
+        ? "Lost contact with the dashboard server (" + err.message + "). Showing the last data received; retrying every 5 seconds."
+        : "Cannot reach the dashboard server (" + err.message + "). Retrying every 5 seconds."
+    );
+    renderLive();
+  }
+  state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
+}
+
+function resolveHashLoop(hash) {
+  if (hash.root) return state.byKey.get(loopKey(hash.root, hash.name)) || null;
+  return state.loops.find((loop) => loop.name === hash.name) || null;
+}
+
+function showBoardError(msg) {
+  el("board-error").hidden = false;
+  el("board-error-text").textContent = msg;
+}
+
+function hideBoardError() {
+  el("board-error").hidden = true;
+}
+
+/* ---------------------------- render ---------------------------- */
+
+function renderAll() {
+  const groups = attentionGroups();
+  renderLive();
+  renderSummary(groups);
+  renderNeeds(groups);
+  renderRunning();
+  renderWorkspaceFilter();
+  renderTabs();
+  renderBoard();
+  renderNotes(groups);
+  renderDrawerInbox();
+}
+
+function renderLive() {
+  const live = el("live");
+  const text = el("live-text");
+  const buildAge = ageMs(state.updatedAt);
+  const sinceOk = state.lastOk ? Date.now() - state.lastOk : null;
+  let cls = "live-ok";
+  let label;
+  if (!state.lastOk) {
+    cls = el("board-error").hidden ? "live-connecting" : "live-offline";
+    label = el("board-error").hidden ? "Connecting" : "Offline";
+  } else if (!el("board-error").hidden) {
+    cls = "live-offline";
+    label = "Offline · data from " + fmtClock(state.updatedAt);
+  } else if ((buildAge != null && buildAge > STALE_AFTER_MS) || sinceOk > STALE_AFTER_MS) {
+    cls = "live-stale";
+    label = "Stale · data from " + fmtClock(state.updatedAt);
+  } else {
+    label = "Live · " + fmtClock(state.updatedAt);
+  }
+  live.className = "live " + cls;
+  text.textContent = label;
+  live.title = "Polls every " + BOARD_POLL_MS / 1000 + " s. Data built at " +
+    (state.updatedAt ? new Date(state.updatedAt).toLocaleString() : "—");
+}
+
+/* Unread attention grouped per loop, split into "needs you" and notes. */
+function attentionGroups() {
+  const needs = new Map();
+  const notes = new Map();
+  let readCount = 0;
+  for (const item of state.inbox) {
+    if (item.read) {
+      readCount += 1;
+      if (!state.showReadInbox) continue;
+    }
+    const loop = state.byKey.get(item.key);
+    const target = isNeedsItem(item, loop) ? needs : notes;
+    if (!target.has(item.key)) target.set(item.key, { key: item.key, loop, items: [] });
+    target.get(item.key).items.push(item);
+  }
+  const order = (g) => Math.min(...g.items.map((i) => SEVERITY_RANK[i.severity] ?? 3));
+  const sortGroups = (map) => Array.from(map.values()).sort((a, b) =>
+    order(a) - order(b) ||
+    String(b.loop?.last_activity || "").localeCompare(String(a.loop?.last_activity || "")));
+  for (const g of [...needs.values(), ...notes.values()]) {
+    g.items.sort((a, b) => (SEVERITY_RANK[a.severity] ?? 3) - (SEVERITY_RANK[b.severity] ?? 3));
+  }
+  return { needs: sortGroups(needs), notes: sortGroups(notes), readCount };
+}
+
+function plural(n, word, many) {
+  return n + " " + (n === 1 ? word : many || word + "s");
+}
+
+function renderSummary(groups) {
+  const loops = state.loops;
+  const running = loops.filter((l) => l.running);
+  const needsLoops = groups.needs.filter((g) => g.items.some((i) => !i.read));
+  const shipped7 = loops.filter((l) => normVerdict(latestVerdict(l)) === "ship" &&
+    (ageMs(l.verdict_mtime) ?? Infinity) <= WEEK_MS);
+  const wsCount = state.workspaces.length;
+
+  let verdict;
+  if (!loops.length) {
+    verdict = "No loop mailboxes found yet.";
+  } else if (needsLoops.length) {
+    verdict = plural(needsLoops.length, "loop") + (needsLoops.length === 1 ? " needs" : " need") + " you" +
+      (running.length ? "; " + plural(running.length, "loop") + " running." : "; nothing is running.");
+  } else if (running.length) {
+    verdict = "All clear: " + plural(running.length, "loop") + " running, nothing needs you.";
+  } else {
+    verdict = "All clear. Nothing is running and nothing needs you.";
+  }
+  el("verdict").textContent = verdict;
+  const latest = loops.slice().sort((a, b) =>
+    String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
+  el("verdict-sub").textContent = latest
+    ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + "."
+    : "Start a loop with /trio-init in a project; it appears here on the next poll.";
+
+  const partial = state.workspaces.filter((w) => w.error);
+  el("board-partial").hidden = partial.length === 0;
+  el("board-partial").textContent = partial.length
+    ? "Could not read " + partial.map((w) => w.name).join(", ") + ". Other workspaces are shown."
+    : "";
+
+  const kpis = el("kpis");
+  kpis.textContent = "";
+  const unread = groups.needs.reduce((n, g) => n + g.items.filter((i) => !i.read).length, 0);
+  const tile = (label, value, context, tone, target) => {
+    const node = document.createElement(target ? "a" : "div");
+    node.className = "kpi" + (tone ? " kpi-" + tone : "");
+    if (target) node.href = target;
+    node.appendChild(span("eyebrow", label));
+    node.appendChild(span("kpi-value", String(value)));
+    node.appendChild(span("kpi-context", context));
+    kpis.appendChild(node);
+  };
+  tile("Needs you", needsLoops.length,
+    needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
+    needsLoops.length ? "warning" : "", "#needs");
+  tile("Running now", running.length,
+    running.length ? running.map((l) => phaseText(l) || "live").slice(0, 2).join(", ") : "No live driver, process or session",
+    running.length ? "live" : "", "#running");
+  tile("Shipped, last 7 days", shipped7.length,
+    plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null);
+  tile("Loops tracked", loops.length,
+    "across " + plural(wsCount, "workspace") + " (" + state.scanned + " scanned)", "", "#loops");
+}
 
 function inboxMarkButton(item) {
   const mark = document.createElement("button");
   mark.type = "button";
-  mark.className = "inbox-mark";
+  mark.className = "btn btn-ghost btn-small";
   mark.textContent = item.read ? "Mark unread" : "Mark read";
   mark.setAttribute(
     "aria-label",
@@ -243,171 +500,209 @@ function inboxMarkButton(item) {
   );
   mark.addEventListener("click", (event) => {
     event.stopPropagation();
-    setInboxRead(item, !item.read);
+    setInboxRead([item], !item.read);
   });
   return mark;
 }
 
-function inboxRow(item, opensDrawer) {
-  const row = document.createElement("div");
-  row.className = "inbox-item inbox-" + cssClass(item.severity || "low");
-  if (item.read) row.classList.add("is-read");
-  row.setAttribute("role", "button");
-  row.tabIndex = 0;
+function severityBadge(item) {
+  const sev = item.severity || "low";
+  const label = { high: "Action", medium: "Check", low: "Note" }[sev] || sev;
+  const tone = { high: "negative", medium: "warning", low: "neutral" }[sev] || "neutral";
+  const badge = span("badge badge-" + tone, "");
+  badge.appendChild(span("badge-icon", { high: "!", medium: "▲", low: "•" }[sev] || "•"));
+  badge.appendChild(document.createTextNode(label));
+  return badge;
+}
 
-  row.appendChild(span("inbox-sev", (item.severity || "").toUpperCase()));
-  const main = document.createElement("span");
-  main.className = "inbox-main";
-  const head = document.createElement("span");
-  head.className = "inbox-headline";
-  head.appendChild(span("inbox-loop", item.loop || "?"));
-  head.appendChild(document.createTextNode(item.headline || ""));
-  main.appendChild(head);
-  if (item.detail) {
-    const det = span("inbox-detail", item.detail);
-    det.title = item.detail;
-    main.appendChild(det);
+/* One row per loop: the most severe item leads, the rest are counted. */
+function attentionRow(group) {
+  const lead = group.items[0];
+  const loop = group.loop;
+  const row = document.createElement("div");
+  row.className = "attn-row";
+  if (group.items.every((i) => i.read)) row.classList.add("is-read");
+  row.dataset.key = group.key;
+
+  row.appendChild(severityBadge(lead));
+
+  const main = document.createElement("div");
+  main.className = "attn-main";
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "attn-open";
+  open.textContent = loop ? loopTitle(loop) : lead.loop;
+  open.setAttribute("aria-label", "Open " + (loop ? loopTitle(loop) : lead.loop) + ": " + lead.headline);
+  open.addEventListener("click", () => openDrawer(group.key));
+  main.appendChild(open);
+  main.appendChild(span("attn-where mono", lead.workspace + " / " + lead.loop));
+  const reason = document.createElement("p");
+  reason.className = "attn-reason";
+  reason.textContent = lead.headline || "";
+  if (group.items.length > 1) {
+    reason.appendChild(span("attn-more", " + " + plural(group.items.length - 1, "more item")));
+  }
+  main.appendChild(reason);
+  if (lead.detail) {
+    const detail = span("attn-detail", oneLine(lead.detail, 220));
+    detail.title = lead.detail;
+    main.appendChild(detail);
   }
   row.appendChild(main);
-  row.appendChild(inboxMarkButton(item));
 
-  if (opensDrawer) {
-    row.addEventListener("click", () => openDrawer(item.loop));
-    row.addEventListener("keydown", (event) => {
-      if (event.target !== row) return;
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      openDrawer(item.loop);
-    });
-  }
+  const side = document.createElement("div");
+  side.className = "attn-side";
+  side.appendChild(span("caption", loop && loop.last_activity ? relTime(loop.last_activity) : ""));
+  const mark = document.createElement("button");
+  mark.type = "button";
+  mark.className = "btn btn-ghost btn-small";
+  const allRead = group.items.every((i) => i.read);
+  mark.textContent = allRead ? "Mark unread" : (group.items.length > 1 ? "Mark all read" : "Mark read");
+  mark.setAttribute("aria-label", mark.textContent + ": " + (loop ? loopTitle(loop) : lead.loop));
+  mark.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setInboxRead(group.items, !allRead);
+  });
+  side.appendChild(mark);
+  row.appendChild(side);
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    openDrawer(group.key);
+  });
   return row;
 }
 
-function renderDrawerInbox() {
-  const section = el("drawer-inbox-section");
-  const list = el("drawer-inbox-list");
-  if (!section || !list) return;
-  list.textContent = "";
-  const items = state.inbox.filter((item) => item.loop === state.activeLoop);
-  section.hidden = items.length === 0;
-  for (const item of items) list.appendChild(inboxRow(item, false));
+function emptyState(icon, text) {
+  const node = document.createElement("div");
+  node.className = "empty";
+  node.appendChild(span("empty-icon", icon));
+  node.appendChild(span("", text));
+  return node;
 }
 
-function renderInbox(inbox) {
-  const section = el("inbox");
-  const list = el("inbox-list");
-  const items = Array.isArray(inbox) ? inbox : [];
-  const readCount = items.filter((item) => item.read).length;
-  const unreadCount = items.length - readCount;
+function renderNeeds(groups) {
+  const list = el("needs-list");
   const toggle = el("inbox-toggle");
-
-  /* Keep the badge as unread work even while read history is revealed. */
-  el("inbox-count").textContent = String(unreadCount);
-  toggle.hidden = readCount === 0;
-  toggle.textContent = (state.showReadInbox ? "hide read (" : "show read (") +
-    readCount + ")";
+  const unreadGroups = groups.needs.filter((g) => g.items.some((i) => !i.read));
+  el("needs-count").textContent = unreadGroups.length ? String(unreadGroups.length) : "";
+  toggle.hidden = groups.readCount === 0;
+  toggle.textContent = (state.showReadInbox ? "Hide read (" : "Show read (") + groups.readCount + ")";
   toggle.setAttribute("aria-expanded", String(state.showReadInbox));
-  section.hidden = items.length === 0;
   list.textContent = "";
-
-  const visible = state.showReadInbox
-    ? items
-    : items.filter((item) => !item.read);
-  for (const item of visible) list.appendChild(inboxRow(item, true));
-  renderDrawerInbox();
-}
-
-async function setInboxRead(item, read) {
-  try {
-    const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ids: [item.id], root: currentRoot}),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
-    await refreshBoard();
-  } catch (err) {
-    showBoardError("Inbox update failed: " + err.message);
+  if (!groups.needs.length) {
+    list.appendChild(emptyState("✓", "Nothing needs you. Loops that block, ask for human verification or stop mid-loop appear here."));
+    return;
   }
+  for (const group of groups.needs) list.appendChild(attentionRow(group));
 }
 
-async function refreshBoard() {
-  try {
-    const res = await fetch(withRoot("/api/board"), { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    state.loops = Array.isArray(data.loops) ? data.loops : [];
-    state.inbox = Array.isArray(data.inbox) ? data.inbox : [];
-    renderInbox(state.inbox);
-    state.updatedAt = data.updated_at || null;
-    setBoardStatus("live", "live");
-    hideBoardError();
-    renderTabs();
-    renderBoard();
-    if (pendingLoopHash && state.loops.some((l) => l.name === pendingLoopHash)) {
-      const target = pendingLoopHash;
-      pendingLoopHash = null;
-      openDrawer(target);
+function renderNotes(groups) {
+  const details = el("notes");
+  details.hidden = groups.notes.length === 0;
+  const count = groups.notes.reduce((n, g) => n + g.items.length, 0);
+  el("notes-count").textContent = String(count);
+  el("notes-sub").textContent = "Drift, overlap and repair notes on " + plural(groups.notes.length, "loop") + " that are not running";
+  const list = el("notes-list");
+  list.textContent = "";
+  for (const group of groups.notes) list.appendChild(attentionRow(group));
+}
+
+function renderRunning() {
+  const list = el("running-list");
+  const running = state.loops.filter((l) => l.running)
+    .sort((a, b) => String(b.last_activity || "").localeCompare(String(a.last_activity || "")));
+  el("running-count").textContent = running.length ? String(running.length) : "";
+  list.textContent = "";
+  if (!running.length) {
+    list.appendChild(emptyState("○", "No loop is running. A loop shows here while its driver, lock, process or session is live."));
+    return;
+  }
+  for (const loop of running) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "run-card";
+    card.dataset.key = loop.key;
+    card.addEventListener("click", () => openDrawer(loop.key));
+    const top = document.createElement("span");
+    top.className = "run-top";
+    top.appendChild(stateBadge(loop));
+    top.appendChild(span("caption", "last write " + relTime(loop.last_activity)));
+    card.appendChild(top);
+    card.appendChild(span("run-title", loopTitle(loop)));
+    card.appendChild(span("attn-where mono", loop.workspace + " / " + loop.name));
+    const meta = document.createElement("span");
+    meta.className = "run-meta";
+    meta.appendChild(span("", "Iteration " + iterationText(loop)));
+    const phase = phaseText(loop);
+    if (phase) meta.appendChild(span("", phase));
+    card.appendChild(meta);
+    if (loop.iteration != null && loop.max_iterations) {
+      const bar = document.createElement("span");
+      bar.className = "meter";
+      bar.setAttribute("role", "img");
+      bar.setAttribute("aria-label", "Iteration " + loop.iteration + " of " + loop.max_iterations);
+      const fill = document.createElement("span");
+      fill.className = "meter-fill";
+      fill.style.width = Math.min(100, (loop.iteration / loop.max_iterations) * 100) + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
     }
-    if (state.activeLoop) refreshDetail({ quiet: true });
-  } catch (err) {
-    setBoardStatus("error", "offline");
-    showBoardError("Cannot reach the dashboard server: " + err.message);
+    card.appendChild(span("caption", "Live via " + (loop.running_sources || []).join(", ")));
+    list.appendChild(card);
   }
-  state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
 }
 
-function setBoardStatus(cls, text) {
-  el("board-status").className = "board-status status-" + cls;
-  el("board-status-text").textContent = text;
+function renderWorkspaceFilter() {
+  const select = el("workspace-filter");
+  const names = state.workspaces.map((w) => [w.root, w.name, (w.loops || []).length]);
+  const sig = JSON.stringify(names);
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.textContent = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All workspaces";
+    select.appendChild(all);
+    for (const [root, name, count] of names) {
+      const option = document.createElement("option");
+      option.value = root;
+      option.textContent = name + " (" + count + ")";
+      option.title = root;
+      select.appendChild(option);
+    }
+  }
+  if (state.workspace && !names.some(([root]) => root === state.workspace)) state.workspace = "";
+  select.value = state.workspace;
 }
 
-function showBoardError(msg) {
-  const node = el("board-error");
-  node.hidden = false;
-  node.textContent = msg;
-}
-
-function hideBoardError() {
-  el("board-error").hidden = true;
-}
-
-function updateAggregates() {
-  const total = state.loops.length;
-  const active = state.loops.filter((l) => Boolean(l.running)).length;
-  el("agg-loops").textContent = total + (total === 1 ? " loop" : " loops");
-  el("agg-active").textContent = active + " active";
-  el("agg-active").classList.toggle("is-active", active > 0);
-  const at = state.updatedAt ? fmtClock(state.updatedAt) : null;
-  el("updated-at").textContent = "updated " + (at || "—");
+function hasUnreadAttention(loop) {
+  return state.inbox.some((item) => item.key === loop.key && !item.read);
 }
 
 function matchesTab(tab, loop) {
   if (tab === "running") return Boolean(loop.running);
-  if (tab === "attention") {
-    return state.inbox.some((item) => item.loop === loop.name && !item.read);
-  }
+  if (tab === "attention") return hasUnreadAttention(loop);
   if (tab === "archived") return isArchived(loop);
   return true;
 }
 
+const TAB_LABELS = { running: "Running", attention: "Attention", all: "All", archived: "Archived" };
+
 function renderTabs() {
   const nav = el("tabs");
+  const scoped = state.loops.filter(matchesFilters);
   nav.textContent = "";
   for (const tab of TABS) {
-    const count = state.loops.filter((loop) => matchesTab(tab, loop)).length;
+    const count = scoped.filter((loop) => matchesTab(tab, loop)).length;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "tab";
-    if (state.tab === tab) btn.classList.add("active");
-    if (count === 0) btn.classList.add("tab-empty");
-    btn.textContent = tab;
-    btn.appendChild(span("tab-count", String(count)));
+    btn.className = "seg-btn";
+    btn.textContent = TAB_LABELS[tab];
+    btn.appendChild(span("seg-count", String(count)));
     btn.setAttribute("aria-pressed", String(state.tab === tab));
     btn.addEventListener("click", () => {
       state.tab = tab;
-      history.replaceState(null, "", tab === "all" ? "#" : "#" + tab);
+      savePrefs();
       renderTabs();
       renderBoard();
     });
@@ -415,241 +710,296 @@ function renderTabs() {
   }
 }
 
+function matchesFilters(loop) {
+  if (state.workspace && loop.root !== state.workspace) return false;
+  const q = state.query.trim().toLowerCase();
+  if (!q) return true;
+  return [loop.title, loop.name, loop.workspace, loop.mission, loop.status]
+    .some((v) => String(v || "").toLowerCase().includes(q));
+}
+
 function visibleLoops() {
+  const { key, dir } = state.sort;
+  const sign = dir === "asc" ? 1 : -1;
+  const value = (loop) => key === "loop" ? loopTitle(loop).toLowerCase()
+    : key === "workspace" ? (loop.workspace + "/" + loop.name).toLowerCase()
+    : String(loop.last_activity || "");
   return state.loops
-    .filter((l) => matchesTab(state.tab, l))
+    .filter((l) => matchesFilters(l) && matchesTab(state.tab, l))
     .sort((a, b) => {
       const running = Number(Boolean(b.running)) - Number(Boolean(a.running));
-      if (running !== 0) return running;
-      return String(b.verdict_mtime || "").localeCompare(
-        String(a.verdict_mtime || "")
-      );
+      if (key === "activity" && running !== 0) return running;
+      return sign * value(a).localeCompare(value(b));
     });
 }
 
 function boardSignature(loops) {
   return JSON.stringify(
     loops.map((loop) => [
-      loop.name,
+      loop.key,
+      loop.title || "",
       loop.status ?? null,
       loop.final_verdict ?? null,
       Boolean(loop.running),
       loop.running_sources || [],
-      isArchived(loop),
-      loop.verdict_mtime ?? null,
+      loop.last_activity ?? null,
       loop.iteration,
       loop.max_iterations,
-      loop.mission || "",
       verdictSeq(loop),
       loop.driver_phase ?? null,
-      loop.driver ?? null,
+      hasUnreadAttention(loop),
+      state.activeLoop === loop.key,
     ])
   );
 }
 
-function boardEmpty(text) {
-  const empty = document.createElement("div");
-  empty.className = "board-empty";
-  empty.textContent = text;
-  return empty;
-}
-
 function renderBoard() {
-  updateAggregates();
-  const grid = el("card-grid");
+  const body = el("loop-rows");
   const loops = state.loops.length ? visibleLoops() : [];
   const emptyText = !state.loops.length
-    ? "No loop mailboxes found. Start one with /trio-init in this project."
-    : loops.length ? "" : "No " + state.tab + " loops.";
+    ? "No loop mailboxes found. Start one with /trio-init in a project."
+    : loops.length ? "" : "No loops match these filters.";
+  for (const th of document.querySelectorAll(".loop-table th[aria-sort]")) {
+    const key = th.querySelector(".th-sort")?.dataset.sort;
+    th.setAttribute("aria-sort", key === state.sort.key
+      ? (state.sort.dir === "asc" ? "ascending" : "descending") : "none");
+  }
   const sig = state.tab + "|" + emptyText + "|" + boardSignature(loops);
   if (sig === state.boardSignature) return;
   state.boardSignature = sig;
 
   if (emptyText) {
-    grid.textContent = "";
-    grid.appendChild(boardEmpty(emptyText));
+    body.textContent = "";
+    const tr = document.createElement("tr");
+    tr.className = "row-empty";
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.appendChild(emptyState("○", emptyText));
+    tr.appendChild(td);
+    body.appendChild(tr);
     return;
   }
-  for (const stale of Array.from(grid.querySelectorAll(".board-empty"))) stale.remove();
+  for (const stale of Array.from(body.querySelectorAll(".row-empty, .row-loading"))) stale.remove();
 
   const existing = new Map();
-  for (const card of grid.querySelectorAll(".loop-card")) {
-    existing.set(card.dataset.loop, card);
-  }
-  const wanted = new Set(loops.map((loop) => loop.name));
-  for (const [name, card] of existing) {
-    if (!wanted.has(name)) {
-      card.remove();
-      existing.delete(name);
+  for (const row of body.querySelectorAll(".loop-row")) existing.set(row.dataset.key, row);
+  const wanted = new Set(loops.map((loop) => loop.key));
+  for (const [key, row] of existing) {
+    if (!wanted.has(key)) {
+      row.remove();
+      existing.delete(key);
     }
   }
-  let added = 0;
   const ordered = loops.map((loop) => {
-    const old = existing.get(loop.name);
+    const old = existing.get(loop.key);
     if (old) {
       patchCard(old, loop);
       return old;
     }
-    const card = cardEl(loop);
-    card.style.animationDelay = Math.min(added * 40, 320) + "ms";
-    added += 1;
-    return card;
+    return cardEl(loop);
   });
-  let cursor = grid.firstElementChild;
-  for (const card of ordered) {
-    if (card === cursor) {
+  let cursor = body.firstElementChild;
+  for (const row of ordered) {
+    if (row === cursor) {
       cursor = cursor.nextElementSibling;
       continue;
     }
-    grid.insertBefore(card, cursor);
+    body.insertBefore(row, cursor);
   }
 }
 
-function patchCard(card, loop) {
+/* Rows patch in place: only cells whose content changed are replaced, so
+ * focus and hover survive the 5 s poll. */
+function patchCard(row, loop) {
   const fresh = cardEl(loop);
-  fresh.classList.remove("active");
-  card.className = fresh.className;
-  if (state.activeLoop === loop.name) card.classList.add("active");
-  card.setAttribute("aria-label", fresh.getAttribute("aria-label"));
-  for (const sel of [".card-top", ".card-name", ".card-mission", ".card-bottom", ".card-controls"]) {
-    const oldPart = card.querySelector(sel);
-    const newPart = fresh.querySelector(sel);
-    if (oldPart && newPart) {
-      if (!oldPart.isEqualNode(newPart)) oldPart.replaceWith(newPart);
-    } else if (oldPart) {
-      oldPart.remove();
-    } else if (newPart) {
-      const controls = card.querySelector(".card-controls");
-      const bottom = card.querySelector(".card-bottom");
-      const anchor = sel === ".card-mission" ? bottom || controls : controls;
-      card.insertBefore(newPart, anchor);
-    }
-  }
+  row.className = fresh.className;
+  const oldCells = Array.from(row.children);
+  const newCells = Array.from(fresh.children);
+  newCells.forEach((cell, i) => {
+    if (!oldCells[i]) row.appendChild(cell);
+    else if (!oldCells[i].isEqualNode(cell)) oldCells[i].replaceWith(cell);
+  });
 }
 
 function cardEl(loop) {
-  const card = document.createElement("article");
-  card.className = "loop-card";
-  card.dataset.loop = loop.name;
-  if (state.activeLoop === loop.name) card.classList.add("active");
-  card.setAttribute("role", "group");
-  card.tabIndex = 0;
-  card.setAttribute("aria-label", "Open detail for " + loop.name);
+  const row = document.createElement("tr");
+  row.className = "loop-row" + (state.activeLoop === loop.key ? " active" : "") +
+    (isArchived(loop) ? " is-archived" : "");
+  row.dataset.key = loop.key;
 
-  const top = document.createElement("div");
-  top.className = "card-top";
-  const tags = document.createElement("div");
-  tags.className = "card-tags";
-  appendLoopTags(tags, loop);
-  const phase = String(loop.driver_phase || loop.phase || "").trim();
-  // An idle phase is not a useful board tag; do not reintroduce an inference.
-  if (phase && phase.toLowerCase() !== "idle") {
-    tags.appendChild(
-      span(
-        "status-label status-phase",
-        phase.replace(/[-_]/g, " ").toUpperCase()
-      )
-    );
+  const nameCell = document.createElement("th");
+  nameCell.scope = "row";
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "row-open";
+  open.textContent = loopTitle(loop);
+  open.title = loop.mission || loopTitle(loop);
+  open.addEventListener("click", () => openDrawer(loop.key));
+  nameCell.appendChild(open);
+  const sub = document.createElement("span");
+  sub.className = "row-sub mono";
+  sub.textContent = loop.name;
+  nameCell.appendChild(sub);
+  if (hasUnreadAttention(loop)) {
+    const n = state.inbox.filter((i) => i.key === loop.key && !i.read).length;
+    nameCell.appendChild(span("row-flag", plural(n, "unread item")));
   }
-  top.appendChild(tags);
-  const iter = document.createElement("span");
-  iter.className = "card-iter";
-  const cur = loop.iteration != null ? loop.iteration : "–";
-  const max = loop.max_iterations != null ? loop.max_iterations : "–";
-  const current = document.createElement("strong");
-  current.textContent = cur;
-  iter.appendChild(current);
-  iter.appendChild(document.createTextNode(" / " + max + " iter"));
-  top.appendChild(iter);
-  card.appendChild(top);
+  if (isArchived(loop)) nameCell.appendChild(span("row-flag row-flag-muted", "Archived"));
+  row.appendChild(nameCell);
 
-  const name = document.createElement("h3");
-  name.className = "card-name";
-  name.textContent = loop.name;
-  card.appendChild(name);
+  const ws = document.createElement("td");
+  ws.className = "col-ws";
+  ws.textContent = loop.workspace;
+  ws.title = loop.root;
+  row.appendChild(ws);
 
-  if (loop.mission) {
-    const mission = document.createElement("p");
-    mission.className = "card-mission";
-    mission.textContent = loop.mission;
-    mission.title = loop.mission;
-    card.appendChild(mission);
-  }
+  const st = document.createElement("td");
+  st.appendChild(stateBadge(loop));
+  const phase = phaseText(loop);
+  if (phase) st.appendChild(span("row-sub", phase));
+  row.appendChild(st);
 
-  const bottom = document.createElement("div");
-  bottom.className = "card-bottom";
-  bottom.appendChild(segbarEl(verdictSeq(loop), false));
-  bottom.appendChild(
-    span(
-      "card-activity",
-      "updated " + (loop.verdict_mtime ? relTime(loop.verdict_mtime) : "—")
-    )
-  );
-  card.appendChild(bottom);
+  const it = document.createElement("td");
+  it.className = "num col-iter";
+  it.textContent = iterationText(loop);
+  row.appendChild(it);
 
-  const controls = document.createElement("div");
-  controls.className = "card-controls";
-  const driver = loop.driver === "omnigent" ? "omnigent" : "portable";
-  const start = document.createElement("button");
-  start.type = "button";
-  start.textContent = "Start";
-  start.title = "Start " + driver + " loop";
-  start.disabled = Boolean(loop.running);
-  start.addEventListener("click", (event) => {
-    event.stopPropagation();
-    controlLoop("start", driver);
+  const hist = document.createElement("td");
+  hist.className = "col-hist";
+  hist.appendChild(historyEl(loop));
+  row.appendChild(hist);
+
+  const act = document.createElement("td");
+  act.className = "num";
+  const time = document.createElement("time");
+  time.dateTime = loop.last_activity || "";
+  time.textContent = loop.last_activity ? relTime(loop.last_activity) : "—";
+  time.title = loop.last_activity ? new Date(loop.last_activity).toLocaleString() : "No activity recorded";
+  act.appendChild(time);
+  row.appendChild(act);
+
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button, a")) return;
+    openDrawer(loop.key);
   });
-  const stop = document.createElement("button");
-  stop.type = "button";
-  stop.textContent = "Stop";
-  stop.title = "Stop " + driver + " loop";
-  stop.disabled = !loop.running;
-  stop.addEventListener("click", (event) => {
-    event.stopPropagation();
-    controlLoop("stop", driver);
-  });
-  controls.appendChild(start);
-  controls.appendChild(stop);
-  card.appendChild(controls);
-
-  card.addEventListener("click", () => openDrawer(loop.name));
-  card.addEventListener("keydown", (event) => {
-    if (event.target !== card) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    openDrawer(loop.name);
-  });
-  return card;
+  return row;
 }
 
-async function controlLoop(action, driver) {
+async function setInboxRead(items, read) {
+  const byRoot = new Map();
+  for (const item of items) {
+    if (!byRoot.has(item.root)) byRoot.set(item.root, []);
+    byRoot.get(item.root).push(item.id);
+  }
+  try {
+    for (const [root, ids] of byRoot) {
+      const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids, root }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+    }
+    for (const item of items) item.read = read;
+    renderAll();
+  } catch (err) {
+    showBoardError("Could not update the attention list: " + err.message);
+  }
+}
+
+function renderDrawerInbox() {
+  const section = el("drawer-inbox-section");
+  const list = el("drawer-inbox-list");
+  if (!section || !list) return;
+  list.textContent = "";
+  const items = state.inbox.filter((item) => item.key === state.activeLoop);
+  section.hidden = items.length === 0;
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "attn-row attn-row-compact" + (item.read ? " is-read" : "");
+    row.appendChild(severityBadge(item));
+    const main = document.createElement("div");
+    main.className = "attn-main";
+    main.appendChild(span("attn-reason", item.headline || ""));
+    if (item.detail) main.appendChild(span("attn-detail", item.detail));
+    row.appendChild(main);
+    row.appendChild(inboxMarkButton(item));
+    list.appendChild(row);
+  }
+}
+
+async function controlLoop(action) {
+  const loop = state.byKey.get(state.activeLoop);
+  if (!loop) return;
+  const driver = loop.driver === "omnigent" ? "omnigent" : "portable";
+  if (action === "stop" && !window.confirm("Stop " + loopTitle(loop) + "? The running " + driver + " driver receives SIGTERM.")) return;
+  const note = el("loop-control-note");
+  note.textContent = action === "start" ? "Starting…" : "Stopping…";
   try {
     const res = await fetch("/api/loop/" + action, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root: currentRoot, driver }),
+      body: JSON.stringify({ root: loop.root, driver }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    note.textContent = action === "start" ? "Start requested (pid " + (data.pid ?? "?") + ")." : "Stop requested.";
     await refreshBoard();
   } catch (err) {
-    showBoardError("Loop " + action + " failed: " + err.message);
+    note.textContent = "Loop " + action + " failed: " + err.message;
   }
 }
 
+/* Start/Stop act on the workspace's `loop/` mailbox only (the API has no
+ * mailbox parameter), so they are offered for that mailbox alone. */
+function renderDrawerControls(loop) {
+  const wrap = el("drawer-controls");
+  if (!loop) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  const controllable = loop.name === "loop";
+  const start = el("loop-start");
+  const stop = el("loop-stop");
+  start.disabled = !controllable || Boolean(loop.running);
+  stop.disabled = !controllable || !loop.running;
+  const why = !controllable
+    ? "Start and stop work on a workspace's loop/ mailbox only; run this one from its session."
+    : loop.running ? "Loop is live; stop sends SIGTERM to its driver." : "Starts the " + (loop.driver === "omnigent" ? "omnigent" : "portable") + " driver for this mailbox.";
+  start.title = why;
+  stop.title = why;
+  if (!el("loop-control-note").dataset.busy) el("loop-control-note").textContent = controllable ? "" : why;
+}
+
 function markActiveCard() {
-  for (const card of document.querySelectorAll(".loop-card")) {
-    card.classList.toggle("active", card.dataset.loop === state.activeLoop);
+  for (const row of document.querySelectorAll(".loop-row")) {
+    row.classList.toggle("active", row.dataset.key === state.activeLoop);
   }
 }
 
 /* ------------------------------ drawer ------------------------------ */
 
-async function openDrawer(name) {
-  if (!el("drawer").hidden && state.activeLoop === name) return;
+/* The drawer is modal: the board behind it leaves the tab order and the
+ * accessibility tree while it is open. */
+function setBackgroundInert(on) {
+  for (const node of document.querySelectorAll(".appbar, #main, .skip-link")) {
+    node.inert = on;
+  }
+}
+
+async function openDrawer(key) {
+  const loop = state.byKey.get(key);
+  if (!loop) return;
+  if (!el("drawer").hidden && state.activeLoop === key) return;
   closeStream();
-  state.activeLoop = name;
-  history.replaceState(null, "", "#loop=" + encodeURIComponent(name));
+  state.activeLoop = key;
+  state.returnFocus = document.activeElement;
+  currentRoot = loop.root;
+  const name = loop.name;
+  history.replaceState(null, "", "#root=" + encodeURIComponent(loop.root) +
+    "&loop=" + encodeURIComponent(name));
   state.detail = null;
   state.compare = [];
   state.sessions = [];
@@ -657,7 +1007,11 @@ async function openDrawer(name) {
   state.drawerTab = "overview";
   state.graphSel = null;
 
-  el("drawer-name").textContent = name;
+  el("drawer-name").textContent = loopTitle(loop);
+  el("drawer-where").textContent = loop.workspace + " / " + name;
+  el("drawer-where").title = loop.root + "/" + name;
+  el("loop-control-note").textContent = "";
+  renderDrawerControls(loop);
   el("drawer-badge").className = "status-tags";
   el("drawer-badge").textContent = "LOADING";
   el("drawer-mission").textContent = "";
@@ -675,6 +1029,8 @@ async function openDrawer(name) {
 
   el("drawer").hidden = false;
   el("drawer-scrim").hidden = false;
+  setBackgroundInert(true);
+  el("drawer-close").focus();
   markActiveCard();
   renderDrawerTabs();
   showDrawerTab();
@@ -694,18 +1050,25 @@ function closeDrawer() {
   state.graphSel = null;
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
+  setBackgroundInert(false);
+  history.replaceState(null, "", location.pathname);
   markActiveCard();
+  const back = state.returnFocus;
+  state.returnFocus = null;
+  if (back && document.contains(back)) back.focus();
 }
 
 async function refreshDetail({ quiet }) {
-  const name = state.activeLoop;
-  if (!name) return;
+  const key = state.activeLoop;
+  const loop = state.byKey.get(key);
+  if (!loop) return;
+  renderDrawerControls(loop);
   try {
-    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(name)), {
+    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(loop.name)), {
       cache: "no-store",
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    if (state.activeLoop !== name) return;
+    if (state.activeLoop !== key) return;
     const detail = await res.json();
     state.detail = detail;
     state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
@@ -786,7 +1149,12 @@ function toggleCompare(n) {
 function renderDetail(detail) {
   const badge = el("drawer-badge");
   badge.className = "status-tags";
-  appendLoopTags(badge, detail);
+  badge.textContent = "";
+  const live = state.byKey.get(state.activeLoop) || {};
+  badge.appendChild(stateBadge(Object.assign({}, detail, {
+    running: live.running ?? detail.running,
+    running_sources: live.running_sources || detail.running_sources,
+  })));
 
   const missionEl = el("drawer-mission");
   missionEl.textContent = detail.mission || "No mission recorded.";
@@ -807,17 +1175,22 @@ function renderDetail(detail) {
   const strip = el("drawer-strip");
   strip.textContent = "";
   const seq = verdictSeq(detail);
-  strip.appendChild(segbarEl(seq, true));
-  strip.appendChild(
-    seq.length ? seqLegendEl(seq) : span("seg-seq", "no verdicts yet")
-  );
+  if (seq.length) {
+    strip.appendChild(historyEl(detail));
+    strip.appendChild(span("caption", " S shipped · I iterate · B blocked · H needs human, oldest first"));
+  } else {
+    strip.appendChild(span("caption", "No evaluator verdicts parsed from LOG.md. Latest recorded verdict: " +
+      (detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "none") + "."));
+  }
 
   const commits = Array.isArray(detail.commits) ? detail.commits : [];
   const csec = el("commits-section");
   const clist = el("commit-list");
   clist.textContent = "";
   csec.hidden = commits.length === 0;
-  for (const c of commits) {
+  const COMMIT_PREVIEW = 8;
+  const showAll = state.showAllCommits === state.activeLoop;
+  for (const c of showAll ? commits : commits.slice(0, COMMIT_PREVIEW)) {
     const row = document.createElement("div");
     row.className = "commit-row";
     const sha = span("commit-sha", c.short || (c.sha || "").slice(0, 7));
@@ -828,6 +1201,17 @@ function renderDetail(detail) {
     subj.title = c.subject || "";
     row.appendChild(subj);
     clist.appendChild(row);
+  }
+  if (commits.length > COMMIT_PREVIEW) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "btn btn-ghost btn-small";
+    more.textContent = showAll ? "Show fewer commits" : "Show all " + commits.length + " commits";
+    more.addEventListener("click", () => {
+      state.showAllCommits = showAll ? null : state.activeLoop;
+      renderDetail(state.detail);
+    });
+    clist.appendChild(more);
   }
 
   renderSlices(detail);
@@ -2256,32 +2640,86 @@ function setOffsetHint() {
 
 /* ------------------------------- boot ------------------------------- */
 
-function init() {
-  const hash = location.hash.replace(/^#/, "");
-  const loopMatch = /^loop=(.+)$/.exec(hash);
-  if (loopMatch) {
-    pendingLoopHash = decodeURIComponent(loopMatch[1]);
-  } else if (TABS.includes(hash)) {
-    state.tab = hash;
+function parseHash() {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const name = params.get("loop");
+  return name ? { root: params.get("root") || "", name } : null;
+}
+
+function trapDrawerFocus(ev) {
+  if (ev.key !== "Tab" || el("drawer").hidden) return;
+  const focusable = Array.from(el("drawer").querySelectorAll(
+    'button:not([disabled]), [href], input, select, [tabindex]:not([tabindex="-1"])'
+  )).filter((node) => node.offsetParent !== null);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault();
+    last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault();
+    first.focus();
   }
+}
+
+function init() {
+  loadPrefs();
+  pendingLoopHash = parseHash();
 
   el("drawer-close").addEventListener("click", closeDrawer);
   el("drawer-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
+    trapDrawerFocus(ev);
   });
   el("inbox-toggle").addEventListener("click", () => {
     state.showReadInbox = !state.showReadInbox;
-    renderInbox(state.inbox);
+    renderAll();
   });
   el("follow-btn").addEventListener("click", () => {
     state.follow = !state.follow;
     updateFollowBtn();
   });
-
-  const grid = el("card-grid");
-  grid.textContent = "";
-  grid.appendChild(boardEmpty("Loading loops…"));
+  window.addEventListener("hashchange", () => {
+    const target = parseHash();
+    if (!target) {
+      if (!el("drawer").hidden) closeDrawer();
+      return;
+    }
+    const loop = state.loaded ? resolveHashLoop(target) : null;
+    if (loop) openDrawer(loop.key);
+    else pendingLoopHash = target;
+  });
+  el("board-retry").addEventListener("click", refreshBoard);
+  el("loop-start").addEventListener("click", () => controlLoop("start"));
+  el("loop-stop").addEventListener("click", () => controlLoop("stop"));
+  el("loop-search").addEventListener("input", (ev) => {
+    state.query = ev.target.value;
+    renderTabs();
+    renderBoard();
+  });
+  el("workspace-filter").addEventListener("change", (ev) => {
+    state.workspace = ev.target.value;
+    savePrefs();
+    renderTabs();
+    renderBoard();
+  });
+  for (const btn of document.querySelectorAll(".th-sort")) {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.sort;
+      state.sort = state.sort.key === key
+        ? { key, dir: state.sort.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "activity" ? "desc" : "asc" };
+      savePrefs();
+      renderBoard();
+    });
+  }
+  /* Relative times ("4m ago") keep moving between polls. */
+  setInterval(() => {
+    if (!state.loaded) return;
+    renderLive();
+  }, 5000);
   refreshBoard();
 }
 

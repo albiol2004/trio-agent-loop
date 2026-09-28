@@ -44,6 +44,33 @@ Adjust the zone to the one holding `tailscale0`; no rule is needed if that inter
 
 There is no authentication in v1 — the tailnet ACL is the access boundary. Do not expose `--host 0.0.0.0` on untrusted networks without an auth layer.
 
+## Workspace service (always-on)
+
+`dashboard/service/` holds a supervised setup for the workspace `svc`
+manager (`~/.services/<name>/run`):
+
+- `run` — starts `serve.py` on `127.0.0.1:$TRIO_DASH_PORT` (default 9470),
+  restarts it on exit with 2–60 s backoff, probes `/healthz` every 20 s and
+  restarts after 3 consecutive failures, and maps tailnet-only HTTPS on the
+  same port with `tailscale serve --bg --https=9470` (the workspace's `/` and
+  `/auth` mappings are untouched).
+- `env.example` — pinned checkout path, port, `TRIO_DASH_SCAN_ROOTS`
+  (directories whose children are auto-discovered, e.g. `~/personal`), and
+  fixed `--workspace` arguments plus `--discover`.
+- `install-service.sh <commit>` — creates `~/.services/trio-dash` with a
+  detached worktree pinned at `<commit>`; leaves the service disabled.
+
+```bash
+dashboard/service/install-service.sh <commit>
+svc enable trio-dash && svc start trio-dash
+curl -s http://127.0.0.1:9470/healthz
+# https://<workspace-host>.<tailnet>:9470/
+```
+
+`serve.py` also accepts `--discover` to keep auto-discovery on alongside
+explicit `--workspace` paths, and `TRIO_DASH_SCAN_ROOTS` (`os.pathsep`
+separated) to replace the default scan roots.
+
 ## Running from the repo checkout (development)
 
 ```bash
@@ -52,15 +79,18 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## What it shows
 
-- **Status board** — nested mailbox discovery: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped). One card per mailbox; cards patch in place on poll with no full re-render. Cards show status fact (from STATE.md status word), verdict fact (latest VERDICT.md word), RUNNING tag (when running_sources union is non-empty), ARCHIVED tag (loop-archive-* directory), phase label when non-idle, iteration count, mission, verdict-history strip (S/I/H/B tiles — the loop's fingerprint), and last activity. Running detection polls three sources: driver pid, /proc cmdline referencing the mailbox path, and .session.json sidecar with live pid; a dead-pid sidecar becomes an 'orphaned' inbox item. Dead pids and a broker probe on running_sources.
-- **Tabs** — Running (running loops first), Attention (unflagged inbox items), All (all mailboxes), Archived (loop-archive-*). Refreshes every 5 seconds.
+- **Board (every workspace at once)** — one `/api/overview` poll every 5 seconds covers every discovered workspace. Top to bottom: a verdict sentence ("2 loops need you; nothing is running."), four tiles (needs you, running now, shipped in the last 7 days, loops tracked), **Needs you**, **Running now**, an **All loops** table, and collapsed **Review notes**. Loops are keyed by workspace root + mailbox name. Nested mailbox discovery is unchanged: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped).
+- **Facts only** — a loop's state badge is derived from facts in this order: live evidence (`running_sources`: driver pid or lock, /proc cmdline naming the mailbox, live `.session.json` pid, opt-in broker probe) → "Running"; else the latest verdict (Shipped / Needs human / Blocked / Iterating); else the STATE.md status word. Every badge has an icon and text; the tooltip lists the underlying facts. Titles come from GOAL.md's first heading (`# Mission: X` → "X"); generic headings such as `# Goal` fall back to the mission's first clause.
+- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold.
+- **All loops table** — sortable by loop, workspace and last activity; filtered by search, workspace, and the fact-only segments Running / Attention / All / Archived (preferences persist in `localStorage` when available). Rows patch in place on poll.
 - **Attention inbox** — stable item ids (sha256 hash of root, loop_name, kind, anchor) and per-workspace read/unread state persisted in `~/.local/share/trio-agent-loop/inbox-state.json` (POST /api/inbox/read or /api/inbox/unread). Read items are hidden by default; unread count remains the inbox badge.
-- **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
+- **Loop detail drawer** — click any row, attention item or running card (deep link `#root=<workspace>&loop=<mailbox>`; the older `#loop=<mailbox>` still works): why the loop is flagged, full mission, fact grid, verdict history, commits (first 8, then "Show all"), slices, and an activity timeline parsed from LOG.md. Start/Stop live here and are enabled only for a workspace's `loop/` mailbox, because `/api/loop/start|stop` act on `<root>/loop`; Stop asks for confirmation. The drawer is modal: focus moves in, Escape closes it and focus returns.
+- **States** — skeletons while loading, an empty state, an error banner with Retry that keeps the last data on screen, a Stale indicator when data is older than 30 s, and a partial-failure banner naming any workspace that could not be read.
 - **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
 
 ## Pages
 
-- `/` — status board with tabs: **Running** (running loops), **Attention** (inbox items not yet read), **All** (all mailboxes), **Archived** (loop-archive-* directories). Each card shows status and verdict facts, iteration count, mission, verdict history, and last activity. Fact tags are STATE.md status word, latest verdict word, RUNNING (when running_sources is non-empty), and ARCHIVED (for loop-archive-* paths); phase label appears when non-idle. **Start/Stop buttons** control loop execution
+- `/` — loop board across all workspaces (see "What it shows")
 - `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only, and scoped creation
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
 - `/topology.html` — layered SVG graphs of harness wiring;
@@ -69,6 +99,15 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 - `/health.html` — registry lineage, manifest drift, installed harnesses, dangling artifacts, and generate.py check result
 
 ## API Endpoints
+
+Board and service:
+- `GET /api/overview` — every workspace's board in one response:
+  `{workspaces: [{root, name, loops, inbox, elapsed_ms, error?}], scanned, updated_at, elapsed_ms}`.
+  Workspaces without loops are omitted (counted in `scanned`). The first
+  request builds synchronously; later requests return the last build at once
+  and trigger one background rebuild when it is older than 4 s. One /proc
+  snapshot and one git slice attribution per loop are shared per build.
+- `GET /healthz` — `{ok, uptime_seconds, version, workspaces, overview_age_seconds}` for supervisors.
 
 Loop control:
 - `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`)

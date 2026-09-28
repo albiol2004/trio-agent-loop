@@ -199,6 +199,7 @@ import threading
 import traceback
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -253,6 +254,12 @@ REGISTRY_CACHE_SECONDS = 5.0
 
 WORKSPACE_SCAN_SECONDS = 60.0
 """Maximum age of the automatically discovered workspace list."""
+
+OVERVIEW_CACHE_SECONDS = 4.0
+"""Maximum age of the cross-workspace overview served to concurrent viewers."""
+
+OVERVIEW_WORKERS = 4
+"""Workspaces scanned in parallel when building the overview."""
 
 _REGISTRY_MODULE = None
 _AGENTS_MODULE = None
@@ -774,15 +781,47 @@ def _read_session_sidecar(loop_dir: Path) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _proc_matches_mailbox(loop_dir: Path) -> bool:
-    """Return whether a live process command line names this mailbox."""
-    try:
-        mailbox_text = str(loop_dir.resolve())
-        entries = list(Path(PROC_ROOT).iterdir())
-    except (OSError, RuntimeError):
+_PROC_SNAPSHOT = threading.local()
+"""Per-thread cache of live command lines while one board is being built."""
+
+
+class _proc_snapshot:
+    """Scope in which every mailbox scan reuses one read of the process table
+    and each loop's git slice attribution.
+
+    A board or overview checks every mailbox against every live process;
+    without the scope that is one full ``/proc`` walk per mailbox (twice,
+    once for the card and once for the inbox).
+    """
+
+    def __init__(self, cmdlines: list[str] | None = None):
+        self._given = cmdlines
+
+    def __enter__(self):
+        self._outer = getattr(_PROC_SNAPSHOT, "cmdlines", None)
+        if self._outer is None:
+            _PROC_SNAPSHOT.cmdlines = (
+                self._given if self._given is not None else _live_cmdlines())
+            # Git attribution is the slowest part of a card; the card and
+            # the inbox both need it, so compute it once per build.
+            _PROC_SNAPSHOT.slice_activity = {}
+        return self
+
+    def __exit__(self, *exc):
+        if self._outer is None:
+            _PROC_SNAPSHOT.cmdlines = None
+            _PROC_SNAPSHOT.slice_activity = None
         return False
 
+
+def _live_cmdlines() -> list[str] | None:
+    """Return live processes' command lines (excluding this server)."""
+    try:
+        entries = list(Path(PROC_ROOT).iterdir())
+    except (OSError, RuntimeError):
+        return None
     current_pid = os.getpid()
+    cmdlines = []
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -792,9 +831,22 @@ def _proc_matches_mailbox(loop_dir: Path) -> bool:
             continue
         if pid == current_pid or not _pid_is_live(pid):
             continue
-        if mailbox_text in _process_cmdline(pid):
-            return True
-    return False
+        cmdlines.append(_process_cmdline(pid))
+    return cmdlines
+
+
+def _proc_matches_mailbox(loop_dir: Path) -> bool:
+    """Return whether a live process command line names this mailbox."""
+    try:
+        mailbox_text = str(loop_dir.resolve())
+    except (OSError, RuntimeError):
+        return False
+    cmdlines = getattr(_PROC_SNAPSHOT, "cmdlines", None)
+    if cmdlines is None:
+        cmdlines = _live_cmdlines()
+    if cmdlines is None:
+        return False
+    return any(mailbox_text in cmdline for cmdline in cmdlines)
 
 
 def _broker_session_ids(
@@ -968,6 +1020,38 @@ def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
     if len(text) > limit:
         text = text[: limit - 1] + "\u2026"
     return text
+
+
+_GENERIC_GOAL_HEADINGS = {"goal", "mission", "objective", "task", "brief"}
+
+
+def _goal_title(goal_path: Path, limit: int = 120) -> str:
+    """Return GOAL.md's first heading as a short human title, or ``""``.
+
+    ``# Mission: fix X`` becomes ``fix X`` (first letter capitalised); a bare
+    generic heading such as ``# Goal`` yields ``""`` so callers fall back to
+    the mailbox name instead of showing a meaningless word.
+    """
+    try:
+        with goal_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line.startswith("#"):
+                    continue
+                text = line.lstrip("#").strip()
+                text = re.sub(
+                    r"^(mission|goal|objective)\s*:\s*", "", text,
+                    flags=re.IGNORECASE)
+                if text.casefold() in _GENERIC_GOAL_HEADINGS:
+                    return ""
+                if text:
+                    text = text[0].upper() + text[1:]
+                if len(text) > limit:
+                    text = text[: limit - 1] + "\u2026"
+                return text
+    except OSError:
+        return ""
+    return ""
 
 
 def _last_activity(loop_dir: Path, entries: list[dict]) -> str | None:
@@ -1145,6 +1229,16 @@ def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     Any failure (no PLAN.md, no slices block, a missing/non-git repo, or a
     shadow-script load error) yields None, never a 500.
     """
+    memo = getattr(_PROC_SNAPSHOT, "slice_activity", None)
+    if memo is None:
+        return _compute_slice_activity(loop_dir, root)
+    key = (str(loop_dir), str(root))
+    if key not in memo:
+        memo[key] = _compute_slice_activity(loop_dir, root)
+    return copy.deepcopy(memo[key])
+
+
+def _compute_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     try:
         shadow = load_shadow_module()
         text = (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
@@ -1239,11 +1333,16 @@ def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
     return commits
 
 
+_RUNNING_STATUS_WORDS = {"running", "in_progress", "in-progress", "active",
+                         "iterating"}
+"""STATE.md status words that claim a loop is still working."""
+
+
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
-    Kinds: needs_human / blocked (high), orphaned / drift / overlap /
-    queue_fault / slice_overlap (medium), and repair (low). For open-loop
+    Kinds: needs_human / blocked (high), orphaned / interrupted / drift /
+    overlap / queue_fault / slice_overlap (medium), and repair (low). For open-loop
     mailboxes (QUEUE.md present) the iteration-overlap item is suppressed
     and replaced by queue_fault (one per open fault) and slice_overlap
     (write-set intersection between simultaneously-building slices);
@@ -1280,6 +1379,26 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         )
 
     verdict = (card.get("final_verdict") or "").upper()
+    status = str(card.get("status") or "").strip().lower()
+    if (
+        status in _RUNNING_STATUS_WORDS
+        and not detection["sources"]
+        and orphaned is None
+        and verdict not in ("SHIP", "NEEDS_HUMAN", "BLOCKED")
+    ):
+        # Two recorded facts disagree; no idle-time threshold is involved.
+        last = card.get("last_activity") or ""
+        checked = "driver, lock, process or session sidecar"
+        if str(BROKER_BASE_URL).strip():
+            checked += " or broker session"
+        add("medium", "interrupted", f"STATE.md says {status}; nothing is live",
+            f"No {checked} is live"
+            + ("" if str(BROKER_BASE_URL).strip()
+               else " (broker not checked)")
+            + (f". Last mailbox write {last[:16].replace('T', ' ')} UTC."
+               if last else "."),
+            f"interrupted:{last}")
+
     if verdict == "NEEDS_HUMAN":
         add("high", "needs_human", "Human verification pending",
             "Agent-verifiable criteria pass; verify: human criteria remain.")
@@ -2954,6 +3073,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "name": analysis["name"],
             "path": analysis["name"],
             "mission": _mission_from_goal(loop_dir / "GOAL.md"),
+            "title": _goal_title(loop_dir / "GOAL.md"),
             "iteration": _to_int(analysis["state_iteration"]),
             "max_iterations": _to_int(analysis["state_max_iterations"]),
             "status": analysis["state_status"] or "unknown",
@@ -2972,6 +3092,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
 
     def _handle_board(self, root: Path) -> None:
+        self._send_json(200, self._board_payload(root))
+
+    def _board_payload(
+        self, root: Path, cmdlines: list[str] | None = None
+    ) -> dict:
+        with _proc_snapshot(cmdlines):
+            return self._build_board(root)
+
+    def _build_board(self, root: Path) -> dict:
         metrics = self.server.metrics
         loop_dirs = list(metrics.discover_loops(root))
         loops = []
@@ -2987,6 +3116,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "name": metrics.loop_name(root, loop_dir),
                     "path": metrics.loop_name(root, loop_dir),
                     "mission": "",
+                    "title": "",
                     "iteration": None,
                     "max_iterations": None,
                     "status": "unknown",
@@ -3009,10 +3139,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
         order = {"high": 0, "medium": 1, "low": 2}
         inbox.sort(key=lambda i: (order[i["severity"]], i["loop"]))
-        self._send_json(200, {
+        return {
             "loops": loops,
             "inbox": inbox,
             "updated_at": _utc_iso(datetime.now(timezone.utc)),
+        }
+
+    # -- /api/overview -----------------------------------------------------
+
+    def _handle_overview(self) -> None:
+        self._send_json(200, self.server.overview(self._board_payload))
+
+    # -- /healthz ----------------------------------------------------------
+
+    def _handle_healthz(self) -> None:
+        server = self.server
+        self._send_json(200, {
+            "ok": True,
+            "uptime_seconds": round(time.monotonic() - server.started_at, 1),
+            "version": server.version,
+            "workspaces": len(server.get_workspace_seeds()),
+            "overview_age_seconds": server.overview_age(),
         })
 
     # -- /api/sessions -----------------------------------------------------
@@ -3417,8 +3564,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path in STATIC_ROUTES:
             name, ctype = STATIC_ROUTES[path]
             return self._serve_static(name, ctype)
+        if path == "/healthz":
+            return self._api(self._handle_healthz)
         if path == "/api/workspaces":
             return self._api(self._handle_workspaces)
+        if path == "/api/overview":
+            return self._api(self._handle_overview)
         if path == "/api/registry":
             root = self._request_root(query)
             if root is None:
@@ -3568,6 +3719,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
 
+def _workspace_scan_roots() -> list[Path]:
+    """Directories whose children are auto-discovered as workspaces.
+
+    ``TRIO_DASH_SCAN_ROOTS`` (``os.pathsep``-separated) replaces the default
+    list, so a long-running service can cover e.g. ``~/personal``.
+    """
+    configured = os.environ.get("TRIO_DASH_SCAN_ROOTS", "").strip()
+    if configured:
+        return [
+            Path(value).expanduser()
+            for value in configured.split(os.pathsep) if value.strip()
+        ]
+    return [
+        HOME / "pruebas",
+        HOME / "Projects",
+        HOME / "projects",
+        HOME / "dev",
+        HOME / "src",
+        HOME / "code",
+        HOME / "repos",
+        HOME / "work",
+    ]
+
+
+def _dashboard_version() -> str:
+    """Short git revision of the served dashboard, or ``"unknown"``."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
 class DashboardServer(ThreadingHTTPServer):
     """Threaded server carrying workspace roots and the loaded metrics module."""
 
@@ -3600,8 +3786,105 @@ class DashboardServer(ThreadingHTTPServer):
         )
         self.root = self.default_root
         self.metrics = load_metrics_module()
+        self._overview_lock = threading.Lock()
+        self._overview_state_lock = threading.Lock()
+        self._overview_building = False
+        self._overview = None
+        self._overview_at = 0.0
+        self.started_at = time.monotonic()
+        self._version = None
         self.get_workspace_seeds(force=True)
         super().__init__(address, DashboardHandler)
+
+    def overview(self, board_payload) -> dict:
+        """Return every workspace's board without making viewers wait.
+
+        The first request builds synchronously. After that a poll gets the
+        last build immediately and, when it is older than
+        ``OVERVIEW_CACHE_SECONDS``, starts one background rebuild; concurrent
+        polls never scan the same mailboxes twice. A workspace that fails
+        keeps its slot with an ``error`` so the rest still show.
+        """
+        with self._overview_state_lock:
+            cached = self._overview
+            fresh = (
+                cached is not None
+                and time.monotonic() - self._overview_at
+                <= OVERVIEW_CACHE_SECONDS
+            )
+            if cached is not None and not fresh and not self._overview_building:
+                self._overview_building = True
+                threading.Thread(
+                    target=self._rebuild_overview, args=(board_payload,),
+                    daemon=True).start()
+        if cached is not None:
+            return cached
+        with self._overview_lock:
+            if self._overview is not None:
+                return self._overview
+            return self._build_overview(board_payload)
+
+    def _rebuild_overview(self, board_payload) -> None:
+        try:
+            with self._overview_lock:
+                self._build_overview(board_payload)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._overview_state_lock:
+                self._overview_building = False
+
+    def _build_overview(self, board_payload) -> dict:
+        """Scan every workspace now; callers hold ``_overview_lock``."""
+        now = time.monotonic()
+        seeds = self.get_workspace_seeds()
+        cmdlines = _live_cmdlines()
+
+        def build(seed: Path) -> dict:
+            started = time.monotonic()
+            entry = {"root": str(seed), "name": seed.name}
+            try:
+                board = board_payload(seed, cmdlines)
+                entry["loops"] = board["loops"]
+                entry["inbox"] = board["inbox"]
+            except Exception as exc:
+                traceback.print_exc()
+                entry["loops"] = []
+                entry["inbox"] = []
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            return entry
+
+        with ThreadPoolExecutor(max_workers=OVERVIEW_WORKERS) as pool:
+            entries = list(pool.map(build, seeds))
+        names = [entry["name"] for entry in entries]
+        for entry, seed in zip(entries, seeds):
+            if names.count(entry["name"]) > 1:
+                entry["name"] = f"{seed.parent.name}/{seed.name}"
+        self._overview = {
+            "workspaces": [
+                entry for entry in entries
+                if entry["loops"] or entry.get("error")
+            ],
+            "scanned": len(entries),
+            "updated_at": _utc_iso(datetime.now(timezone.utc)),
+            "elapsed_ms": int((time.monotonic() - now) * 1000),
+        }
+        self._overview_at = time.monotonic()
+        return self._overview
+
+    @property
+    def version(self) -> str:
+        """Served git revision, resolved on first use (not at startup)."""
+        if self._version is None:
+            self._version = _dashboard_version()
+        return self._version
+
+    def overview_age(self) -> float | None:
+        """Seconds since the last overview build, or None before the first."""
+        if self._overview is None:
+            return None
+        return round(time.monotonic() - self._overview_at, 1)
 
     def get_workspace_seeds(self, force: bool = False) -> tuple[Path, ...]:
         """Return fixed seeds plus a TTL-refreshed scan of project directories."""
@@ -3615,16 +3898,7 @@ class DashboardServer(ThreadingHTTPServer):
             ):
                 return self.workspace_seeds
             seeds = list(self._fixed_workspace_seeds)
-            scan_roots = [
-                HOME / "pruebas",
-                HOME / "Projects",
-                HOME / "projects",
-                HOME / "dev",
-                HOME / "src",
-                HOME / "code",
-                HOME / "repos",
-                HOME / "work",
-            ]
+            scan_roots = _workspace_scan_roots()
             for scan_root in scan_roots:
                 try:
                     discovered = sorted(
@@ -3652,13 +3926,18 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace", action="append", dest="workspace_paths", metavar="PATH",
         help="workspace root (repeatable; default: cwd and ~/pruebas/* dirs)",
     )
+    parser.add_argument(
+        "--discover", action="store_true",
+        help="also auto-discover workspaces below TRIO_DASH_SCAN_ROOTS "
+             "when --workspace is given",
+    )
     # Keep the old spelling for scripts that have not migrated yet.
     parser.add_argument("--root", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.workspace_paths is not None:
         raw_workspaces = args.workspace_paths
-        auto_discover = False
+        auto_discover = args.discover
     elif args.root is not None:
         raw_workspaces = [args.root]
         auto_discover = False
