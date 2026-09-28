@@ -114,9 +114,9 @@ ignoring the flag.
 
 | flag | not given (default) | disable / override |
 |---|---|---|
-| worker isolation | ON for open-loop; OFF for lockstep (no `QUEUE.md`) | `--no-isolate-workers`; `--isolate-workers` opts lockstep in |
+| worker isolation | ON for open-loop; OFF for lockstep (no `QUEUE.md`) | `--no-isolate-workers` (r16b: refused, exit 2, on a root-free open-loop mailbox — a git checkout — since isolation is now mandatory there; still turns it off on lockstep and on an open-loop mailbox outside any git checkout); `--isolate-workers` opts lockstep in |
 | `--worktree-root` | `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`) `/trio-agent-loop/worktrees/<repo>-<sha256(git common dir)[:12]>` | `--worktree-root DIR` |
-| `--slice-eval-concurrency` | 4 for open-loop; 1 for lockstep without `--isolate-workers` | `--slice-eval-concurrency 1` |
+| `--slice-eval-concurrency` | 4 for open-loop; 1 for lockstep without `--isolate-workers` | `--slice-eval-concurrency 1` (the only way left to disable concurrency on a root-free open-loop; isolation itself stays on) |
 | `--slice-eval-drain-seconds` | `$TRIO_SLICE_EVAL_DRAIN_SECONDS`, else `min(--wait-timeout, 120)` | `--slice-eval-drain-seconds S` |
 
 Fallbacks apply only to defaults; an explicit flag is never downgraded:
@@ -125,8 +125,13 @@ Fallbacks apply only to defaults; an explicit flag is never downgraded:
   `metrics/`): default N falls back to 1 with
   `trioctl: vendored loop core predates concurrent slice-eval; running serial (refresh metrics/ to enable)`;
   explicit N > 1 is refused. Isolation is trioctl-only and stays on.
-- Isolation off (`--no-isolate-workers`, or an unmet default prerequisite):
-  default N is 1; explicit N > 1 is refused.
+- Isolation off (`--no-isolate-workers`, or an unmet default prerequisite) —
+  lockstep, or an open-loop mailbox outside any git checkout: default N is
+  1; explicit N > 1 is refused. On a root-free open-loop mailbox (a git
+  checkout) since r16b, `--no-isolate-workers` and an unmet default
+  prerequisite are refused at start instead (exit 2, nothing changed):
+  isolation cannot be turned off there, only concurrency
+  (`--slice-eval-concurrency 1`).
 - Lockstep mailbox (no `QUEUE.md`), plain `loop`: isolation stays off and
   N is 1, with one line
   `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)`.

@@ -126,8 +126,9 @@ Root-free (r16): on an open-loop mailbox (`QUEUE.md` present)
 branch `trio/<mailbox>` and lands the verified result onto the root's
 branch only after SHIP (exit 8 `needs_land` when the land needs you;
 retry with `trioctl omnigent land --mailbox loop/<x>`). Watch it with
-`trioctl omnigent status --mailbox loop/<x>`; `--root-bound` restores the
-pre-r16 behaviour. See `docs/ROOT-FREE-OPEN-LOOP.md`.
+`trioctl omnigent status --mailbox loop/<x>`; `--root-bound` was removed in
+r16b and is refused (exit 2, nothing changed) — use `trioctl omnigent land`
+or `abandon` instead. See `docs/ROOT-FREE-OPEN-LOOP.md`.
 
 The dashboard board also provides Start and Stop controls for portable and
 Omnigent loop drivers. It exposes the same controls through

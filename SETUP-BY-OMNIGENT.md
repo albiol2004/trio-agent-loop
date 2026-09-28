@@ -234,26 +234,37 @@ slice-evals serial unless `--isolate-workers` is given (lockstep with
 isolation has not been qualified live). Worktrees live outside the repository under
 `$TRIO_WORKTREE_ROOT`, else `$XDG_STATE_HOME` (or `~/.local/state`)
 `/trio-agent-loop/worktrees/<repo>-<hash>`; the loop prints
-`trioctl: worktree root <path>` once. Disable with:
+`trioctl: worktree root <path>` once.
 
-- `--no-isolate-workers` (also makes slice-evals serial; an explicit
-  `--slice-eval-concurrency N>1` is then refused)
+On an open-loop mailbox inside a git checkout (the root-free case; see
+below), isolation is mandatory: `--no-isolate-workers` is refused (exit 2,
+"a root-free open-loop needs isolated builders", nothing changed). Slice-eval
+concurrency can still be turned down with:
+
 - `--slice-eval-concurrency 1` (serial slice-evals, isolation kept)
 - `--worktree-root DIR` overrides the worktree location.
 
-A default whose prerequisite is missing falls back with one stderr line
-(not a git branch checkout, `--observe-workers`, session-bound Omnigent
-bindings in the user's Cursor config: non-isolated; a vendored
-`metrics/trio_loop.py` older than r10: serial slice-evals, refresh
-`metrics/` to enable). An explicit flag never falls back: `--isolate-workers`
-(the lockstep opt-in, otherwise a no-op) and `--slice-eval-concurrency N>1`
-are refused instead, including on a detached HEAD.
+Lockstep is unaffected (isolation is off there by default already) and still
+accepts `--no-isolate-workers`/`--observe-workers` explicitly, as does an
+open-loop mailbox that is outside any git checkout (root-free has nothing to
+fork there, so isolation keeps its pre-r16b fallback behavior).
+
+An open-loop mailbox's unmet default prerequisite (not a git branch
+checkout, `--observe-workers`, session-bound Omnigent bindings in the
+user's Cursor config) is a start-time refusal now, not a fallback: exit 2,
+nothing changed (before r16b it fell back to non-isolated/root-bound). A
+vendored `metrics/trio_loop.py` older than r10 still falls back to serial
+slice-evals with one stderr line (refresh `metrics/` to enable) — unrelated
+to isolation, unaffected by this change. An explicit flag never falls back:
+`--isolate-workers` (the lockstep opt-in, otherwise a no-op) and
+`--slice-eval-concurrency N>1` are refused instead, including on a detached
+HEAD.
 
 Resolution by mailbox mode:
 
 | mailbox | plain `loop` | `--isolate-workers` | `--no-isolate-workers` |
 |---|---|---|---|
-| open-loop (`QUEUE.md` present) | isolated, N=4 | isolated, N=4; unmet prerequisite refused | not isolated, N=1 |
+| open-loop (`QUEUE.md` present), in a git checkout | isolated, N=4 | isolated, N=4; unmet prerequisite refused | refused, exit 2 ("a root-free open-loop needs isolated builders"); nothing changed |
 | lockstep (no `QUEUE.md`) | not isolated, N=1, one line `trioctl: lockstep mode: worker isolation stays off by default (open-loop is the fast path; pass --isolate-workers to opt in)` | isolated (opt-in; concurrency not applicable, the loop says so); unmet prerequisite refused | not isolated, N=1 |
 
 Dirty checkout: an isolated builder dispatch (`run builder --isolate`)
@@ -272,13 +283,17 @@ The Lead commits only files it or its builders edited under declared
 Design and speed evidence:
 `docs/CONCURRENT-SLICE-EVAL.md`, `docs/ISOLATED-WORKERS-QUALIFICATION.md`.
 
-Root-free (r16): on an open-loop mailbox (`QUEUE.md` present)
-`trioctl omnigent loop` runs every role in the loop's own Lead worktree on
-branch `trio/<mailbox>` and lands the verified result onto the root's
-branch only after SHIP (exit 8 `needs_land` when the land needs you;
-retry with `trioctl omnigent land --mailbox loop/<x>`). Watch it with
-`trioctl omnigent status --mailbox loop/<x>`; `--root-bound` restores the
-pre-r16 behaviour. See `docs/ROOT-FREE-OPEN-LOOP.md`.
+Root-free (r16; lockstep too since r16b): every `loop` (open-loop and
+lockstep) runs in the loop's own Lead worktree on branch `trio/<mailbox>`
+and lands onto the root's branch only after SHIP, so the root `loop/<x>`
+holds the pre-land copy while it runs (exit 8 `needs_land` when the land
+needs you; retry with `trioctl omnigent land --mailbox loop/<x>`). Watch it
+with `trioctl omnigent status --mailbox loop/<x>` (or read STATE.md/LOG.md
+at the live mailbox path it prints), not the root mailbox. `--root-bound`
+was removed in r16b and is refused (exit 2, "root-bound mode was removed in
+r16b", nothing changed — use `trioctl omnigent land`/`abandon` instead); a
+root checkout that is detached with no `--target` is refused the same way.
+See `docs/ROOT-FREE-OPEN-LOOP.md`.
 
 ## Session and anchor hygiene
 

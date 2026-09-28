@@ -23,7 +23,13 @@ not measured causality.
 Default is **off**. Omit `--observe-workers` and the loop writes no
 `.observe/` tree.
 
-Exact opt-in (mailbox name is an example):
+Exact opt-in (mailbox name is an example) — this pin predates r16b's
+root-free refusals: `--observe-workers` on a root-free **open-loop**
+mailbox (any git checkout) now exits 2 ("a root-free open-loop needs
+isolated builders", nothing changed), since it prescribes its own
+non-isolated worker command. Use it on a **lockstep** mailbox (no
+`QUEUE.md`), which still accepts it (lockstep runs non-isolated by
+default anyway), or on an open-loop mailbox outside any git checkout:
 
 ```text
 trioctl omnigent loop --observe-workers --mailbox loop --max-iterations 3
