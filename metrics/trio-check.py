@@ -319,6 +319,8 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
                 "found in PLAN.md `slices:` block"
             )
         repo = str(entry.get("repo") or HOME_REPO).strip()
+        if repo in (".", "./", ""):
+            repo = HOME_REPO  # the home spellings, as the driver reads them
         if repo != HOME_REPO and repo not in repo_names:
             errors.append(
                 f"QUEUE.md retired: entry for slice {slice_id!r} has repo "
