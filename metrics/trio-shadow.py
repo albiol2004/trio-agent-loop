@@ -255,9 +255,13 @@ def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
                 f"unknown --slice id {slice_filter!r}; available slice id(s): "
                 f"{', '.join(available) if available else '(none)'}"
             )
-    repos, _errors = _METRICS.parse_repos_block(
-        text, _METRICS.mailbox_repo_root(plan_path.parent)
-    )
+    declared_for = getattr(_METRICS, "declared_repos_for", None)
+    if declared_for is not None:
+        repos, _errors = declared_for(plan_path.parent, text)
+    else:
+        repos, _errors = _METRICS.parse_repos_block(
+            text, _METRICS.mailbox_repo_root(plan_path.parent)
+        )
     named = {r["name"]: r["path"] for r in repos}
     entries = [analyze_slice(sl, mailbox, named) for sl in slices]
     summary = {
@@ -280,6 +284,24 @@ def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
         "slices": entries,
         "summary": summary,
     }
+
+
+def _live_mailbox_for(mailbox: Path) -> Path:
+    """r16: a root mailbox whose root-free loop runs in a Lead worktree is
+    read from that live copy (the root copy is stale until the loop lands);
+    anything else is returned unchanged."""
+    live_fn = getattr(_METRICS, "live_mailbox", None)
+    if live_fn is None:
+        return mailbox
+    loop_dir = mailbox / "loop" if (mailbox / "loop" / "PLAN.md").is_file() else mailbox
+    live = live_fn(loop_dir)
+    if live is None:
+        return mailbox
+    print(
+        f"trio-shadow.py: {loop_dir} runs root-free; reading its live mailbox {live}",
+        file=sys.stderr,
+    )
+    return live
 
 
 def discover_mailboxes(root: Path) -> list[Path]:
@@ -617,8 +639,9 @@ def main(argv: list[str] | None = None) -> int:
             print(render_drift(agg))
         return 0
 
+    mailbox = _live_mailbox_for(Path(args.mailbox))
     try:
-        report = analyze(Path(args.mailbox), slice_filter=args.slice)
+        report = analyze(mailbox, slice_filter=args.slice)
     except SliceParseError as exc:
         print(f"trio-shadow.py: error: {exc}", file=sys.stderr)
         return 2

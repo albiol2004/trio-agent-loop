@@ -25,8 +25,12 @@ from pathlib import Path
 # fence closing and orphan `- id:`/`- slice:` entry errors (r11h F-FENCE);
 # 5 = declared product repos (r15): `parse_repos_block`/`read_repos`,
 # `slice_repo_name`, `parse_repo_pins`, `parse_full_check`, and the optional
-# `repo:` key of `retired:` entries. A copy without this constant predates it.
-METRICS_API = 5
+# `repo:` key of `retired:` entries; 6 = root-free open-loop (r16):
+# `loop_slug`, `live_mailbox`, the per-run declared-repo aggregate map
+# (`apply_aggregates`, honoured by `read_repos`/`declared_repos_for`) and the
+# loop core's `land=` hook (`needs_land`, exit 8). A copy without this
+# constant predates it.
+METRICS_API = 6
 
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
@@ -808,6 +812,130 @@ def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], li
     return repos, errors
 
 
+# --- r16 root-free open-loop -------------------------------------------------
+# A root-free loop runs in its own Lead worktree (branch `trio/<slug>`); the
+# live mailbox is that worktree's copy of the root mailbox. These helpers are
+# stdlib-only and read the git common dir's `trio-worktrees/` ledger (the
+# same files omnigent/root_free.py writes).
+
+#: Declared-repo aggregate map of a root-free run, inside the live mailbox's
+#: (gitignored) runtime dir: {"repos": {name: {"path", "branch", "main"}}}.
+AGGREGATES_FILE = (".sessions", "aggregates.json")
+
+_LOOP_SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def loop_slug(mailbox_rel: str) -> str:
+    """Branch/ledger slug of a mailbox path relative to its repo root (r16).
+
+    `loop/scenario-basis-and-months` -> `loop--scenario-basis-and-months`
+    (branch `trio/<slug>`, ledger record `lead-<slug>`). Dots and any other
+    character outside `[A-Za-z0-9_-]` become `-`, so the result is always a
+    valid single git ref component. Must equal omnigent/root_free.py's.
+    """
+    text = str(mailbox_rel).strip().strip("/").replace("/", "--")
+    return (_LOOP_SLUG_RE.sub("-", text).strip("-") or "loop")[:120]
+
+
+def _git_common_dir(path: Path) -> Path | None:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    value = proc.stdout.strip()
+    return Path(value) if proc.returncode == 0 and value else None
+
+
+def lead_record(loop_dir: Path) -> dict | None:
+    """The r16 Lead-worktree ledger record of the ROOT mailbox *loop_dir*, or None.
+
+    Only a record still in use (not ``removed``) whose ``mailbox_rel`` names
+    this mailbox counts. Never raises.
+    """
+    try:
+        loop_dir = Path(loop_dir).resolve()
+        root = mailbox_repo_root(loop_dir)
+        if root is None:
+            return None
+        rel = loop_dir.relative_to(root).as_posix()
+        common = _git_common_dir(root)
+        if common is None:
+            return None
+        path = common / "trio-worktrees" / f"lead-{loop_slug(rel)}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not isinstance(data, dict) or data.get("kind") != "lead":
+        return None
+    if data.get("state") == "removed" or data.get("mailbox_rel") != rel:
+        return None
+    return data
+
+
+def live_mailbox(loop_dir: Path) -> Path | None:
+    """Where a root-free loop keeps the live copy of mailbox *loop_dir* (r16).
+
+    None when *loop_dir* has no Lead worktree (a lockstep, root-bound or
+    finished loop) or already is the live copy. Never raises.
+    """
+    record = lead_record(loop_dir)
+    if record is None:
+        return None
+    live = record.get("live_mailbox")
+    if not isinstance(live, str) or not live:
+        return None
+    live_path = Path(live)
+    try:
+        if live_path.resolve() == Path(loop_dir).resolve() or not live_path.is_dir():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return live_path
+
+
+def apply_aggregates(loop_dir: Path, repos: list[dict]) -> list[dict]:
+    """Map declared repos onto this run's aggregates (r16 `aggregate_for`).
+
+    A root-free run records, per declared repo, the checkout that is the
+    loop's aggregate for it (a worktree on branch `trio/<slug>`); every
+    pin/merge/gate for that repo then uses it: its `path` becomes the
+    aggregate, its `base` the aggregate branch, and `main_path` keeps the
+    declared checkout. Without the map (every non-root-free run) *repos* is
+    returned unchanged.
+    """
+    path = Path(loop_dir).joinpath(*AGGREGATES_FILE)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return repos
+    table = data.get("repos") if isinstance(data, dict) else None
+    if not isinstance(table, dict):
+        return repos
+    out: list[dict] = []
+    for repo in repos:
+        entry = table.get(repo.get("name"))
+        if isinstance(entry, dict) and entry.get("path"):
+            repo = dict(repo)
+            repo["main_path"] = repo["path"]
+            repo["path"] = Path(entry["path"])
+            if entry.get("branch"):
+                repo["base"] = entry["branch"]
+        out.append(repo)
+    return out
+
+
+def declared_repos_for(loop_dir: Path, plan_text: str) -> tuple[list[dict], list[str]]:
+    """`parse_repos_block` for the mailbox *loop_dir*, aggregates applied (r16)."""
+    repos, errors = parse_repos_block(plan_text, mailbox_repo_root(loop_dir))
+    return apply_aggregates(loop_dir, repos), errors
+
+
 def read_repos(loop_dir: Path) -> dict:
     """Declared repos of a mailbox; never raises.
 
@@ -822,6 +950,7 @@ def read_repos(loop_dir: Path) -> dict:
     except OSError:
         return {"root": root, "repos": [], "errors": [], "declared": False}
     repos, errors = parse_repos_block(text, root)
+    repos = apply_aggregates(loop_dir, repos)
     return {
         "root": root,
         "repos": repos,

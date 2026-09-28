@@ -74,8 +74,9 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 #: The sibling trio-metrics.py contract this checker calls into
 #: (``METRICS_API``; 4 = ``find_queue_block(..., errors=)``, r11h; 5 =
-#: declared repos, r15). Must equal omnigent/trioctl ``REQUIRED_METRICS_API``.
-REQUIRED_METRICS_API = 5
+#: declared repos, r15; 6 = root-free open-loop, r16). Must equal
+#: omnigent/trioctl ``REQUIRED_METRICS_API``.
+REQUIRED_METRICS_API = 6
 
 
 class MetricsApiMismatch(ImportError):
@@ -988,6 +989,22 @@ def render(loops: list[dict], root: Path, summary: dict) -> str:
     return "\n".join(lines)
 
 
+def _live_loop_dirs(tm, loop_dirs: list[Path]) -> list[Path]:
+    """r16: a root mailbox whose root-free loop runs in a Lead worktree is
+    checked in that live copy (the root copy is stale until the loop lands)."""
+    live_fn = getattr(tm, "live_mailbox", None)
+    out: list[Path] = []
+    for loop_dir in loop_dirs:
+        live = live_fn(loop_dir) if live_fn is not None else None
+        if live is not None:
+            print(
+                f"trio-check: {loop_dir} runs root-free; checking its live mailbox {live}",
+                file=sys.stderr,
+            )
+        out.append(live or loop_dir)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check trio-agent-loop mailboxes against MAILBOX-SCHEMA.md.",
@@ -1020,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"trio-check: {exc}", file=sys.stderr)
         return 2
     root = Path(args.path).expanduser().resolve()
-    loops = [inspect_loop(p, tm) for p in tm.discover_loops(root)]
+    loops = [inspect_loop(p, tm) for p in _live_loop_dirs(tm, tm.discover_loops(root))]
     summary = summarize(loops)
 
     prompt_ok, prompt_lines = (True, []) if args.no_prompt_sync else check_prompt_sync(root)
