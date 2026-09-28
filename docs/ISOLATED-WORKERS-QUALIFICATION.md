@@ -224,3 +224,19 @@ touched and still refuses the worktree. At the aggregate root a tracked
 config modified ONLY by session-bound Omnigent entries (the Lead launch's
 merge) is listed as ignored by the dirty-checkout gate instead of blocking
 dispatch as a foreign change; any other edit to it still blocks.
+
+### Declared product repos (r15)
+
+`run builder --isolate` looks up the slice's PLAN.md `repo:`. For a
+declared `repos:` repo it creates the worktree from that repo (refusing a
+checkout that is not on its `base:` branch), under the sibling root
+`<state>/worktrees/<repo>-<sha256(git common dir)[:12]>/` next to the home
+repo's (`--worktree-root` names the home root; declared repos get
+siblings), with the ledger record (`repo_name`, `declared_writes`) in that
+repo's `.git/trio-worktrees/`, and merges back onto the base branch. The
+aggregate-dirty check uses only that repo's slices' `writes:`. The JSON
+line adds `repo_name` and `repo`. Cleanup walks every declared repo's
+ledger and accepts a record only against its own repo's verified pin. The
+live failure this closes: a builder committed in a gitignored nested clone,
+the home merge was empty (`merge_commit == base`), the Lead retired at a
+clone sha the home repo does not know, and the slice-eval bind degraded.

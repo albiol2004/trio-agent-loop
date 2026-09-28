@@ -242,3 +242,19 @@ Choosing the budget:
 Examples: a 220 s suite needs about 300 (1.3 × 220 = 286) when it runs
 cross-cutting. An 84 s suite is under 120 s by the 1.3× rule (109 s), but it
 leaves only about 36 s of slack, so 150 is the safer value.
+
+## Multi-repo slices (r15)
+
+When PLAN.md declares `repos:` (MAILBOX-SCHEMA.md "Declared repos (r15)"),
+a retired entry's `repo:` names the repo its sha lives in. The loop core
+puts it in the slice-eval context (`repo`), and trioctl binds the detached
+eval worktree from THAT repo (its own ledger and
+`<state>/worktrees/<repo>-<hash>/` root), so concurrent slice-evals of
+different repos never share a checkout. A context without `repo` (an older
+core) falls back to the slice's PLAN.md `repo:`; a failed bind degrades
+exactly as before. The Lead's gate is one per repo the pass changed (LOG
+suffix `gate: PASS @<repo>:<sha>`; home keeps `gate: PASS @<sha>`), and
+`full_check:` may be a `<repo>: <command>` mapping, each command run from
+its repo's root. The integration eval pins one sha per repo
+(`evaluated_repos` in STATE.md, `evaluated: home@<sha>, <repo>@<sha>` in
+VERDICT.md) and fences worker merges in every repo while it grades.

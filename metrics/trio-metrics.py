@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -586,6 +587,362 @@ def parse_slices_block(plan_text: str) -> list[dict] | None:
         return None
 
 
+# --- Declared product repos (r15 multi-repo slices) --------------------------
+# MAILBOX-SCHEMA.md "Declared repos (r15)". The mailbox repo (the git repo
+# holding loop/<mailbox>/) is the implicit `home` repo. PLAN.md may declare
+# further product repos in its own ```yaml fence whose top-level key is
+# `repos:`; a slice names its repo with `repo: <name>` (default `home`) and
+# its `writes:` are relative to that repo's root. No block (or `repos: []`)
+# is single-repo mode, byte-identical to earlier releases: a slice's `repo:`
+# then keeps its pre-r15 meaning (a path relative to the mailbox dir).
+
+HOME_REPO = "home"
+REPO_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+REPOS_KEY_RE = re.compile(r"^repos\s*:\s*(.*)$")
+REPOS_ENTRY_RE = re.compile(r"^\s+-\s+(.*)$")
+REPOS_FIELD_RE = re.compile(r"^\s+([a-z_]+)\s*:\s*(.*)$")
+REPOS_KEYS = ("name", "path", "base")
+#: `repo@sha` (an `evaluated:`/`commit:` item) or a bare sha (= home).
+REPO_PIN_RE = re.compile(r"^(?:([a-z0-9]+(?:-[a-z0-9]+)*)@)?([0-9a-fA-F]{7,40})$")
+FULL_CHECK_KEY_RE = re.compile(r"^full_check\s*:\s*(.*)$")
+FULL_CHECK_ITEM_RE = re.compile(r"^([a-z0-9]+(?:-[a-z0-9]+)*)\s*:\s+(\S.*)$")
+
+
+def _yaml_scalar(value: str) -> str:
+    """A plain or quoted YAML scalar with an optional trailing `# comment`."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def find_repos_block(plan_text: str) -> list[str] | None:
+    """Lines of the first ```yaml fence whose column-0 key is `repos:`, or None."""
+    in_fence = yaml_fence = False
+    buf: list[str] = []
+    for raw in plan_text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                if yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
+                    return buf
+                in_fence = yaml_fence = False
+            else:
+                in_fence = True
+                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
+            buf = []
+            continue
+        if in_fence and yaml_fence:
+            buf.append(raw)
+    if in_fence and yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
+        return buf
+    return None
+
+
+def mailbox_repo_root(loop_dir: Path) -> Path | None:
+    """The git repo containing *loop_dir* -- the implicit `home` repo: its
+    nearest ancestor (or itself) holding a `.git` entry (directory, or file
+    for a worktree/submodule). None outside any git repo."""
+    here = Path(loop_dir).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _safe_resolve(path: Path) -> Path:
+    """``path.resolve()``, or the absolute unresolved path on a symlink loop."""
+    try:
+        return path.resolve()
+    except (RuntimeError, OSError):
+        return Path(os.path.abspath(path))
+
+
+def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], list[str]]:
+    """Parse and validate PLAN.md's optional `repos:` block (r15 item 1).
+
+    Returns (repos, errors). Absent block, or `repos: []`, is ([], []) --
+    single-repo mode. Each repo is {"name", "path" (resolved Path),
+    "raw_path", "base" (str or None)}. Entries are `- key: value` list
+    items with keys in any order, or flow maps `- {name: a, path: b}`;
+    names are kebab-case and unique; `home` is reserved for the mailbox
+    repo *root* (an entry naming it must point there and is dropped: home
+    is implicit); every other path (relative to *root*, or absolute; only
+    `~` expands, never `$VARS`) must be an existing git repo other than the
+    home repo, and no two names may share a path.
+    """
+    lines = find_repos_block(plan_text)
+    if lines is None:
+        return [], []
+    errors: list[str] = []
+    entries: list[dict] = []
+    in_block = False
+    for i, raw in enumerate(lines, 1):
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        m = REPOS_KEY_RE.match(raw)
+        if m:
+            value = _yaml_scalar(m.group(1))
+            if value == "[]":
+                return [], []
+            if value:
+                errors.append(
+                    f"PLAN.md repos: line {i}: expected `repos:` followed by "
+                    "`- name:` entries"
+                )
+                return [], errors
+            in_block = True
+            continue
+        if not raw[:1].isspace():
+            in_block = False  # another top-level key ends the block
+            continue
+        if not in_block:
+            continue
+        m = REPOS_ENTRY_RE.match(raw)
+        if m:
+            # A new list item: `- name: x` (any first key) or a flow map
+            # `- {name: x, path: y}`; keys may come in any order.
+            body = m.group(1).strip()
+            entry: dict = {"line": i}
+            entries.append(entry)
+            if body.startswith("{") and body.endswith("}"):
+                pairs = [p for p in body[1:-1].split(",") if p.strip()]
+            else:
+                pairs = [body]
+            for pair in pairs:
+                key, sep, value = pair.partition(":")
+                key = key.strip()
+                if not sep or key not in REPOS_KEYS:
+                    errors.append(
+                        f"PLAN.md repos: line {i}: unexpected key {key!r} "
+                        "(expected name, path, base)"
+                    )
+                elif key in entry:
+                    errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
+                else:
+                    entry[key] = _yaml_scalar(value)
+            continue
+        m = REPOS_FIELD_RE.match(raw)
+        if m and entries:
+            key, value = m.group(1), _yaml_scalar(m.group(2))
+            if key not in REPOS_KEYS:
+                errors.append(
+                    f"PLAN.md repos: line {i}: unexpected key {key!r} "
+                    "(expected name, path, base)"
+                )
+            elif key in entries[-1]:
+                errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
+            else:
+                entries[-1][key] = value
+            continue
+        errors.append(
+            f"PLAN.md repos: line {i}: unexpected content {raw.strip()!r}"
+        )
+    repos: list[dict] = []
+    seen: set[str] = set()
+    seen_paths: dict[Path, str] = {}
+    for entry in entries:
+        name = entry.get("name", "")
+        where = f"PLAN.md repos: {name!r}"
+        if not name:
+            errors.append(f"PLAN.md repos: line {entry['line']}: entry has no `name:`")
+            continue
+        if not REPO_NAME_RE.match(name):
+            errors.append(f"{where}: name must be kebab-case")
+            continue
+        if name in seen:
+            errors.append(f"{where}: duplicate name")
+            continue
+        seen.add(name)
+        raw_path = entry.get("path", "")
+        if not raw_path:
+            errors.append(f"{where}: missing `path:`")
+            continue
+        if "$" in raw_path:
+            # Only `~` expands; environment variables never do (a silent
+            # `<root>/$VAR` would name a different directory).
+            errors.append(
+                f"{where}: path {raw_path!r} uses an environment variable; "
+                "only `~` expands -- write the path out"
+            )
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            if root is None:
+                errors.append(f"{where}: relative path but no mailbox repo")
+                continue
+            path = root / path
+        path = _safe_resolve(path)
+        if name == HOME_REPO:
+            if root is None or path != root:
+                errors.append(
+                    f"{where}: `home` is reserved for the mailbox repo ({root})"
+                )
+            continue
+        if root is not None and path == root:
+            errors.append(
+                f"{where}: path {path} is the mailbox repo itself; it is the "
+                "implicit `home` repo"
+            )
+            continue
+        if path in seen_paths:
+            errors.append(
+                f"{where}: path {path} is already declared as {seen_paths[path]!r}"
+            )
+            continue
+        seen_paths[path] = name
+        if not path.is_dir():
+            errors.append(f"{where}: path {path} does not exist")
+            continue
+        if not (path / ".git").exists():
+            errors.append(f"{where}: path {path} is not a git repository")
+            continue
+        repos.append({
+            "name": name, "path": path, "raw_path": raw_path,
+            "base": entry.get("base") or None,
+        })
+    return repos, errors
+
+
+def read_repos(loop_dir: Path) -> dict:
+    """Declared repos of a mailbox; never raises.
+
+    {"root": <home repo root or None>, "repos": [...declared, home excluded],
+    "errors": [...], "declared": <True when PLAN.md has a non-empty block>}.
+    Missing/unreadable PLAN.md is single-repo mode.
+    """
+    loop_dir = Path(loop_dir).resolve()
+    root = mailbox_repo_root(loop_dir)
+    try:
+        text = (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"root": root, "repos": [], "errors": [], "declared": False}
+    repos, errors = parse_repos_block(text, root)
+    return {
+        "root": root,
+        "repos": repos,
+        "errors": errors,
+        "declared": bool(repos or errors),
+    }
+
+
+def slice_repo_name(sl: dict, repo_names) -> str | None:
+    """The declared repo a parsed slice belongs to: `home` for a missing,
+    `.`, or `home` value, the name itself when *repo_names* declares it,
+    else None (a pre-r15 path-valued `repo:`, or an undeclared name)."""
+    value = str(sl.get("repo") or ".").strip()
+    if value in (".", "./", HOME_REPO, ""):
+        return HOME_REPO
+    return value if value in set(repo_names or ()) else None
+
+
+def parse_repo_pins(values) -> list[tuple[str, str]]:
+    """`repo@sha` items of `evaluated:`/`commit:` field values.
+
+    Each value may hold one item or several separated by commas and/or
+    whitespace; a bare sha is the home repo's. Items that are not a
+    `[<repo>@]<7-40 hex>` pin are skipped. Returns [(repo, lowercase sha)].
+    """
+    pins: list[tuple[str, str]] = []
+    for value in values or ():
+        for item in re.split(r"[,\s]+", str(value).strip().strip("`")):
+            item = item.strip().strip("`")
+            if not item:
+                continue
+            m = REPO_PIN_RE.match(item)
+            if m:
+                pins.append((m.group(1) or HOME_REPO, m.group(2).lower()))
+    return pins
+
+
+def _full_check_section(plan_text: str) -> list[str]:
+    """PLAN.md lines from a column-0 `full_check:` key to the next column-0
+    line (or heading/fence), inclusive of the key line; [] when absent."""
+    lines = plan_text.splitlines()
+    in_fence = False
+    for index, raw in enumerate(lines):
+        if raw.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not FULL_CHECK_KEY_RE.match(raw):
+            continue
+        out = [raw]
+        for follow in lines[index + 1:]:
+            if not follow.strip():
+                break
+            if not follow[:1].isspace():
+                break
+            out.append(follow)
+        return out
+    return []
+
+
+def parse_full_check(plan_text: str) -> tuple[dict[str, str], list[str]]:
+    """PLAN.md `full_check:` (under `## Verification standard`) per repo.
+
+    Accepted shapes (r15 item 5): a string -- inline (`full_check: <cmd>`)
+    or on indented continuation lines -- is the home repo's command
+    (today's meaning); a flow mapping `full_check: { app-backend: "<cmd>",
+    home: "<cmd>" }`; or a block mapping of indented `<repo>: <cmd>` lines.
+    Returns ({repo: command}, errors); ({}, []) when there is no
+    `full_check:` line. Repo names are not checked against `repos:` here
+    (see trio-check.py).
+    """
+    section = _full_check_section(plan_text)
+    if not section:
+        return {}, []
+    head = FULL_CHECK_KEY_RE.match(section[0]).group(1).strip()
+    rest = [ln.strip() for ln in section[1:] if ln.strip()]
+    errors: list[str] = []
+    checks: dict[str, str] = {}
+
+    def add(name: str, command: str) -> None:
+        command = _unquote(command.strip())
+        if not REPO_NAME_RE.match(name):
+            errors.append(f"PLAN.md full_check: repo key {name!r} is not kebab-case")
+        elif name in checks:
+            errors.append(f"PLAN.md full_check: duplicate repo key {name!r}")
+        elif not command:
+            errors.append(f"PLAN.md full_check: repo {name!r} has an empty command")
+        else:
+            checks[name] = command
+
+    if head.startswith("{"):
+        body = " ".join([head, *rest])
+        if not body.endswith("}"):
+            return {}, ["PLAN.md full_check: flow mapping `{ ... }` is not closed"]
+        try:
+            items = _split_flow_items(body[1:-1], 0, "full_check mapping")
+        except SliceParseError as exc:
+            return {}, [f"PLAN.md full_check: {exc}".replace("line 0: ", "")]
+        for item in items:
+            key, sep, value = item.partition(":")
+            if not sep:
+                errors.append(f"PLAN.md full_check: mapping item {item.strip()!r} has no `:`")
+                continue
+            add(key.strip(), value)
+        return checks, errors
+    if head:
+        command = " ".join([_unquote(head), *rest]).strip()
+        return {HOME_REPO: command}, []
+    if not rest:
+        return {}, ["PLAN.md full_check: has no command"]
+    mapping = [FULL_CHECK_ITEM_RE.match(ln) for ln in rest]
+    if all(mapping):
+        for m in mapping:
+            add(m.group(1), m.group(2))
+        return checks, errors
+    if any(mapping) and mapping[0]:
+        errors.append(
+            "PLAN.md full_check: mixes `<repo>: <cmd>` lines with plain "
+            "command lines"
+        )
+        return {}, errors
+    return {HOME_REPO: " ".join(rest)}, []
+
+
 # --- QUEUE.md parsing (v1 open-loop extension) -------------------------------
 # MAILBOX-SCHEMA.md "v1 open-loop extension (optional)": QUEUE.md carries two
 # independent fenced ```yaml blocks, `retired:` (Lead-appended) and `faults:`
@@ -1119,6 +1476,11 @@ def parse_retired(
     malformed: set[str] | None = None,
 ) -> list[dict]:
     """Parse a `retired:` block into `{"slice", "sha", "at"}` dicts.
+
+    r15: an entry may carry an optional `repo:` key (conventionally
+    between `slice:` and `sha:`) naming the declared PLAN.md `repos:` repo
+    its sha lives in; it is kept as-is in the dict, and an entry without it
+    is the home (mailbox) repo's -- existing mailboxes parse unchanged.
 
     Strict (raises QueueParseError) unless an `errors` list is passed, in
     which case malformed entries are dropped and reported there, and the
@@ -1768,21 +2130,26 @@ def _covers(a: str, b: str) -> bool:
 
 
 def iteration_path_sets(slices: list[dict] | None) -> dict:
-    """Map iteration number -> {"writes": set, "reads": set} of product paths."""
+    """Map iteration number -> {"writes": set, "reads": set} of product paths.
+
+    Paths of a slice whose `repo:` is not the mailbox repo (`.`/`home`) are
+    qualified as `<repo>:<path>` (r15: disjointness is per repo)."""
     sets: dict[int, dict] = {}
     for sl in slices or []:
         n = sl.get("iteration")
         if n is None:
             continue
+        repo = str(sl.get("repo") or ".").strip()
+        prefix = "" if repo in (".", "./", HOME_REPO, "") else f"{repo}:"
         entry = sets.setdefault(n, {"writes": set(), "reads": set()})
         for p in sl.get("writes") or []:
             np = _norm_declared_path(p)
             if np:
-                entry["writes"].add(np)
+                entry["writes"].add(prefix + np)
         for p in sl.get("reads") or []:
             np = _norm_declared_path(p)
             if np:
-                entry["reads"].add(np)
+                entry["reads"].add(prefix + np)
     return sets
 
 

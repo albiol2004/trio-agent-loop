@@ -4,8 +4,9 @@ Spec r15 item 7 ("refuse rather than limp"): a slice whose `writes:` or
 builder-brief `## Targeted check` `cd` resolves outside the mailbox repo
 (absolute elsewhere, `..` escape, or a gitignored nested clone with its own
 `.git`) and is not covered by a declared `repos:` entry makes trio-check
-exit 2 with one exact line per slice. A declared `repos:` block is parsed,
-validated, and refused as a whole by this release.
+exit 2 with one exact line per slice. Since r15 multi-repo, a declared
+`repos:` block is parsed and validated, and a slice that names its repo
+passes (tests/test_r15_multi_repo_check.py covers the declared mode).
 """
 from __future__ import annotations
 
@@ -23,12 +24,6 @@ GIT_ENV = {
     "GIT_COMMITTER_NAME": "Trio Test",
     "GIT_COMMITTER_EMAIL": "trio@example.invalid",
 }
-UNSUPPORTED = (
-    "repos: declared but multi-repo slices are not supported by this "
-    "release (r15 pending)"
-)
-
-
 def message(slice_id: str, path: Path | str) -> str:
     return (
         f"slice {slice_id} writes outside the mailbox repo ({path}); declare "
@@ -200,13 +195,31 @@ repos:
 """
 
 
-def test_declared_repos_refused_as_unsupported(tmp_path):
+REPO_SLICE = (
+    "  - id: bridge\n    repo: app-backend\n    writes: [app/x.py]\n    reads: []\n"
+)
+REPO_BRIEF = "# Brief\n\n## Targeted check\n\ncd app && python3 -m pytest -q\n"
+
+
+def test_declared_repos_supported_since_r15(tmp_path):
+    """The r15 guard's "not supported" refusal is lifted: a slice that
+    names its declared repo (writes relative to it) passes."""
+    home = make_home(tmp_path, plan(OK_SLICE + REPO_SLICE, REPOS), {"bridge": REPO_BRIEF})
+    proc = check(home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert refusal_lines(proc) == []
+
+
+def test_declared_repos_home_slice_into_clone_is_cross_repo(tmp_path):
+    """A home slice still may not write into the (now declared) clone."""
     home = make_home(tmp_path, plan(OK_SLICE + NESTED_SLICE, REPOS), {"bridge": NESTED_BRIEF})
     proc = check(home)
     assert proc.returncode == 2
-    # The nested clone is covered by the declaration, so only the
-    # release-level refusal remains.
-    assert refusal_lines(proc) == [UNSUPPORTED]
+    target = home / "app-backend" / "app" / "x.py"
+    assert refusal_lines(proc) == [
+        f"slice bridge of repo home touches repo app-backend ({target}); one "
+        "repo per slice: split it (depends_on: across repos is fine) (r15)"
+    ]
 
 
 def test_declared_repos_empty_list_is_single_repo(tmp_path):
@@ -232,8 +245,7 @@ def test_repos_block_validated(tmp_path, block, error):
     proc = check(home)
     assert proc.returncode == 2
     lines = refusal_lines(proc)
-    assert lines[-1] == UNSUPPORTED
-    assert any(error in ln for ln in lines[:-1]), lines
+    assert any(error in ln for ln in lines), lines
 
 
 def test_json_report_carries_refusals(tmp_path):

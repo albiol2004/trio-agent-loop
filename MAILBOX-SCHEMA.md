@@ -150,7 +150,11 @@ for the iteration:
 - **`full_check:`** (required): one plain line naming the exact whole-tree
   command(s) that are the full check — the full test command plus the
   typecheck/lint when the repository has one, e.g.
-  `full_check: cd api && npm test && npm run typecheck`. Optional
+  `full_check: cd api && npm test && npm run typecheck`. With declared
+  `repos:` (r15) it may instead be a per-repo mapping -- flow
+  `full_check: { app-backend: "pytest -q", home: "make test" }` or
+  indented `<repo>: <command>` lines -- each command run from its repo's
+  root; a plain string stays the home repo's command. Optional
   `full_check_budget_s: <n>` overrides the default 120 s wall-clock budget.
   In open-loop the Lead's whole-tree gate after the last retirement is
   proportional: skipped when no product code changed since the last
@@ -250,7 +254,7 @@ One list entry per slice. The restricted shape is exactly:
 | Field | Required | Type | Meaning |
 |---|---|---|---|
 | `id` | yes | kebab-case string | slice identifier; also prefixes the slice's commit messages |
-| `repo` | no (default `.`) | path | target repo, relative to the mailbox root — `.` is the coordination repo; other repos are siblings it references |
+| `repo` | no (default `.` = `home`) | name (r15) or path | with a PLAN.md `repos:` block: `home` (also `.`) or a declared repo name — the repo the slice's `writes:` are relative to (see "Declared repos (r15)"); without one: `.`/`home` only (the r15 guard refuses a path elsewhere) |
 | `writes` | yes | list of paths and/or `api:<Name>` | files (or directories) the slice may touch; `api:` entries name interfaces, not paths |
 | `reads` | yes (may be `[]`) | list of paths and/or `api:<Name>` | inputs the slice needs frozen before it may be dispatched |
 | `gate` | no (default `false`) | bool | foundation slice: never speculated, regardless of predictor state |
@@ -357,6 +361,11 @@ never on ITERATE/NEEDS_HUMAN/BLOCKED). The pattern is exactly two commits:
 - **Mailbox commit** — the mailbox files (`loop/`):
   `loop: iteration N — SHIP`.
 
+With declared `repos:` (r15) the product side is per repo: one empty
+`loop: iteration N — SHIP (<mailbox>)` commit in each declared repo that
+has slices, recorded as `commit: <repo>@<full sha>`, before the home
+mailbox commit (see "Declared repos (r15)").
+
 The Evaluator appends a `commit: <full sha>` line per product commit to
 `VERDICT.md` before the mailbox commit, so the verdict records what was
 committed. **Foreign-path rule**: a modified file that is not attributable to
@@ -413,6 +422,13 @@ retired:
 Each entry has exactly these three keys, in this order: `slice:`, `sha:`,
 `at:`. The key is `sha:` — never `merge_commit:` (that is the builder JSON
 field the value comes from); any other key makes the entry malformed.
+**r15**: an entry for a slice of a declared `repos:` repo carries a fourth
+key, `repo: <name>`, between `slice:` and `sha:`; its `sha` is a commit of
+that repo and `at:` its committer time there (`git -C <repo> log -1
+--format=%cI <sha>`). Omitted means `home`, so existing mailboxes parse
+unchanged; trio-check flags a `repo:` that is undeclared or differs from
+the slice's PLAN.md `repo:`. `faults:` entries are unchanged (the slice id
+implies the repo).
 
 `retired:` is **append-only, Lead only**: the Lead is the only role that
 appends an entry, and no role ever edits or removes an existing one. The
@@ -721,17 +737,79 @@ mean open-loop artifact matching is qualified.
 It is always singular (one loop per session) and never inside a worktree:
 mailbox files are the coordination surface, not build artifacts.
 Multi-repo projects are handled by the slice schema, not by extra
-mailboxes: each slice declares `repo:` — the repo it writes to, defaulting
-to the coordination repo. Tooling resolves `repo:` relative to the mailbox
-root: the project directory passed to it (the one containing `loop/`), or
-the loop directory itself when pointed at directly. **This release does
-not run slices in another repo** — see "Repo scope (r15 guard)".
+mailboxes: PLAN.md declares the product repos (`repos:`, below) and each
+slice names its repo with `repo:`, defaulting to the coordination repo
+(`home`). See "Declared repos (r15)" and "Repo scope (r15 guard)".
+
+### Declared repos (r15)
+
+The mailbox repo (the git repo containing the mailbox dir) is the implicit
+**`home`** repo. The main session declares further product repos with the
+GOAL, in PLAN.md's own ```yaml fence whose top-level key is `repos:`:
+
+```yaml
+repos:
+  - name: app-backend            # kebab-case, unique; `home` is reserved
+    path: app-backend            # relative to the mailbox repo root, or absolute
+    base: feat/cp-gold-only-obo  # branch builders branch from and merge onto
+```
+
+No block (or `repos: []`) is single-repo mode, byte-identical to earlier
+releases. Keys may come in any order or as a flow map (`- {name: a, path:
+b}`); only `~` expands in `path:` (never `$VARS`); every path must be an
+existing git repo, no two names may share one, and no non-`home` name may
+point at the mailbox repo. `base:` defaults to the checkout's current
+branch; when given, a builder dispatch refuses a repo whose checkout is on
+another branch.
+
+- **Slice ↔ repo**: `repo: <name>` (default `home`); `writes:` are relative
+  to that repo's root; one repo per slice (`depends_on:` across repos is
+  fine); disjoint writes are judged per repo.
+- **Isolation per repo**: a slice's builder (and slice-eval) worktree is
+  created from its repo (`git -C <path> worktree add`) under
+  `<state>/worktrees/<name>-<sha256(git common dir)[:12]>/`, a sibling of the
+  home repo's root; its ledger record lives in that repo's
+  `.git/trio-worktrees/` with `repo_name`, and its merge lands on the repo's
+  `base` branch. `.cursor` neutralisation, rebuildable/retention/cleanup
+  rules are unchanged. The builder's targeted check runs from its worktree
+  root, so every `cd` in it is relative (an absolute `cd` into the repo's
+  main checkout is refused). The builder's JSON line carries `repo_name` and
+  `repo`; recover a retained one with `omnigent worktrees integrate <id>
+  --repo <repo path>` (or `--mailbox <dir>`, which finds the ledger).
+- **Retire**: `retired:` entries gain `repo:` (see `QUEUE.md`).
+- **Gate**: one Lead whole-tree gate per repo the pass changed, each with
+  its own skip rule; the LOG.md line ends with every outcome joined by
+  `; ` — home keeps `gate: PASS @<sha>` (so the historical grep is
+  unchanged), a declared repo is `gate: PASS @<repo>:<sha>` (FAIL likewise;
+  `gate: skipped (<repo>: no product change since <sha>)`). REPORT.md
+  `## Whole-tree gate` rows carry the repo. `full_check:` may be per repo
+  (see "Verification standard").
+- **Evals**: a slice-eval pins `(repo, sha)` and binds its worktree from
+  that repo. The integration eval pins one sha per repo: STATE.md keeps
+  `evaluated_sha` (home) plus `evaluated_repos: <repo>@<sha> ...`, and
+  VERDICT.md records one field line `evaluated: home@<sha>, <repo>@<sha>,
+  ...` (single-repo stays a bare sha). Worker merges are fenced in every
+  repo while it grades. It runs each repo's `full_check:` from that repo's
+  root and any `lead_integration:` smoke in home.
+- **SHIP retirement**: in each declared repo that has slices, one empty
+  `loop: iteration N — SHIP (<mailbox>)` commit on its base branch
+  (recorded as `commit: <repo>@<sha>`), plus the home mailbox commit
+  listing every `commit: <repo>@<sha>`. The driver accepts the SHIP only
+  when every repo's pin is recorded, its product tree is unchanged since
+  the pin, its `commit:` lines are reachable, and its retirement commit
+  descends from the pin; post-SHIP cleanup removes each repo's worktrees
+  against that repo's pin.
+- **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`;
+  `trioctl` still drives a METRICS_API 4 set for single-repo mailboxes and
+  refuses a `repos:` PLAN with it (loop `status: error`, nothing
+  dispatched).
 
 ### Repo scope (r15 guard)
 
 Worktrees, retire shas, the whole-tree gate and the eval pin all resolve
-in the **mailbox repo** (the git repo containing the mailbox dir). A slice
-that writes anywhere else is refused, never limped through (silent Lead
+in the **slice's repo**: the mailbox repo, or (with `repos:`) the declared
+repo its `repo:` names. A slice that writes anywhere else is refused,
+never limped through (silent Lead
 take-over, empty aggregate merges, unresolvable retire shas). A slice is
 *outside* when its `repo:`, any `writes:` path (resolved against the
 mailbox repo root; `api:` entries excluded), or any `cd` in its builder
@@ -766,16 +844,19 @@ and again around every Lead/repair pass: it appends `- iter N | loop |
 `trioctl omnigent run builder --isolate` checks its slice and its
 `--prompt-file` brief and exits 2 before creating a worktree.
 
-**`repos:` is reserved.** A PLAN.md fenced ```yaml block whose top-level
-key is `repos:` is parsed and validated (entries `- name:` kebab-case and
-unique, `path:` relative to the mailbox repo root or absolute, an existing
-git repo, optional `base:`; keys in any order or as a flow map
-`- {name: a, path: b}`; only `~` expands, never `$VARS`; two names may not
-share a path and a non-`home` name may not point at the mailbox repo;
-`home` is reserved for the mailbox repo) and
-then refused as a whole with `repos: declared but multi-repo slices are
-not supported by this release (r15 pending)` — same exits as above — so
-no loop half-uses it. `repos: []` equals no block.
+**With `repos:` declared**, each slice is checked against its own repo
+instead: `writes:` resolve against that repo's root and must stay in it,
+and its brief's targeted-check directories start at that root and must
+stay in the same repo — relative only for a declared repo (an absolute
+path is its main checkout, not the builder's worktree). Refusal lines:
+`slice <id> of repo <r> touches repo <other> (<path>); one repo per slice:
+split it ...`, `slice <id> writes outside its repo <r> (<path>); ...`,
+`slice <id> targeted check cds into the main checkout of repo <r>
+(<path>); ...`, `slice <id> repo: '<x>' is not declared in PLAN.md repos:
+...`; an invalid block, a `full_check:` key naming no declared repo, or a
+per-repo `full_check:` command that leaves its repo is refused too. A home
+slice that writes into an undeclared nested clone still gets the exact
+single-repo line above. `repos: []` equals no block.
 
 ## Session sidecar
 
@@ -841,6 +922,16 @@ absence is never a violation.
 
 ## Changelog
 
+- **METRICS_API 5** (r15 multi-repo slices): `trio-metrics.py` gains
+  `parse_repos_block`/`read_repos`/`mailbox_repo_root`, `slice_repo_name`,
+  `parse_repo_pins` and `parse_full_check`; `retired:` entries may carry
+  `repo:`. The loop core pins, verifies and retires per declared repo
+  (`evaluated_repos` STATE.md key; `LOOP_CORE_API` stays 2 -- additive).
+  `trioctl` (`REQUIRED_METRICS_API = 5`, `COMPATIBLE_METRICS_APIS = (4,
+  5)`) still drives a vendored API-4 set for single-repo mailboxes and
+  refuses a `repos:` PLAN with it; `trio-check.py` requires 5. The r15
+  guard's "not supported" refusal is lifted; the undeclared-path refusal
+  stays.
 - **r15 guard** (no METRICS_API bump; lives in `trio-check.py` and
   `trioctl`, not the loop core): slices writing outside the mailbox repo
   and any PLAN.md `repos:` block are refused ("Repo scope (r15 guard)").

@@ -18,11 +18,13 @@ runs its `--check` mode so drift in the single-sourced role prompts fails
 conformance (disable with `--no-prompt-sync`).
 
 Exit code: 0 when no v1 mailbox has violations, 1 when at least one does,
-2 when a v1 mailbox's PLAN.md has a slice that writes outside the mailbox
-repo (r15 guard: absolute path elsewhere, `..` escape, nested git clone,
-or a builder brief's `## Targeted check` `cd` there) or declares `repos:`
-(parsed, refused by this release) -- one stderr line per offending slice --
-and when the sibling trio-metrics.py has a different METRICS_API.
+2 when a v1 mailbox's PLAN.md has a slice that writes outside its repo
+(r15: the mailbox repo, or the declared `repos:` entry its `repo:` names;
+absolute path elsewhere, `..` escape, undeclared nested git clone, a
+second repo, or a builder brief's targeted-check `cd` there), an invalid
+`repos:`/per-repo `full_check:` block, or an unparseable slices block --
+one stderr line per offending slice -- and when the sibling
+trio-metrics.py has a different METRICS_API.
 """
 from __future__ import annotations
 
@@ -283,6 +285,15 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
     errors.extend(f"QUEUE.md `faults:` block: {e}" for e in parse_errors)
 
     known_ids = {sl["id"] for sl in slices} if slices is not None else None
+    # r15: `repo:` of a retired entry (omitted = home) must name the repo
+    # its slice belongs to (a declared PLAN.md `repos:` name, or home).
+    declared = tm.read_repos(loop_dir)
+    repo_names = {r["name"] for r in declared["repos"]}
+    slice_repos = (
+        {sl["id"]: tm.slice_repo_name(sl, repo_names) for sl in slices}
+        if slices is not None and repo_names
+        else {}
+    )
     if known_ids is None:
         errors.append(
             "QUEUE.md is present but PLAN.md is missing or its `slices:` "
@@ -306,6 +317,18 @@ def check_queue(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]:
             errors.append(
                 f"QUEUE.md retired: entry references slice {slice_id!r}, not "
                 "found in PLAN.md `slices:` block"
+            )
+        repo = str(entry.get("repo") or HOME_REPO).strip()
+        if repo != HOME_REPO and repo not in repo_names:
+            errors.append(
+                f"QUEUE.md retired: entry for slice {slice_id!r} has repo "
+                f"{repo!r}, not declared in PLAN.md `repos:`"
+            )
+        elif slice_id in slice_repos and slice_repos[slice_id] not in (None, repo):
+            errors.append(
+                f"QUEUE.md retired: entry for slice {slice_id!r} has repo "
+                f"{repo!r} but PLAN.md puts that slice in repo "
+                f"{slice_repos[slice_id]!r}"
             )
         # A repeated slice id is legal (a post-retirement fix appends a new
         # entry — MAILBOX-SCHEMA.md "v1 open-loop extension"); only a
@@ -368,29 +391,19 @@ def queue_info_lines(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]
     return lines
 
 
-# --- r15 guard: slices must stay inside the mailbox repo ---------------------
-# MAILBOX-SCHEMA.md "Repo scope (r15 guard)". Trio assumes the mailbox repo
-# (the git repo containing loop/<mailbox>/) is the product repo: worktrees,
-# retire shas, the whole-tree gate and the eval pin all resolve there. A
-# slice whose `writes:` (or whose builder brief's `## Targeted check` `cd`)
-# leaves that repo -- an absolute path elsewhere, a `..` escape, or a nested
-# clone with its own `.git` -- is refused instead of limping (silent Lead
-# take-over, empty aggregate merges, unresolvable retire shas). The check is
-# "outside the mailbox repo AND not covered by a declared `repos:` entry";
-# this release parses and validates PLAN.md `repos:` but refuses any
-# declared block (r15 multi-repo support is pending), so nobody can
-# half-use it. Kept here (not in trio_loop.py) so METRICS_API stays 4;
-# omnigent/trioctl loads this file from its own release to enforce it.
+# --- r15: slices stay inside their repo ------------------------------------
+# MAILBOX-SCHEMA.md "Declared repos (r15)" and "Repo scope (r15 guard)".
+# Worktrees, retire shas, the whole-tree gate and the eval pin resolve in the
+# slice's repo: the mailbox repo (`home`, the git repo containing
+# loop/<mailbox>/) unless PLAN.md declares `repos:` and the slice names one
+# with `repo: <name>`. A slice whose `writes:` (or whose builder brief's
+# targeted-check `cd`) leaves its repo -- an absolute path elsewhere, a `..`
+# escape, a nested clone with its own `.git` that no `repos:` entry
+# declares, or a second declared repo -- is refused instead of limping
+# (silent Lead take-over, empty aggregate merges, unresolvable retire shas).
+# The `repos:`/`full_check:` parsers live in trio-metrics.py (METRICS_API
+# 5); omnigent/trioctl loads this file from its own release to enforce it.
 
-R15_UNSUPPORTED = (
-    "repos: declared but multi-repo slices are not supported by this "
-    "release (r15 pending)"
-)
-REPOS_KEY_RE = re.compile(r"^repos\s*:\s*(.*)$")
-REPOS_ENTRY_RE = re.compile(r"^\s+-\s+(.*)$")
-REPOS_FIELD_RE = re.compile(r"^\s+([a-z_]+)\s*:\s*(.*)$")
-REPOS_KEYS = ("name", "path", "base")
-REPO_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 HOME_REPO = "home"
 # `## Targeted check`, `### Targeted checks`, `## Targeted check (backend)`,
 # or a bold `**Targeted check:**` label line (eval-r15a F3). Every such
@@ -423,6 +436,40 @@ def repo_scope_message(slice_id: str, path) -> str:
     )
 
 
+def repo_escape_message(slice_id: str, repo: str, path) -> str:
+    """A slice of declared repo *repo* writes (or cds) outside that repo."""
+    return (
+        f"slice {slice_id} writes outside its repo {repo} ({path}); its "
+        "writes: and targeted-check cds are relative to that repo's root (r15)"
+    )
+
+
+def cross_repo_message(slice_id: str, repo: str, other: str, path) -> str:
+    """A slice touches a second repo (one repo per slice)."""
+    return (
+        f"slice {slice_id} of repo {repo} touches repo {other} ({path}); one "
+        "repo per slice: split it (depends_on: across repos is fine) (r15)"
+    )
+
+
+def main_checkout_message(slice_id: str, repo: str, path) -> str:
+    """A declared-repo slice's targeted check names the repo's main checkout
+    (an absolute path) instead of running in the builder's worktree."""
+    return (
+        f"slice {slice_id} targeted check cds into the main checkout of repo "
+        f"{repo} ({path}); the builder runs it from its worktree root: cd to "
+        "a path relative to the repo root, never an absolute one (r15)"
+    )
+
+
+def full_check_scope_message(repo: str, path) -> str:
+    """A per-repo `full_check:` command leaves its repo."""
+    return (
+        f"PLAN.md full_check: command of repo {repo} runs outside that repo "
+        f"({path}); it runs from the repo's root (r15)"
+    )
+
+
 def plan_scope_message(path) -> str:
     """The r15 refusal line for a PLAN.md-level targeted/full check."""
     return (
@@ -441,176 +488,9 @@ def mailbox_repo_root(loop_dir: Path) -> Path | None:
     return None
 
 
-def _yaml_scalar(value: str) -> str:
-    """A plain or quoted YAML scalar with an optional trailing `# comment`."""
-    value = value.strip()
-    if value[:1] in ("'", '"'):
-        end = value.find(value[0], 1)
-        if end > 0:
-            return value[1:end]
-    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
-
-
-def find_repos_block(plan_text: str) -> list[str] | None:
-    """Lines of the first ```yaml fence whose column-0 key is `repos:`."""
-    in_fence = yaml_fence = False
-    buf: list[str] = []
-    for raw in plan_text.splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("```"):
-            if in_fence:
-                if yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
-                    return buf
-                in_fence = yaml_fence = False
-            else:
-                in_fence = True
-                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
-            buf = []
-            continue
-        if in_fence and yaml_fence:
-            buf.append(raw)
-    if in_fence and yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
-        return buf
-    return None
-
-
 def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], list[str]]:
-    """Parse and validate PLAN.md's optional `repos:` block (r15 item 1).
-
-    Returns (repos, errors). Absent block, or `repos: []`, is ([], []) --
-    single-repo mode. Each entry is {name, path (resolved), base}; names are
-    kebab-case and unique, `home` is reserved for the mailbox repo itself,
-    and every path (relative to the mailbox repo root, or absolute) must be
-    an existing git repo (holds `.git`).
-    """
-    lines = find_repos_block(plan_text)
-    if lines is None:
-        return [], []
-    errors: list[str] = []
-    entries: list[dict] = []
-    in_block = False
-    for i, raw in enumerate(lines, 1):
-        if not raw.strip() or raw.strip().startswith("#"):
-            continue
-        m = REPOS_KEY_RE.match(raw)
-        if m:
-            value = _yaml_scalar(m.group(1))
-            if value == "[]":
-                return [], []
-            if value:
-                errors.append(
-                    f"PLAN.md repos: line {i}: expected `repos:` followed by "
-                    "`- name:` entries"
-                )
-                return [], errors
-            in_block = True
-            continue
-        if not raw[:1].isspace():
-            in_block = False  # another top-level key ends the block
-            continue
-        if not in_block:
-            continue
-        m = REPOS_ENTRY_RE.match(raw)
-        if m:
-            # A new list item: `- name: x` (any first key) or a flow map
-            # `- {name: x, path: y}`; keys may come in any order.
-            body = m.group(1).strip()
-            entry: dict = {"line": i}
-            entries.append(entry)
-            if body.startswith("{") and body.endswith("}"):
-                pairs = [p for p in body[1:-1].split(",") if p.strip()]
-            else:
-                pairs = [body]
-            for pair in pairs:
-                key, sep, value = pair.partition(":")
-                key = key.strip()
-                if not sep or key not in REPOS_KEYS:
-                    errors.append(
-                        f"PLAN.md repos: line {i}: unexpected key {key!r} "
-                        "(expected name, path, base)"
-                    )
-                elif key in entry:
-                    errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
-                else:
-                    entry[key] = _yaml_scalar(value)
-            continue
-        m = REPOS_FIELD_RE.match(raw)
-        if m and entries:
-            key, value = m.group(1), _yaml_scalar(m.group(2))
-            if key not in REPOS_KEYS:
-                errors.append(
-                    f"PLAN.md repos: line {i}: unexpected key {key!r} "
-                    "(expected name, path, base)"
-                )
-            elif key in entries[-1]:
-                errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
-            else:
-                entries[-1][key] = value
-            continue
-        errors.append(
-            f"PLAN.md repos: line {i}: unexpected content {raw.strip()!r}"
-        )
-    repos: list[dict] = []
-    seen: set[str] = set()
-    seen_paths: dict[Path, str] = {}
-    for entry in entries:
-        name = entry.get("name", "")
-        where = f"PLAN.md repos: {name!r}"
-        if not name:
-            errors.append(f"PLAN.md repos: line {entry['line']}: entry has no `name:`")
-            continue
-        if not REPO_NAME_RE.match(name):
-            errors.append(f"{where}: name must be kebab-case")
-            continue
-        if name in seen:
-            errors.append(f"{where}: duplicate name")
-            continue
-        seen.add(name)
-        raw_path = entry.get("path", "")
-        if not raw_path:
-            errors.append(f"{where}: missing `path:`")
-            continue
-        if "$" in raw_path:
-            # Only `~` expands; environment variables never do (a silent
-            # `<root>/$VAR` would name a different directory).
-            errors.append(
-                f"{where}: path {raw_path!r} uses an environment variable; "
-                "only `~` expands -- write the path out"
-            )
-            continue
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            if root is None:
-                errors.append(f"{where}: relative path but no mailbox repo")
-                continue
-            path = root / path
-        path = _safe_resolve(path)
-        if name == HOME_REPO:
-            if root is None or path != root:
-                errors.append(
-                    f"{where}: `home` is reserved for the mailbox repo ({root})"
-                )
-            continue
-        if root is not None and path == root:
-            errors.append(
-                f"{where}: path {path} is the mailbox repo itself; it is the "
-                "implicit `home` repo"
-            )
-            continue
-        if path in seen_paths:
-            errors.append(
-                f"{where}: path {path} is already declared as {seen_paths[path]!r}"
-            )
-            continue
-        seen_paths[path] = name
-        if not path.is_dir():
-            errors.append(f"{where}: path {path} does not exist")
-            continue
-        if not (path / ".git").exists():
-            errors.append(f"{where}: path {path} is not a git repository")
-            continue
-        repos.append({"name": name, "path": path, "base": entry.get("base") or None})
-    return repos, errors
+    """PLAN.md `repos:` block (see trio-metrics.parse_repos_block)."""
+    return load_trio_metrics().parse_repos_block(plan_text, root)
 
 
 def _within(path: Path, base: Path) -> bool:
@@ -762,6 +642,122 @@ def _slice_offending_path(
     return None
 
 
+def repo_owner(path: Path, root: Path | None, by_path: dict[Path, str]) -> str | None:
+    """The repo *path* belongs to: the nearest ancestor that is a declared
+    repo root (its name) or the mailbox repo root (`home`). None when an
+    undeclared nested git repo, or nothing known, contains it."""
+    for anc in (path, *path.parents):
+        if anc in by_path:
+            return by_path[anc]
+        if root is not None and anc == root:
+            return HOME_REPO
+        try:
+            if (anc / ".git").exists():
+                return None
+        except OSError:
+            return None
+    return None
+
+
+def _declared_slice_problem(
+    sl: dict, root: Path, named: dict[str, Path], brief: str | None, tm
+) -> str | None:
+    """Multi-repo mode: the refusal line for one slice, or None.
+
+    The slice's repo is `repo:` (a declared name, or `home`); every
+    `writes:` path resolves against that repo's root and must stay in it;
+    its targeted check starts at that root (the builder's worktree root)
+    and every directory it names must stay in the same repo -- relative,
+    for a declared repo, since an absolute path is the repo's main
+    checkout, not the builder's worktree.
+    """
+    slice_id = sl["id"]
+    name = tm.slice_repo_name(sl, named)
+    if name is None:
+        return (
+            f"slice {slice_id} repo: {str(sl.get('repo')).strip()!r} is not "
+            "declared in PLAN.md repos: (declared: "
+            + ", ".join([HOME_REPO, *named]) + ") (r15)"
+        )
+    base = root if name == HOME_REPO else named[name]
+    by_path = {path: repo for repo, path in named.items()}
+
+    def placed(target: Path) -> str | None:
+        owner = repo_owner(target, root, by_path)
+        if owner == name:
+            return None
+        if owner is not None:
+            return cross_repo_message(slice_id, name, owner, target)
+        if name == HOME_REPO:
+            return repo_scope_message(slice_id, target)
+        return repo_escape_message(slice_id, name, target)
+
+    for write in sl.get("writes") or []:
+        write = str(write).strip()
+        if not write or write.startswith("api:"):
+            continue
+        for target in _expand_write(base, write):
+            problem = placed(target)
+            if problem:
+                return problem
+    if brief:
+        cwd = base
+        for kind, arg in command_dirs(targeted_check_lines(brief)):
+            if arg == "-" or "$" in arg or "`" in arg:
+                continue
+            target = _resolve_under(cwd, arg)
+            problem = placed(target)
+            if problem:
+                return problem
+            if name != HOME_REPO and Path(arg).expanduser().is_absolute():
+                return main_checkout_message(slice_id, name, target)
+            if kind == "cd":
+                cwd = target
+    return None
+
+
+def _declared_plan_problems(
+    plan_text: str, root: Path, named: dict[str, Path], tm
+) -> list[str]:
+    """Multi-repo mode: PLAN-level checks. The `full_check:` mapping keys
+    must be declared repos, and each repo's command must stay in that repo
+    (run from its root); PLAN.md's own targeted-check sections may name
+    home or any declared repo, never an undeclared place."""
+    problems: list[str] = []
+    by_path = {path: repo for repo, path in named.items()}
+    checks, errors = tm.parse_full_check(plan_text)
+    problems.extend(errors)
+    for key, command in checks.items():
+        if key != HOME_REPO and key not in named:
+            problems.append(
+                f"PLAN.md full_check: repo {key!r} is not declared in "
+                "PLAN.md repos: (declared: "
+                + ", ".join([HOME_REPO, *named]) + ")"
+            )
+            continue
+        cwd = root if key == HOME_REPO else named[key]
+        for kind, arg in command_dirs([command]):
+            if arg == "-" or "$" in arg or "`" in arg:
+                continue
+            target = _resolve_under(cwd, arg)
+            if repo_owner(target, root, by_path) != key:
+                problems.append(full_check_scope_message(key, target))
+                break
+            if kind == "cd":
+                cwd = target
+    cwd = root
+    for kind, arg in command_dirs(targeted_check_lines(plan_text)):
+        if arg == "-" or "$" in arg or "`" in arg:
+            continue
+        target = _resolve_under(cwd, arg)
+        if repo_owner(target, root, by_path) is None:
+            problems.append(plan_scope_message(target))
+            break
+        if kind == "cd":
+            cwd = target
+    return problems
+
+
 def _full_check_lines(plan_text: str) -> list[str]:
     """The PLAN.md `full_check:` value lines (key line + indented follow-ups)."""
     lines = plan_text.splitlines()
@@ -785,14 +781,17 @@ def repo_scope_refusals(
     slice_id: str | None = None,
     brief_text: str | None = None,
 ) -> list[str]:
-    """r15 guard: one refusal line per offending slice, plus `repos:` errors.
+    """r15: one refusal line per offending slice, plus `repos:` errors.
 
     Checks every slice of PLAN.md's `slices:` block (only *slice_id* when
-    given): its `repo:`/`writes:` resolved against the mailbox repo root,
-    and the `cd` targets of its builder brief's `## Targeted check`
-    (*brief_text*, else `<mailbox>/briefs/<id>.md`), resolved from the repo
-    root. A declared `repos:` block is validated and then refused as a
-    whole (R15_UNSUPPORTED). [] means nothing to refuse.
+    given) and the directories its builder brief's targeted check names
+    (*brief_text*, else `<mailbox>/briefs/<id>.md`). Without a `repos:`
+    block (single-repo mode) this is the r15 guard: `repo:`/`writes:`
+    resolve against the mailbox repo root and the brief's cds from it, and
+    PLAN.md's own targeted/full checks are scanned too. With one, the block
+    and the per-repo `full_check:` are validated and each slice must stay
+    inside its own repo (`_declared_slice_problem`). An unparseable slices
+    block is refused (fail closed). [] means nothing to refuse.
     """
     loop_dir = Path(loop_dir).resolve()
     plan_path = loop_dir / "PLAN.md"
@@ -801,13 +800,12 @@ def repo_scope_refusals(
     except OSError:
         return []
     root = mailbox_repo_root(loop_dir)
-    repos, problems = parse_repos_block(plan_text, root)
-    if repos or problems:
-        problems.append(R15_UNSUPPORTED)
+    repos, problems = tm.parse_repos_block(plan_text, root)
     if root is None:
         return problems
     named = {r["name"]: r["path"] for r in repos}
     declared = list(named.values())
+    multi = bool(repos)
     try:
         block = tm.find_slices_block(plan_text)
     except tm.SliceParseError:
@@ -823,7 +821,9 @@ def repo_scope_refusals(
                 f"PLAN.md slices block does not parse ({exc}); the repo-scope "
                 "guard cannot check it (r15)"
             )
-    if slice_id is None:
+    if slice_id is None and multi:
+        problems.extend(_declared_plan_problems(plan_text, root, named, tm))
+    elif slice_id is None:
         # eval-r15a F6: PLAN-level checks run from the mailbox repo root.
         path = _command_offending_path(
             targeted_check_lines(plan_text) + _full_check_lines(plan_text),
@@ -849,6 +849,11 @@ def repo_scope_refusals(
                 brief = brief_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 brief = None
+        if multi:
+            problem = _declared_slice_problem(sl, root, named, brief, tm)
+            if problem:
+                problems.append(problem)
+            continue
         path = _slice_offending_path(sl, loop_dir, root, named, brief)
         if path is not None:
             problems.append(repo_scope_message(sl["id"], path))
