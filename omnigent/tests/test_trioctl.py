@@ -2559,6 +2559,70 @@ def test_command_run_env_set_but_no_session_id_appends_nothing(
     assert not ids_path.exists()
 
 
+def test_command_run_non_isolated_cwd_is_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`trioctl omnigent run <role>` without `--isolate` never inherits the
+    caller's cwd: the launched `cursor-agent` process runs with
+    cwd = `--workspace` (r15.x; replaces the deleted
+    test_r15x_root_turn.py::test_i2_..._runs_in_workspace, eval-r16b L6).
+    """
+    trioctl = load_trioctl()
+    seen: dict[str, Any] = {}
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            self.pid = 4242
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            seen["kwargs"]["input"] = input
+            return "SCOUTED\n", ""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(trioctl.shutil, "which", lambda command: "/bin/cursor-agent")
+    monkeypatch.setattr(trioctl.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(trioctl, "cursor_models", lambda timeout=None: [
+        model("glm-5.2-max")
+    ])
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("look around")
+
+    args = trioctl.parser().parse_args(
+        [
+            "omnigent",
+            "run",
+            "scout",
+            "--config",
+            str(trioctl.DEFAULT_CONFIG),
+            "--prompt-file",
+            str(prompt_file),
+            "--workspace",
+            str(workspace),
+        ]
+    )
+
+    assert trioctl.command_run(args) == 0
+    assert seen["kwargs"]["cwd"] == str(workspace.resolve())
+    assert "--workspace" in seen["command"]
+    assert seen["command"][seen["command"].index("--workspace") + 1] == str(
+        workspace.resolve()
+    )
+
+
 def test_command_sessions_prune_cli_wiring_and_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ):
