@@ -40,8 +40,11 @@ violation) -- r18b makes that the default.
 
 After an isolated builder's targeted check passes, trioctl reverts the
 slice's non-test product files to the base inside the builder's worktree,
-re-runs the brief's `## Targeted check`, and restores the tree (sha256
-proof). `killed` / `killed-by-import` / `survived` / `n/a` / `error` land in
+re-runs the brief's `## Targeted check`, and restores the tree from a
+snapshot of every changed path (per-path byte identity + sha256 proof).
+`killed` (a runner's assertion / failed-test report only) / `survived` /
+`n/a` (incl. `absolute cd`) / `error` (not runnable, collection error,
+timeout, `restore:`) land in
 the builder JSON (`kill_check`), the worktree ledger, the driver's
 `retired slice ... | kill_check: <outcome> (shadow)` LOG line, the
 slice-eval's `BASE-REVERT:` context line, `.driver.json` `quality` and

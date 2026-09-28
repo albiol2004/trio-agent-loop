@@ -802,17 +802,27 @@ worktree base, tracked or untracked; excluding test paths — `tests/`,
 `evidence/`) to the base, re-runs the brief's `## Targeted check` command
 from the worktree root under the targeted-check budget (120 s, PLAN.md
 `full_check_budget_s:`, or `TRIO_KILL_CHECK_BUDGET_S`), and restores the
-tree byte-identically — proven by a sha256 over every tracked and
-untracked non-ignored file (`tree_sha256` == `tree_sha256_after`,
-`restored: true`). Outcomes:
+tree from an in-memory snapshot of **every** path the slice changed
+(tracked and untracked: product, tests, fixtures, receipts, mailbox files,
+`.gitignore` — restored first, so newly ignored builder files are never
+treated as check output); files the check touched that the slice did not
+change come back from the base blob, never the index. The restore is
+proven byte-identical per snapshotted path and by a sha256 over every
+tracked and untracked non-ignored file (`tree_sha256` ==
+`tree_sha256_after`, `restored: true`). A check that `cd`s / `pushd`s to an
+absolute (or `~`) path outside the worktree is not run: `n/a (absolute
+cd)`. Outcomes:
 
 | outcome | meaning |
 |---|---|
-| `killed` | the re-run failed with at least one assertion failure: the tests depend on the slice's code |
-| `killed-by-import` | only import/collection/type-resolution errors: the tests touch new code, weak evidence |
+| `killed` | the re-run failed with a runner's own assertion / failed-test report: pytest `N failed` / `FAILED <id>` / `E   assert` / `AssertionError`; vitest/jest `Tests: N failed` or a `×`/`✕` test mark (a bare `FAIL <file>` only without a collection error); go `--- FAIL`; TAP `not ok N`; generic `Error: expect` |
 | `survived` | still green without the product change: the tests do not exercise it |
-| `n/a` | no product file changed, the slice changed no test file, no targeted check in the brief, or the check did not pass |
-| `error` | timeout or the check could not run |
+| `n/a` | no product file changed, the slice changed no test file, no targeted check in the brief, the check did not pass, or an absolute `cd` out of the worktree |
+| `error` | anything else: timeout; missing runner or module, usage error, `cd` failure, pytest exit 4/5 (`reason: targeted check not runnable`); a collection / import / module-resolution / build error (`collection_error: true` — the base lacks what the tests import, not a behavioural kill); any other non-zero exit; or `restore:` — the restore proof failed (`kill_check: error (restore)`) |
+
+The r18a-review split `killed-by-import` is gone (eval-r18a N3: it
+depended on import style, not test strength); the informational
+`collection_error: true` replaces it and is never graded on.
 
 Recorded as `kill_check:` in the builder's JSON line and its worktree
 ledger record; the Omnigent driver logs `- iter N | loop | retired slice
@@ -821,9 +831,10 @@ first dispatches the slice-eval, shows `BASE-REVERT:` / `AUTHORED-BY:`
 lines in that slice-eval's OPEN-LOOP CONTEXT, and records it under
 `quality` in `.driver.json` (trio-shadow prints it). **Shadow in r18a**: it
 never changes the retire decision (r18b: `survived` blocks the retire).
-The one exception is a safety net, not a gate: if the restore cannot be
-proven byte-identical the worktree is retained as
-`kill_check_restore_failed` instead of integrating an altered tree.
+This includes a failed restore proof: it is recorded as `kill_check:
+error (restore)` (with `check_outcome:` and `restore_mismatch:`), printed as
+a WARNING on stderr, and the builder's snapshot-restored tree is integrated
+as usual.
 Disable with `--no-kill-check`, `TRIO_KILL_CHECK=0` (the loop driver then
 writes `kill_check: false` to `.driver.json`, which its builders honour).
 

@@ -1,7 +1,7 @@
 """r18a L2a: base-revert kill check in shadow.
 
-Real git and real (tiny, fake) targeted checks: `killed`, `killed-by-import`,
-`survived` (a receipt-style test), `n/a`, `error`, a byte-identical restore
+Real git and real (tiny, fake) targeted checks: `killed`, an import error
+(`error` + `collection_error`, eval-r18a F2), `survived` (a receipt-style test), `n/a`, `error`, a byte-identical restore
 (sha256 of every tracked/untracked non-ignored file, modes and symlinks
 included, side effects of the check undone), the `run builder --isolate`
 path (JSON `kill_check`, ledger record, --no-kill-check, TRIO_KILL_CHECK=0,
@@ -74,12 +74,14 @@ def test_killed(tmp_path):
     assert res["mode"] == "shadow" and res["exit"] != 0
 
 
-def test_killed_by_import(tmp_path):
+def test_import_error_is_error_not_killed(tmp_path):
+    """eval-r18a F2/N3: an import/collection failure is not a behavioural kill."""
     repo, base = _repo(tmp_path, {"README.md": "r\n"})
     _write(repo, "newmod.py", "VALUE = 7\n")
     _write(repo, "tests/test_newmod.py", "import sys; sys.path.insert(0, '.')\nfrom newmod import VALUE\nassert VALUE == 7\n")
     res = _kill(repo, base, "python3 tests/test_newmod.py")
-    assert res["outcome"] == "killed-by-import", res
+    assert res["outcome"] == "error" and res["collection_error"] is True, res
+    assert "collection/import error" in res["reason"], res
     assert not (repo / "newmod.py").read_text() == ""  # restored
 
 

@@ -1496,20 +1496,15 @@ def _command_run_isolated(
     if _kill_check_enabled(args):
         kill_check = _isolated_kill_check(wt, repo, record, prompt, mailbox, targeted)
         if kill_check is not None and kill_check.get("restored") is False:
-            # Safety net, never a quality gate: the worktree no longer holds
-            # exactly what the builder left, so it is not integrated.
-            record = wt._retain(
-                repo, wt.load_record(repo, record["id"]), "kill_check_restore_failed",
-                f"base-revert kill check could not restore: {kill_check.get('restore_mismatch')}",
+            # Shadow: a failed restore proof never changes the retire
+            # decision (eval-r18a F1). The snapshot restore already put
+            # every changed path back; the outcome is `error (restore)`.
+            print(
+                "trioctl: WARNING: kill_check (shadow) restore proof FAILED -- "
+                f"{kill_check.get('restore_mismatch')}; integrating the builder's "
+                "snapshot-restored tree anyway (shadow never gates)",
+                file=sys.stderr,
             )
-            view = _worktree_view(record)
-            view["targeted_check"] = targeted
-            view["kill_check"] = kill_check
-            if flags:
-                view["verification_flags"] = flags
-            print(output)
-            print(json.dumps(view, sort_keys=True))
-            return ISOLATED_RETAINED_EXIT
     summary = getattr(args, "summary", None) or f"isolated builder {record['id']}"
     record = wt.integrate(repo, record["id"], summary=summary)
     print(output)
@@ -1616,12 +1611,15 @@ def _worktree_view(record: dict[str, Any]) -> dict[str, Any]:
 # After an isolated builder exits 0 with a passing TARGETED_CHECK line, and
 # BEFORE its worktree is committed and merged, trioctl reverts the slice's
 # non-test product files to the worktree's base, re-runs the brief's
-# `## Targeted check` command under a budget, and restores the tree
-# byte-identically (sha256 over every tracked and untracked, non-ignored
-# file, before vs after). The outcome is recorded (`kill_check` in the
-# builder JSON, the worktree ledger record, the driver's LOG line,
-# `.driver.json`, trio-shadow); in r18a it NEVER changes the retire
-# decision. `--no-kill-check` / TRIO_KILL_CHECK=0 (or the driver's
+# `## Targeted check` command under a budget, and restores the tree from an
+# in-memory snapshot of EVERY path the slice changed (tracked + untracked:
+# product, tests, fixtures, mailbox files), proven byte-identical per path
+# and by a sha256 over every tracked and untracked, non-ignored file. The
+# outcome is recorded (`kill_check` in the builder JSON, the worktree
+# ledger record, the driver's LOG line, `.driver.json`, trio-shadow); in
+# r18a it NEVER changes the retire decision -- not even a failed restore
+# proof, which is recorded as `error` (reason `restore: ...`) and printed
+# loudly. `--no-kill-check` / TRIO_KILL_CHECK=0 (or the driver's
 # `.driver.json` `kill_check: false`) disable it.
 
 KILL_CHECK_ENV = "TRIO_KILL_CHECK"
@@ -1629,7 +1627,7 @@ KILL_CHECK_BUDGET_ENV = "TRIO_KILL_CHECK_BUDGET_S"
 #: The targeted-check budget: the whole-tree gate's default wall clock
 #: (PLAN.md `full_check_budget_s:` overrides it, the env var overrides both).
 KILL_CHECK_DEFAULT_BUDGET_S = 120.0
-KILL_CHECK_OUTCOMES = ("killed", "killed-by-import", "survived", "n/a", "error")
+KILL_CHECK_OUTCOMES = ("killed", "survived", "n/a", "error")
 
 # Test files are never reverted: the slice's tests must run against the
 # base product. Globs per MAILBOX-SCHEMA "Base-revert kill check".
@@ -1640,18 +1638,43 @@ _KILL_TEST_PATH_RE = re.compile(
 )
 # Receipts and evidence are never product.
 _KILL_NON_PRODUCT_RE = re.compile(r"(?:^|/)(?:results|evidence)/")
+# `killed` needs a runner's own assertion / failed-test report (eval-r18a F2):
+#   pytest `N failed` summary, `FAILED <nodeid>`, `E   assert`, AssertionError
+#   (also node's `AssertionError [ERR_ASSERTION]`); vitest/jest `Tests: N
+#   failed` and `×`/`✕` test marks; go `--- FAIL`; TAP `not ok N`; generic
+#   `Error: expect(...)`. A bare jest/vitest `FAIL <file>` line counts only
+#   when no collection error explains it. Anything else non-zero is `error`.
 _KILL_ASSERTION_RE = re.compile(
-    r"\b[1-9]\d* failed\b|^FAILED |AssertionError|assert .* ==|--- FAIL"
-    r"|Tests\s+[1-9]\d* failed|✕|× |^not ok \d",
+    r"^(?:=+\s*)?[1-9]\d* failed\b(?:,| in )|^FAILED |^E\s+assert\b|AssertionError"
+    r"|^\s*Tests:?\s+[1-9]\d* failed|^\s*[×✕] |--- FAIL\b|^not ok \d|Error: expect\b",
     re.MULTILINE,
 )
-_KILL_IMPORT_RE = re.compile(
-    r"ImportError|ModuleNotFoundError|error(?:s)? during collection|ERROR collecting"
-    r"|Cannot find module|Failed to (?:load|resolve)|does not provide an export"
-    r"|error TS2305|error TS2307|error TS2614|error TS2724|SyntaxError"
-    r"|cannot import name|has no attribute|undefined: ",
+_KILL_FAIL_LINE_RE = re.compile(r"^\s*FAIL\s+\S", re.MULTILINE)
+# Collection / import / module-resolution / build errors: the tests could not
+# even load against the base. Not a behavioural kill (recorded as `error`
+# with `collection_error: true`; the old `killed-by-import` split is gone).
+_KILL_COLLECTION_RE = re.compile(
+    r"ImportError|ModuleNotFoundError|No module named|error(?:s)? during collection"
+    r"|ERROR collecting|Cannot find module|Failed to (?:load|resolve)|does not provide an export"
+    r"|Test suite failed to run|error TS\d{4}|SyntaxError|cannot import name"
+    r"|has no attribute|undefined: |\[build failed\]|\[setup failed\]",
 )
-_KILL_NOT_RUNNABLE_RE = re.compile(r"command not found|No such file or directory|not recognized as")
+# The runner itself did not run the tests: missing command, cd failure,
+# usage error, pytest exit 4/5 ("no tests ran", "file or directory not found").
+_KILL_NOT_RUNNABLE_RE = re.compile(
+    r"command not found|: not found$|No such file or directory|not recognized as"
+    r"|^\S*python[\d.]*: No module named|^\S*python[\d.]*: can't open file"
+    r"|can't cd to|cd: .*(?:No such file|not a directory|can't cd)"
+    r"|^ERROR: file or directory not found|^ERROR: usage:|error: unrecognized arguments"
+    r"|^usage: |no tests ran|no tests collected|No tests? (?:files )?found",
+    re.MULTILINE | re.IGNORECASE,
+)
+# `cd` / `pushd` to an absolute (or ~) path: the re-run would leave the
+# worktree (eval-r18a N2), so the outcome is `n/a (absolute cd)`.
+_KILL_ABS_CD_RE = re.compile(
+    r"""(?:^|[;&|(]|\bthen|\bdo|\belse)\s*(?:cd|pushd)\s+(?:--\s+)?["']?((?:/|~)[^\s"';&|)]*)""",
+    re.MULTILINE,
+)
 
 
 def _kill_check_enabled(args: argparse.Namespace) -> bool:
@@ -1817,22 +1840,43 @@ def _kill_changed_paths(path: Path, base: str) -> list[str]:
     return sorted({p for p in (tracked + "\0" + untracked).split("\0") if p})
 
 
-def _kill_classify(returncode: int | None, output: str) -> tuple[str, str]:
-    """(outcome, reason) of the re-run against the reverted product."""
+def _kill_first_line(output: str, pattern: re.Pattern[str]) -> str:
+    for ln in output.splitlines():
+        if ln.strip() and pattern.search(ln):
+            return ln.strip()[:200]
+    return ""
+
+
+def _kill_classify(
+    returncode: int | None, output: str, command: str = "",
+) -> tuple[str, str, dict[str, Any]]:
+    """(outcome, reason, extra) of the re-run against the reverted product.
+
+    `killed` only on a runner's assertion / failed-test report; a missing
+    runner or module, usage error, `cd` failure, pytest exit 4/5, collection
+    error or any unmatched non-zero exit is `error` (eval-r18a F2).
+    """
     lines = [ln for ln in output.strip().splitlines() if ln.strip()]
     last = lines[-1].strip()[:200] if lines else ""
     if returncode == 0:
-        return "survived", f"targeted check still passes without the slice's product change ({last})"
-    if returncode in (126, 127) or (
-        _KILL_NOT_RUNNABLE_RE.search(output) and not _KILL_ASSERTION_RE.search(output)
-        and not _KILL_IMPORT_RE.search(output)
+        return "survived", f"targeted check still passes without the slice's product change ({last})", {}
+    assertion = _kill_first_line(output, _KILL_ASSERTION_RE)
+    pytest_exit = returncode in (4, 5) and "pytest" in f"{command}\n{output}"
+    if returncode in (126, 127) or pytest_exit or (
+        not assertion and _KILL_NOT_RUNNABLE_RE.search(output)
     ):
-        return "error", f"targeted check not runnable (exit {returncode}: {last})"
-    if _KILL_ASSERTION_RE.search(output):
-        return "killed", last or f"exit {returncode}"
-    if _KILL_IMPORT_RE.search(output):
-        return "killed-by-import", last or f"exit {returncode}"
-    return "killed", last or f"exit {returncode}"
+        why = _kill_first_line(output, _KILL_NOT_RUNNABLE_RE) or last
+        return "error", f"targeted check not runnable (exit {returncode}: {why})", {}
+    if assertion:
+        return "killed", assertion, {}
+    collection = _kill_first_line(output, _KILL_COLLECTION_RE)
+    if collection:
+        return ("error", f"collection/import error, not an assertion failure (exit {returncode}: "
+                f"{collection})", {"collection_error": True})
+    fail_line = _kill_first_line(output, _KILL_FAIL_LINE_RE)
+    if fail_line:
+        return "killed", fail_line, {}
+    return "error", f"non-zero exit without a recognised assertion failure (exit {returncode}: {last})", {}
 
 
 def _kill_run(
@@ -1862,7 +1906,9 @@ def _kill_run(
         with contextlib.suppress(OSError):
             os.killpg(proc.pid, signal.SIGKILL)
     result["exit"] = proc.returncode
-    return _kill_classify(proc.returncode, output or "")
+    outcome, reason, extra = _kill_classify(proc.returncode, output or "", command)
+    result.update(extra)
+    return outcome, reason
 
 
 _KILL_SKIP_DIRS = frozenset({
@@ -1890,30 +1936,51 @@ def _kill_prune_dirs(path: Path, existed: set[str]) -> None:
 
 def _kill_restore(
     path: Path,
+    base: str,
     before: dict[str, tuple[str, str] | None],
     saved: dict[str, tuple[str, bytes] | None],
 ) -> list[str]:
-    """Put every file back as *before* recorded it; return paths still off."""
+    """Put every file back as *before* recorded it; return paths still off.
+
+    Every path the slice changed comes back from *saved* (the in-memory
+    snapshot) FIRST -- including `.gitignore` files, so the listing below
+    is taken under the builder's ignore rules and its newly ignored files
+    are never mistaken for check output (eval-r18a F1, N1). Any other file
+    the check touched was unchanged vs *base*, so the base blob is it."""
+    for rel in sorted(saved):
+        _kill_write(path, rel, saved[rel])
     after = _kill_tree_state(path)
     for rel in sorted(set(before) | set(after)):
-        if before.get(rel) == after.get(rel) and rel in before:
+        if rel in saved or (before.get(rel) == after.get(rel) and rel in before):
             continue
-        if rel in saved:
-            _kill_write(path, rel, saved[rel])
-        elif rel not in before or before[rel] is None:
+        if rel not in before or before[rel] is None:
             _kill_write(path, rel, None)  # created by the check
-        else:
-            # A clean tracked file the check modified: its index copy is it.
-            blob = subprocess.run(
-                ["git", "-C", str(path), "show", f":{rel}"], capture_output=True,
-            )
-            if blob.returncode == 0:
-                kind = before[rel][0]
-                _kill_write(path, rel, (kind, blob.stdout))
+            continue
+        state = _kill_base_state(path, base, rel)
+        if state is not None:
+            _kill_write(path, rel, (before[rel][0], state[1]))
     final = _kill_tree_state(path)
-    return sorted(
-        rel for rel in set(before) | set(final) if before.get(rel) != final.get(rel)
-    )
+    off = {rel for rel in set(before) | set(final) if before.get(rel) != final.get(rel)}
+    # Byte-identity over every snapshotted path (ignored ones included).
+    off.update(rel for rel, state in saved.items() if _kill_file_state(path, rel) != state)
+    return sorted(off)
+
+
+def _kill_abs_cd(command: str, path: Path) -> str | None:
+    """The first absolute `cd`/`pushd` target outside *path*, else None."""
+    try:
+        root = path.resolve()
+    except OSError:
+        root = path
+    for m in _KILL_ABS_CD_RE.finditer(command):
+        target = m.group(1)
+        try:
+            resolved = Path(os.path.expanduser(target)).resolve()
+        except (OSError, RuntimeError):
+            return target
+        if resolved != root and root not in resolved.parents:
+            return target
+    return None
 
 
 def run_kill_check(
@@ -1931,11 +1998,16 @@ def run_kill_check(
         result.update(outcome="n/a", reason="no `## Targeted check` command in the brief")
         return result
     result["command"] = command
+    outside = _kill_abs_cd(command, path)
+    if outside:
+        result.update(outcome="n/a", reason=f"absolute cd: the check leaves the worktree ({outside})")
+        return result
     try:
-        changed = _kill_changed_paths(path, base)
+        all_changed = _kill_changed_paths(path, base)
     except (OSError, subprocess.CalledProcessError) as exc:
         result.update(outcome="error", reason=f"cannot diff against base: {exc}")
         return result
+    changed = all_changed
     if mailbox_rel:
         prefix = mailbox_rel.rstrip("/") + "/"
         changed = [p for p in changed if not (p + "/").startswith(prefix)]
@@ -1952,31 +2024,46 @@ def run_kill_check(
         return result
     try:
         before = _kill_tree_state(path)
-        saved = {rel: _kill_file_state(path, rel) for rel in product}
+        # Snapshot EVERY changed path (product, tests, fixtures, receipts,
+        # mailbox files): the restore never falls back to the index.
+        saved = {rel: _kill_file_state(path, rel) for rel in all_changed}
         base_states = {rel: _kill_base_state(path, base, rel) for rel in product}
         existed = _kill_dirs(path)
     except (OSError, subprocess.CalledProcessError) as exc:
         result.update(outcome="error", reason=f"cannot snapshot the worktree: {exc}")
         return result
     result["tree_sha256"] = _kill_tree_digest(before)
-    outcome: tuple[str, str]
+    result["snapshot_paths"] = len(saved)
+    outcome: tuple[str, str] = ("error", "the targeted check did not run")
     try:
         for rel, state in base_states.items():
             _kill_write(path, rel, state)
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         outcome = _kill_run(command, path, env, budget, result)
     finally:
-        try:
-            off = _kill_restore(path, before, saved)
-            _kill_prune_dirs(path, existed)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            off = [f"<restore failed: {exc}>"]
+        off: list[str] = []
+        for _attempt in range(2):  # one retry: a straggler may still have been writing
+            try:
+                off = _kill_restore(path, base, before, saved)
+                _kill_prune_dirs(path, existed)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                off = [f"<restore failed: {exc}>"]
+            if not off:
+                break
     after = _kill_tree_state(path)
     result["tree_sha256_after"] = _kill_tree_digest(after)
     result["restored"] = not off and result["tree_sha256_after"] == result["tree_sha256"]
-    if not result["restored"]:
-        result["restore_mismatch"] = off[:20]
-    result.update(outcome=outcome[0], reason=outcome[1])
+    if result["restored"]:
+        result.update(outcome=outcome[0], reason=outcome[1])
+    else:
+        result["restore_mismatch"] = off[:20] or ["<tree digest differs>"]
+        result["check_outcome"] = outcome[0]
+        result.update(
+            outcome="error",
+            reason=f"restore: the worktree could not be proven byte-identical "
+                   f"({', '.join(result['restore_mismatch'][:5])}); the check said "
+                   f"{outcome[0]}: {outcome[1]}",
+        )
     result["seconds"] = round(time.monotonic() - started, 3)
     return result
 
@@ -2190,7 +2277,12 @@ def kill_check_suffix(kill_check: dict[str, Any] | None) -> str:
     """`kill_check: <outcome>` for LOG lines (empty when not run)."""
     if not isinstance(kill_check, dict) or not kill_check.get("outcome"):
         return ""
-    return f"kill_check: {kill_check['outcome']}"
+    tag = ""
+    if kill_check.get("restored") is False:
+        tag = " (restore)"
+    elif str(kill_check.get("reason") or "").startswith("absolute cd"):
+        tag = " (absolute cd)"
+    return f"kill_check: {kill_check['outcome']}{tag}"
 
 
 def _held_session_ids(mailbox: Path | None) -> set[str]:
