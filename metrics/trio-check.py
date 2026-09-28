@@ -464,23 +464,83 @@ def mailbox_dir_message(slice_id: str, path, loop_dir) -> str:
     )
 
 
+def _home_write_base(sl: dict, loop_dir: Path, root: Path) -> Path | None:
+    """Single-repo-mode base a slice's `writes:` resolve against, when that
+    slice is (or resolves into) the home repo, else None.
+
+    `.`, `./`, empty and `home` are conventional home aliases (matched the
+    same way multi-repo mode's `slice_repo_name` treats them) and resolve
+    to *root* directly, never as filesystem paths. Any other value is a
+    pre-r15 path-like `repo:`, resolved the same way `_slice_offending_path`
+    already does it: relative to the mailbox dir first, falling back to the
+    repo root when that is not a directory (trio-shadow's own resolution).
+    home applies when that path lands at the repo root itself or at/under
+    the mailbox dir (eval-r16rc-b L4): an undeclared `repo:` can't spell
+    home, the repo root, or a mailbox subdirectory as a relative path to
+    smuggle a home slice's writes: out of the G1 guard. A resolved path
+    that does not exist as a directory, or that is itself a nested git
+    clone (its own `.git`), is left to the existing r15 escape/cross-repo
+    checks (`_slice_offending_path`), which already refuse it under their
+    own message -- an undeclared clone nested in the mailbox dir is a
+    scope violation, not Lead-owned mailbox content.
+    """
+    repo = str(sl.get("repo") or ".").strip()
+    if repo in ("", ".", "./", HOME_REPO):
+        return root
+    base = _resolve_under(loop_dir, repo)
+    alt = _resolve_under(root, repo)
+    if not base.is_dir() and alt.is_dir():
+        base = alt
+    if base == root:
+        return root
+    if base.is_dir() and (base == loop_dir or loop_dir in base.parents) \
+            and not (base / ".git").exists():
+        return base
+    return None
+
+
+def _under_mailbox(path: Path, loop_dir: Path) -> bool:
+    """*path* is the mailbox dir, under it, or an ancestor of it.
+
+    The G1 guard refuses a home write reaching the mailbox from below
+    (`loop/x/a.py`) exactly as it refuses one covering it from above
+    (`loop`, `.`, an absolute repo-root path, or a glob matching an
+    ancestor directory of the mailbox -- eval-r16rc-b L5): either way the
+    write is Lead-owned mailbox content, not a builder slice's.
+    """
+    return (
+        path == loop_dir
+        or loop_dir in path.parents
+        or path in loop_dir.parents
+    )
+
+
 def _mailbox_dir_write(
     sl: dict, loop_dir: Path, root: Path, named: dict[str, Path], tm
 ) -> Path | None:
-    """First `writes:` path of a home slice at or under *loop_dir*, or None."""
+    """First `writes:` path of a home slice at, above, or under *loop_dir*,
+    or None."""
     if loop_dir == root:
         return None
     if named:
         if tm.slice_repo_name(sl, named) != HOME_REPO:
             return None
-    elif str(sl.get("repo") or ".").strip() not in (".", HOME_REPO):
-        return None
+        base = root
+    else:
+        base = _home_write_base(sl, loop_dir, root)
+        if base is None:
+            return None
+    if base == loop_dir or loop_dir in base.parents:
+        # The slice's repo itself resolves into the mailbox dir (a
+        # path-like `repo:` such as `scripts`, L4): every write of this
+        # slice lands under the mailbox no matter what it names.
+        return base
     for write in sl.get("writes") or []:
         write = str(write).strip()
         if not write or write.startswith("api:"):
             continue
-        for target in _expand_write(root, write):
-            if target == loop_dir or loop_dir in target.parents:
+        for target in _expand_write(base, write):
+            if _under_mailbox(target, loop_dir):
                 return target
     return None
 

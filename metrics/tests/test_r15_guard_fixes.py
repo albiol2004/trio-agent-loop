@@ -132,6 +132,12 @@ REFUSED = [
                                     extra_plan="## Targeted check\n\ncd app-backend && pytest\n")),
     ("F6 plan full_check", dict(extra_plan="full_check: cd app-backend && pytest -q\n")),
     ("F6 plan full_check block", dict(extra_plan="full_check:\n  cd /tmp && pytest -q\n")),
+    # eval-r16rc-b L5: a home write that is an ancestor of the mailbox dir
+    # (here the repo root itself) covers it from above; moved from ALLOWED
+    # (that was the bypass -- the G1 guard now refuses these too, not just
+    # writes reaching the mailbox from below).
+    ("L5 dot covers mailbox from above", dict(writes="[.]")),
+    ("L5 dot slash covers mailbox from above", dict(writes="[./]")),
 ]
 
 ALLOWED = [
@@ -145,8 +151,6 @@ ALLOWED = [
     ("N8 prose mentioning targeted checks", dict(brief="# B\n\nThe targeted checks are cheap.\n\ncd app-backend\n")),
     ("no brief", dict()),
     ("new dir", dict(writes="[newdir/sub/x.py]")),
-    ("dot", dict(writes="[.]")),
-    ("dot slash", dict(writes="[./]")),
     ("api", dict(writes="[api:foo]")),
     ("node_modules dir", dict(writes="[node_modules/, src/x.py]")),
     ("home glob", dict(writes="[src/*.py]")),
