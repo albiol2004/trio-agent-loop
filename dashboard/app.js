@@ -335,6 +335,7 @@ function ingestOverview(data) {
   state.workspaces = workspaces;
   state.scanned = data.scanned || workspaces.length;
   state.broker = data.broker || "disabled";
+  state.worktreesScanned = data.worktrees_scanned || 0;
   state.loops = loops;
   state.inbox = inbox;
   state.byKey = new Map(loops.map((loop) => [loop.key, loop]));
@@ -498,7 +499,11 @@ function renderSummary(groups) {
   el("verdict").textContent = verdict;
   const latest = loops.slice().sort((a, b) =>
     String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
-  const coverage = "Covers " + plural(wsCount, "workspace") + " with loops (" + state.scanned + " scanned).";
+  const wtShown = state.workspaces.filter((w) => w.worktree).length;
+  const coverage = "Covers " + plural(wsCount - wtShown, "workspace") +
+    (wtShown ? " and " + plural(wtShown, "worktree") : "") + " with loops (" +
+    plural(state.scanned, "workspace") + (state.worktreesScanned ? " and " + plural(state.worktreesScanned, "worktree") : "") +
+    " scanned).";
   el("verdict-sub").textContent = (latest
     ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + ". "
     : "Start a loop with /trio-init in a project; it appears here on the next poll. ") + coverage;
@@ -538,7 +543,7 @@ function renderSummary(groups) {
   tile("Shipped, last 7 days", shipped7.length,
     plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null);
   tile("Loops tracked", loops.length,
-    "across " + plural(wsCount, "workspace") + " (" + state.scanned + " scanned)", "", "#loops");
+    "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops");
 }
 
 function inboxMarkButton(item) {

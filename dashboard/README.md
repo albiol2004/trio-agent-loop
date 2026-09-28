@@ -76,18 +76,23 @@ skipped; at most 4000 dirs per root), and `TRIO_DASH_WORKSPACES` for
 explicitly registered workspaces (shown in full).
 
 Linked git worktrees found by the walk appear as `<repo> (worktree <name>)`
-with only the mailboxes that are theirs, each tagged with why:
-`worktree-only` (no such mailbox in the main checkout), `modified` /
-`untracked` (`git status`), `committed on branch` (clean, but a mailbox file
-was written after the worktree's last checkout/reset/merge/rebase, read from
-its HEAD reflog), `runtime files present` (untracked or ignored sidecars or
-locks, which git never creates; tracked sidecars do not count), and `live`
-(argv, broker session with `workspace` = the worktree, or a live sidecar).
-Untouched committed copies stay hidden. The git/stat selection is cached per
-worktree (60 s, or sooner when its index, HEAD reflog, root or `loop*` dirs
-change); `git status` runs with `--no-optional-locks`; liveness is checked
-every build from the shared argv index and broker listing. Worktree
-drilldown works; worktrees are not listed as registry workspaces. Broker liveness:
+with only the mailboxes that are theirs. Ownership is git ancestry, never
+file mtimes: with `mb = merge-base(worktree HEAD, base tip)` (base tip = the
+main checkout's HEAD; for a bare repository `main`/`master`/`origin/HEAD`),
+a mailbox is `new on branch` (absent at `mb`) or `committed on branch` /
+`deleted on branch` when one of its own changes since `mb` is still not in
+the base tip — so a needs-human commit survives merge, rebase, reset and
+stash, a committed deletion counts, and already-merged or identical edits
+and touched files do not. `modified` / `untracked` come from `git status`
+(`--no-optional-locks`, reused up to ~90–135 s unless the index changes);
+`runtime files present` (untracked or ignored sidecars/locks — tracked ones
+do not count) shows a mailbox only alongside other evidence or while its
+STATE/VERDICT says running or needs a person; `live` is argv, a broker
+session with `workspace` = the worktree, or a live sidecar. With no
+merge-base (unrelated history, no base branch) actionable loops are shown as
+`no common base (…)` rather than hidden. Ancestry is cached on the (HEAD,
+base tip) commit ids read from ref files. Worktree drilldown works;
+worktrees are not listed as registry workspaces. Broker liveness:
 `TRIO_BOARD_BROKER_URL` (the service env sets `http://127.0.0.1:6767`).
 
 ## Running from the repo checkout (development)
@@ -100,7 +105,7 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 - **Board (every workspace at once)** — one `/api/overview` poll every 5 seconds covers every discovered workspace. Top to bottom: a verdict sentence ("2 loops need you; nothing is running."), four tiles (needs you, running now, shipped in the last 7 days, loops tracked), **Needs you**, **Running now**, an **All loops** table, and collapsed **Review notes**. Loops are keyed by workspace root + mailbox name. Nested mailbox discovery is unchanged: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped).
 - **Facts only** — a loop's state badge is derived from facts in this order: live evidence (`running_sources`: driver pid or lock, /proc cmdline naming the mailbox, live `.session.json` pid, opt-in broker probe) → "Running"; else the latest verdict (Shipped / Needs human / Blocked / Iterating); else the STATE.md status word. Every badge has an icon and text; the tooltip lists the underlying facts. Titles come from GOAL.md's first heading (`# Mission: X` → "X"); generic headings such as `# Goal` fall back to the mission's first clause.
-- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold. It is a medium "Needs you" item only when the broker listing was read (`broker: ok`) and no non-shell process is working inside the workspace; otherwise it is a low-severity review note (a broker-only or chat-coordinated run cannot be ruled out). A STATE.md status of `needs_human`/`awaiting_human`/`awaiting_user` or `blocked` raises the matching high item even when VERDICT.md is older, and sets the state badge.
+- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold. It is a medium "Needs you" item only when the broker listing was read (`broker: ok`) and no loop-worker process runs inside the workspace; otherwise it is a low-severity review note. Loop workers are positively worker-shaped commands only: `trioctl … run|loop`, `trio_loop.py`, `portable/driver.sh`, and headless harness runs (`claude -p/--print`, `codex … exec`, `cursor-agent -p/--print`, `opencode run`, `omp -p`). Interactive sessions, MCP servers and unknown processes never soften it. A STATE.md status of `needs_human`/`awaiting_human`/`awaiting_user` or `blocked` raises the matching high item even when VERDICT.md is older, and sets the state badge.
 - **Liveness facts** — `driver`: live `.driver.json` or `.lock/pid` process that is not a zombie and started before its record was last written (a recycled PID is not the owner); `proc`: a live process whose argv element (or `--opt=value`, or a relative option value / path with a separator resolved against its cwd) is the mailbox or a file in it, but not a file inside a child mailbox; `session`: live `.session.json` pid (same reuse check); `broker`: sidecar session ids reported running by `GET /v1/sessions/<id>`, or a running session in the paginated `GET /v1/sessions` listing whose `workspace` is this workspace and whose title starts `trioctl <mailbox-dir> ` (ambiguous dir names in one workspace are never attributed).
 - **All loops table** — sortable by loop, workspace and last activity; filtered by search, workspace, and the fact-only segments Running / Attention / All / Archived (preferences persist in `localStorage` when available). Rows patch in place on poll.
 - **Attention inbox** — stable item ids (sha256 hash of root, loop_name, kind, anchor) and per-workspace read/unread state persisted in `~/.local/share/trio-agent-loop/inbox-state.json` (POST /api/inbox/read or /api/inbox/unread). Read items are hidden by default; unread count remains the inbox badge.

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Linked-worktree discovery against real git repositories.
+"""Linked-worktree ownership and loop-worker evidence, against real git
+repositories and real processes.
 
-A main checkout commits a few mailboxes; linked worktrees then either leave
-their inherited copies alone (hidden) or make a mailbox their own
-(modified, untracked, worktree-only, committed on the branch, or live via a
-gitignored sidecar). Merged-in changes from main are not the worktree's own
-work. Also covers the adjacent control/guard fixes of the same pass.
+Ownership is git ancestry: a worktree's mailbox is its own when it is new
+since ``merge-base(HEAD, main)``, changed since then in a way main's tip
+does not already have, uncommitted, holds untracked runtime files, or is
+live. That must survive merge/rebase/reset/stash, count committed
+deletions, ignore touched mtimes and already-merged branches, and keep
+actionable loops visible when no common base exists. Also covers which
+processes count as loop workers, and the adjacent control/guard fixes.
 """
 from __future__ import annotations
 
@@ -82,7 +85,9 @@ def _get(url: str, headers: dict | None = None):
             exc.close()
 
 
-class WorktreeDiscoveryTests(unittest.TestCase):
+class WorktreeOwnershipTests(unittest.TestCase):
+    """Branch ownership comes from git ancestry, never from file mtimes."""
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -96,52 +101,22 @@ class WorktreeDiscoveryTests(unittest.TestCase):
         write_mailbox(cls.main / "loop-alpha", "shipped")
         write_mailbox(cls.main / "loop-beta", "shipped")
         write_mailbox(cls.main / "loop" / "gamma", "shipped")
-        # Some repos commit their sidecars; a checked-out copy of one is
-        # not evidence that a loop ran in the worktree.
-        (cls.main / "loop-beta" / ".repairs").write_text("0\n", "utf-8")
-        git(cls.main, "add", "-A")
         (cls.main / "loop-alpha" / ".driver.json").write_text(
             json.dumps({"pid": 4194000, "phase": "shipped"}), "utf-8")
+        git(cls.main, "add", "-A")
         git(cls.main, "add", "-f", "loop-alpha/.driver.json")
+        (cls.main / "README.md").write_text("product\n", "utf-8")
+        git(cls.main, "add", "-A")
         git(cls.main, "commit", "-q", "-m", "baseline mailboxes")
-
-        def add(name: str) -> Path:
-            path = cls.scan / "acme" / name
-            git(cls.main, "worktree", "add", "-q", "-b", name, str(path))
-            return path
-
-        cls.untouched = add("wt-untouched")
-        cls.modified = add("wt-modified")
-        (cls.modified / "loop-alpha" / "STATE.md").write_text(
-            "status: needs_human\niteration: 3\n", "utf-8")
-        cls.untracked = add("wt-untracked")
-        write_mailbox(cls.untracked / "loop-delta", "running",
-                      verdict="VERDICT: none\n")
-        cls.committed = add("wt-committed")
-        (cls.committed / "loop-beta" / "STATE.md").write_text(
-            "status: running\niteration: 5\n", "utf-8")
-        later(cls.committed / "loop-beta")
-        git(cls.committed, "commit", "-q", "-am", "loop: iteration 5")
-        cls.live = add("wt-live")
-        (cls.live / "loop-beta" / ".driver.json").write_text(
-            json.dumps({"pid": os.getpid(), "phase": "lead"}), "utf-8")
-        # Main moves on; a worktree merges it. The merged files are git's
-        # writes, not the worktree's own loop work.
-        cls.merged = add("wt-merged")
-        (cls.main / "loop-alpha" / "STATE.md").write_text(
-            "status: SHIP\niteration: 9\n", "utf-8")
-        git(cls.main, "commit", "-q", "-am", "main: alpha shipped")
-        time.sleep(1.1)
-        git(cls.merged, "merge", "-q", "--no-edit", "main")
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
     def setUp(self):
-        serve._HEAVY_CACHE.clear()
-        serve._WORKTREE_GIT_CACHE.clear()
-        serve._WORKTREE_SELECT_CACHE.clear()
+        for cache in (serve._HEAVY_CACHE, serve._WORKTREE_GIT_CACHE,
+                      serve._WORKTREE_REFS_CACHE, serve._DISCOVER_CACHE):
+            cache.clear()
         serve._BROKER_LISTING["value"] = None
         self.home = tempfile.TemporaryDirectory()
         self.addCleanup(self.home.cleanup)
@@ -154,126 +129,319 @@ class WorktreeDiscoveryTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    _count = 0
+
+    def worktree(self, prefix: str = "wt") -> Path:
+        WorktreeOwnershipTests._count += 1
+        name = f"{prefix}-{WorktreeOwnershipTests._count}"
+        path = self.scan / "acme" / name
+        git(self.main, "worktree", "add", "-q", "-b", name, str(path))
+        self.addCleanup(git, self.main, "worktree", "remove", "--force",
+                        str(path))
+        return path
+
+    def main_commit(self, rel: str, text: str, message: str):
+        (self.main / rel).write_text(text, "utf-8")
+        git(self.main, "add", "-A")
+        git(self.main, "commit", "-q", "-m", message)
+
     def selection(self, worktree: Path, listing=None) -> dict:
+        for cache in (serve._WORKTREE_GIT_CACHE, serve._WORKTREE_REFS_CACHE,
+                      serve._DISCOVER_CACHE):
+            cache.clear()
         listing = listing or {"status": "disabled", "running": []}
         with serve._proc_snapshot(None, listing):
             got = serve._worktree_mailboxes(worktree, listing)
         return {Path(k).relative_to(worktree).as_posix(): v
                 for k, v in got.items()}
 
-    def test_walk_separates_worktrees_from_workspaces(self):
-        found, linked = serve._scan_root_walk(self.scan)
-        self.assertIn(self.main, found)
-        self.assertEqual(
-            sorted(p.name for p in linked),
-            ["wt-committed", "wt-live", "wt-merged", "wt-modified",
-             "wt-untouched", "wt-untracked"])
-        self.assertEqual(serve._worktree_main(self.modified), self.main)
+    def needs_human(self, wt: Path):
+        (wt / "loop-alpha" / "STATE.md").write_text(
+            "status: needs_human\niteration: 3\n", "utf-8")
 
-    def test_untouched_copy_is_hidden(self):
-        self.assertEqual(self.selection(self.untouched), {})
+    # -- the review's reproduction ------------------------------------
 
-    def test_merged_changes_are_not_the_worktrees_work(self):
-        self.assertEqual(self.selection(self.merged), {})
+    def test_needs_human_survives_merge_rebase_reset_and_stash(self):
+        wt = self.worktree()
+        self.assertEqual(self.selection(wt), {})
+        self.needs_human(wt)
+        self.assertEqual(self.selection(wt), {"loop-alpha": ["modified"]})
+        git(wt, "commit", "-q", "-am", "loop: needs human")
+        expected = {"loop-alpha": ["committed on branch"]}
+        self.assertEqual(self.selection(wt), expected)
 
-    def test_modified_copy_is_shown(self):
-        self.assertEqual(self.selection(self.modified),
-                         {"loop-alpha": ["modified"]})
+        self.main_commit("README.md", "product v2\n", "main: unrelated")
+        git(wt, "merge", "-q", "--no-edit", "main")
+        self.assertEqual(self.selection(wt), expected, "after merge main")
 
-    def test_new_mailbox_is_untracked_and_worktree_only(self):
-        self.assertEqual(self.selection(self.untracked),
-                         {"loop-delta": ["worktree-only", "untracked"]})
+        self.main_commit("README.md", "product v3\n", "main: unrelated 2")
+        git(wt, "rebase", "-q", "main")
+        self.assertEqual(self.selection(wt), expected, "after rebase")
 
-    def test_branch_commit_is_shown_though_git_status_is_clean(self):
-        self.assertEqual(git(self.committed, "status", "--porcelain"), "")
-        self.assertEqual(self.selection(self.committed),
-                         {"loop-beta": ["committed on branch"]})
+        git(wt, "reset", "-q", "--hard", "HEAD")
+        self.assertEqual(self.selection(wt), expected, "after reset --hard")
 
-    def test_ignored_live_sidecar_on_a_clean_copy_is_shown(self):
-        self.assertEqual(git(self.live, "status", "--porcelain"), "")
-        got = self.selection(self.live)
-        self.assertEqual(got["loop-beta"], ["runtime files present", "live"])
-        # loop-alpha carries a committed (tracked) .driver.json: not evidence.
-        self.assertNotIn("loop-alpha", got)
+        (wt / "loop-alpha" / "LOG.md").write_text("## iter 3\n", "utf-8")
+        git(wt, "stash", "-q")
+        self.assertEqual(self.selection(wt), expected, "while stashed")
+        git(wt, "stash", "pop", "-q")
+        self.assertEqual(self.selection(wt),
+                         {"loop-alpha": ["committed on branch", "modified"]},
+                         "after stash pop")
 
-    def test_stale_ignored_sidecar_shows_loop_ran_but_not_live(self):
-        sidecar = self.untouched / "loop-alpha" / ".session.json"
-        sidecar.write_text(json.dumps({"pid": 4194001, "done": True}), "utf-8")
-        try:
-            self.assertEqual(self.selection(self.untouched),
-                             {"loop-alpha": ["runtime files present"]})
-        finally:
-            sidecar.unlink()
-            serve._WORKTREE_GIT_CACHE.clear()
-            serve._WORKTREE_SELECT_CACHE.clear()
+    def test_needs_human_reaches_needs_you_after_merge(self):
+        wt = self.worktree()
+        self.needs_human(wt)
+        git(wt, "commit", "-q", "-am", "loop: needs human")
+        self.main_commit("README.md", "product v9\n", "main: unrelated")
+        git(wt, "merge", "-q", "--no-edit", "main")
+        server = serve.DashboardServer(
+            ("127.0.0.1", 0), workspaces=[self.main], auto_discover=True)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        with patch.object(serve, "BROKER_BASE_URL", ""):
+            status, data = _get(
+                f"http://127.0.0.1:{server.server_address[1]}/api/overview")
+        self.assertEqual(status, 200, data)
+        entry = next(w for w in data["workspaces"]
+                     if w["root"] == str(wt))
+        self.assertEqual([l["name"] for l in entry["loops"]], ["loop-alpha"])
+        self.assertEqual([(i["kind"], i["severity"]) for i in entry["inbox"]],
+                         [("needs_human", "high")])
 
-    def test_nested_child_change_does_not_label_its_container(self):
-        state = self.untouched / "loop" / "gamma" / "STATE.md"
-        original = state.stat()
+    # -- ancestry rules ---------------------------------------------------
+
+    def test_committed_deletion_is_shown(self):
+        wt = self.worktree()
+        git(wt, "rm", "-q", "loop-beta/LOG.md")
+        git(wt, "commit", "-q", "-m", "loop: drop log")
+        self.assertEqual(self.selection(wt),
+                         {"loop-beta": ["deleted on branch"]})
+
+    def test_branch_already_merged_into_main_is_not_duplicated(self):
+        wt = self.worktree()
+        (wt / "loop-beta" / "STATE.md").write_text("status: running\n")
+        git(wt, "commit", "-q", "-am", "loop: beta running")
+        branch = wt.name
+        git(self.main, "merge", "-q", "--no-edit", branch)
+        self.assertEqual(self.selection(wt), {})
+
+    def test_same_edit_already_on_main_is_not_duplicated(self):
+        wt = self.worktree()
+        (wt / "loop-beta" / "VERDICT.md").write_text("VERDICT: ITERATE\n")
+        git(wt, "commit", "-q", "-am", "branch: iterate")
+        self.main_commit("loop-beta/VERDICT.md", "VERDICT: ITERATE\n",
+                         "main: same edit")
+        self.assertEqual(self.selection(wt), {})
+
+    def test_main_moving_ahead_does_not_flag_the_branch(self):
+        # Seen live: main gained child mailboxes the branch lacks, which
+        # made every branch's `loop/` container look changed.
+        wt = self.worktree()
+        write_mailbox(self.main / "loop" / "zeta", "running")
+        (self.main / "loop" / "gamma" / "PLAN.md").write_text("plan\n")
+        git(self.main, "add", "-A")
+        git(self.main, "commit", "-q", "-m", "main: new child, new file")
+        self.assertEqual(self.selection(wt), {})
+
+    def test_touching_inherited_files_changes_nothing(self):
+        wt = self.worktree()
+        stamp = time.time() + 3600
+        for f in wt.rglob("*"):
+            if f.is_file() and ".git" not in f.parts:
+                os.utime(f, (stamp, stamp))
+        self.assertEqual(self.selection(wt), {})
+
+    def test_new_mailboxes_committed_and_untracked(self):
+        wt = self.worktree()
+        write_mailbox(wt / "loop-delta", "running", "VERDICT: none\n")
+        self.assertEqual(self.selection(wt), {"loop-delta": ["untracked"]})
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "loop: open delta")
+        self.assertEqual(self.selection(wt),
+                         {"loop-delta": ["new on branch"]})
+
+    def test_nested_child_is_labelled_not_its_container(self):
+        wt = self.worktree()
+        (wt / "loop" / "gamma" / "STATE.md").write_text("status: running\n")
+        git(wt, "commit", "-q", "-am", "gamma running")
+        write_mailbox(wt / "loop" / "epsilon", "running")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "open epsilon")
+        self.assertEqual(self.selection(wt), {
+            "loop/gamma": ["committed on branch"],
+            "loop/epsilon": ["new on branch"],
+        })
+
+    def test_unrelated_history_shows_actionable_loops_only(self):
+        wt = self.worktree("orphan")
+        git(wt, "checkout", "-q", "--orphan", wt.name + "-root")
+        git(wt, "rm", "-rfq", ".")
+        for leftover in wt.iterdir():  # ignored files survive `git rm`
+            if leftover.name != ".git":
+                subprocess.run(["rm", "-rf", str(leftover)], check=True)
+        write_mailbox(wt / "loop-alpha", "needs_human", "VERDICT: none\n")
+        write_mailbox(wt / "loop-beta", "shipped")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "unrelated root")
+        got = self.selection(wt)
+        self.assertEqual(list(got), ["loop-alpha"], got)
+        self.assertEqual(len(got["loop-alpha"]), 1, got)
+        self.assertTrue(got["loop-alpha"][0].startswith("no common base ("),
+                        got)
+        self.assertIn("no common history", got["loop-alpha"][0])
+
+    def test_worktree_of_a_bare_repository_uses_main_branch(self):
+        bare = Path(self.tmp.name) / "bare.git"
+        if not bare.exists():
+            git(Path(self.tmp.name), "clone", "-q", "--bare",
+                str(self.main), str(bare))
+        wt = self.scan / "acme" / "bare-wt"
+        git(bare, "worktree", "add", "-q", "-b", "bare-wt", str(wt), "main")
+        self.addCleanup(git, bare, "worktree", "remove", "--force", str(wt))
+        self.assertIsNone(serve._worktree_main(wt))
+        self.assertEqual(self.selection(wt), {})
+        self.needs_human(wt)
+        git(wt, "commit", "-q", "-am", "needs human")
+        self.assertEqual(self.selection(wt),
+                         {"loop-alpha": ["committed on branch"]})
+
+    # -- runtime and live evidence ---------------------------------------
+
+    def test_ignored_live_sidecar_shown_tracked_sidecar_ignored(self):
+        wt = self.worktree()
+        self.assertEqual(git(wt, "status", "--porcelain"), "")
+        (wt / "loop-beta" / ".driver.json").write_text(
+            json.dumps({"pid": os.getpid(), "phase": "lead"}), "utf-8")
+        got = self.selection(wt)
+        self.assertEqual(got, {"loop-beta": ["runtime files present", "live"]})
+
+    def test_leftover_sidecar_counts_only_for_a_pending_loop(self):
+        wt = self.worktree()
+        box = wt / "loop" / "gamma"  # shipped on main, never merged into
+        (box / ".session.json").write_text(
+            json.dumps({"pid": 4194001, "done": True}), "utf-8")
+        # A finished loop's leftovers are not pending work.
+        self.assertEqual(self.selection(wt), {})
+        state = box / "STATE.md"
         state.write_text("status: running\n", "utf-8")
-        os.utime(state, (original.st_atime, original.st_mtime))
-        try:
-            got = self.selection(self.untouched)
-            self.assertEqual(got, {"loop/gamma": ["modified"]})
-        finally:
-            git(self.untouched, "checkout", "--", "loop/gamma/STATE.md")
-            # Keep the inherited copy's checkout-time mtime so later tests
-            # still see an untouched worktree.
-            os.utime(state, (original.st_atime, original.st_mtime))
-            serve._WORKTREE_GIT_CACHE.clear()
+        self.assertEqual(self.selection(wt), {
+            "loop/gamma": ["modified", "runtime files present"]})
+        git(wt, "commit", "-q", "-am", "gamma running")
+        self.assertEqual(self.selection(wt), {
+            "loop/gamma": ["committed on branch", "runtime files present"]})
+        # Back to main's content, but the loop is left claiming "running"
+        # only through its sidecar-bearing, unchanged mailbox: not shown
+        # unless STATE on disk says so.
+        git(wt, "reset", "-q", "--hard", "HEAD~1")
+        self.assertEqual(self.selection(wt), {})
 
     def test_broker_session_attributes_only_to_its_own_worktree(self):
+        wt = self.worktree()
+        other = self.worktree()
         listing = {"status": "ok", "running": [{
             "id": "s1", "title": "trioctl loop-alpha lead:iteration 1",
-            "workspace": str(self.untouched)}]}
-        got = self.selection(self.untouched, listing)
-        self.assertEqual(got, {"loop-alpha": ["live"]})
+            "workspace": str(wt)}]}
+        self.assertEqual(self.selection(wt, listing), {"loop-alpha": ["live"]})
+        self.assertEqual(self.selection(other, listing), {})
         with serve._proc_snapshot(None, listing):
             main_detect = serve._running_detection(
                 self.main / "loop-alpha", self.main)
-            other = serve._running_detection(
-                self.modified / "loop-alpha", self.modified)
         self.assertNotIn("broker", main_detect["sources"])
-        self.assertNotIn("broker", other["sources"])
 
-    def test_overview_shows_worktree_loops_and_needs_human(self):
+    def test_walk_separates_worktrees_and_they_are_not_registry_workspaces(self):
+        wt = self.worktree()
+        found, linked = serve._scan_root_walk(self.scan)
+        self.assertIn(self.main, found)
+        self.assertIn(wt, linked)
+        self.assertNotIn(wt, found)
         server = serve.DashboardServer(
             ("127.0.0.1", 0), workspaces=[self.main], auto_discover=True)
         self.addCleanup(server.server_close)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        with patch.object(serve, "BROKER_BASE_URL", ""):
-            status, data = _get(base + "/api/overview")
-        self.assertEqual(status, 200, data)
-        entries = {w["name"]: w for w in data["workspaces"]}
-        self.assertEqual(data["worktrees_scanned"], 6)
-        names = {name for name, w in entries.items() if w.get("worktree")}
-        self.assertEqual(names, {
-            "product (worktree wt-modified)",
-            "product (worktree wt-untracked)",
-            "product (worktree wt-committed)",
-            "product (worktree wt-live)",
-        })
-        modified = entries["product (worktree wt-modified)"]
-        self.assertEqual([l["name"] for l in modified["loops"]], ["loop-alpha"])
-        self.assertEqual(modified["loops"][0]["worktree_reasons"], ["modified"])
-        needs = [i for i in modified["inbox"] if i["kind"] == "needs_human"]
-        self.assertEqual(len(needs), 1)
-        self.assertEqual(needs[0]["severity"], "high")
-        self.assertIn("STATE.md", needs[0]["headline"])
-        # The main checkout keeps all of its own loops, once.
-        main_entry = entries["product"]
-        self.assertEqual(sorted(l["name"] for l in main_entry["loops"]),
-                         ["loop-alpha", "loop-beta", "loop/gamma"])
-        total = sum(len(w["loops"]) for w in data["workspaces"])
-        self.assertEqual(total, 3 + 4)
-        # Worktrees are valid roots for drilldown but not registry workspaces.
-        status, detail = _get(base + "/api/loop?" + urllib.parse.urlencode(
-            {"root": str(self.modified), "name": "loop-alpha"}))
-        self.assertEqual(status, 200, detail)
         status, listed = _get(base + "/api/workspaces")
-        self.assertNotIn(str(self.modified), {w["path"] for w in listed})
+        self.assertNotIn(str(wt), {w["path"] for w in listed})
+        status, detail = _get(base + "/api/loop?" + urllib.parse.urlencode(
+            {"root": str(wt), "name": "loop-alpha"}))
+        self.assertEqual(status, 200, detail)
+
+
+class WorkerShapeTests(unittest.TestCase):
+    """Only positively worker-shaped processes soften "nothing is live"."""
+
+    INTERACTIVE = [
+        ["claude", "--permission-mode", "auto", "--model", "claude-opus-5-5",
+         "--mcp-config", '{"mcpServers":{}}'],
+        ["codex", "app-server", "--listen", "stdio://"],
+        ["codex", "-c", 'model_provider="openai"'],
+        ["railway", "mcp"],
+        ["/home/u/.local/share/uv/tools/omnigent/bin/python", "-I", "-m",
+         "omnigent.harnesses.claude_native.bridge", "serve-mcp",
+         "--bridge-dir", "/tmp/x"],
+        ["python3", "/home/u/.local/bin/trioctl", "omnigent", "resolve",
+         "builder", "--json"],
+        ["node", "/usr/lib/node_modules/vite/bin/vite.js", "--port", "5299"],
+        ["opendesign-mcp"],
+    ]
+    WORKERS = [
+        ["python3", "/home/u/.local/bin/trioctl", "omnigent", "run", "builder",
+         "--config", "/tmp/c.toml", "--workspace", "/w"],
+        ["python3", "/home/u/.local/bin/trioctl", "omnigent", "loop",
+         "--mailbox", "loop/x"],
+        ["python3", "/repo/metrics/trio_loop.py", "run", "--mailbox", "/w/loop"],
+        ["bash", "/repo/portable/driver.sh"],
+        ["claude", "-p", "do the brief", "--output-format", "json"],
+        ["codex", "-c", "x=1", "exec", "--json", "brief"],
+        ["cursor-agent", "--print", "brief"],
+        ["opencode", "run", "brief"],
+    ]
+
+    def test_classification(self):
+        for args in self.INTERACTIVE:
+            with self.subTest(args=args):
+                self.assertFalse(serve._is_loop_worker(args))
+        for args in self.WORKERS:
+            with self.subTest(args=args):
+                self.assertTrue(serve._is_loop_worker(args))
+
+    def run_named(self, directory: Path, name: str, *args: str):
+        script = directory / name
+        script.write_text(f"#!{sys.executable}\nimport time; time.sleep(30)\n")
+        script.chmod(0o755)
+        proc = subprocess.Popen([str(script), *args], cwd=directory)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
+    def test_interactive_sessions_do_not_mask_a_stopped_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            write_mailbox(root / "loop", "running", "VERDICT: none\n")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            listing = {"status": "ok", "running": []}
+            card = {"name": "loop", "status": "running",
+                    "final_verdict": None, "last_activity": None}
+            # Real processes shaped like an interactive session and an MCP.
+            self.run_named(bin_dir, "claude", "--permission-mode", "auto")
+            self.run_named(bin_dir, "railway", "mcp")
+            time.sleep(0.3)
+            with serve._proc_snapshot(None, listing):
+                items = serve._inbox_items(root / "loop", card, root)
+            self.assertEqual([(i["kind"], i["severity"]) for i in items],
+                             [("interrupted", "medium")])
+            # A headless worker in the same workspace softens it.
+            self.run_named(bin_dir, "trioctl", "omnigent", "run", "builder")
+            time.sleep(0.3)
+            with serve._proc_snapshot(None, listing):
+                items = serve._inbox_items(root / "loop", card, root)
+            self.assertEqual([(i["kind"], i["severity"]) for i in items],
+                             [("interrupted", "low")])
+            self.assertIn("1 loop worker", items[0]["detail"])
+            self.assertEqual(serve._workspace_worker_count(root), 1)
 
 
 class AdjacentFixTests(unittest.TestCase):
@@ -352,26 +520,6 @@ class AdjacentFixTests(unittest.TestCase):
         self.assertEqual(resp.status, 415)
         self.assertEqual(resp.getheader("Connection"), "close")
         conn.close()
-
-    def test_work_in_the_workspace_softens_nothing_is_live(self):
-        (self.root / "loop" / "STATE.md").write_text("status: running\n")
-        listing = {"status": "ok", "running": []}
-        card = {"name": "loop", "status": "running", "final_verdict": None,
-                "last_activity": None}
-        with serve._proc_snapshot([], listing):
-            items = serve._inbox_items(self.root / "loop", card, self.root)
-        self.assertEqual([(i["kind"], i["severity"]) for i in items],
-                         [("interrupted", "medium")])
-        worker = subprocess.Popen(["python3", "-c", "import time; time.sleep(30)"],
-                                  cwd=self.root)
-        self.addCleanup(worker.wait)
-        self.addCleanup(worker.kill)
-        time.sleep(0.2)
-        with serve._proc_snapshot(None, listing):
-            items = serve._inbox_items(self.root / "loop", card, self.root)
-        self.assertEqual([(i["kind"], i["severity"]) for i in items],
-                         [("interrupted", "low")])
-        self.assertIn("working in this workspace", items[0]["detail"])
 
     def test_state_blocked_without_verdict_is_flagged(self):
         (self.root / "loop" / "STATE.md").write_text("status: blocked\n")

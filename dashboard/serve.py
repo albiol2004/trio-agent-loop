@@ -1983,13 +1983,15 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         when = (f" Last mailbox write {last[:16].replace('T', ' ')} UTC."
                 if last else "")
         broker = detection.get("broker")
-        working = _workspace_process_count(root)
+        working = _workspace_worker_count(root)
         if working:
             add("low", "interrupted",
-                f"STATE.md says {status}; no process names this mailbox",
-                f"{working} process{'es' if working != 1 else ''} "
-                "are working in this workspace without naming a mailbox, "
-                "so this loop may still be progressing." + when,
+                f"STATE.md says {status}; no worker names this mailbox",
+                f"{working} loop worker{'s' if working != 1 else ''} "
+                "(Trio driver, role runner or headless harness) "
+                f"{'are' if working != 1 else 'is'} running in this "
+                "workspace without naming a mailbox, so this loop may still "
+                "be progressing." + when,
                 f"interrupted:{last}")
         elif broker == "ok":
             add("medium", "interrupted",
@@ -4629,11 +4631,13 @@ def _scan_root_walk(scan_root: Path) -> tuple[list[Path], list[Path]]:
 
 # -- linked worktrees -------------------------------------------------------
 
-WORKTREE_GIT_SECONDS = 300.0
-"""Longest reuse of a worktree's ``git status`` labels with unchanged inputs."""
+WORKTREE_GIT_SECONDS = 90.0
+"""Longest reuse (jittered up to +50%) of a worktree's ``git status``
+labels while its index and HEAD reflog are unchanged; an ordinary edit of a
+tracked mailbox file shows up within this bound."""
 
-WRITE_SLACK_SECONDS = 5.0
-"""A file counts as written locally when newer than the last checkout by this."""
+WORKTREE_REFS_SECONDS = 300.0
+"""Longest reuse of a worktree's ancestry evidence with unchanged refs."""
 
 _WORKTREE_GIT_CACHE: dict[str, tuple] = {}
 _WORKTREE_GIT_LOCK = threading.Lock()
@@ -4669,70 +4673,9 @@ def _worktree_main(worktree: Path) -> Path | None:
     return common.parent
 
 
-_PLAIN_COMMIT_MESSAGES = ("commit:", "commit (amend):", "commit (initial):")
-
-
-def _last_checkout_epoch(worktree: Path) -> float | None:
-    """When the worktree's files were last written by git itself.
-
-    The newest entry of the worktree's HEAD reflog that git may have
-    written files for: checkout, reset (``git worktree add`` records
-    ``reset: moving to HEAD``), merge, rebase, pull, cherry-pick, revert,
-    ``commit (merge)``. Plain commits never rewrite the tree, so a loop that
-    commits its own mailbox stays "written after checkout". Falls back to
-    the ``.git`` file's mtime.
-    """
-    gitdir = _worktree_gitdir(worktree)
-    latest = None
-    if gitdir is not None:
-        try:
-            with open(gitdir / "logs" / "HEAD", "rb") as fh:
-                for raw in fh:
-                    head, _, message = raw.decode(
-                        "utf-8", errors="replace").partition("\t")
-                    if message.startswith(_PLAIN_COMMIT_MESSAGES):
-                        continue
-                    parts = head.split()
-                    try:
-                        latest = float(parts[-2])
-                    except (IndexError, ValueError):
-                        continue
-        except OSError:
-            pass
-    if latest is None:
-        try:
-            latest = (worktree / ".git").stat().st_mtime
-        except OSError:
-            return None
-    return latest
-
-
 _RUNTIME_FILES = {".driver.json", ".session.json", ".lock", ".repairs",
                   ".driver.json.dashboard-tmp"}
 """Runtime files a running loop writes that are not mailbox content."""
-
-
-def _mailbox_write_kind(mailbox: Path, epoch: float) -> str | None:
-    """``"content"`` when a mailbox file or brief was written after
-    ``epoch``, else None. Nested child mailboxes are judged on their own;
-    untracked runtime files are reported by ``_worktree_git_labels``."""
-    try:
-        with os.scandir(mailbox) as entries:
-            for entry in entries:
-                is_file = entry.is_file(follow_symlinks=False)
-                if not is_file and entry.name != "briefs":
-                    continue
-                if entry.name in _RUNTIME_FILES:
-                    continue
-                try:
-                    if entry.stat(follow_symlinks=False).st_mtime > (
-                            epoch + WRITE_SLACK_SECONDS):
-                        return "content"
-                except OSError:
-                    continue
-    except OSError:
-        return None
-    return None
 
 
 def _worktree_git_labels(worktree: Path, mailboxes: list[Path]) -> dict:
@@ -4742,8 +4685,8 @@ def _worktree_git_labels(worktree: Path, mailboxes: list[Path]) -> dict:
     One ``git status --porcelain -uall --ignored=matching -- <mailboxes>``
     per worktree (``--no-optional-locks``: never rewrites the index), reused
     while the worktree's index and HEAD reflog are unchanged and for at most
-    ``WORKTREE_GIT_SECONDS`` (edits that touch neither show up within that
-    bound; writes after checkout and liveness are checked every build).
+    a jittered ``WORKTREE_GIT_SECONDS`` (edits that touch neither show up
+    within that bound; liveness is checked every build).
     """
     gitdir = _worktree_gitdir(worktree)
     stamps = []
@@ -4800,13 +4743,6 @@ def _worktree_git_labels(worktree: Path, mailboxes: list[Path]) -> dict:
     return dict(value)
 
 
-WORKTREE_SELECT_SECONDS = 60.0
-"""Longest reuse of a worktree's stat/git-based mailbox selection."""
-
-_WORKTREE_SELECT_CACHE: dict[str, tuple] = {}
-_WORKTREE_SELECT_LOCK = threading.Lock()
-
-
 DISCOVER_CACHE_SECONDS = 60.0
 _DISCOVER_CACHE: dict[str, tuple] = {}
 _DISCOVER_LOCK = threading.Lock()
@@ -4845,71 +4781,250 @@ def _discover_loops_cached(root: Path) -> list[Path]:
     return list(loops)
 
 
-def _worktree_select_fingerprint(worktree: Path) -> tuple:
-    """Cheap signature of what changes when mailboxes appear or git moves:
-    the worktree's index and HEAD reflog, its root dir and its loop* dirs."""
-    gitdir = _worktree_gitdir(worktree)
-    stamps = []
-    for path in ((gitdir / "index") if gitdir else None,
-                 (gitdir / "logs" / "HEAD") if gitdir else None, worktree):
-        try:
-            stamps.append(path.stat().st_mtime_ns if path else None)
-        except OSError:
-            stamps.append(None)
+def _git_out(cwd: Path, *args: str) -> str | None:
+    """stdout of a read-only git command, or None on any failure."""
     try:
-        with os.scandir(worktree) as entries:
-            for entry in entries:
-                if entry.name.startswith("loop") and entry.is_dir():
-                    stamps.append((entry.name, entry.stat().st_mtime_ns))
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(cwd), *args],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _common_gitdir(worktree: Path) -> Path | None:
+    gitdir = _worktree_gitdir(worktree)
+    if gitdir is None:
+        return None
+    try:
+        return (gitdir / (gitdir / "commondir").read_text(
+            encoding="utf-8").strip()).resolve()
+    except OSError:
+        return None
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+
+def _resolve_ref(common: Path, gitdir: Path, ref: str, depth: int = 0) -> str | None:
+    """Resolve ``HEAD`` or ``refs/...`` by reading ref files and
+    packed-refs; None when that needs git itself (then callers ask git)."""
+    if depth > 4:
+        return None
+    if ref == "HEAD":
+        try:
+            text = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if _SHA_RE.match(text):
+            return text
+        if not text.startswith("ref:"):
+            return None
+        return _resolve_ref(common, gitdir, text[4:].strip(), depth + 1)
+    for base in (gitdir, common):
+        try:
+            text = (base / ref).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if _SHA_RE.match(text):
+            return text
+        if text.startswith("ref:"):
+            return _resolve_ref(common, gitdir, text[4:].strip(), depth + 1)
+    try:
+        with open(common / "packed-refs", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref and _SHA_RE.match(parts[0]):
+                    return parts[0]
     except OSError:
         pass
-    return tuple(stamps)
+    return None
+
+
+def _worktree_heads(worktree: Path) -> tuple[str | None, str | None, str]:
+    """(worktree HEAD, base tip, base description) as commit ids.
+
+    The base tip is the main checkout's HEAD; for a worktree of a bare
+    repository (no main checkout) it is ``main``/``master``/``origin/HEAD``.
+    Ref files are read directly; git is asked only when that fails.
+    """
+    gitdir = _worktree_gitdir(worktree)
+    common = _common_gitdir(worktree)
+    head = tip = None
+    description = "no main checkout or main/master branch"
+    if gitdir is not None and common is not None:
+        head = _resolve_ref(common, gitdir, "HEAD")
+        main = _worktree_main(worktree)
+        if main is not None:
+            tip = _resolve_ref(common, common, "HEAD")
+            try:
+                branch = (common / "HEAD").read_text(encoding="utf-8").strip()
+            except OSError:
+                branch = ""
+            branch = branch[len("ref: refs/heads/"):] if branch.startswith(
+                "ref: refs/heads/") else "detached"
+            description = f"{main.name} HEAD ({branch})"
+            if tip is None:
+                tip = (_git_out(main, "rev-parse", "--verify", "-q", "HEAD")
+                       or "").strip() or None
+        else:
+            for ref in ("refs/heads/main", "refs/heads/master",
+                        "refs/remotes/origin/HEAD"):
+                tip = _resolve_ref(common, common, ref) or (
+                    _git_out(worktree, "rev-parse", "--verify", "-q", ref)
+                    or "").strip() or None
+                if tip:
+                    description = ref
+                    break
+    if head is None:
+        head = (_git_out(worktree, "rev-parse", "--verify", "-q", "HEAD")
+                or "").strip() or None
+    return head, tip, description
+
+
+def _deepest_mailbox(target: Path, ordered: list[Path]) -> Path | None:
+    for mailbox in ordered:
+        if target == mailbox or mailbox in target.parents:
+            return mailbox
+    return None
+
+
+_WORKTREE_REFS_CACHE: dict[str, tuple] = {}
+_WORKTREE_REFS_LOCK = threading.Lock()
+
+
+def _worktree_ancestry(worktree: Path, mailboxes: list[Path]) -> dict:
+    """Ancestry evidence for a worktree's mailboxes, from git objects only
+    (never file mtimes, so merges, rebases, resets, stashes and touched
+    files cannot move it).
+
+    With ``mb = merge-base(HEAD, base tip)``: a mailbox's own files are
+    those added, modified or deleted between ``mb`` and HEAD; they still
+    belong to the branch when the base tip does not already have the same
+    content at that path. ``changed`` maps such mailboxes to
+    ``changed``/``deleted``; ``new`` lists those among them absent from
+    the ``mb`` tree. Cached on (HEAD, tip) commit ids, so a commit
+    elsewhere in the repository does not recompute every worktree.
+    """
+    head, tip, description = _worktree_heads(worktree)
+    fingerprint = (head, tip, tuple(str(m) for m in mailboxes))
+    key = str(worktree)
+    now = time.monotonic()
+    with _WORKTREE_REFS_LOCK:
+        hit = _WORKTREE_REFS_CACHE.get(key)
+        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
+                WORKTREE_REFS_SECONDS, key):
+            return copy.deepcopy(hit[2])
+    rels = [str(m.relative_to(worktree)) for m in mailboxes]
+    ordered = sorted(mailboxes, key=lambda m: len(m.parts), reverse=True)
+    merge_base = None
+    if tip and head:
+        merge_base = (_git_out(worktree, "merge-base", head, tip)
+                      or "").strip() or None
+        if merge_base is None:
+            description += "; no common history"
+    result = {"base": description, "merge_base": merge_base,
+              "changed": {}, "new": []}
+    if merge_base and rels and merge_base != head:
+        own = _git_out(worktree, "diff", "--name-status", "--no-renames",
+                       merge_base, head, "--", *rels)
+        own_files: dict[str, str] = {}
+        for line in (own or "").splitlines():
+            status, _, path = line.partition("\t")
+            if path:
+                own_files[path] = "deleted" if status.startswith("D") else "changed"
+        if own_files:
+            touched = sorted({
+                str(m.relative_to(worktree)) for m in
+                (_deepest_mailbox(worktree / f, ordered) for f in own_files)
+                if m is not None})
+            differs = set((_git_out(worktree, "diff", "--name-only", tip,
+                                    head, "--", *touched) or "").splitlines())
+            for path, kind in own_files.items():
+                if path not in differs:
+                    continue  # the base tip already has this exact content
+                mailbox = _deepest_mailbox(worktree / path, ordered)
+                if mailbox is not None:
+                    kinds = result["changed"].setdefault(str(mailbox), [])
+                    if kind not in kinds:
+                        kinds.append(kind)
+            if result["changed"]:
+                present = _git_out(
+                    worktree, "ls-tree", "-d", "--name-only", merge_base,
+                    "--", *[str(Path(k).relative_to(worktree))
+                            for k in result["changed"]])
+                at_base = {str(worktree / line)
+                           for line in (present or "").splitlines()}
+                result["new"] = [k for k in result["changed"]
+                                 if k not in at_base]
+    with _WORKTREE_REFS_LOCK:
+        _WORKTREE_REFS_CACHE[key] = (fingerprint, now, copy.deepcopy(result))
+    return result
+
+
+_ACTIONABLE_STATUS = (_RUNNING_STATUS_WORDS | _HUMAN_STATUS_WORDS
+                      | {"blocked"})
+
+
+def _mailbox_actionable(mailbox: Path) -> bool:
+    """STATE.md or VERDICT.md says the loop is running or needs a person."""
+    try:
+        state = (mailbox / "STATE.md").read_text(
+            encoding="utf-8", errors="replace")
+        m = re.search(r"(?im)^status:\s*([\w-]+)", state)
+        if m and m.group(1).strip().lower() in _ACTIONABLE_STATUS:
+            return True
+    except OSError:
+        pass
+    try:
+        head = (mailbox / "VERDICT.md").read_text(
+            encoding="utf-8", errors="replace")[:200].upper()
+        return "NEEDS_HUMAN" in head or "BLOCKED" in head
+    except OSError:
+        return False
 
 
 def _worktree_static_selection(worktree: Path) -> tuple[list[Path], dict]:
-    """(all mailboxes, {path: reasons}) from files and git, cached.
+    """(all mailboxes, {path: reasons}) from git evidence.
 
-    Reasons: ``worktree-only``, ``untracked``/``modified`` (git status),
-    ``committed on branch`` (clean, but written after the last git tree
-    update). Reused for ``WORKTREE_SELECT_SECONDS`` or until the
-    fingerprint changes; liveness is added per build by the caller.
+    Reasons: ``new on branch`` (absent from the merge-base tree, with
+    content the base tip does not have), ``committed on branch`` /
+    ``deleted on branch`` (own changes since the merge-base the base tip
+    does not already have), ``modified`` / ``untracked`` (git status), ``runtime
+    files present`` (untracked or ignored sidecars/locks, counted when the
+    mailbox has other evidence or STATE/VERDICT says running or needs a
+    person; a finished loop's leftovers are not pending work). Without a merge-base (no main checkout or
+    branch, unrelated histories) nothing can be called inherited, so
+    mailboxes whose STATE/VERDICT is running or needs a person are shown
+    with ``no common base (…)`` instead of being hidden.
     """
-    fingerprint = _worktree_select_fingerprint(worktree)
-    key = str(worktree)
-    now = time.monotonic()
-    with _WORKTREE_SELECT_LOCK:
-        hit = _WORKTREE_SELECT_CACHE.get(key)
-        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
-                WORKTREE_SELECT_SECONDS, key):
-            return list(hit[2]), {k: list(v) for k, v in hit[3].items()}
     try:
         mailboxes = _discover_loops_cached(worktree)
     except OSError:
         mailboxes = []
-    main = _worktree_main(worktree)
-    checkout = _last_checkout_epoch(worktree)
+    ancestry = _worktree_ancestry(worktree, mailboxes)
     labels = _worktree_git_labels(worktree, mailboxes)
+    new = set(ancestry["new"])
     reasons: dict[str, list[str]] = {}
     for mailbox in mailboxes:
+        key = str(mailbox)
         found = []
-        if main is not None:
-            rel = mailbox.relative_to(worktree)
-            if not (main / rel).is_dir():
-                found.append("worktree-only")
-        tags = labels.get(str(mailbox)) or []
-        uncommitted = [t for t in tags if t != "runtime"]
-        found.extend(uncommitted)
-        written = (_mailbox_write_kind(mailbox, checkout)
-                   if checkout is not None else None)
-        if not uncommitted and written == "content":
-            found.append("committed on branch")
-        if "runtime" in tags:
+        if key in new:
+            found.append("new on branch")
+        else:
+            for kind in sorted(ancestry["changed"].get(key, [])):
+                found.append("deleted on branch" if kind == "deleted"
+                             else "committed on branch")
+        tags = labels.get(key) or []
+        found.extend(t for t in tags if t != "runtime")
+        # Leftover sidecars prove a loop ran here, not that it is pending:
+        # they count for loops that still say running / need a person.
+        if "runtime" in tags and (found or _mailbox_actionable(mailbox)):
             found.append("runtime files present")
+        if ancestry["merge_base"] is None and _mailbox_actionable(mailbox):
+            found.append(f"no common base ({ancestry['base']})")
         if found:
-            reasons[str(mailbox)] = found
-    with _WORKTREE_SELECT_LOCK:
-        _WORKTREE_SELECT_CACHE[key] = (fingerprint, now, list(mailboxes),
-                                       {k: list(v) for k, v in reasons.items()})
+            reasons[key] = found
     return mailboxes, reasons
 
 
@@ -4951,15 +5066,17 @@ def _worktree_mailboxes(worktree: Path, listing: dict) -> dict[str, list[str]]:
     A committed copy the worktree only inherited is left out. A mailbox is
     shown when any of these holds:
 
-    * ``worktree-only`` — the main checkout has no mailbox at that path;
+    * ``new on branch`` / ``committed on branch`` / ``deleted on branch``
+      — git ancestry: absent from ``merge-base(HEAD, base tip)``, or files
+      changed since it that the base tip does not already have;
     * ``untracked`` / ``modified`` — ``git status`` reports uncommitted
       files in it;
-    * ``committed on branch`` — clean, but a mailbox file was written
-      after the worktree's last git tree update, so the branch's own loop
-      committed it (inherited copies keep their checkout mtimes);
     * ``runtime files present`` — untracked or ignored sidecars/locks
-      exist, which git never creates, so a loop ran here (live or not);
-      tracked sidecars (some repos commit them) do not count;
+      exist, which git never creates, so a loop ran here; shown alone only
+      while STATE/VERDICT says running or needs a person; tracked sidecars
+      (some repos commit them) do not count;
+    * ``no common base (…)`` — no merge-base could be found, and STATE or
+      VERDICT says running / needs a person;
     * ``live`` — a live argv path, a broker session whose workspace is this
       worktree, or a live sidecar; checked on every build.
     """
@@ -4979,12 +5096,66 @@ def _worktree_mailboxes(worktree: Path, listing: dict) -> dict[str, list[str]]:
     return reasons
 
 
-_IDLE_COMMANDS = {"bash", "sh", "zsh", "fish", "tmux", "less", "vim", "nvim",
-                  "nano", "watch", "tail"}
+_INTERPRETERS = {"python", "python3", "node", "bun", "deno", "uv", "uvx",
+                 "bash", "sh", "env"}
 
 
-def _workspace_process_count(root: Path, processes=None) -> int:
-    """Live non-shell processes whose cwd is inside ``root``."""
+def _command_words(args: list[str]) -> list[str]:
+    """argv with interpreter prefixes (``python3 -I x``, ``env``, ``node``)
+    stripped, program names reduced to their basename."""
+    words = list(args)
+    while words:
+        name = os.path.basename(words[0])
+        base = re.sub(r"[\d.]+$", "", name)  # python3.12 -> python
+        if base in _INTERPRETERS or name in _INTERPRETERS:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
+            continue
+        break
+    if words:
+        words[0] = os.path.basename(words[0])
+    return words
+
+
+def _is_loop_worker(args: list[str]) -> bool:
+    """A process positively shaped like loop work.
+
+    Trio drivers and role runners (``trioctl … run|loop``, ``trio_loop.py``,
+    ``portable/driver.sh``) and headless harness runs (``claude -p/--print``,
+    ``codex exec``, ``cursor-agent -p/--print``, ``opencode run``,
+    ``omp -p``). Interactive sessions, MCP servers and anything unknown are
+    not workers, so they never mask a stopped loop.
+    """
+    words = _command_words(args)
+    if not words:
+        return False
+    if any(w.endswith("portable/driver.sh") for w in args[:3]):
+        return True
+    program, rest = words[0], words[1:]
+    if "mcp" in program.lower() or any(
+            w in ("mcp", "mcp-server", "serve-mcp") for w in rest[:2]):
+        return False
+    if program in ("trio_loop.py",):
+        return True
+    if program == "trioctl":
+        return any(w in ("run", "loop") for w in rest[:3])
+    if program == "claude":
+        return "-p" in rest or "--print" in rest
+    if program == "codex":
+        return "exec" in rest  # options such as -c k=v may precede it
+    if program in ("cursor-agent", "agent"):
+        return "-p" in rest or "--print" in rest
+    if program == "opencode":
+        return "run" in rest
+    if program == "omp":
+        return "-p" in rest or "--print" in rest
+    return False
+
+
+def _workspace_worker_count(root: Path, processes=None) -> int:
+    """Live loop-worker processes (``_is_loop_worker``) whose cwd is inside
+    ``root``."""
     if processes is None:
         processes = getattr(_PROC_SNAPSHOT, "processes", None)
         if processes is None:
@@ -4995,24 +5166,22 @@ def _workspace_process_count(root: Path, processes=None) -> int:
             base = str(root.resolve())
         except OSError:
             return 0
-        count = 0
-        for _, args, cwd in processes or ():
-            if cwd and (cwd == base or cwd.startswith(base + os.sep)):
-                if args and os.path.basename(args[0]) in _IDLE_COMMANDS:
-                    continue
-                count += 1
-        return count
+        return sum(
+            1 for _, args, cwd in processes or ()
+            if cwd and (cwd == base or cwd.startswith(base + os.sep))
+            and _is_loop_worker(args)
+        )
 
-    return _snapshot_memo(("working", str(root)), compute)
+    return _snapshot_memo(("workers", str(root)), compute)
 
 
 def _unattributed_processes(root: Path, loops: list[dict],
                             processes) -> int:
-    """Live processes whose cwd is inside ``root`` while no loop of that
-    workspace is running (so none of them was attributed)."""
+    """Loop-worker processes whose cwd is inside ``root`` while no loop of
+    that workspace is running (so none of them was attributed)."""
     if any(loop.get("running") for loop in loops):
         return 0
-    return _workspace_process_count(root, processes)
+    return _workspace_worker_count(root, processes)
 
 
 def _worktree_label(worktree: Path) -> str:
