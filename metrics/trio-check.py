@@ -964,6 +964,191 @@ def repo_scope_refusals(
     return problems
 
 
+# --- r18a quality lints (advisory; `--strict-quality` makes REJECT a violation)
+# `accepts:` grammar: `<input/action> -> <observable> | oracle: <kind>`
+# (MAILBOX-SCHEMA "`accepts:` grammar"). A REJECT is free text with no
+# relation and no oracle (or a banned phrase alone); a WARN is a half-formed
+# accept. Also: open-loop mailboxes without `goal_probe:`/`goal_acceptance:`
+# and a `full_check:` made only of artifact readers (L5).
+
+ORACLE_KINDS = ("value", "property", "diff", "refusal", "static", "rerun")
+_ORACLE_TAG_RE = re.compile(r"(?:^|\||\s)oracle\s*:\s*([A-Za-z_-]*)", re.IGNORECASE)
+# `input -> observable`: an arrow, or an (in)equality between two sides.
+_RELATION_RE = re.compile(
+    r"->|\u2192|=>|==|!=|<=|>=|(?<![<>!=:])=(?!=)"
+    # `X is {months:[8]}` / `close month is 7` / `echoes [11,12]`: a precise
+    # observable (C6) without the arrow -- a WARN (no oracle), not a REJECT.
+    r"|\b(?:is|are|equals?|returns?|echoes|prints?|exits?)\s+[{\[\"'`\d-]"
+)
+_BANNED_ACCEPT_RE = re.compile(
+    r"^\s*(?:(?:all|the|existing|other)\s+)*(?:tests?|suite|checks?)?\s*"
+    r"(?:pass(?:es)?|works?|exists?|is\s+documented|documented|stays?\s+green|"
+    r"(?:are|is|stay|stays|remain|remains)\s+green|green)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def accept_findings(text: str) -> list[tuple[str, str]]:
+    """(level, reason) findings for one `accepts:`/`goal_acceptance:` item."""
+    item = str(text).strip()
+    tag = _ORACLE_TAG_RE.search(item)
+    head = item[: tag.start()] if tag else item
+    relation = bool(_RELATION_RE.search(head))
+    if _BANNED_ACCEPT_RE.match(head.strip(" |")):
+        return [("REJECT", "only says tests pass / works / exists / green; name an input -> observable")]
+    if not tag and not relation:
+        return [("REJECT", "free text without an oracle; write `<input/action> -> <observable> | oracle: <kind>`")]
+    out: list[tuple[str, str]] = []
+    if tag:
+        kind = tag.group(1).lower()
+        if kind not in ORACLE_KINDS:
+            out.append(("WARN", f"unknown oracle kind {kind or '(empty)'!r} (one of {', '.join(ORACLE_KINDS)})"))
+        if not relation:
+            out.append(("WARN", "oracle tag without an `input -> observable`"))
+    else:
+        out.append(("WARN", "no `| oracle: <kind>` tag"))
+    return out
+
+
+def _plan_text(loop_dir: Path) -> str | None:
+    try:
+        return (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _goal_acceptance_items(plan_text: str) -> list[str] | None:
+    """Items of the plain `goal_acceptance:` line (flow list or indented
+    `- ` items), or None when PLAN.md declares none."""
+    lines = plan_text.splitlines()
+    for index, raw in enumerate(lines):
+        m = re.match(r"^\s*(?:-\s+)?goal_acceptance\s*:\s*(.*)$", raw)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if value.startswith("["):
+            body = value.strip("[]")
+            return [x.strip().strip("\"'") for x in re.split(r"\"\s*,\s*\"", body) if x.strip()]
+        items: list[str] = [value] if value else []
+        for follow in lines[index + 1:]:
+            if not follow.strip():
+                if items:
+                    break
+                continue
+            item = re.match(r"^\s+-\s+(.*)$", follow)
+            if not item:
+                break
+            items.append(item.group(1).strip().strip("\"'"))
+        return items
+    return None
+
+
+def _has_goal_probe(plan_text: str) -> bool:
+    return any(
+        re.match(r"^\s*(?:-\s+)?goal_probe\s*:\s*\S", ln)
+        for ln in plan_text.splitlines()
+    )
+
+
+_READER_HEAD_RE = re.compile(
+    r"^(?:jq|cat|head|tail|ls|test|stat|file|\[|grep|wc|true|echo)\b"
+)
+
+
+def _full_check_commands(plan_text: str) -> list[str]:
+    """Each `full_check:` command (per repo for a mapping)."""
+    lines = _full_check_lines(plan_text)
+    if not lines:
+        return []
+    first, rest = lines[0].strip(), [ln.strip() for ln in lines[1:] if ln.strip()]
+    if first.startswith("{"):
+        return [v.strip().strip("\"'") for v in re.findall(r":\s*(\"[^\"]*\"|'[^']*')", first)]
+    mapped = [re.match(r"^[a-z0-9]+(?:-[a-z0-9]+)*\s*:\s+(.*)$", ln) for ln in rest]
+    if not first and rest and all(mapped):
+        return [m.group(1).strip().strip("\"'") for m in mapped]
+    return [" ".join([first, *rest]).strip()] if (first or rest) else []
+
+
+def _reader_segment(segment: str, loop_dir: Path, root: Path | None) -> bool | None:
+    """True when a command segment only reads an artifact; None = neutral."""
+    seg = segment.strip().strip("()").strip()
+    seg = re.sub(r"^(?:timeout\s+\S+\s+|env\s+|[A-Z_][A-Z0-9_]*=\S+\s+)+", "", seg)
+    if not seg:
+        return None
+    if re.match(r"^(?:cd|pushd|popd|set)\b", seg):
+        return None
+    if "--verify-only" in seg or _READER_HEAD_RE.match(seg):
+        return True
+    for token in re.findall(r"[^\s'\"]+", seg):
+        if "/" not in token or token.startswith("-"):
+            continue
+        cand = Path(token)
+        if not cand.is_absolute() and root is not None:
+            cand = root / cand
+        try:
+            cand = Path(os.path.normpath(str(cand)))
+        except (TypeError, ValueError):
+            continue
+        if cand == loop_dir or loop_dir in cand.parents:
+            return True
+    return False
+
+
+def full_check_reader_only(plan_text: str, loop_dir: Path) -> list[str]:
+    """`full_check:` commands made only of artifact readers (L5 lint)."""
+    root = mailbox_repo_root(loop_dir)
+    loop_dir = Path(os.path.normpath(str(loop_dir)))
+    flagged: list[str] = []
+    for cmd in _full_check_commands(plan_text):
+        verdicts = [
+            _reader_segment(seg, loop_dir, root)
+            for seg in re.split(r"&&|\|\||;", cmd)
+        ]
+        real = [v for v in verdicts if v is not None]
+        if real and all(real):
+            flagged.append(cmd)
+    return flagged
+
+
+def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
+    """r18a advisory quality findings for one v1 mailbox: (level, message)."""
+    plan_text = _plan_text(loop_dir)
+    if plan_text is None:
+        return []
+    out: list[tuple[str, str]] = []
+    slices = tm.parse_slices_block(plan_text) or []
+    for sl in slices:
+        for n, item in enumerate(sl.get("accepts") or [], 1):
+            for level, why in accept_findings(item):
+                out.append((level, f"slice {sl['id']} accept {n} {_clip(item)!r}: {why}"))
+    goal_items = _goal_acceptance_items(plan_text)
+    for n, item in enumerate(goal_items or [], 1):
+        for level, why in accept_findings(item):
+            out.append((level, f"goal_acceptance {n} {_clip(item)!r}: {why}"))
+    if (loop_dir / "QUEUE.md").is_file():
+        if not _has_goal_probe(plan_text):
+            out.append(("WARN", "no `goal_probe:` under `## Verification standard` (open-loop mailbox)"))
+        if not goal_items:
+            out.append(("WARN", "no `goal_acceptance:` under `## Verification standard` (open-loop mailbox)"))
+        for sl in slices:
+            code = [w for w in sl.get("writes") or [] if not str(w).startswith("api:")]
+            if code and not sl.get("accepts"):
+                out.append(("WARN", f"slice {sl['id']} changes code but has no `accepts:`"))
+    for cmd in full_check_reader_only(plan_text, loop_dir):
+        out.append((
+            "WARN",
+            f"full_check: {_clip(cmd, 120)!r} only reads artifacts (--verify-only, "
+            "JSON/receipt readers or scripts/tests under the mailbox); it is not a "
+            "whole-tree check",
+        ))
+    return out
+
+
+def _clip(text: str, width: int = 70) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
 def check_prompt_sync(root: Path) -> tuple[bool, list[str]]:
     """Run prompts/generate.py --check when the scanned root has a generator.
 
@@ -1030,6 +1215,10 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
         missing = missing_required_files(loop_dir)
         if missing:
             info.append("missing v1 required file(s): " + ", ".join(missing))
+    quality = (
+        [{"level": lv, "message": msg} for lv, msg in quality_findings(loop_dir, tm)]
+        if version == "v1" else []
+    )
     return {
         "name": loop_dir.name,
         "path": str(loop_dir),
@@ -1037,6 +1226,7 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
         "errors": errors,
         "refusals": refusals,
         "info": info,
+        "quality": quality,
         "ok": version == "v1" and not errors and not refusals,
     }
 
@@ -1073,6 +1263,8 @@ def render(loops: list[dict], root: Path, summary: dict) -> str:
                 lines.append(f"    - {err}")
             for msg in loop.get("refusals", []):
                 lines.append(f"    - REFUSED: {msg}")
+            for finding in loop.get("quality", []):
+                lines.append(f"    - quality: {finding['level']} {finding['message']}")
         else:
             lines.append(
                 f"{loop['name']}/  {loop['version']}  (informational — not validated)"
@@ -1127,6 +1319,12 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Emit a machine-readable JSON report"
     )
     parser.add_argument(
+        "--strict-quality",
+        action="store_true",
+        help="r18b preview: a quality REJECT (accepts: free text without an "
+        "oracle) is a violation (exit 1); advisory by default in r18a",
+    )
+    parser.add_argument(
         "--no-prompt-sync",
         action="store_true",
         help="Skip the prompts/generate.py --check drift check (runs automatically "
@@ -1141,7 +1339,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     root = Path(args.path).expanduser().resolve()
     loops = [inspect_loop(p, tm) for p in _live_loop_dirs(tm, tm.discover_loops(root))]
+    if args.strict_quality:
+        for loop in loops:
+            rejects = [q for q in loop.get("quality", []) if q["level"] == "REJECT"]
+            if rejects:
+                loop["errors"] = loop["errors"] + [
+                    f"quality REJECT: {q['message']}" for q in rejects
+                ]
+                loop["ok"] = False
     summary = summarize(loops)
+    summary["quality_findings"] = sum(len(loop.get("quality", [])) for loop in loops)
 
     prompt_ok, prompt_lines = (True, []) if args.no_prompt_sync else check_prompt_sync(root)
     summary["prompt_sync_lines"] = prompt_lines

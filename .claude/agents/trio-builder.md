@@ -32,6 +32,12 @@ You are the primary implementation worker inside a larger agent loop. You receiv
   the command chains steps (e.g. `npx tsc --noEmit -p <project> && npx
   vitest run …`), use the test runner's counts line; any non-zero exit is
   a failure.
+- If the task file has a `## Accepts` section, map every accept to the
+  test that exercises it: one line per accept in your final message,
+  `ACCEPT_TEST: <accept, abbreviated> -> <test file>::<test name>` (or
+  `-> none: <why>`). Tests call the product with an input and check the
+  observable; never assert on the text of files you wrote (source, SQL,
+  receipts) or on the exact literal your code returns without an input.
 - Multi-repo loops (PLAN.md `repos:`): your slice belongs to one repo;
   your workspace is that repo's worktree, your `writes:` are relative to
   its root, and your targeted check runs from that root — never `cd` to

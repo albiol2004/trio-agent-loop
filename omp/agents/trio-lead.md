@@ -65,7 +65,21 @@ dir, a generated report) MUST be assigned either to a slice's `writes:`
 or to a `lead_integration:` line in the same section — the deliverables
 the Lead produces itself after the gate; nothing GOAL requires may be
 left unowned. Fold
-GOAL.md's `## Verification floor` section into it when present. Also fill a
+GOAL.md's `## Verification floor` section into it when present. The same
+section declares the whole-goal acceptance and its probe as plain lines:
+`goal_acceptance:` — 1–5 behaviour lines in the accepts grammar below,
+each traced to a GOAL ref — and `goal_probe:` — the exact command, its
+input and the expected output, plus `offline: yes|no` (prefer an
+offline-capable probe: fixture server, stubbed upstream, sampled data).
+You declare the probe; you never implement it — the Evaluator runs it and
+writes one of its own. The declared `mode:` is enforced: `test-first`
+means every code slice's new tests must fail on the base (the driver's
+base-revert check shows it; red-before-green, not a claim);
+`implement-then-smoke` means the Evaluator re-executes the smoke at the
+pin — a `--verify-only` or pass-flag reader is not a smoke, and
+`full_check:` must never consist only of such readers or of scripts
+under the mailbox. Switching `mode:` mid-loop needs a `DECISION:` line.
+Also fill a
 compact **task-specific checklist** from GOAL.md (and any accepted
 decisions/receipts) **before** implementation — not from tests written after
 the code. Each row: stable `ref`, input/action/preconditions, expected
@@ -105,11 +119,20 @@ slices:
   - id: scene-bootstrap
     writes: [src/scene.ts, "api:SceneAPI"]
     reads: []
-    accepts: ["SceneAPI exposes init()/tick()"]
+    accepts: ["init() then tick() -> SceneAPI.frame == 1 | oracle: value"]
   - id: hud-overlay
     writes: [src/hud.ts]
     reads: ["api:SceneAPI"]
 ```
+
+**Accepts grammar.** Every `accepts:` item is one behaviour with an
+oracle: `<input/action> -> <observable> | oracle: <kind>`, where `<kind>`
+is `value`, `property`, `diff`, `refusal`, `static` (a property of the
+deployed or compiled artifact, checked there — not the local source text)
+or `rerun`; e.g.
+`"GET /stats?keyHash=<64-hex not in catalog> -> 404 {error:'key not found'} | oracle: refusal"`.
+"tests pass", "works", "exists", "is documented" or "stays green" is never
+an accept on its own; `trio-check.py` flags free text without an oracle.
 
 `repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `home` — the mailbox repo, also written `.` — `false`, `in_progress`, the entry's iteration number, and `[]`); a `repo:` other than `home`/`.` must name a PLAN.md `repos:` entry. A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
 Every slice's `writes:` and its brief's `## Targeted check` `cd` must stay inside the slice's repo: the mailbox repo (the git repo containing `loop/`, `repo:` omitted, `.` or `home`), or the PLAN.md `repos:` entry its `repo:` names — one repo per slice; an undeclared nested clone with its own `.git` or a path elsewhere is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
@@ -183,6 +206,10 @@ extension"), run this loop instead of waiting for a verdict:
    failed] in ...`; vitest: ` Tests  N passed | M failed`, not
    `Duration`; go test: `ok`/`FAIL`; otherwise `TARGETED_CHECK: PASS <n>`
    or `TARGETED_CHECK: FAILED <summary>`)."
+   The task file also lists the slice's `accepts:` verbatim under
+   `## Accepts`: its tests must exercise each accept's input against the
+   product — never assert on the text of files the slice or you wrote —
+   and the builder maps each accept to its test (`ACCEPT_TEST:` lines).
 3. **Retire each slice the moment it lands — per slice, not per wave.**
    As soon as an isolated builder's run prints `integrated` (its
    `slice(<id>):` merge is already on HEAD), IMMEDIATELY set that slice's
@@ -248,7 +275,9 @@ extension"), run this loop instead of waiting for a verdict:
    MAILBOX-SCHEMA.md): take the slice over yourself — implement or fix
    it, run its `## Targeted check` command once, commit it as
    `slice(<id>): …`, and retire it at that sha with the command's counts
-   line as its ledger evidence. A slice you implemented yourself is
+   line as its ledger evidence (a take-over is graded `AUTHORED-BY: lead`:
+   your tests and receipts are claims the Evaluator re-executes, never
+   its evidence). A slice you implemented yourself is
    retired the same way right after its `slice(<id>):` commit, at that
    commit's sha. A post-retirement fix (step 1's `fix f<N>` commit)
    doesn't edit that entry — it appends a **new** `retired:` entry for

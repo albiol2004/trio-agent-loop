@@ -146,7 +146,23 @@ for the iteration:
 - **Mode**: one of `test-first` (tests written before the change),
   `implement-then-smoke` (change then run the stated checks), or
   `human-gate` (only the human can verify; the iteration ends in
-  `VERDICT: NEEDS_HUMAN`).
+  `VERDICT: NEEDS_HUMAN`). The mode is enforced (r18a): `test-first`
+  requires red-before-green evidence for every code slice — the driver's
+  base-revert kill check reporting `killed` (trioctl, shadow in r18a) or the
+  Evaluator's own run of the new tests against the base; without it
+  those tests grade `unverified`. `implement-then-smoke` requires the
+  Evaluator to re-execute the smoke at the pin; a `--verify-only` or
+  pass-flag reader is not a smoke. Switching `mode:` mid-loop needs a
+  `DECISION:` line.
+- **`goal_acceptance:`** (r18a): 1–5 behaviour lines in the accepts
+  grammar (see "`accepts:` grammar"), each traced to a GOAL ref, as an
+  indented list under the plain `goal_acceptance:` line.
+- **`goal_probe:`** (r18a): one plain line — the exact command, its input,
+  the expected output and `offline: yes|no`, e.g.
+  `goal_probe: curl -s localhost:8787/stats?keyHash=<unknown> -> 404 {"error":"key not found"} | offline: yes`.
+  The Lead declares it and never implements it; the Evaluator runs it and
+  writes one probe of its own (VERDICT.md `## Independent probe`).
+  `trio-check.py` warns when an open-loop mailbox (QUEUE.md) has none.
 - **Evidence**: what will count as verified — exact commands, the outputs
   they must produce, and the data/ground-truth checks (reconciliation,
   integrity, idempotent re-runs for `profile: data`).
@@ -649,6 +665,43 @@ queues"]`. Default is `[]`. It is what the Evaluator grades that slice
 against in open-loop mode. It must remain optional so every existing
 mailbox — with or without `accepts:` on any slice — stays conformant.
 
+#### `accepts:` grammar (r18a)
+
+Every item (and every `goal_acceptance:` line) is one behaviour with an
+oracle:
+
+```text
+<input/action> -> <observable> | oracle: <kind>
+```
+
+- `<input/action>` — the concrete input or action: a request, a CLI call
+  with its arguments, a query, a public function with its inputs.
+- `<observable>` — what a reviewer sees: a value, a status code, an
+  output line, a row count, a refusal message.
+- `<kind>` — `value` (an exact value), `property` (an invariant over
+  inputs), `diff` (before/after against a named baseline), `refusal` (the
+  input is rejected with a named error), `static` (a property of the
+  deployed or compiled artifact — `SHOW CREATE VIEW`, the built bundle —
+  never the local source text) or `rerun` (re-execute a named command and
+  compare).
+
+Example: `"GET /stats?keyHash=<64-hex not in catalog> -> 404 {error:'key not found'} | oracle: refusal"`.
+"tests pass", "works", "exists", "is documented" and "stays green" are
+never an accept on their own.
+
+`trio-check.py` lints every `accepts:` item of a v1 mailbox's PLAN.md
+(quality findings, printed under the mailbox):
+
+- `REJECT` — free text with no `->` and no `oracle:` tag, or a banned
+  phrase standing alone;
+- `WARN` — an `oracle:` tag without an `input -> observable`, an
+  `input -> observable` without an `oracle:` tag, or an unknown oracle
+  kind.
+
+In r18a the findings are advisory: they never change the exit code
+unless `--strict-quality` is passed (then a `REJECT` is a violation, exit
+1). r18b makes `REJECT` a violation by default.
+
 ### Per-slice verdicts in VERDICT.md
 
 Each slice evaluation is recorded as an **appended** section in
@@ -669,6 +722,50 @@ has `QUEUE.md`, and is **not** valid for a lockstep mailbox. A per-slice
 section body **MUST NOT** contain any line beginning with `VERDICT:` —
 that token stays reserved for the integration verdict so existing verdict
 parsers are unaffected.
+
+### Evidence kinds and the per-accept table (r18a)
+
+Each per-slice section grades every `accepts:` item PASS, FAIL or
+`unverified` and names the evidence kind behind the grade:
+`re-run` (the Evaluator re-executed the behaviour at the pin), `probe`
+(its own check against the public surface), `implementer-test` (a
+builder/Lead test it ran — PASS only when not tautological and, for a
+`value`/`property` accept, shown to fail without the change) or `receipt`
+(a file someone else wrote — never PASS on its own). The section carries
+
+```markdown
+| # | accept | PASS / FAIL / unverified | evidence | command | key output |
+attacks:
+- <input, boundary, removal or injected fault> -> <what happened>
+- <second attack> -> <what happened>
+evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>
+```
+
+A slice SHIP lists at least two attacks. Tests on the canonical
+evaluator's tautology list (string presence on files the slice or Lead
+wrote, one- or two-character `in` checks, `or`-chains satisfied by a
+header, asserting the literal the code writes, `--verify-only`/pass-flag
+readers, presence-only checks, a typecheck over `files: []`, tests that
+read the mailbox, `results/` or `evidence/`) are rejected by name.
+
+### `## Independent probe` (whole-goal verdicts, r18a)
+
+The lockstep verdict and the open-loop integration verdict carry:
+
+```markdown
+## Independent probe
+probe: PASS|FAIL|UNAVAILABLE <one-line reason>
+probe_cmd: <exact command>
+probe_src: <path of the probe the Evaluator wrote, outside product paths>
+expected: <observable from GOAL.md / goal_probe:>
+observed: <verbatim output excerpt>
+```
+
+The probe is written by the Evaluator against the public surface; it
+never imports implementer tests or Lead scripts. `UNAVAILABLE` leaves the
+criterion unverified (NEEDS_HUMAN, never SHIP). In r18a a missing section
+is only logged by the Omnigent driver (`probe: missing`); r18b makes
+`probe: PASS` a SHIP condition.
 
 ### Lead loop (open-loop mode)
 
@@ -1066,7 +1163,21 @@ shape, fault statuses, `retired:` entries referencing slice ids that
 exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
 absence is never a violation.
 
+Quality lints (r18a, advisory; `--strict-quality` makes a `REJECT` a
+violation): the `accepts:` grammar (see "`accepts:` grammar"), a missing
+`goal_probe:`/`goal_acceptance:` in an open-loop mailbox, and a
+`full_check:` made only of artifact readers (`--verify-only`, `jq`/`cat`
+of a JSON receipt, presence checks, or scripts and tests under the
+mailbox directory). They print as `quality: REJECT|WARN ...` lines and
+under `quality` in `--json`.
+
 ## Changelog
+
+- **r18a** (verified output quality, first slice; no METRICS_API bump):
+  the `accepts:` grammar with oracles, `goal_acceptance:`/`goal_probe:`,
+  enforced `mode:`, evidence kinds and the per-accept table in slice
+  sections, `## Independent probe` in whole-goal verdicts; advisory
+  `trio-check.py` quality lints.
 
 - **r16-rc** (merge of r15-fixes, r15.x and r16a): one live-loop
   registry record for every mode ("Live-loop registry"; replaces r15.x's

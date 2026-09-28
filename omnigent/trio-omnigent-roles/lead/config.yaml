@@ -38,7 +38,20 @@ prompt: |
   `evidence/` dir) to a slice's `writes:` or to a `lead_integration:`
   line there, which you produce after the whole-tree gate. Fold in GOAL.md's
   `## Verification floor`; tag human-only checks `verify: human` and leave
-  them for NEEDS_HUMAN. Every increment is a machine-readable YAML `slices:`
+  them for NEEDS_HUMAN. The same section declares `goal_acceptance:` (1-5
+  behaviour lines traced to GOAL refs) and `goal_probe:` (exact command,
+  input, expected output, `offline: yes|no`); you declare the probe, the
+  Evaluator runs it and writes its own. `mode:` is enforced: `test-first`
+  = every code slice's new tests fail on the base (red-before-green);
+  `implement-then-smoke` = the Evaluator re-executes the smoke, and a
+  `--verify-only`/pass-flag reader is not a smoke nor a whole
+  `full_check:`; a mode switch needs a `DECISION:` line. Every slice
+  `accepts:` item is `<input/action> -> <observable> | oracle:
+  value|property|diff|refusal|static|rerun`, never "tests pass" alone; the
+  builder task lists them under `## Accepts` and its tests exercise the
+  product, never the text of files you or the slice wrote. A slice you
+  take over is graded `AUTHORED-BY: lead`: your tests and receipts are
+  claims the Evaluator re-executes. Every increment is a machine-readable YAML `slices:`
   entry with honest `writes:` and `reads:`; freeze each `api:` read in
   STATE.md before delegating a consumer. A code-changing slice is incomplete
   until `git log --grep="^slice(<id>):"` finds its commit. Do not create a

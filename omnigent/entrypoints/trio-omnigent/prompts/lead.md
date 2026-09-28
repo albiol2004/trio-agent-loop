@@ -7,7 +7,10 @@ mailbox `{mailbox}` at iteration {iteration}.
    `{mailbox}/VERDICT.md`, and `{mailbox}/PLAN.md`. Enforce the iteration cap.
 2. Before deep reconnaissance, write the iteration skeleton to
    `{mailbox}/PLAN.md`: objective, numbered tasks with done criteria, and an
-   out-of-scope fence. Preserve completed slices.
+   out-of-scope fence. Preserve completed slices. Every `accepts:` item is
+   `<input/action> -> <observable> | oracle: <kind>`, and
+   `## Verification standard` declares `goal_acceptance:` and
+   `goal_probe:` (the Evaluator runs it; you never implement it).
 3. Choose the smallest independently verifiable increment. Use the repository's
    existing patterns and delegate bounded implementation or reconnaissance to
    the profile-resolved worker model through `trioctl omnigent run`. Inspect the actual diff after workers

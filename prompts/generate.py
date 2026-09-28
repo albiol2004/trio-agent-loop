@@ -99,9 +99,11 @@ RIGOR_SITES = [
 RIGOR_PIECES = [
     ("section", "Data-work profile", None),
     ("bullet", "Method", "Run the acceptance checks yourself"),
-    ("bullet", "Method", "No SHIP on iteration 1"),
+    ("bullet", "Method", "No SHIP — whole-goal verdict or open-loop slice section"),
     ("bullet", "Method", "Prefer executing code over reading it"),
     ("bullet", "Anti-rubber-stamp rules", "If you did not run a criterion's check yourself"),
+    ("section", "Evidence kinds", None),
+    ("section", "Independent probe", None),
 ]
 RIGOR_INTRO = (
     "## Verification rigor\n"
@@ -295,12 +297,27 @@ def essentials_block(style: str) -> str:
 
 def _canonical_section(text: str, heading: str) -> str:
     """Body of the `## <heading>` section of *text* (up to the next `## `)."""
-    m = re.search(rf"^## {re.escape(heading)}[ \t]*$", text, re.M)
-    if not m:
+    lines = text.splitlines()
+    fence: str | None = None
+    start: int | None = None
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if stripped.startswith(("```", "~~~")):
+            mark = stripped[:3]
+            if fence is None:
+                fence = mark
+            elif mark == fence and stripped.strip("`~") == "":
+                fence = None
+            continue
+        if fence is not None or not ln.startswith("## "):
+            continue
+        if start is not None:
+            return "\n".join(lines[start:i]).strip("\n")
+        if ln[3:].strip() == heading:
+            start = i + 1
+    if start is None:
         raise ValueError(f"evaluator rigor: canonical evaluator.md has no `## {heading}` section")
-    rest = text[m.end():]
-    nxt = re.search(r"^## ", rest, re.M)
-    return (rest[: nxt.start()] if nxt else rest).strip("\n")
+    return "\n".join(lines[start:]).strip("\n")
 
 
 def _canonical_bullet(section: str, heading: str, prefix: str) -> str:

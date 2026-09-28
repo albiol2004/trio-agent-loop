@@ -36,6 +36,11 @@ prompt: |
   the command chains steps (e.g. `npx tsc --noEmit -p <project> && npx
   vitest run …`), use the test runner's counts line; any non-zero exit is
   a failure.
+  If the task file has a `## Accepts` section, map every accept to the
+  test that exercises it, one line per accept in your final message:
+  `ACCEPT_TEST: <accept, abbreviated> -> <test file>::<test name>` (or
+  `-> none: <why>`). Tests call the product with an input and check the
+  observable; never assert on the text of files you wrote.
 
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
