@@ -82,6 +82,34 @@ DOCUMENTS = [
 ]
 DOCUMENTS_DIR = ROOT / "prompts" / "documents"
 
+# r18a L0: the canonical evaluator rigor, delivered to the Omnigent evaluator
+# (its registered role config and its per-dispatch prompt), which never
+# receives the canonical role body. The block is EXTRACTED from
+# prompts/canonical/evaluator.md at generation time -- never a hand copy --
+# so `--check` fails as soon as the canonical text and the Omnigent sites
+# disagree, and a missing anchor fails generation loudly.
+RIGOR_MARKER = "trio-evaluator-rigor"
+RIGOR_SITES = [
+    ("omnigent/trio-omnigent-roles/evaluator/config.yaml", "yaml"),
+    ("omnigent/entrypoints/trio-omnigent/prompts/evaluator.md", "md"),
+]
+# (kind, canonical heading, bullet prefix): "section" copies a whole
+# `## <heading>` section (demoted to `###`); "bullet" copies the one
+# top-level bullet of that section whose text starts with the prefix.
+RIGOR_PIECES = [
+    ("section", "Data-work profile", None),
+    ("bullet", "Method", "Run the acceptance checks yourself"),
+    ("bullet", "Method", "No SHIP on iteration 1"),
+    ("bullet", "Method", "Prefer executing code over reading it"),
+    ("bullet", "Anti-rubber-stamp rules", "If you did not run a criterion's check yourself"),
+]
+RIGOR_INTRO = (
+    "## Verification rigor\n"
+    "Generated from the canonical Trio evaluator (prompts/canonical/evaluator.md);\n"
+    "binding for every verdict you write -- open-loop slice sections and the\n"
+    "integration verdict alike.\n"
+)
+
 
 def render_document(source: str, frontmatter: list[str]) -> str:
     body = (DOCUMENTS_DIR / f"{source}.md").read_text(encoding="utf-8")
@@ -243,32 +271,100 @@ def render_role(role: str, target: str, overlay: Overlay) -> str:
     return re.sub(r"\n{3,}", "\n\n", out)
 
 
-def essentials_block(style: str) -> str:
-    content = ESSENTIALS.read_text(encoding="utf-8").rstrip("\n")
+def _marked_block(content: str, style: str, marker: str) -> str:
     if style == "ts":
-        lines = ["// trio-protocol:start"]
+        lines = [f"// {marker}:start"]
         lines += ["// " + ln for ln in content.splitlines()]
-        lines.append("// trio-protocol:end")
+        lines.append(f"// {marker}:end")
         return "\n".join(lines) + "\n"
     if style == "yaml":
-        lines = ["  <!-- trio-protocol:start -->"]
+        lines = [f"  <!-- {marker}:start -->"]
         lines += ["  " + ln for ln in content.splitlines()]
-        lines.append("  <!-- trio-protocol:end -->")
+        lines.append(f"  <!-- {marker}:end -->")
         return "\n".join(lines) + "\n"
-    lines = ["<!-- trio-protocol:start -->"]
+    lines = [f"<!-- {marker}:start -->"]
     lines += content.splitlines()
-    lines.append("<!-- trio-protocol:end -->")
+    lines.append(f"<!-- {marker}:end -->")
     return "\n".join(lines) + "\n"
+
+
+def essentials_block(style: str) -> str:
+    content = ESSENTIALS.read_text(encoding="utf-8").rstrip("\n")
+    return _marked_block(content, style, "trio-protocol")
+
+
+def _canonical_section(text: str, heading: str) -> str:
+    """Body of the `## <heading>` section of *text* (up to the next `## `)."""
+    m = re.search(rf"^## {re.escape(heading)}[ \t]*$", text, re.M)
+    if not m:
+        raise ValueError(f"evaluator rigor: canonical evaluator.md has no `## {heading}` section")
+    rest = text[m.end():]
+    nxt = re.search(r"^## ", rest, re.M)
+    return (rest[: nxt.start()] if nxt else rest).strip("\n")
+
+
+def _canonical_bullet(section: str, heading: str, prefix: str) -> str:
+    """The one top-level bullet of *section* whose text starts with *prefix*."""
+    bullets: list[list[str]] = []
+    for ln in section.splitlines():
+        if ln.startswith("- "):
+            bullets.append([ln])
+        elif bullets and (ln.startswith((" ", "\t")) and ln.strip()):
+            bullets[-1].append(ln)
+        elif bullets and not ln.strip():
+            bullets.append([])  # a blank line ends the bullet
+    found = [b for b in bullets if b and b[0][2:].startswith(prefix)]
+    if len(found) != 1:
+        raise ValueError(
+            f"evaluator rigor: `## {heading}` has {len(found)} bullet(s) starting "
+            f"with {prefix!r} (need exactly one)"
+        )
+    return "\n".join(found[0])
+
+
+def rigor_content() -> str:
+    """The Omnigent evaluator's `## Verification rigor` block (r18a L0)."""
+    canonical = (CANONICAL_DIR / "evaluator.md").read_text(encoding="utf-8")
+    parts = [RIGOR_INTRO.rstrip("\n")]
+    bullets_by_heading: dict[str, list[str]] = {}
+    order: list[tuple[str, str]] = []
+    for kind, heading, prefix in RIGOR_PIECES:
+        section = _canonical_section(canonical, heading)
+        if kind == "section":
+            order.append(("section", heading))
+            bullets_by_heading.setdefault(f"section:{heading}", []).append(section)
+        else:
+            key = f"bullets:{heading}"
+            if key not in bullets_by_heading:
+                order.append(("bullets", heading))
+                bullets_by_heading[key] = []
+            bullets_by_heading[key].append(_canonical_bullet(section, heading, prefix))
+    for kind, heading in order:
+        if kind == "section":
+            body = bullets_by_heading[f"section:{heading}"][0]
+            parts.append(f"### {heading}\n{body}")
+        else:
+            body = "\n".join(bullets_by_heading[f"bullets:{heading}"])
+            parts.append(f"### {heading} (canonical rules)\n{body}")
+    return "\n\n".join(parts) + "\n"
+
+
+def rigor_block(style: str) -> str:
+    return _marked_block(rigor_content().rstrip("\n"), style, RIGOR_MARKER)
 
 
 def upsert_embedded(path: Path, style: str) -> str:
     """Return the new file content for one embedded site (marker upsert)."""
-    text = path.read_text(encoding="utf-8")
-    block = essentials_block(style)
+    return upsert_marked(path.read_text(encoding="utf-8"), style,
+                         "trio-protocol", essentials_block(style))
+
+
+def upsert_marked(text: str, style: str, marker: str, block: str) -> str:
+    """Replace (or append) the *marker* start/end region of *text* with *block*."""
     if style == "ts":
-        pat = re.compile(r"^// trio-protocol:(start|end)[ \t]*$", re.M)
+        pat = re.compile(rf"^// {marker}:(start|end)[ \t]*$", re.M)
     else:
-        pat = re.compile(r"^[ \t]*<!-- trio-protocol:(start|end) -->[ \t]*$", re.M)
+        pat = re.compile(rf"^[ \t]*<!-- {marker}:(start|end) -->[ \t]*$", re.M)
     marks = list(pat.finditer(text))
     starts = [m for m in marks if m.group(1) == "start"]
     ends = [m for m in marks if m.group(1) == "end"]
@@ -289,6 +385,11 @@ def all_outputs() -> dict[Path, str]:
         path = ROOT / relpath
         if path.is_file():
             outputs[path] = upsert_embedded(path, style)
+    for relpath, style in RIGOR_SITES:
+        path = ROOT / relpath
+        if path.is_file():
+            text = outputs.get(path, path.read_text(encoding="utf-8"))
+            outputs[path] = upsert_marked(text, style, RIGOR_MARKER, rigor_block(style))
     for source, dests in DOCUMENTS:
         for relpath, frontmatter in dests:
             outputs[ROOT / relpath] = render_document(source, frontmatter)
