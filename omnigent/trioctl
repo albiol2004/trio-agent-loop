@@ -1018,26 +1018,20 @@ def command_run(args: argparse.Namespace) -> int:
             ) from exc
     if getattr(args, "isolate", False):
         return _command_run_isolated(args, config, prompt)
-    # r15.x: cwd = --workspace (never inherited). A workspace whose Cursor
-    # project root is the aggregate root of a live Trio loop shares that
-    # root's single `.cursor` slot: the one-shot takes the root turn for its
-    # whole run (own process group, drained after it exits) unless it runs
-    # inside the turn holder's own session.
+    # r15.x: cwd = --workspace (never inherited), so the physical cwd picks
+    # the `.cursor` project root the caller named. r16b: no Trio session
+    # runs at a repository root any more, so a one-shot there shares the
+    # root's `.cursor` slot with the user's own config only: no root turn,
+    # no wait (r16 DESIGN §1.9).
     workspace = Path(args.workspace).expanduser().resolve()
-    turn = _one_shot_root_turn(args, workspace)
-    try:
-        output = run_cursor_worker(
-            args.role,
-            config,
-            prompt=prompt,
-            workspace=workspace,
-            timeout=args.timeout,
-            events=_worker_event_ctx(args) or None,
-            **({"isolated": True} if turn is not None else {}),
-        )
-    finally:
-        if turn is not None:
-            turn.release()
+    output = run_cursor_worker(
+        args.role,
+        config,
+        prompt=prompt,
+        workspace=workspace,
+        timeout=args.timeout,
+        events=_worker_event_ctx(args) or None,
+    )
     print(output)
     return 0
 
@@ -3601,14 +3595,50 @@ _ROOT_FREE_INTEGRATION_NOTE = (
     "  `git -C {lead} add -f -- {mailbox}/VERDICT.md {mailbox}/LOG.md`,\n"
     "  `git -C {lead} add -u -- {mailbox}` and\n"
     "  `git -C {lead} commit -m \"loop: iteration {iteration} — SHIP\" -- {mailbox}`.\n"
-    "  Never commit in your detached worktree and never touch `{target}`:\n"
-    "  after accepting your SHIP the driver lands `{branch}` onto `{target}`.\n"
+    "  Step 2's `slice(<id>): ...` product commit does not apply here: every\n"
+    "  retired slice is already committed on `{branch}` and a product commit\n"
+    "  after the pin fails the driver's gate, so the mailbox commit is your\n"
+    "  only commit. Never commit in your detached worktree and never touch\n"
+    "  `{target}`: after accepting your SHIP the driver lands `{branch}` onto\n"
+    "  `{target}`.\n"
 )
 
 _ROOT_FREE_INTEGRATION_REPOS_NOTE = (
     "- MULTI-REPO: each declared repo's aggregate is the path the MULTI-REPO\n"
     "  lines list (a worktree on `{branch}`); its empty retirement commit is\n"
     "  made there with `git -C <that path>`.\n"
+)
+
+
+# r16b root-free LOCKSTEP: rendered only when a lockstep run is root-free
+# (it always is in a git checkout since r16b). Sourced from
+# prompts/canonical/lead.md and evaluator.md ("Root-free (r16)").
+_ROOT_FREE_LOCKSTEP_LEAD_NOTE = (
+    "ROOT-FREE (this lockstep loop runs in its own Lead worktree):\n"
+    "- Your workspace `{lead}` is this loop's private checkout on branch\n"
+    "  `{branch}`, forked from `{target}` @ `{base}`. \"The repo\", HEAD,\n"
+    "  every relative path, every check, every builder `--workspace` and\n"
+    "  every `git` command in these instructions mean THIS checkout; the live\n"
+    "  mailbox is `{mailbox}`.\n"
+    "- The repository root `{home}` belongs to the user and to other loops:\n"
+    "  never cd into it, read or edit files there, or run git against it\n"
+    "  (no `git -C {home}`); its copy of the mailbox is stale until this loop\n"
+    "  lands.\n"
+    "- Commit only on `{branch}`: never check out, merge, rebase, reset,\n"
+    "  push or pull another branch, and never touch `{target}`. After the\n"
+    "  Evaluator's SHIP the driver lands `{branch}` onto `{target}` itself (a\n"
+    "  fast-forward, or a merge of the moved target plus a re-check).\n"
+)
+
+_ROOT_FREE_LOCKSTEP_EVALUATOR_NOTE = (
+    "ROOT-FREE (this lockstep loop runs in its own Lead worktree):\n"
+    "- Your workspace `{lead}` is this loop's private checkout on branch\n"
+    "  `{branch}` (the repo named above); grade the pinned revision as the\n"
+    "  procedure says. The repository root `{home}` is not part of this loop:\n"
+    "  never read, grade, commit or run anything there.\n"
+    "- The SHIP retirement commit is made here, in `{lead}` on `{branch}`,\n"
+    "  exactly as the procedure says (mailbox only). Never touch `{target}`:\n"
+    "  after accepting your SHIP the driver lands `{branch}` onto `{target}`.\n"
 )
 
 
@@ -3947,216 +3977,11 @@ class _SameCwdGate:
 
 
 # --------------------------------------------------------------------------
-# r15.x root-turn lock (r16 DESIGN §2). Every Trio actor that launches a
-# cursor-agent whose project root is an aggregate root -- a loop's root-bound
-# Lead/repair/evaluator turn, a degraded slice-eval, a non-isolated one-shot
-# at a root with a live loop -- holds one per-user flock keyed by that root's
-# realpath for its whole turn, so no two of them share the root's single
-# project `.cursor/{mcp,hooks}.json` slot. The kernel drops the flock when
-# its holder dies (no stale-lock recovery). Isolated builders/slice-evals
-# (their own worktree, their own slot) never take it.
-ROOT_TURN_WAIT_ENV = "TRIO_ROOT_TURN_WAIT_S"
-DEFAULT_ROOT_TURN_WAIT = 3900.0  # >= one role timeout (3600 s) + teardown
-ROOT_TURN_ONESHOT_WAIT_ENV = "TRIO_ROOT_TURN_ONESHOT_WAIT_S"
-DEFAULT_ROOT_TURN_ONESHOT_WAIT = 900.0
-ROOT_TURN_LOCK_DIR_ENV = "TRIO_ROOT_TURN_LOCK_DIR"
-ROOT_TURN_POLL_ENV = "TRIO_ROOT_TURN_POLL_S"
-ROOT_TURN_PROGRESS_ENV = "TRIO_ROOT_TURN_PROGRESS_S"
-DEFAULT_ROOT_TURN_PROGRESS = 60.0
-ROOT_STRANGER_WAIT_ENV = "TRIO_ROOT_STRANGER_WAIT_S"
-DEFAULT_ROOT_STRANGER_WAIT = 300.0
-ROOT_STRANGER_PROGRESS = 30.0
-#: A foreign cursor-agent kept the aggregate root after the bounded wait.
-ROOT_OCCUPIED_EXIT = 9
+# Live-loop registry (r16-rc) and the cross-loop `writes:` check. (The r15.x
+# root-turn lock, the root stranger check and exit 9 were removed in r16b:
+# no Trio session or dispatch runs at a repository root any more.)
 ALLOW_OVERLAPPING_LOOPS_ENV = "TRIO_ALLOW_OVERLAPPING_LOOPS"
 LOOP_REGISTRY_DIR = "loops"
-
-
-class RootBusyError(TrioctlError):
-    """Another Trio actor kept the root turn past the bounded wait."""
-
-
-class RootOccupiedError(TrioctlError):
-    """A cursor-agent Trio does not own still loads the root's project slot."""
-
-    def __init__(self, message: str, *, pids: list[int], details: list[dict[str, Any]]) -> None:
-        super().__init__(message)
-        self.pids = pids
-        self.details = details
-
-
-class WritesOverlapError(TrioctlError):
-    """This mailbox's `writes:` overlap a live loop's in the same repo."""
-
-
-def _env_seconds(name: str, default: float) -> float:
-    value = broker_http._env_float(name, default)
-    return value if value >= 0 else default
-
-
-def _root_turn_lock_dir() -> Path:
-    """Per-user dir (sibling of `cwd-locks/`): one lock file per aggregate root."""
-    env = os.environ.get(ROOT_TURN_LOCK_DIR_ENV, "").strip()
-    if env:
-        return Path(env).expanduser()
-    state = os.environ.get("XDG_STATE_HOME", "").strip()
-    base = Path(state) if state else Path.home() / ".local" / "state"
-    return base / "trio-agent-loop" / "root-turn"
-
-
-def _root_turn_path(root: str | Path) -> Path:
-    key = hashlib.sha256(os.path.realpath(str(root)).encode("utf-8")).hexdigest()[:24]
-    return _root_turn_lock_dir() / f"{key}.lock"
-
-
-def _read_root_turn_holder(path: Path) -> dict[str, Any] | None:
-    """The holder record of a root-turn lock file (line 2, JSON), or None."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        record = json.loads(lines[1]) if len(lines) > 1 else None
-    except (OSError, ValueError):
-        return None
-    return record if isinstance(record, dict) else None
-
-
-def _describe_root_holder(holder: dict[str, Any] | None) -> str:
-    if not holder:
-        return "an unknown holder"
-    who = holder.get("mailbox") or "one-shot"
-    since = holder.get("since")
-    when = (
-        time.strftime("%H:%M:%S", time.localtime(float(since)))
-        if isinstance(since, (int, float)) else "?"
-    )
-    return f"{who} {holder.get('role') or '?'} (pid {holder.get('pid')}, since {when})"
-
-
-class _RootTurnLock:
-    """One acquisition of the per-root turn lock (see ROOT_TURN_WAIT_ENV).
-
-    Same flock pattern as :class:`_SameCwdGate`: line 1 ``"<pid> <root>"``
-    (so :func:`_prune_same_cwd_locks` prunes files of vanished roots), line
-    2 the JSON holder record, rewritten under the lock; the locked inode is
-    re-checked after every acquisition.
-    """
-
-    def __init__(self, root: str | Path, *, who: dict[str, Any]) -> None:
-        self.root = os.path.realpath(str(root))
-        self.who = dict(who)
-        self.path = _root_turn_path(self.root)
-        self._fh: Any = None
-        self.contended = False
-
-    def holder(self) -> dict[str, Any] | None:
-        return _read_root_turn_holder(self.path)
-
-    def held_by_other(self) -> bool:
-        """Whether some description (another holder) holds the flock now."""
-        import fcntl
-
-        try:
-            with open(self.path, "a+", encoding="utf-8") as fh:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return True
-                return False
-        except OSError:
-            return False
-
-    def acquire(self, max_wait: float, *, label: str = "") -> float:
-        """Take the lock (bounded); returns the seconds waited.
-
-        Raises :class:`RootBusyError` naming the holder after *max_wait*.
-        Prints one line when it starts waiting and one per progress period.
-        """
-        import fcntl
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        poll = _env_seconds(ROOT_TURN_POLL_ENV, 0.5) or 0.5
-        every = _env_seconds(ROOT_TURN_PROGRESS_ENV, DEFAULT_ROOT_TURN_PROGRESS) or 60.0
-        start = time.monotonic()
-        next_note = start
-        fh = open(self.path, "a+", encoding="utf-8")
-        while True:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if _same_lock_inode(fh, self.path):
-                    break
-                fh.close()  # pruned while we queued: re-open the path
-                fh = open(self.path, "a+", encoding="utf-8")
-                continue
-            except BlockingIOError:
-                self.contended = True
-            except OSError:
-                fh.close()
-                raise
-            waited = time.monotonic() - start
-            if waited >= max_wait:
-                fh.close()
-                raise RootBusyError(
-                    f"root turn at {self.root} is still held by "
-                    f"{_describe_root_holder(self.holder())} after {waited:.0f}s "
-                    f"(bound {max_wait:.0f}s, {ROOT_TURN_WAIT_ENV}/"
-                    f"{ROOT_TURN_ONESHOT_WAIT_ENV}); {label or 'dispatch'} not started"
-                )
-            if time.monotonic() >= next_note:
-                print(
-                    f"trioctl: root turn at {self.root} held by "
-                    f"{_describe_root_holder(self.holder())} "
-                    f"(waited {waited:.0f}s/<={max_wait:.0f}s)"
-                    + (f"; {label} waits" if label else ""),
-                    file=sys.stderr,
-                )
-                next_note = time.monotonic() + every
-            time.sleep(poll)
-        waited = time.monotonic() - start
-        record = {
-            "pid": os.getpid(),
-            "pid_start": (
-                worker_worktrees.process_identity(os.getpid()).get("start")
-                if worker_worktrees is not None else None
-            ),
-            "since": time.time(),
-            "argv0": Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "",
-            "root": self.root,
-            **self.who,
-        }
-        try:
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"{os.getpid()} {self.root}\n{json.dumps(record, sort_keys=True)}\n")
-            fh.flush()
-        except OSError:
-            pass
-        self._fh = fh
-        return waited
-
-    def release(self) -> None:
-        fh, self._fh = self._fh, None
-        if fh is not None:
-            try:
-                fh.close()  # closing the description drops the flock
-            except OSError:
-                pass
-
-    @property
-    def held(self) -> bool:
-        return self._fh is not None
-
-
-#: Process-wide root turns: {lock path: {lock, count, mutex}}. A trioctl
-#: process holds each root's flock at most once; its dispatches (the Lead,
-#: its degraded slice-eval, the next Lead after a sticky evaluator) share it.
-_ROOT_TURNS: dict[str, dict[str, Any]] = {}
-_ROOT_TURNS_GUARD = threading.Lock()
-
-
-def _root_turn_slot(key: str) -> dict[str, Any]:
-    with _ROOT_TURNS_GUARD:
-        return _ROOT_TURNS.setdefault(
-            key, {"lock": None, "count": 0, "mutex": threading.Lock()}
-        )
 
 
 #: Unified live-loop registry schema (r16-rc: r15.x `loops/<slug>-<pid>.json`
@@ -4267,22 +4092,18 @@ def _live_loops(
     *,
     exclude_mailbox: Path | None = None,
     any_root: bool = False,
-    root_bound_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Registered live `omnigent loop` drivers of *root*'s repository.
 
-    By default only loops whose aggregate root is *root* itself (the
-    root-turn users); ``any_root`` returns every live loop of the
-    repository (root-free Lead worktrees included); ``root_bound_only``
-    drops root-free loops (they never take the root turn).
+    By default only loops registered with *root* itself as their root;
+    ``any_root`` returns every live loop of the repository (whatever
+    checkout the caller names: the root, a Lead worktree, an aggregate).
     """
     here = os.path.realpath(str(root))
     skip = os.path.realpath(str(exclude_mailbox)) if exclude_mailbox else None
     live: list[dict[str, Any]] = []
     for entry in _registry_records(root):
         if not any_root and entry.get("root") != here:
-            continue
-        if root_bound_only and entry.get("mode") == "root-free":
             continue
         if not _registry_alive(entry):
             continue
@@ -4375,11 +4196,13 @@ class _LoopRegistration:
     ``<git common dir>/trio-worktrees/loops/<slug>.json`` (slug of the root
     mailbox path, as the r16 Lead worktree record), written while a
     `trioctl omnigent loop` driver runs, in every mode. Keys (schema 1):
-    ``schema``, ``slug``, ``mode`` (``root-bound`` | ``lockstep`` |
-    ``root-free``), ``root`` (the repository root this loop belongs to),
+    ``schema``, ``slug``, ``mode`` (``root-free`` = open-loop, ``lockstep``;
+    both root-free since r16b, with ``lead_worktree`` set; ``root-bound`` only
+    for a mailbox outside any git checkout, which has no registry, and in
+    records of older releases), ``root`` (the repository root this loop belongs to),
     ``mailbox`` (the root mailbox), ``mailbox_rel``, ``live_mailbox`` (where
     the driver reads/writes it: the root mailbox, or the Lead worktree's copy),
-    ``lead_worktree``/``branch``/``target_ref`` (root-free; else null),
+    ``lead_worktree``/``branch``/``target_ref`` (null in older records),
     ``aggregates`` (``{repo name: aggregate checkout}``), ``pid``,
     ``pid_start``, ``started_at``, ``writes_by_repo`` (``{repository
     identity: [writes]}``, see `_repo_identity`).
@@ -4417,7 +4240,7 @@ class _LoopRegistration:
         rel = self.rel()
         ident = worker_worktrees.process_identity(os.getpid())
         aggregates: dict[str, str] = {}
-        if self.mode == "root-free":
+        if self.info:  # root-free (open-loop or, since r16b, lockstep)
             aggregates["home"] = str(self.info.get("lead") or "")
             for name, info in (self.info.get("repo_aggregates") or {}).items():
                 aggregates[name] = str(info)
@@ -4514,47 +4337,6 @@ def _set_state_reason(state_path: Path, reason: str | None) -> None:
 DRIVER_STOP_REASONS = ("root-occupied", "writes-overlap", "driver-exception")
 
 
-def _one_shot_root_turn(args: Any, workspace: Path) -> "_RootTurnLock | None":
-    """A non-isolated one-shot's root turn (None = no lock needed / joined).
-
-    Taken only when *workspace*'s Cursor project root is the aggregate root
-    of a live registered loop. A one-shot started from inside a root
-    session (a cursor-agent at that root is its ancestor: the turn holder's
-    own scouts/builders), or naming the holder's mailbox, shares that turn.
-    """
-    if worker_worktrees is None:
-        return None
-    root = worker_worktrees.cursor_project_root(workspace)
-    if not (root / ".git").exists():
-        return None
-    root = Path(os.path.realpath(str(root)))
-    if not _live_loops(root, root_bound_only=True):
-        # No root-bound/lockstep loop at this root (root-free loops never
-        # take the root turn): nothing to serialise with.
-        return None
-    parent = worker_worktrees.cursor_agent_ancestor(root)
-    if parent:
-        print(
-            f"trioctl: one-shot inside root session (cursor-agent pid {parent}) "
-            f"at {root}: shares its root turn",
-            file=sys.stderr,
-        )
-        return None
-    mailbox_arg = getattr(args, "worker_events_mailbox", None)
-    mailbox = str(Path(str(mailbox_arg)).expanduser().resolve()) if mailbox_arg else None
-    lock = _RootTurnLock(root, who={"mailbox": None, "role": args.role, "kind": "one-shot",
-                                    "worker_mailbox": mailbox})
-    holder = lock.holder() or {}
-    if mailbox and holder.get("mailbox") == mailbox and lock.held_by_other():
-        print(f"trioctl: one-shot for {mailbox}: shares its loop's root turn", file=sys.stderr)
-        return None
-    lock.acquire(
-        _env_seconds(ROOT_TURN_ONESHOT_WAIT_ENV, DEFAULT_ROOT_TURN_ONESHOT_WAIT),
-        label=f"one-shot {args.role}",
-    )
-    return lock
-
-
 # Prompts of this process's dispatches, per mailbox, so a first-prompt hold
 # can tell a cross-wired mirror (the only saved user row is a SIBLING
 # dispatch's prompt) from a generic uncertain delivery.
@@ -4628,8 +4410,7 @@ class OmnigentRunner:
         observe: dict[str, Any] | None = None,
         completion_receipts: bool = False,
         isolate_workers: dict[str, Any] | None = None,
-        end_root_sessions: bool = True,
-        restore_root_config: bool = False,
+        end_sessions: bool = True,
         root_free: dict[str, Any] | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
@@ -4656,36 +4437,14 @@ class OmnigentRunner:
         # get their own worktree via `run --isolate`; open-loop slice-evals
         # are bound to a detached worktree at their pinned sha.
         self._isolate = isolate_workers
-        # Isolated runs end a finished root-bound evaluator's own session
-        # and then undo this run's own Omnigent merges into the root's
-        # project Cursor config, so the graded tree is the product alone
-        # (False with --keep-sessions: the config stays, acceptance waits).
-        self._end_root_sessions = end_root_sessions
-        # Non-isolated loop runs (`--no-isolate-workers`, lockstep default):
-        # every session's workspace is the root, so Omnigent's generated
-        # `.cursor/{mcp,hooks}.json` lands there too. When set, the same
-        # baseline/restore as isolated mode applies to it, without ever
-        # waiting for the root before a launch (sessions may overlap).
-        self._restore_root_nonisolated = bool(restore_root_config) and not isolate_workers
-        # Root-bound (aggregate workspace) sessions this runner created, in
-        # order; used to prove the previous one no longer owns the root's
-        # project Cursor config before the root is reused.
-        #
-        # Ownership is recorded per dispatch (never by slicing the shared
-        # created_session_ids list: open-loop runs the Lead thread and the
-        # evaluator on ONE runner concurrently). Only a FINISHED root-bound
-        # dispatch's own session is ever ended for root reuse; sessions of
-        # in-flight dispatches (any role) are never touched.
+        # r16b lockstep: a finished Lead/repair/Evaluator session in the
+        # Lead worktree is ended at its turn end (False with
+        # --keep-sessions); see `_end_finished_session`.
+        self._end_sessions = end_sessions
         self._own_lock = threading.Lock()
-        self._root_finished: list[dict[str, Any]] = []
         self._inflight: set[str] = set()
         # {session_id: {role, kind, slice, sha}} for in-flight dispatches.
         self._inflight_meta: dict[str, dict[str, Any]] = {}
-        # Degraded (root-bound) slice-evals of THIS run still in flight:
-        # {token: {slice, sha, started}}. Their cursor-agent runs at the
-        # root; `_release_root` treats them as known occupants and waits
-        # for them (bounded by the role timeout) instead of refusing.
-        self._degraded_root_evals: dict[str, dict[str, Any]] = {}
         # Integration-fence tokens this runner holds: acquired per evaluator
         # dispatch; only tokens of FINISHED evaluator dispatches are released
         # at the next Lead/repair dispatch; all are released at loop end.
@@ -4693,22 +4452,14 @@ class OmnigentRunner:
         # r15: fence token -> the repository whose ledger holds it (tokens
         # absent here are the home repo's).
         self._fence_repos: dict[str, Path] = {}
-        # r15.x root-turn share: {key, count (this runner's holders), sticky
-        # (finished root-bound evaluators still holding it with their
-        # fence)}; see `_enter_root_turn` / `_root_turn_slot`.
-        self._root_turn: dict[str, Any] = {"key": None, "count": 0, "sticky": 0}
-        # Set when a dispatch stops the loop for a human (root-occupied,
-        # writes-overlap): `_command_loop` maps it to STATE + exit code.
-        self.driver_stop: dict[str, Any] | None = None
         # {root, allow}: set by `_command_loop` (live-loop registry checks).
         self.loop_registry: dict[str, Any] | None = None
         # The loop core driving this runner (set by `loop`); None = unknown.
         self.loop_core: Any = None
-        # r16 root-free open-loop: {home, lead, branch, target, target_base}.
-        # Every session runs in the Lead worktree (``repo``/``workspace``)
-        # or a task-owned worktree; none of the root machinery below
-        # (release/snapshot/restore/record) applies, and no eval ever falls
-        # back to the aggregate root.
+        # r16 root-free: {home, lead, branch, target, target_base}. Every
+        # session runs in the Lead worktree (``repo``/``workspace``) or a
+        # task-owned worktree; no eval ever falls back to the aggregate root
+        # (r16b: lockstep too; the root machinery is gone).
         self._root_free = root_free
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
         # provenance for `omnigent reconcile`. Needs a server + runner
@@ -5004,6 +4755,7 @@ class OmnigentRunner:
                 note = self._lockstep_multi_repo_note(
                     "evaluator", iteration, mailbox, repos, context
                 )
+            note += self._root_free_lockstep_note("evaluator", mailbox)
             result = (
                 f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n"
                 + note + "\n" + result
@@ -5015,7 +4767,33 @@ class OmnigentRunner:
                 result = self._lockstep_multi_repo_note(
                     role, iteration, mailbox, repos, context
                 ) + "\n" + result
+            note = self._root_free_lockstep_note(role, mailbox)
+            if note:
+                result = note + "\n" + result
+        elif role == "evaluator" and not (context or {}).get("mode"):
+            note = self._root_free_lockstep_note("evaluator", mailbox)
+            if note:
+                result = note + "\n" + result
         return result
+
+    def _root_free_lockstep_note(self, role: str, mailbox: Path) -> str:
+        """The ROOT-FREE block of a root-free LOCKSTEP prompt (r16b), or ""."""
+        rf = self.__dict__.get("_root_free")
+        if rf is None:
+            return ""
+        values = {
+            "lead": rf.get("lead") or str(self.repo),
+            "branch": rf.get("branch") or "trio/<mailbox>",
+            "target": rf.get("target") or "<target>",
+            "base": str(rf.get("target_base") or "")[:12] or "<sha>",
+            "home": rf.get("home") or "<root>",
+            "mailbox": str(mailbox),
+        }
+        template = (
+            _ROOT_FREE_LOCKSTEP_EVALUATOR_NOTE if role == "evaluator"
+            else _ROOT_FREE_LOCKSTEP_LEAD_NOTE
+        )
+        return template.format(**values)
 
     def _lockstep_multi_repo_note(
         self,
@@ -5027,19 +4805,31 @@ class OmnigentRunner:
     ) -> str:
         """The r15 MULTI-REPO procedure of a LOCKSTEP prompt (eval-r15 N2)."""
         if role in ("lead", "repair"):
-            return _LOCKSTEP_MULTI_REPO_LEAD_NOTE.format(
+            text = _LOCKSTEP_MULTI_REPO_LEAD_NOTE.format(
                 repos="Repos:\n" + _multi_repo_listing(repos, self.repo)
             )
-        context = context or {}
-        pins = dict(context.get("pins") or {})
-        pins.setdefault("home", str(context.get("pinned_sha") or ""))
-        order = ["home", *repos]
-        return _LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE.format(
-            pins=_multi_repo_listing(repos, self.repo, pins),
-            evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
-            iteration=iteration,
-            mailbox_name=mailbox.name,
-        )
+        else:
+            context = context or {}
+            pins = dict(context.get("pins") or {})
+            pins.setdefault("home", str(context.get("pinned_sha") or ""))
+            order = ["home", *repos]
+            text = _LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE.format(
+                pins=_multi_repo_listing(repos, self.repo, pins),
+                evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
+                iteration=iteration,
+                mailbox_name=mailbox.name,
+            )
+        if self.__dict__.get("_root_free") is not None:
+            # r16b: a root-free lockstep loop's declared repos are its
+            # aggregates on the loop branch (as eval-r16rc N9 for open-loop).
+            text = text.replace(
+                "(on that repo's checked-out base branch)",
+                "(in that repo's aggregate, on the loop branch)",
+            ).replace(
+                "on its checked-out base branch, make ONE",
+                "in its aggregate (on the loop branch), make ONE",
+            )
+        return text
 
     def _root_free_note(
         self,
@@ -5263,218 +5053,27 @@ class OmnigentRunner:
         mailbox: Path,
         context: dict[str, Any] | None,
         dispatch: dict[str, Any],
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """(slice-eval worktree or None, degraded reason or None). Never raises.
+    ) -> dict[str, Any] | None:
+        """The eval worktree of this dispatch, or None (not an isolated eval).
 
-        A failed bind never kills the driver: it is logged once, recorded
-        as ``eval_isolation: degraded (<reason>)`` in this dispatch's
-        session bookkeeping (``inflight_sessions`` -> `.driver.json`) and
-        in LOG.md, and the slice-eval runs on the root-bound non-isolated
-        path (the evaluator grades in its own ``git worktree add`` at the
-        pin, as with ``--no-isolate-workers``).
-
-        Root-free runs (r16) never degrade: see `_bind_root_free_eval`.
+        Since r16b no evaluation ever falls back to the repository root: see
+        `_bind_root_free_eval` (bound, or not dispatched / terminal).
         """
-        if self.__dict__.get("_root_free") is not None:
-            return self._bind_root_free_eval(role, iteration, mailbox, context, dispatch)
-        try:
-            return self._slice_eval_worktree(role, mailbox, context), None
-        except Exception as exc:  # noqa: BLE001 - any bind failure degrades
-            error_class = type(exc).__name__
-            reason = str(exc) if isinstance(exc, TrioctlError) else f"{error_class}: {exc}"
-        slice_id = (context or {}).get("slice") or "?"
-        sha = str((context or {}).get("sha") or "")[:12]
-        note = f"eval_isolation: degraded ({reason})"
-        print(
-            f"trioctl: slice-eval {slice_id}@{sha}: {note} [{error_class}]; "
-            "grading on the root-bound (non-isolated) path",
-            file=sys.stderr,
-        )
-        dispatch["meta"]["eval_isolation"] = f"degraded ({reason})"
-        with self._own_lock:
-            self.__dict__.setdefault("eval_isolation_degraded", []).append(
-                {"slice": slice_id, "sha": (context or {}).get("sha"), "reason": reason}
-            )
-        line = (
-            f"- iter {iteration} | loop | slice-eval {slice_id} @{sha} "
-            f"{note.replace(chr(10), ' ')}\n"
-        )
-        try:
-            log = mailbox / "LOG.md"
-            prefix = ""
-            if log.is_file():
-                with open(log, "rb") as fh:
-                    fh.seek(0, os.SEEK_END)
-                    if fh.tell():
-                        fh.seek(-1, os.SEEK_END)
-                        prefix = "" if fh.read(1) == b"\n" else "\n"
-            with open(log, "a", encoding="utf-8") as fh:
-                fh.write(prefix + line)
-        except OSError as exc:
-            print(f"trioctl: could not log degraded eval isolation: {exc}", file=sys.stderr)
-        return None, reason
+        if not self._isolate and self.__dict__.get("_root_free") is None:
+            return None
+        return self._bind_root_free_eval(role, iteration, mailbox, context, dispatch)
 
-    # ------------------------------------------------ r15.x root-turn lock
-
-    ROOT_STRANGER_WAIT = DEFAULT_ROOT_STRANGER_WAIT
-
-    def _turn_state(self) -> dict[str, Any]:
-        """This runner's share of the root turn (lazy for __new__-built runners):
-        {key (lock path), count (its holders), sticky (finished evaluators)}."""
-        state = self.__dict__.get("_root_turn")
-        if state is None:
-            state = self.__dict__.setdefault(
-                "_root_turn", {"key": None, "count": 0, "sticky": 0},
-            )
-        return state
-
-    def _root_turn_root(self) -> Path:
-        """The Cursor project root a root-bound dispatch of this runner loads."""
-        workspace = Path(self.__dict__.get("_workspace") or self.repo).resolve()
-        if worker_worktrees is None:
-            return workspace
-        return worker_worktrees.cursor_project_root(workspace)
-
-    def _enter_root_turn(
-        self, role: str, mailbox: Path, iteration: int, kind: str | None
-    ) -> bool:
-        """Hold the root turn for this dispatch (re-entrant within the process).
-
-        A dispatch joins a turn this process already holds (its Lead's
-        degraded slice-eval, the next Lead after a sticky evaluator turn);
-        otherwise it waits for the per-root flock, bounded by
-        TRIO_ROOT_TURN_WAIT_S (RootBusyError after that). True when it had
-        to wait for another holder.
-        """
-        root = self._root_turn_root()
-        key = str(_root_turn_path(root))
-        mine = self._turn_state()
-        slot = _root_turn_slot(key)
-        with slot["mutex"]:
-            if slot["count"] > 0:
-                slot["count"] += 1
-                mine["key"] = key
-                mine["count"] += 1
-                return False
-            lock = _RootTurnLock(
-                root, who={"mailbox": str(mailbox), "role": role, "kind": kind or role},
-            )
-            label = f"{mailbox.name} {kind or role} (iteration {iteration})"
-            waited = lock.acquire(
-                _env_seconds(ROOT_TURN_WAIT_ENV, DEFAULT_ROOT_TURN_WAIT), label=label,
-            )
-            slot["lock"] = lock
-            slot["count"] = 1
-            mine["key"] = key
-            mine["count"] += 1
-        if not lock.contended:
-            return False
-        with self._dict_lock():
-            current = self.__dict__.get("driver_meta")
-            current = dict(current) if isinstance(current, dict) else {}
-            current["root_turn_wait_s"] = round(
-                float(current.get("root_turn_wait_s") or 0.0) + waited, 3
-            )
-            self.driver_meta = current  # rebind: the core may be serialising it
-        threshold = _env_seconds(ROOT_TURN_PROGRESS_ENV, DEFAULT_ROOT_TURN_PROGRESS)
-        if waited > threshold:
-            _append_mailbox_log(
-                mailbox,
-                f"- iter {iteration} | loop | root turn: {kind or role} waited "
-                f"{waited:.0f}s for another Trio actor at {lock.root}",
-            )
-        return True
-
-    def _repin_after_turn_wait(
-        self, iteration: int, mailbox: Path, context: dict[str, Any] | None
-    ) -> bool:
-        """Re-bind a root-bound evaluation's pin after waiting for the root turn.
-
-        The loop core pins HEAD before it dispatches; while this dispatch
-        waited, another loop's turn may have committed. The core's own
-        binding helper decides (it keeps the pin/attempt while the product
-        is intact since the pin, else pins HEAD with a fresh attempt); the
-        shared *context* dict is updated in place. True when it changed.
-        """
-        core = self.__dict__.get("loop_core")
-        if not context or core is None or not context.get("pinned_sha"):
-            return False
-        state_path = mailbox / "STATE.md"
-        before = (context.get("pinned_sha"), context.get("evaluator_attempt"))
-        try:
-            if context.get("kind") == "integration-eval":
-                helper = getattr(core, "_open_loop_integration_context", None)
-                if not callable(helper):
-                    return False
-                fresh = helper(mailbox, self.repo, iteration, state_path)
-            elif context.get("mode") != "open-loop":
-                helper = getattr(core, "_lockstep_eval_context", None)
-                intact = getattr(core, "_evaluated_product_intact", None)
-                if not callable(helper) or not callable(intact):
-                    return False
-                if intact(self.repo, mailbox, str(context["pinned_sha"])):
-                    return False
-                core._update_state(
-                    state_path, {"evaluated_sha": "", "evaluator_attempt": ""}
-                )
-                fresh = helper(mailbox, self.repo, iteration,
-                               core._read_state(state_path), state_path)
-            else:
-                return False
-        except Exception as exc:  # noqa: BLE001 - keep the core's pin
-            print(f"trioctl: could not re-pin after the root-turn wait: {exc}",
-                  file=sys.stderr)
-            return False
-        context.update(fresh)
-        after = (context.get("pinned_sha"), context.get("evaluator_attempt"))
-        if after != before:
-            print(
-                f"trioctl: root turn wait moved the product; evaluation re-pinned "
-                f"{str(before[0])[:12]} -> {str(after[0])[:12]}",
-                file=sys.stderr,
-            )
-        return after != before
-
-    def _exit_root_turn(self, count: int = 1) -> None:
-        mine = self._turn_state()
-        if not mine["key"]:
-            return
-        slot = _root_turn_slot(mine["key"])
-        with slot["mutex"]:
-            count = min(count, mine["count"])
-            mine["count"] -= count
-            slot["count"] = max(0, slot["count"] - count)
-            if slot["count"] == 0 and slot["lock"] is not None:
-                slot["lock"].release()
-                slot["lock"] = None
-
-    def _keep_root_turn_sticky(self) -> None:
-        """A root-bound evaluator's turn outlives its dispatch (fence-tied)."""
-        self._turn_state()["sticky"] += 1
-
-    def _release_sticky_root_turns(self) -> None:
-        """At the next Lead/repair dispatch: drop finished evaluators' turns."""
-        mine = self._turn_state()
-        sticky, mine["sticky"] = mine["sticky"], 0
-        if sticky:
-            self._exit_root_turn(sticky)
-
-    def release_root_turns(self) -> None:
-        """Loop end (after prune/restore): no dispatch of this runner is at the root."""
-        mine = self._turn_state()
-        mine["sticky"] = 0
-        self._exit_root_turn(mine["count"])
+    # ------------------------------------------------ cross-loop checks
 
     def _check_writes_overlap(self, mailbox: Path, iteration: int) -> None:
         """Lead-pass start: a live loop's `writes:` overlap this loop's.
 
-        Root-bound and lockstep loops share the one aggregate at the root:
-        refuse (needs_human, exit 5). A root-free loop has its own
-        aggregate and the land merges and re-verifies a moved target, so a
-        mid-run overlap (often introduced by the OTHER loop's Lead) only
-        warns -- LOG line naming the other loop and paths, `.driver.json`
-        `writes_overlap` -- and never stops this loop (eval-r16rc N4). The
-        start-time refusal (exit 2) is unchanged in every mode.
+        Every loop has its own aggregate since r16b (root-free, both modes),
+        and the land merges and re-verifies a moved target, so a mid-run
+        overlap (often introduced by the OTHER loop's Lead) only warns --
+        one LOG line per overlap naming the other loop and paths,
+        `.driver.json` `writes_overlap` -- and never stops this loop
+        (eval-r16rc N4). The start-time refusal (exit 2) is unchanged.
         """
         registry = self.__dict__.get("loop_registry")
         if not registry:
@@ -5486,351 +5085,38 @@ class OmnigentRunner:
                 with self._dict_lock():
                     self.driver_meta = {k: v for k, v in meta.items() if k != "writes_overlap"}
             return
-        if self.__dict__.get("_root_free") is not None and not registry.get("allow"):
-            logged = registry.setdefault("logged", set())
-            fresh = [p for p in problems if p not in logged]
-            for problem in fresh:
-                logged.add(problem)
-                _append_mailbox_log(
-                    mailbox,
-                    f"- iter {iteration} | loop | warning: {problem}; root-free: this "
-                    "loop continues (its land merges and re-verifies the other "
-                    "loop's changes; a real conflict ends in needs_land)",
+        logged = registry.setdefault("logged", set())
+        fresh = [p for p in problems if p not in logged]
+        for problem in fresh:
+            logged.add(problem)
+            if registry.get("allow"):
+                line = f"{ALLOW_OVERLAPPING_LOOPS_ENV}=1 proceeds"
+            else:
+                line = (
+                    "root-free: this loop continues (its land merges and re-verifies "
+                    "the other loop's changes; a real conflict ends in needs_land)"
                 )
-                print(f"trioctl: warning: {problem} (root-free: continuing)",
-                      file=sys.stderr)
-            with self._dict_lock():
-                current = self.__dict__.get("driver_meta")
-                current = dict(current) if isinstance(current, dict) else {}
-                current["writes_overlap"] = list(problems)
-                self.driver_meta = current  # rebind: the core may be serialising it
-            return
-        if registry.get("allow"):
-            logged = registry.setdefault("logged", set())
-            for problem in problems:
-                if problem in logged:
-                    continue
-                logged.add(problem)
-                _append_mailbox_log(
-                    mailbox,
-                    f"- iter {iteration} | loop | warning: {problem}; "
-                    f"{ALLOW_OVERLAPPING_LOOPS_ENV}=1 proceeds (one shared aggregate: unsafe)",
-                )
-            return
-        message = "; ".join(problems)
-        error = WritesOverlapError(message)
-        error.stop = {
-            "status": "needs_human", "phase": "writes-overlap", "reason": "writes-overlap",
-            "message": message, "exit": 5,
-        }
-        raise error
-
-    ROOT_RELEASE_WAIT = 30.0
-
-    def _wait_known_root_occupants(self) -> float:
-        """Wait for this run's in-flight degraded root-bound slice-evals.
-
-        Such an eval is a known occupant of the root, not a stranger: its
-        cursor-agent legitimately runs there until the dispatch ends. The
-        wait is bounded by each dispatch's own role timeout (plus
-        ROOT_RELEASE_WAIT for its teardown); past that the caller's normal
-        stranger check decides. Returns the seconds waited.
-        """
-        start = time.monotonic()
-        announced: set[str] = set()
-        while True:
-            with self._dict_lock():
-                known = dict(self.__dict__.get("_degraded_root_evals") or {})
-            if not known:
-                break
-            timeout = float(self._timeout or 0.0)
-            deadline = max(
-                float(entry.get("started") or start) for entry in known.values()
-            ) + timeout + self.ROOT_RELEASE_WAIT
-            if time.monotonic() >= deadline:
-                print(
-                    "trioctl: degraded slice-eval(s) "
-                    f"{sorted(str(e.get('slice') or '?') for e in known.values())} "
-                    "outlived their role timeout; checking the root as usual",
-                    file=sys.stderr,
-                )
-                break
-            for token, entry in known.items():
-                if token not in announced:
-                    announced.add(token)
-                    print(
-                        "trioctl: root busy with degraded slice-eval "
-                        f"{entry.get('slice') or '?'}; Lead pass waits",
-                        file=sys.stderr,
-                    )
-            time.sleep(0.5 if self._interval else 0.02)
-        waited = time.monotonic() - start
-        if announced:
-            with self._dict_lock():
-                current = self.__dict__.get("driver_meta")
-                current = dict(current) if isinstance(current, dict) else {}
-                current["root_wait_s"] = round(
-                    float(current.get("root_wait_s") or 0.0) + waited, 3
-                )
-                # Rebind, never mutate (the loop core may be serialising it).
-                self.driver_meta = current
-        return waited
-
-    def _release_root(self, mailbox: Path, *, stranger_wait: float | None = None) -> None:
-        """Before a root-bound dispatch: prove no earlier session owns the root.
-
-        Cursor-native writes the aggregate root's project ``.cursor``
-        config at launch, overwriting whatever an earlier root session
-        (e.g. the idle Lead of the previous pass) still has loaded. A held
-        earlier session is never touched: the dispatch is refused. Others
-        are archived and deleted through the normal id-scoped prune, then
-        no cursor-agent may remain with its cwd at the root.
-
-        A degraded (root-bound) slice-eval of this run that is still in
-        flight is a known occupant: it is waited for first (bounded by its
-        role timeout), then its finished session is released like any
-        other. Only unknown cursor-agents at the root refuse the dispatch.
-
-        r15.x: every Trio actor at this root holds the root-turn lock, so a
-        cursor-agent still found here (at the root or in a subdirectory
-        that loads its slot) is not Trio's: the user's own session, an older
-        Trio, or a leaked process. It is waited for up to
-        TRIO_ROOT_STRANGER_WAIT_S (default 300 s, progress every 30 s), then
-        :class:`RootOccupiedError` names it (pid, cwd, start, parents, cmd).
-        """
-        self._wait_known_root_occupants()
-        with self._own_lock:
-            # Claimed atomically: a concurrent release (the degraded eval's
-            # own post-dispatch release) never prunes the same session.
-            claimed = [
-                entry for entry in self._root_finished
-                if entry["session_id"] not in self._inflight
-            ]
-            previous = [entry["session_id"] for entry in claimed]
-            self._root_finished = [
-                e for e in self._root_finished if e["session_id"] not in previous
-            ]
-        try:
-            self._end_previous_root_sessions(mailbox, previous)
-        except BaseException:
-            with self._own_lock:
-                known = {e["session_id"] for e in self._root_finished}
-                self._root_finished[:0] = [
-                    e for e in claimed if e["session_id"] not in known
-                ]
-            raise
-        if stranger_wait is None:
-            stranger_wait = _env_seconds(ROOT_STRANGER_WAIT_ENV, float(self.ROOT_STRANGER_WAIT))
-        start = time.monotonic()
-        deadline = start + stranger_wait
-        next_note = start + min(ROOT_STRANGER_PROGRESS, max(stranger_wait, 0.0))
-        while True:
-            live = worker_worktrees.cursor_processes_at(self.repo)
-            if not live:
-                return
-            now = time.monotonic()
-            if now >= deadline:
-                raise self._root_occupied(mailbox, live, now - start)
-            if now >= next_note and stranger_wait > self.ROOT_RELEASE_WAIT:
-                print(
-                    f"trioctl: cursor-agent process(es) {live[:10]} not owned by Trio "
-                    f"at the aggregate root {self.repo}; waited {now - start:.0f}s/"
-                    f"<={stranger_wait:.0f}s",
-                    file=sys.stderr,
-                )
-                next_note = now + ROOT_STRANGER_PROGRESS
-            time.sleep(0.5 if self._interval else 0.0)
-
-    def _root_occupied(self, mailbox: Path, live: list[int], waited: float) -> RootOccupiedError:
-        """The clean root-occupied abort (recorded for `_command_loop`)."""
-        details = []
-        for pid in live[:10]:
-            try:
-                details.append(worker_worktrees.process_detail(pid))
-            except Exception:  # noqa: BLE001 - a vanished pid keeps its number
-                details.append({"pid": pid})
-        described = "; ".join(worker_worktrees.describe_process(d) for d in details)
-        message = (
-            f"cursor-agent process(es) {live[:10]} still run at the aggregate root "
-            f"{self.repo} after {waited:.0f}s: root {self.repo} is in use by a process "
-            f"Trio does not own: {described}; Trio would overwrite its "
-            ".cursor/hooks.json and mcp.json. Close it or run this loop after it ends; "
-            f"resume with: trioctl omnigent loop --mailbox {mailbox}"
-        )
-        error = RootOccupiedError(message, pids=list(live), details=details)
-        error.stop = {
-            "status": "needs_human", "phase": "root-occupied", "reason": "root-occupied",
-            "message": message, "exit": ROOT_OCCUPIED_EXIT,
-        }
-        return error
-
-    def _end_previous_root_sessions(self, mailbox: Path, previous: list[str]) -> None:
-        """Prune the claimed finished root sessions (refuses held ones)."""
-        if previous:
-            held = set(self.held_session_ids) | {
-                str(r.get("session_id")) for _p, r in _held_records(mailbox)
-                if r.get("session_id")
-            }
-            if any(not r.get("session_id") for _p, r in _held_records(mailbox)):
-                raise TrioctlError(
-                    "unreadable held record: cannot prove the aggregate root "
-                    "is free; not reusing it"
-                )
-            blocked = [sid for sid in previous if sid in held]
-            if blocked:
-                raise TrioctlError(
-                    f"held session(s) {blocked} still own the aggregate root's "
-                    "Cursor config; not reusing the root"
-                )
-            counts = _prune_broker_sessions(
-                self._client(), mailbox, session_ids=previous, keep_unarchived=True,
+            _append_mailbox_log(
+                mailbox, f"- iter {iteration} | loop | warning: {problem}; {line}",
             )
-            print(
-                f"trioctl: ended previous root session(s) {previous} before "
-                f"reusing the aggregate root: {counts}",
-                file=sys.stderr,
-            )
+            print(f"trioctl: warning: {problem} (continuing)", file=sys.stderr)
+        with self._dict_lock():
+            current = self.__dict__.get("driver_meta")
+            current = dict(current) if isinstance(current, dict) else {}
+            current["writes_overlap"] = list(problems)
+            self.driver_meta = current  # rebind: the core may be serialising it
 
-    def _root_owned_ids(self, mailbox: Path) -> set[str]:
-        """Root sessions this task provably launched and that no longer run.
+    def _end_finished_session(self, mailbox: Path, session_id: str, role: str) -> None:
+        """End a FINISHED lockstep session in the Lead worktree (r16b).
 
-        This run's created ids, ids recorded at THIS root under THIS
-        mailbox, and ids an earlier trioctl run of this mailbox archived
-        (full id and locked title prefix). A session recorded under another
-        mailbox, or with no mailbox, is only evidence: another trioctl
-        process may have it in flight (recorded before its cursor-agent
-        starts), so it is never included, whatever else claims it. Held
-        sessions (of this mailbox or of the mailbox a recorded session
-        belongs to) and in-flight dispatches are never included either;
-        restore_root_cursor adds nothing back.
+        Lockstep's Lead, repair and Evaluator run one after another in the
+        loop's Lead worktree, whose project `.cursor` slot the next launch
+        rewrites: the finished session is ended (archived + deleted through
+        the id-scoped prune) at its turn end so no idle cursor-agent keeps
+        the old slot loaded. A held session is never touched; with
+        `--keep-sessions` sessions stay until the post-loop decision.
         """
-        owned = set(self.created_session_ids)
-        held_elsewhere: set[str] = set()
-        foreign: set[str] = set()
-        recorded = worker_worktrees.root_owned_sessions(self.repo)
-        here = mailbox.resolve()
-        for sid, box in recorded.items():
-            try:
-                ours = bool(box) and Path(box).resolve() == here
-            except (OSError, RuntimeError):
-                ours = False
-            if ours:
-                owned.add(sid)
-                continue
-            foreign.add(sid)
-            if box:
-                held_elsewhere |= _held_session_ids(Path(box))
-        prefix = f"trioctl {mailbox.name} "
-        archive = mailbox / ".sessions"
-        if archive.is_dir():
-            for path in sorted(archive.glob("*.jsonl")):
-                try:
-                    with open(path, encoding="utf-8") as fh:
-                        first = json.loads(fh.readline())
-                except (OSError, ValueError):
-                    continue
-                if (
-                    isinstance(first, dict)
-                    and isinstance(first.get("id"), str)
-                    and str(first.get("title") or "").startswith(prefix)
-                ):
-                    owned.add(first["id"])
-        held = set(self.held_session_ids) | _held_session_ids(mailbox) | held_elsewhere
-        with self._own_lock:
-            inflight = set(self._inflight)
-        return owned - held - inflight - foreign
-
-    def _restore_root_config(self, mailbox: Path, *, final: bool = False) -> list[str]:
-        """Undo this task's own Omnigent merges into the root ``.cursor`` config.
-
-        Only while no cursor-agent runs at the root; anything not provably
-        this task's own is left in place, so acceptance stays pending.
-        """
-        if _has_unreadable_hold(mailbox):
-            problems = ["unreadable held record: root Cursor config left in place"]
-        elif worker_worktrees.cursor_processes_at(self.repo):
-            problems = ["a cursor-agent still runs at the root; its Cursor config was left in place"]
-        else:
-            try:
-                problems = worker_worktrees.restore_root_cursor(
-                    self.repo, self._root_owned_ids(mailbox), final=final,
-                )
-            except worker_worktrees.WorktreeError as exc:
-                problems = [str(exc)]
-        for problem in problems:
-            print(f"trioctl: root Cursor config: {problem}", file=sys.stderr)
-        return problems
-
-    def _manages_root_config(self) -> bool:
-        """Whether root-bound dispatches baseline/restore the root ``.cursor``."""
-        if self.__dict__.get("_root_free") is not None:
-            return False  # r16: no session ever runs at the root
-        return worker_worktrees is not None and bool(
-            self._isolate or self._restore_root_nonisolated
-        )
-
-    def _snapshot_root_config(self) -> None:
-        """Non-isolated launch: record the root's pre-run config once, never wait."""
-        try:
-            worker_worktrees.snapshot_root_cursor(self.repo)
-        except worker_worktrees.WorktreeError as exc:
-            print(f"trioctl: root Cursor config baseline not taken: {exc}", file=sys.stderr)
-
-    def _end_root_sessions_nonisolated(self, mailbox: Path) -> None:
-        """Non-isolated: after a finished evaluator, end finished root sessions, restore.
-
-        Only when no other dispatch of this runner is in flight (open-loop
-        can run the Lead and an evaluator at the root together; their
-        sessions are never touched and the config stays until loop end).
-        Held sessions refuse the release; the config is then left in place
-        and the loop core's acceptance check decides.
-        """
-        if not self._end_root_sessions:
-            return
-        with self._own_lock:
-            # A degraded eval registered before its session id exists is
-            # in flight too (never wait for it here: the Lead does).
-            busy = bool(self._inflight) or bool(
-                self.__dict__.get("_degraded_root_evals")
-            )
-        if busy:
-            return
-        try:
-            self._release_root(mailbox, stranger_wait=self.ROOT_RELEASE_WAIT)
-        except Exception as exc:  # noqa: BLE001 - config stays; acceptance decides
-            print(f"trioctl: root Cursor config left in place: {exc}", file=sys.stderr)
-            return
-        self._restore_root_config(mailbox)
-
-    def _prepare_root_config(self, mailbox: Path) -> None:
-        """Before a root-bound launch (root already released): restore, then baseline."""
-        self._restore_root_config(mailbox)
-        try:
-            worker_worktrees.snapshot_root_cursor(self.repo)
-        except worker_worktrees.WorktreeError as exc:
-            print(f"trioctl: root Cursor config baseline not taken: {exc}", file=sys.stderr)
-
-    def _end_root_evaluator(self, mailbox: Path, session_id: str) -> None:
-        """Back-compat name: :meth:`_end_root_session` for an evaluator."""
-        self._end_root_session(mailbox, session_id, "evaluator")
-
-    def _end_root_session(self, mailbox: Path, session_id: str, role: str) -> None:
-        """End a finished root-bound session of *role*, then restore the root.
-
-        Evaluator sessions were always ended here; since r15.x the Lead /
-        repair session is too, at its turn end, instead of idling at the root
-        until the next root dispatch (it would keep a cursor-agent there and
-        block every other loop's root turn between passes). No session is
-        ever reused. A held session is never touched. While a degraded
-        slice-eval of this run still runs at the root, the session is ended
-        but the root is not waited for / restored (the next release does it).
-        """
-        if not self._end_root_sessions:
-            print(
-                "trioctl: root Cursor config left in place (--keep-sessions keeps "
-                f"{role} session {session_id}); acceptance stays pending",
-                file=sys.stderr,
-            )
+        if not self.__dict__.get("_end_sessions", True):
             return
         if session_id in set(self.held_session_ids) | _held_session_ids(mailbox):
             return
@@ -5838,51 +5124,12 @@ class OmnigentRunner:
             counts = _prune_broker_sessions(
                 self._client(), mailbox, session_ids=[session_id], keep_unarchived=True,
             )
-        except Exception as exc:  # noqa: BLE001 - config stays; acceptance fails closed
+        except Exception as exc:  # noqa: BLE001 - never masks the dispatch result
             print(f"trioctl: could not end {role} session {session_id}: {exc}",
                   file=sys.stderr)
             return
-        if not isinstance(counts, dict) or int(counts.get("deleted") or 0) < 1:
-            # Kept (archive failure, skipped, ...): it may still own the
-            # root, so keep its bookkeeping; the next root dispatch retries
-            # the release and the config stays until then.
-            print(
-                f"trioctl: finished root {role} session {session_id} was not deleted "
-                f"({counts}); root Cursor config left in place, acceptance stays pending",
-                file=sys.stderr,
-            )
-            return
-        print(
-            f"trioctl: ended finished root {role} session {session_id}: {counts}",
-            file=sys.stderr,
-        )
-        with self._own_lock:
-            self._root_finished = [
-                e for e in self._root_finished if e["session_id"] != session_id
-            ]
-            degraded = bool(self.__dict__.get("_degraded_root_evals"))
-        if degraded:
-            return
-        deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
-        while worker_worktrees.cursor_processes_at(self.repo):
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.5 if self._interval else 0.0)
-        self._restore_root_config(mailbox)
-
-    def restore_root_config_final(self, mailbox: Path) -> list[str]:
-        """Loop end, after the post-loop prune: restore and drop the baseline."""
-        if not self._manages_root_config():
-            return []
-        if not self._isolate:
-            # Non-isolated: nothing ended the root sessions before the
-            # post-loop prune; their runners exit asynchronously.
-            deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
-            while worker_worktrees.cursor_processes_at(self.repo):
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.5 if self._interval else 0.0)
-        return self._restore_root_config(mailbox, final=True)
+        print(f"trioctl: ended finished {role} session {session_id}: {counts}",
+              file=sys.stderr)
 
     def _observe_phase(
         self,
@@ -6149,16 +5396,6 @@ class OmnigentRunner:
                 self._inflight.add(session_id)
                 meta = self.__dict__.setdefault("_inflight_meta", {})
                 meta[session_id] = dict(dispatch.get("meta") or {"role": role})
-            if dispatch.get("root_mailbox") is not None:
-                # Durable ownership evidence as soon as the id exists, so a
-                # crash mid-dispatch still leaves a provable record.
-                try:
-                    worker_worktrees.record_root_session(
-                        self.repo, session_id, dispatch["root_mailbox"]
-                    )
-                except Exception as exc:  # noqa: BLE001 - finally retries it
-                    print(f"trioctl: could not record root session {session_id}: {exc}",
-                          file=sys.stderr)
         with self._dict_lock():
             # Last dispatch of this role (back-compat); never read in flight.
             self.session_ids[role] = session_id
@@ -6425,51 +5662,14 @@ class OmnigentRunner:
                 "sha": (context or {}).get("sha"),
             },
         }
-        eval_wt, eval_degraded = self._bind_slice_eval(
-            role, iteration, mailbox, context, dispatch
+        eval_wt = self._bind_slice_eval(role, iteration, mailbox, context, dispatch)
+        if role in ("lead", "repair"):
+            # Cross-loop `writes:` warning (r16-rc; warn-only since r16b).
+            self._check_writes_overlap(mailbox, iteration)
+        return self._run_bound(
+            role, iteration, mailbox, context, agent_id, model, prompt, title,
+            dispatch, eval_wt, nonce,
         )
-        # r15.x: every dispatch launched at the aggregate root (not bound to
-        # its own eval worktree) holds the root turn; see `_enter_root_turn`.
-        # r16 root-free: nothing runs at the root (the Lead works in its own
-        # worktree, every eval in a detached one), so no turn is taken.
-        at_root = eval_wt is None and self.__dict__.get("_root_free") is None
-        if at_root:
-            waited = self._enter_root_turn(
-                role, mailbox, iteration, (context or {}).get("kind")
-            )
-            if (
-                waited and role == "evaluator" and eval_degraded is None
-                and self._repin_after_turn_wait(iteration, mailbox, context)
-            ):
-                # The core pinned before this dispatch waited; another
-                # loop's turn moved the product meanwhile: grade the new pin.
-                prompt = self._prompt(role, iteration, mailbox, context)
-                if nonce:
-                    prompt += f"\nDispatch nonce: {nonce}\n"
-        try:
-            if role in ("lead", "repair"):
-                if at_root:
-                    # This pass holds its own turn now: finished evaluators'
-                    # sticky turns (held through `_finalize_ship`) end here,
-                    # with their integration fences.
-                    self._release_sticky_root_turns()
-                # Cross-loop `writes:` refusal: every mode (r16-rc).
-                self._check_writes_overlap(mailbox, iteration)
-            return self._run_bound(
-                role, iteration, mailbox, context, agent_id, model, prompt, title,
-                dispatch, eval_wt, eval_degraded, nonce,
-            )
-        except (RootOccupiedError, WritesOverlapError) as exc:
-            self.driver_stop = getattr(exc, "stop", None)
-            raise
-        finally:
-            if at_root:
-                if role == "evaluator" and eval_degraded is None:
-                    # Held with the fence: released at the next Lead/repair
-                    # dispatch or loop end (`release_root_turns`).
-                    self._keep_root_turn_sticky()
-                else:
-                    self._exit_root_turn()
 
     def _run_bound(
         self,
@@ -6483,52 +5683,13 @@ class OmnigentRunner:
         title: str,
         dispatch: dict[str, Any],
         eval_wt: dict[str, Any] | None,
-        eval_degraded: str | None,
         nonce: str | None,
     ) -> int:
-        """The dispatch proper (root turn, if any, already held by `_run`)."""
+        """The dispatch proper (its eval worktree, if any, already bound)."""
         workspace = self._workspace
         if self.__dict__.get("_root_free") is not None:
             # r16: nothing at the root to release or restore.
             self._root_free_prepare(role, iteration, mailbox, context, dispatch)
-        elif eval_degraded is not None and worker_worktrees is not None:
-            # Degraded slice-eval: the non-isolated path. The Lead may be
-            # live at the root, so never wait for / release the root and
-            # hold no integration fence (the evaluator grades its own
-            # worktree at the pin); only baseline the root config once.
-            self._snapshot_root_config()
-        elif self._isolate and worker_worktrees is not None and eval_wt is None:
-            # Root-bound dispatch (Lead, repair, lockstep evaluator,
-            # integration-eval): the root must be free first.
-            self._release_root(mailbox)
-            self._prepare_root_config(mailbox)
-            if role == "evaluator":
-                # No worker merge may land while the aggregate is graded or
-                # retired; held until the next Lead/repair dispatch after
-                # this evaluation FINISHED, or loop end (acceptance is also
-                # bound to the exact pin).
-                token = worker_worktrees.acquire_fence(
-                    self.repo, reason=f"{role} iteration {iteration}", mailbox=mailbox,
-                )
-                dispatch["fence"] = token
-                with self._own_lock:
-                    self._fence_tokens[token] = False
-                # r15: every declared repo is graded (and retired) too; no
-                # worker merge may land in any of them meanwhile.
-                dispatch["repo_fences"] = []
-                for declared in _declared_repos(mailbox).values():
-                    extra = worker_worktrees.acquire_fence(
-                        declared["path"], reason=f"{role} iteration {iteration}",
-                        mailbox=mailbox,
-                    )
-                    dispatch["repo_fences"].append(extra)
-                    with self._own_lock:
-                        self._fence_tokens[extra] = False
-                        self._fence_repos[extra] = Path(declared["path"])
-            else:
-                self._release_fences(finished_only=True)
-        elif self._restore_root_nonisolated and worker_worktrees is not None and eval_wt is None:
-            self._snapshot_root_config()
         if eval_wt is not None:
             workspace = eval_wt["path"]
             prompt = self._eval_workspace_preface(eval_wt, mailbox) + prompt
@@ -6556,22 +5717,6 @@ class OmnigentRunner:
         _register_dispatch_prompt(
             dispatch["prompt_token"], mailbox, prompt, dispatch["meta"]
         )
-        root_bound = eval_wt is None and self._manages_root_config()
-        if root_bound:
-            dispatch["root_mailbox"] = mailbox
-        degraded_token = None
-        if eval_degraded is not None:
-            # A known root occupant until it ends (registered right before
-            # the launch, dropped in the same critical section that records
-            # its finished session): the Lead's next `_release_root` waits
-            # for it instead of refusing an unknown cursor-agent.
-            degraded_token = uuid.uuid4().hex
-            with self._own_lock:
-                self.__dict__.setdefault("_degraded_root_evals", {})[degraded_token] = {
-                    "slice": (context or {}).get("slice"),
-                    "sha": (context or {}).get("sha"),
-                    "started": started,
-                }
         try:
             code = self._run_dispatch(
                 client, agent_id, model, prompt, title, role, iteration,
@@ -6583,12 +5728,6 @@ class OmnigentRunner:
                 dispatch.get("prompt_token"), ended=time.monotonic()
             )
             session_id = dispatch.get("session_id")
-            if root_bound and session_id:
-                try:
-                    worker_worktrees.record_root_session(self.repo, session_id, mailbox)
-                except Exception as exc:  # noqa: BLE001 - never mask the dispatch result
-                    print(f"trioctl: could not record root session {session_id}: {exc}",
-                          file=sys.stderr)
             with self._own_lock:
                 if session_id:
                     self._inflight.discard(session_id)
@@ -6598,28 +5737,19 @@ class OmnigentRunner:
                     self._fence_tokens[dispatch["fence"]] = True  # finished
                 for extra in dispatch.get("repo_fences") or ():
                     self._fence_tokens[extra] = True
-                if root_bound and session_id:
-                    self._root_finished.append(
-                        {"session_id": session_id, "role": role, "workspace": workspace}
-                    )
-                if degraded_token is not None:
-                    self.__dict__.setdefault("_degraded_root_evals", {}).pop(
-                        degraded_token, None
-                    )
             if eval_wt is not None:
                 self._release_eval_worktree(eval_wt, session_id)
-        if root_bound and role == "evaluator" and code == 0 and dispatch.get("session_id"):
-            # The loop core grades acceptance right after this returns.
-            if self._isolate and eval_degraded is None:
-                self._end_root_evaluator(mailbox, dispatch["session_id"])
-            else:
-                self._end_root_sessions_nonisolated(mailbox)
-        if root_bound and role in ("lead", "repair") and dispatch.get("session_id"):
-            # r15.x: the Lead/repair session ends with its root turn.
-            if self._isolate:
-                self._end_root_session(mailbox, dispatch["session_id"], role)
-            else:
-                self._end_root_sessions_nonisolated(mailbox)
+        session_id = dispatch.get("session_id")
+        if (
+            session_id and eval_wt is None
+            and self.__dict__.get("_root_free") is not None
+            and not (context or {}).get("mode")
+            and (role != "evaluator" or code == 0)
+        ):
+            # r16b lockstep: Lead, repair and Evaluator take turns in the
+            # Lead worktree's single `.cursor` slot; a finished session ends
+            # with its turn (the evaluator's once its verdict is written).
+            self._end_finished_session(mailbox, session_id, role)
         if role in ("lead", "repair") and code == 0:
             # r15 guard on the PLAN this pass wrote: the driver ends with
             # `status: error` (exit 3) before any evaluator is dispatched.
@@ -6667,7 +5797,7 @@ class OmnigentRunner:
         mailbox: Path,
         context: dict[str, Any] | None,
         dispatch: dict[str, Any],
-    ) -> tuple[dict[str, Any] | None, str | None]:
+    ) -> dict[str, Any] | None:
         """Root-free eval binding: a worktree, or no dispatch -- never the root.
 
         Slice-eval: a detached worktree at its pin; integration-eval: a
@@ -6680,13 +5810,13 @@ class OmnigentRunner:
         """
         kind = (context or {}).get("kind")
         if role != "evaluator" or kind not in ("slice-eval", "integration-eval"):
-            return None, None
+            return None
         last: BaseException | None = None
         for _attempt in range(2):
             try:
                 if kind == "slice-eval":
-                    return self._slice_eval_worktree(role, mailbox, context), None
-                return self._integration_eval_worktree(mailbox, context or {}), None
+                    return self._slice_eval_worktree(role, mailbox, context)
+                return self._integration_eval_worktree(mailbox, context or {})
             except Exception as exc:  # noqa: BLE001 - retried once, then refused
                 last = exc
         reason = str(last) if isinstance(last, TrioctlError) else f"{type(last).__name__}: {last}"
@@ -6771,15 +5901,19 @@ class OmnigentRunner:
     ) -> None:
         """Per-dispatch bookkeeping of a root-free run (no root access).
 
-        Lead/repair: release the fences of finished integration-evals.
-        Integration-eval: fence this loop's own aggregate(s) (per-branch
-        fences: other loops' builders are never retained) and log how far the
-        target advanced since the fork (the land merges it).
+        Lead/repair: release the fences of finished evaluations.
+        Integration-eval (and, r16b, a lockstep Evaluator of an isolated
+        run): fence this loop's own aggregate(s) (per-branch fences: other
+        loops' builders are never retained) and log how far the target
+        advanced since the fork (the land merges it).
         """
         if role in ("lead", "repair"):
             self._release_fences(finished_only=True)
             return
-        if role != "evaluator" or (context or {}).get("kind") != "integration-eval":
+        kind = (context or {}).get("kind")
+        if role != "evaluator" or not (
+            kind == "integration-eval" or (not kind and self._isolate)
+        ):
             return
         token = worker_worktrees.acquire_fence(
             self.repo, reason=f"{role} iteration {iteration}", mailbox=mailbox,
@@ -7096,9 +6230,10 @@ REQUIRED_METRICS_API = 6
 #: Vendored metrics/ sets this trioctl still drives. A repository whose
 #: copy predates r15 (4) runs single-repo mailboxes unchanged; a PLAN.md
 #: `repos:` block is refused with it (see ``_old_core_repos_refusal``). A
-#: copy before r16 (4, 5) runs lockstep and `--root-bound` open-loop
-#: unchanged; a root-free open-loop run is refused with it
-#: (``_old_core_root_free_refusal``).
+#: copy before r16 (4, 5) still loads (``metrics refresh``, trio-check, a
+#: mailbox outside any git checkout), but every root-free loop -- open-loop
+#: and, since r16b, lockstep -- refuses a target whose committed set is
+#: below ``ROOT_FREE_METRICS_API``.
 COMPATIBLE_METRICS_APIS = (4, 5, 6)
 
 #: First METRICS_API whose loop core pins, retires and verifies per repo.
@@ -7651,40 +6786,64 @@ def _ensure_mailbox_gitignore(mailbox: Path) -> list[str]:
 #: starved (resumable with `trioctl omnigent land --mailbox ...`).
 NEEDS_LAND_EXIT = 8
 
-ROOT_FREE_BOUND_NOTICE = (
-    "trioctl: {why}: running this open-loop at the repository root "
-    "(pre-r16 root-bound mode)"
+#: r16b: `--root-bound` is kept only to refuse with this message.
+ROOT_BOUND_REMOVED = (
+    "trioctl: root-bound mode was removed in r16b: every loop (open-loop and "
+    "lockstep) runs root-free in its own Lead worktree on trio/<mailbox> and lands "
+    "onto its target after SHIP; use `trioctl omnigent land --mailbox {rel}` to "
+    "finish a loop that is waiting to land, or `trioctl omnigent abandon --mailbox "
+    "{rel}` to retire it. Drop --root-bound; nothing was changed"
 )
 
 
-def _root_free_wanted(args: argparse.Namespace, mailbox: Path) -> tuple[bool, str | None]:
-    """(root-free?, why not). Default ON for open-loop; flags only disable it."""
-    raw = getattr(args, "root_free", None)
-    if raw is False:
-        return False, None
+def _root_free_wanted(args: argparse.Namespace, mailbox: Path) -> tuple[bool, int | None]:
+    """(root-free?, refusal exit code). Every loop in a git checkout runs
+    root-free since r16b (open-loop and lockstep); a mailbox outside any
+    git checkout runs in place (nothing to fork). A refusal prints why."""
+    explicit = getattr(args, "root_free", None)
+    if explicit is False:
+        print(ROOT_BOUND_REMOVED.format(rel=getattr(args, "mailbox", mailbox)), file=sys.stderr)
+        return False, 2
     if root_free is None or worker_worktrees is None:
-        return False, "root_free.py/worker_worktrees.py are not installed next to trioctl"
+        print(
+            "trioctl: root_free.py/worker_worktrees.py are not installed next to trioctl "
+            "(every loop in a git checkout runs root-free since r16b): reinstall "
+            "trioctl; nothing was changed",
+            file=sys.stderr,
+        )
+        return False, 3
     probe = root_free._existing_ancestor(Path(mailbox))
     if worker_worktrees.git(probe, "rev-parse", "--show-toplevel", check=False).returncode != 0:
-        return False, None  # not a git checkout: nothing to fork (isolation says why)
+        if explicit:
+            print(f"trioctl: --root-free refused: {mailbox} is not inside a git checkout",
+                  file=sys.stderr)
+            return False, 2
+        return False, None  # not a git checkout: nothing to fork, runs in place
     open_loop = (mailbox / "QUEUE.md").is_file() or (
         root_free.live_mailbox(worker_worktrees, mailbox) is not None
+        and (root_free.live_mailbox(worker_worktrees, mailbox) / "QUEUE.md").is_file()
     )
     if not open_loop:
-        return False, None  # lockstep stays root-bound (r16b)
+        return True, None  # r16b: lockstep runs root-free too (any isolation)
+    why = None
     if getattr(args, "isolate_workers", None) is False:
-        # An explicit opt-out of isolation is root-bound, as before (silent
-        # unless --root-free was asked for too: refused below).
-        return False, ("--no-isolate-workers (root-free needs isolated builders)"
-                       if raw is True else None)
-    if getattr(args, "observe_workers", False):
-        return False, "--observe-workers prescribes its own (non-isolated) worker command"
-    inherited = worker_worktrees.inherited_cursor_problems()
-    if inherited:
-        return False, (
-            "Cursor user/system config carries session-bound Omnigent bindings "
-            "(worker isolation unavailable): " + "; ".join(inherited)
+        why = "--no-isolate-workers"
+    elif getattr(args, "observe_workers", False):
+        why = "--observe-workers (it prescribes its own non-isolated worker command)"
+    else:
+        inherited = worker_worktrees.inherited_cursor_problems()
+        if inherited:
+            why = (
+                "Cursor user/system config carries session-bound Omnigent bindings every "
+                "isolated worker would load (trioctl never edits it): " + "; ".join(inherited)
+            )
+    if why:
+        print(
+            f"trioctl: a root-free open-loop needs isolated builders, refused: {why} "
+            "(root-bound mode was removed in r16b); nothing was changed",
+            file=sys.stderr,
         )
+        return False, 2
     return True, None
 
 
@@ -7838,36 +6997,18 @@ def _root_lock_refused(root_box: Path, rel: str, *, clear_stale: bool) -> bool:
 def _root_free_begin(
     args: argparse.Namespace, cwd: Path, mailbox: Path, *, land_only: bool = False
 ) -> dict[str, Any] | int | None:
-    """Enter root-free mode for `loop` (r16a), or None for the root-bound path.
+    """Enter root-free mode for `loop` (r16a; lockstep too since r16b).
 
     Creates/re-attaches the loop's Lead worktree (never touching the root's
     tree, index or `.cursor`), installs dependencies once, records the
     target in the live STATE.md and announces the loop in the registry.
     Returns the context dict, an exit code (refused: nothing changed), or
-    None when the run is not root-free (lockstep, `--root-bound`, ...).
+    None when the mailbox is outside any git checkout (runs in place).
     """
-    wanted, why = _root_free_wanted(args, mailbox)
-    if not wanted and root_free is not None and worker_worktrees is not None:
-        live = root_free.live_mailbox(worker_worktrees, mailbox)
-        if live is not None and _discard_pristine_lead(
-            mailbox, why or "--root-bound", land_only=land_only,
-        ):
-            live = None  # nothing of the root-free attempt was worth keeping
-        if live is not None:
-            print(
-                f"trioctl: {mailbox} belongs to a root-free loop (live mailbox {live}); "
-                f"it cannot run root-bound ({why or '--root-bound'}): continue it "
-                "root-free, or `trioctl omnigent abandon` it first",
-                file=sys.stderr,
-            )
-            return 2
+    wanted, refused = _root_free_wanted(args, mailbox)
+    if refused is not None:
+        return refused
     if not wanted:
-        explicit = getattr(args, "root_free", None) is True
-        if why and explicit:
-            print(f"trioctl: --root-free refused: {why}", file=sys.stderr)
-            return 2
-        if why:
-            print(ROOT_FREE_BOUND_NOTICE.format(why=why), file=sys.stderr)
         return None
     wt = worker_worktrees
     try:
@@ -7912,6 +7053,20 @@ def _root_free_begin(
         ):
             record = root_free.load_record(wt, home, slug)
     if not root_free.active(record) and not land_only:
+        status, phase = _state_status_phase(mailbox)
+        if status == "shipped" and phase != "landing":
+            # Already finished (landed, or shipped before r16): a no-op run,
+            # as the loop core itself would return 0 -- never a new Lead
+            # worktree for it (r16-rc follow-up).
+            print(
+                f"trioctl: {rel} is already shipped (STATE.md status: shipped"
+                + (f", phase: {phase}" if phase else "")
+                + "); nothing to run. Set `status: ready` in its STATE.md to start a "
+                "new run",
+                file=sys.stderr,
+            )
+            return 0
+    if not root_free.active(record) and not land_only:
         # r15 guard before anything exists: a refused PLAN never gets a Lead
         # worktree, and the root stays untouched (stderr only).
         refused = _repo_scope_refusals(mailbox) if (mailbox / "PLAN.md").is_file() else []
@@ -7946,22 +7101,18 @@ def _root_free_begin(
                 f"{home} is not on a branch (detached HEAD) and no --target "
                 "names the branch this loop lands onto"
             )
-            if getattr(args, "root_free", None) is True:
-                print(f"trioctl: --root-free refused: {why}", file=sys.stderr)
-                return 2
-            print(ROOT_FREE_BOUND_NOTICE.format(why=why), file=sys.stderr)
-            return None
+            print(f"trioctl: root-free refused: {why}; nothing was changed", file=sys.stderr)
+            return 2
         api = _target_metrics_api(home, target)
         if api is None or api < ROOT_FREE_METRICS_API:
             bundled = Path(__file__).resolve().parent.parent / "metrics"
             found = "no committed metrics/ set" if api is None else f"METRICS_API {api}"
             print(
-                f"trioctl: root-free open-loop (r16) needs the loop core committed on "
-                f"{target} with METRICS_API >= {ROOT_FREE_METRICS_API} ({found}): refresh "
-                f"the repository's metrics/ as a set from {bundled} and commit it to "
-                f"{target} (with {target} checked out: `{METRICS_REFRESH_COMMAND}`), "
-                "or pass --root-bound to run this loop at the repository root as "
-                "before. Nothing was changed.",
+                f"trioctl: a root-free loop (r16; lockstep too since r16b) needs the loop "
+                f"core committed on {target} with METRICS_API >= {ROOT_FREE_METRICS_API} "
+                f"({found}): refresh the repository's metrics/ as a set from {bundled} "
+                f"and commit it to {target} (with {target} checked out: "
+                f"`{METRICS_REFRESH_COMMAND}`). Nothing was changed.",
                 file=sys.stderr,
             )
             return 3
@@ -8042,10 +7193,10 @@ def _root_free_begin_locked(
         core, refusal = None, str(exc)
     if core is not None and _core_metrics_api(core) < ROOT_FREE_METRICS_API:
         refusal = (
-            f"the loop core in {lead} predates root-free open-loop "
+            f"the loop core in {lead} predates root-free loops "
             f"(METRICS_API {_core_metrics_api(core)}); refresh metrics/ on "
             f"{record['target_ref']} (`{METRICS_REFRESH_COMMAND}` with it checked "
-            "out) or pass --root-bound"
+            "out)"
         )
     if refusal is not None:
         print(f"trioctl: {refusal}", file=sys.stderr)
@@ -8086,6 +7237,19 @@ def _root_free_begin_locked(
         "home": home, "repo": lead, "mailbox": live, "record": record, "slug": slug,
         "core": core, "info": _root_free_info(record), "created": created,
     }
+
+
+def _state_status_phase(mailbox: Path) -> tuple[str, str]:
+    """(status, phase) of *mailbox*'s STATE.md, lower-cased first words."""
+    try:
+        text = (Path(mailbox) / "STATE.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ""
+    out = []
+    for key in ("status", "phase"):
+        match = re.search(rf"^\s*(?:-\s+)?{key}\s*:\s*(\S+)", text, re.M | re.I)
+        out.append(match.group(1).lower() if match else "")
+    return out[0], out[1]
 
 
 def _root_free_setup(record: dict[str, Any], args: argparse.Namespace) -> str | None:
@@ -8401,7 +7565,7 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
 
 
 def command_land(args: argparse.Namespace) -> int:
-    """`trioctl omnigent land`: finish landing a root-free loop (r16a).
+    """`trioctl omnigent land`: finish landing a root-free loop (r16a; lockstep too, r16b).
 
     For a `needs_land` loop (blocked by local changes at the target's
     checkout, a merge conflict you resolved in the Lead worktree, or a
@@ -8434,9 +7598,13 @@ def command_land(args: argparse.Namespace) -> int:
         phase_word = phase.group(1).lower() if phase else ""
     except OSError:
         phase_word = ""
+    landed_value = re.search(r"^\s*(?:-\s+)?landed\s*:\s*(\S+)", text if status else "", re.M | re.I)
+    lockstep_pending = (
+        _loop_is_lockstep(live) and status == "shipped" and not landed_value
+    )  # r16b: a lockstep SHIP not landed yet (crash before `phase: landing`)
     if status != "needs_land" and not (status == "shipped" and phase_word == "landing") and not (
         status == "error" and phase_word == "land-error"  # rc before eval-r16rc F2
-    ):
+    ) and not lockstep_pending:
         print(
             f"trioctl: {rel} is {status or 'not started'!r}, not waiting to land "
             f"(`trioctl omnigent loop --mailbox {rel}` continues it)",
@@ -8624,10 +7792,8 @@ def _command_loop_run(
         _ensure_mailbox_gitignore(mailbox)
     except OSError as exc:
         print(f"trioctl: could not update {mailbox / '.gitignore'}: {exc}", file=sys.stderr)
-    # r14.1 F3: same-cwd lock files of workspaces that no longer exist
-    # (and r15.x root-turn lock files of roots that no longer exist).
+    # r14.1 F3: same-cwd lock files of workspaces that no longer exist.
     _prune_same_cwd_locks()
-    _prune_same_cwd_locks(_root_turn_lock_dir())
     loop_core = _load_trio_loop(repo)
     # r15 guard: a PLAN with a slice outside its repo (or an invalid
     # `repos:` block), or a `repos:` PLAN on a vendored loop core that
@@ -8670,8 +7836,12 @@ def _command_loop_run(
     loop_kwargs = _slice_eval_concurrency_kwargs(
         loop_core, args, isolation_off=concurrency_off
     )
-    if rf is not None:
-        loop_kwargs["land"] = _root_free_land_hook(rf, args)
+    lockstep = _loop_is_lockstep(mailbox)
+    land_hook = _root_free_land_hook(rf, args) if rf is not None else None
+    if land_hook is not None and not lockstep:
+        # Open-loop: the loop core lands after its integration SHIP. Lockstep
+        # (r16b) lands through `_run_lockstep_root_free` (no core change).
+        loop_kwargs["land"] = land_hook
     if (
         loop_kwargs.get("slice_eval_concurrency", 1) > 1
         and _loop_is_lockstep(mailbox)
@@ -8705,8 +7875,7 @@ def _command_loop_run(
         host_id=getattr(args, "host_id", None),
         workspace=str(repo),
         completion_receipts=getattr(args, "completion_receipts", False),
-        end_root_sessions=not getattr(args, "keep_sessions", False),
-        restore_root_config=not isolate,
+        end_sessions=not getattr(args, "keep_sessions", False),
         **runner_kwargs,
     )
     # r15: a Lead pass that adds `repos:` to PLAN.md on an old core is
@@ -8745,15 +7914,13 @@ def _command_loop_run(
     previous_sigint = signal.signal(signal.SIGINT, _loop_signal_handler)
     previous_sigterm = signal.signal(signal.SIGTERM, _loop_signal_handler)
     try:
-        exit_code = loop_core.run_loop(
+        if land_hook is not None and lockstep:
+            return _run_lockstep_root_free(
+                loop_core, mailbox, args, runner, repo, loop_kwargs, land_hook,
+            )
+        return loop_core.run_loop(
             mailbox, args.max_iterations, runner, repo=repo, **loop_kwargs
         )
-        stop = getattr(runner, "driver_stop", None)
-        if stop:
-            # A Lead-thread stop (root-occupied, writes-overlap): the core
-            # recorded `status: error`; it is a human's call, not an error.
-            return _apply_driver_stop(loop_core, mailbox, stop)
-        return exit_code
     except RepoScopeRefusal:
         # Lockstep propagates runner errors; the refusal is already in
         # LOG.md/STATE.md and on stderr (open-loop returns 3 itself).
@@ -8767,9 +7934,6 @@ def _command_loop_run(
         # STATE"): e.g. the integration-eval dispatch (or, root-free, its
         # worktree bind) raising out of the loop core while STATE.md said
         # `running` and `.driver.json` `eval_alive: true`.
-        stop = getattr(runner, "driver_stop", None)
-        if stop:
-            return _apply_driver_stop(loop_core, mailbox, stop)
         # A held dispatch already set `status: needs_human` (exit 7 on
         # resume): only its sidecars change; a status that is already
         # terminal is kept.
@@ -8781,7 +7945,7 @@ def _command_loop_run(
         )
         if rf is not None:
             # Root-free: a clean exit 3 (the Lead worktree is kept; resume
-            # re-attaches). Root-bound keeps propagating (exit 1 from `main`).
+            # re-attaches). A mailbox outside git keeps propagating (exit 1).
             return code
         raise
     finally:
@@ -8856,17 +8020,12 @@ def _command_loop_run(
                 ids_file.unlink()
             except OSError:
                 pass
-        if isolate:
+        if isolate or rf is not None:
             try:
                 runner.release_all_fences()
             except Exception as exc:  # noqa: BLE001
                 print(f"trioctl: could not release integration fence: {exc}", file=sys.stderr)
-            if not keep_sessions:
-                try:
-                    runner.restore_root_config_final(mailbox)
-                except Exception as exc:  # noqa: BLE001 - never change the exit code
-                    print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
-            _release_root_turns_of(runner)
+        if isolate:
             # After prune, so deleted role sessions no longer hold their
             # worktrees; held sessions keep theirs (see _blocking_state).
             # Their runners exit asynchronously after archive/DELETE, so
@@ -8875,14 +8034,6 @@ def _command_loop_run(
                 _run_worktree_cleanup(repo, mailbox, torn_down=torn_down)
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: worker worktree cleanup failed: {exc}", file=sys.stderr)
-        elif not keep_sessions:
-            # Non-isolated: the root sessions were just pruned; undo their
-            # own Omnigent merges into the root `.cursor` config.
-            try:
-                runner.restore_root_config_final(mailbox)
-            except Exception as exc:  # noqa: BLE001 - never change the exit code
-                print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
-        _release_root_turns_of(runner)
         if registration is not None:
             registration.unregister()
         if rf is not None:
@@ -8891,14 +8042,104 @@ def _command_loop_run(
             _finish_observation(observe)
 
 
-def _release_root_turns_of(runner: Any) -> None:
-    """Loop end: drop every root turn *runner* holds (never raises)."""
-    release = getattr(runner, "release_root_turns", None)
-    if callable(release):
+def _lockstep_land_pending(state: dict[str, str]) -> bool:
+    """A verified lockstep SHIP in a Lead worktree that has not landed yet
+    (r16b): `needs_land`, `shipped` without `landed:` (an interrupted land,
+    or a crash between the SHIP and the land: a live Lead record's mailbox is
+    never "shipped" otherwise -- a shipped root mailbox gets no Lead
+    worktree), or an rc driver's `error`/`land-error`."""
+    status = (state.get("status") or "").strip().lower().split(" ")[0]
+    phase = (state.get("phase") or "").strip().lower()
+    return (
+        status == "needs_land"
+        or (status == "shipped" and not (state.get("landed") or "").strip())
+        or (status == "error" and phase == "land-error")
+    )
+
+
+def _run_lockstep_root_free(
+    loop_core: Any, mailbox: Path, args: argparse.Namespace, runner: Any, repo: Path,
+    loop_kwargs: dict[str, Any], land: Any,
+) -> int:
+    """r16b lockstep in the Lead worktree: run the (unchanged) lockstep state
+    machine, then land its SHIP exactly as the loop core lands an open-loop
+    one (same STATE/LOG lines, exit 8 `needs_land`, bounded re-verification).
+
+    No loop-core change (METRICS_API stays 6): the land runs here, after
+    `run_loop` returns 0 with this run's SHIP, or first thing on resume
+    (`needs_land`, interrupted `landing`) without dispatching a Lead. A
+    `reverify` result (the target moved under this loop's paths) sets
+    `phase: lead-done` with the evaluator pin cleared, so the lockstep
+    machine's own crash-resume dispatches ONE fresh Evaluator at the merged
+    tip; its SHIP lands again (at most MAX_LAND_REVERIFY_ROUNDS rounds,
+    then `needs_land`/`land-starved`), an ITERATE continues the loop.
+    """
+    state_path = mailbox / "STATE.md"
+    read = loop_core._read_state
+    update = loop_core._update_state
+    append = loop_core._append_log
+    rounds_max = int(getattr(loop_core, "MAX_LAND_REVERIFY_ROUNDS", 2) or 2)
+    kwargs = {k: v for k, v in loop_kwargs.items() if k != "land"}
+    rounds = 0
+
+    def run() -> tuple[int, bool]:
+        before = read(state_path)
+        was_shipped = (before.get("status") or "").strip().lower().startswith("shipped")
+        code = loop_core.run_loop(mailbox, args.max_iterations, runner, repo=repo, **kwargs)
+        after = read(state_path)
+        shipped_now = (
+            code == 0 and not was_shipped
+            and (after.get("status") or "").strip().lower().startswith("shipped")
+            and not (after.get("landed") or "").strip()
+        )
+        return code, shipped_now
+
+    if not _lockstep_land_pending(read(state_path)):
+        if getattr(args, "land_only", False):
+            return 2  # `command_land` already said why
+        code, shipped_now = run()
+        if not shipped_now:
+            return code
+    while True:
+        iteration = loop_core._number(read(state_path)["iteration"])
+        update(state_path, {"phase": "landing"})
         try:
-            release()
-        except Exception as exc:  # noqa: BLE001 - never change the exit code
-            print(f"trioctl: could not release the root turn: {exc}", file=sys.stderr)
+            result = land(mailbox, iteration)
+        except Exception as exc:  # noqa: BLE001 - a land failure is resumable, never `running`
+            result = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(result, dict):
+            result = {"status": "error", "detail": f"land hook returned {result!r}"}
+        status = str(result.get("status") or "error")
+        detail = " ".join(str(result.get("detail") or "").split())
+        if status == "landed":
+            return 0
+        if status == "reverify":
+            rounds += 1
+            if rounds > rounds_max:
+                update(state_path, {"status": "needs_land", "phase": "land-starved"})
+                append(mailbox, f"- iter {iteration} | loop | needs_land (land-starved): "
+                       f"target kept moving after {rounds_max} re-verification round(s): "
+                       f"{detail}")
+                return 8
+            update(state_path, {
+                "status": "running", "phase": "lead-done", "evaluator_attempt": "",
+                "evaluated_sha": "", "evaluated_repos": "",
+            })
+            append(mailbox, f"- iter {iteration} | loop | land: {detail}; re-verifying "
+                   f"with a new evaluator (round {rounds}/{rounds_max})")
+            code, shipped_now = run()
+            if not shipped_now:
+                return code
+            continue
+        if status == "needs_land":
+            phase = str(result.get("phase") or "land-blocked")
+        else:
+            phase, detail = "land-error", f"land failed: {detail}"
+        update(state_path, {"status": "needs_land", "phase": phase})
+        append(mailbox, f"- iter {iteration} | loop | needs_land ({phase}): {detail}")
+        print(f"trioctl: iteration {iteration} SHIP verified but not landed ({phase}): "
+              f"{detail}", file=sys.stderr)
+        return 8
 
 
 def _register_live_loop(
@@ -8923,6 +8164,7 @@ def _register_live_loop(
         registration = _LoopRegistration(
             root, root / rf["info"]["mailbox_rel"], root_free_info=rf["info"],
             live_mailbox=mailbox,
+            mode="lockstep" if _loop_is_lockstep(mailbox) else "root-free",
         )
     else:
         root = Path(os.path.realpath(str(worker_worktrees.cursor_project_root(repo))))
@@ -9474,7 +8716,7 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def _add_root_free_arguments(loop: argparse.ArgumentParser) -> None:
-    """r16a root-free open-loop flags of `loop` (default ON for open-loop)."""
+    """Root-free flags of `loop` (r16a; every loop since r16b)."""
     mode = loop.add_mutually_exclusive_group()
     mode.add_argument(
         "--root-free",
@@ -9482,17 +8724,18 @@ def _add_root_free_arguments(loop: argparse.ArgumentParser) -> None:
         action="store_const",
         const=True,
         default=None,
-        help="open-loop (default): run every role in this loop's own Lead "
-        "worktree on branch trio/<mailbox>, never at the repository root, and "
-        "land it onto the target branch after SHIP; given explicitly, an "
-        "unmet prerequisite is a refusal instead of a root-bound run",
+        help="the default (every loop, open-loop and lockstep): run every role in "
+        "this loop's own Lead worktree on branch trio/<mailbox>, never at the "
+        "repository root, and land it onto the target branch after SHIP; given "
+        "explicitly, a mailbox outside any git checkout is refused instead of "
+        "run in place",
     )
     mode.add_argument(
         "--root-bound",
         dest="root_free",
         action="store_const",
         const=False,
-        help="run this open-loop at the repository root (pre-r16 behaviour)",
+        help="removed in r16b (refused with a pointer to `land`/`abandon`)",
     )
     loop.add_argument(
         "--target",

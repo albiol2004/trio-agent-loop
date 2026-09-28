@@ -219,9 +219,14 @@ class World:
                 "ctx": dict(ctx),
             })
         hook = self.hooks.get(kind)
+        lockstep = not (Path(mailbox) / "QUEUE.md").is_file()
         if not (hook and hook(self, spec, runner, ctx, Path(workspace), Path(mailbox), prompt,
                               iteration)):
-            if role == "lead":
+            if lockstep and role in ("lead", "repair"):
+                self.lockstep_lead(spec, runner, Path(workspace), Path(mailbox), iteration)
+            elif lockstep and role == "evaluator":
+                self.lockstep_eval(spec, ctx, Path(workspace), Path(mailbox), iteration)
+            elif role == "lead":
                 self.lead(spec, runner, Path(mailbox), iteration)
             elif kind == "slice-eval":
                 self.slice_eval(ctx, Path(mailbox))
@@ -278,6 +283,82 @@ class World:
         with (box / "LOG.md").open("a") as fh:
             fh.write(f"- iter {iteration} | lead | retired {len(entries)}; {gate}\n")
 
+    def lockstep_lead(self, spec: dict, runner, workspace: Path, box: Path,
+                      iteration: int) -> None:
+        """r16b lockstep Lead in the Lead worktree: implement every planned
+        slice (isolated builders when the run is isolated, else directly in
+        its own repo checkout), commit `slice(<id>):`, commit the mailbox."""
+        t = self.trioctl
+        plan = (box / "PLAN.md").read_text()
+        declared = t._declared_repos(box)
+        for sl in spec["slices"]:
+            if f"  - id: {sl['id']}\n" not in plan or sl.get("done"):
+                continue
+            name = sl.get("repo", "home")
+            where = Path(declared[name]["path"]) if name != "home" else workspace
+            if runner._isolate:
+                args = t.parser().parse_args([
+                    "omnigent", "run", "builder", "--isolate", "--mailbox", str(box),
+                    "--worker-slice", sl["id"], "--summary", f"{sl['id']} work",
+                    "--worktree-root", str(runner._isolate["worktree_root"]),
+                    "--workspace", str(workspace),
+                    "--prompt-file", str(box / "briefs" / f"{sl['id']}.md"),
+                ])
+                out = io.StringIO()
+                with World._stdout_lock, contextlib.redirect_stdout(out):
+                    code = t.command_run(args)
+                assert code == 0, out.getvalue()
+            else:
+                target = where / sl["write"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(sl.get("content", f"# {sl['id']}\n"))
+                git(where, "add", "--", sl["write"])
+                git(where, "commit", "-q", "-m", f"slice({sl['id']}): {sl['id']} work")
+            plan = re.sub(
+                rf"(  - id: {re.escape(sl['id'])}\n(?:    .*\n)*?    status: )planned",
+                r"\1complete", plan, count=1,
+            )
+            sl["done"] = True
+        (box / "PLAN.md").write_text(plan)
+        with (box / "LOG.md").open("a") as fh:
+            fh.write(f"- iter {iteration} | lead | lockstep pass; gate: PASS\n")
+        rel = box.relative_to(workspace).as_posix()
+        git(workspace, "add", "-A", "--", rel)
+        git(workspace, "commit", "-q", "--allow-empty", "-m", f"loop: iteration {iteration}")
+
+    def lockstep_eval(self, spec: dict, ctx: dict, workspace: Path, box: Path,
+                      iteration: int, verdict: str = "SHIP") -> None:
+        """r16b lockstep Evaluator in the Lead worktree: a bound verdict and
+        the SHIP retirement commit(s) in its own workspace (and aggregates)."""
+        it = ctx.get("iteration", iteration)
+        pin = ctx["pinned_sha"]
+        pins = dict(ctx.get("pins") or {})
+        evaluated, commits = pin, ""
+        if pins:
+            declared = self.trioctl._declared_repos(box)
+            evaluated = ", ".join(
+                f"{n}@{pins[n]}" for n in ["home", *[n for n in pins if n != "home"]]
+            )
+            for name in [n for n in pins if n != "home"]:
+                agg = Path(declared[name]["path"])
+                if verdict == "SHIP":
+                    git(agg, "commit", "-q", "--allow-empty", "-m",
+                        f"loop: iteration {it} — SHIP ({box.name})")
+                    commits += f"commit: {name}@{git(agg, 'rev-parse', 'HEAD')}\n"
+        old = (box / "VERDICT.md").read_text()
+        (box / "VERDICT.md").write_text(
+            f"VERDICT: {verdict}\n\niteration: {it}\nattempt: {ctx['evaluator_attempt']}\n"
+            f"evaluated: {evaluated}\ncommit: {pin}\n{commits}\n" + old
+        )
+        with (box / "LOG.md").open("a") as fh:
+            fh.write(f"- iter {it} | evaluator | VERDICT: {verdict} — r16b\n")
+        if verdict != "SHIP":
+            return
+        rel = box.relative_to(workspace).as_posix()
+        git(workspace, "add", "-f", "--", f"{rel}/VERDICT.md", f"{rel}/LOG.md")
+        git(workspace, "add", "-u", "--", rel)
+        git(workspace, "commit", "-q", "-m", f"loop: iteration {it} — SHIP", "--", rel)
+
     def slice_eval(self, ctx: dict, box: Path) -> None:
         with self.lock:
             with (box / "VERDICT.md").open("a") as fh:
@@ -316,8 +397,11 @@ class World:
         git(lead, "commit", "-q", "-m", f"loop: iteration {ctx['iteration']} — SHIP", "--", rel)
 
     # ---------------------------------------------------------- driving
-    def add_loop(self, home: Path, rel: str, slices: list[dict], **plan_kw: Any) -> dict:
+    def add_loop(self, home: Path, rel: str, slices: list[dict], *, lockstep: bool = False,
+                 **plan_kw: Any) -> dict:
         box = write_root_mailbox(home, rel, slices, **plan_kw)
+        if lockstep:
+            (box / "QUEUE.md").unlink()
         spec = {"rel": rel, "slug": self.rf.loop_slug(rel), "slices": slices, "home": home,
                 "root_box": box}
         for sl in slices:
