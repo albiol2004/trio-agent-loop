@@ -219,6 +219,54 @@ class MailboxSessionTests(unittest.TestCase):
                     self._url("/api/transcript", path=str(path)), want=1)
                 self.assertEqual(events, [("error", {"error": "invalid session path"})])
 
+    def test_symlinked_sessions_dir_is_neither_listed_nor_streamed(self):
+        # .sessions itself is a symlink: out of the workspace, and to the
+        # .sessions of a sibling loop. Neither may list (no outside path or
+        # size in the response). The outside file must not stream either;
+        # through the sibling link the path resolves to loop-demo's own
+        # export, which stays streamable as that loop's session.
+        outside = Path(self.other.name) / "exports"
+        outside.mkdir()
+        leaked = outside / "1789651642-trioctl-leak-lead-1-deadbeef.jsonl"
+        leaked.write_text(json.dumps(HEADER) + "\n", encoding="utf-8")
+        cases = {"loop-out": outside, "loop-sibling": self.loop / ".sessions"}
+        for name, target in cases.items():
+            loop = self.root / name
+            loop.mkdir()
+            (loop / "GOAL.md").write_text("# Mission: x\n", encoding="utf-8")
+            os.symlink(target, loop / ".sessions")
+            via_link = loop / ".sessions" / (
+                leaked.name if name == "loop-out" else self.newer.name)
+            with self.subTest(name):
+                status, sessions = _get(self._url("/api/sessions", loop=name))
+                self.assertEqual(status, 200)
+                self.assertEqual(sessions, [])
+                status, detail = _get(self._url("/api/loop", name=name))
+                self.assertEqual(status, 200)
+                body = json.dumps(detail)
+                self.assertEqual(detail["sessions"], [])
+                self.assertNotIn(str(outside), body)
+                self.assertNotIn(leaked.name, body)
+                events = _sse_events(
+                    self._url("/api/transcript", path=str(via_link)), want=1)
+                if name == "loop-out":
+                    self.assertEqual(
+                        events, [("error", {"error": "invalid session path"})])
+                else:
+                    self.assertEqual(events[0][0], "init")
+        # The real loop's own exports are unaffected by the sibling link.
+        status, sessions = _get(self._url("/api/sessions", loop="loop-demo"))
+        self.assertEqual(len(sessions), 3)
+
+    def test_listed_sessions_are_exactly_the_streamable_ones(self):
+        status, sessions = _get(self._url("/api/sessions", loop="loop-demo"))
+        self.assertEqual(status, 200)
+        for s in sessions:
+            with self.subTest(s["path"]):
+                events = _sse_events(
+                    self._url("/api/transcript", path=s["path"]), want=1)
+                self.assertEqual(events[0][0], "init")
+
     def test_transcript_refuses_another_roots_export(self):
         # The export is real, but the request names a different workspace.
         status, _ = _get(self._url("/api/board", root=self.second_root))

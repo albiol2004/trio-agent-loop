@@ -2273,14 +2273,21 @@ def _parse_session_file(path: Path) -> dict:
 def _mailbox_session_files(loop_dir: Path) -> list[Path]:
     """``.jsonl`` files directly inside ``<loop>/.sessions/``.
 
-    Symlinks that resolve outside that directory are skipped, so the
-    transcript endpoint only ever tails files that really live there.
+    A ``.sessions`` directory that is itself a symlink (or resolves anywhere
+    but ``<resolved loop>/.sessions``) lists nothing, and file symlinks that
+    resolve outside it are skipped, so the session list shows exactly what
+    the transcript endpoint will tail and never another directory's paths
+    or sizes.
     """
     directory = Path(loop_dir) / MAILBOX_SESSIONS_DIR
     try:
+        if directory.is_symlink():
+            return []
         real_dir = directory.resolve()
+        if real_dir != Path(loop_dir).resolve() / MAILBOX_SESSIONS_DIR:
+            return []
         entries = list(directory.iterdir())
-    except OSError:
+    except (OSError, RuntimeError):
         return []
     files = []
     for entry in entries:
@@ -2289,7 +2296,7 @@ def _mailbox_session_files(loop_dir: Path) -> list[Path]:
         try:
             if entry.is_file() and entry.resolve().parent == real_dir:
                 files.append(entry)
-        except OSError:
+        except (OSError, RuntimeError):
             continue
     return files
 

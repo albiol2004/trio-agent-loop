@@ -30,6 +30,7 @@ const state = {
   drawerTab: "overview",
   graphSel: null,
   compare: [],
+  tlOpen: new Set(),
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -1107,6 +1108,7 @@ async function openDrawer(key) {
     "&loop=" + encodeURIComponent(name));
   state.detail = null;
   state.compare = [];
+  state.tlOpen.clear();
   state.sessions = [];
   state.activePath = null;
   state.drawerTab = "overview";
@@ -1152,6 +1154,7 @@ function closeDrawer() {
   state.activeLoop = null;
   state.detail = null;
   state.compare = [];
+  state.tlOpen.clear();
   state.sessions = [];
   state.activePath = null;
   state.pendingLines = [];
@@ -1691,7 +1694,55 @@ function renderTimelineView() {
   if (state.compare.length) view.appendChild(comparePanel());
 
   for (const row of rows) view.appendChild(timelineIteration(row));
+  requestAnimationFrame(() => syncSummaryToggles(view));
 }
+
+/* Summaries clamp to three lines. A "Show more" button (keyboard and touch,
+ * not a hover-only tooltip) expands one in place; it is hidden when the text
+ * already fits. Open state survives the detail poll's re-render. */
+const TL_SUMMARY_TOGGLE_MIN = 80;
+let tlSummarySeq = 0;
+
+function timelineSummary(text, key) {
+  const frag = document.createDocumentFragment();
+  const body = span("tl-summary", text || "—");
+  frag.appendChild(body);
+  if (text.length < TL_SUMMARY_TOGGLE_MIN) return frag;
+  body.id = "tl-summary-" + ++tlSummarySeq;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn btn-ghost btn-small tl-more";
+  btn.setAttribute("aria-controls", body.id);
+  const setOpen = (open) => {
+    body.classList.toggle("is-open", open);
+    btn.setAttribute("aria-expanded", String(open));
+    btn.textContent = open ? "Show less" : "Show more";
+  };
+  setOpen(state.tlOpen.has(key));
+  btn.addEventListener("click", () => {
+    const open = !state.tlOpen.has(key);
+    if (open) state.tlOpen.add(key);
+    else state.tlOpen.delete(key);
+    setOpen(open);
+  });
+  frag.appendChild(btn);
+  return frag;
+}
+
+function syncSummaryToggles(view) {
+  if (!view || view.hidden) return;
+  for (const btn of view.querySelectorAll(".tl-more")) {
+    const body = document.getElementById(btn.getAttribute("aria-controls"));
+    if (!body || body.classList.contains("is-open")) continue;
+    btn.hidden = body.scrollHeight <= body.clientHeight + 1;
+  }
+}
+
+let tlResizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(tlResizeTimer);
+  tlResizeTimer = setTimeout(() => syncSummaryToggles(el("view-timeline")), 150);
+});
 
 function timelineIteration(row) {
   const card = document.createElement("section");
@@ -1749,9 +1800,8 @@ function timelineIteration(row) {
       sc.title = "Repair scope: " + String(entry.scope);
       text.appendChild(sc);
     }
-    const body = span("tl-summary", summary || "—");
-    body.title = summary;
-    text.appendChild(body);
+    text.appendChild(timelineSummary(
+      summary, row.it + "\u0000" + role + "\u0000" + summary));
     li.appendChild(text);
     const side = document.createElement("div");
     side.className = "tl-entry-side";
@@ -2301,9 +2351,10 @@ function openDefaultSession() {
   }
   if (!state.sessions.length) {
     showTranscriptNotice(
-      "No session transcripts for this loop. Omnigent drivers export each " +
-      "role session to the mailbox's .sessions/ folder and omp runs keep " +
-      "theirs under ~/.omp; this loop's driver recorded neither."
+      "No session transcripts for this loop yet. Omnigent drivers export " +
+      "role sessions to the mailbox's .sessions/ folder when trioctl archives " +
+      "them at the end of a run, and omp runs keep theirs under ~/.omp; " +
+      "neither exists for this loop so far."
     );
     return;
   }
@@ -2314,6 +2365,9 @@ function openDefaultSession() {
 function renderSessionList() {
   const list = el("session-list");
   list.textContent = "";
+  /* Mailbox exports are written when a role's session is archived; say so
+   * rather than let the list read as a live view of the broker session. */
+  el("sessions-note").hidden = !state.sessions.some((s) => s.source === "mailbox");
   if (!state.sessions.length) {
     list.appendChild(span("session-empty", state.detail ? "No sessions recorded" : "Loading…"));
     return;
@@ -2420,7 +2474,7 @@ function openSession(path) {
   state.es = es;
 
   es.addEventListener("open", () => {
-    if (state.es === es) setPaneStatus("connected", "live");
+    if (state.es === es) setPaneStatus("connected", "following file");
   });
 
   es.addEventListener("init", (ev) => {
@@ -2492,7 +2546,14 @@ function flushLines() {
   state.pendingLines = [];
   if (!lines.length) return;
   const view = el("transcript-view");
-  for (const rec of lines) appendRecord(view, rec);
+  for (const rec of lines) {
+    /* One malformed record must not drop the rest of the batch. */
+    try {
+      appendRecord(view, rec);
+    } catch (err) {
+      console.warn("transcript record skipped", err);
+    }
+  }
   state.records += lines.length;
   if (!view.childElementCount) {
     showTranscriptNotice(state.records + " records read, none of them messages yet.");
@@ -2500,11 +2561,15 @@ function flushLines() {
   if (state.follow) view.scrollTop = view.scrollHeight;
 }
 
+/* ISO time of a record, or null. Out-of-range epochs ("1e20") make an
+ * Invalid Date, whose toISOString() throws. */
 function recordTime(rec) {
   if (!rec) return null;
   if (rec.timestamp) return rec.timestamp;
   const epoch = Number(rec.created_at);
-  return Number.isFinite(epoch) && epoch > 0 ? new Date(epoch * 1000).toISOString() : null;
+  if (!Number.isFinite(epoch) || epoch <= 0) return null;
+  const date = new Date(epoch * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
 function timeEl(rec) {

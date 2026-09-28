@@ -397,6 +397,9 @@ html, body {
   flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
+.tl-summary.is-open { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.tl-more { flex: none; }
+@media (max-width: 760px), (pointer: coarse) { .btn.tl-more { min-height: 44px; } }
 .tl-entry-side { display: flex; align-items: center; gap: var(--sp-2); justify-content: flex-end; }
 .tl-entry-side .tl-dur { min-width: 48px; }
 
@@ -585,6 +588,10 @@ html, body {
 .session-meta { font-size: var(--fs-caption); color: var(--faint); font-variant-numeric: tabular-nums; }
 .session-subagent .session-label { color: var(--muted); }
 .session-empty { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-label); color: var(--faint); }
+.sessions-note {
+  margin: 0; padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--border);
+  font-size: var(--fs-caption); line-height: 1.4; color: var(--muted);
+}
 
 .transcript-view {
   overflow-y: auto;
@@ -1721,4 +1728,22 @@ tr.is-active td { background: var(--primary-tint); }
   .topology-field select { flex: 1; min-width: 0; }
   .import-grid { grid-template-columns: minmax(0, 1fr); }
   .matrix-table th, .matrix-table td, #models-table th, #models-table td { padding: var(--sp-2) var(--sp-3); }
+}
+
+/* Phones: each model row becomes a labelled card so the select, custom input
+ * and Save fit the width instead of clipping inside a scrolled table. */
+@media (max-width: 640px) {
+  #models-table { min-width: 0; }
+  #models-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  #models-table, #models-table tbody, #models-table tr, #models-table td { display: block; }
+  #models-table tbody tr { padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); }
+  #models-table tbody tr:last-child { border-bottom: 0; }
+  #models-table td { border-bottom: 0; padding: var(--sp-1) var(--sp-3); overflow-wrap: anywhere; }
+  #models-table td[data-label]::before {
+    content: attr(data-label); display: block; font-size: var(--fs-eyebrow); font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+  }
+  .model-cell-controls { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+  .model-cell-controls .model-input { flex: 1 1 100%; width: 100%; min-width: 0; }
+  .model-save { margin-left: 0; }
 }
