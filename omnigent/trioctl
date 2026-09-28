@@ -1232,10 +1232,18 @@ def _mark_repo_scope_refused(
 
 
 def _refuse_repo_scope(
-    mailbox: Path, role: str, iteration: Any = None
+    mailbox: Path, role: str, iteration: Any = None, loop_core: Any = None
 ) -> None:
-    """Raise RepoScopeRefusal (after logging it) when the guard objects."""
+    """Raise RepoScopeRefusal (after logging it) when the guard objects.
+
+    With *loop_core* known, a `repos:` PLAN on a core that predates r15 is
+    refused too (``_old_core_repos_refusal``).
+    """
     lines = _repo_scope_refusals(mailbox)
+    if loop_core is not None:
+        old_core = _old_core_repos_refusal(mailbox, loop_core)
+        if old_core:
+            lines = [*lines, old_core]
     if not lines:
         return
     # eval-r15a F8: label with STATE.md's committed iteration, so an
@@ -5152,7 +5160,7 @@ class OmnigentRunner:
             # r15 guard: never dispatch a pass over a PLAN that writes
             # outside the mailbox repo (the Lead would limp: take-overs,
             # empty merges, unresolvable retire shas).
-            _refuse_repo_scope(mailbox, role, iteration)
+            _refuse_repo_scope(mailbox, role, iteration, self.loop_core)
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
@@ -5317,7 +5325,7 @@ class OmnigentRunner:
         if role in ("lead", "repair") and code == 0:
             # r15 guard on the PLAN this pass wrote: the driver ends with
             # `status: error` (exit 3) before any evaluator is dispatched.
-            _refuse_repo_scope(mailbox, role, iteration)
+            _refuse_repo_scope(mailbox, role, iteration, self.loop_core)
         return code
 
     def _release_fences(self, *, finished_only: bool) -> None:
@@ -5588,8 +5596,17 @@ class OmnigentRunner:
 REQUIRED_LOOP_CORE_API = 2
 
 
-#: The sibling module trio_loop.py imports by path (``METRICS_API``).
-REQUIRED_METRICS_API = 4
+#: The sibling module trio_loop.py imports by path (``METRICS_API``): this
+#: release's metrics/ set (5 = declared product repos, r15).
+REQUIRED_METRICS_API = 5
+
+#: Vendored metrics/ sets this trioctl still drives. A repository whose
+#: copy predates r15 (4) runs single-repo mailboxes unchanged; a PLAN.md
+#: `repos:` block is refused with it (see ``_old_core_repos_refusal``).
+COMPATIBLE_METRICS_APIS = (4, 5)
+
+#: First METRICS_API whose loop core pins, retires and verifies per repo.
+MULTI_REPO_METRICS_API = 5
 
 
 def _api_marker(path: Path, name: str) -> int:
@@ -5661,11 +5678,37 @@ def _check_loop_core_api(path: Path) -> None:
     if not metrics.is_file():
         raise _refuse_core(path, f"its sibling {metrics.name} is missing")
     found = _api_marker(metrics, "METRICS_API")
-    if found != REQUIRED_METRICS_API:
+    if found not in COMPATIBLE_METRICS_APIS:
         raise _refuse_core(
             path, f"sibling {metrics.name} has METRICS_API {found}, this trioctl "
-            f"requires {REQUIRED_METRICS_API} (mixed metrics/ versions)"
+            f"requires {REQUIRED_METRICS_API} (or "
+            f"{', '.join(str(v) for v in COMPATIBLE_METRICS_APIS if v != REQUIRED_METRICS_API)}"
+            " without PLAN.md repos:) (mixed metrics/ versions)"
         )
+
+
+def _core_metrics_api(loop_core: Any) -> int:
+    """METRICS_API of the metrics module a loaded loop core runs on (1 = unmarked)."""
+    value = getattr(getattr(loop_core, "_METRICS", None), "METRICS_API", 1)
+    return value if isinstance(value, int) else 1
+
+
+def _old_core_repos_refusal(mailbox: Path, loop_core: Any) -> str | None:
+    """Refusal line when *mailbox* declares `repos:` but *loop_core* predates r15."""
+    api = _core_metrics_api(loop_core)
+    if api >= MULTI_REPO_METRICS_API:
+        return None
+    _module, metrics = _load_trio_check()
+    if not metrics.read_repos(Path(mailbox))["declared"]:
+        return None
+    where = getattr(loop_core, "__file__", None) or "metrics/trio_loop.py"
+    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    return (
+        f"PLAN.md declares repos: (r15 multi-repo slices) but the loop core "
+        f"{where} runs on METRICS_API {api}; multi-repo needs "
+        f"{MULTI_REPO_METRICS_API}: refresh the repository's metrics/ as a set "
+        f"from {bundled} and commit it (nothing was dispatched)"
+    )
 
 
 def _load_trio_loop(repo: Path) -> Any:
@@ -6112,11 +6155,15 @@ def _command_loop(args: argparse.Namespace) -> int:
     # r14.1 F3: same-cwd lock files of workspaces that no longer exist.
     _prune_same_cwd_locks()
     loop_core = _load_trio_loop(repo)
-    # r15 guard: a PLAN that already writes outside the mailbox repo (or
-    # declares `repos:`) is refused before anything is dispatched -- under
-    # the mailbox lock (eval-r15a F2): a mailbox a live driver owns is left
-    # byte-identical (exit 5, as the loop core itself refuses it).
+    # r15 guard: a PLAN with a slice outside its repo (or an invalid
+    # `repos:` block), or a `repos:` PLAN on a vendored loop core that
+    # predates multi-repo, is refused before anything is dispatched --
+    # under the mailbox lock (eval-r15a F2): a mailbox a live driver owns
+    # is left byte-identical (exit 5, as the loop core itself refuses it).
     refused = _repo_scope_refusals(mailbox)
+    old_core = _old_core_repos_refusal(mailbox, loop_core)
+    if old_core:
+        refused = [*refused, old_core]
     if refused:
         acquire = getattr(loop_core, "_acquire_lock", None)
         release = getattr(loop_core, "_release_lock", None)
@@ -6184,6 +6231,9 @@ def _command_loop(args: argparse.Namespace) -> int:
         restore_root_config=not isolate,
         **runner_kwargs,
     )
+    # r15: a Lead pass that adds `repos:` to PLAN.md on an old core is
+    # refused like any other out-of-repo slice (see OmnigentRunner._run).
+    runner.loop_core = loop_core
     keep_sessions = getattr(args, "keep_sessions", False)
     ids_file = mailbox / ".sessions" / f"run-{os.getpid()}.ids"
     previous_ids_env = os.environ.get(SESSION_IDS_ENV_VAR)

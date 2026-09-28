@@ -486,4 +486,4 @@ def test_n2_rebound_marker_is_ambiguous_and_refused(trioctl, repo):
 def test_n2_current_set_loads(trioctl, repo):
     _vendor(repo, REPO_ROOT / "metrics")
     module = trioctl._load_trio_loop(repo)
-    assert module.LOOP_CORE_API == 2 and module._METRICS.METRICS_API == 4
+    assert module.LOOP_CORE_API == 2 and module._METRICS.METRICS_API == 5

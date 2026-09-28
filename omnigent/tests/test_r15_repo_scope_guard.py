@@ -28,9 +28,9 @@ GIT_ENV = {
     "GIT_COMMITTER_NAME": "Trio Test",
     "GIT_COMMITTER_EMAIL": "trio@example.invalid",
 }
-UNSUPPORTED = (
-    "repos: declared but multi-repo slices are not supported by this "
-    "release (r15 pending)"
+REPO_SLICE = (
+    "  - id: bridge\n    repo: app-backend\n    writes: [app/x.py]\n    reads: []\n"
+    "    status: planned\n"
 )
 
 
@@ -140,7 +140,9 @@ def test_loop_start_refuses_offending_plan(tmp_path, monkeypatch, capsys):
     assert len(worktrees(home)) == 1
 
 
-def test_loop_start_refuses_declared_repos(tmp_path, monkeypatch, capsys):
+def test_loop_start_refuses_home_slice_writing_into_declared_repo(
+    tmp_path, monkeypatch, capsys
+):
     home, box = make_home(tmp_path, plan(OK + BAD, REPOS))
     monkeypatch.chdir(home)
     monkeypatch.setattr(trioctl, "OmnigentRunner", NoRunner)
@@ -148,9 +150,59 @@ def test_loop_start_refuses_declared_repos(tmp_path, monkeypatch, capsys):
     args = _loop_args(box)
     assert args.func(args) == 3
     log = (box / "LOG.md").read_text().splitlines()
-    assert f"- iter 1 | loop | {UNSUPPORTED}" in log
-    assert not any("slice bridge" in ln for ln in log)  # covered, not refused
-    assert UNSUPPORTED in capsys.readouterr().err
+    assert any("slice bridge of repo home touches repo app-backend" in ln for ln in log)
+    assert "one repo per slice" in capsys.readouterr().err
+
+
+class OldCore:
+    """A vendored loop core whose metrics set predates r15 (METRICS_API 4)."""
+
+    class _METRICS:
+        METRICS_API = 4
+
+    @staticmethod
+    def run_loop(*_a, **_kw):
+        raise AssertionError("run_loop called on an old core with repos:")
+
+
+def test_loop_start_refuses_declared_repos_on_old_core(tmp_path, monkeypatch, capsys):
+    home, box = make_home(tmp_path, plan(OK + REPO_SLICE, REPOS))
+    (box / "briefs" / "bridge.md").write_text(BRIEF_OK)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(trioctl, "OmnigentRunner", NoRunner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: OldCore)
+    args = _loop_args(box)
+    assert args.func(args) == 3
+    err = capsys.readouterr().err
+    assert "PLAN.md declares repos: (r15 multi-repo slices)" in err
+    assert "METRICS_API 4; multi-repo needs 5" in err
+    assert "status: error" in (box / "STATE.md").read_text().splitlines()
+
+
+def test_old_core_single_repo_still_runs(tmp_path, monkeypatch):
+    home, box = make_home(tmp_path, plan(OK))
+    monkeypatch.chdir(home)
+    calls = []
+
+    class Runner:
+        def __init__(self, **kw):
+            calls.append("runner")
+
+    class Loop(OldCore):
+        @staticmethod
+        def run_loop(*_a, **_kw):
+            calls.append("loop")
+            return 0
+
+    monkeypatch.setattr(trioctl, "OmnigentRunner", Runner)
+    monkeypatch.setattr(trioctl, "_load_trio_loop", lambda repo: Loop)
+    monkeypatch.setattr(trioctl, "_resolve_isolation", lambda *a: (None, "test"))
+    args = trioctl.parser().parse_args(
+        ["omnigent", "loop", "--mailbox", str(box), "--max-iterations", "3",
+         "--keep-sessions"]
+    )
+    assert args.func(args) == 0
+    assert calls == ["runner", "loop"]
 
 
 def test_loop_start_single_repo_unchanged(tmp_path, monkeypatch):
@@ -311,11 +363,16 @@ def test_run_builder_isolate_refuses_brief_targeted_check(tmp_path, no_worktree,
     assert no_worktree == []
 
 
-def test_run_builder_isolate_refuses_declared_repos(tmp_path, no_worktree, capsys):
-    home, box = make_home(tmp_path, plan(OK + BAD, REPOS))
-    args = _run_builder(box, home, "home-ok", box / "briefs" / "home-ok.md")
-    assert args.func(args) == 2
-    assert UNSUPPORTED in capsys.readouterr().err
+def test_run_builder_isolate_declared_repo_slice_reaches_its_repo(tmp_path, no_worktree):
+    """r15: a declared-repo slice passes the guard and its worktree is
+    created from that repo (not the home checkout)."""
+    home, box = make_home(tmp_path, plan(OK + REPO_SLICE, REPOS))
+    brief = tmp_path / "task.md"
+    brief.write_text("## Targeted check\n\ncd app && python3 -m pytest -q\n")
+    args = _run_builder(box, home, "bridge", brief)
+    with pytest.raises(AssertionError, match="worktree created"):
+        args.func(args)
+    assert no_worktree == ["bridge"]
 
 
 def test_run_builder_isolate_other_slice_passes_guard(tmp_path, no_worktree):

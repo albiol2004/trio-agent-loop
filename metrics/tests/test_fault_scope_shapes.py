@@ -484,11 +484,13 @@ def _load_trioctl():
     return module
 
 
-def test_metrics_api_is_4_and_matches_trioctl() -> None:
-    assert TM.METRICS_API == 4
+def test_metrics_api_is_5_and_matches_trioctl() -> None:
+    assert TM.METRICS_API == 5
     trioctl = _load_trioctl()
     assert trioctl.REQUIRED_METRICS_API == TM.METRICS_API
-    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 4
+    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 5
+    # r15: a pre-multi-repo vendored set (4) is still driven, single-repo.
+    assert trioctl.COMPATIBLE_METRICS_APIS == (4, 5)
 
 
 def test_too_old_vendored_metrics_is_refused_with_clear_message(
@@ -500,11 +502,11 @@ def test_too_old_vendored_metrics_is_refused_with_clear_message(
     core_src = Path(__file__).parents[1] / "trio_loop.py"
     (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
     (metrics_dir / "trio-metrics.py").write_text(
-        METRICS_PATH.read_text().replace("METRICS_API = 4\n", "METRICS_API = 2\n")
+        METRICS_PATH.read_text().replace("METRICS_API = 5\n", "METRICS_API = 2\n")
     )
     with pytest.raises(
         trioctl.TrioctlError,
-        match=r"METRICS_API 2, this trioctl requires 4 \(mixed metrics/ versions\)",
+        match=r"METRICS_API 2, this trioctl requires 5 \(or 4 without PLAN.md repos:\) \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
 
@@ -517,11 +519,11 @@ def test_same_api3_vendored_metrics_is_refused(tmp_path: Path) -> None:
     core_src = Path(__file__).parents[1] / "trio_loop.py"
     (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
     (metrics_dir / "trio-metrics.py").write_text(
-        METRICS_PATH.read_text().replace("METRICS_API = 4\n", "METRICS_API = 3\n")
+        METRICS_PATH.read_text().replace("METRICS_API = 5\n", "METRICS_API = 3\n")
     )
     with pytest.raises(
         trioctl.TrioctlError,
-        match=r"METRICS_API 3, this trioctl requires 4 \(mixed metrics/ versions\)",
+        match=r"METRICS_API 3, this trioctl requires 5 \(or 4 without PLAN.md repos:\) \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
 

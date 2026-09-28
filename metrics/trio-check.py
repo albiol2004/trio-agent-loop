@@ -73,9 +73,9 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 #: The sibling trio-metrics.py contract this checker calls into
-#: (``METRICS_API``; 4 = ``find_queue_block(..., errors=)``, r11h). Must
-#: equal omnigent/trioctl ``REQUIRED_METRICS_API``.
-REQUIRED_METRICS_API = 4
+#: (``METRICS_API``; 4 = ``find_queue_block(..., errors=)``, r11h; 5 =
+#: declared repos, r15). Must equal omnigent/trioctl ``REQUIRED_METRICS_API``.
+REQUIRED_METRICS_API = 5
 
 
 class MetricsApiMismatch(ImportError):

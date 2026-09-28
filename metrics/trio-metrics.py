@@ -22,9 +22,11 @@ from pathlib import Path
 # relies on: 2 = read_queue / parse_slice_verdicts / parse_verdict_scope;
 # 3 = plain fault `scope:` values, lenient read_queue `errors` and
 # `malformed_slices`; 4 = `find_queue_block(..., errors=)` with CommonMark
-# fence closing and orphan `- id:`/`- slice:` entry errors (r11h F-FENCE).
-# A copy without this constant predates it.
-METRICS_API = 4
+# fence closing and orphan `- id:`/`- slice:` entry errors (r11h F-FENCE);
+# 5 = declared product repos (r15): `parse_repos_block`/`read_repos`,
+# `slice_repo_name`, `parse_repo_pins`, `parse_full_check`, and the optional
+# `repo:` key of `retired:` entries. A copy without this constant predates it.
+METRICS_API = 5
 
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
