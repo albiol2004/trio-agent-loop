@@ -166,9 +166,15 @@ ends with `status: error`, `phase: driver-exception`, exit 3.
 | `<live mailbox>/.sessions/aggregates.json` | per-run map of declared repos to aggregates |
 
 `<common>` is the git common dir. A loop whose `writes:` overlap a live
-loop's (root-free, root-bound or lockstep) is refused as in every mode:
-at start with exit 2 before anything is created (stderr only), at a later
-Lead pass with exit 5 (`phase: writes-overlap`).
+loop's (root-free, root-bound or lockstep) is refused at start with exit 2
+before anything is created (stderr only), as in every mode. An overlap
+that appears mid-run (typically the other loop's Lead widened its PLAN)
+does not stop a root-free loop: it logs one warning per overlap naming the
+other loop and the paths, flags `.driver.json` `writes_overlap`, and
+continues; its land merges the other loop's landed change and re-verifies
+(a real conflict ends in `needs_land`/`land-conflict`) (eval-r16rc N4).
+Root-bound and lockstep loops still stop that Lead pass with exit 5
+(`phase: writes-overlap`).
 `TRIO_ALLOW_OVERLAPPING_LOOPS=1` or `--allow-overlapping-writes` proceeds
 (expect a late land conflict or a re-verification). Root-free Leads and
 evaluations never take the r15.x root-turn lock (nothing runs at the

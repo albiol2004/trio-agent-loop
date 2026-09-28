@@ -5461,13 +5461,44 @@ class OmnigentRunner:
         self._exit_root_turn(mine["count"])
 
     def _check_writes_overlap(self, mailbox: Path, iteration: int) -> None:
-        """Lead-pass start: refuse (needs_human) when a live loop's writes overlap
-        (any mode: root-bound, lockstep and root-free loops of the repository)."""
+        """Lead-pass start: a live loop's `writes:` overlap this loop's.
+
+        Root-bound and lockstep loops share the one aggregate at the root:
+        refuse (needs_human, exit 5). A root-free loop has its own
+        aggregate and the land merges and re-verifies a moved target, so a
+        mid-run overlap (often introduced by the OTHER loop's Lead) only
+        warns -- LOG line naming the other loop and paths, `.driver.json`
+        `writes_overlap` -- and never stops this loop (eval-r16rc N4). The
+        start-time refusal (exit 2) is unchanged in every mode.
+        """
         registry = self.__dict__.get("loop_registry")
         if not registry:
             return
         problems = _writes_overlap_problems(Path(registry["root"]), mailbox)
         if not problems:
+            meta = self.__dict__.get("driver_meta")
+            if isinstance(meta, dict) and "writes_overlap" in meta:
+                with self._dict_lock():
+                    self.driver_meta = {k: v for k, v in meta.items() if k != "writes_overlap"}
+            return
+        if self.__dict__.get("_root_free") is not None and not registry.get("allow"):
+            logged = registry.setdefault("logged", set())
+            fresh = [p for p in problems if p not in logged]
+            for problem in fresh:
+                logged.add(problem)
+                _append_mailbox_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | warning: {problem}; root-free: this "
+                    "loop continues (its land merges and re-verifies the other "
+                    "loop's changes; a real conflict ends in needs_land)",
+                )
+                print(f"trioctl: warning: {problem} (root-free: continuing)",
+                      file=sys.stderr)
+            with self._dict_lock():
+                current = self.__dict__.get("driver_meta")
+                current = dict(current) if isinstance(current, dict) else {}
+                current["writes_overlap"] = list(problems)
+                self.driver_meta = current  # rebind: the core may be serialising it
             return
         if registry.get("allow"):
             logged = registry.setdefault("logged", set())

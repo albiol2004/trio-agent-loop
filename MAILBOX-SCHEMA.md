@@ -942,8 +942,15 @@ lockstep mailboxes stay root-bound). Operator guide:
   so its Lead and evaluations never take the r15.x root-turn lock
   (`--root-bound` and lockstep runs, and root one-shots while such a loop
   is live, still do). The cross-loop `writes:` refusal applies as in every
-  mode: start refused with exit 2 before anything is created, a Lead pass
-  stopped with exit 5 (`phase: writes-overlap`).
+  mode at start: refused with exit 2 before anything is created. Mid-run
+  (an overlap that appears at a later Lead pass, e.g. the other loop's
+  Lead widened its PLAN) a root-free loop only warns -- one LOG line per
+  overlap naming the other loop and the paths, `.driver.json`
+  `writes_overlap: [...]` -- and continues: its private aggregate is never
+  shared, and the land merges and re-verifies the other loop's change (a
+  real conflict ends in `needs_land`/`land-conflict`) (eval-r16rc N4).
+  Root-bound and lockstep loops still stop that pass with exit 5
+  (`phase: writes-overlap`).
 - **Exit codes**: see "Driver exit codes" below (0 means verified AND
   landed; **8 needs_land** resumes with `trioctl omnigent land --mailbox <x>`).
 - **Compat**: root-free needs METRICS_API 6 in the repository's committed
@@ -978,7 +985,7 @@ the dirty-checkout gate or the untracked-product scan.
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository, any mode (STATE untouched; root-bound: one LOG line; root-free: stderr only, nothing created); or a refused flag combination (`--root-free` unmet, `--root-bound` on a root-free mailbox) |
 | 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
-| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x); or the mailbox is owned by a live driver (left byte-identical; root-free also reads the root mailbox's `.lock`, eval-r16rc B1) |
+| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x; root-bound/lockstep only -- root-free warns, eval-r16rc N4); or the mailbox is owned by a live driver (left byte-identical; root-free also reads the root mailbox's `.lock`, eval-r16rc B1) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
 | 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
 | 8 | `needs_land` | root-free (r16): the verified loop branch could not land (`phase: land-blocked`, `land-conflict`, `land-starved`, `land-error`); resume with `trioctl omnigent land --mailbox <x>` |
@@ -1080,7 +1087,8 @@ absence is never a violation.
 - **r15.x root-turn lock** (no METRICS_API bump; trioctl and
   worker_worktrees only): exit 9 `root-occupied`, STATE `reason:`, the
   live-loop registry under `<git common dir>/trio-worktrees/loops/`, and
-  the cross-loop `writes:` refusal (exit 2 at start, exit 5 mid-run).
+  the cross-loop `writes:` refusal (exit 2 at start, exit 5 mid-run; since
+  eval-r16rc N4 a root-free loop warns mid-run instead).
 - **METRICS_API 5** (r15 multi-repo slices): `trio-metrics.py` gains
   `parse_repos_block`/`read_repos`/`mailbox_repo_root`, `slice_repo_name`,
   `parse_repo_pins` and `parse_full_check`; `retired:` entries may carry

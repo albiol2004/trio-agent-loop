@@ -330,8 +330,11 @@ loop's SHIP acceptance (`needs_retirement`, exit 6).
   PLAN.md `writes:` are compared per repository (every worktree of a repo
   counts as that repo, so root-free loops are compared too) with every
   other live loop's (prefix-covering either way). Start: refused with exit 2, naming the other mailbox and the exact
-  overlapping paths (one LOG line, STATE untouched). Mid-run: the pass is
-  not dispatched; STATE `needs_human` / `writes-overlap`, exit 5.
+  overlapping paths (one LOG line, STATE untouched). Mid-run: root-bound
+  and lockstep loops do not dispatch the pass (STATE `needs_human` /
+  `writes-overlap`, exit 5); a root-free loop warns (one LOG line per
+  overlap, `.driver.json` `writes_overlap`) and continues, its land merging
+  and re-verifying the other loop's change (eval-r16rc N4).
   `TRIO_ALLOW_OVERLAPPING_LOOPS=1` (or `--allow-overlapping-writes`)
   proceeds with a LOG warning. Loops of an older release are not in the
   registry (only the stranger check sees their sessions).
