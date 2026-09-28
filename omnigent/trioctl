@@ -3305,6 +3305,97 @@ _OPEN_LOOP_INTEGRATION_EVAL_PROCEDURE = (
 )
 
 
+# r15 multi-repo: rendered only when PLAN.md declares `repos:` (single-repo
+# prompts stay byte-identical). Sourced from prompts/canonical/lead.md and
+# evaluator.md ("Multi-repo (PLAN.md `repos:`)").
+_OPEN_LOOP_MULTI_REPO_LEAD_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 0-7:\n"
+    "{repos}"
+    "- A slice's `repo:` (default `home`) is the repo its `writes:` are\n"
+    "  relative to, its builder worktree is created from, its\n"
+    "  `slice(<id>):` commits and merge land in (on that repo's base\n"
+    "  branch), and its slice-eval grades. One repo per slice (split a slice\n"
+    "  that would touch two; `depends_on:` across repos is fine);\n"
+    "  disjoint `writes:` are judged per repo.\n"
+    "- Dispatch: the `## Isolated builders` command is unchanged\n"
+    "  (`--workspace` stays the home repo); trioctl creates the worktree\n"
+    "  from the slice's repo (without `## Isolated builders`, dispatch with\n"
+    "  `--workspace <repo path>`). The brief's `## Targeted check` runs from\n"
+    "  that worktree's root: `cd` only to paths relative to the repo root,\n"
+    "  never to an absolute path (trioctl refuses it).\n"
+    "- Step 3: a slice of a declared repo is retired with FOUR keys, in this\n"
+    "  order: `slice:`, `repo: <name>`, `sha:` (its JSON `merge_commit`, a\n"
+    "  commit of THAT repo), `at:` = `git -C <repo path> log -1\n"
+    "  --format=%cI <sha>`. A home slice keeps the three keys. Reverts,\n"
+    "  take-overs and fixes of such a slice are committed in its repo\n"
+    "  (`git -C <repo path> ...`); `omnigent worktrees integrate <id>` takes\n"
+    "  `--repo <repo path>` (the JSON line's `repo`).\n"
+    "- Step 6: one gate per repo this pass committed product code in, each\n"
+    "  with its own skip rule: the last PASS of repo X is\n"
+    "  `grep -oE 'gate: PASS @X:[0-9a-f]{{40}}' <mailbox>/LOG.md | tail -n 1`\n"
+    "  (home: the plain `gate: PASS @[0-9a-f]{{40}}` grep above) and the skip\n"
+    "  test is `git -C <repo path> diff --quiet <gate_sha> HEAD` (home: as\n"
+    "  above, mailbox excluded). Run each repo's commands from that repo's\n"
+    "  root: its integration check is its `full_check:` typecheck/lint plus\n"
+    "  the targeted checks of its slices retired this pass; its full check\n"
+    "  is its `full_check:` entry (`full_check:` is a string = home's\n"
+    "  command, or a `<repo>: <command>` mapping).\n"
+    "- End the LOG.md line with EVERY gate outcome of the pass, joined by\n"
+    "  `; `: home as `gate: PASS @<full sha>`, a declared repo as\n"
+    "  `gate: PASS @<repo>:<full sha>` (FAIL likewise;\n"
+    "  `gate: skipped (<repo>: no product change since <sha>)`).\n"
+    "- Step 7: the slice ledger and every `## Whole-tree gate` row carry the\n"
+    "  repo (first column).\n"
+)
+
+_OPEN_LOOP_MULTI_REPO_SLICE_EVAL_NOTE = (
+    "MULTI-REPO: slice `{slice}` belongs to the declared repo `{name}`\n"
+    "(`{path}`); `{sha}` is a commit of THAT repo, not of the home repo. Step\n"
+    "2 runs there: `git -C {path} worktree add <tmp> {sha}` ...\n"
+    "`git -C {path} worktree remove <tmp>`. Step 1's trio-shadow gate is\n"
+    "unchanged (it resolves the slice's repo from PLAN.md).\n"
+)
+
+_OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`): the pin is one sha per repo --\n"
+    "{pins}"
+    "- Grade every repo at its pin (worker merges into any of them are\n"
+    "  fenced during this evaluation). Record them on ONE field line instead\n"
+    "  of the bare sha: `evaluated: {evaluated}`.\n"
+    "- Run each repo's `full_check:` from that repo's root (a bare-string\n"
+    "  `full_check:` is home's command) plus any PLAN.md `lead_integration:`\n"
+    "  smoke in the home repo.\n"
+    "- SHIP retirement is per repo. In each declared repo that has slices,\n"
+    "  on its checked-out base branch, make ONE empty retirement commit\n"
+    "  (no product edits -- any product change after the pin fails the\n"
+    "  driver's gate):\n"
+    "  `git -C <repo path> commit --allow-empty -m \"loop: iteration {iteration} — SHIP ({mailbox_name})\"`\n"
+    "  and record it in VERDICT.md as `commit: <repo>@<full sha>`. Then make\n"
+    "  the home mailbox commit `loop: iteration {iteration} — SHIP` as usual;\n"
+    "  its VERDICT.md lists every `commit: <repo>@<sha>`. These empty\n"
+    "  per-repo commits are the one exception to committing only the\n"
+    "  mailbox; never commit product edits.\n"
+)
+
+
+def _multi_repo_listing(
+    repos: dict[str, dict[str, Any]], home: Path | None, pins: dict[str, str] | None = None
+) -> str:
+    """One `  - <name>: <path> (base <b>)[ @<sha>]` line per repo, home first."""
+    rows: list[str] = []
+    for name, path, base in [
+        ("home", home, None),
+        *[(n, d["path"], d.get("base")) for n, d in repos.items()],
+    ]:
+        line = f"  - `{name}`: `{path}`"
+        if base:
+            line += f" (base `{base}`)"
+        if pins is not None:
+            line += f" @`{pins.get(name) or '?'}`"
+        rows.append(line + "\n")
+    return "".join(rows)
+
+
 def _omnigent_prompt_dirs(repo: Path) -> list[Path]:
     """Ordered directories to search for checked-in Omnigent role prompts.
 
@@ -3866,7 +3957,12 @@ class OmnigentRunner:
         raise TrioctlError(f"missing Omnigent prompt: {filename} (tried: {tried})")
 
     @staticmethod
-    def _open_loop_context_block(context: dict[str, Any]) -> str:
+    def _open_loop_context_block(
+        context: dict[str, Any],
+        repos: dict[str, dict[str, Any]] | None = None,
+        home: Path | None = None,
+        mailbox: Path | None = None,
+    ) -> str:
         """Build the OPEN-LOOP CONTEXT block prepended to open-loop prompts.
 
         Line 1 matches portable/driver.sh's build_prompt byte-for-byte:
@@ -3875,6 +3971,10 @@ class OmnigentRunner:
         hand-maintained and only gets the one-paragraph description), so a
         kind-specific rendering of it is appended before the blank line
         that separates the block from the role's normal prompt.
+
+        *repos* (r15): the mailbox's declared PLAN.md `repos:`; when given,
+        the kind's multi-repo note is appended to its procedure. Without
+        it (single-repo) the block is byte-identical to earlier releases.
         """
         kind = context.get("kind") or ""
         line = f"OPEN-LOOP CONTEXT: kind={kind}"
@@ -3898,6 +3998,10 @@ class OmnigentRunner:
             )
         else:
             procedure = ""
+        if repos and procedure:
+            procedure += OmnigentRunner._multi_repo_note(
+                kind, context, repos, home, mailbox
+            )
         queue_errors = [str(e) for e in context.get("queue_errors") or []]
         if queue_errors:
             # r11g Q1: the driver holds the integration gate while the
@@ -3907,6 +4011,41 @@ class OmnigentRunner:
         if not procedure:
             return line + "\n\n"
         return line + "\n" + procedure + "\n"
+
+    @staticmethod
+    def _multi_repo_note(
+        kind: str,
+        context: dict[str, Any],
+        repos: dict[str, dict[str, Any]],
+        home: Path | None,
+        mailbox: Path | None,
+    ) -> str:
+        """The r15 multi-repo addendum of one OPEN-LOOP CONTEXT procedure."""
+        if kind == "lead-pass":
+            return _OPEN_LOOP_MULTI_REPO_LEAD_NOTE.format(
+                repos="Repos:\n" + _multi_repo_listing(repos, home)
+            )
+        if kind == "slice-eval":
+            name = str(context.get("repo") or "").strip()
+            if name not in repos:
+                return ""
+            return _OPEN_LOOP_MULTI_REPO_SLICE_EVAL_NOTE.format(
+                slice=context.get("slice") or "<slice>",
+                sha=context.get("sha") or "<sha>",
+                name=name,
+                path=repos[name]["path"],
+            )
+        if kind == "integration-eval":
+            pins = dict(context.get("pins") or {})
+            pins.setdefault("home", str(context.get("pinned_sha") or context.get("sha") or ""))
+            order = ["home", *repos]
+            return _OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE.format(
+                pins=_multi_repo_listing(repos, home, pins),
+                evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
+                iteration=context.get("iteration") or "N",
+                mailbox_name=mailbox.name if mailbox is not None else "<mailbox>",
+            )
+        return ""
 
     def _prompt(
         self,
@@ -3954,7 +4093,13 @@ class OmnigentRunner:
         if self._isolate and role in ("lead", "repair"):
             result += self._isolate_block(iteration, mailbox)
         if context and context.get("mode") == "open-loop":
-            result = self._open_loop_context_block(context) + result
+            repos = _declared_repos(mailbox)
+            if repos:
+                result = self._open_loop_context_block(
+                    context, repos, self.repo, mailbox
+                ) + result
+            else:
+                result = self._open_loop_context_block(context) + result
         elif context and (
             context.get("evaluator_attempt") or context.get("pinned_sha")
         ):
@@ -3965,8 +4110,13 @@ class OmnigentRunner:
             sha = str(
                 context.get("pinned_sha") or context.get("expected_sha") or ""
             )
+            pins = context.get("pins") or {}
+            extra = (
+                " pins=" + ",".join(f"{n}@{v}" for n, v in pins.items())
+                if pins else ""
+            )
             result = (
-                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}\n\n"
+                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n\n"
                 + result
             )
         return result

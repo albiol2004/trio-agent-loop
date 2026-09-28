@@ -108,8 +108,8 @@ slices:
     reads: ["api:SceneAPI"]
 ```
 
-`repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `.`, `false`, `in_progress`, the entry's iteration number, and `[]`). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
-Every slice's `repo:` (omit it or use `.`), `writes:` and its brief's `## Targeted check` `cd` must stay inside the mailbox repo (the git repo containing `loop/`) unless PLAN.md declares `repos:`, which this release refuses; a nested clone with its own `.git` is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
+`repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `home` — the mailbox repo, also written `.` — `false`, `in_progress`, the entry's iteration number, and `[]`); a `repo:` other than `home`/`.` must name a PLAN.md `repos:` entry. A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
+Every slice's `writes:` and its brief's `## Targeted check` `cd` must stay inside the slice's repo: the mailbox repo (the git repo containing `loop/`, `repo:` omitted, `.` or `home`), or the PLAN.md `repos:` entry its `repo:` names — one repo per slice; an undeclared nested clone with its own `.git` or a path elsewhere is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review
@@ -324,6 +324,28 @@ extension"), run this loop instead of waiting for a verdict:
    bar's lockstep build/tests/linters bullet and the lockstep REPORT.md
    template: REPORT.md is the open-loop ledger shown under Output.
    **Never weaken verification** still applies in full.
+7. **Multi-repo (only when PLAN.md declares `repos:`).** The main session
+   declares product repos with the GOAL in their own ```yaml fence
+   (`repos:` entries `name`, `path` relative to the mailbox repo root or
+   absolute, optional `base:` branch); the mailbox repo is the implicit
+   `home`. A slice names its repo with `repo: <name>` (default `home`);
+   its `writes:` are relative to that repo's root, one repo per slice
+   (split a slice that would touch two; `depends_on:` across repos is
+   fine), and disjoint `writes:` are judged per repo. Its builder
+   worktree is created from that repo and merges back onto its `base`
+   branch; its `## Targeted check` runs from that worktree's root, so any
+   `cd` in it is relative — never an absolute path. Retire a declared-repo
+   slice with four keys in this order: `slice:`, `repo: <name>`, `sha:`
+   (a commit of THAT repo), `at:` (`git -C <repo path> log -1 --format=%cI
+   <sha>`); home slices keep three. Step 6 runs one gate per repo the pass
+   committed product code in, each with its own skip rule (last PASS:
+   `grep -oE 'gate: PASS @<repo>:[0-9a-f]{40}'`; home keeps the plain
+   `gate: PASS @<sha>`; diff: `git -C <repo path> diff --quiet <sha> HEAD`)
+   and its own `full_check:` (a string is home's command; a `<repo>:
+   <command>` mapping gives each repo its own, run from that repo's root).
+   End the LOG.md line with every gate outcome joined by `; ` (e.g.
+   `gate: PASS @<sha>; gate: PASS @app-backend:<sha>`); REPORT.md's slice
+   ledger and gate rows carry the repo.
 
 ## Quality bar
 - Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6's one whole-tree gate replaces this bullet.)

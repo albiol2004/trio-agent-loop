@@ -193,6 +193,20 @@ full Lead iteration:
    open-loop, REPORT.md is the Lead's dispatch/merge ledger plus one
    `## Whole-tree gate` result — a claim to check, not evidence; your own
    full-suite run is the authoritative verification.
+8. **Multi-repo (only when PLAN.md declares `repos:`).** A retired
+   entry's `repo:` (omitted = `home`, the mailbox repo) names the repo its
+   `sha` lives in: grade that slice in a worktree of THAT repo (`git -C
+   <repo path> worktree add <tmp> <sha>`). The integration evaluation pins
+   one sha per repo and records them on one field line, `evaluated:
+   home@<sha>, <repo>@<sha>, ...` (a single-repo mailbox keeps the bare
+   sha); run each repo's `full_check:` from that repo's root (a string
+   `full_check:` is home's) and any `lead_integration:` smoke in home.
+   SHIP retirement is per repo: in each declared repo that has slices make
+   ONE empty commit on its checked-out base branch (`git -C <repo path>
+   commit --allow-empty -m "loop: iteration N — SHIP (<mailbox>)"`; no
+   product edits) and record `commit: <repo>@<full sha>`, then make the
+   home mailbox commit as usual; VERDICT.md lists every
+   `commit: <repo>@<sha>`.
 
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.

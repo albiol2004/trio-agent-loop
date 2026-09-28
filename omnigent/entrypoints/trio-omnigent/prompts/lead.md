@@ -29,11 +29,12 @@ mailbox `{mailbox}` at iteration {iteration}.
    In `PLAN.md` slice metadata, `status:` must be exactly one of
    `planned`, `in_progress`, `complete` and `writes:` must be a
    single-line bracketed list.
-   Every slice's `repo:` (omit it or use `.`), `writes:` and its
-   brief's `## Targeted check` `cd` must stay inside the mailbox repo
-   (the git repo containing the mailbox) unless PLAN.md declares
-   `repos:`, which this release
-   refuses; a nested clone with its own `.git` is not a workaround —
+   Every slice's `writes:` and its brief's `## Targeted check` `cd`
+   must stay inside the slice's repo: the mailbox repo (the git repo
+   containing the mailbox; `repo:` omitted, `.` or `home`), or the
+   PLAN.md `repos:` entry its `repo:` names (one repo per slice; the
+   OPEN-LOOP CONTEXT's MULTI-REPO lines then apply); an undeclared nested
+   clone with its own `.git` or a path elsewhere is not a workaround —
    trioctl refuses such a plan (loop `status: error`).
 6. Append one Format-A line to `{mailbox}/LOG.md`:
    `- iter {iteration} | lead | <one-line summary>`.

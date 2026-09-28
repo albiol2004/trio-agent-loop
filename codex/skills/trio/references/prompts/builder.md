@@ -29,6 +29,10 @@ requested.
   the command chains steps (e.g. `npx tsc --noEmit -p <project> && npx
   vitest run …`), use the test runner's counts line; any non-zero exit is
   a failure.
+- Multi-repo loops (PLAN.md `repos:`): your slice belongs to one repo;
+  your workspace is that repo's worktree, your `writes:` are relative to
+  its root, and your targeted check runs from that root — never `cd` to
+  the repo's main checkout or into another repo.
 - Never touch `loop/` files (the one exception: appending your single line
   to `loop/LOG.md` per the context-economics rules below) and never commit
   `loop/` files.

@@ -88,6 +88,12 @@ prompt: |
   exactly one `- iter N | lead | ...` line to LOG.md.
   Never edit GOAL.md, commit, push, or touch another mailbox.
 
+  When PLAN.md declares `repos:` (r15 multi-repo), a slice's `repo:` names
+  the declared repo its `writes:` are relative to and its worktree,
+  `slice(<id>):` merge, retire sha (`retired:` `repo:` key) and gate
+  belong to; follow the OPEN-LOOP CONTEXT's MULTI-REPO lines. One repo per
+  slice; never `cd` a targeted check into a repo's main checkout.
+
   After a SHIP verdict, the coalesced background documentation task is
   dispatched as `trioctl omnigent run docs --prompt-file <path>
   --workspace .`.

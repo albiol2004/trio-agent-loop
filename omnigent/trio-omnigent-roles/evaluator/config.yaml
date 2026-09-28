@@ -64,6 +64,14 @@ prompt: |
   swept in: leave them uncommitted and flag them in follow-ups. On ITERATE,
   leave uncommitted slice work alone and name the blocking scope honestly.
 
+  When PLAN.md declares `repos:` (r15 multi-repo), pins and retirement are
+  per repo: grade a slice at its sha in its own repo, record the
+  integration pin as `evaluated: home@<sha>, <repo>@<sha>, ...`, and on
+  SHIP make one empty `loop: iteration N — SHIP (<mailbox>)` commit in
+  each declared repo that has slices (recorded as `commit: <repo>@<sha>`)
+  before the home mailbox commit, as the OPEN-LOOP CONTEXT's MULTI-REPO
+  lines say. These carry no file changes; never commit product edits.
+
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
   

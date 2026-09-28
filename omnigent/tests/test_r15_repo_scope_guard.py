@@ -344,7 +344,8 @@ REPO_ROOT = ROOT.parent
 )
 def test_lead_prompt_states_the_repo_scope_rule(relative):
     text = " ".join((REPO_ROOT / relative).read_text().split())
-    assert "must stay inside the mailbox repo" in text
-    assert "Every slice's `repo:` (omit it or use `.`)" in text
-    assert "unless PLAN.md declares `repos:`, which this release refuses" in text
-    assert "a nested clone with its own `.git` is not a workaround" in text
+    assert "must stay inside the slice's repo" in text
+    assert "`repos:` entry its `repo:` names" in text
+    assert "one repo per slice" in text
+    assert "nested clone with its own `.git`" in text
+    assert "which this release refuses" not in text  # r15: lifted
