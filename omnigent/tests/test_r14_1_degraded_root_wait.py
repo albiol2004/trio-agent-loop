@@ -82,7 +82,9 @@ def test_next_lead_pass_waits_for_degraded_eval_then_proceeds(
     assert codes["eval"] == 0
     # Waited for the eval (well past the 0.2 s stranger window), not refused.
     assert waited >= 0.8
-    assert pruned == ["s1"]  # the eval's finished session, released exactly once
+    # The eval's finished session, released exactly once; r15.x: the Lead's
+    # own session (s2) is ended at its turn end, not left idle at the root.
+    assert pruned == ["s1", "s2"]
     assert runner._client().workspaces == [str(repo), str(repo)]
     err = capsys.readouterr().err
     assert err.count("trioctl: root busy with degraded slice-eval A; Lead pass waits") == 1

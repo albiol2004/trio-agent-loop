@@ -509,7 +509,8 @@ def test_root_reuse_ends_previous_session_and_fences_evaluation(
     assert pruned == [["s1"], ["s2"]]
     assert seen[0]["fence"] is None and seen[1]["fence"] is not None
     assert runner.run("lead", 2, repo / "loop", None) == 0
-    assert pruned == [["s1"], ["s2"]]  # nothing left to end at the next Lead pass
+    # r15.x: the Lead's own session (s3) ends at its turn end; nothing else.
+    assert pruned == [["s1"], ["s2"], ["s3"]]
     assert seen[2]["fence"] is None  # released at the next Lead pass
 
 
@@ -517,8 +518,16 @@ def test_held_previous_root_session_blocks_root_reuse(trioctl, repo, root, monke
     monkeypatch.setattr(trioctl, "_prune_broker_sessions",
                         lambda *a, **k: pytest.fail("held session must not be pruned"))
     runner, _seen = _runner(trioctl, repo, root, monkeypatch)
+    dispatch = runner._run_dispatch
+
+    def held_during_dispatch(*a, **k):
+        code = dispatch(*a, **k)
+        runner.held_session_ids.append("s1")  # held while its turn ran (r15.x)
+        return code
+
+    monkeypatch.setattr(runner, "_run_dispatch", held_during_dispatch)
     runner.run("lead", 1, repo / "loop", None)
-    runner.held_session_ids.append("s1")
+    monkeypatch.setattr(runner, "_run_dispatch", dispatch)
     with pytest.raises(trioctl.TrioctlError, match="held session"):
         runner.run("evaluator", 1, repo / "loop", None)
 

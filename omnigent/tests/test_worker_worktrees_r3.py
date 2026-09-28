@@ -163,7 +163,9 @@ def test_n1_running_slice_eval_is_never_pruned_by_next_lead_pass(
     # Next Lead pass while s2 is alive: only the FINISHED root session s1
     # may be ended; s2 (running, other role, other workspace) never.
     assert runner.run("lead", 2, mailbox, None) == 0            # s3
-    assert pruned == [["s1"]]
+    # r15.x: each Lead session is ended at its own turn end (this fake prune
+    # deletes nothing, so s1 is retried once at the next root reuse).
+    assert pruned == [["s1"], ["s1"], ["s3"]]
     assert all("s2" not in call for call in pruned)
     client.hold["s2"].set()
     evaluator.join(10)
@@ -173,7 +175,8 @@ def test_n1_running_slice_eval_is_never_pruned_by_next_lead_pass(
     assert rec["session_ids"] == ["s2"]
     # A later root reuse ends s3 only; s2 (slice-eval) is never a root session.
     assert runner.run("lead", 3, mailbox, None) == 0
-    assert pruned[-1] == ["s3"]
+    assert pruned[-2:] == [["s3"], ["s4"]]  # s3 retried at reuse; s4 at its turn end
+    assert all("s2" not in call for call in pruned)
 
 
 def test_n1_failure_path_holds_its_own_session_not_a_concurrent_one(

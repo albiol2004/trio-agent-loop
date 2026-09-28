@@ -24,7 +24,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Iterator, NoReturn
 
 VERSION = "0.5.0"
 ROLES = ("lead", "evaluator", "builder", "scout", "docs")
@@ -1195,6 +1195,23 @@ def _state_iteration(mailbox: Path) -> str:
         return "?"
     match = re.search(r"^\s*(?:-\s+)?iteration\s*:\s*(\S+)", text, re.M | re.I)
     return match.group(1) if match else "?"
+
+
+def _append_mailbox_log(mailbox: Path, line: str) -> None:
+    """Append one line to ``<mailbox>/LOG.md`` (newline-safe). Never raises."""
+    try:
+        log = Path(mailbox) / "LOG.md"
+        prefix = ""
+        if log.is_file():
+            with open(log, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell():
+                    fh.seek(-1, os.SEEK_END)
+                    prefix = "" if fh.read(1) == b"\n" else "\n"
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(prefix + line.replace("\n", " ") + "\n")
+    except OSError as exc:
+        print(f"trioctl: could not append to {mailbox}/LOG.md: {exc}", file=sys.stderr)
 
 
 def _mark_repo_scope_refused(
@@ -3709,6 +3726,199 @@ class _SameCwdGate:
         self.release()
 
 
+# --------------------------------------------------------------------------
+# r15.x root-turn lock (r16 DESIGN §2). Every Trio actor that launches a
+# cursor-agent whose project root is an aggregate root -- a loop's root-bound
+# Lead/repair/evaluator turn, a degraded slice-eval, a non-isolated one-shot
+# at a root with a live loop -- holds one per-user flock keyed by that root's
+# realpath for its whole turn, so no two of them share the root's single
+# project `.cursor/{mcp,hooks}.json` slot. The kernel drops the flock when
+# its holder dies (no stale-lock recovery). Isolated builders/slice-evals
+# (their own worktree, their own slot) never take it.
+ROOT_TURN_WAIT_ENV = "TRIO_ROOT_TURN_WAIT_S"
+DEFAULT_ROOT_TURN_WAIT = 3900.0  # >= one role timeout (3600 s) + teardown
+ROOT_TURN_ONESHOT_WAIT_ENV = "TRIO_ROOT_TURN_ONESHOT_WAIT_S"
+DEFAULT_ROOT_TURN_ONESHOT_WAIT = 900.0
+ROOT_TURN_LOCK_DIR_ENV = "TRIO_ROOT_TURN_LOCK_DIR"
+ROOT_TURN_POLL_ENV = "TRIO_ROOT_TURN_POLL_S"
+ROOT_TURN_PROGRESS_ENV = "TRIO_ROOT_TURN_PROGRESS_S"
+DEFAULT_ROOT_TURN_PROGRESS = 60.0
+
+
+class RootBusyError(TrioctlError):
+    """Another Trio actor kept the root turn past the bounded wait."""
+
+
+def _env_seconds(name: str, default: float) -> float:
+    value = broker_http._env_float(name, default)
+    return value if value >= 0 else default
+
+
+def _root_turn_lock_dir() -> Path:
+    """Per-user dir (sibling of `cwd-locks/`): one lock file per aggregate root."""
+    env = os.environ.get(ROOT_TURN_LOCK_DIR_ENV, "").strip()
+    if env:
+        return Path(env).expanduser()
+    state = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(state) if state else Path.home() / ".local" / "state"
+    return base / "trio-agent-loop" / "root-turn"
+
+
+def _root_turn_path(root: str | Path) -> Path:
+    key = hashlib.sha256(os.path.realpath(str(root)).encode("utf-8")).hexdigest()[:24]
+    return _root_turn_lock_dir() / f"{key}.lock"
+
+
+def _read_root_turn_holder(path: Path) -> dict[str, Any] | None:
+    """The holder record of a root-turn lock file (line 2, JSON), or None."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        record = json.loads(lines[1]) if len(lines) > 1 else None
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _describe_root_holder(holder: dict[str, Any] | None) -> str:
+    if not holder:
+        return "an unknown holder"
+    who = holder.get("mailbox") or "one-shot"
+    since = holder.get("since")
+    when = (
+        time.strftime("%H:%M:%S", time.localtime(float(since)))
+        if isinstance(since, (int, float)) else "?"
+    )
+    return f"{who} {holder.get('role') or '?'} (pid {holder.get('pid')}, since {when})"
+
+
+class _RootTurnLock:
+    """One acquisition of the per-root turn lock (see ROOT_TURN_WAIT_ENV).
+
+    Same flock pattern as :class:`_SameCwdGate`: line 1 ``"<pid> <root>"``
+    (so :func:`_prune_same_cwd_locks` prunes files of vanished roots), line
+    2 the JSON holder record, rewritten under the lock; the locked inode is
+    re-checked after every acquisition.
+    """
+
+    def __init__(self, root: str | Path, *, who: dict[str, Any]) -> None:
+        self.root = os.path.realpath(str(root))
+        self.who = dict(who)
+        self.path = _root_turn_path(self.root)
+        self._fh: Any = None
+        self.contended = False
+
+    def holder(self) -> dict[str, Any] | None:
+        return _read_root_turn_holder(self.path)
+
+    def held_by_other(self) -> bool:
+        """Whether some description (another holder) holds the flock now."""
+        import fcntl
+
+        try:
+            with open(self.path, "a+", encoding="utf-8") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+        except OSError:
+            return False
+
+    def acquire(self, max_wait: float, *, label: str = "") -> float:
+        """Take the lock (bounded); returns the seconds waited.
+
+        Raises :class:`RootBusyError` naming the holder after *max_wait*.
+        Prints one line when it starts waiting and one per progress period.
+        """
+        import fcntl
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        poll = _env_seconds(ROOT_TURN_POLL_ENV, 0.5) or 0.5
+        every = _env_seconds(ROOT_TURN_PROGRESS_ENV, DEFAULT_ROOT_TURN_PROGRESS) or 60.0
+        start = time.monotonic()
+        next_note = start
+        fh = open(self.path, "a+", encoding="utf-8")
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if _same_lock_inode(fh, self.path):
+                    break
+                fh.close()  # pruned while we queued: re-open the path
+                fh = open(self.path, "a+", encoding="utf-8")
+                continue
+            except BlockingIOError:
+                self.contended = True
+            except OSError:
+                fh.close()
+                raise
+            waited = time.monotonic() - start
+            if waited >= max_wait:
+                fh.close()
+                raise RootBusyError(
+                    f"root turn at {self.root} is still held by "
+                    f"{_describe_root_holder(self.holder())} after {waited:.0f}s "
+                    f"(bound {max_wait:.0f}s, {ROOT_TURN_WAIT_ENV}/"
+                    f"{ROOT_TURN_ONESHOT_WAIT_ENV}); {label or 'dispatch'} not started"
+                )
+            if time.monotonic() >= next_note:
+                print(
+                    f"trioctl: root turn at {self.root} held by "
+                    f"{_describe_root_holder(self.holder())} "
+                    f"(waited {waited:.0f}s/<={max_wait:.0f}s)"
+                    + (f"; {label} waits" if label else ""),
+                    file=sys.stderr,
+                )
+                next_note = time.monotonic() + every
+            time.sleep(poll)
+        waited = time.monotonic() - start
+        record = {
+            "pid": os.getpid(),
+            "pid_start": (
+                worker_worktrees.process_identity(os.getpid()).get("start")
+                if worker_worktrees is not None else None
+            ),
+            "since": time.time(),
+            "argv0": Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "",
+            "root": self.root,
+            **self.who,
+        }
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()} {self.root}\n{json.dumps(record, sort_keys=True)}\n")
+            fh.flush()
+        except OSError:
+            pass
+        self._fh = fh
+        return waited
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is not None:
+            try:
+                fh.close()  # closing the description drops the flock
+            except OSError:
+                pass
+
+    @property
+    def held(self) -> bool:
+        return self._fh is not None
+
+
+#: Process-wide root turns: {lock path: {lock, count, mutex}}. A trioctl
+#: process holds each root's flock at most once; its dispatches (the Lead,
+#: its degraded slice-eval, the next Lead after a sticky evaluator) share it.
+_ROOT_TURNS: dict[str, dict[str, Any]] = {}
+_ROOT_TURNS_GUARD = threading.Lock()
+
+
+def _root_turn_slot(key: str) -> dict[str, Any]:
+    with _ROOT_TURNS_GUARD:
+        return _ROOT_TURNS.setdefault(
+            key, {"lock": None, "count": 0, "mutex": threading.Lock()}
+        )
+
+
 # Prompts of this process's dispatches, per mailbox, so a first-prompt hold
 # can tell a cross-wired mirror (the only saved user row is a SIBLING
 # dispatch's prompt) from a generic uncertain delivery.
@@ -3846,6 +4056,10 @@ class OmnigentRunner:
         # r15: fence token -> the repository whose ledger holds it (tokens
         # absent here are the home repo's).
         self._fence_repos: dict[str, Path] = {}
+        # r15.x root-turn share: {key, count (this runner's holders), sticky
+        # (finished root-bound evaluators still holding it with their
+        # fence)}; see `_enter_root_turn` / `_root_turn_slot`.
+        self._root_turn: dict[str, Any] = {"key": None, "count": 0, "sticky": 0}
         # The loop core driving this runner (set by `loop`); None = unknown.
         self.loop_core: Any = None
         # Opt-in (default off): opt-in label, prompt nonce and dispatch
@@ -4353,6 +4567,155 @@ class OmnigentRunner:
             print(f"trioctl: could not log degraded eval isolation: {exc}", file=sys.stderr)
         return None, reason
 
+    # ------------------------------------------------ r15.x root-turn lock
+
+    def _turn_state(self) -> dict[str, Any]:
+        """This runner's share of the root turn (lazy for __new__-built runners):
+        {key (lock path), count (its holders), sticky (finished evaluators)}."""
+        state = self.__dict__.get("_root_turn")
+        if state is None:
+            state = self.__dict__.setdefault(
+                "_root_turn", {"key": None, "count": 0, "sticky": 0},
+            )
+        return state
+
+    def _root_turn_root(self) -> Path:
+        """The Cursor project root a root-bound dispatch of this runner loads."""
+        workspace = Path(self.__dict__.get("_workspace") or self.repo).resolve()
+        if worker_worktrees is None:
+            return workspace
+        return worker_worktrees.cursor_project_root(workspace)
+
+    def _enter_root_turn(
+        self, role: str, mailbox: Path, iteration: int, kind: str | None
+    ) -> bool:
+        """Hold the root turn for this dispatch (re-entrant within the process).
+
+        A dispatch joins a turn this process already holds (its Lead's
+        degraded slice-eval, the next Lead after a sticky evaluator turn);
+        otherwise it waits for the per-root flock, bounded by
+        TRIO_ROOT_TURN_WAIT_S (RootBusyError after that). True when it had
+        to wait for another holder.
+        """
+        root = self._root_turn_root()
+        key = str(_root_turn_path(root))
+        mine = self._turn_state()
+        slot = _root_turn_slot(key)
+        with slot["mutex"]:
+            if slot["count"] > 0:
+                slot["count"] += 1
+                mine["key"] = key
+                mine["count"] += 1
+                return False
+            lock = _RootTurnLock(
+                root, who={"mailbox": str(mailbox), "role": role, "kind": kind or role},
+            )
+            label = f"{mailbox.name} {kind or role} (iteration {iteration})"
+            waited = lock.acquire(
+                _env_seconds(ROOT_TURN_WAIT_ENV, DEFAULT_ROOT_TURN_WAIT), label=label,
+            )
+            slot["lock"] = lock
+            slot["count"] = 1
+            mine["key"] = key
+            mine["count"] += 1
+        if not lock.contended:
+            return False
+        with self._dict_lock():
+            current = self.__dict__.get("driver_meta")
+            current = dict(current) if isinstance(current, dict) else {}
+            current["root_turn_wait_s"] = round(
+                float(current.get("root_turn_wait_s") or 0.0) + waited, 3
+            )
+            self.driver_meta = current  # rebind: the core may be serialising it
+        threshold = _env_seconds(ROOT_TURN_PROGRESS_ENV, DEFAULT_ROOT_TURN_PROGRESS)
+        if waited > threshold:
+            _append_mailbox_log(
+                mailbox,
+                f"- iter {iteration} | loop | root turn: {kind or role} waited "
+                f"{waited:.0f}s for another Trio actor at {lock.root}",
+            )
+        return True
+
+    def _repin_after_turn_wait(
+        self, iteration: int, mailbox: Path, context: dict[str, Any] | None
+    ) -> bool:
+        """Re-bind a root-bound evaluation's pin after waiting for the root turn.
+
+        The loop core pins HEAD before it dispatches; while this dispatch
+        waited, another loop's turn may have committed. The core's own
+        binding helper decides (it keeps the pin/attempt while the product
+        is intact since the pin, else pins HEAD with a fresh attempt); the
+        shared *context* dict is updated in place. True when it changed.
+        """
+        core = self.__dict__.get("loop_core")
+        if not context or core is None or not context.get("pinned_sha"):
+            return False
+        state_path = mailbox / "STATE.md"
+        before = (context.get("pinned_sha"), context.get("evaluator_attempt"))
+        try:
+            if context.get("kind") == "integration-eval":
+                helper = getattr(core, "_open_loop_integration_context", None)
+                if not callable(helper):
+                    return False
+                fresh = helper(mailbox, self.repo, iteration, state_path)
+            elif context.get("mode") != "open-loop":
+                helper = getattr(core, "_lockstep_eval_context", None)
+                intact = getattr(core, "_evaluated_product_intact", None)
+                if not callable(helper) or not callable(intact):
+                    return False
+                if intact(self.repo, mailbox, str(context["pinned_sha"])):
+                    return False
+                core._update_state(
+                    state_path, {"evaluated_sha": "", "evaluator_attempt": ""}
+                )
+                fresh = helper(mailbox, self.repo, iteration,
+                               core._read_state(state_path), state_path)
+            else:
+                return False
+        except Exception as exc:  # noqa: BLE001 - keep the core's pin
+            print(f"trioctl: could not re-pin after the root-turn wait: {exc}",
+                  file=sys.stderr)
+            return False
+        context.update(fresh)
+        after = (context.get("pinned_sha"), context.get("evaluator_attempt"))
+        if after != before:
+            print(
+                f"trioctl: root turn wait moved the product; evaluation re-pinned "
+                f"{str(before[0])[:12]} -> {str(after[0])[:12]}",
+                file=sys.stderr,
+            )
+        return after != before
+
+    def _exit_root_turn(self, count: int = 1) -> None:
+        mine = self._turn_state()
+        if not mine["key"]:
+            return
+        slot = _root_turn_slot(mine["key"])
+        with slot["mutex"]:
+            count = min(count, mine["count"])
+            mine["count"] -= count
+            slot["count"] = max(0, slot["count"] - count)
+            if slot["count"] == 0 and slot["lock"] is not None:
+                slot["lock"].release()
+                slot["lock"] = None
+
+    def _keep_root_turn_sticky(self) -> None:
+        """A root-bound evaluator's turn outlives its dispatch (fence-tied)."""
+        self._turn_state()["sticky"] += 1
+
+    def _release_sticky_root_turns(self) -> None:
+        """At the next Lead/repair dispatch: drop finished evaluators' turns."""
+        mine = self._turn_state()
+        sticky, mine["sticky"] = mine["sticky"], 0
+        if sticky:
+            self._exit_root_turn(sticky)
+
+    def release_root_turns(self) -> None:
+        """Loop end (after prune/restore): no dispatch of this runner is at the root."""
+        mine = self._turn_state()
+        mine["sticky"] = 0
+        self._exit_root_turn(mine["count"])
+
     ROOT_RELEASE_WAIT = 30.0
 
     def _wait_known_root_occupants(self) -> float:
@@ -4597,15 +4960,24 @@ class OmnigentRunner:
             print(f"trioctl: root Cursor config baseline not taken: {exc}", file=sys.stderr)
 
     def _end_root_evaluator(self, mailbox: Path, session_id: str) -> None:
-        """End a finished root-bound evaluator's own session, then restore the root.
+        """Back-compat name: :meth:`_end_root_session` for an evaluator."""
+        self._end_root_session(mailbox, session_id, "evaluator")
 
-        The evaluator session is never reused; the post-loop prune would
-        end it anyway. A held session is never touched.
+    def _end_root_session(self, mailbox: Path, session_id: str, role: str) -> None:
+        """End a finished root-bound session of *role*, then restore the root.
+
+        Evaluator sessions were always ended here; since r15.x the Lead /
+        repair session is too, at its turn end, instead of idling at the root
+        until the next root dispatch (it would keep a cursor-agent there and
+        block every other loop's root turn between passes). No session is
+        ever reused. A held session is never touched. While a degraded
+        slice-eval of this run still runs at the root, the session is ended
+        but the root is not waited for / restored (the next release does it).
         """
         if not self._end_root_sessions:
             print(
                 "trioctl: root Cursor config left in place (--keep-sessions keeps "
-                f"evaluator session {session_id}); acceptance stays pending",
+                f"{role} session {session_id}); acceptance stays pending",
                 file=sys.stderr,
             )
             return
@@ -4616,7 +4988,7 @@ class OmnigentRunner:
                 self._client(), mailbox, session_ids=[session_id], keep_unarchived=True,
             )
         except Exception as exc:  # noqa: BLE001 - config stays; acceptance fails closed
-            print(f"trioctl: could not end evaluator session {session_id}: {exc}",
+            print(f"trioctl: could not end {role} session {session_id}: {exc}",
                   file=sys.stderr)
             return
         if not isinstance(counts, dict) or int(counts.get("deleted") or 0) < 1:
@@ -4624,19 +4996,22 @@ class OmnigentRunner:
             # root, so keep its bookkeeping; the next root dispatch retries
             # the release and the config stays until then.
             print(
-                f"trioctl: finished root evaluator session {session_id} was not deleted "
+                f"trioctl: finished root {role} session {session_id} was not deleted "
                 f"({counts}); root Cursor config left in place, acceptance stays pending",
                 file=sys.stderr,
             )
             return
         print(
-            f"trioctl: ended finished root evaluator session {session_id}: {counts}",
+            f"trioctl: ended finished root {role} session {session_id}: {counts}",
             file=sys.stderr,
         )
         with self._own_lock:
             self._root_finished = [
                 e for e in self._root_finished if e["session_id"] != session_id
             ]
+            degraded = bool(self.__dict__.get("_degraded_root_evals"))
+        if degraded:
+            return
         deadline = time.monotonic() + self.ROOT_RELEASE_WAIT
         while worker_worktrees.cursor_processes_at(self.repo):
             if time.monotonic() >= deadline:
@@ -5187,6 +5562,57 @@ class OmnigentRunner:
         eval_wt, eval_degraded = self._bind_slice_eval(
             role, iteration, mailbox, context, dispatch
         )
+        # r15.x: every dispatch launched at the aggregate root (not bound to
+        # its own eval worktree) holds the root turn; see `_enter_root_turn`.
+        at_root = eval_wt is None
+        if at_root:
+            waited = self._enter_root_turn(
+                role, mailbox, iteration, (context or {}).get("kind")
+            )
+            if (
+                waited and role == "evaluator" and eval_degraded is None
+                and self._repin_after_turn_wait(iteration, mailbox, context)
+            ):
+                # The core pinned before this dispatch waited; another
+                # loop's turn moved the product meanwhile: grade the new pin.
+                prompt = self._prompt(role, iteration, mailbox, context)
+                if nonce:
+                    prompt += f"\nDispatch nonce: {nonce}\n"
+        try:
+            if at_root and role in ("lead", "repair"):
+                # This pass holds its own turn now: finished evaluators'
+                # sticky turns (held through `_finalize_ship`) end here, with
+                # their integration fences.
+                self._release_sticky_root_turns()
+            return self._run_bound(
+                role, iteration, mailbox, context, agent_id, model, prompt, title,
+                dispatch, eval_wt, eval_degraded, nonce,
+            )
+        finally:
+            if at_root:
+                if role == "evaluator" and eval_degraded is None:
+                    # Held with the fence: released at the next Lead/repair
+                    # dispatch or loop end (`release_root_turns`).
+                    self._keep_root_turn_sticky()
+                else:
+                    self._exit_root_turn()
+
+    def _run_bound(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        context: dict[str, Any] | None,
+        agent_id: str,
+        model: str,
+        prompt: str,
+        title: str,
+        dispatch: dict[str, Any],
+        eval_wt: dict[str, Any] | None,
+        eval_degraded: str | None,
+        nonce: str | None,
+    ) -> int:
+        """The dispatch proper (root turn, if any, already held by `_run`)."""
         workspace = self._workspace
         if eval_degraded is not None and worker_worktrees is not None:
             # Degraded slice-eval: the non-isolated path. The Lead may be
@@ -5320,6 +5746,12 @@ class OmnigentRunner:
             # The loop core grades acceptance right after this returns.
             if self._isolate and eval_degraded is None:
                 self._end_root_evaluator(mailbox, dispatch["session_id"])
+            else:
+                self._end_root_sessions_nonisolated(mailbox)
+        if root_bound and role in ("lead", "repair") and dispatch.get("session_id"):
+            # r15.x: the Lead/repair session ends with its root turn.
+            if self._isolate:
+                self._end_root_session(mailbox, dispatch["session_id"], role)
             else:
                 self._end_root_sessions_nonisolated(mailbox)
         if role in ("lead", "repair") and code == 0:
@@ -6152,8 +6584,10 @@ def _command_loop(args: argparse.Namespace) -> int:
         _ensure_mailbox_gitignore(mailbox)
     except OSError as exc:
         print(f"trioctl: could not update {mailbox / '.gitignore'}: {exc}", file=sys.stderr)
-    # r14.1 F3: same-cwd lock files of workspaces that no longer exist.
+    # r14.1 F3: same-cwd lock files of workspaces that no longer exist
+    # (and r15.x root-turn lock files of roots that no longer exist).
     _prune_same_cwd_locks()
+    _prune_same_cwd_locks(_root_turn_lock_dir())
     loop_core = _load_trio_loop(repo)
     # r15 guard: a PLAN with a slice outside its repo (or an invalid
     # `repos:` block), or a `repos:` PLAN on a vendored loop core that
@@ -6347,6 +6781,7 @@ def _command_loop(args: argparse.Namespace) -> int:
                     runner.restore_root_config_final(mailbox)
                 except Exception as exc:  # noqa: BLE001 - never change the exit code
                     print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
+            _release_root_turns_of(runner)
             # After prune, so deleted role sessions no longer hold their
             # worktrees; held sessions keep theirs (see _blocking_state).
             # Their runners exit asynchronously after archive/DELETE, so
@@ -6362,8 +6797,19 @@ def _command_loop(args: argparse.Namespace) -> int:
                 runner.restore_root_config_final(mailbox)
             except Exception as exc:  # noqa: BLE001 - never change the exit code
                 print(f"trioctl: root Cursor config restore failed: {exc}", file=sys.stderr)
+        _release_root_turns_of(runner)
         if observe:
             _finish_observation(observe)
+
+
+def _release_root_turns_of(runner: Any) -> None:
+    """Loop end: drop every root turn *runner* holds (never raises)."""
+    release = getattr(runner, "release_root_turns", None)
+    if callable(release):
+        try:
+            release()
+        except Exception as exc:  # noqa: BLE001 - never change the exit code
+            print(f"trioctl: could not release the root turn: {exc}", file=sys.stderr)
 
 
 def _resolve_mailbox(value: Any, repo: Path) -> Path:
