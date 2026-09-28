@@ -927,9 +927,10 @@ Operator guide: `docs/ROOT-FREE-OPEN-LOOP.md`.
   (native core, pre-r16 release) on the same mailbox refuses; it is never
   seeded or landed.
 - **Lockstep (r16b).** Lead, repair and Evaluator all run in the Lead
-  worktree (the Evaluator still grades in its own `git worktree add` at
-  the pin and makes its SHIP retirement commit in its workspace, i.e. on
-  `trio/<slug>`); builders run non-isolated in the Lead worktree unless
+  worktree (the Evaluator runs there too, not in its own separate
+  `git worktree add` at the pin, and makes its SHIP retirement commit in
+  that workspace, i.e. on `trio/<slug>`); builders run non-isolated in the Lead
+  worktree unless
   `--isolate-workers`. After this run's SHIP the driver (trioctl, no core
   change) lands exactly as for open-loop; a `reverify` sets
   `phase: lead-done` with the pin cleared so one fresh Evaluator grades the
