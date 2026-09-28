@@ -8,6 +8,7 @@ PLAN.md, or an invalid `repos:` block, is final -- never a home-only SHIP.
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -355,3 +356,146 @@ def test_n1_single_repo_queue_without_repo_keys_is_untouched(env, tmp_path):
     )
     raw = core._METRICS.read_queue(box)
     assert core._read_queue(box) == raw
+
+
+# --- N2: lockstep with `repos:` renders its own MULTI-REPO procedure --------
+
+
+def _lockstep_layout(tmp_path):
+    layout = E._layout(tmp_path, "B")
+    box, home = layout["box"], layout["home"]
+    (box / "QUEUE.md").unlink()
+    git(home, "add", "-A")
+    git(home, "commit", "-q", "-m", "lockstep mailbox")
+    return layout
+
+
+def test_n2_lockstep_prompts_render_the_multi_repo_procedure(env, tmp_path):
+    _tmp, _wt, trioctl, _core = env
+    layout = _lockstep_layout(tmp_path)
+    box, home = layout["box"], layout["home"]
+    runner = trioctl.OmnigentRunner(
+        repo=home, broker_client=E._Client(), config={}, interval=0, workspace=str(home),
+    )
+    lead = runner._prompt("lead", 1, box, {})
+    assert lead.startswith("MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 3-5:\n")
+    assert "`app-backend`" in lead and "git -C <repo path> commit" in lead
+    assert "OPEN-LOOP CONTEXT" not in lead.split("# Trio Lead")[0]
+    pins = {"home": "a" * 40, "app-backend": "b" * 40, "app-frontend": "c" * 40}
+    ev = runner._prompt("evaluator", 1, box, {
+        "evaluator_attempt": "att", "pinned_sha": "a" * 40, "pins": pins,
+    })
+    head, _, body = ev.partition("\n\n# Trio Evaluator")
+    assert head.startswith(f"LOCKSTEP CONTEXT: attempt=att sha={'a' * 40} pins=")
+    assert (f"`evaluated: home@{'a' * 40}, app-backend@{'b' * 40}, "
+            f"app-frontend@{'c' * 40}`") in head
+    assert "loop: iteration 1 — SHIP (loop)" in head
+    assert "one\n  exception to" in head
+    # Single-repo lockstep renders are unchanged (no MULTI-REPO text).
+    plan = (box / "PLAN.md").read_text()
+    (box / "PLAN.md").write_text(re.sub(r"```yaml\nrepos:\n.*?```\n", "", plan, flags=re.S))
+    assert "MULTI-REPO (PLAN.md" not in runner._prompt("lead", 1, box, {})
+    single = runner._prompt("evaluator", 1, box, {"evaluator_attempt": "att", "pinned_sha": "a" * 40})
+    assert single.startswith(f"LOCKSTEP CONTEXT: attempt=att sha={'a' * 40}\n\n# Trio Evaluator")
+
+
+class LiteralLockstep(E.Scenario):
+    """A lockstep Lead that commits each slice in its repo, and an Evaluator
+    that follows the rendered LOCKSTEP prompt literally (repro
+    lockstep-False.json: without the note this was exit 6)."""
+
+    def lockstep_lead(self, iteration, prompt):
+        assert "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 3-5" in prompt
+        box = self.l["box"]
+        plan = (box / "PLAN.md").read_text()
+        for sl in self.l["slices"]:
+            path = self.l["home"] if sl["repo"] == "home" else self.l["repos"][sl["repo"]]["path"]
+            target = path / sl["write"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"# {sl['id']}\n")
+            git(path, "add", "--", sl["write"])
+            git(path, "commit", "-q", "-m", f"slice({sl['id']}): work")
+            plan = plan.replace("status: planned", "status: complete", 1)
+        (box / "PLAN.md").write_text(plan)
+        with (box / "LOG.md").open("a") as fh:
+            fh.write(f"- iter {iteration} | lead | all slices\n")
+
+    def lockstep_eval(self, ctx, prompt):
+        box, home = self.l["box"], self.l["home"]
+        head = prompt.split("\n\n# Trio Evaluator")[0]
+        evaluated = re.search(r"`(evaluated: [^`]+)`", head).group(1)
+        command = re.search(r"`(git -C <repo path> commit --allow-empty -m [^`]+)`", head).group(1)
+        commits = []
+        for name, d in self.l["repos"].items():  # both repos have slices
+            argv = shlex.split(command)
+            assert argv[:4] == ["git", "-C", "<repo", "path>"]
+            git(d["path"], *argv[4:])
+            commits.append(f"commit: {name}@{git(d['path'], 'rev-parse', 'HEAD')}\n")
+        (box / "VERDICT.md").write_text(
+            f"VERDICT: SHIP\n\niteration: {ctx['iteration']}\n"
+            f"attempt: {ctx['evaluator_attempt']}\n{evaluated}\n"
+            f"commit: {ctx['pinned_sha']}\n" + "".join(commits)
+        )
+        with (box / "LOG.md").open("a") as fh:
+            fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP — lockstep\n")
+        rel = box.relative_to(home).as_posix()
+        git(home, "add", "-f", "--", f"{rel}/VERDICT.md", f"{rel}/LOG.md")
+        git(home, "add", "-u", "--", rel)
+        git(home, "commit", "-q", "-m", f"loop: iteration {ctx['iteration']} — SHIP", "--", rel)
+
+
+def test_n2_lockstep_evaluator_following_the_rendered_prompt_ships(env, monkeypatch, tmp_path):
+    _tmp, _wt, trioctl, core = env
+    layout = _lockstep_layout(tmp_path)
+    box, home = layout["box"], layout["home"]
+    scenario = LiteralLockstep(layout, None, trioctl, None)
+    runner = trioctl.OmnigentRunner(
+        repo=home, broker_client=E._Client(), config={}, interval=0, workspace=str(home),
+    )
+    monkeypatch.setattr(runner, "_agent_id", lambda role: "agent")
+    monkeypatch.setattr(runner, "_resolve_model", lambda role: "m")
+    monkeypatch.setattr(runner, "_new_dispatch_nonce", lambda: None)
+    monkeypatch.setattr(trioctl, "_prune_broker_sessions",
+                        lambda client, mailbox, **kw: {"deleted": 0})
+
+    def run_dispatch(client, agent_id, model, prompt, title, role, iteration, mailbox,
+                     ctx, started, before_text, before_mtime, dispatch, workspace):
+        if role == "lead":
+            scenario.lockstep_lead(iteration, prompt)
+        else:
+            scenario.lockstep_eval({**(ctx or {}), "iteration": iteration}, prompt)
+        dispatch["session_id"] = f"sess-{role}-{iteration}"
+        return 0
+
+    monkeypatch.setattr(runner, "_run_dispatch", run_dispatch)
+    code = core.run_loop(box, 2, runner, repo=home, mode="lockstep")
+    assert code == 0, _log(layout)
+    assert "status: shipped" in _state(layout)
+    for d in layout["repos"].values():
+        assert git(d["path"], "log", "-1", "--format=%s") == "loop: iteration 1 — SHIP (loop)"
+
+
+# --- N9: wording and `base:` ------------------------------------------------
+
+
+def test_n9_base_must_be_an_existing_branch(env, tmp_path):
+    _tmp, _wt, trioctl, _core = env
+    layout = E._layout(tmp_path, "B")
+    box = layout["box"]
+    assert trioctl._repo_scope_refusals(box) == []
+    plan = (box / "PLAN.md").read_text()
+    (box / "PLAN.md").write_text(plan.replace("    base: dev\n", "    base: nope\n", 1))
+    refused = trioctl._repo_scope_refusals(box)
+    assert any("base: 'nope' is not a branch" in line for line in refused), refused
+
+
+def test_n9_old_core_refusal_wording(env, tmp_path, monkeypatch):
+    _tmp, _wt, trioctl, _core = env
+    layout = E._layout(tmp_path, "B")
+    old = type("OldCore", (), {"_METRICS": type("M", (), {"METRICS_API": 4})})()
+    line = trioctl._old_core_repos_refusal(layout["box"], old)
+    assert "nothing was dispatched" not in line and "no further role is dispatched" in line
+    # Plain install.sh layout: no metrics/ next to the bin dir.
+    monkeypatch.setattr(trioctl, "__file__", str(tmp_path / "bin" / "trioctl"))
+    assert "installed from" in trioctl._bundled_metrics_hint()
+    assert "/metrics" not in trioctl._bundled_metrics_hint()

@@ -774,6 +774,30 @@ def _full_check_lines(plan_text: str) -> list[str]:
     return []
 
 
+def _declared_base_problems(repos: list[dict]) -> list[str]:
+    """eval-r15 N9: a declared `base:` must be an existing branch of its repo
+    (a dispatch refuses it anyway; refuse it before any dispatch)."""
+    problems: list[str] = []
+    for repo in repos:
+        base = repo.get("base")
+        if not base:
+            continue
+        try:
+            found = subprocess.run(
+                ["git", "-C", str(repo["path"]), "rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{base}^{{commit}}"],
+                capture_output=True, text=True, check=False,
+            ).returncode == 0
+        except OSError:
+            found = False
+        if not found:
+            problems.append(
+                f"PLAN.md repos: {repo['name']!r}: base: {base!r} is not a branch "
+                f"of {repo['path']} (r15)"
+            )
+    return problems
+
+
 def repo_scope_refusals(
     loop_dir: Path,
     tm,
@@ -823,6 +847,7 @@ def repo_scope_refusals(
             )
     if slice_id is None and multi:
         problems.extend(_declared_plan_problems(plan_text, root, named, tm))
+        problems.extend(_declared_base_problems(repos))
     elif slice_id is None:
         # eval-r15a F6: PLAN-level checks run from the mailbox repo root.
         path = _command_offending_path(

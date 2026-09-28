@@ -3430,6 +3430,46 @@ _OPEN_LOOP_MULTI_REPO_INTEGRATION_NOTE = (
 )
 
 
+# r15 multi-repo in LOCKSTEP (eval-r15 N2): rendered only when PLAN.md
+# declares `repos:`, so single-repo lockstep prompts stay byte-identical.
+_LOCKSTEP_MULTI_REPO_LEAD_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`) -- extends steps 3-5:\n"
+    "{repos}"
+    "- A slice's `repo:` (default `home`) is the repo its `writes:` are\n"
+    "  relative to, its builder works in, and its `slice(<id>):` commits\n"
+    "  land in (on that repo's checked-out base branch). One repo per slice\n"
+    "  (split a slice that would touch two).\n"
+    "- Dispatch a declared-repo slice's builder with `--workspace <repo path>`\n"
+    "  (with `## Isolated builders` the command is unchanged: trioctl creates\n"
+    "  the worktree from the slice's repo). A brief's `## Targeted check`\n"
+    "  `cd`s only to paths relative to the repo root, never to an absolute one.\n"
+    "- Step 4: run each repo's checks from that repo's root (`full_check:` is\n"
+    "  a string = home's command, or a `<repo>: <command>` mapping).\n"
+    "- Step 5: commit each slice in ITS repo (`git -C <repo path> commit ...`);\n"
+    "  the commit gate resolves every slice in its own repo, and every\n"
+    "  declared repo's tree must be clean.\n"
+)
+
+_LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE = (
+    "MULTI-REPO (PLAN.md declares `repos:`): the LOCKSTEP CONTEXT pins one sha\n"
+    "per repo --\n"
+    "{pins}"
+    "- Grade every repo at its pin. Step 4's `evaluated:` is ONE field line\n"
+    "  naming every pin instead of the bare sha: `evaluated: {evaluated}`.\n"
+    "- Run each repo's `full_check:` from that repo's root (a bare-string\n"
+    "  `full_check:` is home's command).\n"
+    "- Step 5 SHIP retirement is per repo. First, in each declared repo that\n"
+    "  has slices, on its checked-out base branch, make ONE empty retirement\n"
+    "  commit (no product edits -- any product change after the pin fails\n"
+    "  the driver's gate):\n"
+    "  `git -C <repo path> commit --allow-empty -m \"loop: iteration {iteration} — SHIP ({mailbox_name})\"`\n"
+    "  and record it in VERDICT.md as `commit: <repo>@<full sha>`; home's\n"
+    "  `commit:` line stays the bare sha. Then make the home mailbox commit\n"
+    "  exactly as step 5 says. These empty per-repo commits are the one\n"
+    "  exception to \"the SHIP mailbox retirement commit is your only commit\";\n"
+    "  never commit product edits.\n"
+)
+
 def _multi_repo_listing(
     repos: dict[str, dict[str, Any]], home: Path | None, pins: dict[str, str] | None = None
 ) -> str:
@@ -4167,11 +4207,49 @@ class OmnigentRunner:
                 " pins=" + ",".join(f"{n}@{v}" for n, v in pins.items())
                 if pins else ""
             )
+            note = ""
+            repos = _declared_repos(mailbox) if pins else {}
+            if repos:
+                # eval-r15 N2: the lockstep Evaluator's multi-repo procedure.
+                note = self._lockstep_multi_repo_note(
+                    "evaluator", iteration, mailbox, repos, context
+                )
             result = (
-                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n\n"
-                + result
+                f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n"
+                + note + "\n" + result
             )
+        elif role in ("lead", "repair") and not (context or {}).get("mode"):
+            repos = _declared_repos(mailbox)
+            if repos:
+                # eval-r15 N2: the lockstep Lead's multi-repo procedure.
+                result = self._lockstep_multi_repo_note(
+                    role, iteration, mailbox, repos, context
+                ) + "\n" + result
         return result
+
+    def _lockstep_multi_repo_note(
+        self,
+        role: str,
+        iteration: int,
+        mailbox: Path,
+        repos: dict[str, dict[str, Any]],
+        context: dict[str, Any] | None,
+    ) -> str:
+        """The r15 MULTI-REPO procedure of a LOCKSTEP prompt (eval-r15 N2)."""
+        if role in ("lead", "repair"):
+            return _LOCKSTEP_MULTI_REPO_LEAD_NOTE.format(
+                repos="Repos:\n" + _multi_repo_listing(repos, self.repo)
+            )
+        context = context or {}
+        pins = dict(context.get("pins") or {})
+        pins.setdefault("home", str(context.get("pinned_sha") or ""))
+        order = ["home", *repos]
+        return _LOCKSTEP_MULTI_REPO_EVALUATOR_NOTE.format(
+            pins=_multi_repo_listing(repos, self.repo, pins),
+            evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
+            iteration=iteration,
+            mailbox_name=mailbox.name,
+        )
 
     def _observe_block(self, iteration: int, mailbox: Path) -> str:
         """Explicit worker-dispatch CLI for an observed Lead/repair pass.
@@ -5695,6 +5773,23 @@ def _loop_core_api(path: Path) -> int:
     return _api_marker(path, "LOOP_CORE_API")
 
 
+def _bundled_metrics_hint() -> str:
+    """Where a matching metrics/ set comes from (eval-r15 N9).
+
+    A release tree (RELEASE/omnigent/trioctl) has RELEASE/metrics next to
+    it; the plain install.sh layout (~/.local/bin/trioctl) has no loop core
+    beside it, so it names the source checkout instead of a path that does
+    not exist (~/.local/metrics).
+    """
+    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    if (bundled / "trio_loop.py").is_file():
+        return f"{bundled} (the release this trioctl belongs to)"
+    return (
+        "the metrics/ directory of the Trio release or checkout this trioctl "
+        "was installed from"
+    )
+
+
 def _refuse_core(path: Path, what: str) -> TrioctlError:
     import hashlib
 
@@ -5702,11 +5797,10 @@ def _refuse_core(path: Path, what: str) -> TrioctlError:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except OSError:
         digest = "unreadable"
-    bundled = Path(__file__).resolve().parent.parent / "metrics"
     return TrioctlError(
         f"incompatible loop core {path} (sha256 {digest}…): {what}. Refresh the "
         f"repository's metrics/ as a set (trio_loop.py, trio-metrics.py, trio-shadow.py, "
-        f"trio-check.py) from {bundled} (the release this trioctl belongs to) "
+        f"trio-check.py) from {_bundled_metrics_hint()} "
         "and commit it, or run the trioctl release that matches the vendored "
         "copy. Nothing was changed."
     )
@@ -5754,12 +5848,14 @@ def _old_core_repos_refusal(mailbox: Path, loop_core: Any) -> str | None:
     if not metrics.read_repos(Path(mailbox))["declared"]:
         return None
     where = getattr(loop_core, "__file__", None) or "metrics/trio_loop.py"
-    bundled = Path(__file__).resolve().parent.parent / "metrics"
+    # Used before any dispatch and after a Lead/repair pass alike: say what
+    # holds in both (eval-r15 N9), never "nothing was dispatched".
     return (
         f"PLAN.md declares repos: (r15 multi-repo slices) but the loop core "
         f"{where} runs on METRICS_API {api}; multi-repo needs "
         f"{MULTI_REPO_METRICS_API}: refresh the repository's metrics/ as a set "
-        f"from {bundled} and commit it (nothing was dispatched)"
+        f"from {_bundled_metrics_hint()} and commit it (no further role is "
+        "dispatched)"
     )
 
 

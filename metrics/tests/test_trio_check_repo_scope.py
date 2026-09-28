@@ -61,6 +61,9 @@ def make_home(tmp_path: Path, plan_text: str, briefs: dict[str, str] | None = No
     nested = home / "app-backend"
     (nested / "app").mkdir(parents=True)
     git(nested, "init", "-q", "-b", "dev")
+    # The declared `base: feat/x` below must be a branch (eval-r15 N9).
+    git(nested, "commit", "-q", "--allow-empty", "-m", "init")
+    git(nested, "branch", "feat/x")
     (box / "GOAL.md").write_text("# Goal\n")
     (box / "STATE.md").write_text(
         "schema: 1\niteration: 1\nmax_iterations: 3\nstatus: running\nmission: m\n"

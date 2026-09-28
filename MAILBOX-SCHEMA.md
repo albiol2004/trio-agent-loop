@@ -232,7 +232,7 @@ code block whose top-level key is `slices:`:
 ```yaml
 slices:
   - id: provider-config
-    repo: .                         # target repo relative to the mailbox root; default .
+    repo: home                      # optional; `home` (the mailbox repo; also `.`, the default) or a PLAN.md `repos:` name (r15)
     writes: [omp/configure-models.sh, "api:ProviderConfig"]
     reads:  []                      # dispatchable immediately
     gate: false                     # optional; default false
@@ -423,7 +423,8 @@ Each entry has exactly these three keys, in this order: `slice:`, `sha:`,
 `at:`. The key is `sha:` — never `merge_commit:` (that is the builder JSON
 field the value comes from); any other key makes the entry malformed.
 **r15**: an entry for a slice of a declared `repos:` repo carries a fourth
-key, `repo: <name>`, between `slice:` and `sha:`; its `sha` is a commit of
+key, `repo: <name>`, written between `slice:` and `sha:` (the parser also
+accepts it after `sha:`; the three-key order above is otherwise fixed); its `sha` is a commit of
 that repo and `at:` its committer time there (`git -C <repo> log -1
 --format=%cI <sha>`). Omitted means `home`, so existing mailboxes parse
 unchanged. PLAN.md is authoritative: trio-check flags a `repo:` that is
@@ -763,8 +764,9 @@ releases. Keys may come in any order or as a flow map (`- {name: a, path:
 b}`); only `~` expands in `path:` (never `$VARS`); every path must be an
 existing git repo, no two names may share one, and no non-`home` name may
 point at the mailbox repo. `base:` defaults to the checkout's current
-branch; when given, a builder dispatch refuses a repo whose checkout is on
-another branch.
+branch; when given it must be an existing branch of that repo (trio-check
+refuses one that is not), and a builder dispatch refuses a repo whose
+checkout is on another branch.
 
 - **Slice ↔ repo**: `repo: <name>` (default `home`); `writes:` are relative
   to that repo's root; one repo per slice (`depends_on:` across repos is
@@ -772,7 +774,8 @@ another branch.
 - **Isolation per repo**: a slice's builder (and slice-eval) worktree is
   created from its repo (`git -C <path> worktree add`) under
   `<state>/worktrees/<name>-<sha256(git common dir)[:12]>/`, a sibling of the
-  home repo's root; its ledger record lives in that repo's
+  home repo's root (with `--worktree-root X` the declared repos' roots are
+  siblings of `X`: `<parent of X>/<name>-<hash>/`); its ledger record lives in that repo's
   `.git/trio-worktrees/` with `repo_name`, and its merge lands on the repo's
   `base` branch. `.cursor` neutralisation, rebuildable/retention/cleanup
   rules are unchanged. The builder's targeted check runs from its worktree
@@ -808,6 +811,11 @@ another branch.
   that no longer validates makes the SHIP final (never accepted on the
   home checks alone), and an integration pin is reused on resume only
   under the same rule.
+- **Lockstep**: the same pins and per-repo retirement apply. trioctl
+  renders a MULTI-REPO procedure into the lockstep prompts too (the Lead's
+  per-repo dispatch and `slice(<id>):` commits; the Evaluator's pin list,
+  `evaluated:` line and empty per-repo SHIP commits), only when PLAN.md
+  declares `repos:`; single-repo lockstep prompts are unchanged.
 - **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`;
   `trioctl` still drives a METRICS_API 4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it (loop `status: error`, nothing
