@@ -348,8 +348,17 @@ def snapshot_root(home: Path) -> dict:
     for rel in ("mcp.json", "hooks.json"):
         p = home / ".cursor" / rel
         cursor[rel] = p.read_bytes() if p.exists() else None
+    status = git(home, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all")
+    # eval-r16rc-b M1: the driver's own root mailbox `.lock/{owner,pid}` (the
+    # loop core's lock, held for the whole run) is the one sanctioned root
+    # mark; real mailboxes ignore it (`.gitignore` `.lock/`), these fixtures
+    # leave the mailbox untracked and unignored.
+    status = "\n".join(
+        line for line in status.splitlines()
+        if not re.match(r"^\?\? .*/\.lock/(pid|owner)$", line)
+    )
     return {
-        "status": git(home, "--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"),
+        "status": status,
         "index_mtime": index.stat().st_mtime_ns if index.exists() else None,
         "head": git(home, "rev-parse", "HEAD"),
         "cursor": cursor,

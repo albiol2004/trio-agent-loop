@@ -291,6 +291,121 @@ def root_lock_holder(
         os.close(fd)
 
 
+def _write_lock_file(lock: Path, name: str, text: str) -> None:
+    """The core's ``_write_lock_file`` (tmp + fsync + atomic replace)."""
+    tmp = lock / f".{name}.{os.getpid()}.tmp"
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, lock / name)
+
+
+def acquire_root_lock(
+    mailbox: Path, *, log: Callable[[str], None] | None = None,
+) -> dict[str, str] | None:
+    """Take the ROOT mailbox's ``.lock`` for this driver's whole run (eval-r16rc-b M1).
+
+    Exactly the loop core's ``_acquire_lock`` protocol (same directory,
+    same ``owner``/``pid`` files, same flock on the mailbox directory, same
+    stale rule and grace), so every lock-only driver -- the native
+    ``metrics/trio_loop.py``, a pre-r16 release after a rollback -- sees a
+    live owner and refuses, exactly as two core drivers exclude each other.
+    Returns the handle for :func:`release_root_lock`, or None while a live
+    driver (or one between mkdir and pid) holds it. A dead-pid or old
+    pid-less lock is moved aside and deleted first, as the core does.
+    """
+    import fcntl
+    import uuid
+
+    mailbox = Path(mailbox)
+    mailbox.mkdir(parents=True, exist_ok=True)
+    lock = mailbox / ".lock"
+    fd = os.open(mailbox, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            if root_lock_holder_unlocked(lock) is not None:
+                return None
+            if log is not None:
+                try:
+                    pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    pid = 0
+                log(f"Removing stale lock on {mailbox}/ (pid {pid or 'unknown'} is gone).")
+            tomb = mailbox / f".lock.stale-{os.getpid()}-{uuid.uuid4().hex}"
+            with contextlib.suppress(FileNotFoundError):
+                os.rename(lock, tomb)
+                shutil.rmtree(tomb, ignore_errors=True)
+            try:
+                lock.mkdir()
+            except FileExistsError:
+                return None  # an older, unguarded driver got in first
+        token = uuid.uuid4().hex
+        _write_lock_file(lock, "owner", f"{token}\n")
+        _write_lock_file(lock, "pid", f"{os.getpid()}\n")
+        return {"lock": str(lock), "token": token}
+    finally:
+        os.close(fd)
+
+
+def root_lock_holder_unlocked(lock: Path) -> int | None:
+    """Holder of an existing ``.lock`` dir (caller holds the mailbox flock):
+    a live pid, 0 for a pid-less lock inside the grace, None when stale."""
+    try:
+        pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid > 0 and _pid_alive(pid):
+        return pid
+    if pid <= 0:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except FileNotFoundError:
+            age = 0.0  # released by a non-guarded holder just now
+        if age < ROOT_LOCK_EMPTY_GRACE_SECONDS:
+            return 0
+    return None
+
+
+def root_lock_ours(handle: dict[str, str] | None) -> bool:
+    """Whether *handle*'s lock still carries this driver's owner token."""
+    if not handle:
+        return False
+    try:
+        owner = (Path(handle["lock"]) / "owner").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return owner == handle.get("token")
+
+
+def release_root_lock(handle: dict[str, str] | None) -> None:
+    """The core's ``_release_lock``: remove the lock only while it is ours."""
+    if not handle:
+        return
+    import fcntl
+    import uuid
+
+    lock = Path(handle["lock"])
+    try:
+        fd = os.open(lock.parent, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if not root_lock_ours(handle):
+            return
+        tomb = lock.parent / f".lock.stale-{os.getpid()}-{uuid.uuid4().hex}"
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(lock, tomb)
+            shutil.rmtree(tomb, ignore_errors=True)
+    finally:
+        os.close(fd)
+        handle.clear()
+
+
 # ------------------------------------------------------------------ registry
 
 
@@ -377,6 +492,9 @@ def _seed(wt: Any, home: Path, lead: Path, rel: str) -> str | None:
     for item in listed:
         if not item or item in seen or item.endswith("/"):
             continue  # a nested repo shows as a directory entry: never copied
+        inner = item[len(rel) + 1:] if item.startswith(rel + "/") else item
+        if inner.split("/", 1)[0] == ".lock" or inner.startswith(".lock.stale-"):
+            continue  # the driver's own root mailbox lock (M1), never product
         seen.add(item)
         src, dst = home / item, lead / item
         if src.is_symlink():
@@ -618,16 +736,23 @@ def progress(wt: Any, record: dict[str, Any], *, branches_only: bool = False) ->
 
 
 def discard_pristine(
-    wt: Any, record: dict[str, Any], why: str, *, branches_only: bool = False
+    wt: Any, record: dict[str, Any], why: str, *, branches_only: bool = False,
+    guard: Callable[[], bool] | None = None,
 ) -> bool:
     """Remove a loop's Lead worktree(s) and ``trio/<slug>`` branch(es) when it
     has no progress (:func:`progress`), so the next start re-seeds from the
     target's current tip (eval-r16rc F1). False (nothing done) otherwise.
     *branches_only*: the caller created the worktree in this run and
-    dispatched nothing, so only its driver files changed (eval-r16rc N5)."""
+    dispatched nothing, so only its driver files changed (eval-r16rc N5).
+    *guard* (evaluated under the same ``lead`` lock ``begin`` takes): True
+    = another live driver owns the loop now (eval-r16rc-b L1: a starting
+    driver holds the root mailbox lock before it creates anything), so its
+    fresh worktree is never removed."""
     home = Path(record["repo"])
     with wt.repo_lock(home, "lead"):
         current = load_record(wt, home, record["slug"]) or record
+        if guard is not None and guard():
+            return False
         if not active(current) or current.get("state") == "landed" or progress(
             wt, current, branches_only=branches_only
         ):

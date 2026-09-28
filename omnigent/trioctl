@@ -7789,9 +7789,19 @@ def _discard_pristine_lead(
         return False
     if _live_driver_of(home, rel) is not None:
         return False
+    root_box = Path(home) / rel
+
+    def foreign_owner() -> bool:
+        # eval-r16rc-b L1: a starting driver takes the root mailbox lock
+        # before it creates or re-attaches anything; its fresh worktree is
+        # never "pristine leftovers" of an earlier run.
+        holder = root_free.root_lock_holder(root_box, clear_stale=False)
+        return holder is not None and holder != os.getpid()
+
     try:
         done = root_free.discard_pristine(
-            worker_worktrees, record, why, branches_only=branches_only
+            worker_worktrees, record, why, branches_only=branches_only,
+            guard=foreign_owner,
         )
     except (root_free.RootFreeError, worker_worktrees.WorktreeError, OSError) as exc:
         print(f"trioctl: root-free: could not remove the unused Lead worktree: {exc}",
@@ -7961,10 +7971,42 @@ def _root_free_begin(
         else wt.default_worktree_root(wt.repo_toplevel(home))
     )
     declared = [] if root_free.active(record) else _root_free_declared(mailbox)
-    # Committed to proceed: re-check the root lock and clear a stale one the
-    # way the loop core's `_acquire_lock` does (dead pid / old pid-less lock).
-    if _root_lock_refused(root_box, rel, clear_stale=True):
+    # Committed to proceed (eval-r16rc-b M1): TAKE the root mailbox's
+    # `.lock` with the loop core's own protocol and hold it for the whole
+    # run (released after `_root_free_finish`), so a lock-only driver
+    # (native core, pre-r16 release) started on this mailbox at any time
+    # sees a live owner and refuses. A stale lock is cleared exactly as
+    # the core clears it.
+    root_lock = root_free.acquire_root_lock(
+        root_box, log=lambda line: print(f"trioctl: {line}", file=sys.stderr),
+    )
+    if root_lock is None:
+        if not _root_lock_refused(root_box, rel, clear_stale=False):
+            print(f"trioctl: mailbox {rel}: another driver took {root_box}/.lock first; "
+                  "nothing was created or changed", file=sys.stderr)
         return 5
+    try:
+        result = _root_free_begin_locked(
+            args, mailbox, home=home, rel=rel, slug=slug, record=record,
+            worktree_root=worktree_root, declared=declared, land_only=land_only,
+        )
+    except BaseException:
+        root_free.release_root_lock(root_lock)
+        raise
+    if not isinstance(result, dict):
+        root_free.release_root_lock(root_lock)
+        return result
+    result["root_lock"] = root_lock
+    return result
+
+
+def _root_free_begin_locked(
+    args: argparse.Namespace, mailbox: Path, *, home: Path, rel: str, slug: str,
+    record: dict[str, Any] | None, worktree_root: Path, declared: list[dict[str, Any]],
+    land_only: bool,
+) -> dict[str, Any] | int:
+    """`_root_free_begin` once this driver holds the root mailbox lock."""
+    wt = worker_worktrees
     try:
         record, created = root_free.begin(
             wt, home=home, mailbox_rel=rel, worktree_root=worktree_root,
@@ -8073,6 +8115,18 @@ def _root_free_land_hook(rf: dict[str, Any], args: argparse.Namespace) -> Any:
         record = root_free.load_record(wt, home, slug)
         if not root_free.active(record):
             return {"status": "error", "detail": f"Lead worktree record lead-{slug} is gone"}
+        lock = rf.get("root_lock")
+        if lock is not None and not root_free.root_lock_ours(lock):
+            # eval-r16rc-b M1: never write the root mailbox under another
+            # driver (the lock was taken away from this run).
+            return {
+                "status": "needs_land", "phase": "land-blocked",
+                "detail": (
+                    f"the root mailbox lock {lock.get('lock') or '.lock'} is no longer "
+                    "held by this driver (another driver owns the mailbox now); nothing "
+                    "was landed: once it ends, run `trioctl omnigent land`"
+                ),
+            }
         state = core._read_state(Path(mailbox) / "STATE.md")
         pins = {"home": str(state.get("evaluated_sha") or "").strip()}
         pins.update(core._state_repo_pins(state))
@@ -8419,6 +8473,11 @@ def command_abandon(args: argparse.Namespace) -> int:
     if entry is not None:
         print(f"trioctl: a driver (pid {entry.get('pid')}) still runs {rel}", file=sys.stderr)
         return 5
+    holder = root_free.root_lock_holder(Path(home) / rel, clear_stale=False)
+    if holder is not None:
+        print(f"trioctl: a driver ({'pid ' + str(holder) if holder else 'no pid yet'}) "
+              f"holds {Path(home) / rel}/.lock; not abandoning {rel}", file=sys.stderr)
+        return 5
     result = root_free.teardown(
         worker_worktrees, record, abandon=True,
         log=lambda line: print(f"trioctl: {line}", file=sys.stderr),
@@ -8510,8 +8569,20 @@ def _command_loop(args: argparse.Namespace) -> int:
     rf = _root_free_begin(args, repo, mailbox, land_only=getattr(args, "land_only", False))
     if isinstance(rf, int):
         return rf
-    if rf is not None:
-        repo, mailbox = rf["repo"], rf["mailbox"]
+    if rf is None:
+        return _command_loop_run(args, repo, mailbox, None)
+    try:
+        return _command_loop_run(args, rf["repo"], rf["mailbox"], rf)
+    finally:
+        # eval-r16rc-b M1: the root mailbox lock is held until the very
+        # end (after `_root_free_finish`), like a core driver's own lock.
+        root_free.release_root_lock(rf.get("root_lock"))
+
+
+def _command_loop_run(
+    args: argparse.Namespace, repo: Path, mailbox: Path, rf: dict[str, Any] | None,
+) -> int:
+    """`_command_loop` once the workspace (root-free: the Lead worktree) is known."""
     mailbox.mkdir(parents=True, exist_ok=True)
     if getattr(args, "reconcile_held", False) and _held_records(mailbox):
         # Opt-in (default OFF): one bounded reconcile before the refusal.
