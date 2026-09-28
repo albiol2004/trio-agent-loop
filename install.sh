@@ -226,6 +226,14 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     # (sibling first), never a repository's vendored metrics/.
     cp "$ROOT/metrics/trio-check.py" "$TRIOCTL_BIN_DIR/trio-check.py"
     cp "$ROOT/metrics/trio-metrics.py" "$TRIOCTL_BIN_DIR/trio-metrics.py"
+    # The release's loop-core set for `trioctl omnigent metrics refresh`
+    # (vendored into repositories' metrics/; never loaded from here).
+    mkdir -p "$TRIOCTL_BIN_DIR/trio-release-metrics"
+    for f in trio_loop.py trio-metrics.py trio-shadow.py trio-check.py; do
+      cp "$ROOT/metrics/$f" "$TRIOCTL_BIN_DIR/trio-release-metrics/$f"
+    done
+    git -C "$ROOT" rev-parse --short=12 HEAD > "$TRIOCTL_BIN_DIR/trio-release-metrics/PIN" 2>/dev/null \
+      || rm -f "$TRIOCTL_BIN_DIR/trio-release-metrics/PIN"
     cp "$ROOT/omnigent/trioctl.example.toml" "$TRIOCTL_BIN_DIR/trioctl.example.toml"
     chmod +x "$TRIOCTL_BIN_DIR/trioctl"
     "$TRIOCTL_BIN_DIR/trioctl" omnigent configure --config "$TRIOCTL_CONFIG"

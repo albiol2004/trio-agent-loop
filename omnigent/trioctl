@@ -7819,8 +7819,9 @@ def _root_free_begin(
                 f"trioctl: root-free open-loop (r16) needs the loop core committed on "
                 f"{target} with METRICS_API >= {ROOT_FREE_METRICS_API} ({found}): refresh "
                 f"the repository's metrics/ as a set from {bundled} and commit it to "
-                f"{target}, or pass --root-bound to run this loop at the repository "
-                "root as before. Nothing was changed.",
+                f"{target} (with {target} checked out: `{METRICS_REFRESH_COMMAND}`), "
+                "or pass --root-bound to run this loop at the repository root as "
+                "before. Nothing was changed.",
                 file=sys.stderr,
             )
             return 3
@@ -7858,7 +7859,8 @@ def _root_free_begin(
         print(
             f"trioctl: the loop core in {lead} predates root-free open-loop "
             f"(METRICS_API {_core_metrics_api(core)}); refresh metrics/ on "
-            f"{record['target_ref']} or pass --root-bound",
+            f"{record['target_ref']} (`{METRICS_REFRESH_COMMAND}` with it checked "
+            "out) or pass --root-bound",
             file=sys.stderr,
         )
         return 3
@@ -7978,6 +7980,210 @@ def _root_free_finish(rf: dict[str, Any], args: argparse.Namespace) -> None:
     if not result["retained"]:
         print(f"trioctl: root-free: landed and removed Lead worktree {record['path']}",
               file=sys.stderr)
+
+
+#: The loop core set a repository vendors under `metrics/` (always as a set).
+METRICS_SET = ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py")
+#: install.sh copies the release's set here (next to trioctl) with a PIN file.
+INSTALLED_METRICS_SET_DIR = "trio-release-metrics"
+METRICS_REFRESH_COMMAND = "trioctl omnigent metrics refresh --commit"
+
+
+def _release_metrics_source() -> tuple[Path, str] | None:
+    """(directory holding this release's four metrics/ files, pin), or None.
+
+    A release/source tree has `<root>/metrics/` next to `<root>/omnigent/`;
+    the install.sh layout has `trio-release-metrics/` next to trioctl
+    (with a PIN file naming the release commit).
+    """
+    here = Path(__file__).resolve().parent
+    for directory in (here.parent / "metrics", here / INSTALLED_METRICS_SET_DIR):
+        if all((directory / name).is_file() for name in METRICS_SET):
+            break
+    else:
+        return None
+    pin = ""
+    with contextlib.suppress(OSError):
+        pin = (directory / "PIN").read_text(encoding="utf-8").strip()
+    if not pin:
+        proc = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            pin = proc.stdout.strip()
+            dirty = subprocess.run(
+                ["git", "-C", str(directory), "status", "--porcelain", "--", "."],
+                capture_output=True, text=True,
+            )
+            if dirty.returncode == 0 and dirty.stdout.strip():
+                pin += "-dirty"
+    api = _api_marker_source(
+        (directory / "trio-metrics.py").read_bytes(), "METRICS_API", "trio-metrics.py"
+    )
+    if not pin:
+        import hashlib
+
+        digest = hashlib.sha256(
+            b"".join((directory / name).read_bytes() for name in METRICS_SET)
+        ).hexdigest()[:12]
+        pin = f"sha256:{digest}"
+    return directory, f"{pin}, METRICS_API {api}"
+
+
+def _metrics_refresh_targets(args: argparse.Namespace) -> list[Path]:
+    """The repositories `metrics refresh` writes: --repo (default: the cwd's
+    repository), or with --mailbox the mailbox's repository plus every repo
+    its PLAN.md `repos:` declares."""
+    if getattr(args, "mailbox", None) is not None:
+        mailbox = Path(args.mailbox).expanduser()
+        if not mailbox.is_absolute():
+            mailbox = Path.cwd() / mailbox
+        mailbox = mailbox.resolve()
+        home = worker_worktrees.repo_toplevel(mailbox)
+        _module, metrics = _load_trio_check()
+        info = metrics.read_repos(mailbox)
+        if info["errors"]:
+            raise TrioctlError(
+                "PLAN.md repos: does not validate: " + "; ".join(info["errors"])
+            )
+        targets = [home] + [
+            Path(r.get("main_path") or r["path"]).resolve() for r in info["repos"]
+        ]
+    else:
+        repo = Path(getattr(args, "repo", None) or Path.cwd()).expanduser().resolve()
+        targets = [worker_worktrees.repo_toplevel(repo)]
+    out: list[Path] = []
+    for target in targets:
+        top = worker_worktrees.repo_toplevel(target)
+        if top not in out:
+            out.append(top)
+    return out
+
+
+def _metrics_diff_line(rel: str, old: bytes | None, new: bytes) -> str:
+    if old is None:
+        return f"  {rel}: added ({len(new.splitlines())} lines)"
+    if old == new:
+        return f"  {rel}: unchanged"
+    import difflib
+
+    plus = minus = 0
+    for line in difflib.unified_diff(
+        old.decode("utf-8", "replace").splitlines(),
+        new.decode("utf-8", "replace").splitlines(), lineterm="", n=0,
+    ):
+        if line.startswith("+") and not line.startswith("+++"):
+            plus += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus += 1
+    return f"  {rel}: updated (+{plus} -{minus})"
+
+
+def command_metrics_refresh(args: argparse.Namespace) -> int:
+    """`trioctl omnigent metrics refresh`: vendor this release's loop core.
+
+    Copies the release's four `metrics/` files (trio_loop.py,
+    trio-metrics.py, trio-shadow.py, trio-check.py) into the repository
+    (`--repo`, default the current one), or into the mailbox's repository
+    and every repo its PLAN.md `repos:` declares (`--mailbox`), and prints a
+    per-file diff summary. With `--commit` each changed repository gets
+    one commit `chore: vendor trio loop core (<pin>)` of exactly those files
+    on its current branch. Refuses (exit 2, nothing written anywhere) when
+    any target's `metrics/` has uncommitted or untracked changes, or with
+    `--commit` on a detached HEAD.
+    """
+    if worker_worktrees is None:
+        raise TrioctlError("worker_worktrees.py is not installed next to trioctl")
+    source = _release_metrics_source()
+    if source is None:
+        print(
+            "trioctl: this trioctl has no release metrics/ set next to it (a release "
+            f"tree's metrics/ or {INSTALLED_METRICS_SET_DIR}/ from install.sh); "
+            "re-run install.sh from the Trio checkout",
+            file=sys.stderr,
+        )
+        return 2
+    directory, pin = source
+    try:
+        targets = _metrics_refresh_targets(args)
+    except (TrioctlError, worker_worktrees.WorktreeError) as exc:
+        print(f"trioctl: metrics refresh: {exc}", file=sys.stderr)
+        return 2
+    problems: list[str] = []
+    for repo in targets:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all",
+             "--", "metrics"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            problems.append(f"{repo}: git status failed: {proc.stderr.strip()}")
+        elif proc.stdout.strip():
+            problems.append(
+                f"{repo}/metrics has uncommitted changes (commit or stash them first): "
+                + "; ".join(proc.stdout.splitlines()[:8])
+            )
+        if getattr(args, "commit", False):
+            head = subprocess.run(
+                ["git", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"],
+                capture_output=True, text=True,
+            )
+            if head.returncode != 0:
+                problems.append(f"{repo} is on a detached HEAD: check out a branch to commit")
+    if problems:
+        for line in problems:
+            print(f"trioctl: metrics refresh refused: {line}", file=sys.stderr)
+        print("trioctl: nothing was changed", file=sys.stderr)
+        return 2
+    print(f"release metrics set: {directory} ({pin})")
+    for repo in targets:
+        (repo / "metrics").mkdir(exist_ok=True)
+        changed: list[str] = []
+        lines: list[str] = []
+        for name in METRICS_SET:
+            dest = repo / "metrics" / name
+            new = (directory / name).read_bytes()
+            old = dest.read_bytes() if dest.is_file() else None
+            lines.append(_metrics_diff_line(f"metrics/{name}", old, new))
+            if old != new:
+                tmp = dest.with_name(f".{name}.refresh-{os.getpid()}")
+                tmp.write_bytes(new)
+                with contextlib.suppress(OSError):
+                    os.chmod(tmp, (directory / name).stat().st_mode & 0o777)
+                os.replace(tmp, dest)
+                changed.append(f"metrics/{name}")
+        print(f"{repo}:")
+        for line in lines:
+            print(line)
+        if not changed:
+            print("  already current; nothing to commit")
+            continue
+        if not getattr(args, "commit", False):
+            print("  not committed (pass --commit to commit these files)")
+            continue
+        add = subprocess.run(
+            ["git", "-C", str(repo), "add", "--", *changed], capture_output=True, text=True,
+        )
+        commit = add if add.returncode != 0 else subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m",
+             f"chore: vendor trio loop core ({pin})", "--", *changed],
+            capture_output=True, text=True,
+        )
+        if commit.returncode != 0:
+            print(f"trioctl: metrics refresh: commit failed in {repo}: "
+                  f"{(commit.stderr or commit.stdout).strip()}", file=sys.stderr)
+            return 3
+        sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        print(f"  committed {sha} on {branch}: chore: vendor trio loop core ({pin})")
+    return 0
 
 
 def command_land(args: argparse.Namespace) -> int:
@@ -9389,6 +9595,26 @@ def parser() -> argparse.ArgumentParser:
     )
     abandon.add_argument("--mailbox", type=Path, default=Path("loop"))
     abandon.set_defaults(func=command_abandon)
+
+    metrics_cmd = commands.add_parser(
+        "metrics", help="the repository's vendored loop core (metrics/)",
+    )
+    metrics_commands = metrics_cmd.add_subparsers(dest="metrics_command", required=True)
+    metrics_refresh = metrics_commands.add_parser(
+        "refresh",
+        help="copy this release's four metrics/ files into the repo (or every "
+        "repo of a `repos:` PLAN with --mailbox); --commit commits them",
+    )
+    metrics_target = metrics_refresh.add_mutually_exclusive_group()
+    metrics_target.add_argument("--repo", type=Path, default=None,
+                                help="repository to refresh (default: the current one)")
+    metrics_target.add_argument("--mailbox", type=Path, default=None,
+                                help="refresh the mailbox's repo and every declared repo")
+    metrics_refresh.add_argument(
+        "--commit", action="store_true",
+        help="commit `chore: vendor trio loop core (<pin>)` on each repo's current branch",
+    )
+    metrics_refresh.set_defaults(func=command_metrics_refresh)
 
     status = commands.add_parser(
         "status",

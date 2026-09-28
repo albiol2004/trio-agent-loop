@@ -207,6 +207,17 @@ aggregate and is refused by the r15 guard.
   the repository's metrics/ as a set ... and commit it to <target>, or pass
   --root-bound". Lockstep and `--root-bound` open-loop keep working with
   METRICS_API 4/5 cores.
+- Refresh with `trioctl omnigent metrics refresh [--repo <path>] [--commit]`
+  (with the target branch checked out): it copies this release's four
+  `metrics/` files (trio_loop.py, trio-metrics.py, trio-shadow.py,
+  trio-check.py) into the repository, prints a per-file diff summary, and
+  with `--commit` commits exactly those files as `chore: vendor trio loop
+  core (<pin>)` on the current branch. `--mailbox <mb>` covers the
+  mailbox's repository and every repo its PLAN.md `repos:` declares. A
+  dirty or untracked `metrics/` (or `--commit` on a detached HEAD) is
+  refused with exit 2 and nothing written. The installed trioctl reads the
+  set from `trio-release-metrics/` next to it (install.sh; `PIN` = release
+  commit), a release tree from its own `metrics/`.
 
 ## 11. Migrating mailboxes started before r16a
 
