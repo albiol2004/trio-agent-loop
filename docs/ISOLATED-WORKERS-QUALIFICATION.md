@@ -12,9 +12,11 @@ instead of sharing the driver's checkout:
   worktree, separate from builders/integration evaluator.
 - **Acceptance-bound retirement**: a worktree is removed only once accepted
   by the SHIP that binds it (`accepted_by.attempt`/`evaluated` must match).
-- **Root `.cursor` restore**: the driver root's `.cursor/mcp.json` and
-  `.cursor/hooks.json` are swapped out for the run and restored byte-for-byte
-  (hash + mode) afterward, with no leftover empty `.cursor` or store entries.
+- **Root untouched** (r16b; was "root `.cursor` restore"): no session runs
+  at the repository root any more (every loop runs in its own Lead
+  worktree, `docs/ROOT-FREE-OPEN-LOOP.md`), so the root's `.cursor`, tree
+  and index are never written before the land; the r9–r15 snapshot/restore
+  of the root `.cursor` was deleted in r16b.
 
 "Qualified" means a live run passes all 12 independent, read-only gates in
 `<lab>/live-qual/r7-live/verify_r7.py`: G1 candidate pin unmodified, G2
@@ -26,6 +28,16 @@ owner exit — may be NOT_COVERED), G8 no runners/sessions left at the broker,
 G9 root `.cursor` restored exactly, G10 monitor bounds/no violations, G11 no
 secrets in evidence, G12 one mailbox per root. Any FAIL fails the run;
 G6/G7 may be NOT_COVERED without failing it.
+
+**Gate changes since r16b** (root-free loops, both modes): **G9 is "root
+untouched"** — from start until the land the root's `git status
+--porcelain` (ignoring the driver's own `<mailbox>/.lock/`), `.git/index`
+mtime, HEAD and `.cursor/{mcp,hooks}.json` bytes are unchanged and no
+process with its cwd at the root is a Trio session (sampled every second);
+the land is exactly one fast-forward (or one CAS `update-ref`) of the
+target. **G12 (one mailbox per root) is dropped**: any number of loops
+(open-loop and lockstep) may run on one root, each on `trio/<slug>`;
+overlapping `writes:` are refused at start and otherwise meet at the land.
 
 ## 2. Three defects fixed on top of a241b8b
 
@@ -146,13 +158,16 @@ isolation stays OFF unless `--isolate-workers` is explicit.
   where the root is.
 - Isolation is implemented in trioctl only; it works with any loop core
   that trioctl accepts (qualified above with 3b5b93b's).
-- Default fallbacks (one stderr line, pre-r11 non-isolated run, serial
-  slice-evals): `worker_worktrees.py` missing, not a git checkout on a
-  branch, `--observe-workers` (both prescribe the worker command), or
-  session-bound Omnigent bindings in the user's/system Cursor config. With
-  an explicit `--isolate-workers` each of these is a refusal, as before;
-  that includes a detached HEAD (`--isolate-workers refused: checkout is
-  not on a branch (detached HEAD); ...`).
+- r16b: an open-loop runs root-free and root-free open-loop needs isolated
+  builders, so what used to be a silent fallback to a non-isolated
+  root-bound run is a refusal (exit 2, nothing changed): `--no-isolate-workers`,
+  `--observe-workers` (both prescribe the worker command), session-bound
+  Omnigent bindings in the user's/system Cursor config, a detached root
+  without `--target`; `worker_worktrees.py`/`root_free.py` missing is exit
+  3. A mailbox outside any git checkout still runs in place, non-isolated.
+  Lockstep keeps isolation OFF by default and runs root-free either way
+  (its builders then work in its Lead worktree); `--isolate-workers` opts
+  in (builders branch from and merge into `trio/<slug>`).
 - An explicit `--slice-eval-concurrency N>1` without isolation is refused.
 - Dirty-checkout gate (`worker_worktrees.classify_aggregate`, checked at
   builder dispatch and again at integration), for status entries outside
@@ -220,10 +235,11 @@ file is discarded with the worktree (no restore step, nothing to race).
 (`cursor_config_write`). The record lists the paths as `neutralised_cursor`.
 The guard is unchanged for everything else: an UNTRACKED foreign config, a
 symlinked `.cursor`, a non-regular index entry or unparsable JSON is never
-touched and still refuses the worktree. At the aggregate root a tracked
-config modified ONLY by session-bound Omnigent entries (the Lead launch's
-merge) is listed as ignored by the dirty-checkout gate instead of blocking
-dispatch as a foreign change; any other edit to it still blocks.
+touched and still refuses the worktree. The Lead worktree (r16) gets the
+same neutralisation plus `skip-worktree`, so the Lead's own Omnigent launch
+never shows in its `git status` either (r16b removed the root-only
+"Omnigent-only change of a tracked config is ignored" rule of the
+dirty-checkout gate: no session launches at a root checkout any more).
 
 ### Declared product repos (r15)
 

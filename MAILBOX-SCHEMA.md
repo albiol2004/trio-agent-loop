@@ -50,8 +50,8 @@ In addition to `schema: 1`, a v1 STATE.md must define these top-level fields
 - `max_iterations` — hard budget cap for the loop.
 - `status` — current loop status (e.g. `ready`, `running`; driver-set
   terminal values include `shipped`, `blocked`, `error`, `needs_human`,
-  `needs_retirement` and, for root-free open-loop runs, `needs_land` —
-  see "Root-free open-loop (r16)").
+  `needs_retirement` and, for root-free runs (every loop in a git
+  checkout since r16b), `needs_land` — see "Root-free loops (r16)").
 - `mission` — the first sentence of GOAL.md's mission, verbatim; the
   orchestrator halts if it ever stops matching GOAL.md.
 
@@ -898,12 +898,13 @@ per-repo `full_check:` command that leaves its repo is refused too. A home
 slice that writes into an undeclared nested clone still gets the exact
 single-repo line above. `repos: []` equals no block.
 
-### Root-free open-loop (r16)
+### Root-free loops (r16)
 
-`trioctl omnigent loop` on an open-loop mailbox (QUEUE.md present) runs
-**root-free** by default (`--root-bound` restores pre-r16 behaviour;
-lockstep mailboxes stay root-bound). Operator guide:
-`docs/ROOT-FREE-OPEN-LOOP.md`.
+`trioctl omnigent loop` runs every mailbox inside a git checkout
+**root-free**: open-loop (QUEUE.md present) since r16a, lockstep since
+r16b. `--root-bound` was removed in r16b (refused, exit 2, with a pointer
+to `land`/`abandon`); a mailbox outside any git checkout runs in place.
+Operator guide: `docs/ROOT-FREE-OPEN-LOOP.md`.
 
 - **Live mailbox.** The driver creates (or re-attaches) the loop's Lead
   worktree `<worktree_root>/lead-<slug>` on branch `trio/<slug>`, forked
@@ -920,42 +921,56 @@ lockstep mailboxes stay root-bound). Operator guide:
   registry" below); `<live mailbox>/.sessions/aggregates.json` maps each
   declared `repos:` entry to its per-run aggregate on `trio/<slug>`.
   Integration fences live under `<common>/trio-worktrees/fences/<branch-slug>/`.
+- **Root mailbox lock** (eval-r16rc-b M1): the driver holds the root
+  mailbox's `.lock` (the loop core's `.lock/{owner,pid}` protocol) from
+  before it creates anything until after the cleanup, so a lock-only driver
+  (native core, pre-r16 release) on the same mailbox refuses; it is never
+  seeded or landed.
+- **Lockstep (r16b).** Lead, repair and Evaluator all run in the Lead
+  worktree (the Evaluator still grades in its own `git worktree add` at
+  the pin and makes its SHIP retirement commit in its workspace, i.e. on
+  `trio/<slug>`); builders run non-isolated in the Lead worktree unless
+  `--isolate-workers`. After this run's SHIP the driver (trioctl, no core
+  change) lands exactly as for open-loop; a `reverify` sets
+  `phase: lead-done` with the pin cleared so one fresh Evaluator grades the
+  merged tip. A live Lead worktree whose STATE is `needs_land` or `shipped`
+  without `landed:` resumes at the land. The prompts carry a `ROOT-FREE
+  (this lockstep loop runs in its own Lead worktree)` block.
 - **STATE.md keys** (driver-owned, root-free runs only): `target_ref:`
   (branch it lands onto), `target_base:` (target sha at fork), `landed:`
   (verified loop-branch sha that landed). Status `needs_land`. Phases:
   `landing`, `landed`, `land-blocked`, `land-conflict`, `land-starved`,
-  `land-reverify`, `land-error`, `worktree-setup`, `driver-exception`.
+  `land-reverify` (open-loop), `land-error`, `worktree-setup`,
+  `driver-exception`.
 - **Land (SHIP only).** Under the repo-wide land lock, per aggregate
   (declared repos first, home last): a moved target is *merged* into the
   loop branch (never rebased); a conflict aborts → `needs_land` /
   `land-conflict`. A clean merge touching none of PLAN's `writes:`/`reads:`
-  runs `full_check:`; otherwise (or on failure) one new integration-eval
-  of the merged branch (`land-reverify`), at most 2 rounds, then
-  `land-starved`. The home land commits the live mailbox as `loop: land
+  runs `full_check:`; otherwise (or on failure) one new evaluation of the
+  merged branch (open-loop: integration-eval, `land-reverify`; lockstep:
+  Evaluator), at most 2 rounds, then `land-starved`. The home land commits the live mailbox as `loop: land
   <mailbox> (iteration N)` (`status: shipped`, `phase: landed`) and
   advances the target (`git merge --ff-only` where it is checked out, else
   a compare-and-swap `update-ref`); a refused fast-forward →
   `land-blocked`. Then runtime files are copied to the root mailbox, the
   worktrees removed (retained with a reason when unsafe) and `trio/<slug>`
   deleted unless `--keep-branch`.
-- **Root turn / overlap.** Nothing of a root-free loop runs at the root,
-  so its Lead and evaluations never take the r15.x root-turn lock
-  (`--root-bound` and lockstep runs, and root one-shots while such a loop
-  is live, still do). The cross-loop `writes:` refusal applies as in every
-  mode at start: refused with exit 2 before anything is created. Mid-run
-  (an overlap that appears at a later Lead pass, e.g. the other loop's
-  Lead widened its PLAN) a root-free loop only warns -- one LOG line per
-  overlap naming the other loop and the paths, `.driver.json`
+- **Overlap.** Nothing runs at the root (the r15.x root-turn lock, the
+  root stranger check and exit 9 were removed in r16b). The cross-loop
+  `writes:` refusal applies at start: refused with exit 2 before anything
+  is created. Mid-run (an overlap that appears at a later Lead pass, e.g.
+  the other loop's Lead widened its PLAN) a loop only warns -- one LOG
+  line per overlap naming the other loop and the paths, `.driver.json`
   `writes_overlap: [...]` -- and continues: its private aggregate is never
   shared, and the land merges and re-verifies the other loop's change (a
   real conflict ends in `needs_land`/`land-conflict`) (eval-r16rc N4).
-  Root-bound and lockstep loops still stop that pass with exit 5
-  (`phase: writes-overlap`).
 - **Exit codes**: see "Driver exit codes" below (0 means verified AND
   landed; **8 needs_land** resumes with `trioctl omnigent land --mailbox <x>`).
 - **Compat**: root-free needs METRICS_API 6 in the repository's committed
   `metrics/` at the target tip; an older set is refused (exit 3, nothing
-  changed). Lockstep and `--root-bound` keep working with API 4/5.
+  changed), lockstep included since r16b (no root-bound fallback). A
+  gitignored mailbox protocol file or brief is refused (exit 3) before
+  anything, the root lock included, is touched.
 
 ## Session sidecar
 
@@ -980,27 +995,27 @@ the dirty-checkout gate or the untracked-product scan.
 
 | Exit | STATE.md `status` | Meaning |
 |---|---|---|
-| 0 | `shipped` | SHIP accepted (retirement complete); root-free: verified **and landed** (`phase: landed`) |
-| 1 | unchanged, or `error` (`phase: driver-exception`) | root-bound/lockstep trioctl error; a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
-| 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository, any mode (STATE untouched; root-bound: one LOG line; root-free: stderr only, nothing created); or a refused flag combination (`--root-free` unmet, `--root-bound` on a root-free mailbox) |
-| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
+| 0 | `shipped` | SHIP accepted (retirement complete) and, root-free, landed (`phase: landed`); also a root mailbox that is already `shipped` (nothing run, r16b) |
+| 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error of a mailbox outside any git checkout (run in place); a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
+| 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository (stderr only, nothing created); or a refused flag combination (`--root-bound`, removed in r16b; an open-loop without isolated builders; a detached root without `--target`; `--root-free` outside git) |
+| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
-| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict or a Lead-pass stop (`phase: writes-overlap`, r15.x; root-bound/lockstep only -- root-free warns, eval-r16rc N4); or the mailbox is owned by a live driver (left byte-identical; root-free also reads the root mailbox's `.lock`, eval-r16rc B1) |
+| 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict; or the mailbox is owned by a live driver (left byte-identical; a registered driver, or a live pid in the root mailbox's `.lock`, eval-r16rc B1/M1). (r15.x's Lead-pass `writes-overlap` stop was removed in r16b: a mid-run overlap warns) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
 | 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
 | 8 | `needs_land` | root-free (r16): the verified loop branch could not land (`phase: land-blocked`, `land-conflict`, `land-starved`, `land-error`); resume with `trioctl omnigent land --mailbox <x>` |
-| 9 | `needs_human`, `phase: root-occupied`, `reason: root-occupied` | a cursor-agent Trio does not own kept the aggregate root's `.cursor` slot past `TRIO_ROOT_STRANGER_WAIT_S` (r15.x); the LOG line names pid, cwd, start, parents, cmd |
+| 9 | — | retired in r16b (r15.x `root-occupied`: nothing runs at the root any more) |
 | 130 | unchanged | interrupted (SIGINT/SIGTERM) |
 
 `reason:` (r15.x) is a driver-owned STATE.md line written with a driver
-stop (`root-occupied`, `writes-overlap`, `driver-exception`) and removed
-when the loop is resumed. See docs/CONCURRENT-SLICE-EVAL.md "Many loops
-per repo (interim, r15.x)".
+stop (`driver-exception`; `root-occupied` and `writes-overlap` from older
+releases) and removed when the loop is resumed. See
+docs/CONCURRENT-SLICE-EVAL.md "Many loops per repo".
 
 ### Live-loop registry
 
-Every `trioctl omnigent loop` driver (root-bound, lockstep and root-free)
-writes ONE record `<git common dir>/trio-worktrees/loops/<slug>.json`
+Every `trioctl omnigent loop` driver in a git checkout (open-loop and
+lockstep, both root-free since r16b) writes ONE record `<git common dir>/trio-worktrees/loops/<slug>.json`
 (`slug` as for the Lead worktree, from the root mailbox path) while it
 runs, and removes it at exit (only while its own pid still owns it; a
 crashed driver's record is ignored once its pid identity is dead). Keys
@@ -1008,18 +1023,17 @@ crashed driver's record is ignored once its pid identity is dead). Keys
 
 | Key | Meaning |
 |---|---|
-| `schema`, `slug`, `mode` | `1`; the loop slug; `root-bound`, `lockstep` or `root-free` |
+| `schema`, `slug`, `mode` | `1`; the loop slug; `root-free` (open-loop) or `lockstep` (both root-free since r16b; `root-bound` only in records of older releases) |
 | `root` | the repository root the loop belongs to (realpath) |
 | `mailbox`, `mailbox_rel` | the root mailbox (absolute, and relative to `root`) |
 | `live_mailbox` | where the driver reads/writes it (= `mailbox`, or the Lead worktree copy) |
-| `lead_worktree`, `branch`, `target_ref` | root-free only (else `null`) |
+| `lead_worktree`, `branch`, `target_ref` | the Lead worktree, `trio/<slug>`, the target (`null` only in records of older root-bound runs) |
 | `aggregates` | `{repo name: aggregate checkout}` (`home` + each declared repo) |
 | `pid`, `pid_start`, `started_at` | driver identity (pid + `/proc` start ticks), ISO start time |
 | `writes_by_repo` | `{repository identity: [writes...]}`; identity = the repository's main checkout (realpath), the same for every worktree of it |
 
 A second driver for a mailbox that has a live record exits 5. Readers:
-the cross-loop `writes:` refusal, root one-shots (only root-bound and
-lockstep records take the root turn), `trioctl omnigent status`
+the cross-loop `writes:` refusal and mid-run warning, `trioctl omnigent status`
 (`driver`), `abandon`, `aggregate_for`, and the dashboard board
 (`live_driver` per loop card, via `trio-metrics.py:live_driver`).
 
@@ -1067,6 +1081,18 @@ exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
 absence is never a violation.
 
 ## Changelog
+
+- **r16b** (no METRICS_API bump: no loop-core change): lockstep runs
+  root-free (Lead, repair and Evaluator in the Lead worktree; the land is
+  driven by trioctl with the open-loop rules and exit 8); `--root-bound`
+  removed (refused, exit 2); an open-loop without isolated builders is
+  refused instead of falling back; exit 9 `root-occupied` retired with the
+  r15.x root-turn lock, the root stranger check and the root `.cursor`
+  snapshot/restore/session records; a mid-run `writes:` overlap only warns
+  in every mode; registry `mode` is `root-free` or `lockstep`; a root-free
+  driver holds the root mailbox `.lock` for its whole run (eval-r16rc-b M1)
+  and refuses any gitignored protocol file or brief before touching it
+  (L2/L3); an already `shipped` root mailbox is a no-op (exit 0).
 
 - **r16-rc** (merge of r15-fixes, r15.x and r16a): one live-loop
   registry record for every mode ("Live-loop registry"; replaces r15.x's

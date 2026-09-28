@@ -259,82 +259,44 @@ its repo's root. The integration eval pins one sha per repo
 (`evaluated_repos` in STATE.md, `evaluated: home@<sha>, <repo>@<sha>` in
 VERDICT.md) and fences worker merges in every repo while it grades.
 
-## Many loops per repo (interim, r15.x)
+## Many loops per repo (r16b: every loop root-free)
 
-Until r16 gives every loop its own aggregate worktree, all loops of one
-repository share the root checkout and its single project Cursor slot
-(`.cursor/mcp.json` + `hooks.json`, read by every cursor-agent whose
-nearest `.git` ancestor is the root). r15.x makes Trio serialise itself
-there instead of crashing, and makes the non-Trio case fail clearly. It
-does **not** make N loops on one branch correct: builder merges, the dirty
-gate, the shared index and SHIP acceptance still see each other (r16
-DESIGN C7-C12). In particular a tracked mailbox of another live loop, or a
-user's untracked file at the root, is still a product change to this
-loop's SHIP acceptance (`needs_retirement`, exit 6).
+Since r16b every loop in a git checkout -- open-loop and lockstep -- runs
+in its own Lead worktree on `trio/<slug>` (`docs/ROOT-FREE-OPEN-LOOP.md`),
+so N loops on one repository no longer share an aggregate, an index or a
+project Cursor slot (r16 DESIGN C1-C12). The r15.x interim machinery was
+removed: the root-turn lock (`$XDG_STATE_HOME/trio-agent-loop/root-turn/`,
+`TRIO_ROOT_TURN_*`), the one-shot root turn, the foreign-cursor-agent
+("stranger") wait at the root (`TRIO_ROOT_STRANGER_WAIT_S`) and its exit
+**9** / `phase: root-occupied`, and the mid-run writes-overlap stop for
+root-bound/lockstep loops. What remains:
 
-- **Root-turn lock.** One per-user `flock` per aggregate root:
-  `$XDG_STATE_HOME/trio-agent-loop/root-turn/<sha256(realpath)[:24]>.lock`
-  (`TRIO_ROOT_TURN_LOCK_DIR` overrides; files of vanished roots are
-  pruned at loop start like `cwd-locks/`). Line 1 is `<pid> <root>`,
-  line 2 the JSON holder record (`pid`, `pid_start`, `mailbox`, `role`,
-  `kind`, `since`, `argv0`). The kernel releases it when the holder dies.
-  - Held by a loop for every root-bound role turn: a Lead or repair pass
-    for its whole turn (its session is now **ended at turn end**, not left
-    idle at the root); a root-bound evaluator (lockstep eval, integration
-    eval) from dispatch until its integration fence is released (the next
-    Lead/repair dispatch, or loop end), so `_finalize_ship` runs inside
-    the turn; a degraded (root-bound) slice-eval, joining its runner's
-    turn when held. Re-entrant per runner.
-  - Held by a non-isolated `trioctl omnigent run <role>` one-shot for its
-    whole run (own process group, drained after exit) when its
-    `--workspace` Cursor root is the aggregate root of a live loop
-    (registry below). A one-shot started from inside a root session (a
-    cursor-agent at that root is its ancestor: the turn holder's own
-    scouts/builders) or naming the holder's mailbox shares that turn.
-  - Never taken by isolated builders, bound slice-evals or `run --isolate`
-    (own worktree, own slot).
-  - Waits are bounded: `TRIO_ROOT_TURN_WAIT_S` (default 3900 s) for loop
-    dispatches, `TRIO_ROOT_TURN_ONESHOT_WAIT_S` (default 900 s) for
-    one-shots; a stderr line names the holder at the start and every
-    `TRIO_ROOT_TURN_PROGRESS_S` (60 s); a loop wait longer than that adds
-    one `- iter N | loop | root turn: <kind> waited Ns ...` LOG line and
-    accumulates `root_turn_wait_s` in `.driver.json`. flock is not FIFO.
-  - An integration eval / lockstep eval that had to wait is re-pinned
-    through the loop core's own binding helper when another loop's turn
-    moved the product meanwhile (the core pins before it dispatches).
-- **Root one-shots share the root's `.cursor` slot.** A headless one-shot
-  at the root loads whatever Omnigent session config is in the root slot;
-  that is why it takes the turn while a loop is live. Its cwd is now
-  always `--workspace` (never the caller's cwd).
-- **Foreign cursor-agent at the root** (the user's own session, an older
-  Trio, a leaked process -- now also one started in a subdirectory of the
-  root): a root-bound dispatch waits up to `TRIO_ROOT_STRANGER_WAIT_S`
-  (default 300 s, a stderr line every 30 s), then stops cleanly: STATE
-  `status: needs_human`, `phase: root-occupied`, `reason: root-occupied`,
-  one LOG line naming pid, cwd, start time, parent chain and command,
-  `.driver.json` `lead_alive`/`eval_alive` false, exit **9**. Close it and
-  resume with `trioctl omnigent loop --mailbox <mb>` (the `reason:` line is
-  dropped on resume). Proceeding without Omnigent's config rewrite is not
-  safe and is not offered.
+- **Root one-shots.** A headless `trioctl omnigent run <role>` runs with
+  its physical cwd = `--workspace` (never the caller's cwd). No Trio session
+  runs at a root, so a one-shot there shares the root's `.cursor` slot with
+  the user's own config only: it takes no lock and never waits.
+- **Root mailbox lock.** A root-free driver holds its root mailbox's
+  `.lock` (the loop core's lock) for its whole run (eval-r16rc-b M1), so a
+  lock-only driver (native core, older release) on the same mailbox
+  refuses, and vice versa (exit 5).
 - **Driver exceptions** from any dispatch (e.g. the integration eval)
   never leave STATE `running`: `status: error`, `phase: driver-exception`,
   `reason: driver-exception`, one LOG line, sidecars not alive; sessions,
-  fences, the root turn and the mailbox lock are released; the exception
-  still exits 1 as before (a root-free run exits 3 through the same
-  mechanism). A held dispatch keeps its `needs_human` STATE.
-- **Overlapping `writes:` across live loops are refused.** Each driver
-  writes one record `<git common dir>/trio-worktrees/loops/<mailbox-slug>.json`
-  (removed at exit; stale when the pid identity is dead; one schema for
-  root-bound, lockstep and root-free loops -- MAILBOX-SCHEMA "Live-loop
-  registry"). At loop start and at every Lead/repair pass, this mailbox's
-  PLAN.md `writes:` are compared per repository (every worktree of a repo
-  counts as that repo, so root-free loops are compared too) with every
-  other live loop's (prefix-covering either way). Start: refused with exit 2, naming the other mailbox and the exact
-  overlapping paths (one LOG line, STATE untouched). Mid-run: root-bound
-  and lockstep loops do not dispatch the pass (STATE `needs_human` /
-  `writes-overlap`, exit 5); a root-free loop warns (one LOG line per
-  overlap, `.driver.json` `writes_overlap`) and continues, its land merging
-  and re-verifying the other loop's change (eval-r16rc N4).
+  fences and both mailbox locks are released; exit 3 (a mailbox outside
+  any git checkout, run in place, still exits 1). A held dispatch keeps its
+  `needs_human` STATE.
+- **Overlapping `writes:` across live loops.** Each driver writes one
+  record `<git common dir>/trio-worktrees/loops/<mailbox-slug>.json`
+  (removed at exit; stale when the pid identity is dead; one schema --
+  MAILBOX-SCHEMA "Live-loop registry"; `mode` `root-free` for open-loop,
+  `lockstep` for lockstep). At loop start this mailbox's PLAN.md `writes:`
+  are compared per repository (every worktree of a repo counts as that
+  repo) with every other live loop's (prefix-covering either way): an
+  overlap is refused with exit 2, naming the other mailbox and the exact
+  paths (stderr only, nothing created). At every Lead/repair pass an
+  overlap that appeared mid-run only warns (one LOG line per overlap,
+  `.driver.json` `writes_overlap`) and the loop continues; its land merges
+  and re-verifies the other loop's change (eval-r16rc N4).
   `TRIO_ALLOW_OVERLAPPING_LOOPS=1` (or `--allow-overlapping-writes`)
-  proceeds with a LOG warning. Loops of an older release are not in the
-  registry (only the stranger check sees their sessions).
+  proceeds at start with a LOG warning. Loops of a pre-r16 release are not
+  in the registry; they hold the root mailbox `.lock` only.
