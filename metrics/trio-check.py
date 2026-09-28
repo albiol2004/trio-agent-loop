@@ -412,16 +412,31 @@ TARGETED_CHECK_HEADING_RE = re.compile(
     r"^(?:#{2,6}\s+targeted\s+checks?\b.*|\*\*targeted\s+checks?\b[^*]*\*\*.*)$",
     re.IGNORECASE,
 )
+# eval-r15 N8: label (not heading) spellings -- `__Targeted check__` and a
+# plain `Targeted check:` line (optionally a list item). A label line's own
+# text after the label is part of its section (`Targeted check: `cd x``).
+TARGETED_CHECK_LABEL_RE = re.compile(
+    r"^(?:[-*+]\s+)?(?:\*\*|__)?targeted\s+checks?(?![a-z0-9])[^:*_\n]*"
+    r"(?::(?:\*\*|__)?|(?:\*\*|__):?)(?P<rest>.*)$",
+    re.IGNORECASE,
+)
 HEADING_RE = re.compile(r"^#{1,6}\s")
 _ARG = r"""("[^"]*"|'[^']*'|[^\s;&|)`'"]+)"""
 _SEP = r"""(?:^|&&|\|\||;|\(|`|\s)"""
-# cwd-changing commands: `cd <dir>` / `pushd <dir>`.
-CD_RE = re.compile(_SEP + r"(?:cd|pushd)\s+" + _ARG)
+# cwd-changing commands: `cd <dir>` / `pushd <dir>`, with `cd`'s own
+# options and an end-of-options `--` skipped (eval-r15 N8: `cd -- <dir>`).
+CD_RE = re.compile(
+    _SEP + r"(?:cd|pushd)\s+(?:-[LPe@]+\s+)*(?:--\s+)?" + _ARG
+)
 # Commands that run in a named directory without changing the shell's cwd:
-# `git -C <dir>`, `make -C <dir>`, `--rootdir/--prefix/--cwd[= ]<dir>`.
+# `git -C <dir>`, `make -C <dir>`, `env -C <dir>`, `npm -C <dir>`,
+# `pnpm -C|--dir <dir>`, `poetry -C <dir>`,
+# `--rootdir/--prefix/--cwd/--directory/--chdir[= ]<dir>` (`uv run
+# --directory`, `env --chdir`; eval-r15 N8).
 TARGET_DIR_RE = re.compile(
-    _SEP + r"(?:(?:git|make)\s+-C\s+" + _ARG
-    + r"|--(?:rootdir|prefix|cwd)(?:=|\s+)" + _ARG + ")"
+    _SEP + r"(?:(?:git|make|env|npm|pnpm|poetry)\s+-C(?:=|\s+)" + _ARG
+    + r"|pnpm\s+--dir(?:=|\s+)" + _ARG
+    + r"|--(?:rootdir|prefix|cwd|directory|chdir)(?:=|\s+)" + _ARG + ")"
 )
 # A shell comment: ` # ...` to end of line (never inside the command).
 COMMENT_RE = re.compile(r"(?:^|\s)#(?:\s|$).*$")
@@ -521,6 +536,15 @@ def targeted_check_lines(text: str) -> list[str]:
         stripped = line.strip()
         if TARGETED_CHECK_HEADING_RE.match(stripped):
             inside = True
+            label = TARGETED_CHECK_LABEL_RE.match(stripped)
+            if label and label.group("rest").strip():
+                section.append(label.group("rest"))
+            continue
+        label = TARGETED_CHECK_LABEL_RE.match(stripped)
+        if label:
+            inside = True
+            if label.group("rest").strip():
+                section.append(label.group("rest"))
             continue
         if inside and HEADING_RE.match(stripped):
             inside = False
@@ -541,7 +565,8 @@ def command_dirs(lines: list[str]) -> list[tuple[str, str]]:
 
     kind `cd` changes the working directory of the rest of the command
     (`cd`, `pushd`); kind `target` names a directory without changing it
-    (`git -C`, `make -C`, `--rootdir`, `--prefix`, `--cwd`). Shell comments
+    (`git`/`make`/`env`/`npm`/`pnpm`/`poetry` `-C`, `pnpm --dir`, `--rootdir`,
+    `--prefix`, `--cwd`, `--directory`, `--chdir`). Shell comments
     are ignored; inline-code backticks are separators.
     """
     found: list[tuple[int, str, str]] = []
@@ -550,7 +575,7 @@ def command_dirs(lines: list[str]) -> list[tuple[str, str]]:
         for m in CD_RE.finditer(line):
             found.append((index * 10_000 + m.start(), "cd", _unquote_arg(m.group(1))))
         for m in TARGET_DIR_RE.finditer(line):
-            arg = m.group(1) or m.group(2)
+            arg = next(g for g in m.groups() if g is not None)
             found.append((index * 10_000 + m.start(), "target", _unquote_arg(arg)))
     return [(kind, arg) for _pos, kind, arg in sorted(found)]
 
@@ -759,15 +784,31 @@ def _declared_plan_problems(
 
 
 def _full_check_lines(plan_text: str) -> list[str]:
-    """The PLAN.md `full_check:` value lines (key line + indented follow-ups)."""
+    """The PLAN.md `full_check:` value lines (key line + indented follow-ups).
+
+    A block mapping continues across blank lines while the next non-blank
+    line is another indented `<repo>: <cmd>` item (eval-r15 N4), matching
+    trio-metrics' ``_full_check_section``.
+    """
+    item = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*\s*:\s+\S")
     lines = plan_text.splitlines()
     for index, raw in enumerate(lines):
         m = re.match(r"^full_check\s*:\s*(.*)$", raw)
         if not m:
             continue
         out = [m.group(1)]
-        for follow in lines[index + 1:]:
-            if not follow.strip() or not follow[:1].isspace():
+        follow_lines = lines[index + 1:]
+        for pos, follow in enumerate(follow_lines):
+            if not follow.strip():
+                nxt = next((ln for ln in follow_lines[pos + 1:] if ln.strip()), "")
+                if (
+                    not out[0].strip() and len(out) > 1 and nxt[:1].isspace()
+                    and item.match(nxt.strip())
+                    and all(item.match(ln.strip()) for ln in out[1:])
+                ):
+                    continue
+                break
+            if not follow[:1].isspace():
                 break
             out.append(follow)
         return out

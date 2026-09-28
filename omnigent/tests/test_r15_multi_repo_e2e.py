@@ -199,6 +199,10 @@ class Scenario:
         self.dispatch_views: list[dict] = []
         self.pins: dict | None = None
         self.retire_shas: dict[str, str] = {}
+        # eval-r15 N7: a test that asserts overlapping slice-evals sets a
+        # Barrier here; every eval then waits inside for all the others, so
+        # overlap is guaranteed instead of timed (a broken barrier fails).
+        self.overlap_barrier: threading.Barrier | None = None
 
     # --- Lead -----------------------------------------------------------
     def _worker(self, role, config, *, prompt, workspace, timeout=None, events=None,
@@ -277,7 +281,10 @@ class Scenario:
             assert ctx.get("repo") == sl["repo"]
             assert f"MULTI-REPO: slice `{sl['id']}` belongs to the declared repo `{sl['repo']}`" in prompt
             assert "(a checkout of the declared repo" in prompt
-        time.sleep(0.4)
+        if self.overlap_barrier is not None:
+            self.overlap_barrier.wait()
+        else:
+            time.sleep(0.4)
         with self.lock:
             with (self.l["box"] / "VERDICT.md").open("a") as fh:
                 fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n")
@@ -374,6 +381,9 @@ def test_multi_repo_open_loop_ships_with_per_repo_worktrees_pins_and_retirement(
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     scenario = Scenario(layout, wt, trioctl, root)
+    # Every slice is retired in one Lead pass and slice_eval_concurrency
+    # covers them all, so all evals must be inside at once (eval-r15 N7).
+    scenario.overlap_barrier = threading.Barrier(len(layout["slices"]), timeout=120)
     runner = _runner(trioctl, layout, scenario, root, monkeypatch)
     try:
         code = core.run_loop(box, 5, runner, repo=home, poll_seconds=0.01,

@@ -34,9 +34,17 @@ from typing import Protocol
 # this constant predates that contract (treated as 1). Bump on any change
 # a caller must not silently run against. (r15 multi-repo is additive --
 # a `repo` key in slice-eval contexts, `pins` in integration contexts, the
-# `evaluated_repos` STATE.md key -- and is gated by the sibling
-# trio-metrics.py METRICS_API 5, so this stays 2.)
+# `evaluated_repos` STATE.md key -- and is gated by METRICS_API 5, so
+# this stays 2.)
 LOOP_CORE_API = 2
+
+# The METRICS_API contract this core itself implements (eval-r15 N3). 5 =
+# r15 multi-repo: per-repo pins, retire checks and SHIP retirement. The
+# sibling trio-metrics.py carries its own METRICS_API; trioctl takes the
+# lower of the two, so a partial refresh (an older core next to a newer
+# trio-metrics.py) is never trusted with a `repos:` mailbox. A core without
+# this constant predates r15.
+METRICS_API = 5
 
 def _load_metrics_module():
     path = Path(__file__).resolve().with_name("trio-metrics.py")

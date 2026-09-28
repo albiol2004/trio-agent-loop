@@ -5469,7 +5469,16 @@ class OmnigentRunner:
                 self._fence_tokens.pop(token, None)
             repos = {token: self._fence_repos.pop(token, self.repo) for token in tokens}
         for token in tokens:
-            worker_worktrees.release_fence(repos[token], token)
+            # eval-r15 N5: each token on its own -- one vanished repo must
+            # not leak the fences of the others.
+            try:
+                worker_worktrees.release_fence(repos[token], token)
+            except Exception as exc:  # noqa: BLE001 - release the rest
+                print(
+                    f"trioctl: could not release merge fence {token} in "
+                    f"{repos[token]}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     def release_all_fences(self) -> None:
         """Loop end: no evaluation of this runner can still be running."""
@@ -5834,9 +5843,19 @@ def _check_loop_core_api(path: Path) -> None:
 
 
 def _core_metrics_api(loop_core: Any) -> int:
-    """METRICS_API of the metrics module a loaded loop core runs on (1 = unmarked)."""
+    """METRICS_API a loaded loop core can honour (1 = unmarked).
+
+    The lower of the core's own ``METRICS_API`` marker and its sibling
+    metrics module's (eval-r15 N3): a core that predates r15 carries no
+    marker and counts as below ``MULTI_REPO_METRICS_API`` even next to a
+    refreshed trio-metrics.py.
+    """
     value = getattr(getattr(loop_core, "_METRICS", None), "METRICS_API", 1)
-    return value if isinstance(value, int) else 1
+    metrics_api = value if isinstance(value, int) else 1
+    core_api = getattr(loop_core, "METRICS_API", None)
+    if not isinstance(core_api, int):
+        core_api = min(metrics_api, MULTI_REPO_METRICS_API - 1)
+    return min(metrics_api, core_api)
 
 
 def _old_core_repos_refusal(mailbox: Path, loop_core: Any) -> str | None:

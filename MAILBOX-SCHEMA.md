@@ -153,8 +153,9 @@ for the iteration:
   `full_check: cd api && npm test && npm run typecheck`. With declared
   `repos:` (r15) it may instead be a per-repo mapping -- flow
   `full_check: { app-backend: "pytest -q", home: "make test" }` or
-  indented `<repo>: <command>` lines -- each command run from its repo's
-  root; a plain string stays the home repo's command. Optional
+  indented `<repo>: <command>` lines (blank lines between them are
+  allowed) -- each command run from its repo's root; a plain string stays
+  the home repo's command. Optional
   `full_check_budget_s: <n>` overrides the default 120 s wall-clock budget.
   In open-loop the Lead's whole-tree gate after the last retirement is
   proportional: skipped when no product code changed since the last
@@ -816,7 +817,10 @@ checkout is on another branch.
   per-repo dispatch and `slice(<id>):` commits; the Evaluator's pin list,
   `evaluated:` line and empty per-repo SHIP commits), only when PLAN.md
   declares `repos:`; single-repo lockstep prompts are unchanged.
-- **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`;
+- **Compat**: needs METRICS_API 5 in the repository's vendored `metrics/`
+  -- in the loop core itself (`trio_loop.py` `METRICS_API = 5`) and in its
+  `trio-metrics.py`; trioctl takes the lower of the two, so a partial
+  refresh (an older core next to a newer trio-metrics.py) is refused too;
   `trioctl` still drives a METRICS_API 4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it (loop `status: error`, nothing
   dispatched).
@@ -842,10 +846,14 @@ slice <id> writes outside the mailbox repo (<path>); declare it in PLAN.md repos
 ```
 
 The brief scan covers every targeted-check section (`##`-`######
-Targeted check[s][ (...)]` headings and a bold `**Targeted check:**`
-label, each up to the next heading), `cd`/`pushd` in plain lines, fenced
-blocks and inline code, and the directories named by `git -C`, `make -C`,
-`--rootdir`, `--prefix` and `--cwd`; shell comments are ignored. A glob in
+Targeted check[s][ (...)]` headings, and a `**Targeted check:**`,
+`__Targeted check__` or plain `Targeted check:` label line together with
+the text after the label, each up to the next heading), `cd`/`pushd`
+(also `cd -- <dir>`, `cd -P <dir>`) in plain lines, fenced blocks and
+inline code, and the directories named by `git`/`make`/`env`/`npm`/
+`pnpm`/`poetry` `-C`, `pnpm --dir`, `--rootdir`, `--prefix`, `--cwd`,
+`--directory` (`uv run --directory`) and `--chdir`; shell comments are
+ignored. A glob in
 `writes:` is checked against every existing match of each path prefix.
 PLAN.md's own targeted-check sections and `full_check:` commands are
 scanned from the repo root (refusal line `PLAN.md targeted/full check runs
@@ -948,7 +956,11 @@ absence is never a violation.
   5)`) still drives a vendored API-4 set for single-repo mailboxes and
   refuses a `repos:` PLAN with it; `trio-check.py` requires 5. The r15
   guard's "not supported" refusal is lifted; the undeclared-path refusal
-  stays.
+  stays. eval-r15 fixes: `trio_loop.py` carries its own `METRICS_API = 5`
+  (trioctl takes the lower of core and metrics); SHIP retirement and pin
+  reuse verify from the STATE.md pins; the driver holds retired entries
+  whose `repo:` disagrees with PLAN.md or whose sha is not a commit of
+  their repo.
 - **r15 guard** (no METRICS_API bump; lives in `trio-check.py` and
   `trioctl`, not the loop core): slices writing outside the mailbox repo
   and any PLAN.md `repos:` block are refused ("Repo scope (r15 guard)").

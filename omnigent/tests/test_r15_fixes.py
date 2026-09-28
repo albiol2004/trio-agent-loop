@@ -31,10 +31,7 @@ def _run(env, layout, scenario_cls, monkeypatch, *, iters=2, conc=3):
             slice_eval_concurrency=conc,
         )
     finally:
-        try:
-            runner.release_all_fences()
-        except FileNotFoundError:
-            pass  # a vanished clone's fence (eval-r15 N5, fixed separately)
+        runner.release_all_fences()
     return code, scenario, runner
 
 
@@ -499,3 +496,104 @@ def test_n9_old_core_refusal_wording(env, tmp_path, monkeypatch):
     monkeypatch.setattr(trioctl, "__file__", str(tmp_path / "bin" / "trioctl"))
     assert "installed from" in trioctl._bundled_metrics_hint()
     assert "/metrics" not in trioctl._bundled_metrics_hint()
+
+
+# --- N3: API marker in the loop core itself ---------------------------------
+
+
+def test_n3_old_core_next_to_new_metrics_is_refused_for_repos(env, tmp_path):
+    _tmp, _wt, trioctl, core = env
+    layout = E._layout(tmp_path, "B")
+    box = layout["box"]
+    assert core.METRICS_API == 5 and trioctl._core_metrics_api(core) == 5
+    assert trioctl._old_core_repos_refusal(box, core) is None
+    # repro test_q2_oldcore.py::test_mixed_old_loop_new_metrics_accepts_repos:
+    # a pre-r15 trio_loop.py (no core marker) next to a METRICS_API 5
+    # trio-metrics.py.
+    old_core = type("OldCore", (), {"_METRICS": core._METRICS})()
+    assert trioctl._core_metrics_api(old_core) == 4
+    line = trioctl._old_core_repos_refusal(box, old_core)
+    assert line and "METRICS_API 4; multi-repo needs 5" in line
+    # A new core next to an API-4 trio-metrics.py is refused as before.
+    new_core_old_metrics = type(
+        "Mixed", (), {"METRICS_API": 5, "_METRICS": type("M", (), {"METRICS_API": 4})}
+    )()
+    assert trioctl._core_metrics_api(new_core_old_metrics) == 4
+
+
+# --- N4: full_check: mapping across blank lines -----------------------------
+
+
+def test_n4_full_check_mapping_continues_across_blank_lines(env, tmp_path):
+    _tmp, _wt, trioctl, core = env
+    tm = core._METRICS
+    text = ("full_check:\n  app-backend: python3 -m pytest -q\n\n"
+            "  app-frontend: npx vitest run\n\nnext: 1\n")
+    assert tm.parse_full_check(text) == (
+        {"app-backend": "python3 -m pytest -q", "app-frontend": "npx vitest run"}, [])
+    # A string command still ends at its first blank line.
+    assert tm.parse_full_check("full_check: pytest -q\n\n  prose\n") == ({"home": "pytest -q"}, [])
+    # The guard now sees (and scope-checks) the repo after the blank line.
+    layout = E._layout(tmp_path, "B")
+    box = layout["box"]
+    plan = (box / "PLAN.md").read_text()
+    plan = plan.replace("  app-frontend: npx vitest run\n",
+                        "\n  app-frontend: cd /tmp && npx vitest run\n")
+    (box / "PLAN.md").write_text(plan)
+    refused = trioctl._repo_scope_refusals(box)
+    assert any("full_check: command of repo app-frontend runs outside" in r for r in refused), refused
+
+
+# --- N5: one vanished repo; healthy repos stay independent ------------------
+
+
+class VanishBeforeEvals(E.Scenario):
+    """repro test_q6.py::VanishBeforeEvals: app-frontend moves away right
+    after the Lead pass retired every slice."""
+
+    def lead(self, iteration, prompt):
+        super().lead(iteration, prompt)
+        if iteration == 1:
+            d = self.l["repos"]["app-frontend"]["path"]
+            shutil.move(str(d), str(self.l["home"].parent / "moved-away-fe"))
+
+    def slice_eval(self, ctx, workspace, prompt):
+        with self.lock:
+            self.__dict__.setdefault("eval_ws", {})[ctx["slice"]] = Path(workspace)
+        super().slice_eval(ctx, workspace, prompt)
+
+
+def test_n5_vanished_repo_does_not_send_healthy_slice_evals_home(env, monkeypatch, tmp_path):
+    layout = E._layout(tmp_path, "B")
+    code, scenario, runner = _run(env, layout, VanishBeforeEvals, monkeypatch)
+    assert code != 0
+    assert "status: shipped" not in _state(layout)
+    ws = scenario.eval_ws
+    backend = layout["repos"]["app-backend"]["path"]
+    # be-a is graded in a worktree of app-backend, never on the home path.
+    common = git(ws["be-a"], "rev-parse", "--path-format=absolute", "--git-common-dir")
+    assert Path(common) == (backend / ".git").resolve()
+    assert "fe-b" not in ws  # its repo is gone: held, never graded elsewhere
+    assert not getattr(runner, "eval_isolation_degraded", None)
+
+
+def test_n5_release_fences_releases_every_repo_despite_a_vanished_one(env, tmp_path, capsys):
+    _tmp, wt, trioctl, _core = env
+    layout = E._layout(tmp_path, "B")
+    backend = layout["repos"]["app-backend"]["path"]
+    frontend = layout["repos"]["app-frontend"]["path"]
+    runner = trioctl.OmnigentRunner(
+        repo=layout["home"], broker_client=E._Client(), config={}, interval=0,
+        workspace=str(layout["home"]),
+    )
+    tokens = {}
+    for path in (frontend, backend):  # the vanishing repo's token first
+        token = wt.acquire_fence(path, reason="test")
+        tokens[path] = token
+        runner._fence_tokens[token] = True
+        runner._fence_repos[token] = path
+    shutil.move(str(frontend), str(tmp_path / "gone-fe"))
+    runner.release_all_fences()
+    assert "could not release merge fence" in capsys.readouterr().err
+    assert not runner._fence_tokens
+    assert not any(wt._fence_dir(backend).glob("*")), "app-backend fence leaked"
