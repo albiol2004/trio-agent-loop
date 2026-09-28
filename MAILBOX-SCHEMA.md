@@ -692,15 +692,29 @@ never an accept on their own.
 `trio-check.py` lints every `accepts:` item of a v1 mailbox's PLAN.md
 (quality findings, printed under the mailbox):
 
-- `REJECT` — free text with no `->` and no `oracle:` tag, or a banned
-  phrase standing alone;
-- `WARN` — an `oracle:` tag without an `input -> observable`, an
-  `input -> observable` without an `oracle:` tag, or an unknown oracle
-  kind.
+- `REJECT` — free text with no relation and no `oracle:` tag, or a banned
+  phrase standing alone. A relation is `->`, `==`/`=`/`!=`/`<`/`>`/`<=`/`>=`,
+  a bare HTTP status code (`401 {error:..}`, `429 is rate_limited`), or a
+  relation word (`is`, `returns`, `equals`, `match(es)`, `exactly`,
+  `identical`, `unchanged`, `vs`, `renders`, `refuses`, ...) together with
+  an observable (a number, a quoted/bracketed literal, an identifier with
+  `_`/`()`/inner capitals, an ALLCAPS token, `None`/`null`/`true`). `->` is
+  then optional: "hung binary returns None in under 4 s" is a `WARN` (no
+  oracle tag), not a `REJECT`;
+- `WARN` — an `oracle:` tag without a relation, a relation without an
+  `oracle:` tag, or an unknown oracle kind;
+- `static-config` — an accept about a static config artifact (compose,
+  nginx, Dockerfile, systemd units, tsconfig, yaml/toml/ini) that is the
+  deployed artifact. It is checked by parsing it (yaml load, `nginx -t`,
+  `docker compose config` when available), is never a `REJECT` and never a
+  tautology, but a slice whose accepts are ALL static-config gets a `WARN`
+  to pair them with one runtime accept.
 
 In r18a the findings are advisory: they never change the exit code
 unless `--strict-quality` is passed (then a `REJECT` is a violation, exit
-1). r18b makes `REJECT` a violation by default.
+1, except in a finished mailbox — STATE `status:`/`phase:` SHIP, shipped,
+landed, done, complete, abandoned or stopped — whose PLAN is history). r18b
+makes `REJECT` a violation by default.
 
 ### Per-slice verdicts in VERDICT.md
 
@@ -758,17 +772,26 @@ prints it. Telemetry only; nothing is gated in r18a.
 
 **Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
 builder, trioctl runs a deterministic AST/regex lint (no model call) over
-the slice's changed test files: `in` checks of a one- or two-character
-literal, `or`-chains of `in` checks, string presence on text read from a
-file, presence-only `is_file()`/`exists()` asserts, tests that read
-`results/`/`evidence/` or run `--verify-only`, tests that import none of
-the slice's product modules, TypeScript `toContain` over `readFileSync`
-text, and a `tsc -p` over a tsconfig with `files: []`. The flags are
+the slice's changed test files: `in` / `toContain` checks of a zero- or
+one-character literal (two characters on file text), `or`-chains of `in`
+checks that are negative or run on file text, string presence on text read
+from a file (names scoped per function; an HTTP response body or a file the
+test's own action just wrote is runtime output, not file text),
+presence-only `is_file()`/`exists()` asserts, tests whose file reads name a
+`results/`/`evidence/` path or run `--verify-only`, tests that import none
+of the slice's product modules (module and package names; tests that run
+the product by subprocess / importlib / a script path, or read it, are
+exempt), TypeScript `toContain` over a `readFileSync` variable, and a
+`tsc -p` over a tsconfig with `files: []`. String presence on a static
+config artifact (compose, nginx, Dockerfile, systemd, tsconfig, yaml, ...)
+is the separate `static-config` category — not a tautology flag unless the
+test file has no runtime check at all. The flags are
 `verification_flags` in the builder JSON and ledger record and a
 `PRE-GATE FLAGS` block ("the following tests look tautological; grade
 them explicitly") in the slice-eval's OPEN-LOOP CONTEXT. `trio-check.py`
 applies the same lint to the mailbox's own test files and the test files
-slices declare in `writes:` (`quality: WARN test looks tautological`).
+slices declare in `writes:` (`quality: WARN test looks tautological`);
+nested repos / worktrees under the mailbox (declared repos) are skipped.
 
 ### `## Independent probe` (whole-goal verdicts, r18a)
 

@@ -973,13 +973,57 @@ def repo_scope_refusals(
 
 ORACLE_KINDS = ("value", "property", "diff", "refusal", "static", "rerun")
 _ORACLE_TAG_RE = re.compile(r"(?:^|\||\s)oracle\s*:\s*([A-Za-z_-]*)", re.IGNORECASE)
-# `input -> observable`: an arrow, or an (in)equality between two sides.
+# `input -> observable`: an arrow, or an (in)equality / comparison between
+# two sides (`==`, `=`, `!=`, `<=`, `>=`, `<`, `>`).
 _RELATION_RE = re.compile(
-    r"->|\u2192|=>|==|!=|<=|>=|(?<![<>!=:])=(?!=)"
-    # `X is {months:[8]}` / `close month is 7` / `echoes [11,12]`: a precise
-    # observable (C6) without the arrow -- a WARN (no oracle), not a REJECT.
-    r"|\b(?:is|are|equals?|returns?|echoes|prints?|exits?)\s+[{\[\"'`\d-]"
+    r"->|→|=>|==|!=|<=|>=|(?<![<>!=:])=(?!=)|(?<![-=<])>(?![=>])|\s<\s"
 )
+# A relation word (C6, eval-r18a lint table): "returns None", "is not_found",
+# "equals raw gold", "match build_bridge(...)", "exactly 0", "byte-identical
+# to cd2cc8e", "232/.../4 unchanged", "close 7 vs 8". It counts as a relation
+# only together with an observable (below), so "the page is fine" stays free
+# text; `->` is then optional (a WARN for the missing oracle tag, not REJECT).
+_RELATION_WORD_RE = re.compile(
+    r"\b(?:is|are|was|equals?|returns?|match(?:es)?|exactly|identical|unchanged"
+    r"|echo(?:es)?|prints?|exits?|yields?|gives?|responds?|vs\.?|raises?|renders?|shows?"
+    r"|emits?|sends?|posts?|maps?|records?|stores?|refuses?|rejects?)\b",
+    re.IGNORECASE,
+)
+# An observable: a number, a quoted / backticked / bracketed literal, an
+# identifier with `_`, `()` or inner capitals, an ALLCAPS token (3+), or
+# None/null/true/false.
+_OBSERVABLE_RE = re.compile(
+    r"\d|['\"`{\[]|\b[A-Za-z]\w*_\w+|\b\w+\(|\b[a-z]+[A-Z]\w*|\b[A-Z]{3,}\b"
+    r"|\b(?:None|null|nil|true|false|True|False|NaN)\b"
+)
+# A bare HTTP status code is itself an observable relation ("401 {error:..}
+# when missing", "upstream 429 is rate_limited").
+_HTTP_STATUS_RE = re.compile(
+    r"(?<![\w.-])(?:200|201|202|204|301|302|303|304|307|308|400|401|403|404|405|406|409"
+    r"|410|412|413|415|422|423|429|500|501|502|503|504)(?![\w.-])"
+)
+# Static config artifacts (compose, nginx, Dockerfile, systemd, tsconfig,
+# yaml/toml/ini): an accept or a test ABOUT their content is `static-config`
+# -- not a tautology, but it must be paired with one runtime check (parse
+# it: yaml load / `nginx -t` / `docker compose config`, or a behavioural
+# accept/test on the same slice / file).
+STATIC_CONFIG_RE = re.compile(
+    r"(?:^|[/\s(`'\"])(?:(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml|Dockerfile[\w.-]*|[\w.-]+\.service"
+    r"|[\w.-]+\.timer|nginx[\w.-]*\.conf|[\w.-]*\.conf|tsconfig[\w.-]*\.json|[\w.-]+\.ya?ml"
+    r"|[\w.-]+\.toml|[\w.-]+\.ini|[\w.-]+\.tf|requirements[\w.-]*\.txt|package\.json"
+    r"|runtime-deps|Caddyfile|\.env(?:\.[\w-]+)?)(?=$|[\s)`'\",;:])"
+    r"|\b(?:docker[- ]compose|compose file|nginx|Dockerfile|systemd(?: units?)?|tsconfig)\b",
+    re.IGNORECASE,
+)
+
+
+def accept_relation(head: str) -> bool:
+    """True when an accept (sans oracle tag) states a checkable relation."""
+    if _RELATION_RE.search(head) or _HTTP_STATUS_RE.search(head):
+        return True
+    return bool(_RELATION_WORD_RE.search(head) and _OBSERVABLE_RE.search(head))
+
+
 _BANNED_ACCEPT_RE = re.compile(
     r"^\s*(?:(?:all|the|existing|other)\s+)*(?:tests?|suite|checks?)?\s*"
     r"(?:pass(?:es)?|works?|exists?|is\s+documented|documented|stays?\s+green|"
@@ -989,21 +1033,31 @@ _BANNED_ACCEPT_RE = re.compile(
 
 
 def accept_findings(text: str) -> list[tuple[str, str]]:
-    """(level, reason) findings for one `accepts:`/`goal_acceptance:` item."""
+    """(level, reason) findings for one `accepts:`/`goal_acceptance:` item.
+
+    Levels: REJECT (free text / banned phrase), WARN (half-formed), and
+    STATIC (a static-config accept: never a tautology finding on its own;
+    `quality_findings` WARNs when a slice has nothing but static accepts).
+    """
     item = str(text).strip()
     tag = _ORACLE_TAG_RE.search(item)
     head = item[: tag.start()] if tag else item
-    relation = bool(_RELATION_RE.search(head))
+    relation = accept_relation(head)
     if _BANNED_ACCEPT_RE.match(head.strip(" |")):
         return [("REJECT", "only says tests pass / works / exists / green; name an input -> observable")]
+    static = bool(STATIC_CONFIG_RE.search(head))
+    if static and not relation:
+        return [("STATIC", "static-config accept (checked by parsing the artifact); pair it with one runtime accept")]
     if not tag and not relation:
         return [("REJECT", "free text without an oracle; write `<input/action> -> <observable> | oracle: <kind>`")]
     out: list[tuple[str, str]] = []
+    if static:
+        out.append(("STATIC", "static-config accept"))
     if tag:
         kind = tag.group(1).lower()
         if kind not in ORACLE_KINDS:
             out.append(("WARN", f"unknown oracle kind {kind or '(empty)'!r} (one of {', '.join(ORACLE_KINDS)})"))
-        if not relation:
+        if not relation and not static:
             out.append(("WARN", "oracle tag without an `input -> observable`"))
     else:
         out.append(("WARN", "no `| oracle: <kind>` tag"))
@@ -1118,13 +1172,23 @@ def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     slices = tm.parse_slices_block(plan_text) or []
     for sl in slices:
-        for n, item in enumerate(sl.get("accepts") or [], 1):
-            for level, why in accept_findings(item):
-                out.append((level, f"slice {sl['id']} accept {n} {_clip(item)!r}: {why}"))
+        items = list(sl.get("accepts") or [])
+        static_only = bool(items)
+        for n, item in enumerate(items, 1):
+            found = accept_findings(item)
+            if not any(level == "STATIC" for level, _ in found):
+                static_only = False
+            for level, why in found:
+                if level != "STATIC":
+                    out.append((level, f"slice {sl['id']} accept {n} {_clip(item)!r}: {why}"))
+        if static_only:
+            out.append(("WARN", f"slice {sl['id']}: static-config accepts only; pair them with one "
+                                "runtime accept (parse / start / request the configured service)"))
     goal_items = _goal_acceptance_items(plan_text)
     for n, item in enumerate(goal_items or [], 1):
         for level, why in accept_findings(item):
-            out.append((level, f"goal_acceptance {n} {_clip(item)!r}: {why}"))
+            if level != "STATIC":
+                out.append((level, f"goal_acceptance {n} {_clip(item)!r}: {why}"))
     if (loop_dir / "QUEUE.md").is_file():
         if not _has_goal_probe(plan_text):
             out.append(("WARN", "no `goal_probe:` under `## Verification standard` (open-loop mailbox)"))
@@ -1162,46 +1226,195 @@ TEST_FILE_RE = re.compile(
 _RECEIPT_DIR_RE = re.compile(r"(?:^|/)(?:results|evidence)(?:/|$)")
 
 
+def _py_open_handles(tree) -> set[str]:
+    """Names bound to `open(...)` (`with open(p) as fh`, `fh = open(p)`)."""
+    import ast
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.withitem) and _is_open_call(node.context_expr) \
+                and isinstance(node.optional_vars, ast.Name):
+            names.add(node.optional_vars.id)
+        elif isinstance(node, ast.Assign) and _is_open_call(node.value):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+def _is_open_call(node) -> bool:
+    import ast
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "open")
+
+
 def _py_file_reader_funcs(tree) -> set[str]:
     """Module functions whose return value is a file's text (`_text(p)`)."""
     import ast
     names: set[str] = set()
+    handles = _py_open_handles(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             for sub in ast.walk(node):
-                if isinstance(sub, ast.Return) and _is_file_read(sub.value, set()):
+                if isinstance(sub, ast.Return) and _is_file_read(sub.value, set(), handles):
                     names.add(node.name)
     return names
 
 
-def _is_file_read(node, readers: set[str]) -> bool:
+def _is_file_read(node, readers: set[str], handles: set[str] | frozenset = frozenset()) -> bool:
+    """A call returning a file's text: `.read_text()`/`.read_bytes()`, a reader
+    helper, or `.read()` on an `open(...)` handle -- never an HTTP response's
+    `.read()` / `.decode()` (eval-r18a: response bodies are not file text)."""
     import ast
     if not isinstance(node, ast.Call):
         return False
     func = node.func
-    if isinstance(func, ast.Attribute) and func.attr in ("read_text", "read_bytes", "read"):
+    if isinstance(func, ast.Attribute) and func.attr in ("read_text", "read_bytes"):
         return True
+    if isinstance(func, ast.Attribute) and func.attr == "read":
+        target = func.value
+        return _is_open_call(target) or (isinstance(target, ast.Name) and target.id in handles)
     if isinstance(func, ast.Name) and func.id in readers:
         return True
     return False
 
 
-def python_test_flags(rel: str, text: str, product_modules: set[str] | None = None) -> list[str]:
-    """Advisory tautology flags for one Python test file (`<rel>:<line> why`)."""
+def _py_name_constants(tree) -> dict[str, set[str]]:
+    """name -> every string constant its assignments build on, followed
+    through other names (`RES = ROOT / "results"`; `p = RES / "r.txt"`)."""
+    import ast
+    direct: dict[str, set[str]] = {}
+    refs: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        consts = {x.value for x in ast.walk(node.value)
+                  if isinstance(x, ast.Constant) and isinstance(x.value, str)}
+        names = {x.id for x in ast.walk(node.value) if isinstance(x, ast.Name)}
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                direct.setdefault(t.id, set()).update(consts)
+                refs.setdefault(t.id, set()).update(names)
+    out = {k: set(v) for k, v in direct.items()}
+    for _ in range(6):
+        changed = False
+        for name, via in refs.items():
+            for other in via:
+                extra = out.get(other, set()) - out[name]
+                if extra and other != name:
+                    out[name] |= extra
+                    changed = True
+        if not changed:
+            break
+    return out
+
+
+def _expr_constants(node, name_consts: dict[str, set[str]]) -> set[str]:
+    import ast
+    found: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            found.add(sub.value)
+        elif isinstance(sub, ast.Name):
+            found |= name_consts.get(sub.id, set())
+    return found
+
+
+def _static_config_read(node, name_consts: dict[str, set[str]] | None = None) -> bool:
+    """The read's path names a static config artifact (compose, nginx, ...)."""
+    consts = _expr_constants(node, name_consts or {})
+    return any(STATIC_CONFIG_RE.search(" " + c.strip()) for c in consts)
+
+
+_PY_INERT_CALLS = frozenset({
+    "Path", "PurePath", "open", "read", "read_text", "read_bytes", "joinpath", "resolve",
+    "absolute", "exists", "is_file", "is_dir", "with_suffix", "with_name", "relative_to",
+    "encode", "decode", "strip", "rstrip", "lstrip", "lower", "upper", "splitlines", "split",
+    "replace", "format", "join", "len", "str", "int", "float", "bool", "sorted", "list",
+    "set", "dict", "tuple", "print", "getenv", "get", "dirname", "abspath", "startswith",
+    "endswith", "count", "index", "find", "isinstance", "any", "all", "enumerate", "range",
+})
+
+
+def _first_action_line(nodes) -> int | None:
+    """Line of the first call in a scope that DOES something (runs product
+    code, a runner, a subprocess): a file read after it is runtime output."""
+    import ast
+    best = None
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name is None or name in _PY_INERT_CALLS or name.startswith("assert"):
+            continue
+        line = getattr(node, "lineno", None)
+        if line is not None and (best is None or line < best):
+            best = line
+    return best
+
+
+def _py_scopes(tree):
+    """(scope node, its own statements' nodes) for the module and each
+    function; a function's nodes exclude nested function bodies."""
+    import ast
+
+    def own(node):
+        out = []
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            cur = stack.pop()
+            out.append(cur)
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            stack.extend(ast.iter_child_nodes(cur))
+        return out
+
+    scopes = [(tree, own(tree))]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scopes.append((node, own(node)))
+    return scopes
+
+
+_PY_RUNTIME_RE = re.compile(
+    r"\bsubprocess\b|\bos\.system\b|\brunpy\b|spec_from_file_location|import_module"
+    r"|\burlopen\b|\brequests\.|\bhttpx\.|TestClient\b"
+)
+
+
+def product_modules(paths) -> set[str]:
+    """Python product module names a test may import, from changed paths:
+    each non-test `.py` stem (hyphens as underscores) and its package dirs."""
+    out: set[str] = set()
+    for p in paths:
+        p = str(p)
+        if not p.endswith(".py") or _RECEIPT_DIR_RE.search(p) or TEST_FILE_RE.search(p) \
+                or re.search(r"(?:^|/)(?:tests?|__tests__)/|(?:^|/)conftest\.py$", p):
+            continue
+        parts = Path(p).with_suffix("").parts
+        for part in parts:
+            name = part.replace("-", "_")
+            if name.isidentifier() and name not in ("__init__", "src", "lib"):
+                out.add(name)
+    return out
+
+
+def python_test_findings(
+    rel: str, text: str, product_modules: set[str] | None = None,
+) -> list[tuple[str, str]]:
+    """(category, `<rel>:<line> why`) for one Python test file. Categories:
+    `tautology` (advisory flag) and `static-config` (string presence on a
+    static config artifact: not a tautology; flagged only when the file has
+    no runtime check at all)."""
     import ast
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return []
     readers = _py_file_reader_funcs(tree)
-    file_vars: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and _is_file_read(node.value, readers):
-            file_vars.update(t.id for t in node.targets if isinstance(t, ast.Name))
-    flags: list[str] = []
+    handles = _py_open_handles(tree)
+    out: list[tuple[str, str]] = []
 
-    def flag(node, why: str) -> None:
-        flags.append(f"{rel}:{getattr(node, 'lineno', 0)} {why}")
+    def flag(node, why: str, cat: str = "tautology") -> None:
+        out.append((cat, f"{rel}:{getattr(node, 'lineno', 0)} {why}"))
 
     def in_checks(expr) -> list:
         return [expr] if (
@@ -1209,36 +1422,115 @@ def python_test_flags(rel: str, text: str, product_modules: set[str] | None = No
             and isinstance(expr.ops[0], (ast.In, ast.NotIn))
         ) else []
 
+    name_consts = _py_name_constants(tree)
+
+    def bound(nodes, helpers: set[str] = frozenset()) -> tuple[set[str], set[str], set[str]]:
+        """(file-text names, static-config names, other names) assigned here.
+        A file read AFTER the scope ran something (a runner, product code)
+        is that action's runtime output, not static file text."""
+        files: set[str] = set()
+        static: set[str] = set()
+        other: set[str] = set()
+        acted = _first_action_line([n for n in nodes if not (
+            isinstance(n, ast.Call) and _is_file_read(n, readers, handles))])
+        for node in nodes:
+            if not isinstance(node, ast.Assign):
+                continue
+            names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if _is_file_read(node.value, readers, handles):
+                if acted is not None and node.lineno > acted:
+                    other.update(names)
+                elif _static_config_read(node.value, name_consts):
+                    static.update(names)
+                else:
+                    files.update(names)
+            else:
+                other.update(names)
+        return files, static, other - files - static
+
+    scopes = _py_scopes(tree)
+    mod_files, mod_static, _mod_other = bound(scopes[0][1])
     receipts = False
     verify_only = False
+    runtime_asserts = 0
+    static_hits: list[tuple[object, str]] = []
+    def receipt_const(sub) -> bool:
+        return isinstance(sub, ast.Constant) and isinstance(sub.value, str) and (
+            sub.value.strip("/") in ("results", "evidence")
+            or bool(re.search(r"(?:^|/)(?:results|evidence)/", sub.value.strip() + "/")))
+
+    # Receipt detection is path-based (eval-r18a): a file read whose path
+    # expression names results/ or evidence/ (directly or via a variable
+    # bound to such a path) -- never a "results" JSON key.
+    receipt_names: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if _RECEIPT_DIR_RE.search(node.value.strip("/")) or node.value in ("results", "evidence"):
-                receipts = True
-            if "--verify-only" in node.value:
-                verify_only = True
-        if not isinstance(node, ast.Assert):
-            continue
-        test = node.test
-        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
-            if sum(1 for v in test.values if in_checks(v)) >= 2:
-                flag(node, "or-chain of `in` checks (one disjunct may be satisfied by a header or constant)")
-            continue
-        for cmp_ in in_checks(test):
-            left, right = cmp_.left, cmp_.comparators[0]
-            if isinstance(left, ast.Constant) and isinstance(left.value, str):
-                if len(left.value) <= 2:
-                    flag(node, f"`{left.value!r} in ...` checks a {len(left.value)}-character literal")
-                elif isinstance(right, ast.Name) and right.id in file_vars:
-                    flag(node, f"string presence {left.value[:40]!r} on file text (`{right.id}`), not behaviour")
-        if isinstance(test, ast.Call) and isinstance(test.func, ast.Attribute) \
-                and test.func.attr in ("is_file", "exists", "is_dir"):
-            flag(node, f"presence-only check (`.{test.func.attr}()`)")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "--verify-only" in node.value:
+            verify_only = True
+        if isinstance(node, ast.Assign) and any(receipt_const(x) for x in ast.walk(node.value)):
+            receipt_names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    for scope, nodes in scopes:
+        files, static, other = bound(nodes)
+        if scope is not scopes[0][0]:
+            files = files | (mod_files - other - static)
+            static = static | (mod_static - other - files)
+        for node in nodes:
+            if isinstance(node, ast.Call) and _is_file_read(node, readers, handles):
+                for sub in ast.walk(node):
+                    if receipt_const(sub) or (isinstance(sub, ast.Name) and (
+                            sub.id in receipt_names or any(
+                                receipt_const(ast.Constant(value=c)) for c in name_consts.get(sub.id, ())))):
+                        receipts = True
+            if not isinstance(node, ast.Assert):
+                continue
+            test = node.test
+            if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+                disj = [c for v in test.values for c in in_checks(v)]
+                subjects = [c.comparators[0] for c in disj]
+                negative = any(isinstance(c.ops[0], ast.NotIn) for c in disj)
+                on_file = any(isinstance(x, ast.Name) and x.id in files for x in subjects)
+                if len(disj) >= 2 and (negative or on_file):
+                    flag(node, "or-chain of `in` checks (one disjunct may be satisfied by a header or constant)")
+                elif len(disj) >= 2 and all(isinstance(x, ast.Name) and x.id in static for x in subjects):
+                    static_hits.append((node, "or-chain"))
+                else:
+                    runtime_asserts += 1
+                continue
+            checks = in_checks(test)
+            if not checks:
+                runtime_asserts += 1
+            for cmp_ in checks:
+                left, right = cmp_.left, cmp_.comparators[0]
+                on_file = isinstance(right, ast.Name) and right.id in files
+                on_static = isinstance(right, ast.Name) and right.id in static
+                if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                    if len(left.value) <= 1 or (len(left.value) <= 2 and on_file):
+                        flag(node, f"`{left.value!r} in ...` checks a {len(left.value)}-character literal")
+                    elif on_file:
+                        flag(node, f"string presence {left.value[:40]!r} on file text (`{right.id}`), not behaviour")
+                    elif on_static:
+                        static_hits.append((node, left.value))
+                    else:
+                        runtime_asserts += 1
+                else:
+                    runtime_asserts += 1
+            if isinstance(test, ast.Call) and isinstance(test.func, ast.Attribute) \
+                    and test.func.attr in ("is_file", "exists", "is_dir"):
+                flag(node, f"presence-only check (`.{test.func.attr}()`)")
+    runtime = runtime_asserts > 0 or bool(_PY_RUNTIME_RE.search(text)) or bool(
+        re.search(r"\bself\.assert(?!In\b|NotIn\b)\w+\(", text))
+    for node, what in static_hits:
+        cat = "static-config"
+        why = f"static-config: string presence {str(what)[:40]!r} on a config artifact"
+        if not runtime:
+            cat = "tautology"
+            why += " with no runtime check in the file (parse it or run the service)"
+        flag(node, why, cat)
     if receipts:
-        flags.append(f"{rel}:1 reads receipts under results/ or evidence/ (a receipt is a claim, not an oracle)")
+        out.append(("tautology", f"{rel}:1 reads receipts under results/ or evidence/ (a receipt is a claim, not an oracle)"))
     if verify_only:
-        flags.append(f"{rel}:1 runs a `--verify-only` pass-flag reader")
+        out.append(("tautology", f"{rel}:1 runs a `--verify-only` pass-flag reader"))
     if product_modules:
+        mods = {m.replace("-", "_") for m in product_modules}
         imported: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -1247,39 +1539,75 @@ def python_test_flags(rel: str, text: str, product_modules: set[str] | None = No
                 imported.add(node.module)
                 imported.update(f"{node.module}.{a.name}" for a in node.names)
         parts = {seg for name in imported for seg in name.split(".")}
-        if not parts & product_modules:
-            flags.append(
+        # A module named in a string (subprocess `-m pkg.mod`, a script path,
+        # importlib) or a test that loads / runs / reads the product counts.
+        named = {w.replace("-", "_") for w in re.findall(r"[A-Za-z_][\w-]*", " ".join(
+            n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)))}
+        exercises = bool(_PY_RUNTIME_RE.search(text)) or any(
+            isinstance(n, ast.Call) and _is_file_read(n, readers, handles) for n in ast.walk(tree))
+        if not (parts | named) & mods and not exercises:
+            out.append((
+                "tautology",
                 f"{rel}:1 imports none of the slice's product modules "
-                f"({', '.join(sorted(product_modules))})"
-            )
-    return flags
+                f"({', '.join(sorted(product_modules))})",
+            ))
+    return out
+
+
+def python_test_flags(rel: str, text: str, product_modules: set[str] | None = None) -> list[str]:
+    """Advisory tautology flags for one Python test file (`<rel>:<line> why`)."""
+    return [msg for cat, msg in python_test_findings(rel, text, product_modules) if cat == "tautology"]
 
 
 _TS_READFILE_RE = re.compile(r"readFileSync\s*\(")
-_TS_TOCONTAIN_RE = re.compile(r"\.toContain\(\s*(['\"`])(.{0,2}?)\1\s*\)")
+_TS_TOCONTAIN_RE = re.compile(r"expect\(\s*([\w.$]+)[^;]*?\)\s*(?:\.not)?\.toContain\(\s*(['\"`])(.*?)\2\s*\)")
+_TS_FILE_VAR_RE = re.compile(r"(?:const|let|var)\s+([\w$]+)\s*(?::\s*[\w<>\[\]]+\s*)?=\s*(?:await\s+)?"
+                             r"(?:[\w.]*\.)?readFileSync\s*\(([^)]*)\)")
+_TS_FILE_READ_CALL_RE = re.compile(r"readFileSync\s*\(([^)]*)\)|readFile\s*\(([^)]*)\)")
+
+
+def ts_test_findings(rel: str, text: str) -> list[tuple[str, str]]:
+    """Regex equivalent for TypeScript/JavaScript tests: (category, flag)."""
+    out: list[tuple[str, str]] = []
+    file_vars: dict[str, bool] = {}          # name -> is a static config file
+    for m in _TS_FILE_VAR_RE.finditer(text):
+        file_vars[m.group(1)] = bool(STATIC_CONFIG_RE.search(" " + m.group(2)))
+    runtime = bool(re.search(r"\b(?:render|screen|fetch|request|supertest|spawn|exec|execFile)\b", text))
+    for n, line in enumerate(text.splitlines(), 1):
+        for m in _TS_TOCONTAIN_RE.finditer(line):
+            subject, literal = m.group(1), m.group(3)
+            static = file_vars.get(subject)
+            on_file = subject in file_vars or "readFileSync" in subject
+            if len(literal) <= 1 or (len(literal) <= 2 and on_file and not static):
+                out.append(("tautology", f"{rel}:{n} toContain of a {len(literal)}-character literal"))
+            elif on_file and static:
+                cat = "static-config" if runtime else "tautology"
+                out.append((cat, f"{rel}:{n} static-config: toContain over config text (`{subject}`)"
+                                 + ("" if runtime else " with no runtime check in the file")))
+            elif on_file:
+                out.append(("tautology", f"{rel}:{n} toContain over file text read with readFileSync, not behaviour"))
+        for m in _TS_FILE_READ_CALL_RE.finditer(line):
+            arg = m.group(1) or m.group(2) or ""
+            if re.search(r"(?:^|['\"`/])(?:results|evidence)/", arg):
+                out.append(("tautology", f"{rel}:{n} reads a receipt under results/ or evidence/"))
+    return out
 
 
 def ts_test_flags(rel: str, text: str) -> list[str]:
-    """Regex equivalent for TypeScript/JavaScript tests."""
-    flags: list[str] = []
-    reads = bool(_TS_READFILE_RE.search(text))
-    for n, line in enumerate(text.splitlines(), 1):
-        m = _TS_TOCONTAIN_RE.search(line)
-        if m and len(m.group(2)) <= 2:
-            flags.append(f"{rel}:{n} toContain of a {len(m.group(2))}-character literal")
-        if reads and ".toContain(" in line:
-            flags.append(f"{rel}:{n} toContain over file text read with readFileSync, not behaviour")
-        if _RECEIPT_DIR_RE.search(line) and ("readFileSync" in line or "readFile(" in line):
-            flags.append(f"{rel}:{n} reads a receipt under results/ or evidence/")
-    return flags
+    return [msg for cat, msg in ts_test_findings(rel, text) if cat == "tautology"]
+
+
+def test_file_findings(rel: str, text: str, product_modules: set[str] | None = None) -> list[tuple[str, str]]:
+    if rel.endswith(".py"):
+        return python_test_findings(rel, text, product_modules)
+    if re.search(r"\.[cm]?[jt]sx?$", rel):
+        return ts_test_findings(rel, text)
+    return []
 
 
 def test_file_flags(rel: str, text: str, product_modules: set[str] | None = None) -> list[str]:
-    if rel.endswith(".py"):
-        return python_test_flags(rel, text, product_modules)
-    if re.search(r"\.[cm]?[jt]sx?$", rel):
-        return ts_test_flags(rel, text)
-    return []
+    """Tautology flags only (static-config findings are not tautologies)."""
+    return [msg for cat, msg in test_file_findings(rel, text, product_modules) if cat == "tautology"]
 
 
 def empty_tsconfig_flag(root: Path, command: str | None) -> list[str]:
@@ -1302,11 +1630,19 @@ def mailbox_test_flags(loop_dir: Path, tm) -> list[str]:
     """L7 flags over the mailbox's own test files and the test files the
     slices declare in `writes:` (resolved in the mailbox repo)."""
     root = mailbox_repo_root(loop_dir) or loop_dir
-    files: list[Path] = [
-        p for p in sorted(loop_dir.rglob("*"))
-        if p.is_file() and TEST_FILE_RE.search(p.as_posix())
-        and "node_modules" not in p.parts and not any(part.startswith(".") for part in p.relative_to(loop_dir).parts)
-    ]
+    files: list[Path] = []
+    for top, dirs, names in os.walk(loop_dir):
+        # Nested repos / worktrees (declared repos under the mailbox) are not
+        # mailbox files: their suites would crowd out the mailbox's own tests.
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".") and d not in ("node_modules", "__pycache__")
+            and not os.path.lexists(os.path.join(top, d, ".git"))
+        )
+        for name in sorted(names):
+            p = Path(top) / name
+            if TEST_FILE_RE.search(p.as_posix()):
+                files.append(p)
     plan_text = _plan_text(loop_dir) or ""
     for sl in tm.parse_slices_block(plan_text) or []:
         for write in sl.get("writes") or []:
@@ -1405,8 +1741,24 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
         "refusals": refusals,
         "info": info,
         "quality": quality,
+        "finished": finished_mailbox(loop_dir),
         "ok": version == "v1" and not errors and not refusals,
     }
+
+
+_FINISHED_RE = re.compile(
+    r"^\s*(?:status|phase)\s*:\s*(?:SHIP|shipped|landed|done|complete|abandoned|stopped)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def finished_mailbox(loop_dir: Path) -> bool:
+    """A finished (shipped / landed / abandoned) mailbox: its PLAN is history,
+    so `--strict-quality` keeps its quality REJECTs advisory."""
+    try:
+        return bool(_FINISHED_RE.search((loop_dir / "STATE.md").read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return False
 
 
 def summarize(loops: list[dict]) -> dict:
@@ -1520,7 +1872,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.strict_quality:
         for loop in loops:
             rejects = [q for q in loop.get("quality", []) if q["level"] == "REJECT"]
-            if rejects:
+            if rejects and loop.get("finished"):
+                loop["info"] = loop["info"] + [
+                    f"--strict-quality: {len(rejects)} quality REJECT(s) kept advisory "
+                    "(finished mailbox: its PLAN is history)"
+                ]
+            elif rejects:
                 loop["errors"] = loop["errors"] + [
                     f"quality REJECT: {q['message']}" for q in rejects
                 ]

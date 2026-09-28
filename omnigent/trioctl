@@ -2081,11 +2081,10 @@ def _isolated_verification_flags(
         path = Path(record["path"])
         changed = _kill_changed_paths(path, str(record["base"]))
         tests = [p for p in changed if check.TEST_FILE_RE.search(p)]
-        modules = {
-            Path(p).stem for p in changed
-            if p.endswith(".py") and not _KILL_TEST_PATH_RE.search(p)
-            and not _KILL_NON_PRODUCT_RE.search(p) and Path(p).stem != "__init__"
-        }
+        modules = check.product_modules(
+            p for p in changed
+            if not _KILL_TEST_PATH_RE.search(p) and not _KILL_NON_PRODUCT_RE.search(p)
+        )
         flags: list[str] = []
         for rel in tests:
             try:

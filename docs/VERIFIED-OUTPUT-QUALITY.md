@@ -32,9 +32,15 @@ builder note).
 mailbox (and `quality` in `--json`): free-text accepts without an oracle
 (REJECT), half-formed accepts (WARN), open-loop mailboxes without
 `goal_probe:`/`goal_acceptance:` (WARN), code slices without `accepts:`
-(WARN), and a `full_check:` made only of artifact readers (WARN). The exit
-code is unchanged unless `--strict-quality` is passed (a REJECT is then a
-violation) -- r18b makes that the default.
+(WARN), and a `full_check:` made only of artifact readers (WARN). A
+relation is `->`, a comparison, a bare HTTP status code, or a relation word
+(`is`, `returns`, `equals`, `match(es)`, `exactly`, `identical`,
+`unchanged`, `vs`, ...) with an observable. Accepts about static config
+artifacts (compose, nginx, Dockerfile, tsconfig, yaml) are `static-config`:
+never a REJECT, but a slice with nothing else is told to pair them with one
+runtime accept. The exit code is unchanged unless `--strict-quality` is
+passed (a REJECT is then a violation, except in a finished mailbox) -- r18b
+makes that the default.
 
 ## Base-revert kill check (L2a, shadow)
 
