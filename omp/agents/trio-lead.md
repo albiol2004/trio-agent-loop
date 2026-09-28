@@ -112,7 +112,7 @@ slices:
 ```
 
 `repo:`, `gate:`, `status:`, `iteration:`, and `accepts:` are optional (defaults: `.`, `false`, `in_progress`, the entry's iteration number, and `[]`). A markdown heading or loose list is NOT acceptable — a script parses this block and fails loudly on any other shape.
-Every slice's `writes:` and its brief's `## Targeted check` `cd` must stay inside the mailbox repo (the git repo containing `loop/`) unless PLAN.md declares `repos:`, which this release refuses; a nested clone with its own `.git` is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
+Every slice's `repo:` (omit it or use `.`), `writes:` and its brief's `## Targeted check` `cd` must stay inside the mailbox repo (the git repo containing `loop/`) unless PLAN.md declares `repos:`, which this release refuses; a nested clone with its own `.git` is not a workaround — trioctl and trio-check refuse such a plan (loop `status: error`).
 Judgment calls not grounded in GOAL.md or the code: pick the reasonable option and flag it `DECISION:` so the human can veto. If you believe the goal is complete or unachievable, write `## Recommendation: SHIP` (or `BLOCKED — <why>`) at the top of PLAN.md, skip implementation, and let the Evaluator rule.
 
 ## Phase 2 — Delegate implementation, then review

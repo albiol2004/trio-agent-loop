@@ -746,8 +746,21 @@ yields exactly:
 slice <id> writes outside the mailbox repo (<path>); declare it in PLAN.md repos: (r15) or move the mailbox into that repo
 ```
 
+The brief scan covers every targeted-check section (`##`-`######
+Targeted check[s][ (...)]` headings and a bold `**Targeted check:**`
+label, each up to the next heading), `cd`/`pushd` in plain lines, fenced
+blocks and inline code, and the directories named by `git -C`, `make -C`,
+`--rootdir`, `--prefix` and `--cwd`; shell comments are ignored. A glob in
+`writes:` is checked against every existing match of each path prefix.
+PLAN.md's own targeted-check sections and `full_check:` commands are
+scanned from the repo root (refusal line `PLAN.md targeted/full check runs
+outside the mailbox repo (<path>); ...`). A `slices:` block that does not
+parse is refused (the guard fails closed); a symlink loop is treated as
+a path, never a crash.
+
 `trio-check.py` exits 2 with one such stderr line per slice (v1
-mailboxes). `trioctl omnigent loop` refuses before dispatching anything,
+mailboxes). `trioctl omnigent loop` refuses before dispatching anything (under the
+mailbox lock: a mailbox a live driver owns is left byte-identical, exit 5),
 and again around every Lead/repair pass: it appends `- iter N | loop |
 <line>` to LOG.md, sets STATE.md `status: error`, and exits 3.
 `trioctl omnigent run builder --isolate` checks its slice and its
@@ -756,7 +769,10 @@ and again around every Lead/repair pass: it appends `- iter N | loop |
 **`repos:` is reserved.** A PLAN.md fenced ```yaml block whose top-level
 key is `repos:` is parsed and validated (entries `- name:` kebab-case and
 unique, `path:` relative to the mailbox repo root or absolute, an existing
-git repo, optional `base:`; `home` is reserved for the mailbox repo) and
+git repo, optional `base:`; keys in any order or as a flow map
+`- {name: a, path: b}`; only `~` expands, never `$VARS`; two names may not
+share a path and a non-`home` name may not point at the mailbox repo;
+`home` is reserved for the mailbox repo) and
 then refused as a whole with `repos: declared but multi-repo slices are
 not supported by this release (r15 pending)` — same exits as above — so
 no loop half-uses it. `repos: []` equals no block.

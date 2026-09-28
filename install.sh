@@ -220,6 +220,10 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     cp "$ROOT/omnigent/reconcile.py" "$TRIOCTL_BIN_DIR/reconcile.py"
     cp "$ROOT/omnigent/worker_worktrees.py" "$TRIOCTL_BIN_DIR/worker_worktrees.py"
     cp "$ROOT/omnigent/worker_events.py" "$TRIOCTL_BIN_DIR/worker_events.py"
+    # The r15 repo-scope guard: trioctl loads its own release's checker
+    # (sibling first), never a repository's vendored metrics/.
+    cp "$ROOT/metrics/trio-check.py" "$TRIOCTL_BIN_DIR/trio-check.py"
+    cp "$ROOT/metrics/trio-metrics.py" "$TRIOCTL_BIN_DIR/trio-metrics.py"
     cp "$ROOT/omnigent/trioctl.example.toml" "$TRIOCTL_BIN_DIR/trioctl.example.toml"
     chmod +x "$TRIOCTL_BIN_DIR/trioctl"
     "$TRIOCTL_BIN_DIR/trioctl" omnigent configure --config "$TRIOCTL_CONFIG"

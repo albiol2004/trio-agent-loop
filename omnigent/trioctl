@@ -1044,13 +1044,28 @@ class RepoScopeRefusal(TrioctlError):
         self.lines = lines
 
 
+def _trio_check_candidates() -> list[Path]:
+    """Where this release's trio-check.py lives, in lookup order.
+
+    An installed trioctl (install.sh: ``$TRIOCTL_BIN_DIR``) has trio-check.py
+    and trio-metrics.py as siblings; a source/release tree has them in
+    ``<root>/metrics/`` next to ``<root>/omnigent/trioctl`` (eval-r15a F1).
+    """
+    here = Path(__file__).resolve().parent
+    return [here / "trio-check.py", here.parent / "metrics" / "trio-check.py"]
+
+
 def _load_trio_check() -> Any:
-    """This release's metrics/trio-check.py with its sibling trio-metrics."""
+    """This release's trio-check.py with its sibling trio-metrics.py."""
     if _TRIO_CHECK:
         return _TRIO_CHECK[0]
-    path = Path(__file__).resolve().parent.parent / "metrics" / "trio-check.py"
-    if not path.is_file():
-        raise TrioctlError(f"r15 repo-scope guard unavailable: {path} is missing")
+    candidates = _trio_check_candidates()
+    path = next((c for c in candidates if c.is_file()), None)
+    if path is None:
+        raise TrioctlError(
+            "r15 repo-scope guard unavailable: trio-check.py is missing "
+            f"(tried {', '.join(str(c) for c in candidates)})"
+        )
     loader = importlib.machinery.SourceFileLoader("trio_check_r15", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     if spec is None or spec.loader is None:
@@ -1127,7 +1142,11 @@ def _refuse_repo_scope(
     lines = _repo_scope_refusals(mailbox)
     if not lines:
         return
-    _mark_repo_scope_refused(mailbox, lines, iteration)
+    # eval-r15a F8: label with STATE.md's committed iteration, so an
+    # open-loop refusal never logs the uncommitted candidate N+1 before the
+    # driver's own `iter N` line.
+    del iteration
+    _mark_repo_scope_refused(mailbox, lines)
     for line in lines:
         print(f"trioctl: {line}", file=sys.stderr)
     raise RepoScopeRefusal(
@@ -5729,10 +5748,23 @@ def _command_loop(args: argparse.Namespace) -> int:
     _prune_same_cwd_locks()
     loop_core = _load_trio_loop(repo)
     # r15 guard: a PLAN that already writes outside the mailbox repo (or
-    # declares `repos:`) is refused before anything is dispatched.
+    # declares `repos:`) is refused before anything is dispatched -- under
+    # the mailbox lock (eval-r15a F2): a mailbox a live driver owns is left
+    # byte-identical (exit 5, as the loop core itself refuses it).
     refused = _repo_scope_refusals(mailbox)
     if refused:
-        _mark_repo_scope_refused(mailbox, refused)
+        acquire = getattr(loop_core, "_acquire_lock", None)
+        release = getattr(loop_core, "_release_lock", None)
+        lock = acquire(mailbox) if callable(acquire) else None
+        if callable(acquire) and lock is None:
+            for line in refused:
+                print(f"trioctl: {line}", file=sys.stderr)
+            return 5
+        try:
+            _mark_repo_scope_refused(mailbox, refused)
+        finally:
+            if callable(release):
+                release(lock)
         for line in refused:
             print(f"trioctl: {line}", file=sys.stderr)
         return 3

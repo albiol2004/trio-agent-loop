@@ -27,8 +27,10 @@ and when the sibling trio-metrics.py has a different METRICS_API.
 from __future__ import annotations
 
 import argparse
+import glob
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -385,15 +387,32 @@ R15_UNSUPPORTED = (
     "release (r15 pending)"
 )
 REPOS_KEY_RE = re.compile(r"^repos\s*:\s*(.*)$")
-REPOS_ENTRY_RE = re.compile(r"^\s+-\s+name\s*:\s*(.*)$")
+REPOS_ENTRY_RE = re.compile(r"^\s+-\s+(.*)$")
 REPOS_FIELD_RE = re.compile(r"^\s+([a-z_]+)\s*:\s*(.*)$")
 REPOS_KEYS = ("name", "path", "base")
 REPO_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 HOME_REPO = "home"
-TARGETED_CHECK_HEADING_RE = re.compile(r"^##\s+targeted check\s*$", re.IGNORECASE)
-CD_RE = re.compile(
-    r"""(?:^|&&|\|\||;|\(|\s)cd\s+("[^"]*"|'[^']*'|[^\s;&|)]+)"""
+# `## Targeted check`, `### Targeted checks`, `## Targeted check (backend)`,
+# or a bold `**Targeted check:**` label line (eval-r15a F3). Every such
+# section is scanned, up to the next markdown heading.
+TARGETED_CHECK_HEADING_RE = re.compile(
+    r"^(?:#{2,6}\s+targeted\s+checks?\b.*|\*\*targeted\s+checks?\b[^*]*\*\*.*)$",
+    re.IGNORECASE,
 )
+HEADING_RE = re.compile(r"^#{1,6}\s")
+_ARG = r"""("[^"]*"|'[^']*'|[^\s;&|)`'"]+)"""
+_SEP = r"""(?:^|&&|\|\||;|\(|`|\s)"""
+# cwd-changing commands: `cd <dir>` / `pushd <dir>`.
+CD_RE = re.compile(_SEP + r"(?:cd|pushd)\s+" + _ARG)
+# Commands that run in a named directory without changing the shell's cwd:
+# `git -C <dir>`, `make -C <dir>`, `--rootdir/--prefix/--cwd[= ]<dir>`.
+TARGET_DIR_RE = re.compile(
+    _SEP + r"(?:(?:git|make)\s+-C\s+" + _ARG
+    + r"|--(?:rootdir|prefix|cwd)(?:=|\s+)" + _ARG + ")"
+)
+# A shell comment: ` # ...` to end of line (never inside the command).
+COMMENT_RE = re.compile(r"(?:^|\s)#(?:\s|$).*$")
+GLOB_CHARS = frozenset("*?[")
 
 
 def repo_scope_message(slice_id: str, path) -> str:
@@ -401,6 +420,14 @@ def repo_scope_message(slice_id: str, path) -> str:
     return (
         f"slice {slice_id} writes outside the mailbox repo ({path}); declare "
         "it in PLAN.md repos: (r15) or move the mailbox into that repo"
+    )
+
+
+def plan_scope_message(path) -> str:
+    """The r15 refusal line for a PLAN.md-level targeted/full check."""
+    return (
+        f"PLAN.md targeted/full check runs outside the mailbox repo ({path}); "
+        "declare it in PLAN.md repos: (r15) or move the mailbox into that repo"
     )
 
 
@@ -485,12 +512,32 @@ def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], li
             continue
         m = REPOS_ENTRY_RE.match(raw)
         if m:
-            entries.append({"name": _yaml_scalar(m.group(1)), "line": i})
+            # A new list item: `- name: x` (any first key) or a flow map
+            # `- {name: x, path: y}`; keys may come in any order.
+            body = m.group(1).strip()
+            entry: dict = {"line": i}
+            entries.append(entry)
+            if body.startswith("{") and body.endswith("}"):
+                pairs = [p for p in body[1:-1].split(",") if p.strip()]
+            else:
+                pairs = [body]
+            for pair in pairs:
+                key, sep, value = pair.partition(":")
+                key = key.strip()
+                if not sep or key not in REPOS_KEYS:
+                    errors.append(
+                        f"PLAN.md repos: line {i}: unexpected key {key!r} "
+                        "(expected name, path, base)"
+                    )
+                elif key in entry:
+                    errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
+                else:
+                    entry[key] = _yaml_scalar(value)
             continue
         m = REPOS_FIELD_RE.match(raw)
         if m and entries:
             key, value = m.group(1), _yaml_scalar(m.group(2))
-            if key not in REPOS_KEYS or key == "name":
+            if key not in REPOS_KEYS:
                 errors.append(
                     f"PLAN.md repos: line {i}: unexpected key {key!r} "
                     "(expected name, path, base)"
@@ -505,9 +552,13 @@ def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], li
         )
     repos: list[dict] = []
     seen: set[str] = set()
+    seen_paths: dict[Path, str] = {}
     for entry in entries:
-        name = entry["name"]
+        name = entry.get("name", "")
         where = f"PLAN.md repos: {name!r}"
+        if not name:
+            errors.append(f"PLAN.md repos: line {entry['line']}: entry has no `name:`")
+            continue
         if not REPO_NAME_RE.match(name):
             errors.append(f"{where}: name must be kebab-case")
             continue
@@ -519,19 +570,39 @@ def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], li
         if not raw_path:
             errors.append(f"{where}: missing `path:`")
             continue
+        if "$" in raw_path:
+            # Only `~` expands; environment variables never do (a silent
+            # `<root>/$VAR` would name a different directory).
+            errors.append(
+                f"{where}: path {raw_path!r} uses an environment variable; "
+                "only `~` expands -- write the path out"
+            )
+            continue
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             if root is None:
                 errors.append(f"{where}: relative path but no mailbox repo")
                 continue
             path = root / path
-        path = path.resolve()
+        path = _safe_resolve(path)
         if name == HOME_REPO:
             if root is None or path != root:
                 errors.append(
                     f"{where}: `home` is reserved for the mailbox repo ({root})"
                 )
             continue
+        if root is not None and path == root:
+            errors.append(
+                f"{where}: path {path} is the mailbox repo itself; it is the "
+                "implicit `home` repo"
+            )
+            continue
+        if path in seen_paths:
+            errors.append(
+                f"{where}: path {path} is already declared as {seen_paths[path]!r}"
+            )
+            continue
+        seen_paths[path] = name
         if not path.is_dir():
             errors.append(f"{where}: path {path} does not exist")
             continue
@@ -561,31 +632,99 @@ def _outside_repo(path: Path, root: Path, declared: list[Path]) -> bool:
     return False
 
 
-def targeted_check_cds(text: str) -> list[str]:
-    """Every `cd <dir>` argument in a brief's `## Targeted check` section."""
+def targeted_check_lines(text: str) -> list[str]:
+    """Lines of EVERY targeted-check section of *text* (heading variants per
+    TARGETED_CHECK_HEADING_RE), each up to the next markdown heading."""
     section: list[str] = []
     inside = False
     for line in text.splitlines():
-        if TARGETED_CHECK_HEADING_RE.match(line.strip()):
+        stripped = line.strip()
+        if TARGETED_CHECK_HEADING_RE.match(stripped):
             inside = True
             continue
-        if inside and line.startswith("## "):
-            break
+        if inside and HEADING_RE.match(stripped):
+            inside = False
+            continue
         if inside:
             section.append(line)
-    cds: list[str] = []
-    for line in section:
+    return section
+
+
+def _unquote_arg(arg: str) -> str:
+    if arg[:1] in ("'", '"') and arg[-1:] == arg[:1]:
+        return arg[1:-1]
+    return arg
+
+
+def command_dirs(lines: list[str]) -> list[tuple[str, str]]:
+    """(kind, dir) of every directory a check command runs in, in order.
+
+    kind `cd` changes the working directory of the rest of the command
+    (`cd`, `pushd`); kind `target` names a directory without changing it
+    (`git -C`, `make -C`, `--rootdir`, `--prefix`, `--cwd`). Shell comments
+    are ignored; inline-code backticks are separators.
+    """
+    found: list[tuple[int, str, str]] = []
+    for index, line in enumerate(lines):
+        line = COMMENT_RE.sub("", line)
         for m in CD_RE.finditer(line):
-            arg = m.group(1)
-            if arg[:1] in ("'", '"'):
-                arg = arg[1:-1]
-            cds.append(arg)
-    return cds
+            found.append((index * 10_000 + m.start(), "cd", _unquote_arg(m.group(1))))
+        for m in TARGET_DIR_RE.finditer(line):
+            arg = m.group(1) or m.group(2)
+            found.append((index * 10_000 + m.start(), "target", _unquote_arg(arg)))
+    return [(kind, arg) for _pos, kind, arg in sorted(found)]
+
+
+def targeted_check_cds(text: str) -> list[str]:
+    """Every `cd`/`pushd` argument in *text*'s targeted-check sections."""
+    return [arg for kind, arg in command_dirs(targeted_check_lines(text)) if kind == "cd"]
+
+
+def _safe_resolve(path: Path) -> Path:
+    """``path.resolve()``, or the absolute unresolved path on a symlink loop
+    (eval-r15a F7: never a traceback; the caller treats it as a path)."""
+    try:
+        return path.resolve()
+    except (RuntimeError, OSError):
+        return Path(os.path.abspath(path))
 
 
 def _resolve_under(base: Path, value: str) -> Path:
     p = Path(value).expanduser()
-    return (p if p.is_absolute() else base / p).resolve()
+    return _safe_resolve(p if p.is_absolute() else base / p)
+
+
+def _expand_write(base: Path, value: str) -> list[Path]:
+    """*value* resolved under *base*; a glob (`*`, `?`, `[`) also yields
+    every existing match of each of its path prefixes (eval-r15a F5), so
+    `app-*/x.py` or `*/app/x.py` reaches a nested clone it could name."""
+    target = _resolve_under(base, value)
+    if not GLOB_CHARS & set(value):
+        return [target]
+    out = [target]
+    parts = Path(value).expanduser().parts
+    anchor = Path(value).expanduser() if Path(value).expanduser().is_absolute() else None
+    for depth in range(1, len(parts) + 1):
+        pattern = Path(*parts[:depth])
+        full = pattern if anchor is not None else base / pattern
+        for match in glob.glob(str(full)):
+            out.append(_safe_resolve(Path(match)))
+    return out
+
+
+def _command_offending_path(
+    lines: list[str], cwd: Path, root: Path, declared: list[Path]
+) -> Path | None:
+    """First directory a check command runs in outside the mailbox repo."""
+    for kind, arg in command_dirs(lines):
+        if arg == "-" or "$" in arg or "`" in arg:
+            continue
+        target = _resolve_under(cwd, arg)
+        if _outside_repo(target, root, declared):
+            return target
+        if kind == "cd":
+            cwd = target
+    return None
 
 
 def _slice_offending_path(
@@ -613,18 +752,30 @@ def _slice_offending_path(
         write = str(write).strip()
         if not write or write.startswith("api:"):
             continue
-        target = _resolve_under(base, write)
-        if _outside_repo(target, root, declared):
-            return target
+        for target in _expand_write(base, write):
+            if _outside_repo(target, root, declared):
+                return target
     if brief:
-        cwd = root
-        for arg in targeted_check_cds(brief):
-            if arg == "-" or "$" in arg or "`" in arg:
-                continue
-            cwd = _resolve_under(cwd, arg)
-            if _outside_repo(cwd, root, declared):
-                return cwd
+        return _command_offending_path(
+            targeted_check_lines(brief), root, root, declared
+        )
     return None
+
+
+def _full_check_lines(plan_text: str) -> list[str]:
+    """The PLAN.md `full_check:` value lines (key line + indented follow-ups)."""
+    lines = plan_text.splitlines()
+    for index, raw in enumerate(lines):
+        m = re.match(r"^full_check\s*:\s*(.*)$", raw)
+        if not m:
+            continue
+        out = [m.group(1)]
+        for follow in lines[index + 1:]:
+            if not follow.strip() or not follow[:1].isspace():
+                break
+            out.append(follow)
+        return out
+    return []
 
 
 def repo_scope_refusals(
@@ -656,7 +807,39 @@ def repo_scope_refusals(
     if root is None:
         return problems
     named = {r["name"]: r["path"] for r in repos}
-    for sl in tm.parse_slices_block(plan_text) or []:
+    declared = list(named.values())
+    try:
+        block = tm.find_slices_block(plan_text)
+    except tm.SliceParseError:
+        block = None  # no slices block yet: nothing to check
+    slices: list[dict] = []
+    if block is not None:
+        try:
+            slices = tm.parse_slices(block)
+        except tm.SliceParseError as exc:
+            # eval-r15a F4: fail closed -- an unparseable block could hide
+            # any `repo:`/`writes:`.
+            problems.append(
+                f"PLAN.md slices block does not parse ({exc}); the repo-scope "
+                "guard cannot check it (r15)"
+            )
+    if slice_id is None:
+        # eval-r15a F6: PLAN-level checks run from the mailbox repo root.
+        path = _command_offending_path(
+            targeted_check_lines(plan_text) + _full_check_lines(plan_text),
+            root, root, declared,
+        )
+        if path is not None:
+            problems.append(plan_scope_message(path))
+    elif brief_text is not None and slice_id not in {sl["id"] for sl in slices}:
+        # eval-r15a F3: a slice id PLAN.md does not know still has its
+        # brief checked (`run builder --isolate --worker-slice <ghost>`).
+        path = _command_offending_path(
+            targeted_check_lines(brief_text), root, root, declared
+        )
+        if path is not None:
+            problems.append(repo_scope_message(slice_id, path))
+    for sl in slices:
         if slice_id is not None and sl["id"] != slice_id:
             continue
         brief = brief_text if slice_id is not None else None

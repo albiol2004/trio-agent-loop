@@ -236,7 +236,8 @@ def test_lead_pass_not_dispatched_over_offending_plan(tmp_path, monkeypatch):
     with pytest.raises(trioctl.RepoScopeRefusal):
         runner.run("lead", 2, box, {"mode": "open-loop", "kind": "lead-pass"})
     assert seen == []
-    assert "- iter 2 | loop | " + message(
+    # eval-r15a F8: labelled with STATE.md's iteration (1), not the pass's 2.
+    assert "- iter 1 | loop | " + message(
         "bridge", home / "app-backend" / "app" / "x.py"
     ) in (box / "LOG.md").read_text().splitlines()
 
@@ -344,5 +345,6 @@ REPO_ROOT = ROOT.parent
 def test_lead_prompt_states_the_repo_scope_rule(relative):
     text = " ".join((REPO_ROOT / relative).read_text().split())
     assert "must stay inside the mailbox repo" in text
+    assert "Every slice's `repo:` (omit it or use `.`)" in text
     assert "unless PLAN.md declares `repos:`, which this release refuses" in text
     assert "a nested clone with its own `.git` is not a workaround" in text
