@@ -347,15 +347,17 @@ extension"), run this loop instead of waiting for a verdict:
    End the LOG.md line with every gate outcome joined by `; ` (e.g.
    `gate: PASS @<sha>; gate: PASS @app-backend:<sha>`); REPORT.md's slice
    ledger and gate rows carry the repo.
-8. **Root-free (trioctl `omnigent loop`, r16).** When the OPEN-LOOP
-   CONTEXT carries ROOT-FREE lines, your workspace is this loop's private
+8. **Root-free (trioctl `omnigent loop`, r16; lockstep too since r16b).**
+   When the prompt carries ROOT-FREE lines (the OPEN-LOOP CONTEXT's, or
+   the lockstep ROOT-FREE block), your workspace is this loop's private
    Lead worktree on branch `trio/<mailbox>`: HEAD, "the aggregate", "the
    repo root", every relative path and every `git` command mean THAT
    checkout, and the live mailbox is under it. Never `cd` into, read,
    edit or run `git` against the repository root the lines name. Commit
    only on the loop branch — never check out, merge, rebase, reset, push
    or pull another branch, and never touch the target branch. The driver
-   lands the loop branch onto the target after the integration SHIP.
+   lands the loop branch onto the target after the SHIP (open-loop: the
+   integration SHIP; lockstep: the Evaluator's SHIP).
 
 ## Quality bar
 - Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6's one whole-tree gate replaces this bullet.)

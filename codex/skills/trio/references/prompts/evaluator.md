@@ -215,7 +215,14 @@ full Lead iteration:
    <lead-wt> ...`: the mailbox commit there, and each declared repo's
    empty commit in its aggregate. Never commit in the detached worktree,
    never touch the repository root or the target branch — the driver
-   lands the loop branch after it accepts the SHIP.
+   lands the loop branch after it accepts the SHIP. The retirement
+   convention's `slice(<id>): ...` product commit (step 7) does not apply there: every retired
+   slice is already committed on the loop branch, so the mailbox commit is
+   your only commit. **Lockstep (r16b):** when the prompt carries the
+   lockstep ROOT-FREE block, your workspace is the loop's Lead worktree on
+   `trio/<mailbox>`: grade as usual (your own `git worktree add` of the
+   pin) and make the SHIP retirement commit there; never touch the
+   repository root or the target branch.
 
 ## Verdict semantics — choose honestly
 - **SHIP** — all acceptance criteria pass AND GOAL.md is satisfied, with no remaining unverified GOAL criteria. This ends the loop. Keep this exact first-line verdict syntax; do not invent tokens.

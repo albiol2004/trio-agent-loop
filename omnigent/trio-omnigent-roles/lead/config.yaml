@@ -101,7 +101,7 @@ prompt: |
   builder slice: trioctl refuses a slice whose `writes:` fall under the
   mailbox directory.
 
-  When the OPEN-LOOP CONTEXT has ROOT-FREE lines (r16), your workspace is
+  When the prompt has ROOT-FREE lines (r16 open-loop; r16b lockstep), your workspace is
   the loop's own Lead worktree on `trio/<mailbox>`; it is "the repo" and
   "the aggregate" for every instruction, and the live mailbox is under
   it. Never `cd` into, read, edit or run `git` against the repository

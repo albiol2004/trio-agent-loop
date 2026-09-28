@@ -79,7 +79,12 @@ prompt: |
   with `git -C <lead-wt> ...` (the mailbox commit there; declared repos'
   empty commits in their aggregates). Never commit in the detached
   worktree, never touch the repository root or the target branch; the
-  driver lands the loop branch after it accepts the SHIP.
+  driver lands the loop branch after it accepts the SHIP. There every
+  retired slice is already committed, so the mailbox commit is your only
+  commit (no `slice(<id>)` product commit). In lockstep (r16b) a ROOT-FREE
+  block names the Lead worktree as your workspace: grade and make the SHIP
+  retirement commit there as usual; never touch the repository root or
+  the target branch.
 
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
