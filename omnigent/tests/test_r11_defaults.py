@@ -313,9 +313,6 @@ def _run_loop(trioctl, monkeypatch, repo: Path, core, argv: list[str], *, queue:
         def release_all_fences(self):
             pass
 
-        def restore_root_config_final(self, mailbox):
-            pass
-
     def make_runner(**kw):
         calls["runner"] = kw
         return Runner()
