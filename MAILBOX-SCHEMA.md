@@ -724,7 +724,42 @@ Multi-repo projects are handled by the slice schema, not by extra
 mailboxes: each slice declares `repo:` — the repo it writes to, defaulting
 to the coordination repo. Tooling resolves `repo:` relative to the mailbox
 root: the project directory passed to it (the one containing `loop/`), or
-the loop directory itself when pointed at directly.
+the loop directory itself when pointed at directly. **This release does
+not run slices in another repo** — see "Repo scope (r15 guard)".
+
+### Repo scope (r15 guard)
+
+Worktrees, retire shas, the whole-tree gate and the eval pin all resolve
+in the **mailbox repo** (the git repo containing the mailbox dir). A slice
+that writes anywhere else is refused, never limped through (silent Lead
+take-over, empty aggregate merges, unresolvable retire shas). A slice is
+*outside* when its `repo:`, any `writes:` path (resolved against the
+mailbox repo root; `api:` entries excluded), or any `cd` in its builder
+brief's `## Targeted check` section (`briefs/<id>.md`, resolved from the
+repo root) is an absolute path elsewhere, a `..` escape, a `repo:` that
+names no directory, or lands in a nested git repo inside the mailbox repo
+(any directory below the root holding its own `.git`, e.g. a gitignored
+clone) — and no declared `repos:` entry covers it. Each offending slice
+yields exactly:
+
+```text
+slice <id> writes outside the mailbox repo (<path>); declare it in PLAN.md repos: (r15) or move the mailbox into that repo
+```
+
+`trio-check.py` exits 2 with one such stderr line per slice (v1
+mailboxes). `trioctl omnigent loop` refuses before dispatching anything,
+and again around every Lead/repair pass: it appends `- iter N | loop |
+<line>` to LOG.md, sets STATE.md `status: error`, and exits 3.
+`trioctl omnigent run builder --isolate` checks its slice and its
+`--prompt-file` brief and exits 2 before creating a worktree.
+
+**`repos:` is reserved.** A PLAN.md fenced ```yaml block whose top-level
+key is `repos:` is parsed and validated (entries `- name:` kebab-case and
+unique, `path:` relative to the mailbox repo root or absolute, an existing
+git repo, optional `base:`; `home` is reserved for the mailbox repo) and
+then refused as a whole with `repos: declared but multi-repo slices are
+not supported by this release (r15 pending)` — same exits as above — so
+no loop half-uses it. `repos: []` equals no block.
 
 ## Session sidecar
 
@@ -778,8 +813,10 @@ python3 metrics/trio-check.py <path> --json  # machine-readable report
 ```
 
 The exit code is 0 when no v1 mailbox has violations, and non-zero when at
-least one v1 mailbox violates this schema. Legacy and unknown mailboxes never
-affect the exit code.
+least one v1 mailbox violates this schema: 1 for violations, 2 when a v1
+mailbox is refused by the repo-scope guard ("Repo scope (r15 guard)") or
+the sibling `trio-metrics.py` has a different METRICS_API. Legacy and
+unknown mailboxes never affect the exit code.
 
 When `QUEUE.md` is present, `trio-check.py` also validates it (block
 shape, fault statuses, `retired:` entries referencing slice ids that
@@ -787,6 +824,10 @@ exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
 absence is never a violation.
 
 ## Changelog
+
+- **r15 guard** (no METRICS_API bump; lives in `trio-check.py` and
+  `trioctl`, not the loop core): slices writing outside the mailbox repo
+  and any PLAN.md `repos:` block are refused ("Repo scope (r15 guard)").
 
 - **METRICS_API 4** (r11h fence-fix): `find_queue_block(text, key,
   errors=)` closes a fence only on a CommonMark closer (indent <= 3, same

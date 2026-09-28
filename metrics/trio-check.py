@@ -17,7 +17,12 @@ run. When the scanned root contains prompts/generate.py, the checker also
 runs its `--check` mode so drift in the single-sourced role prompts fails
 conformance (disable with `--no-prompt-sync`).
 
-Exit code: 0 when no v1 mailbox has violations, 1 when at least one does.
+Exit code: 0 when no v1 mailbox has violations, 1 when at least one does,
+2 when a v1 mailbox's PLAN.md has a slice that writes outside the mailbox
+repo (r15 guard: absolute path elsewhere, `..` escape, nested git clone,
+or a builder brief's `## Targeted check` `cd` there) or declares `repos:`
+(parsed, refused by this release) -- one stderr line per offending slice --
+and when the sibling trio-metrics.py has a different METRICS_API.
 """
 from __future__ import annotations
 
@@ -361,6 +366,312 @@ def queue_info_lines(loop_dir: Path, tm, slices: list[dict] | None) -> list[str]
     return lines
 
 
+# --- r15 guard: slices must stay inside the mailbox repo ---------------------
+# MAILBOX-SCHEMA.md "Repo scope (r15 guard)". Trio assumes the mailbox repo
+# (the git repo containing loop/<mailbox>/) is the product repo: worktrees,
+# retire shas, the whole-tree gate and the eval pin all resolve there. A
+# slice whose `writes:` (or whose builder brief's `## Targeted check` `cd`)
+# leaves that repo -- an absolute path elsewhere, a `..` escape, or a nested
+# clone with its own `.git` -- is refused instead of limping (silent Lead
+# take-over, empty aggregate merges, unresolvable retire shas). The check is
+# "outside the mailbox repo AND not covered by a declared `repos:` entry";
+# this release parses and validates PLAN.md `repos:` but refuses any
+# declared block (r15 multi-repo support is pending), so nobody can
+# half-use it. Kept here (not in trio_loop.py) so METRICS_API stays 4;
+# omnigent/trioctl loads this file from its own release to enforce it.
+
+R15_UNSUPPORTED = (
+    "repos: declared but multi-repo slices are not supported by this "
+    "release (r15 pending)"
+)
+REPOS_KEY_RE = re.compile(r"^repos\s*:\s*(.*)$")
+REPOS_ENTRY_RE = re.compile(r"^\s+-\s+name\s*:\s*(.*)$")
+REPOS_FIELD_RE = re.compile(r"^\s+([a-z_]+)\s*:\s*(.*)$")
+REPOS_KEYS = ("name", "path", "base")
+REPO_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+HOME_REPO = "home"
+TARGETED_CHECK_HEADING_RE = re.compile(r"^##\s+targeted check\s*$", re.IGNORECASE)
+CD_RE = re.compile(
+    r"""(?:^|&&|\|\||;|\(|\s)cd\s+("[^"]*"|'[^']*'|[^\s;&|)]+)"""
+)
+
+
+def repo_scope_message(slice_id: str, path) -> str:
+    """The exact r15 refusal line for one offending slice."""
+    return (
+        f"slice {slice_id} writes outside the mailbox repo ({path}); declare "
+        "it in PLAN.md repos: (r15) or move the mailbox into that repo"
+    )
+
+
+def mailbox_repo_root(loop_dir: Path) -> Path | None:
+    """The git repo containing *loop_dir*: its nearest ancestor (or itself)
+    holding a `.git` entry (directory, or file for a worktree/submodule)."""
+    here = Path(loop_dir).resolve()
+    for candidate in (here, *here.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _yaml_scalar(value: str) -> str:
+    """A plain or quoted YAML scalar with an optional trailing `# comment`."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def find_repos_block(plan_text: str) -> list[str] | None:
+    """Lines of the first ```yaml fence whose column-0 key is `repos:`."""
+    in_fence = yaml_fence = False
+    buf: list[str] = []
+    for raw in plan_text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                if yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
+                    return buf
+                in_fence = yaml_fence = False
+            else:
+                in_fence = True
+                yaml_fence = stripped[3:].strip().lower() in ("yaml", "yml")
+            buf = []
+            continue
+        if in_fence and yaml_fence:
+            buf.append(raw)
+    if in_fence and yaml_fence and any(REPOS_KEY_RE.match(ln) for ln in buf):
+        return buf
+    return None
+
+
+def parse_repos_block(plan_text: str, root: Path | None) -> tuple[list[dict], list[str]]:
+    """Parse and validate PLAN.md's optional `repos:` block (r15 item 1).
+
+    Returns (repos, errors). Absent block, or `repos: []`, is ([], []) --
+    single-repo mode. Each entry is {name, path (resolved), base}; names are
+    kebab-case and unique, `home` is reserved for the mailbox repo itself,
+    and every path (relative to the mailbox repo root, or absolute) must be
+    an existing git repo (holds `.git`).
+    """
+    lines = find_repos_block(plan_text)
+    if lines is None:
+        return [], []
+    errors: list[str] = []
+    entries: list[dict] = []
+    in_block = False
+    for i, raw in enumerate(lines, 1):
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        m = REPOS_KEY_RE.match(raw)
+        if m:
+            value = _yaml_scalar(m.group(1))
+            if value == "[]":
+                return [], []
+            if value:
+                errors.append(
+                    f"PLAN.md repos: line {i}: expected `repos:` followed by "
+                    "`- name:` entries"
+                )
+                return [], errors
+            in_block = True
+            continue
+        if not raw[:1].isspace():
+            in_block = False  # another top-level key ends the block
+            continue
+        if not in_block:
+            continue
+        m = REPOS_ENTRY_RE.match(raw)
+        if m:
+            entries.append({"name": _yaml_scalar(m.group(1)), "line": i})
+            continue
+        m = REPOS_FIELD_RE.match(raw)
+        if m and entries:
+            key, value = m.group(1), _yaml_scalar(m.group(2))
+            if key not in REPOS_KEYS or key == "name":
+                errors.append(
+                    f"PLAN.md repos: line {i}: unexpected key {key!r} "
+                    "(expected name, path, base)"
+                )
+            elif key in entries[-1]:
+                errors.append(f"PLAN.md repos: line {i}: duplicate key {key!r}")
+            else:
+                entries[-1][key] = value
+            continue
+        errors.append(
+            f"PLAN.md repos: line {i}: unexpected content {raw.strip()!r}"
+        )
+    repos: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        name = entry["name"]
+        where = f"PLAN.md repos: {name!r}"
+        if not REPO_NAME_RE.match(name):
+            errors.append(f"{where}: name must be kebab-case")
+            continue
+        if name in seen:
+            errors.append(f"{where}: duplicate name")
+            continue
+        seen.add(name)
+        raw_path = entry.get("path", "")
+        if not raw_path:
+            errors.append(f"{where}: missing `path:`")
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            if root is None:
+                errors.append(f"{where}: relative path but no mailbox repo")
+                continue
+            path = root / path
+        path = path.resolve()
+        if name == HOME_REPO:
+            if root is None or path != root:
+                errors.append(
+                    f"{where}: `home` is reserved for the mailbox repo ({root})"
+                )
+            continue
+        if not path.is_dir():
+            errors.append(f"{where}: path {path} does not exist")
+            continue
+        if not (path / ".git").exists():
+            errors.append(f"{where}: path {path} is not a git repository")
+            continue
+        repos.append({"name": name, "path": path, "base": entry.get("base") or None})
+    return repos, errors
+
+
+def _within(path: Path, base: Path) -> bool:
+    return path == base or base in path.parents
+
+
+def _outside_repo(path: Path, root: Path, declared: list[Path]) -> bool:
+    """True when *path* leaves the mailbox repo -- not under *root*, or under
+    a nested git repo inside it -- and no declared repo covers it."""
+    if any(_within(path, d) for d in declared):
+        return False
+    if not _within(path, root):
+        return True
+    for anc in (path, *path.parents):
+        if anc == root:
+            return False
+        if (anc / ".git").exists():
+            return True
+    return False
+
+
+def targeted_check_cds(text: str) -> list[str]:
+    """Every `cd <dir>` argument in a brief's `## Targeted check` section."""
+    section: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if TARGETED_CHECK_HEADING_RE.match(line.strip()):
+            inside = True
+            continue
+        if inside and line.startswith("## "):
+            break
+        if inside:
+            section.append(line)
+    cds: list[str] = []
+    for line in section:
+        for m in CD_RE.finditer(line):
+            arg = m.group(1)
+            if arg[:1] in ("'", '"'):
+                arg = arg[1:-1]
+            cds.append(arg)
+    return cds
+
+
+def _resolve_under(base: Path, value: str) -> Path:
+    p = Path(value).expanduser()
+    return (p if p.is_absolute() else base / p).resolve()
+
+
+def _slice_offending_path(
+    sl: dict, loop_dir: Path, root: Path, repos: dict[str, Path], brief: str | None
+) -> Path | None:
+    declared = list(repos.values())
+    repo = str(sl.get("repo") or ".").strip()
+    if repo in repos:
+        base = repos[repo]
+    elif repo in (".", HOME_REPO):
+        base = root
+    else:
+        # Pre-r15 `repo:` is a path relative to the mailbox dir (as
+        # trio-shadow resolves it); fall back to the repo root. A value
+        # that names no directory is an undeclared repo, never the home.
+        base = _resolve_under(loop_dir, repo)
+        alt = _resolve_under(root, repo)
+        if not base.is_dir() and alt.is_dir():
+            base = alt
+        if not base.is_dir() or _outside_repo(base, root, declared):
+            return base
+    if _outside_repo(base, root, declared):
+        return base
+    for write in sl.get("writes") or []:
+        write = str(write).strip()
+        if not write or write.startswith("api:"):
+            continue
+        target = _resolve_under(base, write)
+        if _outside_repo(target, root, declared):
+            return target
+    if brief:
+        cwd = root
+        for arg in targeted_check_cds(brief):
+            if arg == "-" or "$" in arg or "`" in arg:
+                continue
+            cwd = _resolve_under(cwd, arg)
+            if _outside_repo(cwd, root, declared):
+                return cwd
+    return None
+
+
+def repo_scope_refusals(
+    loop_dir: Path,
+    tm,
+    *,
+    slice_id: str | None = None,
+    brief_text: str | None = None,
+) -> list[str]:
+    """r15 guard: one refusal line per offending slice, plus `repos:` errors.
+
+    Checks every slice of PLAN.md's `slices:` block (only *slice_id* when
+    given): its `repo:`/`writes:` resolved against the mailbox repo root,
+    and the `cd` targets of its builder brief's `## Targeted check`
+    (*brief_text*, else `<mailbox>/briefs/<id>.md`), resolved from the repo
+    root. A declared `repos:` block is validated and then refused as a
+    whole (R15_UNSUPPORTED). [] means nothing to refuse.
+    """
+    loop_dir = Path(loop_dir).resolve()
+    plan_path = loop_dir / "PLAN.md"
+    try:
+        plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    root = mailbox_repo_root(loop_dir)
+    repos, problems = parse_repos_block(plan_text, root)
+    if repos or problems:
+        problems.append(R15_UNSUPPORTED)
+    if root is None:
+        return problems
+    named = {r["name"]: r["path"] for r in repos}
+    for sl in tm.parse_slices_block(plan_text) or []:
+        if slice_id is not None and sl["id"] != slice_id:
+            continue
+        brief = brief_text if slice_id is not None else None
+        if brief is None:
+            brief_path = loop_dir / "briefs" / f"{sl['id']}.md"
+            try:
+                brief = brief_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                brief = None
+        path = _slice_offending_path(sl, loop_dir, root, named, brief)
+        if path is not None:
+            problems.append(repo_scope_message(sl["id"], path))
+    return problems
+
+
 def check_prompt_sync(root: Path) -> tuple[bool, list[str]]:
     """Run prompts/generate.py --check when the scanned root has a generator.
 
@@ -417,9 +728,11 @@ def check_v1(loop_dir: Path, tm) -> list[str]:
 
 def inspect_loop(loop_dir: Path, tm) -> dict:
     version, info = classify_version(loop_dir / "STATE.md")
+    refusals: list[str] = []
     if version == "v1":
         errors = check_v1(loop_dir, tm)
         info = info + queue_info_lines(loop_dir, tm, _plan_slices(loop_dir, tm))
+        refusals = repo_scope_refusals(loop_dir, tm)
     else:
         errors = []
         missing = missing_required_files(loop_dir)
@@ -430,25 +743,30 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
         "path": str(loop_dir),
         "version": version,
         "errors": errors,
+        "refusals": refusals,
         "info": info,
-        "ok": version == "v1" and not errors,
+        "ok": version == "v1" and not errors and not refusals,
     }
 
 
 def summarize(loops: list[dict]) -> dict:
     counts = {"v1": 0, "legacy": 0, "unknown": 0}
     violations = 0
+    refused = 0
     for loop in loops:
         counts[loop["version"]] = counts.get(loop["version"], 0) + 1
         if loop["version"] == "v1" and loop["errors"]:
             violations += 1
+        if loop.get("refusals"):
+            refused += 1
     return {
         "total": len(loops),
         "v1": counts["v1"],
         "legacy": counts["legacy"],
         "unknown": counts["unknown"],
         "v1_violations": violations,
-        "ok": violations == 0,
+        "refused": refused,
+        "ok": violations == 0 and refused == 0,
     }
 
 
@@ -461,6 +779,8 @@ def render(loops: list[dict], root: Path, summary: dict) -> str:
             lines.append(f"{loop['name']}/  v1  {'PASS' if loop['ok'] else 'FAIL'}")
             for err in loop["errors"]:
                 lines.append(f"    - {err}")
+            for msg in loop.get("refusals", []):
+                lines.append(f"    - REFUSED: {msg}")
         else:
             lines.append(
                 f"{loop['name']}/  {loop['version']}  (informational — not validated)"
@@ -526,6 +846,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(render(loops, root, summary))
 
+    if summary["refused"]:
+        # r15 guard: refuse rather than limp -- one line per offending
+        # slice on stderr, exit 2 (over a plain violation's 1).
+        for loop in loops:
+            for msg in loop.get("refusals", []):
+                print(f"trio-check: {loop['name']}: {msg}", file=sys.stderr)
+        return 2
     return 0 if summary["ok"] else 1
 
 

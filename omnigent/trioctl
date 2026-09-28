@@ -1023,6 +1023,120 @@ _ISOLATED_BUILDER_NOTE = (
 )
 
 
+# --- r15 guard: refuse slices that write outside the mailbox repo -----------
+# The check lives in metrics/trio-check.py (`repo_scope_refusals`) so the
+# loop core and METRICS_API are untouched; trioctl loads the copy from its
+# own release (never a repository's vendored metrics/). Enforced before the
+# loop dispatches anything, around every Lead/repair pass, and by
+# `run builder --isolate` before it creates a worktree.
+
+#: `run builder --isolate` exit when the r15 guard refuses the slice.
+REPO_SCOPE_REFUSED_EXIT = 2
+
+_TRIO_CHECK: list[Any] = []
+
+
+class RepoScopeRefusal(TrioctlError):
+    """A slice writes outside the mailbox repo (r15 guard)."""
+
+    def __init__(self, message: str, lines: list[str]) -> None:
+        super().__init__(message)
+        self.lines = lines
+
+
+def _load_trio_check() -> Any:
+    """This release's metrics/trio-check.py with its sibling trio-metrics."""
+    if _TRIO_CHECK:
+        return _TRIO_CHECK[0]
+    path = Path(__file__).resolve().parent.parent / "metrics" / "trio-check.py"
+    if not path.is_file():
+        raise TrioctlError(f"r15 repo-scope guard unavailable: {path} is missing")
+    loader = importlib.machinery.SourceFileLoader("trio_check_r15", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise TrioctlError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(module)
+        metrics = module.load_trio_metrics()
+    except Exception as exc:  # noqa: BLE001 - a guard that cannot run refuses
+        raise TrioctlError(
+            f"r15 repo-scope guard unavailable ({type(exc).__name__}: {exc})"
+        ) from exc
+    _TRIO_CHECK.append((module, metrics))
+    return _TRIO_CHECK[0]
+
+
+def _repo_scope_refusals(
+    mailbox: Path, *, slice_id: str | None = None, brief_text: str | None = None
+) -> list[str]:
+    """r15 guard lines for *mailbox* ([] = nothing to refuse)."""
+    module, metrics = _load_trio_check()
+    return module.repo_scope_refusals(
+        Path(mailbox), metrics, slice_id=slice_id, brief_text=brief_text
+    )
+
+
+def _state_iteration(mailbox: Path) -> str:
+    try:
+        text = (mailbox / "STATE.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "?"
+    match = re.search(r"^\s*(?:-\s+)?iteration\s*:\s*(\S+)", text, re.M | re.I)
+    return match.group(1) if match else "?"
+
+
+def _mark_repo_scope_refused(
+    mailbox: Path, lines: list[str], iteration: Any = None
+) -> None:
+    """LOG.md `- iter N | loop | <line>` per refusal; STATE.md `status: error`.
+
+    Mirrors :func:`_mark_mailbox_held` (other STATE lines are kept).
+    """
+    iteration = _state_iteration(mailbox) if iteration is None else iteration
+    log = mailbox / "LOG.md"
+    text = (
+        log.read_text(encoding="utf-8", errors="replace")
+        if log.is_file()
+        else "# Trio loop log\n"
+    )
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "".join(f"- iter {iteration} | loop | {line}\n" for line in lines)
+    log.write_text(text, encoding="utf-8")
+    state = mailbox / "STATE.md"
+    rows = (
+        state.read_text(encoding="utf-8", errors="replace").splitlines()
+        if state.is_file()
+        else []
+    )
+    done = False
+    for index, row in enumerate(rows):
+        if re.match(r"^\s*status\s*:", row, re.I):
+            rows[index] = "status: error"
+            done = True
+    if not done:
+        rows.append("status: error")
+    state.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _refuse_repo_scope(
+    mailbox: Path, role: str, iteration: Any = None
+) -> None:
+    """Raise RepoScopeRefusal (after logging it) when the guard objects."""
+    lines = _repo_scope_refusals(mailbox)
+    if not lines:
+        return
+    _mark_repo_scope_refused(mailbox, lines, iteration)
+    for line in lines:
+        print(f"trioctl: {line}", file=sys.stderr)
+    raise RepoScopeRefusal(
+        f"r15 repo-scope guard refused the {role} pass "
+        f"({len(lines)} line(s) logged above)",
+        lines,
+    )
+
+
 def _require_worktrees() -> Any:
     if worker_worktrees is None:
         raise TrioctlError("worker_worktrees.py is not installed next to trioctl")
@@ -1049,6 +1163,13 @@ def _command_run_isolated(
         raise TrioctlError("--isolate requires --mailbox <mailbox dir>")
     repo = wt.repo_toplevel(Path(args.workspace).resolve())
     mailbox = _resolve_mailbox(mailbox_arg, repo)
+    # r15 guard: refuse before any worktree exists (never limp into an
+    # aggregate that has no copy of the slice's repo).
+    refusals = _repo_scope_refusals(mailbox, slice_id=slice_id, brief_text=prompt)
+    if refusals:
+        for line in refusals:
+            print(f"trioctl: {line}", file=sys.stderr)
+        return REPO_SCOPE_REFUSED_EXIT
     try:
         record = wt.create(
             repo,
@@ -4663,6 +4784,11 @@ class OmnigentRunner:
         refusal = _held_dispatch_message(mailbox)
         if refusal:
             raise TrioctlError(refusal)
+        if role in ("lead", "repair"):
+            # r15 guard: never dispatch a pass over a PLAN that writes
+            # outside the mailbox repo (the Lead would limp: take-overs,
+            # empty merges, unresolvable retire shas).
+            _refuse_repo_scope(mailbox, role, iteration)
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
@@ -4806,6 +4932,10 @@ class OmnigentRunner:
                 self._end_root_evaluator(mailbox, dispatch["session_id"])
             else:
                 self._end_root_sessions_nonisolated(mailbox)
+        if role in ("lead", "repair") and code == 0:
+            # r15 guard on the PLAN this pass wrote: the driver ends with
+            # `status: error` (exit 3) before any evaluator is dispatched.
+            _refuse_repo_scope(mailbox, role, iteration)
         return code
 
     def _release_fences(self, *, finished_only: bool) -> None:
@@ -5598,6 +5728,14 @@ def _command_loop(args: argparse.Namespace) -> int:
     # r14.1 F3: same-cwd lock files of workspaces that no longer exist.
     _prune_same_cwd_locks()
     loop_core = _load_trio_loop(repo)
+    # r15 guard: a PLAN that already writes outside the mailbox repo (or
+    # declares `repos:`) is refused before anything is dispatched.
+    refused = _repo_scope_refusals(mailbox)
+    if refused:
+        _mark_repo_scope_refused(mailbox, refused)
+        for line in refused:
+            print(f"trioctl: {line}", file=sys.stderr)
+        return 3
     # r11: worker isolation and concurrent slice-eval are default ON; the
     # --no-isolate-workers / --slice-eval-concurrency 1 flags disable them.
     # A lockstep mailbox keeps isolation (and so concurrency) off unless
@@ -5673,6 +5811,10 @@ def _command_loop(args: argparse.Namespace) -> int:
             **loop_kwargs,
         )
         return exit_code
+    except RepoScopeRefusal:
+        # Lockstep propagates runner errors; the refusal is already in
+        # LOG.md/STATE.md and on stderr (open-loop returns 3 itself).
+        return 3
     except KeyboardInterrupt:
         # SIGINT/SIGTERM arrived: prune first (in finally), then exit 130.
         return 130
