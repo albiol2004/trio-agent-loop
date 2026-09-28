@@ -69,7 +69,10 @@ it logs `probe: PASS|FAIL|UNAVAILABLE|missing (shadow)`. Both land in
 `.driver.json` `quality` and trio-shadow. The deterministic tautology lint
 (trio-check.py; AST for Python, regex for TypeScript) flags the slice's
 test files before integration: `verification_flags` in the builder JSON,
-`PRE-GATE FLAGS` in the slice-eval context. Advisory only; the Evaluator
+`PRE-GATE FLAGS` in the slice-eval context. The lints also run in-loop for
+Lead take-overs (over the slice's commits at its sha) and after every Lead
+pass (`.driver.json` `lint`); each slice-eval's `PRE-GATE:` block carries
+the slice's accept-lint findings too. Advisory only; the Evaluator
 adjudicates. Note: a grep over the product file itself is *killed* by the
 base-revert check (the text changes), so W1-style tests are the lint's
 job, W3-style receipt tests the kill check's.

@@ -7098,7 +7098,11 @@ class OmnigentRunner:
     ) -> None:
         """r18a L1 telemetry: the slice section's evidence kinds, or the
         whole-goal verdict's `## Independent probe` line (logged, recorded
-        under `quality` in `.driver.json`; never gates)."""
+        under `quality` in `.driver.json`; never gates). After a Lead pass:
+        the advisory verification lints over the mailbox (eval-r18a)."""
+        if role == "lead":
+            self._lint_after_lead_pass(iteration, mailbox)
+            return
         if role != "evaluator":
             return
         try:
@@ -7145,6 +7149,109 @@ class OmnigentRunner:
             print(f"trioctl: verdict quality telemetry skipped: {exc}", file=sys.stderr)
 
     # --- r18a shadow quality telemetry (never gates) -----------------------
+
+    def _lint_after_lead_pass(self, iteration: int, mailbox: Path) -> None:
+        """Run trio-check's quality lints (accepts grammar, goal lines,
+        reader-only full_check, mailbox test tautologies) after every Lead
+        pass -- including passes where the Lead took a slice over and no
+        builder ran -- and record them as `.driver.json` `lint`. Advisory."""
+        try:
+            module, metrics = _load_trio_check()
+            findings = module.quality_findings(Path(mailbox), metrics)
+        except Exception as exc:  # noqa: BLE001 - advisory: never break a loop
+            print(f"trioctl: verification lint skipped: {exc}", file=sys.stderr)
+            return
+        counts: dict[str, int] = {}
+        for level, _msg in findings:
+            counts[level] = counts.get(level, 0) + 1
+        with self._dict_lock():
+            current = self.__dict__.get("driver_meta")
+            current = dict(current) if isinstance(current, dict) else {}
+            current["lint"] = {
+                "iteration": iteration,
+                "counts": counts,
+                "findings": [f"{lv} {msg}" for lv, msg in findings[:60]],
+                "mode": "advisory",
+            }
+            self.driver_meta = current
+        if findings:
+            print(
+                "trioctl: verification lint (advisory, lead pass "
+                f"{iteration}): " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                file=sys.stderr,
+            )
+
+    def _slice_repo(self, mailbox: Path, context: dict[str, Any]) -> Path:
+        repo: Path = self.repo
+        name = str(context.get("repo") or "").strip()
+        if name and name != "home":
+            declared = _declared_repos(mailbox) or {}
+            if name in declared:
+                repo = Path(declared[name]["path"])
+        return repo
+
+    def _slice_lint(
+        self, mailbox: Path, context: dict[str, Any], builder_flags: list[str] | None,
+    ) -> tuple[list[str], list[str]]:
+        """(test tautology flags, accept findings) for one slice-eval.
+
+        Builder slices reuse the builder run's flags; a Lead take-over (no
+        builder ran) is linted here over the files its `slice(<id>):`
+        commits changed, read at the slice sha. The slice's `accepts:` are
+        linted either way. Advisory; never raises."""
+        slice_id = str(context.get("slice") or "")
+        sha = str(context.get("sha") or context.get("pinned_sha") or "")
+        flags: list[str] = list(builder_flags or [])
+        accepts: list[str] = []
+        try:
+            module, metrics = _load_trio_check()
+        except Exception:  # noqa: BLE001
+            return flags, accepts
+        try:
+            plan = _mailbox_text(Path(mailbox) / "PLAN.md")
+            for sl in metrics.parse_slices_block(plan) or []:
+                if str(sl.get("id")) != slice_id:
+                    continue
+                for n, item in enumerate(sl.get("accepts") or [], 1):
+                    for level, why in module.accept_findings(item):
+                        if level in ("REJECT", "WARN"):
+                            clipped = " ".join(str(item).split())[:90]
+                            accepts.append(f"accept {n} {clipped!r}: {level} {why}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"trioctl: accept lint skipped: {exc}", file=sys.stderr)
+        if builder_flags is not None or not sha:
+            return flags, accepts
+        try:
+            repo = self._slice_repo(mailbox, context)
+
+            def git(*argv: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), "--no-optional-locks", *argv],
+                    capture_output=True, text=True, errors="replace", timeout=60,
+                ).stdout
+
+            changed: list[str] = []
+            for line in git("log", "-60", "--format=%H%x09%s", sha).splitlines():
+                commit, _tab, subject = line.partition("\t")
+                if not subject.startswith(f"slice({slice_id}):"):
+                    continue
+                for rel in git("diff-tree", "--no-commit-id", "--name-only", "-r",
+                               "--no-renames", commit).splitlines():
+                    if rel and rel not in changed:
+                        changed.append(rel)
+            modules = module.product_modules(
+                p for p in changed
+                if not _KILL_TEST_PATH_RE.search(p) and not _KILL_NON_PRODUCT_RE.search(p)
+            )
+            for rel in changed[:200]:
+                if not module.TEST_FILE_RE.search(rel):
+                    continue
+                text = git("show", f"{sha}:{rel}")
+                if text:
+                    flags.extend(module.test_file_flags(rel, text, modules or None))
+        except Exception as exc:  # noqa: BLE001
+            print(f"trioctl: take-over lint skipped: {exc}", file=sys.stderr)
+        return flags, accepts
 
     def _record_quality(self, key: str, values: dict[str, Any]) -> None:
         """Merge *values* into ``driver_meta['quality'][key]`` (`.driver.json`)."""
@@ -7200,47 +7307,65 @@ class OmnigentRunner:
         authorship) in the OPEN-LOOP CONTEXT, log it once, record it."""
         if role != "evaluator" or not isinstance(context, dict):
             return
-        if context.get("kind") != "slice-eval" or not self._isolate:
+        if context.get("kind") != "slice-eval":
             return
         try:
-            readable, rec = self._slice_builder_record(mailbox, context)
-            if not readable:
-                return
             slice_id = str(context.get("slice"))
             sha = str(context.get("sha") or context.get("pinned_sha"))
-            if rec is None:
-                facts: dict[str, Any] = {
-                    "authored_by": "lead",
-                    "kill_check": {"mode": "shadow", "outcome": "n/a",
-                                   "reason": "no builder run merged this sha (Lead take-over or fix)"},
-                }
-            else:
-                facts = {"authored_by": "builder", "worker": rec.get("id"),
-                         "kill_check": rec.get("kill_check") or {
-                             "mode": "shadow", "outcome": "n/a",
-                             "reason": "not recorded (kill check off or pre-r18a trioctl)"}}
-                if rec.get("verification_flags"):
-                    facts["verification_flags"] = rec.get("verification_flags")
-            kc = facts["kill_check"]
-            lines = [
-                "SLICE QUALITY (r18a shadow; informs your grading, gates nothing):",
-                f"BASE-REVERT: {kc.get('outcome')}"
-                + (f" -- {kc.get('reason')}" if kc.get("reason") else ""),
-                f"AUTHORED-BY: {facts['authored_by']}",
-            ]
-            flags = facts.get("verification_flags") or []
+            facts: dict[str, Any] = {}
+            builder_flags: list[str] | None = None
+            if self._isolate:
+                readable, rec = self._slice_builder_record(mailbox, context)
+                if readable and rec is None:
+                    facts = {
+                        "authored_by": "lead",
+                        "kill_check": {"mode": "shadow", "outcome": "n/a",
+                                       "reason": "no builder run merged this sha (Lead take-over or fix)"},
+                    }
+                elif readable:
+                    facts = {"authored_by": "builder", "worker": rec.get("id"),
+                             "kill_check": rec.get("kill_check") or {
+                                 "mode": "shadow", "outcome": "n/a",
+                                 "reason": "not recorded (kill check off or pre-r18a trioctl)"}}
+                    builder_flags = list(rec.get("verification_flags") or [])
+            flags, accept_lint = self._slice_lint(mailbox, context, builder_flags)
+            if flags:
+                facts["verification_flags"] = flags
+            if accept_lint:
+                facts["accept_lint"] = accept_lint
+            if not facts:
+                return
+            lines = ["SLICE QUALITY (r18a shadow; informs your grading, gates nothing):"]
+            kc = facts.get("kill_check")
+            if kc is not None:
+                lines += [
+                    f"BASE-REVERT: {kc.get('outcome')}"
+                    + (f" -- {kc.get('reason')}" if kc.get("reason") else ""),
+                    f"AUTHORED-BY: {facts['authored_by']}",
+                ]
+            if flags or accept_lint:
+                source = ("the builder's worktree" if builder_flags is not None
+                          else "the slice's commits at this sha (no builder ran)")
+                lines.append(f"PRE-GATE: advisory verification lints over {source}; "
+                             "grade every listed item explicitly")
             if flags:
                 lines.append(
                     "PRE-GATE FLAGS (advisory AST lint; the following tests look "
                     "tautological -- grade them explicitly):"
                 )
                 lines.extend(f"- {f}" for f in flags[:20])
+            if accept_lint:
+                lines.append(
+                    "PRE-GATE ACCEPTS (advisory accept lint; an accept without a relation "
+                    "or oracle is graded `unverified` unless you establish one):"
+                )
+                lines.extend(f"- {f}" for f in accept_lint[:20])
             context["quality_note"] = "\n".join(lines) + "\n"
             key = f"{slice_id}@{sha[:12]}"
             meta = self.__dict__.get("driver_meta")
             seen = isinstance(meta, dict) and key in (meta.get("quality") or {})
             self._record_quality(key, {"slice": slice_id, "sha": sha, **facts})
-            if not seen:
+            if not seen and kc is not None:
                 _append_mailbox_log(
                     mailbox,
                     f"- iter {iteration} | loop | retired slice {slice_id} @{sha[:12]} "

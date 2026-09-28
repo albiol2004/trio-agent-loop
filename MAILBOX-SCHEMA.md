@@ -788,7 +788,15 @@ is the separate `static-config` category — not a tautology flag unless the
 test file has no runtime check at all. The flags are
 `verification_flags` in the builder JSON and ledger record and a
 `PRE-GATE FLAGS` block ("the following tests look tautological; grade
-them explicitly") in the slice-eval's OPEN-LOOP CONTEXT. `trio-check.py`
+them explicitly") in the slice-eval's OPEN-LOOP CONTEXT. The lints also run
+in-loop without a builder (eval-r18a N7): for a Lead take-over the driver
+lints the files the slice's `slice(<id>):` commits changed, read at the
+slice sha, and every slice-eval's `PRE-GATE:` block also lists the slice's
+accept-lint findings (`PRE-GATE ACCEPTS`); both are recorded under
+`quality` in `.driver.json` (`verification_flags`, `accept_lint`). After
+every Lead pass the driver runs trio-check's quality lints over the mailbox
+and records them as `.driver.json` `lint` (`counts`, `findings`,
+`mode: advisory`). Nothing is gated. `trio-check.py`
 applies the same lint to the mailbox's own test files and the test files
 slices declare in `writes:` (`quality: WARN test looks tautological`);
 nested repos / worktrees under the mailbox (declared repos) are skipped.
