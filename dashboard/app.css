@@ -1487,3 +1487,13 @@ th[aria-sort="descending"] .th-sort::after { content: " ↓"; }
   .primary-nav { gap: 0; }
   .primary-nav a { padding: 0 var(--sp-2); }
 }
+
+.run-note { grid-column: 1 / -1; margin: 0; font-size: var(--fs-caption); color: var(--muted); }
+/* Worktree labels are long; the workspace filter must shrink, never widen
+ * the page. */
+.field { min-width: 0; }
+.select { min-width: 0; text-overflow: ellipsis; }
+@media (max-width: 760px) {
+  .field:not(.field-search) { flex: 1 1 0; }
+  .select { width: 100%; }
+}

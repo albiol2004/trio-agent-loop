@@ -71,9 +71,23 @@ curl -s http://127.0.0.1:9470/healthz
 explicit `--workspace` paths. Discovery settings: `TRIO_DASH_SCAN_ROOTS`
 (`os.pathsep` separated; replaces the defaults; HOME and `/` are refused),
 `TRIO_DASH_SCAN_DEPTH` (default 3: direct children always, deeper dirs only
-when they hold a `loop*/` dir; linked git worktrees, dot-dirs and
-dependency/build dirs are skipped; at most 4000 dirs per root), and
-`TRIO_DASH_WORKSPACES` for explicitly registered workspaces. Broker liveness:
+when they hold a `loop*/` dir; dot-dirs and dependency/build dirs are
+skipped; at most 4000 dirs per root), and `TRIO_DASH_WORKSPACES` for
+explicitly registered workspaces (shown in full).
+
+Linked git worktrees found by the walk appear as `<repo> (worktree <name>)`
+with only the mailboxes that are theirs, each tagged with why:
+`worktree-only` (no such mailbox in the main checkout), `modified` /
+`untracked` (`git status`), `committed on branch` (clean, but a mailbox file
+was written after the worktree's last checkout/reset/merge/rebase, read from
+its HEAD reflog), `runtime files present` (untracked or ignored sidecars or
+locks, which git never creates; tracked sidecars do not count), and `live`
+(argv, broker session with `workspace` = the worktree, or a live sidecar).
+Untouched committed copies stay hidden. The git/stat selection is cached per
+worktree (60 s, or sooner when its index, HEAD reflog, root or `loop*` dirs
+change); `git status` runs with `--no-optional-locks`; liveness is checked
+every build from the shared argv index and broker listing. Worktree
+drilldown works; worktrees are not listed as registry workspaces. Broker liveness:
 `TRIO_BOARD_BROKER_URL` (the service env sets `http://127.0.0.1:6767`).
 
 ## Running from the repo checkout (development)
@@ -86,7 +100,7 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 - **Board (every workspace at once)** — one `/api/overview` poll every 5 seconds covers every discovered workspace. Top to bottom: a verdict sentence ("2 loops need you; nothing is running."), four tiles (needs you, running now, shipped in the last 7 days, loops tracked), **Needs you**, **Running now**, an **All loops** table, and collapsed **Review notes**. Loops are keyed by workspace root + mailbox name. Nested mailbox discovery is unchanged: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped).
 - **Facts only** — a loop's state badge is derived from facts in this order: live evidence (`running_sources`: driver pid or lock, /proc cmdline naming the mailbox, live `.session.json` pid, opt-in broker probe) → "Running"; else the latest verdict (Shipped / Needs human / Blocked / Iterating); else the STATE.md status word. Every badge has an icon and text; the tooltip lists the underlying facts. Titles come from GOAL.md's first heading (`# Mission: X` → "X"); generic headings such as `# Goal` fall back to the mission's first clause.
-- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold. It is a medium "Needs you" item only when the broker listing was read (`broker: ok`); with the broker disabled, unreachable or truncated it is a low-severity review note, because a broker-only run cannot be ruled out.
+- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold. It is a medium "Needs you" item only when the broker listing was read (`broker: ok`) and no non-shell process is working inside the workspace; otherwise it is a low-severity review note (a broker-only or chat-coordinated run cannot be ruled out). A STATE.md status of `needs_human`/`awaiting_human`/`awaiting_user` or `blocked` raises the matching high item even when VERDICT.md is older, and sets the state badge.
 - **Liveness facts** — `driver`: live `.driver.json` or `.lock/pid` process that is not a zombie and started before its record was last written (a recycled PID is not the owner); `proc`: a live process whose argv element (or `--opt=value`, or a relative option value / path with a separator resolved against its cwd) is the mailbox or a file in it, but not a file inside a child mailbox; `session`: live `.session.json` pid (same reuse check); `broker`: sidecar session ids reported running by `GET /v1/sessions/<id>`, or a running session in the paginated `GET /v1/sessions` listing whose `workspace` is this workspace and whose title starts `trioctl <mailbox-dir> ` (ambiguous dir names in one workspace are never attributed).
 - **All loops table** — sortable by loop, workspace and last activity; filtered by search, workspace, and the fact-only segments Running / Attention / All / Archived (preferences persist in `localStorage` when available). Rows patch in place on poll.
 - **Attention inbox** — stable item ids (sha256 hash of root, loop_name, kind, anchor) and per-workspace read/unread state persisted in `~/.local/share/trio-agent-loop/inbox-state.json` (POST /api/inbox/read or /api/inbox/unread). Read items are hidden by default; unread count remains the inbox badge.
@@ -113,8 +127,9 @@ Board and service:
   request builds synchronously; later requests return the last build at once
   and trigger one background rebuild when it is older than 4 s. One /proc
   snapshot and one git slice attribution per loop are shared per build.
+- Control routes require an explicit `root` (400 otherwise). Start is also disabled while broker liveness is unknown (`unreachable`/`truncated`). `--config` values in argv are not mailbox evidence.
 - `GET /healthz` — `{ok, uptime_seconds, version, workspaces, overview_age_seconds, broker}` for supervisors.
-- Rebuilds: a poll older than 10 s triggers one background rebuild; git-backed derivations (slice attribution, iterations, commits) and parsed card facts are reused while the mailbox files and the repo's HEAD/reflog are unchanged; one `/proc` read and one broker listing are shared per build; the server pre-warms the overview at startup; hidden tabs stop polling.
+- Rebuilds: a poll older than 15 s triggers one background rebuild (cache expiries are jittered per path so refreshes spread out); git-backed derivations (slice attribution, iterations, commits) and parsed card facts are reused while the mailbox files and the repo's HEAD/reflog are unchanged; one `/proc` read and one broker listing are shared per build; the server pre-warms the overview at startup; hidden tabs stop polling.
 - Request guards (all routes): the Host must be an IP literal, `localhost` or a name in `TRIO_DASH_ALLOWED_HOSTS` (DNS-rebinding defence, 421 otherwise). POST/PUT/DELETE with an `Origin` must be same-origin or listed in `TRIO_DASH_ALLOWED_ORIGINS`; `Sec-Fetch-Site: cross-site` is refused; a request body must be `application/json` (415 otherwise).
 
 Loop control:

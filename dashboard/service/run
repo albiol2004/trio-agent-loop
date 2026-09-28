@@ -22,14 +22,21 @@ log() { printf '%s trio-dash: %s\n' "$(date -u +%FT%TZ)" "$*"; }
 identity=/etc/agent-platform/identity
 ws_host="${WORKSPACE_HOSTNAME:-$(sed -n 's/^WORKSPACE_HOSTNAME=//p' "$identity" 2>/dev/null | head -1)}"
 ts_domain="${TAILNET_DOMAIN:-$(sed -n 's/^TAILNET_DOMAIN=//p' "$identity" 2>/dev/null | head -1)}"
-if [ -n "$ws_host" ]; then
-  case "$ws_host" in
-    *.*) fqdn="$ws_host" ;;
-    *) fqdn="$ws_host${ts_domain:+.$ts_domain}" ;;
+# Accept both the inherited/identity name and the name tailscale itself
+# reports (they have drifted apart before: see the ws-1 serve mappings).
+id_host="$(sed -n 's/^WORKSPACE_HOSTNAME=//p' "$identity" 2>/dev/null | head -1)"
+ts_self="$(timeout 5 tailscale status --json 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)"
+for name in "$ws_host" "$id_host" "$ts_self"; do
+  [ -n "$name" ] || continue
+  case "$name" in
+    *.*) fqdn="$name" ;;
+    *) fqdn="$name${ts_domain:+.$ts_domain}" ;;
   esac
+  case ",$TRIO_DASH_ALLOWED_HOSTS," in *",$fqdn,"*) continue ;; esac
   export TRIO_DASH_ALLOWED_HOSTS="${TRIO_DASH_ALLOWED_HOSTS:+$TRIO_DASH_ALLOWED_HOSTS,}$fqdn"
   export TRIO_DASH_ALLOWED_ORIGINS="${TRIO_DASH_ALLOWED_ORIGINS:+$TRIO_DASH_ALLOWED_ORIGINS,}https://$fqdn:$PORT"
-fi
+done
 
 child=""
 # TERM, resume (a stopped process cannot act on TERM), then KILL after 5 s.

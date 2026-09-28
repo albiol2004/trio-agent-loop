@@ -227,16 +227,27 @@ function loopTitle(loop) {
   return mission ? oneLine(mission, 90) : loop.name;
 }
 
-/* One state word per loop, from facts only: live evidence first, then the
- * latest verdict, then the STATE.md status word. */
+const HUMAN_STATUS = new Set(["needs_human", "awaiting_human", "awaiting_user"]);
+
+/* One state word per loop, from facts only: live evidence first, then a
+ * STATE.md hand-off to a person (or blocked), then the latest verdict, then
+ * the STATE.md status word. */
 function stateBadge(loop) {
   const badge = document.createElement("span");
   let tone = "neutral";
   let text = statusWord(loop);
   const verdict = normVerdict(latestVerdict(loop));
+  const status = String(loop.status || "").trim().toLowerCase().replace(/-/g, "_");
   if (loop.running) {
     tone = "live";
     text = "Running";
+  } else if (HUMAN_STATUS.has(status)) {
+    // STATE.md handing the loop to a person outranks an older verdict file.
+    tone = "warning";
+    text = "Needs human";
+  } else if (status === "blocked") {
+    tone = "negative";
+    text = "Blocked";
   } else if (verdict === "ship") {
     tone = "positive";
     text = "Shipped";
@@ -310,6 +321,7 @@ function ingestOverview(data) {
     for (const loop of ws.loops || []) {
       loop.root = ws.root;
       loop.workspace = ws.name;
+      loop.worktree = Boolean(ws.worktree);
       loop.key = loopKey(ws.root, loop.name);
       loops.push(loop);
     }
@@ -366,7 +378,7 @@ function schedulePoll() {
   clearTimeout(state.boardTimer);
   if (document.hidden) return;
   const age = ageMs(state.updatedAt);
-  const soon = state.loaded && age != null && age > 12000 && !state.quickRepoll;
+  const soon = state.loaded && age != null && age > 18000 && !state.quickRepoll;
   state.quickRepoll = soon;
   state.boardTimer = setTimeout(refreshBoard, soon ? 1500 : BOARD_POLL_MS);
 }
@@ -454,6 +466,16 @@ function plural(n, word, many) {
   return n + " " + (n === 1 ? word : many || word + "s");
 }
 
+/* "2 via driver · 1 process only": distinct phases, else evidence counts. */
+function runningContext(running) {
+  const phases = Array.from(new Set(running.map(phaseText).filter(Boolean)));
+  if (phases.length) return phases.slice(0, 2).join(", ") + (phases.length > 2 ? "…" : "");
+  const byDriver = running.filter((l) => (l.running_sources || []).includes("driver")).length;
+  const other = running.length - byDriver;
+  return [byDriver ? byDriver + " via driver" : "", other ? other + " via process or session" : ""]
+    .filter(Boolean).join(" · ");
+}
+
 function renderSummary(groups) {
   const loops = state.loops;
   const running = loops.filter((l) => l.running);
@@ -511,7 +533,7 @@ function renderSummary(groups) {
     needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
     needsLoops.length ? "warning" : "", "#needs");
   tile("Running now", running.length,
-    running.length ? running.map((l) => phaseText(l) || "live").slice(0, 2).join(", ") : "No live driver, process or session",
+    running.length ? runningContext(running) : "No live driver, process or session",
     running.length ? "live" : "", "#running");
   tile("Shipped, last 7 days", shipped7.length,
     plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null);
@@ -643,6 +665,14 @@ function renderRunning() {
     .sort((a, b) => String(b.last_activity || "").localeCompare(String(a.last_activity || "")));
   el("running-count").textContent = running.length ? String(running.length) : "";
   list.textContent = "";
+  const busy = state.workspaces.filter((w) => w.unattributed_processes > 0);
+  for (const ws of busy) {
+    const note = document.createElement("p");
+    note.className = "run-note";
+    note.textContent = plural(ws.unattributed_processes, "process", "processes") +
+      " working in " + ws.name + " name no mailbox, so no loop there is marked running.";
+    list.appendChild(note);
+  }
   if (!running.length) {
     list.appendChild(emptyState("○", "No loop is running. A loop shows here while its driver, lock, process or session is live."));
     return;
@@ -875,6 +905,12 @@ function cardEl(loop) {
     nameCell.appendChild(span("row-flag", plural(n, "unread item")));
   }
   if (isArchived(loop)) nameCell.appendChild(span("row-flag row-flag-muted", "Archived"));
+  if (loop.worktree && (loop.worktree_reasons || []).length) {
+    const tag = span("row-flag row-flag-muted", "Worktree: " + loop.worktree_reasons.join(", "));
+    tag.title = "Shown because this linked worktree's copy is " + loop.worktree_reasons.join(", ") +
+      "; untouched committed copies of the main checkout's mailboxes are hidden.";
+    nameCell.appendChild(tag);
+  }
   row.appendChild(nameCell);
 
   const ws = document.createElement("td");
