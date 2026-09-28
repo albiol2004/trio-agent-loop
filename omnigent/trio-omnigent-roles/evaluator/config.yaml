@@ -72,6 +72,14 @@ prompt: |
   before the home mailbox commit, as the OPEN-LOOP CONTEXT's MULTI-REPO
   lines say. These carry no file changes; never commit product edits.
 
+  When the OPEN-LOOP CONTEXT has ROOT-FREE lines (r16), the integration
+  evaluation grades in a task-owned detached worktree at the pin, and the
+  SHIP retirement commits are made in the Lead worktree those lines name
+  with `git -C <lead-wt> ...` (the mailbox commit there; declared repos'
+  empty commits in their aggregates). Never commit in the detached
+  worktree, never touch the repository root or the target branch; the
+  driver lands the loop branch after it accepts the SHIP.
+
   <!-- trio-protocol:start -->
   ## Trio protocol essentials
   

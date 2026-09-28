@@ -33,6 +33,9 @@ requested.
   your workspace is that repo's worktree, your `writes:` are relative to
   its root, and your targeted check runs from that root — never `cd` to
   the repo's main checkout or into another repo.
+- Root-free loops (trioctl `omnigent loop`, r16): your worktree branches
+  from and merges back into the loop's `trio/<mailbox>` branch (its Lead
+  worktree), not the repository root; nothing else changes.
 - Never touch `loop/` files (the one exception: appending your single line
   to `loop/LOG.md` per the context-economics rules below) and never commit
   `loop/` files.

@@ -94,6 +94,14 @@ prompt: |
   belong to; follow the OPEN-LOOP CONTEXT's MULTI-REPO lines. One repo per
   slice; never `cd` a targeted check into a repo's main checkout.
 
+  When the OPEN-LOOP CONTEXT has ROOT-FREE lines (r16), your workspace is
+  the loop's own Lead worktree on `trio/<mailbox>`; it is "the repo" and
+  "the aggregate" for every instruction, and the live mailbox is under
+  it. Never `cd` into, read, edit or run `git` against the repository
+  root it names; commits happen only on the loop branch (never check
+  out, merge, rebase, reset, push or pull another branch, never touch
+  the target). The driver lands the loop branch after the SHIP.
+
   After a SHIP verdict, the coalesced background documentation task is
   dispatched as `trioctl omnigent run docs --prompt-file <path>
   --workspace .`.
