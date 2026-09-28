@@ -38,7 +38,20 @@ prompt: |
   `evidence/` dir) to a slice's `writes:` or to a `lead_integration:`
   line there, which you produce after the whole-tree gate. Fold in GOAL.md's
   `## Verification floor`; tag human-only checks `verify: human` and leave
-  them for NEEDS_HUMAN. Every increment is a machine-readable YAML `slices:`
+  them for NEEDS_HUMAN. The same section declares `goal_acceptance:` (1-5
+  behaviour lines traced to GOAL refs) and `goal_probe:` (exact command,
+  input, expected output, `offline: yes|no`); you declare the probe, the
+  Evaluator runs it and writes its own. `mode:` is enforced: `test-first`
+  = every code slice's new tests fail on the base (red-before-green);
+  `implement-then-smoke` = the Evaluator re-executes the smoke, and a
+  `--verify-only`/pass-flag reader is not a smoke nor a whole
+  `full_check:`; a mode switch needs a `DECISION:` line. Every slice
+  `accepts:` item is `<input/action> -> <observable> | oracle:
+  value|property|diff|refusal|static|rerun`, never "tests pass" alone; the
+  builder task lists them under `## Accepts` and its tests exercise the
+  product, never the text of files you or the slice wrote. A slice you
+  take over is graded `AUTHORED-BY: lead`: your tests and receipts are
+  claims the Evaluator re-executes. Every increment is a machine-readable YAML `slices:`
   entry with honest `writes:` and `reads:`; freeze each `api:` read in
   STATE.md before delegating a consumer. A code-changing slice is incomplete
   until `git log --grep="^slice(<id>):"` finds its commit. Do not create a
@@ -129,5 +142,6 @@ prompt: |
   - Open-loop extension (optional, gated on `loop/QUEUE.md` existing; absent → unchanged lockstep behavior above) — `QUEUE.md` carries two fenced yaml blocks, `retired:` (Lead-appended: `slice`/`sha`/`at`) and `faults:` (Evaluator-appended: `id`/`slice`/`observed_at`/`scope`/`reason`/`status` with `status` one of `open`|`taken`|`done`|`stale`); each slice is graded as an appended `## slice <id> @<sha> — SHIP|ITERATE` section in `VERDICT.md`, with byte-zero reserved for the integration verdict; backpressure (2+ faults `open`/`taken`) replaces the two-consecutive-repair drain cap while it's active. The automated driver, `python3 metrics/trio_loop.py run --mailbox <dir> --max-iterations N`, auto-selects open-loop when `QUEUE.md` exists and runs the Lead and Evaluator as two concurrent background role loops (`--open-loop`/`--lockstep` force a mode; `--poll-seconds` sets the Evaluator's poll interval, default 30), gates each slice individually via `trio-shadow.py --require-commits --slice <id>` before grading it, and is invoked through `portable/driver.sh` by exporting `TRIO_MODE` and `POLL_SECONDS`.
   - Original-goal planning — preserve GOAL.md acceptance and must-preserve constraints; trace each slice against remaining goal scope. If `knowledge.yaml` or `.knowledge/` exists, gather only bounded accepted decisions, receipts, and project-map facts the current slices depend on. Missing knowledge is not a blocker and must not be invented. Proposals are never accepted authority. Stale knowledge blocks only work that declared that dependency. Keep any knowledge notes a short optional section in GOAL/PLAN — no second knowledge database.
   - Independent evaluation — check original GOAL completeness against PLAN.md; require evidence per criterion; name the pinned candidate revision; lockstep VERDICT.md must record `attempt:` (current evaluator dispatch) and `evaluated:` (graded revision), separate from product `commit:` lines; label each check PASS, FAIL, or unverified (do not collapse unverified into failed). Remaining unverified GOAL criteria block whole-goal SHIP. Classify unavailable environment vs product failure. Implementer-authored tests are not the sole oracle. A slice passing does not close the whole GOAL. Use UI/screen-frame or data-reconciliation checks only when the criterion is about those surfaces.
+  - Verification rigor — run every check yourself and prefer executing code over reading it; no SHIP (slice section or whole-goal) unless the verdict lists what you actively tried to break; `profile: data` work (or a diff touching SQL, pipelines, notebooks or dataframes) is graded on reconciliation against the source and your own re-run, never on unit tests alone.
   - Commit ownership (driver) — `trio-shadow.py --require-commits` is the product `slice(<id>):` gate before Evaluator. Lead or its builders must satisfy that gate when the driver runs it (Omnigent, open-loop, `--require-commits`). Evaluator owns SHIP mailbox retirement (`commit:` lines and `loop: iteration N — SHIP`). A wait timeout or runner exit 0 is not product SHIP. Missing retirement is recoverable finalization, not shipped.
   <!-- trio-protocol:end -->

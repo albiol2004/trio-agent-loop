@@ -146,7 +146,23 @@ for the iteration:
 - **Mode**: one of `test-first` (tests written before the change),
   `implement-then-smoke` (change then run the stated checks), or
   `human-gate` (only the human can verify; the iteration ends in
-  `VERDICT: NEEDS_HUMAN`).
+  `VERDICT: NEEDS_HUMAN`). The mode is enforced (r18a): `test-first`
+  requires red-before-green evidence for every code slice — the driver's
+  base-revert kill check reporting `killed` (trioctl, shadow in r18a) or the
+  Evaluator's own run of the new tests against the base; without it
+  those tests grade `unverified`. `implement-then-smoke` requires the
+  Evaluator to re-execute the smoke at the pin; a `--verify-only` or
+  pass-flag reader is not a smoke. Switching `mode:` mid-loop needs a
+  `DECISION:` line.
+- **`goal_acceptance:`** (r18a): 1–5 behaviour lines in the accepts
+  grammar (see "`accepts:` grammar"), each traced to a GOAL ref, as an
+  indented list under the plain `goal_acceptance:` line.
+- **`goal_probe:`** (r18a): one plain line — the exact command, its input,
+  the expected output and `offline: yes|no`, e.g.
+  `goal_probe: curl -s localhost:8787/stats?keyHash=<unknown> -> 404 {"error":"key not found"} | offline: yes`.
+  The Lead declares it and never implements it; the Evaluator runs it and
+  writes one probe of its own (VERDICT.md `## Independent probe`).
+  `trio-check.py` warns when an open-loop mailbox (QUEUE.md) has none.
 - **Evidence**: what will count as verified — exact commands, the outputs
   they must produce, and the data/ground-truth checks (reconciliation,
   integrity, idempotent re-runs for `profile: data`).
@@ -649,6 +665,57 @@ queues"]`. Default is `[]`. It is what the Evaluator grades that slice
 against in open-loop mode. It must remain optional so every existing
 mailbox — with or without `accepts:` on any slice — stays conformant.
 
+#### `accepts:` grammar (r18a)
+
+Every item (and every `goal_acceptance:` line) is one behaviour with an
+oracle:
+
+```text
+<input/action> -> <observable> | oracle: <kind>
+```
+
+- `<input/action>` — the concrete input or action: a request, a CLI call
+  with its arguments, a query, a public function with its inputs.
+- `<observable>` — what a reviewer sees: a value, a status code, an
+  output line, a row count, a refusal message.
+- `<kind>` — `value` (an exact value), `property` (an invariant over
+  inputs), `diff` (before/after against a named baseline), `refusal` (the
+  input is rejected with a named error), `static` (a property of the
+  deployed or compiled artifact — `SHOW CREATE VIEW`, the built bundle —
+  never the local source text) or `rerun` (re-execute a named command and
+  compare).
+
+Example: `"GET /stats?keyHash=<64-hex not in catalog> -> 404 {error:'key not found'} | oracle: refusal"`.
+"tests pass", "works", "exists", "is documented" and "stays green" are
+never an accept on their own.
+
+`trio-check.py` lints every `accepts:` item of a v1 mailbox's PLAN.md
+(quality findings, printed under the mailbox):
+
+- `REJECT` — free text with no relation and no `oracle:` tag, or a banned
+  phrase standing alone. A relation is `->`, `==`/`=`/`!=`/`<`/`>`/`<=`/`>=`,
+  a bare HTTP status code (`401 {error:..}`, `429 is rate_limited`), or a
+  relation word (`is`, `returns`, `equals`, `match(es)`, `exactly`,
+  `identical`, `unchanged`, `vs`, `renders`, `refuses`, ...) together with
+  an observable (a number, a quoted/bracketed literal, an identifier with
+  `_`/`()`/inner capitals, an ALLCAPS token, `None`/`null`/`true`). `->` is
+  then optional: "hung binary returns None in under 4 s" is a `WARN` (no
+  oracle tag), not a `REJECT`;
+- `WARN` — an `oracle:` tag without a relation, a relation without an
+  `oracle:` tag, or an unknown oracle kind;
+- `static-config` — an accept about a static config artifact (compose,
+  nginx, Dockerfile, systemd units, tsconfig, yaml/toml/ini) that is the
+  deployed artifact. It is checked by parsing it (yaml load, `nginx -t`,
+  `docker compose config` when available), is never a `REJECT` and never a
+  tautology, but a slice whose accepts are ALL static-config gets a `WARN`
+  to pair them with one runtime accept.
+
+In r18a the findings are advisory: they never change the exit code
+unless `--strict-quality` is passed (then a `REJECT` is a violation, exit
+1, except in a finished mailbox — STATE `status:`/`phase:` SHIP, shipped,
+landed, done, complete, abandoned or stopped — whose PLAN is history). r18b
+makes `REJECT` a violation by default.
+
 ### Per-slice verdicts in VERDICT.md
 
 Each slice evaluation is recorded as an **appended** section in
@@ -669,6 +736,146 @@ has `QUEUE.md`, and is **not** valid for a lockstep mailbox. A per-slice
 section body **MUST NOT** contain any line beginning with `VERDICT:` —
 that token stays reserved for the integration verdict so existing verdict
 parsers are unaffected.
+
+### Evidence kinds and the per-accept table (r18a)
+
+Each per-slice section grades every `accepts:` item PASS, FAIL or
+`unverified` and names the evidence kind behind the grade:
+`re-run` (the Evaluator re-executed the behaviour at the pin), `probe`
+(its own check against the public surface), `implementer-test` (a
+builder/Lead test it ran — PASS only when not tautological and, for a
+`value`/`property` accept, shown to fail without the change) or `receipt`
+(a file someone else wrote — never PASS on its own). An accept that needs
+an environment the Evaluator cannot reach is graded `unverified` with
+`UNAVAILABLE(<reason>)` in its evidence column and listed on an
+`unavailable:` line: at slice level that gap alone is not an ITERATE (SHIP
+on the other accepts); the integration evaluation attempts every such
+accept itself or returns NEEDS_HUMAN listing them under `## Human check`
+(eval-r18a). When a slice changes a shared module the slice-eval also runs
+the existing suites that exercise it, and the integration evaluation runs
+the repo's full check. The section carries
+
+```markdown
+| # | accept | PASS / FAIL / unverified | evidence | command | key output |
+attacks:
+- <input, boundary, removal or injected fault> -> <what happened>
+- <second attack> -> <what happened>
+evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>
+```
+
+A slice SHIP lists at least two attacks. Tests on the canonical
+evaluator's tautology list (string presence on files the slice or Lead
+wrote, one- or two-character `in` checks, `or`-chains satisfied by a
+header, asserting the literal the code writes, `--verify-only`/pass-flag
+readers, presence-only checks, a typecheck over `files: []`, tests that
+read the mailbox, `results/` or `evidence/`) are rejected by name.
+
+The Omnigent driver parses each slice section after the slice-eval returns
+(the `evidence:` line, else the table's evidence cells; the `attacks:`
+items) and logs `- iter N | loop | slice <id> @<sha12> SHIP|ITERATE
+evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n>
+unverified=<n> attacks=<n> (shadow)` (`evidence: missing` when neither is
+present), records it under `quality` in `.driver.json`, and trio-shadow
+prints it. Telemetry only; nothing is gated in r18a.
+
+**Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
+builder, trioctl runs a deterministic AST/regex lint (no model call) over
+the slice's changed test files: `in` / `toContain` checks of a zero- or
+one-character literal (two characters on file text), `or`-chains of `in`
+checks that are negative or run on file text, string presence on text read
+from a file (names scoped per function; an HTTP response body or a file the
+test's own action just wrote is runtime output, not file text),
+presence-only `is_file()`/`exists()` asserts, tests whose file reads name a
+`results/`/`evidence/` path or run `--verify-only`, tests that import none
+of the slice's product modules (module and package names; tests that run
+the product by subprocess / importlib / a script path, or read it, are
+exempt), TypeScript `toContain` over a `readFileSync` variable, and a
+`tsc -p` over a tsconfig with `files: []`. String presence on a static
+config artifact (compose, nginx, Dockerfile, systemd, tsconfig, yaml, ...)
+is the separate `static-config` category — not a tautology flag unless the
+test file has no runtime check at all. The flags are
+`verification_flags` in the builder JSON and ledger record and a
+`PRE-GATE FLAGS` block ("the following tests look tautological; grade
+them explicitly") in the slice-eval's OPEN-LOOP CONTEXT. The lints also run
+in-loop without a builder (eval-r18a N7): for a Lead take-over the driver
+lints the files the slice's `slice(<id>):` commits changed, read at the
+slice sha, and every slice-eval's `PRE-GATE:` block also lists the slice's
+accept-lint findings (`PRE-GATE ACCEPTS`); both are recorded under
+`quality` in `.driver.json` (`verification_flags`, `accept_lint`). After
+every Lead pass the driver runs trio-check's quality lints over the mailbox
+and records them as `.driver.json` `lint` (`counts`, `findings`,
+`mode: advisory`). Nothing is gated. `trio-check.py`
+applies the same lint to the mailbox's own test files and the test files
+slices declare in `writes:` (`quality: WARN test looks tautological`);
+nested repos / worktrees under the mailbox (declared repos) are skipped.
+
+### `## Independent probe` (whole-goal verdicts, r18a)
+
+The lockstep verdict and the open-loop integration verdict carry:
+
+```markdown
+## Independent probe
+probe: PASS|FAIL|UNAVAILABLE <one-line reason>
+probe_cmd: <exact command>
+probe_src: <path of the probe the Evaluator wrote, outside product paths>
+expected: <observable from GOAL.md / goal_probe:>
+observed: <verbatim output excerpt>
+```
+
+The probe is written by the Evaluator against the public surface; it
+never imports implementer tests or Lead scripts. `UNAVAILABLE` leaves the
+criterion unverified (NEEDS_HUMAN, never SHIP). In r18a the Omnigent
+driver only logs it after each integration-eval (`- iter N | loop |
+integration-eval @<sha12> probe: PASS|FAIL|UNAVAILABLE|missing (shadow)`)
+and records it under `quality` in `.driver.json` (lockstep verdicts:
+`.driver.json` only); r18b makes `probe: PASS` a SHIP condition.
+
+### Base-revert kill check (r18a L2a, shadow)
+
+`trioctl omnigent run builder --isolate`, after the builder exits 0 with a
+passing `TARGETED_CHECK:` line and **before** its worktree is committed
+and merged: reverts the slice's non-test product files (changed vs the
+worktree base, tracked or untracked; excluding test paths — `tests/`,
+`test/`, `__tests__/`, `spec/`, `test_*.py`, `*_test.py`, `*_test.go`,
+`conftest.py`, `*.test.*`, `*.spec.*` — the mailbox, `results/` and
+`evidence/`) to the base, re-runs the brief's `## Targeted check` command
+from the worktree root under the targeted-check budget (120 s, PLAN.md
+`full_check_budget_s:`, or `TRIO_KILL_CHECK_BUDGET_S`), and restores the
+tree from an in-memory snapshot of **every** path the slice changed
+(tracked and untracked: product, tests, fixtures, receipts, mailbox files,
+`.gitignore` — restored first, so newly ignored builder files are never
+treated as check output); files the check touched that the slice did not
+change come back from the base blob, never the index. The restore is
+proven byte-identical per snapshotted path and by a sha256 over every
+tracked and untracked non-ignored file (`tree_sha256` ==
+`tree_sha256_after`, `restored: true`). A check that `cd`s / `pushd`s to an
+absolute (or `~`) path outside the worktree is not run: `n/a (absolute
+cd)`. Outcomes:
+
+| outcome | meaning |
+|---|---|
+| `killed` | the re-run failed with a runner's own assertion / failed-test report: pytest `N failed` / `FAILED <id>` / `E   assert` / `AssertionError`; vitest/jest `Tests: N failed` or a `×`/`✕` test mark (a bare `FAIL <file>` only without a collection error); go `--- FAIL`; TAP `not ok N`; generic `Error: expect` |
+| `survived` | still green without the product change: the tests do not exercise it |
+| `n/a` | no product file changed, the slice changed no test file, no targeted check in the brief, the check did not pass, or an absolute `cd` out of the worktree |
+| `error` | anything else: timeout; missing runner or module, usage error, `cd` failure, pytest exit 4/5 (`reason: targeted check not runnable`); a collection / import / module-resolution / build error (`collection_error: true` — the base lacks what the tests import, not a behavioural kill); any other non-zero exit; or `restore:` — the restore proof failed (`kill_check: error (restore)`) |
+
+The r18a-review split `killed-by-import` is gone (eval-r18a N3: it
+depended on import style, not test strength); the informational
+`collection_error: true` replaces it and is never graded on.
+
+Recorded as `kill_check:` in the builder's JSON line and its worktree
+ledger record; the Omnigent driver logs `- iter N | loop | retired slice
+<id> @<sha12> by builder|lead | kill_check: <outcome> (shadow)` when it
+first dispatches the slice-eval, shows `BASE-REVERT:` / `AUTHORED-BY:`
+lines in that slice-eval's OPEN-LOOP CONTEXT, and records it under
+`quality` in `.driver.json` (trio-shadow prints it). **Shadow in r18a**: it
+never changes the retire decision (r18b: `survived` blocks the retire).
+This includes a failed restore proof: it is recorded as `kill_check:
+error (restore)` (with `check_outcome:` and `restore_mismatch:`), printed as
+a WARNING on stderr, and the builder's snapshot-restored tree is integrated
+as usual.
+Disable with `--no-kill-check`, `TRIO_KILL_CHECK=0` (the loop driver then
+writes `kill_check: false` to `.driver.json`, which its builders honour).
 
 ### Lead loop (open-loop mode)
 
@@ -1081,6 +1288,14 @@ shape, fault statuses, `retired:` entries referencing slice ids that
 exist in PLAN.md) — see "v1 open-loop extension (optional)" above. Its
 absence is never a violation.
 
+Quality lints (r18a, advisory; `--strict-quality` makes a `REJECT` a
+violation): the `accepts:` grammar (see "`accepts:` grammar"), a missing
+`goal_probe:`/`goal_acceptance:` in an open-loop mailbox, and a
+`full_check:` made only of artifact readers (`--verify-only`, `jq`/`cat`
+of a JSON receipt, presence checks, or scripts and tests under the
+mailbox directory). They print as `quality: REJECT|WARN ...` lines and
+under `quality` in `--json`.
+
 ## Changelog
 
 - **r16b** (no METRICS_API bump: no loop-core change): lockstep runs
@@ -1094,6 +1309,13 @@ absence is never a violation.
   driver holds the root mailbox `.lock` for its whole run (eval-r16rc-b M1)
   and refuses any gitignored protocol file or brief before touching it
   (L2/L3); an already `shipped` root mailbox is a no-op (exit 0).
+- **r18a** (verified output quality, first slice; no METRICS_API bump):
+  the `accepts:` grammar with oracles, `goal_acceptance:`/`goal_probe:`,
+  enforced `mode:`, evidence kinds and the per-accept table in slice
+  sections, `## Independent probe` in whole-goal verdicts; advisory
+  `trio-check.py` quality lints; the base-revert kill check in shadow
+  (builder JSON, ledger record, driver LOG line, `.driver.json`
+  `quality`, trio-shadow).
 
 - **r16-rc** (merge of r15-fixes, r15.x and r16a): one live-loop
   registry record for every mode ("Live-loop registry"; replaces r15.x's

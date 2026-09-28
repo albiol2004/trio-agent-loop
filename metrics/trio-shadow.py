@@ -231,6 +231,26 @@ def analyze_slice(sl: dict, base: Path, repos: dict | None = None) -> dict:
     return entry
 
 
+def _attach_quality(entries: list[dict], loop_dir: Path) -> None:
+    """r18a shadow telemetry the Omnigent driver recorded in `.driver.json`
+    (`quality`: per `<slice>@<sha12>` the base-revert kill check, authorship,
+    evidence kinds). Informational only; absent file or key adds nothing."""
+    try:
+        data = json.loads((loop_dir / ".driver.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    quality = data.get("quality") if isinstance(data, dict) else None
+    if not isinstance(quality, dict):
+        return
+    for entry in entries:
+        rows = [
+            dict(v) for v in quality.values()
+            if isinstance(v, dict) and v.get("slice") == entry["id"]
+        ]
+        if rows:
+            entry["quality"] = rows
+
+
 def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
     mailbox = mailbox.resolve()
     plan_path = mailbox / "loop" / "PLAN.md"
@@ -264,6 +284,7 @@ def analyze(mailbox: Path, slice_filter: str | None = None) -> dict:
         )
     named = {r["name"]: r["path"] for r in repos}
     entries = [analyze_slice(sl, mailbox, named) for sl in slices]
+    _attach_quality(entries, plan_path.parent)
     summary = {
         "total_slices": len(entries),
         "slices_with_undeclared_touches": sum(
@@ -556,6 +577,17 @@ def render(report: dict, require_commits: bool = False) -> str:
             lines.append(f"    declared but untouched: {_join(sl['declared_untouched'])}")
         if sl["repo_status"] == "ok" and not sl["commits"]:
             lines.append("    no slice-prefixed commits")
+        for q in sl.get("quality") or []:
+            kc = q.get("kill_check") if isinstance(q.get("kill_check"), dict) else {}
+            parts = [f"@{str(q.get('sha') or '')[:12]}",
+                     f"kill_check: {kc.get('outcome', 'n/a')}",
+                     f"by {q.get('authored_by', '?')}"]
+            ev = q.get("evidence")
+            if isinstance(ev, dict) and ev:
+                parts.append("evidence: " + " ".join(f"{k}={v}" for k, v in ev.items()))
+            if q.get("verification_flags"):
+                parts.append(f"flags: {len(q['verification_flags'])}")
+            lines.append("    quality (r18a shadow): " + ", ".join(parts))
     s = report["summary"]
     lines.append(
         f"Summary: {s['total_slices']} slice(s), "
