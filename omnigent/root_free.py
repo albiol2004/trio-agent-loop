@@ -1213,6 +1213,14 @@ def teardown(
     live = Path(record["live_mailbox"])
     root_mailbox = home / record["mailbox_rel"]
     result: dict[str, Any] = {"retained": {}, "branches_kept": {}}
+    if abandon and Path(record["path"]).is_dir():
+        # Keep the driver's own uncommitted mailbox state on the kept branch
+        # (never lost, and the worktree is then clean to remove).
+        lead = Path(record["path"])
+        _git(wt, lead, "add", "-A", "--", record["mailbox_rel"], check=False)
+        if _git(wt, lead, "diff", "--cached", "--quiet", check=False).returncode != 0:
+            _git(wt, lead, "commit", "-q", "-m", f"loop: abandon {record['mailbox_rel']}",
+                 check=False)
     copied = _copy_runtime(live, root_mailbox)
     if copied:
         emit(f"copied {len(copied)} runtime file(s) of {live} to {root_mailbox}")

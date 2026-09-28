@@ -920,12 +920,14 @@ def apply_aggregates(loop_dir: Path, repos: list[dict]) -> list[dict]:
     out: list[dict] = []
     for repo in repos:
         entry = table.get(repo.get("name"))
-        if isinstance(entry, dict) and entry.get("path"):
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if isinstance(path, str) and path.strip():
             repo = dict(repo)
             repo["main_path"] = repo["path"]
-            repo["path"] = Path(entry["path"])
-            if entry.get("branch"):
-                repo["base"] = entry["branch"]
+            repo["path"] = Path(path)
+            branch = entry.get("branch")
+            if isinstance(branch, str) and branch.strip():
+                repo["base"] = branch
         out.append(repo)
     return out
 

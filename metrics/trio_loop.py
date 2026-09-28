@@ -2356,6 +2356,7 @@ def _lead_thread_body(
     repo: Path | None = None,
     gate_held_logged: set | None = None,
     gate_held_lock: threading.Lock | None = None,
+    empty_passes: dict | None = None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
@@ -2374,9 +2375,14 @@ def _lead_thread_body(
     treat `finished` as the authoritative "thread has ended" signal instead
     of racing `Thread.is_alive()`).
     """
+    # r16: consecutive no-op passes are counted across Lead-thread respawns
+    # (an integration ITERATE respawns the thread with a forced pass; a Lead
+    # that never changes anything must still end `stalled`, not re-dispatch
+    # the integration-eval forever).
+    counter = empty_passes if empty_passes is not None else {}
+    counter.setdefault("n", 0)
     try:
         first = True
-        empty_attempts = 0
         while True:
             if stop_event.is_set():
                 result_holder["outcome"] = "stopped"
@@ -2422,7 +2428,8 @@ def _lead_thread_body(
             if result != 0:
                 raise RuntimeError(f"lead runner failed with exit {result}")
             if _lead_pass_snapshot(mailbox, repo) == snapshot_before:
-                empty_attempts += 1
+                counter["n"] += 1
+                empty_attempts = counter["n"]
                 _append_log(
                     mailbox,
                     f"- iter {iteration} | loop | open-loop: lead pass made "
@@ -2438,7 +2445,7 @@ def _lead_thread_body(
                     result_holder["outcome"] = "stalled"
                     return
                 continue
-            empty_attempts = 0
+            counter["n"] = 0
             _update_state(
                 state_path, {"iteration": str(iteration), "status": "running"}
             )
@@ -2870,6 +2877,7 @@ def run_open_loop(
         # by the Lead thread and the done re-check below.
         gate_held_logged: set = set()
         gate_held_lock = threading.Lock()
+        lead_empty_passes: dict = {"n": 0}
 
         def spawn_lead(force_first_pass: bool = False) -> tuple[threading.Thread, dict]:
             holder: dict = {}
@@ -2888,6 +2896,7 @@ def run_open_loop(
                     repo,
                     gate_held_logged,
                     gate_held_lock,
+                    lead_empty_passes,
                 ),
                 daemon=True,
             )
