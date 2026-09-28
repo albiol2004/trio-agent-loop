@@ -22,12 +22,3 @@ def _same_cwd_lock_dir(monkeypatch: pytest.MonkeyPatch, tmp_path_factory) -> Non
         "TRIO_SAME_CWD_LOCK_DIR", str(tmp_path_factory.mktemp("cwd-locks"))
     )
 
-
-@pytest.fixture(autouse=True)
-def _root_turn_lock_dir(monkeypatch: pytest.MonkeyPatch, tmp_path_factory) -> None:
-    """r15.x root-turn locks go to a scratch dir, never ~/.local."""
-    monkeypatch.setenv(
-        "TRIO_ROOT_TURN_LOCK_DIR", str(tmp_path_factory.mktemp("root-turn"))
-    )
-    # A test that leaks a turn fails in a minute instead of hanging 3900 s.
-    monkeypatch.setenv("TRIO_ROOT_TURN_WAIT_S", "60")

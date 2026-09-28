@@ -3633,9 +3633,9 @@ _ROOT_FREE_LOCKSTEP_LEAD_NOTE = (
 _ROOT_FREE_LOCKSTEP_EVALUATOR_NOTE = (
     "ROOT-FREE (this lockstep loop runs in its own Lead worktree):\n"
     "- Your workspace `{lead}` is this loop's private checkout on branch\n"
-    "  `{branch}` (the repo named above); grade the pinned revision as the\n"
-    "  procedure says. The repository root `{home}` is not part of this loop:\n"
-    "  never read, grade, commit or run anything there.\n"
+    "  `{branch}` (the repository this prompt names); grade the pinned\n"
+    "  revision as the procedure says. The repository root `{home}` is not\n"
+    "  part of this loop: never read, grade, commit or run anything there.\n"
     "- The SHIP retirement commit is made here, in `{lead}` on `{branch}`,\n"
     "  exactly as the procedure says (mailbox only). Never touch `{target}`:\n"
     "  after accepting your SHIP the driver lands `{branch}` onto `{target}`.\n"
@@ -5099,7 +5099,7 @@ class OmnigentRunner:
             _append_mailbox_log(
                 mailbox, f"- iter {iteration} | loop | warning: {problem}; {line}",
             )
-            print(f"trioctl: warning: {problem} (continuing)", file=sys.stderr)
+            print(f"trioctl: warning: {problem} (root-free: continuing)", file=sys.stderr)
         with self._dict_lock():
             current = self.__dict__.get("driver_meta")
             current = dict(current) if isinstance(current, dict) else {}

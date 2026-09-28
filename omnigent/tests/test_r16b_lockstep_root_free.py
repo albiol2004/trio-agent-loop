@@ -361,3 +361,75 @@ def test_lockstep_fixture_b_multi_repo_aggregates_and_land_home_last(world, tmp_
         [(True, False), (False, True)], [(False, True), (True, False)])
     assert landed[-1].endswith("onto main") or "onto main (" in landed[-1]
     assert _state(home / "loop/x")["phase"] == "landed"
+
+
+def test_lockstep_mailbox_interrupted_at_the_root_continues_root_free(world, tmp_path):
+    """Migration: a pre-r16b lockstep run stopped at the root after its Lead
+    pass (product committed on main, STATE lead-done) restarts root-free."""
+    home = _home(tmp_path)
+    spec = world.add_loop(home, "loop/mg", [{"id": "mg-a", "write": "src/mg.py",
+                                              "status": "complete"}], lockstep=True)
+    spec["slices"][0]["done"] = True
+    (home / "src/mg.py").write_text("# mg\n")
+    git(home, "add", "src/mg.py")
+    git(home, "commit", "-q", "-m", "slice(mg-a): mg-a work")
+    box = spec["root_box"]
+    (box / "STATE.md").write_text(
+        "schema: 1\niteration: 2\nmax_iterations: 5\nstatus: running\nmission: r16\n"
+        "phase: lead-done\n"
+    )
+    with (box / "LOG.md").open("a") as fh:
+        fh.write("- iter 2 | lead | old root-bound pass; gate: PASS\n")
+    assert world.run_loop(spec) == 0
+    assert _kinds(world, "lead") == []  # straight to the Evaluator
+    evals = _kinds(world, "evaluator")
+    assert len(evals) == 1 and Path(evals[0]["workspace"]).name == "lead-loop--mg"
+    state = _state(home / "loop/mg")
+    assert state["iteration"] == "2" and state["phase"] == "landed"
+    assert git(home, "log", "-1", "--format=%s", "main") == "loop: land loop/mg (iteration 2)"
+
+
+@pytest.mark.parametrize("first", ["native", "lockstep"])
+def test_lockstep_root_lock_excludes_a_native_driver_both_ways(world, tmp_path, first):
+    import os
+    import subprocess
+    import sys
+    from r16_harness import REPO_ROOT
+
+    home = _home(tmp_path)
+    spec = world.add_loop(home, "loop/nl", [{"id": "nl-a", "write": "src/nl.py"}],
+                          lockstep=True)
+    box = spec["root_box"]
+    core = str(REPO_ROOT / "metrics" / "trio_loop.py")
+    code = (
+        "import sys, time; sys.dont_write_bytecode = True\n"
+        "import importlib.machinery, importlib.util\n"
+        f"l = importlib.machinery.SourceFileLoader('c', {core!r})\n"
+        "s = importlib.util.spec_from_loader('c', l); m = importlib.util.module_from_spec(s)\n"
+        "l.exec_module(m)\n"
+        f"lock = m._acquire_lock({str(box)!r}); print('held' if lock else 'refused', flush=True)\n"
+        "time.sleep(60 if lock else 0)\n"
+    )
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    if first == "native":
+        holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                  text=True, env=env)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            assert world.run_loop(spec) == 5
+            assert world.events == []
+        finally:
+            holder.kill()
+            holder.wait()
+        return
+    seen = {}
+
+    def probe(w, sp, runner, ctx, workspace, mailbox, prompt, iteration):
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             env=env)
+        seen["native"] = out.stdout.strip()
+        return False
+
+    world.hooks["evaluator"] = probe
+    assert world.run_loop(spec) == 0
+    assert seen["native"] == "refused"
