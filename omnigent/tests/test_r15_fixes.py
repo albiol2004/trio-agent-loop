@@ -252,3 +252,106 @@ def test_b1_single_repo_mailbox_is_unaffected(env, tmp_path):
     (box / "PLAN.md").write_text(re.sub(r"```yaml\nrepos:\n.*?```\n", "", plan, flags=re.S))
     state = {"evaluated_repos": ""}
     assert core._declared_repos_retirement_problem(box, 1, "", state) is None
+
+
+# --- N1 / N6: retired `repo:` must match PLAN; wrong-repo/phantom shas -------
+
+
+class RetireTamper(E.Scenario):
+    """The scripted Lead retires every slice, then rewrites app-backend's
+    be-a entry (repro test_q6.py::WrongRepoSha / PhantomSha and
+    test_q2_evalrepo.py): ``repo`` = a wrong `repo:` value (None drops the
+    key), ``sha`` = "frontend" (a real app-frontend commit), "phantom"
+    (no such object) or None (keep)."""
+
+    repo: str | None = "app-backend"
+    sha: str | None = None
+
+    def lead(self, iteration, prompt):
+        super().lead(iteration, prompt)
+        if iteration != 1:
+            return
+        box = self.l["box"]
+        views = {v.get("repo_name"): v["merge_commit"] for v in self.dispatch_views}
+        be = views["app-backend"]
+        bad_sha = {"frontend": views["app-frontend"], "phantom": "ab" * 20}.get(self.sha, be)
+        self.bad = (self.repo, bad_sha)
+        repo_line = f"    repo: {self.repo}\n" if self.repo else ""
+        q = (box / "QUEUE.md").read_text()
+        old = f"    repo: app-backend\n    sha: {be}\n"
+        assert old in q
+        (box / "QUEUE.md").write_text(q.replace(old, f"{repo_line}    sha: {bad_sha}\n"))
+
+    def slice_eval(self, ctx, workspace, prompt):
+        with self.lock:
+            self.__dict__.setdefault("eval_ctx", []).append(dict(ctx))
+        super().slice_eval(ctx, workspace, prompt)
+
+
+@pytest.mark.parametrize(
+    "repo, sha, message",
+    [
+        ("app-frontend", "frontend",
+         "has repo: app-frontend but PLAN.md puts slice be-a in repo app-backend"),
+        (None, None, "has repo: home but PLAN.md puts slice be-a in repo app-backend"),
+        ("home", None, "has repo: home but PLAN.md puts slice be-a in repo app-backend"),
+        ("ghost", None, "has repo: ghost but PLAN.md puts slice be-a in repo app-backend"),
+        ("app-backend", "frontend", "is not a commit of repo app-backend"),
+        ("app-backend", "phantom", "is not a commit of repo app-backend"),
+    ],
+    ids=["wrong-repo", "omitted", "home", "ghost", "wrong-repo-sha", "phantom-sha"],
+)
+def test_n1_n6_bad_retired_entry_is_held_at_retire_parse(
+    env, monkeypatch, tmp_path, repo, sha, message
+):
+    layout = E._layout(tmp_path, "B")
+    cls = type("Tamper", (RetireTamper,), {"repo": repo, "sha": sha})
+    code, scenario, runner = _run(env, layout, cls, monkeypatch)
+    assert code != 0
+    assert "status: shipped" not in _state(layout)
+    log = _log(layout)
+    # Fails fast with a clear queue error, not "failed to write a verdict".
+    assert message in log, log
+    assert "QUEUE.md: slice be-a has a malformed retired entry; not gated as retired" in log
+    assert "failed to write a verdict section" not in log
+    # The tampered entry was never graded (not on a wrong tree, not on a
+    # degraded path). The scripted Lead writes the correct entry first and
+    # tampers with it right after, so the driver may grade that one.
+    graded = getattr(scenario, "eval_ctx", [])
+    bad_repo, bad_sha = scenario.bad
+    for ctx in graded:
+        if ctx["slice"] == "be-a":
+            assert ctx["sha"] != bad_sha or bad_sha == scenario.dispatch_views[0]["merge_commit"]
+            assert ctx.get("repo") == "app-backend"
+    assert {"fe-b", "home-c"} <= {c["slice"] for c in graded}
+    assert not getattr(runner, "eval_isolation_degraded", None)
+
+
+def test_n1_eval_repo_is_plan_authoritative(env, tmp_path):
+    _tmp, _wt, trioctl, _core = env
+    layout = E._layout(tmp_path, "B")
+    box = layout["box"]
+    eval_repo = trioctl.OmnigentRunner._eval_repo
+    backend = layout["repos"]["app-backend"]["path"]
+    name, declared = eval_repo(box, {"slice": "be-a"})
+    assert name == "app-backend" and declared["path"] == backend.resolve()
+    assert eval_repo(box, {"slice": "be-a", "repo": "app-backend"})[0] == "app-backend"
+    assert eval_repo(box, {"slice": "home-c"}) == ("home", None)
+    for claimed in ("app-frontend", "ghost", "home"):
+        with pytest.raises(trioctl.TrioctlError, match="PLAN.md puts slice"):
+            eval_repo(box, {"slice": "be-a", "repo": claimed})
+
+
+def test_n1_single_repo_queue_without_repo_keys_is_untouched(env, tmp_path):
+    _tmp, _wt, _trioctl, core = env
+    layout = E._layout(tmp_path, "B")
+    box = layout["box"]
+    plan = (box / "PLAN.md").read_text()
+    plan = re.sub(r"```yaml\nrepos:\n.*?```\n", "", plan, flags=re.S)
+    (box / "PLAN.md").write_text(plan.replace("    repo: app-backend\n", "").replace(
+        "    repo: app-frontend\n", ""))
+    (box / "QUEUE.md").write_text(
+        "```yaml\nretired:\n  - slice: be-a\n    sha: " + "a" * 40 + "\n    at: t\n```\n"
+    )
+    raw = core._METRICS.read_queue(box)
+    assert core._read_queue(box) == raw

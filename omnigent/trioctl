@@ -4308,17 +4308,25 @@ class OmnigentRunner:
     ) -> tuple[str, dict[str, Any] | None]:
         """(repo name, declared repo or None) a slice-eval grades in (r15).
 
-        The loop core names it in the context (``repo``); a context without
-        it (an older core) falls back to the slice's PLAN.md `repo:`.
+        PLAN.md is authoritative (eval-r15 N1): the slice's PLAN.md `repo:`
+        (omitted = home, as in trio-check's check_queue) names the repo.
+        The loop core's context ``repo`` (set only for a declared repo; its
+        retire parse already holds an entry that disagrees with PLAN.md) is
+        a cross-check: a disagreement raises, so the bind degrades loudly
+        instead of grading another repo's tree.
         """
         context = context or {}
         repos = _declared_repos(mailbox)
         if not repos:
             return "home", None
-        name = str(context.get("repo") or "").strip()
-        if name:
-            return (name, repos[name]) if name in repos else ("home", None)
-        return _slice_repo(mailbox, context.get("slice"))
+        name, declared = _slice_repo(mailbox, context.get("slice"))
+        claimed = str(context.get("repo") or "").strip()
+        if claimed and claimed != name:
+            raise TrioctlError(
+                f"slice-eval context names repo {claimed!r} but PLAN.md puts "
+                f"slice {context.get('slice')!r} in repo {name!r}"
+            )
+        return name, declared
 
     def _discard_eval_worktree(self, record: dict[str, Any], exc: BaseException) -> None:
         """Remove (or record as retained) a created-but-unbound eval worktree."""

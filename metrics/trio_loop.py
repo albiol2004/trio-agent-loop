@@ -2182,6 +2182,116 @@ def _malformed_retired_slices(queue: dict) -> set[str]:
     return set(queue.get("malformed_slices") or [])
 
 
+RETIRED_REPO_ERROR_PREFIX = "`retired:` block:"
+
+#: (repo path, sha) pairs already proven to be commits (they stay commits).
+_KNOWN_REPO_COMMITS: set[tuple[str, str]] = set()
+
+
+def _plan_slice_repos(mailbox: Path) -> dict[str, str] | None:
+    """``{slice id: PLAN.md repo:}`` with `.`/`home`/omitted as ``home``;
+    None when PLAN.md is missing or its slices block does not parse."""
+    try:
+        text = (Path(mailbox) / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    slices = _METRICS.parse_slices_block(text)
+    if slices is None:
+        return None
+    return {sl["id"]: _repo_value(sl.get("repo")) for sl in slices}
+
+
+def _repo_value(value) -> str:
+    """A `repo:` value with the home spellings (omitted, `.`, `./`, `home`)
+    folded to ``home``; MAILBOX-SCHEMA.md: an omitted `repo:` is home."""
+    value = str(value or "").strip()
+    return "home" if value in ("", ".", "./", "home") else value
+
+
+def _retired_repo_problems(mailbox: Path, queue: dict) -> list[tuple[dict, str]]:
+    """Retired entries whose `repo:`/`sha:` the driver must not grade (r15).
+
+    PLAN.md is authoritative (eval-r15 N1): an entry's `repo:` (omitted =
+    home) must equal its slice's PLAN.md `repo:`, and a declared repo must
+    still be declared and valid. Its sha must be a commit of that repo
+    (eval-r15 N6: a wrong-repo or phantom sha fails at retire parse, not
+    three dispatches later). A single-repo mailbox whose entries carry no
+    `repo:` is never affected. Returns ``[(entry, message)]``.
+    """
+    retired = queue.get("retired") or []
+    declared, errors = _declared_repos_checked(mailbox)
+    tagged = [e for e in retired if _repo_value(e.get("repo")) != "home"]
+    if not declared and not errors and not tagged:
+        return []
+    plan = _plan_slice_repos(mailbox)
+    if plan is None:
+        return []  # the per-slice commit gate reports an unreadable PLAN
+    paths = {name: path for name, path in declared}
+    problems: list[tuple[dict, str]] = []
+    for entry in retired:
+        slice_id = entry.get("slice", "")
+        if slice_id not in plan:
+            continue  # unknown slice: the per-slice commit gate exits 2
+        sha = str(entry.get("sha", "")).strip()
+        entry_repo = _repo_value(entry.get("repo"))
+        plan_repo = plan[slice_id]
+        where = f"entry for slice {slice_id} (sha {sha[:12]})"
+        if entry_repo != plan_repo:
+            problems.append((entry, (
+                f"{where} has repo: {entry_repo} but PLAN.md puts slice "
+                f"{slice_id} in repo {plan_repo} (an omitted repo: is home); "
+                "PLAN.md is authoritative -- re-retire it with the PLAN repo"
+            )))
+            continue
+        if entry_repo == "home":
+            continue
+        path = paths.get(entry_repo)
+        if path is None:
+            problems.append((entry, (
+                f"{where} names repo {entry_repo}, which is not a valid "
+                "declared PLAN.md repos: entry"
+                + (f" ({errors[0]})" if errors else "")
+            )))
+            continue
+        key = (str(path), sha)
+        if key in _KNOWN_REPO_COMMITS:
+            continue
+        if _git_commit_sha(path, sha) is None:
+            problems.append((entry, (
+                f"{where}: sha {sha} is not a commit of repo {entry_repo} "
+                f"({path}); retire the slice's merge commit in its own repo"
+            )))
+            continue
+        _KNOWN_REPO_COMMITS.add(key)
+    return problems
+
+
+def _read_queue(mailbox: Path) -> dict:
+    """``read_queue`` plus the r15 retired `repo:`/`sha:` checks.
+
+    An entry of ``_retired_repo_problems`` is held exactly like any other
+    malformed `retired:` entry: dropped from ``retired``, its slice listed
+    in ``malformed_slices`` (never gated as retired, never dispatched), and
+    its message appended to ``errors`` (logged once per iteration).
+    """
+    queue = _METRICS.read_queue(mailbox)
+    problems = _retired_repo_problems(mailbox, queue)
+    if not problems:
+        return queue
+    bad = {id(entry) for entry, _msg in problems}
+    queue = dict(queue)
+    queue["retired"] = [e for e in queue["retired"] if id(e) not in bad]
+    queue["malformed_slices"] = sorted(
+        set(queue.get("malformed_slices") or [])
+        | {entry.get("slice", "") for entry, _msg in problems}
+    )
+    queue["errors"] = [
+        *(queue.get("errors") or []),
+        *(f"{RETIRED_REPO_ERROR_PREFIX} {msg}" for _entry, msg in problems),
+    ]
+    return queue
+
+
 def _gate_retired_ids(queue: dict) -> set[str]:
     """Slice ids `_slices_fully_retired` may count as retired: every slice
     with a valid `retired:` entry, minus `_malformed_retired_slices`."""
@@ -2420,7 +2530,7 @@ def _lead_thread_body(
                 return
             if not (first and force_first_pass):
                 slice_ids = _read_plan_slice_ids(mailbox)
-                queue = _METRICS.read_queue(mailbox)
+                queue = _read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
                 open_or_taken = _live_faults(queue)
                 if _slices_fully_retired(
@@ -2451,7 +2561,7 @@ def _lead_thread_body(
             # r11g Q1: a held gate's error text reaches the Lead through
             # its OPEN-LOOP CONTEXT (the Lead never reads LOG.md). The key
             # is only present when there is something to repair.
-            queue_errors = _queue_fault_errors(_METRICS.read_queue(mailbox))
+            queue_errors = _queue_fault_errors(_read_queue(mailbox))
             if queue_errors:
                 context["queue_errors"] = queue_errors
             snapshot_before = _lead_pass_snapshot(mailbox, repo)
@@ -2912,7 +3022,7 @@ def run_open_loop(
         while True:
             lead_alive = not lead_result.get("finished", False)
 
-            queue = _METRICS.read_queue(mailbox)
+            queue = _read_queue(mailbox)
             _log_queue_errors(
                 mailbox, current_iteration(), queue, queue_errors_logged
             )
@@ -3112,7 +3222,7 @@ def run_open_loop(
                 # trusting it -- a slice-eval just above may have opened a
                 # fault after the Lead thread already decided it was done.
                 slice_ids = _read_plan_slice_ids(mailbox)
-                queue = _METRICS.read_queue(mailbox)
+                queue = _read_queue(mailbox)
                 # Log parse errors / malformed slices / unknown statuses in
                 # THIS turn: the final slice-eval may have just written a
                 # malformed fault, and the integration eval must never be

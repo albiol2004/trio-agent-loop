@@ -426,9 +426,13 @@ field the value comes from); any other key makes the entry malformed.
 key, `repo: <name>`, between `slice:` and `sha:`; its `sha` is a commit of
 that repo and `at:` its committer time there (`git -C <repo> log -1
 --format=%cI <sha>`). Omitted means `home`, so existing mailboxes parse
-unchanged; trio-check flags a `repo:` that is undeclared or differs from
-the slice's PLAN.md `repo:`. `faults:` entries are unchanged (the slice id
-implies the repo).
+unchanged. PLAN.md is authoritative: trio-check flags a `repo:` that is
+undeclared or differs from the slice's PLAN.md `repo:`, and the open-loop
+driver holds such an entry -- and one whose `sha` is not a commit of its
+declared repo -- like any other malformed entry (logged as a QUEUE.md
+parse error, never gated as retired, never graded) until it is re-retired
+correctly. `faults:` entries are unchanged (the slice id implies the
+repo).
 
 `retired:` is **append-only, Lead only**: the Lead is the only role that
 appends an entry, and no role ever edits or removes an existing one. The
