@@ -15,7 +15,9 @@ Usage:
   trio-acceptance.py verify --mailbox <mb> --pin <sha256>
 
 Check outcomes (from the check's exit code):
-  0 -> PASS (and every `expect.stdout` regex matches), 1 -> FAIL,
+  0 -> PASS (and every `expect` regex matches: `stdout` against the full
+  stdout, `stderr` against the full stderr, `output` against stdout then
+  stderr; each stream up to MATCH_BYTES = 1 MiB), 1 -> FAIL,
   77 or an unmet `needs` entry -> UNAVAILABLE, killed at `timeout_s` ->
   FAIL (reason `timeout`), anything else -> ERROR, re-run once; still
   ERROR -> FAIL (reason `error`).
@@ -29,10 +31,13 @@ own process group, under bwrap (`--unshare-all`: loopback only, read-only
 /, tmpfs /tmp, only its own copy writable, its pack view read-only) when
 available, else unsandboxed with a dead http(s) proxy (``sandbox: none``:
 fresh copies only; a hostile check can still write outside its copy).
-A check whose `run` starts a Python script runs that interpreter with
-``-P`` (the check script's own directory is not importable); the flag is
-not inherited, so the product and any Python the check starts resolve
-imports normally (eval-r19d finding 1). ``acceptance/lib/`` is the
+A check whose `run` starts Python on PACK code (a script under
+``acceptance/``, ``-c``, or ``-m`` of a module in ``acceptance/lib/``) runs
+that interpreter with ``-P -s`` (neither the script's directory, the tree
+nor user site-packages is importable by it); the flags are not inherited,
+and a `run` that starts the PRODUCT (``python3 app.py``, ``python3 -m
+pkg``) gets neither, so the product and any Python a check starts resolve
+imports normally (eval-r19d finding 1, eval-r19e findings 1, 3, 4). ``acceptance/lib/`` is the
 explicit shared helper path (PYTHONPATH/NODE_PATH). Checks get a
 controlled PATH (system directories plus the directories of the
 interpreters the driver resolved when it started; ``check_path``). The
@@ -53,6 +58,7 @@ import importlib.util
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -87,6 +93,13 @@ MAX_CHECKS = 25
 RETRY_DROP_FRACTION = 0.30
 EXIT_UNAVAILABLE = 77
 EXCERPT_BYTES = 2048
+#: How much of each stream `expect` patterns see (eval-r19e finding 2): the
+#: first MATCH_BYTES of stdout / stderr, captured separately. Beyond it the
+#: stream is drained and discarded (``*_truncated`` in the attempt).
+MATCH_BYTES = 1 << 20
+#: `expect` pattern lists: `stdout` (stdout only), `stderr` (stderr only),
+#: `output` (stdout followed by stderr, for a check that asks for both).
+EXPECT_STREAMS = ("stdout", "stderr", "output")
 CHECK_ID_RE = re.compile(r"^ACC-[0-9]{1,4}$")
 BINDING_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SETUP_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -155,7 +168,12 @@ def pack_symlinks(acc_dir: Path) -> list[str]:
     if not acc_dir.is_dir():
         return out
     for root, dirs, files in os.walk(acc_dir):
+        # The pin's own exclusions (eval-r19e finding 6): `node_modules/`
+        # and caches are never pinned, copied into a run or committed.
+        dirs[:] = [d for d in dirs if d not in HASH_SKIP_DIRS]
         for name in dirs + files:
+            if name in HASH_SKIP_DIRS:
+                continue
             full = Path(root) / name
             if full.is_symlink():
                 out.append(full.relative_to(acc_dir).as_posix())
@@ -170,8 +188,9 @@ def symlinks_at(repo: Path, rev: str, acc_rel: str) -> list[str]:
     out = []
     for raw in proc.stdout.decode("utf-8", "surrogateescape").split("\0"):
         meta, _tab, path = raw.partition("\t")
-        if meta.split()[:1] == ["120000"]:
-            out.append(path[len(acc_rel) + 1:])
+        rel = path[len(acc_rel) + 1:]
+        if meta.split()[:1] == ["120000"] and not HASH_SKIP_DIRS.intersection(rel.split("/")):
+            out.append(rel)
     return sorted(out)
 
 
@@ -275,25 +294,34 @@ def check_errors(check: Any, manifest: dict[str, Any], goal_text: str | None = N
     run = check.get("run")
     if not (isinstance(run, list) and run and all(isinstance(a, str) and a for a in run)):
         errs.append("run must be a non-empty argv list of strings")
-    elif acc_root is not None:
-        for arg in run:
-            if arg.startswith(PACK_DIR + "/") and not (acc_root.parent / arg).exists():
-                errs.append(f"run names {arg}, which does not exist")
+    else:
+        if _PY_NAME_RE.match(os.path.basename(run[0])):
+            kind, value = python_target(run)
+            if kind == "module" and value and value.split(".", 1)[0] == PACK_DIR:
+                errs.append(f"run `-m {value}`: run a pack module by its path "
+                            f"(python3 {PACK_DIR}/.../x.py), or put it in "
+                            f"{PACK_DIR}/{HELPER_DIR}/ and run `-m <name>`")
+        if acc_root is not None:
+            for arg in run:
+                if arg.startswith(PACK_DIR + "/") and not (acc_root.parent / arg).exists():
+                    errs.append(f"run names {arg}, which does not exist")
     expect = check.get("expect", {"exit": 0})
-    if not isinstance(expect, dict) or set(expect) - {"exit", "stdout"}:
-        errs.append("expect must be an object with `exit` (0) and optional `stdout`")
+    if not isinstance(expect, dict) or set(expect) - {"exit", *EXPECT_STREAMS}:
+        errs.append("expect must be an object with `exit` (0) and optional "
+                    "`stdout`, `stderr`, `output` regex lists")
     else:
         if expect.get("exit", 0) != 0:
             errs.append("expect.exit must be 0 (a check exits 0 on PASS)")
-        pats = expect.get("stdout", [])
-        if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
-            errs.append("expect.stdout must be a list of regexes")
-        else:
+        for key in EXPECT_STREAMS:
+            pats = expect.get(key, [])
+            if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
+                errs.append(f"expect.{key} must be a list of regexes")
+                continue
             for pat in pats:
                 try:
                     re.compile(pat)
                 except re.error as exc:
-                    errs.append(f"expect.stdout regex {pat!r}: {exc}")
+                    errs.append(f"expect.{key} regex {pat!r}: {exc}")
     timeout = check.get("timeout_s", DEFAULT_TIMEOUT_S)
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) \
             or not 0 < timeout <= MAX_TIMEOUT_S:
@@ -385,9 +413,30 @@ def _copy_ignore(root: Path, exclude: set[str]):
     return ignore
 
 
-def copy_tree(src: Path, dst: Path, exclude: Iterable[str] = ()) -> None:
+def copy_tree(src: Path, dst: Path, exclude: Iterable[str] = ()) -> list[str]:
+    """Copy *src* to *dst* (symlinks as links, SKIP_DIRS and *exclude*
+    left out). Entries that cannot be read (a mode-000 file or directory)
+    are skipped and returned as warnings (eval-r19e finding 7); an
+    unreadable *src* itself raises RuntimeError."""
     src = Path(src).resolve()
-    shutil.copytree(src, dst, symlinks=True, ignore=_copy_ignore(src, set(exclude)))
+    try:
+        shutil.copytree(src, dst, symlinks=True, ignore=_copy_ignore(src, set(exclude)))
+    except shutil.Error as exc:
+        warnings = []
+        for entry in exc.args[0] if exc.args and isinstance(exc.args[0], list) else [exc.args]:
+            if isinstance(entry, tuple) and len(entry) == 3:
+                where, _dst, why = entry
+                try:
+                    where = Path(where).relative_to(src).as_posix()
+                except ValueError:
+                    pass
+                warnings.append(f"{where}: {why}")
+            else:
+                warnings.append(str(entry))
+        return warnings
+    except OSError as exc:
+        raise RuntimeError(f"cannot copy tree {src}: {exc}") from exc
+    return []
 
 
 def _git(repo: Path, *args: str, check: bool = True, **kw: Any) -> subprocess.CompletedProcess:
@@ -491,6 +540,7 @@ def _sandbox_argv(argv: list[str], cwd: Path, writable: list[Path],
 
 
 def _tail(data: bytes | str | None) -> str:
+    """The last EXCERPT_BYTES of *data*: evidence and log excerpts only."""
     if data is None:
         return ""
     if isinstance(data, bytes):
@@ -505,53 +555,133 @@ def _reason_line(text: str) -> str:
     return ""
 
 
+class _Capture:
+    """One stream: its first MATCH_BYTES (for `expect`), whether more came."""
+
+    def __init__(self) -> None:
+        self.head = bytearray()
+        self.truncated = False
+
+    def add(self, chunk: bytes) -> None:
+        room = MATCH_BYTES - len(self.head)
+        if room > 0:
+            self.head += chunk[:room]
+        if len(chunk) > max(room, 0):
+            self.truncated = True
+
+    def text(self) -> str:
+        return bytes(self.head).decode("utf-8", errors="replace")
+
+
+def _drain(proc: subprocess.Popen, deadline: float, streams: dict[int, _Capture],
+           merged: bytearray) -> bool:
+    """Read stdout and stderr until both reach EOF or *deadline*; True on
+    EOF. *merged* keeps the last EXCERPT_BYTES in arrival order."""
+    sel = selectors.DefaultSelector()
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            os.set_blocking(pipe.fileno(), False)
+            sel.register(pipe, selectors.EVENT_READ)
+    try:
+        while sel.get_map():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            for key, _ in sel.select(timeout=min(left, 1.0)):
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    continue
+                streams[key.fd].add(chunk)
+                merged += chunk
+                if len(merged) > 4 * EXCERPT_BYTES:
+                    del merged[:-EXCERPT_BYTES * 2]
+        return True
+    finally:
+        sel.close()
+
+
 def _attempt(argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
              sandbox: str, writable: list[Path], readable: list[Path],
              read_only: Iterable[Path] = ()) -> dict[str, Any]:
+    """Run one attempt. stdout and stderr are captured separately (their
+    first MATCH_BYTES each, for `expect`); ``output`` is the tail of both in
+    arrival order (excerpt and FAIL reason only)."""
     cmd = _sandbox_argv(argv, cwd, writable, readable, read_only) \
         if sandbox == "bwrap" else argv
     started = time.monotonic()
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                 start_new_session=True)
     except OSError as exc:
         return {"exit": None, "error": f"cannot start: {exc}", "output": "",
-                "wall_s": 0.0, "timeout": False}
+                "stdout": "", "stderr": "", "wall_s": 0.0, "timeout": False}
+    out, err = _Capture(), _Capture()
+    streams = {proc.stdout.fileno(): out, proc.stderr.fileno(): err}  # type: ignore[union-attr]
+    merged = bytearray()
+    timed_out = False
     try:
-        out, _ = proc.communicate(timeout=timeout)
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        if not _drain(proc, started + timeout, streams, merged):
+            timed_out = True
+        else:
+            try:
+                proc.wait(timeout=max(0.0, started + timeout - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # the check's group: strays too
         except (ProcessLookupError, PermissionError):
-            proc.kill()
+            if timed_out:
+                proc.kill()
+        if timed_out:
+            _drain(proc, time.monotonic() + 10, streams, merged)
         try:
-            out, _ = proc.communicate(timeout=10)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            out = b""
-    else:
-        # Reap stray children the check left in its group.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return {"exit": proc.returncode, "output": _tail(out), "timeout": timed_out,
-            "wall_s": round(time.monotonic() - started, 2)}
+            proc.kill()
+            proc.wait()
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+    return {"exit": proc.returncode, "output": _tail(bytes(merged)),
+            "stdout": out.text(), "stderr": err.text(),
+            **({"stdout_truncated": True} if out.truncated else {}),
+            **({"stderr_truncated": True} if err.truncated else {}),
+            "timeout": timed_out, "wall_s": round(time.monotonic() - started, 2)}
+
+
+def _expect_text(attempt: dict[str, Any], key: str) -> str:
+    """The text an `expect.<key>` list is matched against (full streams up
+    to MATCH_BYTES; an attempt without separate streams falls back to its
+    ``output``)."""
+    if "stdout" not in attempt and "stderr" not in attempt:
+        return attempt.get("output") or ""
+    if key == "output":
+        return (attempt.get("stdout") or "") + (attempt.get("stderr") or "")
+    return attempt.get(key) or ""
 
 
 def _classify(check: dict[str, Any], attempt: dict[str, Any]) -> tuple[str, str | None]:
-    """(outcome, reason): PASS | FAIL | UNAVAILABLE | ERROR."""
+    """(outcome, reason): PASS | FAIL | UNAVAILABLE | ERROR. `expect`
+    patterns (``re.search``, MULTILINE) see the full stream they name, not
+    the excerpt tail (eval-r19e finding 2)."""
     if attempt.get("timeout"):
         return "FAIL", "timeout"
     code = attempt.get("exit")
     if code is None:
         return "ERROR", attempt.get("error") or "runner failure"
     if code == 0:
-        for pat in (check.get("expect") or {}).get("stdout") or []:
-            if not re.search(pat, attempt.get("output") or "", re.MULTILINE):
-                return "FAIL", f"stdout does not match {pat!r}"
+        expect = check.get("expect") or {}
+        for key in EXPECT_STREAMS:
+            text = _expect_text(attempt, key)
+            for pat in expect.get(key) or []:
+                if not re.search(pat, text, re.MULTILINE):
+                    return "FAIL", f"{key} does not match {pat!r}"
         return "PASS", None
     if code == 1:
         return "FAIL", _reason_line(attempt.get("output") or "") or "exit 1"
@@ -815,8 +945,11 @@ def check_path(env_path: str | None = None) -> str:
 
 
 _PY_NAME_RE = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)*)?$")
-#: Python options that take a separate value argument.
-_PY_VALUE_OPTS = frozenset({"-W", "-X", "-Q", "--check-hash-based-pycs"})
+#: Single-letter Python options that take a value (attached, ``-Wignore``,
+#: or as the next word). ``-c``/``-m`` also end the option list.
+_PY_VALUE_LETTERS = frozenset("WXQ")
+#: Long options that take a separate value argument.
+_PY_VALUE_LONG = frozenset({"--check-hash-based-pycs"})
 _SAFE_PATH_OK: dict[str, bool] = {}
 
 
@@ -831,33 +964,114 @@ def _supports_safe_path(exe: str) -> bool:
     return _SAFE_PATH_OK[exe]
 
 
-def isolated_argv(run: list[str], path: str) -> list[str]:
-    """The argv a check runs: its `run`, with ``-P`` added when it starts a
-    Python interpreter on a script (eval-r19d finding 1). ``-P`` keeps the
-    script's own directory (the check's pack view) off *that* interpreter's
-    ``sys.path`` and is not inherited -- unlike ``PYTHONSAFEPATH``, which
-    leaked into the product. ``-m``/``-c`` invocations are left alone (their
-    ``sys.path[0]`` is the tree copy, not the pack). Interpreters older than
-    3.11 (no ``-P``) rely on the views alone."""
-    argv = [str(a) for a in run]
-    if not argv or not _PY_NAME_RE.match(os.path.basename(argv[0])):
-        return argv
+def python_target(argv: list[str]) -> tuple[str, str | None]:
+    """What a Python command line runs: ``("script", path)``,
+    ``("module", name)``, ``("code", source)`` or ``("none", None)`` (an
+    interactive/stdin interpreter, or ``-h``/``-V``). Parses CPython's
+    option syntax: combined short options (``-um pkg``, ``-Bc code``,
+    ``-mpkg``, ``-uWignore``), value options as a separate word (``-W x``,
+    ``-X y``, ``--check-hash-based-pycs v``) and ``--``."""
     i = 1
     while i < len(argv):
         arg = argv[i]
+        if arg == "--":
+            return ("script", argv[i + 1]) if i + 1 < len(argv) else ("none", None)
         if arg == "-" or not arg.startswith("-"):
-            break  # the script
-        if arg.startswith(("-m", "-c")) or arg == "--":
-            return argv
-        if arg in _PY_VALUE_OPTS:
+            return ("none", None) if arg == "-" else ("script", arg)
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name in ("--help", "--version", "--help-env", "--help-xoptions",
+                        "--help-all"):
+                return ("none", None)
+            if name in _PY_VALUE_LONG and "=" not in arg:
+                i += 1
             i += 1
+            continue
+        j = 1
+        while j < len(arg):
+            letter = arg[j]
+            rest = arg[j + 1:]
+            if letter in "cm":
+                value = rest if rest else (argv[i + 1] if i + 1 < len(argv) else None)
+                if value is None:
+                    return ("none", None)
+                return ("code" if letter == "c" else "module", value)
+            if letter in _PY_VALUE_LETTERS:
+                if not rest:
+                    i += 1  # the value is the next word
+                break
+            if letter in "hV?":
+                return ("none", None)
+            j += 1
         i += 1
-    else:
-        return argv  # no script: an interactive/stdin interpreter
-    exe = shutil.which(argv[0], path=path)
-    if exe is None or not _supports_safe_path(exe):
+    return ("none", None)
+
+
+def _inside(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def runs_pack_code(run: list[str], tree: Path | str | None = None,
+                   lib_present: bool = False) -> bool:
+    """True when *run* starts a Python interpreter on code that comes from
+    the check's pack (eval-r19e findings 1 and 4):
+
+    - a script that resolves inside ``acceptance/`` of *tree* (the check's
+      copy; symlinks resolved, as CPython does for ``sys.path[0]``), or,
+      with no *tree*, whose normalised relative path starts with
+      ``acceptance/``;
+    - ``-c <code>`` (the code is the manifest's, i.e. the pack's);
+    - ``-m <name>`` whose top-level package is ``acceptance`` or is found in
+      ``acceptance/lib/`` (``lib_present``; *tree* given).
+
+    A product script (``python3 app.py``, ``python3 template/build/t.py``)
+    or a product/third-party module (``-m pkg``, ``-m pytest``) is not pack
+    code: it runs exactly the way its users run it."""
+    argv = [str(a) for a in run]
+    if not argv or not _PY_NAME_RE.match(os.path.basename(argv[0])):
+        return False
+    kind, value = python_target(argv)
+    if kind == "code":
+        return True
+    if kind == "script" and value:
+        if tree is None:
+            if os.path.isabs(value):
+                return False
+            norm = os.path.normpath(value).replace(os.sep, "/")
+            return norm == PACK_DIR or norm.startswith(PACK_DIR + "/")
+        root = os.path.realpath(str(tree))
+        target = os.path.realpath(os.path.join(root, value))
+        return _inside(target, os.path.join(root, PACK_DIR))
+    if kind == "module" and value:
+        top = value.split(".", 1)[0]
+        if top == PACK_DIR:
+            return True
+        if lib_present and tree is not None:
+            lib = Path(str(tree)) / PACK_DIR / HELPER_DIR
+            return (lib / f"{top}.py").is_file() or (lib / top).is_dir()
+    return False
+
+
+def isolated_argv(run: list[str], path: str, tree: Path | str | None = None,
+                  lib_present: bool = False) -> list[str]:
+    """The argv a check runs: its `run`, with ``-P -s`` added to the
+    check's OWN interpreter when the code it runs comes from the pack
+    (``runs_pack_code``; eval-r19c F2, eval-r19e findings 1, 3, 4). ``-P``
+    keeps the check script's directory (its pack view) and the product
+    tree (cwd, for ``-c``) off *that* interpreter's ``sys.path``; ``-s``
+    keeps user site-packages (a ``.pth`` planted there) out of it. Both are
+    flags, not environment variables: the product and every process the
+    check starts resolve imports normally, user site included. Product
+    scripts and product/third-party modules get nothing. Interpreters
+    older than 3.11 (no ``-P``) get ``-s`` only and rely on the views."""
+    argv = [str(a) for a in run]
+    if not runs_pack_code(argv, tree, lib_present):
         return argv
-    return [argv[0], "-P", *argv[1:]]
+    exe = shutil.which(argv[0], path=path)
+    flags = ["-s"]
+    if exe is not None and _supports_safe_path(exe):
+        flags = ["-P", "-s"]
+    return [argv[0], *flags, *argv[1:]]
 
 
 def check_env(env: dict[str, str], tree: Path, pack_view: Path, lib_present: bool,
@@ -865,7 +1079,8 @@ def check_env(env: dict[str, str], tree: Path, pack_view: Path, lib_present: boo
     """The per-check environment: its own tree and pack view, the pinned
     helper path and the controlled PATH. Nothing here changes how the
     PRODUCT resolves its imports (eval-r19d finding 1: no PYTHONSAFEPATH /
-    PYTHONNOUSERSITE, which every child Python inherited)."""
+    PYTHONNOUSERSITE, which every child Python inherited); the check's own
+    interpreter gets ``-P -s`` as flags instead (``isolated_argv``)."""
     out = {k: v for k, v in env.items() if k not in IMPLICIT_ENV}
     out.update({"ACC_TREE": str(tree), "ACC_DIR": str(pack_view),
                 "PYTHONDONTWRITEBYTECODE": "1"})
@@ -934,7 +1149,8 @@ def run_pack(
         sources: list[Path] = []
         tree_path = Path(str(tree))
         if tree_path.is_dir():
-            copy_tree(tree_path, copy_root, exclude=set(exclude) | {INPUT_DIR})
+            for warning in copy_tree(tree_path, copy_root, exclude=set(exclude) | {INPUT_DIR}):
+                result["log"].append(f"tree copy: skipped unreadable {warning}")
             sources.append(tree_path.resolve())
             top = git_toplevel(tree_path)
             if top is not None:
@@ -1064,10 +1280,10 @@ def run_pack(
                     pool.submit(_rmtree_force, slot)
                     continue
                 croot, view = slot / "tree", slot / "tree" / PACK_DIR
-                cenv = check_env(env, croot, view,
-                                 any(r.startswith(HELPER_DIR + "/") for r in rels), env["PATH"])
+                has_lib = any(r.startswith(HELPER_DIR + "/") for r in rels)
+                cenv = check_env(env, croot, view, has_lib, env["PATH"])
                 res = run_one(check, croot, slot / "work", cenv, sandbox, readable, unmet, [view],
-                              argv=isolated_argv(check["run"], env["PATH"]))
+                              argv=isolated_argv(check["run"], env["PATH"], croot, has_lib))
                 pool.submit(_rmtree_force, slot)
                 result["results"].append(res)
         finally:

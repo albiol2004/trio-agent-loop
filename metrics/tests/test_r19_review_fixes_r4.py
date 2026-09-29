@@ -167,15 +167,18 @@ def test_python_m_pytest_inside_a_check_works(tmp_path, sandbox):
 
 
 def test_isolated_argv_only_for_a_python_script():
+    # eval-r19e (round 5): only PACK code gets flags, and they are `-P -s`
+    # (`-c` is pack code too); product scripts and `-m <product>` get none.
     path = os.environ.get("PATH", "")
     has_p = TA._supports_safe_path(shutil.which("python3", path=path) or "python3")
-    want = ["python3", "-P", "acceptance/checks/a.py"] if has_p \
-        else ["python3", "acceptance/checks/a.py"]
-    assert TA.isolated_argv(["python3", "acceptance/checks/a.py"], path) == want
-    if has_p:
-        assert TA.isolated_argv(["python3", "-u", "-W", "ignore", "x.py", "-m"], path) == \
-            ["python3", "-P", "-u", "-W", "ignore", "x.py", "-m"]
-    for argv in (["python3", "-m", "pytest"], ["python3", "-c", "print(1)"], ["python3"],
+    flags = ["-P", "-s"] if has_p else ["-s"]
+    assert TA.isolated_argv(["python3", "acceptance/checks/a.py"], path) == \
+        ["python3", *flags, "acceptance/checks/a.py"]
+    assert TA.isolated_argv(["python3", "-u", "-W", "ignore", "acceptance/x.py", "-m"], path) == \
+        ["python3", *flags, "-u", "-W", "ignore", "acceptance/x.py", "-m"]
+    assert TA.isolated_argv(["python3", "-c", "print(1)"], path) == \
+        ["python3", *flags, "-c", "print(1)"]
+    for argv in (["python3", "-m", "pytest"], ["python3"], ["python3", "x.py"],
                  ["node", "a.mjs"], ["sh", "-c", "python3 a.py"], ["python3", "-mpytest"]):
         assert TA.isolated_argv(argv, path) == argv
 
