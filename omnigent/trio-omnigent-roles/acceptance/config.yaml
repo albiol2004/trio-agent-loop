@@ -113,10 +113,18 @@ prompt: |
     `ACC_WORK` (scratch), `ACC_ID` and `ACC_BIND_<NAME>` set, each in its
     own copy of the tree, loopback only, with a read-only `acceptance/`
     that holds only its own files and the shared ones (`fakes/`, `lib/`).
-    A script's own directory is not importable (Python runs with
-    `PYTHONSAFEPATH`): put shared helpers in `acceptance/lib/` (on
+    A check script's own directory is not importable by it (a Python
+    check runs as `python3 -P`): put shared helpers in `acceptance/lib/` (on
     `PYTHONPATH` and `NODE_PATH`) and name a check's own extra files in its
-    `run` or keep them under `acceptance/checks/ACC-NN/`.
+    `run` or keep them under `acceptance/checks/ACC-NN/`. Run the product
+    the way its users do (`python3 app.py`, `python3 -m pkg`,
+    `python3 -m pytest`, `node bin/x.mjs`): the product resolves its own
+    imports normally. `PATH` holds the system directories and the
+    interpreters only; put fake CLIs under `acceptance/fakes/` and prepend
+    them yourself.
+  - Load pack files by explicit paths (`$ACC_DIR/checks/ACC-07/cases.json`),
+    never by a computed name or a glob: a check sees only the files its
+    text names plus `fakes/` and `lib/`. No symlinks in the pack.
   - `setup` entries are the only step allowed network access (a package
     registry) and run only when their `provides` directory is absent.
 
