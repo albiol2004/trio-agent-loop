@@ -641,14 +641,58 @@ def test_harness_garbled_begin_still_runs_end() -> None:
     (["docs/*.md"], ["src/x.py"], True),
     (["src/a/*.py"], ["src/b/*.py"], True),
     (["srcfoo/*.py"], ["src/x.py"], True),
+    # probe 3 F: literal prefix up to the first metacharacter
+    (["tests/test_io*.py"], ["tests/test_reports*.py"], True),
+    (["tests/test_io*.py"], ["tests/test_io_csv.py"], False),
+    (["tests/test_io*.py"], ["tests/test_reports.py"], True),
+    (["tests/test_io*.py"], ["tests"], False),
+    (["tests/test_io*.py"], ["tests/test_i*.py"], False),
+    (["a/**"], ["a/b.py"], False),
+    (["a/**"], ["b/c.py"], True),
+    (["a/*.py"], ["a/b/c.py"], False),       # conservative across `/`
+    (["a/b/*"], ["a"], False),
+    (["a/[xy].py"], ["a/z.py"], False),      # `[` ends the literal prefix
+    (["a/{x,y}.py"], ["a/w.py"], False),
+    (["src/a"], ["src/ab"], True),           # plain paths: directory boundary
+    (["src/a"], ["src/a/b.py"], False),
 ])
 def test_harness_glob_writes_never_share_a_wave(wa, wb, together) -> None:
-    """eval-native-v0b N4: a glob overlaps every path under its prefix."""
+    """A glob overlaps every path that starts with its literal prefix
+    (probe 3 F; supersedes the directory prefix of eval-native-v0b N4)."""
     plan = [{"id": "a", "brief": "A", "writes": wa},
             {"id": "b", "brief": "B", "writes": wb}]
     out = run({"verdicts": ["SHIP"], "plan": plan})
     waves = out["result"]["iterations"][0]["waves"]
     assert waves == ([["a", "b"]] if together else [["a"], ["b"]])
+
+
+@needs_node
+def test_harness_probe3_q5_plan_shape_and_wave_log() -> None:
+    """probe 3 F: the q5 plan keeps the Lead's shape (W2 csv-import +
+    reports concurrent), and the driver logs its waves next to the plan."""
+    plan = [
+        {"id": "model", "brief": "M", "writes": ["ledger/model.py", "tests/test_model.py"]},
+        {"id": "csv-import", "brief": "C", "writes": ["ledger/io.py", "tests/test_io*.py"],
+         "depends": ["model"]},
+        {"id": "reports", "brief": "R", "writes": ["ledger/reports.py", "tests/test_reports*.py"],
+         "depends": ["model"]},
+        {"id": "cli", "brief": "L", "writes": ["ledger/cli.py", "tests/test_cli.py"],
+         "depends": ["csv-import", "reports"]},
+    ]
+    out = run({"verdicts": ["SHIP"], "plan": plan})
+    it = out["result"]["iterations"][0]
+    assert it["waves"] == [["model"], ["csv-import", "reports"], ["cli"]]
+    assert it["planned_waves"] == it["waves"]
+    line = next(m for m in out["logs"] if "plan:" in m and "driver waves" in m)
+    assert "driver waves [model] [csv-import, reports] [cli]" in line
+
+
+def test_meta_documents_all_args() -> None:
+    """probe 3 G: helper, run_token and models are documented args."""
+    meta = _meta_text()
+    for key in ("mailbox", "max_iterations", "max_agents", "token_budget",
+                "helper", "run_token", "models"):
+        assert key in meta, key
 
 
 # ------------------------------------------------- C6: DENIAL_RE gap bound

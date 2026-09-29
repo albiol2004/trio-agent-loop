@@ -1,7 +1,7 @@
 export const meta = {
   name: 'trio-native',
   description: 'Claude-native lockstep Trio loop: Lead plan, driver-owned isolated builder waves, Lead integrate, commit gate, pinned Evaluator, verdict; decisions by trio_native_step.py',
-  whenToUse: 'Run a lockstep Trio loop on an initialized mailbox without Omnigent. args: {mailbox, max_iterations, [max_agents], [token_budget]}. Launch with --settings {"worktree":{"baseRef":"head"}}.',
+  whenToUse: 'Run a lockstep Trio loop on an initialized mailbox without Omnigent. args: {mailbox, max_iterations, [max_agents], [token_budget], [helper: absolute path of trio_native_step.py], [run_token: [A-Za-z0-9._-]{1,64}], [models: {lead, evaluator, builder, repair, step}]}; all are in-schema. Launch with --settings {"worktree":{"baseRef":"head"}}.',
   phases: [
     { title: 'Begin', detail: 'lock the mailbox, exclude .claude/worktrees/, read STATE' },
     { title: 'Iterate', detail: 'next, Lead plan, builder waves (worktrees), Lead integrate, cleanup, gate, pin, Evaluator, apply' },
@@ -489,22 +489,29 @@ function productWrites(s) {
   return (s.writes || []).map(normPath).filter(p => p && !p.startsWith('api:') && p !== 'loop' && !p.startsWith('loop/'))
 }
 
-// A glob write covers every path under its fixed directory prefix (the
-// segments before the first one with a glob metacharacter); a glob with no
-// fixed prefix (`*.py`, `**/x`) overlaps everything (eval-native-v0b N4).
-function globPrefix(p) {
-  const segs = p.split('/')
-  const i = segs.findIndex(x => /[*?[\]{}]/.test(x))
-  return i < 0 ? null : segs.slice(0, i).join('/')
+// Every match of a glob starts with its literal prefix: the characters
+// before the first glob metacharacter (`tests/test_io*.py` -> `tests/test_io`,
+// `src/**` -> `src/`, `*.py` -> ``). Two writes may overlap iff one's literal
+// prefix is a string prefix of the other's; a plain path is its own literal
+// prefix. This is conservative (`a/*.py` still overlaps `a/b/c.py`, a glob
+// without a literal prefix overlaps everything) but keeps filename globs in a
+// shared directory apart (probe 3 F; supersedes the directory-prefix rule of
+// eval-native-v0b N4). Two plain paths overlap iff equal or one is under the
+// other.
+const GLOB_META = /[*?[\]{}\\]/
+
+function literalPrefix(p) {
+  const i = p.search(GLOB_META)
+  return i < 0 ? null : p.slice(0, i)
 }
 
 function pathsOverlap(p, q) {
-  const gp = globPrefix(p)
-  const gq = globPrefix(q)
-  if (gp === '' || gq === '') return true
-  const x = gp === null ? p : gp
-  const y = gq === null ? q : gq
-  return x === y || x.startsWith(y + '/') || y.startsWith(x + '/')
+  const lp = literalPrefix(p)
+  const lq = literalPrefix(q)
+  if (lp === null && lq === null) return p === q || p.startsWith(q + '/') || q.startsWith(p + '/')
+  const x = lp === null ? p : lp
+  const y = lq === null ? q : lq
+  return x.startsWith(y) || y.startsWith(x)
 }
 
 function overlaps(a, b) {
@@ -600,6 +607,11 @@ async function leadPass(n, rec) {
   }
   rec.slices = plan.slices.map(s => s.id)
   rec.waves = waves.map(w => w.map(s => s.id))
+  // The driver's shape next to the Lead's plan, so the two can be compared.
+  rec.planned_waves = rec.waves.map(w => w.slice())
+  rec.plan_notes = typeof plan.notes === 'string' ? plan.notes : ''
+  log(`iteration ${n.iteration} plan: ${plan.slices.length} slice(s); driver waves ${rec.planned_waves.map(w => '[' + w.join(', ') + ']').join(' ')}` +
+    (rec.plan_notes ? `; lead notes: ${rec.plan_notes.slice(0, 400)}` : ''))
   rec.conflicts = []
   const redispatched = new Set()
   const kept = new Map()  // branch -> reason, across this pass's cleanups
