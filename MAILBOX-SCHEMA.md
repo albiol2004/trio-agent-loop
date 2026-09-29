@@ -737,46 +737,51 @@ section body **MUST NOT** contain any line beginning with `VERDICT:` —
 that token stays reserved for the integration verdict so existing verdict
 parsers are unaffected.
 
-### Evidence kinds and the per-accept table (r18a)
+### Evidence kinds and the slice summary line (r18a, trimmed in r19)
 
-Each per-slice section grades every `accepts:` item PASS, FAIL or
-`unverified` and names the evidence kind behind the grade:
+Each per-slice section grades the slice's `accepts:` items PASS, FAIL or
+`unverified` and names the evidence kind behind a grade:
 `re-run` (the Evaluator re-executed the behaviour at the pin), `probe`
 (its own check against the public surface), `implementer-test` (a
 builder/Lead test it ran — PASS only when not tautological and, for a
 `value`/`property` accept, shown to fail without the change) or `receipt`
 (a file someone else wrote — never PASS on its own). An accept that needs
 an environment the Evaluator cannot reach is graded `unverified` with
-`UNAVAILABLE(<reason>)` in its evidence column and listed on an
-`unavailable:` line: at slice level that gap alone is not an ITERATE (SHIP
-on the other accepts); the integration evaluation attempts every such
-accept itself or returns NEEDS_HUMAN listing them under `## Human check`
-(eval-r18a). When a slice changes a shared module the slice-eval also runs
-the existing suites that exercise it, and the integration evaluation runs
-the repo's full check. The section carries
+`UNAVAILABLE(<reason>)` and listed on an `unavailable:` line: at slice
+level that gap alone is not an ITERATE (SHIP on the other accepts); the
+integration evaluation attempts every such accept itself or returns
+NEEDS_HUMAN listing them under `## Human check` (eval-r18a). When a slice
+changes a shared module the slice-eval also runs the existing suites that
+exercise it, and the integration evaluation runs the repo's full check.
+
+**r19 C1 (slice-evals back to fast, independent of the acceptance
+switch):** a slice section names its failing or unverified accepts with
+their evidence kind and command, and ends with ONE summary line:
 
 ```markdown
-| # | accept | PASS / FAIL / unverified | evidence | command | key output |
-attacks:
-- <input, boundary, removal or injected fault> -> <what happened>
-- <second attack> -> <what happened>
-evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>
+evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
 
-A slice SHIP lists at least two attacks. Tests on the canonical
-evaluator's tautology list (string presence on files the slice or Lead
-wrote, one- or two-character `in` checks, `or`-chains satisfied by a
-header, asserting the literal the code writes, `--verify-only`/pass-flag
-readers, presence-only checks, a typecheck over `files: []`, tests that
-read the mailbox, `results/` or `evidence/`) are rejected by name.
+The per-accept table, the `attacks:` list, the independent probe and the
+re-execution duties (implement-then-smoke, `AUTHORED-BY: lead` receipt
+families, data-work re-run) are whole-goal duties: the lockstep verdict
+and the open-loop integration verdict carry them (the Omnigent driver
+appends the generated `integration-rigor.md` to those prompts only).
+Tests on the canonical evaluator's tautology list (string presence on
+files the slice or Lead wrote, one- or two-character `in` checks,
+`or`-chains satisfied by a header, asserting the literal the code writes,
+`--verify-only`/pass-flag readers, presence-only checks, a typecheck over
+`files: []`, tests that read the mailbox, `results/` or `evidence/`) are
+still rejected by name in slice sections.
 
 The Omnigent driver parses each slice section after the slice-eval returns
-(the `evidence:` line, else the table's evidence cells; the `attacks:`
+(the `evidence:` line, else a table's evidence cells; any `attacks:`
 items) and logs `- iter N | loop | slice <id> @<sha12> SHIP|ITERATE
 evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n>
-unverified=<n> attacks=<n> (shadow)` (`evidence: missing` when neither is
-present), records it under `quality` in `.driver.json`, and trio-shadow
-prints it. Telemetry only; nothing is gated in r18a.
+unverified=<n> attacks=<n|n/a> (shadow)` (`evidence: missing` when neither
+is present; `attacks=n/a` when the section lists none, the r19 norm),
+records it under `quality` in `.driver.json`, and trio-shadow prints it.
+Telemetry only.
 
 **Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
 builder, trioctl runs a deterministic AST/regex lint (no model call) over
@@ -946,6 +951,104 @@ new text names the dispatched slice or sha. Lockstep freshness is the
 dispatched `attempt:` (and pin on `commit:` when a git repo is visible),
 not an iteration-only leftover SHIP. Passing lockstep CLI tests does not
 mean open-loop artifact matching is qualified.
+
+## Frozen acceptance (r19, optional)
+
+Behind the switch `[acceptance] enabled` (trioctl.toml; CLI
+`--acceptance/--no-acceptance`; env `TRIO_ACCEPTANCE=0|1`; default
+**off**). A mailbox without `acceptance/` is checked and driven exactly as
+before. With the switch on, an independent **acceptance author** (a
+separate role on the Lead/Evaluator model tier, never the Lead) turns
+GOAL.md into black-box checks before any builder runs; the driver
+validates them at base, freezes them, and the PLAN must map every one.
+
+### `acceptance/` layout
+
+```
+<mailbox>/acceptance/
+  MANIFEST.json      # acceptance_version: 1 (JSON)
+  AUTHOR.md          # GOAL sentence inventory: testable-black-box /
+                     # testable-only-live / not-testable, drops + reasons
+  checks/acc_NN_<slug>.{py,sh,mjs}
+  fakes/...          # fake CLIs / loopback servers / fixtures
+  FROZEN             # written by the DRIVER: pin chain
+  AMENDMENTS.md      # created empty at freeze; append-only
+```
+
+`MANIFEST.json`: `acceptance_version: 1`, `goal_sha256`, `notes_sha256`,
+`base`, `author {role, model, effort, session, path}`, `budget_s` (<= 300),
+`setup: [{id, cmd, provides, network: allowed}]`, `bindings: {NAME:
+{default, goal_quote}}` and `checks: [{id: ACC-NN, goal_ref, goal_quote,
+kind, surface, run: [argv], expect: {exit: 0, stdout?: [regex]},
+timeout_s (<= 120), needs: [tool | setup:<id>], binds: [NAME], network:
+loopback}]`. `goal_quote` is a verbatim substring of GOAL.md (or
+`ACCEPTANCE-NOTES.md`). `kind`: `behaviour` (must FAIL at base, needs
+coverage), `doc` (help text/README obligation; must FAIL at base, needs
+coverage), `guard` (may PASS at base; at most 3; no coverage).
+
+Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
+PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
+(`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). Each
+check runs in a copy of the tree (no .git/node_modules/caches/mailbox),
+loopback-only under bwrap when available (else `sandbox: none` with a dead
+proxy), env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`/proxies,
+with `ACC_TREE`, `ACC_DIR`, `ACC_WORK`, `ACC_ID`, `ACC_BIND_<NAME>`.
+
+`FROZEN` lines: `manifest_sha256`, `base`, `frozen_utc`, `author`,
+`dropped: <id> <reason>; ...`, then the pin chain `pin[0]: <sha256>
+freeze`, `pin[k]: <sha256> amend ACC-NN` / `restore`. `manifest_sha256` is
+the sha256 over the sorted `(relpath NUL bytes NUL)` of every pack file
+except `FROZEN` (`__pycache__`/`*.pyc` ignored).
+
+### PLAN.md mapping (METRICS_API 7)
+
+- Slice key **`covers: [ACC-NN, ...]`** (optional; flow or block list of
+  acceptance ids).
+- Plain lines under `## Verification standard`: **`lead_integration:`**
+  keeps its meaning (whole-goal deliverables) and its `ACC-NN` items are
+  the checks the Lead satisfies itself; **`acceptance_bindings: {NAME:
+  value}`** overrides a manifest binding's default (only declared names).
+- Every `behaviour`/`doc` id must appear in some slice's `covers:` or in
+  `lead_integration:`. The frozen checks are the GOAL's floor: PLAN may be
+  stricter, never looser.
+
+### Who may change `acceptance/`
+
+The Lead, builders, repair and slice-evals never do. The Lead files
+`ACCEPTANCE-DISPUTE: ACC-NN — <why; quote the GOAL>` lines in REPORT.md
+and still maps the check. Only the integration Evaluator amends, by the
+amendment protocol: `checks/<file>`, `fakes/**` and a check's `run`,
+`expect`, `timeout_s`, `binds`, `needs` may change (`id`, `goal_quote`,
+`kind` are immutable; no check is removed); one `## ACC-NN · iter N ·
+evaluator · <utc>` record per amended id in `AMENDMENTS.md` (`goal_quote:`,
+`defect in check:`, `change:`); commit subject `acceptance: amend ACC-NN
+(evaluator, iter N): <reason>`, touching only `acceptance/`; at most 2
+amendments per loop and 25% of the checks; the amended check must still
+FAIL at base. A human may change anything while the loop is stopped
+(`trioctl acceptance amend --human`, or a commit `acceptance: amend
+<ids> (human): <reason>`).
+
+### UNAVAILABLE
+
+A check that exits 77 or has an unmet `needs` is UNAVAILABLE. It never
+justifies ITERATE; with every other check passing the verdict must be
+NEEDS_HUMAN, listing the UNAVAILABLE checks and exact commands under
+`## Human check`.
+
+### `trio-check.py` findings
+
+Whenever `<mailbox>/acceptance/MANIFEST.json` exists these are
+**violations** (exit 1, not advisory): an invalid manifest or check;
+a `goal_quote` that is not verbatim in GOAL.md; the pack hash differing
+from FROZEN's last pin with no amend commit explaining it; an unmapped
+`behaviour`/`doc` id; an unknown id in `covers:`/`lead_integration:`; an
+`acceptance_bindings:` key the manifest does not declare. WARN: more than
+40% of the ids mapped only to `lead_integration:`; a `cli`/`http`/
+`function` check covered only by slices whose `writes:` are docs. With a
+pack present the r18a WARNs for a missing `goal_acceptance:` /
+`goal_probe:` are not emitted (the frozen pack replaces the Lead-authored
+goal acceptance). `coverage_refusals(mailbox)` exports the coverage part
+for the drivers.
 
 ## Mailbox placement standard
 

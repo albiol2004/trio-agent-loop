@@ -1250,10 +1250,14 @@ def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
         for level, why in accept_findings(item):
             if level != "STATIC":
                 out.append((level, f"goal_acceptance {n} {_clip(item)!r}: {why}"))
+    # r19: a frozen acceptance pack replaces the Lead-authored
+    # `goal_acceptance:` (the author must not be the Lead) and makes
+    # `goal_probe:` optional; without a pack the r18a lints are unchanged.
+    frozen_pack = (loop_dir / "acceptance" / "MANIFEST.json").is_file()
     if (loop_dir / "QUEUE.md").is_file():
-        if not _has_goal_probe(plan_text):
+        if not _has_goal_probe(plan_text) and not frozen_pack:
             out.append(("WARN", "no `goal_probe:` under `## Verification standard` (open-loop mailbox)"))
-        if not goal_items:
+        if not goal_items and not frozen_pack:
             out.append(("WARN", "no `goal_acceptance:` under `## Verification standard` (open-loop mailbox)"))
         for sl in slices:
             code = [w for w in sl.get("writes") or [] if not str(w).startswith("api:")]
@@ -1268,6 +1272,182 @@ def quality_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
             "JSON/receipt readers or scripts/tests under the mailbox); it is not a "
             "whole-tree check",
         ))
+    return out
+
+
+# --- Frozen acceptance (r19) -----------------------------------------------
+# MAILBOX-SCHEMA.md "Frozen acceptance (r19)". Runs whenever
+# `<mailbox>/acceptance/MANIFEST.json` exists; a mailbox without one is
+# checked exactly as before.
+
+ACCEPTANCE_DIR = "acceptance"
+#: More than this share of the covered ids mapped only to `lead_integration:`
+#: is the escape-hatch WARN.
+LEAD_INTEGRATION_WARN_SHARE = 0.40
+_DOC_WRITE_RE = re.compile(r"(?:^|/)(?:docs?/.*|[^/]*\.(?:md|rst|txt|adoc))$", re.IGNORECASE)
+_AMEND_SUBJECT_RE = re.compile(
+    r"^acceptance: amend ACC-[0-9]{1,4}(?:\s*,\s*ACC-[0-9]{1,4})* "
+    r"\((?:evaluator|human)\b[^)]*\): \S"
+)
+
+
+def load_trio_acceptance():
+    """The sibling trio-acceptance.py (r19), or None when the vendored
+    metrics/ set predates it."""
+    path = Path(__file__).resolve().parent / "trio-acceptance.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("trio_acceptance", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _acceptance_git(loop_dir: Path, *args: str) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(["git", "-C", str(loop_dir), *args],
+                              capture_output=True, text=True)
+    except OSError:
+        return None
+
+
+def _pin_mismatch_explained(loop_dir: Path) -> bool:
+    """True when every commit that touched acceptance/ after the last FROZEN
+    change is an amend commit and acceptance/ has no uncommitted edits (an
+    amendment the driver has not re-pinned yet)."""
+    acc = str(loop_dir / ACCEPTANCE_DIR)
+    status = _acceptance_git(loop_dir, "status", "--porcelain", "--", acc)
+    if status is None or status.returncode != 0 or status.stdout.strip():
+        return False
+    last = _acceptance_git(loop_dir, "log", "-1", "--format=%H", "--", f"{acc}/FROZEN")
+    if last is None or last.returncode != 0 or not last.stdout.strip():
+        return False
+    log = _acceptance_git(loop_dir, "log", "--format=%s", f"{last.stdout.strip()}..HEAD",
+                          "--", acc)
+    if log is None or log.returncode != 0:
+        return False
+    subjects = [s for s in log.stdout.splitlines() if s.strip()]
+    return bool(subjects) and all(_AMEND_SUBJECT_RE.match(s) for s in subjects)
+
+
+def _acceptance_state(loop_dir: Path, tm) -> dict:
+    """Parsed pack + PLAN mapping; ``problems`` are violations."""
+    ta = load_trio_acceptance()
+    acc = Path(loop_dir) / ACCEPTANCE_DIR
+    out: dict = {"violations": [], "warns": [], "manifest": None, "covered": [],
+                 "covers": {}, "lead": [], "bindings": {}}
+    if ta is None:
+        out["violations"].append(
+            "acceptance/MANIFEST.json exists but this metrics/ set has no "
+            "trio-acceptance.py (refresh metrics/ as a set)")
+        return out
+    try:
+        manifest = ta.load_manifest(acc)
+    except ta.ManifestError as exc:
+        out["violations"].append(f"acceptance manifest invalid: {exc}")
+        return out
+    out["manifest"] = manifest
+    goal_path = Path(loop_dir) / "GOAL.md"
+    notes_path = Path(loop_dir) / "ACCEPTANCE-NOTES.md"
+    goal = goal_path.read_text(encoding="utf-8", errors="replace") if goal_path.is_file() else None
+    notes = notes_path.read_text(encoding="utf-8", errors="replace") if notes_path.is_file() else None
+    for err in ta.manifest_errors(manifest, goal, notes):
+        out["violations"].append(f"acceptance manifest invalid: {err}")
+    for check in manifest.get("checks") or []:
+        for err in ta.check_errors(check, manifest, goal, notes):
+            cid = check.get("id") if isinstance(check, dict) else "?"
+            out["violations"].append(f"acceptance check {cid}: {err}")
+    out["covered"] = ta.covered_ids(manifest)
+    plan_text = _plan_text(Path(loop_dir)) or ""
+    slices = tm.parse_slices_block(plan_text) or []
+    out["slices"] = slices
+    out["covers"] = tm.plan_covers(slices)
+    parsed = tm.parse_plan_acceptance(plan_text)
+    out["lead"] = parsed["lead_integration"]
+    out["bindings"] = parsed["bindings"]
+    for err in parsed["errors"]:
+        out["violations"].append(f"acceptance mapping: {err}")
+    return out
+
+
+def coverage_refusals(loop_dir: Path, tm=None) -> list[str]:
+    """r19 §4.2: one refusal line per unmapped / unknown / unbound acceptance
+    id (plus an invalid manifest). [] when nothing to refuse or no pack."""
+    loop_dir = Path(loop_dir).resolve()
+    if not (loop_dir / ACCEPTANCE_DIR / "MANIFEST.json").is_file():
+        return []
+    tm = tm or load_trio_metrics()
+    st = _acceptance_state(loop_dir, tm)
+    refusals = list(st["violations"])
+    manifest = st["manifest"]
+    if manifest is None:
+        return refusals
+    known = {c.get("id") for c in manifest.get("checks") or [] if isinstance(c, dict)}
+    plan_text = _plan_text(loop_dir) or ""
+    if plan_text and tm.parse_slices_block(plan_text) is None and "slices:" in plan_text:
+        refusals.append("PLAN.md slices block does not parse; acceptance coverage "
+                        "cannot be checked (r19)")
+    mapped = set(st["covers"]) | set(st["lead"])
+    unmapped = [cid for cid in st["covered"] if cid not in mapped]
+    if unmapped:
+        refusals.append(
+            "unmapped acceptance check(s): " + ", ".join(unmapped) + " -- map each in a "
+            "slice's `covers:` or in `lead_integration:` (r19; the frozen checks are the "
+            "GOAL's floor)")
+    unknown = sorted((set(st["covers"]) | set(st["lead"])) - known)
+    if unknown:
+        refusals.append("unknown acceptance id(s) in PLAN.md `covers:`/`lead_integration:`: "
+                        + ", ".join(unknown))
+    declared = set((manifest.get("bindings") or {}).keys())
+    undeclared = sorted(set(st["bindings"]) - declared)
+    if undeclared:
+        refusals.append("`acceptance_bindings:` key(s) not declared in the manifest: "
+                        + ", ".join(undeclared))
+    return refusals
+
+
+def acceptance_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
+    """(level, message) findings of a frozen pack; level VIOLATION or WARN."""
+    loop_dir = Path(loop_dir).resolve()
+    acc = loop_dir / ACCEPTANCE_DIR
+    if not (acc / "MANIFEST.json").is_file():
+        return []
+    out = [("VIOLATION", msg) for msg in coverage_refusals(loop_dir, tm)]
+    ta = load_trio_acceptance()
+    st = _acceptance_state(loop_dir, tm)
+    if ta is not None and (acc / "FROZEN").is_file():
+        pin = ta.latest_pin(acc)
+        now = ta.manifest_sha256(acc)
+        if pin is None:
+            out.append(("VIOLATION", "acceptance/FROZEN has no pin[] line"))
+        elif pin != now:
+            if _pin_mismatch_explained(loop_dir):
+                out.append(("WARN", f"acceptance pack {now[:12]} differs from pin {pin[:12]}: "
+                                    "amendment commit(s) await the driver's re-pin"))
+            else:
+                out.append(("VIOLATION", f"acceptance pack hash {now[:12]} != pinned "
+                                         f"{pin[:12]} in FROZEN (edited outside the "
+                                         "freeze/amend protocol)"))
+    covered = st["covered"]
+    if covered and st["manifest"] is not None:
+        only_lead = [c for c in covered if c in st["lead"] and c not in st["covers"]]
+        if len(only_lead) / len(covered) > LEAD_INTEGRATION_WARN_SHARE:
+            out.append(("WARN", f"{len(only_lead)}/{len(covered)} acceptance ids are mapped only "
+                                "to `lead_integration:` (escape hatch; map them to slices)"))
+        by_id = {c.get("id"): c for c in st["manifest"].get("checks") or [] if isinstance(c, dict)}
+        slices = {s["id"]: s for s in st.get("slices") or []}
+        for cid, owners in st["covers"].items():
+            check = by_id.get(cid)
+            if not check or cid in st["lead"]:
+                continue
+            if str(check.get("surface") or "") not in ("cli", "http", "function"):
+                continue
+            writes = [str(w) for sid in owners for w in (slices.get(sid) or {}).get("writes") or []]
+            if writes and all(_DOC_WRITE_RE.search(w) for w in writes):
+                out.append(("WARN", f"{cid} (surface {check['surface']}) is covered only by "
+                                    f"slice(s) {', '.join(owners)} whose writes are docs"))
     return out
 
 
@@ -1829,6 +2009,12 @@ def inspect_loop(loop_dir: Path, tm) -> dict:
         [{"level": lv, "message": msg} for lv, msg in quality_findings(loop_dir, tm)]
         if version == "v1" else []
     )
+    # r19: acceptance violations are real violations (not advisory lints).
+    for level, msg in acceptance_findings(loop_dir, tm):
+        if level == "VIOLATION":
+            errors = errors + [f"acceptance: {msg}"]
+        else:
+            quality.append({"level": "WARN", "message": f"acceptance: {msg}"})
     return {
         "name": loop_dir.name,
         "path": str(loop_dir),
