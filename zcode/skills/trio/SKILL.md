@@ -37,7 +37,7 @@ line of VERDICT.md: `SHIP`, `ITERATE` (optionally `scope=design` or
 run a scoped repair pass instead of the full Lead sequence: give
 `trio-builder` a repair brief fixing exactly the listed paths (read
 VERDICT.md, smallest correct diff, no re-planning/refactoring/scope
-expansion, append a `- iter N | lead | repair: ...` line to LOG.md), then go
+expansion, append a `- iter N | repair | ...` line to LOG.md), then go
 straight to the independent evaluator Scout/Evaluator. Track the consecutive
 count in `loop/.repairs` (driver-internal; start at 1, cap at 2, reset to 0
 after any full Lead pass). On the 3rd consecutive scoped verdict, or for any

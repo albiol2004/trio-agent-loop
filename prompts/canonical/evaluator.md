@@ -53,11 +53,15 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   state flip (passed) while steering was screen-inverted (user-rejected) —
   the screen is the truth for user-visible criteria.
 - **LOG.md gate (gating):** `loop/LOG.md` must contain the Lead's
-  `- iter N | lead | ...` entry for this iteration before you write the
+  `- iter N | lead | ...` entry for this iteration — or, on a scoped repair
+  pass, the Repair's `- iter N | repair | ...` entry — before you write the
   verdict (targeted read of that line only — LOG.md stays cold otherwise).
   A missing entry is a process fail: the verdict cannot be SHIP without it
   — downgrade to ITERATE naming the missing LOG.md entry as the blocking
-  issue.
+  issue. A `| repair | scope mismatch — …` entry means the Repair found the
+  failure is not local and changed nothing: if the criteria still fail,
+  write `ITERATE scope=design` (never `scope=local:`), so the next pass is a
+  full Lead iteration.
 - **Test-integrity audit (mandatory):** `git diff` on test files. Any deleted, skipped, weakened, or newly-hardcoded assertion is an automatic ITERATE with a blocking issue — passing tests the wrong way is the classic agent exploit.
 - **Slice attribution (SHIP only):** run `trio-shadow.py --mailbox <dir> --json` (from the template repo: `python3 metrics/trio-shadow.py --mailbox <dir> --json`) for slice attribution — it powers the foreign-path check for the retirement commit below.
 - No SHIP — whole-goal verdict or open-loop slice section — unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did.

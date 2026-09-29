@@ -207,7 +207,7 @@ never a builder slice: trioctl and trio-check refuse a slice whose
    Lead pass: invoke `trioctl omnigent run builder --prompt-file <repair
    brief>` with a brief that fixes exactly the listed paths (read VERDICT.md,
    smallest correct diff, no re-planning/refactoring/scope expansion, append a
-   `- iter N | lead | repair: ...` line to LOG.md), then go straight to the
+   `- iter N | repair | ...` line to LOG.md), then go straight to the
    Evaluator. Track the consecutive count in `loop/.repairs` (driver-internal;
    start at 1, cap at 2, reset to 0 after any full Lead pass). On the 3rd
    consecutive scoped verdict, or for any other ITERATE, run the full Lead
