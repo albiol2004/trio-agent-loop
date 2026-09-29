@@ -43,9 +43,9 @@ INTEGRATION = {"mode": "open-loop", "kind": "integration-eval", "slice": None, "
 GRAMMAR = "`<input/action> -> <observable> | oracle: <kind>`"
 LEAD_NEEDLES = (GRAMMAR, "`## Accepts`", "`ACCEPT_TEST:` lines", "AUTHORED-BY: lead")
 SLICE_NEEDLES = (
-    "evidence kind `re-run`|`probe`|`implementer-test`|`receipt`",
-    "`attacks:` (at least two you tried",
-    "`evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>`",
+    # r19 C1: slice-evals back to fast -- one summary line, no table/attacks.
+    "evidence kind (`re-run`|`implementer-test`|`receipt`)",
+    "`evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>`",
     "a receipt alone is never PASS",
     "the declared `mode:` is enforced",
 )
@@ -55,7 +55,7 @@ INTEGRATION_NEEDLES = (
     "UNAVAILABLE is NEEDS_HUMAN, never SHIP",
 )
 RIGOR_NEEDLES = (
-    "## Evidence kinds", "## Independent probe",
+    "## Evidence kinds",
     "A receipt alone is never PASS",
     "`in` checks of a one- or two-character literal (`assert \"4\" in t`)",
     "a typecheck over an empty project (`tsc` whose tsconfig has `files: []`)",
@@ -63,8 +63,13 @@ RIGOR_NEEDLES = (
     "`--verify-only` or pass-flag readers",
     "string-presence checks on files the slice or the Lead wrote",
     "`test-first` needs red-before-green evidence",
-    "`implement-then-smoke` needs the smoke re-executed by you at the pin",
     "`AUTHORED-BY: lead`",
+)
+# r19 C1: whole-goal only (integration-eval, lockstep; never a slice-eval).
+WHOLE_GOAL_NEEDLES = (
+    "probe_cmd: <exact command",
+    "`implement-then-smoke` needs the smoke re-executed by you at the pin",
+    "you re-execute at least one command per receipt family",
     "at least two concrete attacks",
 )
 
@@ -87,15 +92,17 @@ def test_open_loop_renders_carry_the_pack(tmp_path, root_free):
     sl = _prompt(tmp_path, "evaluator", SLICE, root_free=root_free)
     for needle in SLICE_NEEDLES + RIGOR_NEEDLES:
         assert needle in sl, needle
+    for needle in WHOLE_GOAL_NEEDLES:
+        assert needle not in sl, needle
     integ = _prompt(tmp_path, "evaluator", INTEGRATION, root_free=root_free)
-    for needle in INTEGRATION_NEEDLES + RIGOR_NEEDLES:
+    for needle in INTEGRATION_NEEDLES + RIGOR_NEEDLES + WHOLE_GOAL_NEEDLES:
         assert needle in integ, needle
 
 
 def test_lockstep_evaluator_render_carries_rigor(tmp_path):
     ev = _prompt(tmp_path, "evaluator", {"evaluator_attempt": "a", "pinned_sha": "c" * 40},
                  root_free=False)
-    for needle in RIGOR_NEEDLES + ("the `## Independent probe` section",):
+    for needle in RIGOR_NEEDLES + WHOLE_GOAL_NEEDLES + ("follows `## Whole-goal verification rigor`",):
         assert needle in ev, needle
 
 
@@ -115,7 +122,7 @@ def test_canonical_bodies_carry_the_pack():
                    "`## Accepts`", "AUTHORED-BY: lead"):
         assert needle in lead, needle
     ev = _flat((CANONICAL / "evaluator.md").read_text())
-    for needle in RIGOR_NEEDLES:
+    for needle in RIGOR_NEEDLES + WHOLE_GOAL_NEEDLES:
         assert needle in ev, needle
     builder = _flat((CANONICAL / "builder.md").read_text())
     assert "`ACCEPT_TEST: <accept, abbreviated> -> <test file>::<test name>`" in builder
@@ -131,7 +138,7 @@ def test_every_generated_flavor_carries_the_pack():
             assert "`goal_probe:`" in flat and GRAMMAR in flat, path
         elif "Role: Evaluator" in text:
             seen["evaluator"] += 1
-            for needle in RIGOR_NEEDLES:
+            for needle in RIGOR_NEEDLES + WHOLE_GOAL_NEEDLES:
                 assert needle in flat, (path, needle)
         elif "Role: Builder" in text:
             seen["builder"] += 1

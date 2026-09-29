@@ -21,14 +21,22 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "omnigent" / "trio-omnigent-roles" / "evaluator" / "config.yaml"
 ENTRY = ROOT / "omnigent" / "entrypoints" / "trio-omnigent" / "prompts" / "evaluator.md"
 
+INTEGRATION_FILE = ROOT / "omnigent" / "entrypoints" / "trio-omnigent" / "prompts" / "integration-rigor.md"
+# r19 C1: the rigor is split. Core (every evaluator dispatch) ...
 RIGOR = (
     "## Verification rigor",
-    "unit tests are NOT sufficient ground truth",
-    "re-run the pipeline yourself from scratch",
-    "lists what you actively tried to break",
     "Prefer executing code over reading it",
     "If you did not run a criterion's check yourself, it is not PASS",
-    "Then go beyond them: edge cases, error paths",
+    "A receipt alone is never PASS",
+)
+# ... and whole-goal (integration-eval + lockstep prompts only).
+WHOLE_GOAL = (
+    "Generated from the canonical Trio evaluator (prompts/canonical/evaluator.md); binding for this whole-goal verdict",
+    "unit tests are NOT sufficient ground truth",
+    "re-run the pipeline yourself from scratch",
+    "at least two concrete attacks",
+    "Then go beyond them (whole-goal verdicts: integration-eval, lockstep): edge cases, error paths",
+    "### Independent probe",
 )
 DANGLING = (
     "Method and Output sections above",
@@ -71,6 +79,14 @@ def test_omnigent_evaluator_sources_carry_rigor(path: Path) -> None:
     for needle in RIGOR:
         assert needle in flat, (path.name, needle)
     assert "<!-- trio-evaluator-rigor:start -->" in path.read_text(encoding="utf-8")
+    for needle in WHOLE_GOAL:
+        assert needle not in flat, (path.name, needle)
+
+
+def test_integration_rigor_file_carries_the_whole_goal_rules() -> None:
+    flat = _flat(INTEGRATION_FILE.read_text(encoding="utf-8"))
+    for needle in WHOLE_GOAL:
+        assert needle in flat, needle
 
 
 @pytest.mark.parametrize("context", [SLICE, INTEGRATION], ids=["slice", "integration"])
@@ -81,11 +97,17 @@ def test_rendered_omnigent_evaluator_prompt_has_rigor_and_no_dangling_refs(
     flat = _flat(prompt)
     for needle in RIGOR:
         assert needle in flat, needle
+    for needle in WHOLE_GOAL:
+        # r19 C1: whole-goal rigor only on the integration render.
+        assert (needle in flat) == (context["kind"] == "integration-eval"), needle
     for needle in DANGLING:
         assert needle not in flat, needle
     # Every "your role prompt's `## X`" reference resolves inside the prompt.
     for heading in re.findall(r"role prompt's `## ([^`]+)`", flat):
         assert re.search(rf"^\s*## {re.escape(heading)}\s*$", prompt, re.M), heading
+    if context["kind"] == "integration-eval":
+        assert "`## Whole-goal verification rigor` at the end of this prompt" in flat
+        assert re.search(r"^## Whole-goal verification rigor\s*$", prompt, re.M)
 
 
 def test_integration_procedure_spells_out_its_method(tmp_path: Path) -> None:
@@ -104,19 +126,19 @@ def test_integration_procedure_spells_out_its_method(tmp_path: Path) -> None:
 
 def test_rigor_block_is_generated_from_canonical_not_copied() -> None:
     gen = _load("trio_generate_r18a_l0", ROOT / "prompts" / "generate.py")
-    content = gen.rigor_content()
     canonical = (ROOT / "prompts" / "canonical" / "evaluator.md").read_text(encoding="utf-8")
-    # Every non-heading line of the block (after its intro) is canonical text
-    # (modulo the one declared rewrite: the test-integrity bullet's plain git diff).
-    body = content.split("\n\n", 1)[1]
-    for line in body.splitlines():
-        if not line.strip() or line.startswith("### "):
-            continue
-        for old, new in gen._RIGOR_REWRITES.values():
-            line = line.replace(new, old)
-        assert line in canonical, line
+    for content in (gen.rigor_content(), gen.integration_rigor_content()):
+        # Every non-heading line of the block (after its intro) is canonical text
+        # (modulo the one declared rewrite: the test-integrity bullet's plain git diff).
+        body = content.split("\n\n", 1)[1]
+        for line in body.splitlines():
+            if not line.strip() or line.startswith("### "):
+                continue
+            for old, new in gen._RIGOR_REWRITES.values():
+                line = line.replace(new, old)
+            assert line in canonical, line
     outputs = gen.all_outputs()
-    for path in (CONFIG, ENTRY):
+    for path in (CONFIG, ENTRY, INTEGRATION_FILE):
         assert outputs[path] == path.read_text(encoding="utf-8"), path
 
 
@@ -130,6 +152,10 @@ def test_missing_canonical_anchor_fails_generation(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(gen, "CANONICAL_DIR", canon)
     with pytest.raises(ValueError, match="Prefer executing code"):
         gen.rigor_content()
+    ev.write_text(ev.read_text(encoding="utf-8").replace(
+        "- No whole-goal SHIP", "- No SHIP"), encoding="utf-8")
+    with pytest.raises(ValueError, match="No whole-goal SHIP"):
+        gen.integration_rigor_content()
 
 
 def test_protocol_essentials_carry_rigor_bullet_everywhere() -> None:

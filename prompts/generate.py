@@ -96,22 +96,45 @@ RIGOR_SITES = [
 # (kind, canonical heading, bullet prefix): "section" copies a whole
 # `## <heading>` section (demoted to `###`); "bullet" copies the one
 # top-level bullet of that section whose text starts with the prefix.
-RIGOR_PIECES = [
-    ("section", "Data-work profile", None),
-    ("bullet", "Method", "Run the acceptance checks yourself"),
+#
+# r19 C1 (slice-evals back to fast): the rigor is split. RIGOR_CORE is the
+# cheap part every Omnigent evaluator dispatch carries (it is embedded in
+# the registered role config and the per-dispatch prompt); RIGOR_INTEGRATION
+# is the whole-goal part (attacks, independent probe, data-work re-run, "go
+# beyond", the implement-then-smoke and receipt-family re-executions),
+# generated into its own prompt file that trioctl appends only to
+# integration-eval and lockstep evaluator prompts -- never to slice-evals.
+RIGOR_CORE = [
     ("bullet", "Method", "**Suites outside the targeted check:**"),
     ("bullet", "Method", "**Test-integrity audit (mandatory):**"),
-    ("bullet", "Method", "No SHIP — whole-goal verdict or open-loop slice section"),
     ("bullet", "Method", "Prefer executing code over reading it"),
     ("bullet", "Anti-rubber-stamp rules", "If you did not run a criterion's check yourself"),
     ("section", "Evidence kinds", None),
+]
+RIGOR_INTEGRATION = [
+    ("section", "Data-work profile", None),
+    ("bullet", "Method", "Run the acceptance checks yourself"),
+    ("bullet", "Method", "No whole-goal SHIP"),
+    ("section", "Whole-goal rigor", None),
     ("section", "Independent probe", None),
 ]
+# Back-compat name (r18a): the full rigor, core then integration.
+RIGOR_PIECES = RIGOR_CORE + RIGOR_INTEGRATION
 RIGOR_INTRO = (
     "## Verification rigor\n"
     "Generated from the canonical Trio evaluator (prompts/canonical/evaluator.md);\n"
     "binding for every verdict you write -- open-loop slice sections and the\n"
-    "integration verdict alike.\n"
+    "integration verdict alike. Whole-goal verdicts (integration-eval,\n"
+    "lockstep) also carry `## Whole-goal verification rigor`, which trioctl\n"
+    "appends to those dispatch prompts only.\n"
+)
+INTEGRATION_RIGOR_PATH = "omnigent/entrypoints/trio-omnigent/prompts/integration-rigor.md"
+INTEGRATION_RIGOR_INTRO = (
+    "## Whole-goal verification rigor\n"
+    "Generated from the canonical Trio evaluator (prompts/canonical/evaluator.md);\n"
+    "binding for this whole-goal verdict (open-loop integration evaluation or\n"
+    "lockstep), in addition to your role prompt's `## Verification rigor`.\n"
+    "Open-loop slice sections never carry these duties.\n"
 )
 
 
@@ -362,13 +385,12 @@ def _rigor_bullet_text(bullet: str, prefix: str) -> str:
     return bullet.replace(old, new)
 
 
-def rigor_content() -> str:
-    """The Omnigent evaluator's `## Verification rigor` block (r18a L0)."""
+def _rigor_text(pieces: list, intro: str) -> str:
     canonical = (CANONICAL_DIR / "evaluator.md").read_text(encoding="utf-8")
-    parts = [RIGOR_INTRO.rstrip("\n")]
+    parts = [intro.rstrip("\n")]
     bullets_by_heading: dict[str, list[str]] = {}
     order: list[tuple[str, str]] = []
-    for kind, heading, prefix in RIGOR_PIECES:
+    for kind, heading, prefix in pieces:
         section = _canonical_section(canonical, heading)
         if kind == "section":
             order.append(("section", heading))
@@ -388,6 +410,17 @@ def rigor_content() -> str:
             body = "\n".join(bullets_by_heading[f"bullets:{heading}"])
             parts.append(f"### {heading} (canonical rules)\n{body}")
     return "\n\n".join(parts) + "\n"
+
+
+def rigor_content() -> str:
+    """The Omnigent evaluator's `## Verification rigor` block (r18a L0,
+    r19 C1: the core part only)."""
+    return _rigor_text(RIGOR_CORE, RIGOR_INTRO)
+
+
+def integration_rigor_content() -> str:
+    """The whole-goal `## Whole-goal verification rigor` prompt (r19 C1)."""
+    return _rigor_text(RIGOR_INTEGRATION, INTEGRATION_RIGOR_INTRO)
 
 
 def rigor_block(style: str) -> str:
@@ -431,6 +464,7 @@ def all_outputs() -> dict[Path, str]:
         if path.is_file():
             text = outputs.get(path, path.read_text(encoding="utf-8"))
             outputs[path] = upsert_marked(text, style, RIGOR_MARKER, rigor_block(style))
+    outputs[ROOT / INTEGRATION_RIGOR_PATH] = integration_rigor_content()
     for source, dests in DOCUMENTS:
         for relpath, frontmatter in dests:
             outputs[ROOT / relpath] = render_document(source, frontmatter)
@@ -456,6 +490,11 @@ def all_output_sources() -> dict[Path, dict[str, str | None]]:
                 "prompt": "prompts/protocol-essentials.md",
                 "overlay": None,
             }
+    sources[ROOT / INTEGRATION_RIGOR_PATH] = {
+        "kind": "document",
+        "prompt": "prompts/canonical/evaluator.md",
+        "overlay": None,
+    }
     for source, dests in DOCUMENTS:
         for relpath, _frontmatter in dests:
             sources[ROOT / relpath] = {

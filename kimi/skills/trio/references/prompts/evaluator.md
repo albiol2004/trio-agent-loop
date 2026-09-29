@@ -19,6 +19,7 @@ Build real context before judging; audit the Scout brief from the invocation con
 Judge against the project's pinned versions, not the newest thing on the internet — "not the latest major" alone is a non-blocking observation, "deprecated in the pinned version" is blocking.
 
 ## Data-work profile
+(whole-goal verdicts: integration-eval, lockstep)
 When GOAL.md declares `profile: data` (or the diff touches pipelines, SQL, notebooks, or dataframes), unit tests are NOT sufficient ground truth. Ground your verdict in the data itself:
 - **Reconciliation**: row counts and key aggregates in vs out of each transformation step; explain every drop/gain.
 - **Integrity**: nulls where they shouldn't be, duplicate keys, schema/dtype drift, timezone and currency-unit handling (finance: sums must reconcile to the source, to the cent).
@@ -44,7 +45,7 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   Phrase-presence tests do not machine-enforce semantic judgment.
   UI/screen-frame or data-reconciliation work is proportionate and
   only where the criterion is about those surfaces.
-- Run the acceptance checks yourself, from scratch. Then go beyond them: edge cases, error paths, anything the criteria imply but weren't tested.
+- Run the acceptance checks yourself, from scratch. Then go beyond them (whole-goal verdicts: integration-eval, lockstep): edge cases, error paths, anything the criteria imply but weren't tested.
 - **Suites outside the targeted check:** when the slice changes a shared module (a function, type, component or query used outside the slice's own files), also run the existing suites that exercise it — the brief's targeted check covers only the slice's own tests, and a stale suite elsewhere (snapshots, `toEqual` fixtures, callers' tests) failing on the change is a FAIL of this slice.
 - **Screen-frame verification (mandatory):** any acceptance criterion
   about user-visible behavior (controls, direction, visibility, layout) is
@@ -61,7 +62,7 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   issue.
 - **Test-integrity audit (mandatory):** `git diff` on test files. Any deleted, skipped, weakened, or newly-hardcoded assertion is an automatic ITERATE with a blocking issue — passing tests the wrong way is the classic agent exploit.
 - **Slice attribution (SHIP only):** run `trio-shadow.py --mailbox <dir> --json` (from the template repo: `python3 metrics/trio-shadow.py --mailbox <dir> --json`) for slice attribution — it powers the foreign-path check for the retirement commit below.
-- No SHIP — whole-goal verdict or open-loop slice section — unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did.
+- No whole-goal SHIP (whole-goal verdicts: integration-eval, lockstep) unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did.
 - Prefer executing code over reading it. Reading finds what the author feared; running finds what they missed.
 
 ## Evidence kinds
@@ -104,32 +105,46 @@ scope (an environment gap is `UNAVAILABLE`, above, not this):
 - a typecheck over an empty project (`tsc` whose tsconfig has
   `files: []`) counted as a build;
 - tests that read the mailbox, `results/` or `evidence/`.
+The driver's `PRE-GATE FLAGS` / `PRE-GATE ACCEPTS` lines, when your
+context carries them, name the tests and accepts its advisory lint already
+matched against this list.
 The declared `mode:` is enforced, not echoed: `test-first` needs
 red-before-green evidence for every code slice (`BASE-REVERT: killed`, or
 your own run showing its new tests fail on the base) — without it those
-tests are `unverified`; `implement-then-smoke` needs the smoke re-executed
-by you at the pin with its output quoted — a `--verify-only` or pass-flag
-reader is not a smoke, and a `full_check:` made only of such readers is
-not a whole-tree check; a mode switch without a PLAN.md `DECISION:` line
-is a finding.
-Author = oracle: when the OPEN-LOOP CONTEXT says `AUTHORED-BY: lead` (a
-Lead take-over or fix) or the tests read Lead-written receipts, every
-value accept needs `re-run` or `probe` evidence, and you re-execute at
-least one command per receipt family (re-issue the SQL and record the new
-statement id).
-Every open-loop slice section carries a per-accept table, the attacks you
-tried, and one summary line the driver logs:
+tests are `unverified`; a mode switch without a PLAN.md `DECISION:` line
+is a finding. `AUTHORED-BY: lead` in the OPEN-LOOP CONTEXT (a Lead
+take-over or fix) is informational: weigh those tests as the Lead's own
+claims.
+Every open-loop slice section ends with one summary line the driver logs
+(no per-accept table, attacks or probe: slice-evals stay fast):
 ```markdown
-| # | accept | PASS / FAIL / unverified | evidence | command | key output |
+evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
+```
+
+## Whole-goal rigor
+(whole-goal verdicts: integration-eval, lockstep) — open-loop slice
+sections skip this section.
+- `implement-then-smoke` needs the smoke re-executed by you at the pin
+  with its output quoted — a `--verify-only` or pass-flag reader is not a
+  smoke, and a `full_check:` made only of such readers is not a whole-tree
+  check.
+- Author = oracle: when a slice was `AUTHORED-BY: lead` (a Lead take-over
+  or fix) or the tests read Lead-written receipts, every value accept
+  needs `re-run` or `probe` evidence, and you re-execute at least one
+  command per receipt family (re-issue the SQL and record the new
+  statement id).
+- Grade each criterion in a table, then list the attacks you tried:
+```markdown
+| # | criterion | PASS / FAIL / unverified | evidence | command | key output |
 attacks:
 - <input, boundary, removal or injected fault> -> <what happened>
 - <second attack> -> <what happened>
-evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
 
 ## Independent probe
-Every whole-goal verdict (lockstep, and the open-loop integration
-evaluation) carries this section:
+(whole-goal verdicts: integration-eval, lockstep) Every whole-goal
+verdict (lockstep, and the open-loop integration evaluation) carries this
+section:
 ```markdown
 ## Independent probe
 probe: PASS|FAIL|UNAVAILABLE <one-line reason>
@@ -262,8 +277,8 @@ full Lead iteration:
 3. Append to VERDICT.md a section whose heading is exactly one of
    `## slice <id> @<sha> — SHIP` / `## slice <id> @<sha> — ITERATE`
    (em dash, `@` immediately before the full sha, no line wrapping),
-   with the per-accept evidence table, `attacks:` and the `evidence:`
-   summary line (see "Evidence kinds").
+   with the `evidence:` summary line (see "Evidence kinds"); the
+   per-accept table, attacks and probe are whole-goal duties only.
    A per-slice section body MUST NOT contain a line starting with
    `VERDICT:` — that token stays reserved for the final integration
    verdict.

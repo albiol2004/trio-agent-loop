@@ -52,7 +52,9 @@ def test_slice_evidence_table_fallback_and_missing():
     assert got["evidence"]["re-run"] == 1 and got["evidence"]["receipt"] == 1
     assert got["evidence"]["unverified"] == 1 and got["verdict"] == "ITERATE"
     bare = TRIOCTL.slice_evidence(_section("accepts: PASS"), "s1", SHA)
-    assert bare["evidence"] == {} and bare["evidence_source"] == "missing" and bare["attacks"] == 0
+    assert bare["evidence"] == {} and bare["evidence_source"] == "missing"
+    # r19 C1: a slice section without `attacks:` reports n/a (slice-evals are fast).
+    assert bare["attacks"] == "n/a"
     assert TRIOCTL.slice_evidence(_section("x"), "other", SHA) is None
 
 
