@@ -520,6 +520,21 @@ def test_harness_builder_discards_untrusted_leftovers() -> None:
 
 
 @needs_node
+def test_harness_builder_reset_uses_real_path_and_first_action_only() -> None:
+    """C4: the base check uses `pwd -P` / `git rev-parse --show-toplevel`
+    (never a logical/symlinked path), and the reset is stated as allowed
+    only as the very first action, never after the builder's own edits or
+    commits (a resumed step-2, e.g. after context compaction, must not
+    reset the builder's own work away)."""
+    out = run({"verdicts": ["SHIP"]})
+    b = next(c["prompt"] for c in out["calls"] if c["agentType"] == "trio-builder")
+    assert "pwd -P" in b
+    assert "git rev-parse --show-toplevel" in b
+    assert "only as the very first action of your run" in b
+    assert "never after you have edited or committed" in b
+
+
+@needs_node
 def test_harness_finish_from_needs_retirement_reports_shas_and_fold() -> None:
     """Probe 2 finding D: the p4b recovery reported commit_shas [] and
     retirement_fold null."""
@@ -634,3 +649,29 @@ def test_harness_glob_writes_never_share_a_wave(wa, wb, together) -> None:
     out = run({"verdicts": ["SHIP"], "plan": plan})
     waves = out["result"]["iterations"][0]["waves"]
     assert waves == ([["a", "b"]] if together else [["a"], ["b"]])
+
+
+# ------------------------------------------------- C6: DENIAL_RE gap bound
+@needs_node
+def test_harness_long_gap_self_refusal_is_error_not_held() -> None:
+    """C6: the gap between the anchor words and the verdict is bounded
+    (`[^\\n]{0,200}`), so a self-refusal that merely quotes harness-shaped
+    wording across a long stretch of its own reasoning does not match."""
+    filler = "x" * 220
+    text = f"Permission to use Bash with command {filler} has been denied."
+    out = run({"verdicts": ["SHIP"], "self_refuse_op": "pin",
+               "self_refuse_text": text})
+    r = out["result"]
+    assert r["status"] == "error" and r["held_step"] is None, r
+    assert "declined without a harness permission denial" in r["reason"]
+
+
+@needs_node
+@pytest.mark.parametrize("text", HARNESS_DENIALS)
+def test_harness_short_gap_denial_still_held_after_bound(text: str) -> None:
+    """C6: the real, short-gap harness wording still matches after bounding
+    the gap (regression guard alongside test_harness_denial_wording_is_held)."""
+    out = run({"verdicts": ["SHIP"], "self_refuse_op": "pin",
+               "self_refuse_text": text})
+    r = out["result"]
+    assert r["status"] == "held" and r["held_step"] == "pin", r

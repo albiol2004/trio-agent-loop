@@ -80,7 +80,13 @@ const REQUIRED = {
 // permissions to use X, but you haven't granted it yet"); anything else — a
 // step agent declining in its own words, even ones like "not allowed",
 // "permission" or "denied" — is an error, not a hold (eval-native-v0b N1).
-const DENIAL_RE = /Permission to use \w+[\s\S]*?(?:has been|was) denied|Permission for this action (?:has been|was) denied|denied by the Claude Code auto mode classifier|requested permissions? to use \w+[\s\S]*?haven't granted/i
+// The gap between the anchor words and the verdict is bounded (eval-native-v0c
+// C6): the previous lazy, unbounded `[\s\S]*?` could match a self-refusal
+// that quotes unrelated harness wording across an arbitrarily long stretch of
+// its own reasoning (e.g. "Permission to use X … [500 words later] … was
+// denied to someone else"), calling it `held`. 200 chars covers the harness's
+// own short forms with room to spare.
+const DENIAL_RE = /Permission to use \w+[^\n]{0,200}(?:has been|was) denied|Permission for this action (?:has been|was) denied|denied by the Claude Code auto mode classifier|requested permissions? to use \w+[^\n]{0,200}haven't granted/i
 
 const PLAN_SCHEMA = {
   type: 'object',
@@ -301,13 +307,17 @@ function builderPrompt(n, s, head) {
     REPORT_DENIALS,
     '',
     'Your cwd is an isolated git worktree created for you. Before anything else:',
-    `1. Run \`pwd\`, \`git rev-parse HEAD\` and \`git status --porcelain\`.`,
+    `1. Run \`pwd -P\`, \`git rev-parse --show-toplevel\`, \`git rev-parse HEAD\` and \`git status --porcelain\`.`,
     `2. Leftovers are untrusted. A resumed run re-creates a killed builder's worktree at the same path, with its ` +
-    `uncommitted files and commits. If HEAD is ${head} or a descendant of it (\`git merge-base --is-ancestor ${head} ` +
-    `HEAD\`) and HEAD differs from it or the status is not empty, and \`pwd\` is inside ` +
-    `\`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`, discard the leftovers with \`git reset --hard ${head} && ` +
-    `git clean -fd\` and start from scratch. Never run these outside that directory, and never reuse leftover work ` +
-    `without redoing it.`,
+    `uncommitted files and commits. This check and reset run only as the very first action of your run — never ` +
+    `after you have edited or committed anything in this session (a later re-run of this step, for example after a ` +
+    `context compaction, must never reset your own work away). Use \`pwd -P\` and \`git rev-parse ` +
+    `--show-toplevel\` (the real path, never the logical or a symlinked one) to check whether you are inside ` +
+    `\`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`. If HEAD is ${head} or a descendant of it (\`git merge-base ` +
+    `--is-ancestor ${head} HEAD\`) and HEAD differs from it or the status is not empty, and that real path ` +
+    `is inside \`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`, discard the leftovers with ` +
+    `\`git reset --hard ${head} && git clean -fd\` and start from scratch. Never run these outside that directory, ` +
+    `and never once you have made your own edits or commits.`,
     `3. Report \`git rev-parse HEAD\` (now) as \`base\`. The driver requires \`base\` = ${head} (the Lead's HEAD). ` +
     'If HEAD is not that commit or a descendant of it, do no work and return with `commits: []` and a summary saying so.',
     `The mailbox ${MAILBOX} is read-only for you (read PLAN.md and GOAL.md there if you need them). Do NOT write LOG.md ` +
