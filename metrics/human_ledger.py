@@ -229,10 +229,18 @@ def make_record(key: bytes, *, answer_id: str, loop: str, mailbox: Path, root_ma
 
 # --------------------------------------------------------- stop binding
 
+#: Config overrides for every git call on a mailbox's repository: never run
+#: a repository-configured fsmonitor command or hook, never follow file://
+#: transports (eval4 finding 2).
+SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                   "-c", "protocol.file.allow=never")
+
+
 def _git(mailbox: Path, *args: str) -> bytes | None:
     """stdout of ``git -C <mailbox> <args>`` or None (not a checkout, error)."""
     try:
-        proc = subprocess.run(["git", "-C", str(mailbox), *args], capture_output=True,
+        proc = subprocess.run(["git", *SAFE_GIT_CONFIG, "-C", str(mailbox), *args],
+                              capture_output=True,
                               timeout=60, stdin=subprocess.DEVNULL, check=False,
                               env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.SubprocessError):
@@ -446,6 +454,18 @@ def entry_verified(key: bytes, entry: dict, records: list[dict], mailbox_real: s
                and _record_ok(key, r) for r in records)
 
 
+_RETRY_KEY_RE = re.compile(r"native:[0-9a-f]{32}:[^\n]+@-?[0-9]+")
+
+
+def retry_eligible(consume_key: str) -> bool:
+    """Whether ``consume_key`` may re-receive a consumed answer: only a
+    ``native:{exec_id}:{nonce}@{iteration}`` key, whose 32-hex ``exec_id``
+    is minted per script execution (so it names one delivery of one run).
+    Anything else — ``""``, the round-3 ``native:{nonce}@{iteration}``
+    shape — gets no retry allowance."""
+    return isinstance(consume_key, str) and bool(_RETRY_KEY_RE.fullmatch(consume_key))
+
+
 def verified_answer(mailbox: Path, iteration: int, *, home: Path | None = None,
                     sdir: Path | None = None, consume: bool = False,
                     role: str = "", consume_key: str = "") -> tuple[dict | None, list[str]]:
@@ -458,8 +478,11 @@ def verified_answer(mailbox: Path, iteration: int, *, home: Path | None = None,
     ``consume`` (the Evaluator that rules on the answer) marks it consumed
     before it is returned; if that cannot be recorded nothing is returned.
     ``consume_key`` names one delivery: a retry of that same delivery (the
-    same claude-workflow step nonce) receives the answer again; nothing
-    else does once it is consumed.
+    same claude-workflow step nonce in the same script execution) receives
+    the answer again; nothing else does once it is consumed. Only a key
+    unique to one execution is retry-eligible (:func:`retry_eligible`: a
+    native key carries the random run-execution id its ``begin`` minted),
+    so a fresh run can never reproduce a consumed key.
     ``notes`` say what was ignored and why (the driver logs them). No
     HUMAN.md: (None, []) without reading anything else."""
     notes: list[str] = []
@@ -518,7 +541,7 @@ def verified_answer(mailbox: Path, iteration: int, *, home: Path | None = None,
                      f"{problem}; not applied")
         return None, notes
     marks = consumed.get(str(newest.get("mac")))
-    retry = bool(consume_key) and marks is not None and consume_key in marks
+    retry = retry_eligible(consume_key) and marks is not None and consume_key in marks
     if marks is not None and not retry:
         notes.append(f"newest answer {newest.get('id')} was already delivered to the Evaluator "
                      "that ruled on it (consumed); not applied")

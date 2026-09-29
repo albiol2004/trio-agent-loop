@@ -88,7 +88,9 @@ def step(repo: Path, op: str, *, token: str = TOKEN, env=None, **kw) -> dict:
 
 
 def same(a: dict, b: dict) -> bool:
-    strip = lambda d: {k: v for k, v in d.items() if k != "nonce"}
+    # ``exec_id``: every ``begin`` mints a fresh run-execution id (eval4
+    # finding 1); everything else a replayed op answers is identical.
+    strip = lambda d: {k: v for k, v in d.items() if k not in ("nonce", "exec_id")}
     return strip(a) == strip(b)
 
 
@@ -146,6 +148,7 @@ def test_begin_adds_exclude_once_and_is_idempotent(repo: Path) -> None:
     again = step(repo, "begin")
     assert first["ok"] and first["mode"] == "lockstep"
     assert same(first, again)
+    assert first["exec_id"] != again["exec_id"]
     exclude = Path(first["exclude_path"])
     lines = exclude.read_text(encoding="utf-8").splitlines()
     assert lines.count(".claude/worktrees/") == 1

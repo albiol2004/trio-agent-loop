@@ -111,12 +111,12 @@ def test_pin_consumes_and_only_a_retry_of_that_step_gets_it_again(repo: Path, tm
     box = _stopped(repo)
     _answer(state, box, 2)
     (box / "STATE.md").write_text("iteration: 3\nstatus: running\nphase: lead-done\n")
-    assert step(repo, "begin", env=env)["ok"]
-    first = _raw_step(repo, "pin", "t-run1/90/pin", env, iteration=3)
+    exec_id = step(repo, "begin", env=env)["exec_id"]
+    first = _raw_step(repo, "pin", f"t-run1/{exec_id}/90/pin", env, iteration=3)
     assert "## Verified human answer (driver)" in first["human_answer"], first
-    again = _raw_step(repo, "pin", "t-run1/90/pin", env, iteration=3)  # the script's retry
+    again = _raw_step(repo, "pin", f"t-run1/{exec_id}/90/pin", env, iteration=3)  # the script's retry
     assert again["human_answer"] == first["human_answer"]
-    other = _raw_step(repo, "pin", "t-run1/91/pin", env, iteration=3)
+    other = _raw_step(repo, "pin", f"t-run1/{exec_id}/91/pin", env, iteration=3)
     assert other["human_answer"] == ""
     assert any("consumed" in x for x in other["human_notes"])
     lines = (state / "consumed.jsonl").read_text().splitlines()

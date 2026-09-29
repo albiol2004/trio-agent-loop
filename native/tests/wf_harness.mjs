@@ -40,7 +40,7 @@ function stepResult(op, nonce, prompt) {
   const base = { ok: true, op, nonce }
   switch (op) {
     case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration, status: 'ready', phase: 'idle',
-      lock_owner: 'workflow:x' }
+      lock_owner: 'workflow:x', ...(sc.no_exec_id ? {} : { exec_id: sc.exec_id || '0123456789abcdef0123456789abcdef' }) }
     case 'dispatch': {
       lastHead = `H${iteration}w${flag('wave')}`
       return { ...base, iteration, wave: Number(flag('wave')), head: lastHead }

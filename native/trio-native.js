@@ -73,7 +73,7 @@ const STEP_SCHEMA = {
 // Keys an `ok: true` helper result must carry, per op. A result missing one
 // is treated like a nonce mismatch: the step is re-run once.
 const REQUIRED = {
-  begin: ['repo', 'iteration', 'status', 'phase', 'lock_owner'],
+  begin: ['repo', 'iteration', 'status', 'phase', 'lock_owner', 'exec_id'],
   next: ['action', 'iteration'],
   dispatch: ['head', 'wave'],
   builders: ['accepted', 'refused', 'merge'],
@@ -180,6 +180,10 @@ const MAILBOX_WRITES = `Write mailbox files (PLAN.md, REPORT.md, VERDICT.md, LOG
 // ------------------------------------------------------------- plumbing
 let agentsUsed = 0
 let seq = 0
+// The run-execution id `begin` mints (random, per script execution): every
+// later step nonce carries it, so the helper's pin retry allowance
+// (`native:{exec_id}:{nonce}@{iteration}`) never matches across runs.
+let EXEC = ''
 
 function shq(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'"
@@ -254,7 +258,7 @@ function readStep(op, nonce, r) {
 
 async function step(op, extra, reserved) {
   seq += 1
-  const nonce = `${TOKEN}/${seq}/${op}`
+  const nonce = EXEC ? `${TOKEN}/${EXEC}/${seq}/${op}` : `${TOKEN}/${seq}/${op}`
   const flags = [
     op,
     '--mailbox', shq(MAILBOX),
@@ -744,10 +748,13 @@ try {
   // garbled begin result may still have taken the lock, and `end` is safe
   // for a run that does not own it (lock `foreign`, nothing removed).
   began = true
-  if (!b.ok) {
+  if (b.ok && !/^[0-9a-f]{32}$/.test(String(b.exec_id))) {
+    outcome = { status: 'error', reason: 'begin: no run-execution id (exec_id) from the helper' }
+  } else if (!b.ok) {
     outcome = stepFail('begin', b)
   } else {
     B = b
+    EXEC = b.exec_id
     log(`mailbox ${MAILBOX}: iteration ${b.iteration}, status ${b.status}, phase ${b.phase}`)
     phase('Iterate')
     while (true) {

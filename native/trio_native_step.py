@@ -71,6 +71,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -238,7 +239,7 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def _human_answer(mailbox: Path, iteration: int, *, consume: bool = False,
-                  nonce: str = "") -> dict:
+                  key: str = "") -> dict:
     """The driver-verified human answer for a Lead / Evaluator dispatch of
     ``iteration`` (``metrics/human_ledger.py``): ``{human_answer: <block or
     "">, human_notes: [...]}``, or ``{}`` — no keys at all — when the
@@ -246,8 +247,9 @@ def _human_answer(mailbox: Path, iteration: int, *, consume: bool = False,
     unchanged). The script logs the notes; roles see only the block.
     ``consume`` (``pin``: the Evaluator that rules on the answer) marks it
     consumed in the ledger, so it is never delivered again — except to a
-    retry of the same step (same ``nonce``: the script re-runs a step whose
-    stdout came back garbled)."""
+    retry of the same step in the same script execution (same ``key``,
+    :func:`_retry_key`: the script re-runs a step whose stdout came back
+    garbled)."""
     try:
         os.lstat(mailbox / "HUMAN.md")
     except OSError:
@@ -262,7 +264,6 @@ def _human_answer(mailbox: Path, iteration: int, *, consume: bool = False,
     except (ImportError, OSError, SyntaxError) as exc:
         return {"human_answer": "",
                 "human_notes": [f"HUMAN.md ignored: no answer ledger module ({exc})"]}
-    key = f"native:{nonce}@{iteration}" if nonce else ""
     answer, notes = module.verified_answer(mailbox, iteration, consume=consume,
                                            role="evaluator" if consume else "lead",
                                            consume_key=key)
@@ -373,7 +374,10 @@ def _snapshot(state: dict[str, str]) -> dict:
     }
 
 
-def _write_session(mailbox: Path, token: str, phase: str, done: bool) -> None:
+def _write_session(mailbox: Path, token: str, phase: str, done: bool,
+                   exec_id: str | None = None) -> None:
+    """``exec_id``: ``begin`` mints a fresh run-execution id per script
+    execution (kept by every later write of the same session)."""
     path = mailbox / SESSION
     old = _read_json(path)
     same = old.get("driver") == DRIVER and old.get("session") == token
@@ -385,7 +389,33 @@ def _write_session(mailbox: Path, token: str, phase: str, done: bool) -> None:
         "phase": "done" if done else phase,
         "done": done,
     }
+    if exec_id is None and same and _EXEC_ID_RE.fullmatch(str(old.get("exec_id") or "")):
+        exec_id = str(old["exec_id"])
+    if exec_id is not None:
+        payload["exec_id"] = exec_id
     _write_json(path, payload)
+
+
+_EXEC_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _retry_key(mailbox: Path, token: str, nonce: str, iteration: int) -> str:
+    """The consume/retry key of a ``pin`` delivery:
+    ``native:{exec_id}:{nonce}@{iteration}``, where ``exec_id`` is the
+    run-execution id ``begin`` minted for the current script execution (the
+    helper's session state) and the nonce carries it
+    (``<token>/<exec_id>/<seq>/<op>``). A retry of that same step in that
+    same execution gets the answer again; a fresh run (a new ``begin``,
+    whatever its run token) mints a new id, so it can never match a key an
+    earlier execution consumed. Anything else: ``""`` (no retry allowance)."""
+    session = _read_json(mailbox / SESSION)
+    exec_id = str(session.get("exec_id") or "")
+    if (session.get("driver") != DRIVER or session.get("session") != token
+            or session.get("done") or not _EXEC_ID_RE.fullmatch(exec_id)):
+        return ""
+    if not nonce.startswith(f"{token}/{exec_id}/"):
+        return ""
+    return f"native:{exec_id}:{nonce}@{iteration}"
 
 
 # ------------------------------------------------------------------- lock
@@ -604,7 +634,8 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     snap = _snapshot(state)
     _purge_stale_records(mailbox, snap["iteration"])
     exclude = _ensure_exclude(repo)
-    _write_session(mailbox, a.token, snap["phase"], done=False)
+    exec_id = uuid.uuid4().hex
+    _write_session(mailbox, a.token, snap["phase"], done=False, exec_id=exec_id)
     _register(mailbox, replace=True, repo=str(repo) if repo else None,
               helper=str(Path(__file__).resolve()), run_token=a.token,
               holder_pid=_holder_pid(), state="running",
@@ -613,6 +644,7 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         "mode": "lockstep",
         "repo": str(repo) if repo else None,
         "lock_owner": _owner(a.token),
+        "exec_id": exec_id,
         "exclude_path": exclude,
         **snap,
     }
@@ -1501,7 +1533,8 @@ def main(argv: list[str] | None = None) -> int:
             body.update(_human_answer(mailbox, int(body.get("iteration") or 0)))
         elif a.op == "pin":
             body.update(_human_answer(mailbox, a.iteration, consume=True,
-                                      nonce=str(a.nonce or "")))
+                                      key=_retry_key(mailbox, a.token, str(a.nonce or ""),
+                                                     a.iteration)))
         out.update(body)
         out["ok"] = True
     except StepError as exc:
