@@ -32,6 +32,10 @@ CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
 # Roles run pytest in the checkout and in builder worktrees: no .pyc files
 # (probe 2 blocker A; `begin` also excludes the artefacts in info/exclude).
 export PYTHONDONTWRITEBYTECODE=1
+# Headless `claude -p` (2.1.280) terminates background tasks, and the
+# Workflow is one, 600 s after the launching turn ends unless this is 0
+# (probe 3 blocker E). Environment only: no settings file is involved.
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
 MODEL="claude-opus-5-5"
 SETTINGS='{"worktree":{"baseRef":"head"}}'
 SUFFIX='Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop.'
@@ -116,9 +120,25 @@ import json, os, re, sys
 raw, rc, session, mode, record, prev = sys.argv[1:7]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
+try:
+    err = open(raw + ".err", encoding="utf-8", errors="replace").read()
+except OSError:
+    err = ""
+# claude -p's bg-wait ceiling killed the Workflow (probe 3 blocker E); the
+# run is recoverable with `launch.sh resume --run-id` or a fresh start.
+bg_killed = "Background tasks still running" in err
+if bg_killed:
+    launcher["bg_wait_ceiling"] = True
 
 
-def fail(reason):
+def fail(reason, head=None):
+    if bg_killed:
+        reason = ("bg-wait ceiling terminated workflow: claude -p killed its "
+                  "background tasks (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS); "
+                  "resume with launch.sh resume --run-id, or start again")
+    if head:
+        launcher["result_head"] = head
+        reason += "; session reply begins: " + json.dumps(head)
     print(json.dumps({"status": "error", "reason": reason, "launcher": launcher},
                      indent=2, sort_keys=True))
     sys.exit(3)
@@ -137,6 +157,19 @@ if outer is None:
 elif isinstance(outer, dict):
     text = outer.get("result")
     text = text if isinstance(text, str) else ""
+    # The session's total_cost_usd / modelUsage[].costUSD are API list-price
+    # estimates, not what a subscription is billed: label them so.
+    usd = outer.get("total_cost_usd")
+    if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+        launcher["api_equiv_usd"] = usd
+    usage = outer.get("modelUsage")
+    if isinstance(usage, dict):
+        by_model = {m: u["costUSD"] for m, u in usage.items()
+                    if isinstance(u, dict) and isinstance(u.get("costUSD"), (int, float))}
+        if by_model:
+            launcher["api_equiv_usd_by_model"] = by_model
+    if "api_equiv_usd" in launcher or "api_equiv_usd_by_model" in launcher:
+        launcher["api_equiv_usd_note"] = "estimate at API list price, not billed"
 else:
     fail("session output is JSON but not an object")
 # ```json / ```JSON / ```jsonc / a bare fence; CRLF tolerated.
@@ -153,7 +186,10 @@ for block in blocks:
 # The workflow result carries `status`; a trailing non-result block loses.
 results = [d for d in dicts if "status" in d] or dicts
 if not results:
-    fail("no fenced result JSON in the session output")
+    # First 300 chars of the final reply: e.g. a launch session that
+    # refused to run the workflow (probe 3 G).
+    head = (text or "").strip()[:300]
+    fail("no fenced result JSON in the session output", head or None)
 result = results[-1]
 refused = (mode == "start" and result.get("status") == "error"
            and result.get("lock") in ("foreign", "not_released")

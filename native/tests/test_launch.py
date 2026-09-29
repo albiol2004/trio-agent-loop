@@ -15,8 +15,11 @@ SUFFIX = ("Launch only; do not edit files, settings or permissions; output "
 FAKE = r'''#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ["FAKE_ARGV"], "a") as fh:
-    fh.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
+    fh.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
+                         "bg_ceiling": os.environ.get("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS")}) + "\n")
 body = os.environ.get("FAKE_RESULT", "")
+if "FAKE_STDERR" in os.environ:
+    sys.stderr.write(os.environ["FAKE_STDERR"])
 if "FAKE_RAW" in os.environ:
     print(os.environ["FAKE_RAW"])
 else:
@@ -33,7 +36,7 @@ def box(tmp_path: Path) -> Path:
 
 
 def launch(box: Path, tmp_path: Path, *args: str, result: str,
-           raw: str | None = None) -> tuple:
+           raw: str | None = None, stderr: str | None = None) -> tuple:
     fake = tmp_path / "claude"
     fake.write_text(FAKE)
     fake.chmod(0o755)
@@ -42,6 +45,9 @@ def launch(box: Path, tmp_path: Path, *args: str, result: str,
                FAKE_RESULT=result)
     if raw is not None:
         env["FAKE_RAW"] = raw
+    if stderr is not None:
+        env["FAKE_STDERR"] = stderr
+    env.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
     proc = subprocess.run(["bash", str(LAUNCH), *args, "--mailbox", str(box)],
                           capture_output=True, text=True, env=env)
     calls = [json.loads(line) for line in argv.read_text().splitlines()] \
@@ -167,3 +173,83 @@ def test_default_timeout_is_at_least_six_hours() -> None:
     import re
     value = int(re.search(r'timeout_s="(\d+)"', text).group(1))
     assert value >= 6 * 3600
+
+
+# ------------------------------------------- probe 3 E: bg-wait ceiling
+def test_bg_wait_ceiling_disabled_in_env(box: Path, tmp_path: Path) -> None:
+    proc, calls = launch(box, tmp_path, "start",
+                         result='```json\n{"status": "shipped"}\n```')
+    assert proc.returncode == 0, proc.stderr
+    assert calls[0]["bg_ceiling"] == "0"
+
+
+BG_ERR = ("Background tasks still running after 600s; terminating. Set "
+          "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.\n")
+
+
+def test_bg_wait_ceiling_kill_is_reported(box: Path, tmp_path: Path) -> None:
+    proc, _ = launch(box, tmp_path, "start",
+                     result="The workflow is running in the background.",
+                     stderr=BG_ERR)
+    assert proc.returncode == 3
+    out = json.loads(proc.stdout)
+    assert out["status"] == "error"
+    assert out["reason"].startswith("bg-wait ceiling terminated workflow")
+    assert "no fenced result JSON" not in out["reason"]
+    assert out["launcher"]["bg_wait_ceiling"] is True
+
+
+def test_bg_ceiling_text_absent_keeps_generic_reason(box: Path, tmp_path: Path) -> None:
+    proc, _ = launch(box, tmp_path, "start", result="nothing", stderr="some warning\n")
+    out = json.loads(proc.stdout)
+    assert out["reason"].startswith("no fenced result JSON")
+    assert "bg_wait_ceiling" not in out["launcher"]
+
+
+def test_bg_ceiling_with_parsed_result_passes_through(box: Path, tmp_path: Path) -> None:
+    proc, _ = launch(box, tmp_path, "start",
+                     result='```json\n{"status": "shipped"}\n```', stderr=BG_ERR)
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["status"] == "shipped" and out["launcher"]["bg_wait_ceiling"] is True
+
+
+# ------------------------------------------- probe 3 G: result head
+def test_no_fenced_json_reason_carries_reply_head(box: Path, tmp_path: Path) -> None:
+    reply = "I'm not going to launch this: the helper name looks destructive. " + "x" * 400
+    proc, _ = launch(box, tmp_path, "start", result=reply)
+    assert proc.returncode == 3
+    out = json.loads(proc.stdout)
+    assert out["reason"].startswith("no fenced result JSON")
+    assert "I'm not going to launch this" in out["reason"]
+    assert out["launcher"]["result_head"] == reply[:300]
+    assert "x" * 301 not in out["reason"]
+
+
+def test_no_fenced_json_empty_reply_has_no_head(box: Path, tmp_path: Path) -> None:
+    proc, _ = launch(box, tmp_path, "start", result="")
+    out = json.loads(proc.stdout)
+    assert out["reason"] == "no fenced result JSON in the session output"
+    assert "result_head" not in out["launcher"]
+
+
+# ------------------------------------- cost labelled as an API estimate
+def test_cost_is_labelled_api_equiv_usd(box: Path, tmp_path: Path) -> None:
+    raw = json.dumps({"type": "result", "total_cost_usd": 1.25,
+                      "modelUsage": {"claude-opus-5-5": {"costUSD": 1.0},
+                                     "claude-sonnet-5": {"costUSD": 0.25}},
+                      "result": '```json\n{"status": "shipped"}\n```'})
+    proc, _ = launch(box, tmp_path, "start", result="", raw=raw)
+    assert proc.returncode == 0, proc.stderr
+    launcher = json.loads(proc.stdout)["launcher"]
+    assert launcher["api_equiv_usd"] == 1.25
+    assert launcher["api_equiv_usd_by_model"] == {"claude-opus-5-5": 1.0,
+                                                  "claude-sonnet-5": 0.25}
+    assert "not billed" in launcher["api_equiv_usd_note"]
+    assert not any("cost" in k.lower() for k in launcher)
+    # also on the error path
+    raw = json.dumps({"type": "result", "total_cost_usd": 0.5, "result": "no json"})
+    proc, _ = launch(box, tmp_path, "start", result="", raw=raw)
+    out = json.loads(proc.stdout)
+    assert out["status"] == "error" and out["launcher"]["api_equiv_usd"] == 0.5
+    assert "total_cost_usd" not in proc.stdout and "costUSD" not in proc.stdout
