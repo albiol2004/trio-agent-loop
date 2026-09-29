@@ -280,7 +280,11 @@ def test_audit_flags_paths_outside_export_and_forbidden_names(tmp_path, monkeypa
     assert clean == {"contaminated": False, "hits": []}
     dirty = TA.audit_transcript(["cat /work/repo/loop-hard/PLAN.md"], export)
     assert dirty["contaminated"] and any("PLAN.md" in h for h in dirty["hits"])
-    assert TA.audit_transcript(["ls /home/coder/elsewhere"], export)["contaminated"]
+    # eval-r19 finding 2: only a read of the loop repository (a forbidden
+    # root) contaminates; any other absolute path does not.
+    assert not TA.audit_transcript(["ls /home/coder/elsewhere"], export)["contaminated"]
+    assert TA.audit_transcript(["ls /work/repo"], export,
+                               forbidden=[Path("/work/repo")])["contaminated"]
     assert TA.audit_transcript(["cat ../speed/hard/hidden/x"], export)["contaminated"]
 
 

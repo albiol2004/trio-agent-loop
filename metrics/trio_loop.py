@@ -446,6 +446,13 @@ def _commit_gate(mailbox: Path, repo: Path | None) -> tuple[bool, str]:
         return False, f"commit gate could not run: {exc}"
     if result.returncode == 0:
         return True, "commit gate passed"
+    # r19: name the frozen-acceptance cause (freeze ordering, a pack edit);
+    # trio-shadow prints these lines only when the mailbox has a pack.
+    acc_lines = [line.strip() for line in (result.stdout or "").splitlines()
+                 if line.startswith("acceptance gate:") and "FAIL" not in line]
+    if acc_lines:
+        return False, (f"commit gate failed with exit {result.returncode} "
+                       f"({acc_lines[0][:300]})")
     return False, f"commit gate failed with exit {result.returncode}"
 
 def _log_gate(mailbox: Path, iteration: int, role: str) -> tuple[bool, str]:
@@ -507,8 +514,14 @@ def _run_role(mailbox, iteration, role, runner, repo, state_path,
         if acceptance is not None:
             try:
                 acceptance.check_pin(iteration, f"before {role}")
-            except AcceptanceError:
-                pass
+            except AcceptanceError as exc:
+                _update_state(state_path, {"status": "error", "phase": "error"})
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | gate breach before {role}: "
+                    f"acceptance {exc.reason}: {exc.detail}",
+                )
+                return False
             if acceptance.pending_errors:
                 context = {"acceptance_errors": list(acceptance.pending_errors)}
                 acceptance.pending_errors = []
@@ -1925,6 +1938,10 @@ MAX_AMENDMENTS = 2
 MAX_AMENDMENT_SHARE = 0.25
 #: Integration-evals a check may FAIL in a row before NEEDS_HUMAN.
 ANTI_THRASH_STREAK = 2
+#: Restored tamper events per loop before it stops (`status: error`,
+#: reason `acceptance-tamper-repeated`; §3.3 "a second breach sets status:
+#: error", counted loop-wide -- eval-r19 finding 9).
+TAMPER_ESCALATE = 2
 _AMEND_SUBJECT_RE = re.compile(
     r"^acceptance: amend (ACC-[0-9]{1,4}(?:\s*,\s*ACC-[0-9]{1,4})*) "
     r"\((evaluator|human)\b[^)]*\): \S"
@@ -1959,6 +1976,10 @@ class AcceptanceError(RuntimeError):
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
         self.detail = detail
+
+
+class AcceptanceNeedsHuman(AcceptanceError):
+    """The acceptance phase needs a human (``status: needs_human``, exit 5)."""
 
 
 def acceptance_enabled(config) -> bool:
@@ -2041,6 +2062,7 @@ class AcceptanceController:
         self.pending_errors: list[str] = []
         self.last_run: dict | None = None
         self.last_pin_sha: str | None = None
+        self._resume_error: AcceptanceError | None = None
 
     # ------------------------------------------------------------ state
 
@@ -2060,6 +2082,7 @@ class AcceptanceController:
                 "state_file": str(self.state_path),
                 "checks": self.state.get("checks"),
                 "amendments": self.state.get("amendments", 0),
+                "tamper_events": self.state.get("tamper_events", 0),
             })
 
     def _set_meta(self, key: str, value) -> None:
@@ -2083,6 +2106,8 @@ class AcceptanceController:
     def start(self, iteration: int) -> None:
         """Resume a frozen pack, or start the author in the background
         (idempotent: a running author or a frozen pack is left alone)."""
+        if self._resume_error is not None:
+            raise self._resume_error
         if self._thread is not None:
             return
         if self.frozen() and (self.acc_dir / self.ta.FROZEN).is_file():
@@ -2139,19 +2164,34 @@ class AcceptanceController:
             result = {"exit": 1}
         return result
 
+    def _audit_forbidden(self) -> list[Path]:
+        """Roots whose paths in an author tool call prove a read of the
+        loop's plan or code: the repository (and its git dir) and mailbox."""
+        roots = [self.repo, self.mailbox]
+        common = _git(self.repo, "rev-parse", "--git-common-dir")
+        if common.returncode == 0 and common.stdout.strip():
+            git_dir = (self.repo / common.stdout.strip()).resolve()
+            roots.append(git_dir)
+            if git_dir.name == ".git":
+                roots.append(git_dir.parent)  # the main checkout of a worktree
+        return roots
+
     def _audit(self, export: Path, result: dict) -> dict:
         transcript = result.get("transcript")
+        forbidden = self._audit_forbidden()
         if transcript is None:
-            # No transcript: layer 1 plus a scan of the authored output.
+            # No tool-call rows: layer 1 plus a scan of the authored output
+            # for the loop's own paths (eval-r19 finding 2: string mentions
+            # of routes or PLAN.md are not evidence of a read).
             texts = []
             acc = export / self.ta.PACK_DIR
             for path in sorted(acc.rglob("*")) if acc.is_dir() else []:
                 if path.is_file() and path.stat().st_size < 512_000:
                     texts.append(path.read_text(encoding="utf-8", errors="replace"))
-            audit = self.ta.audit_transcript(texts, export)
+            audit = self.ta.audit_output(texts, forbidden)
             audit["limited"] = True
             return audit
-        audit = self.ta.audit_transcript([str(x) for x in transcript], export)
+        audit = self.ta.audit_transcript(list(transcript), export, forbidden=forbidden)
         audit["limited"] = False
         return audit
 
@@ -2261,6 +2301,10 @@ class AcceptanceController:
             "chain": [[pin, "freeze"]], "checks": n, "dropped": dropped,
             "author": author, "amendments": 0, "amended_ids": [], "fail_streak": {},
             "frozen_utc": ta.utc_now(),
+            # The driver's own record of its pack commits (outside the
+            # repo): trio-shadow anchors on it, never on commit subjects.
+            "freeze_commit": sha, "driver_commits": [sha] if sha else [],
+            "human_amends": [], "tamper_events": 0,
         })
         self._save()
         _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
@@ -2299,9 +2343,12 @@ class AcceptanceController:
         return 0
 
     def human_amend(self, ids: list[str], reason: str, iteration: int = 0) -> int:
-        """`trioctl omnigent acceptance amend --human`: commit the working-tree
-        pack edits as `acceptance: amend <ids> (human): <reason>` and re-pin
-        (loop stopped; humans may change anything)."""
+        """`trioctl omnigent acceptance amend --human`: commit the pack edits
+        (working tree, or already committed by the human since the pin) as
+        `acceptance: amend <ids> (human): <reason>` and re-pin. The caller
+        refuses while a live driver holds the mailbox; the amend commit is
+        recorded in the driver state (outside the repo), which is what makes
+        it a *human* amendment -- a `(human)` subject alone never is."""
         ta = self.ta
         if not ids or not reason.strip():
             print("acceptance amend: --ids and --reason are required", file=sys.stderr)
@@ -2316,6 +2363,33 @@ class AcceptanceController:
         if sha is None:
             print("acceptance amend: nothing changed", file=sys.stderr)
             return 3
+        # The human vouches for every `(human)` amend since the pin (edits
+        # they committed themselves before running this command) and this one.
+        shas = [c["sha"] for c in self._human_labelled_since_pin()]
+        pin = self._repin_human(ids, shas + [sha] if sha not in shas else shas, iteration)
+        print(f"acceptance re-pinned {pin[:12]} (amend {', '.join(ids)} (human))")
+        return 0
+
+    def _human_labelled_since_pin(self, upto: str = "HEAD") -> list[dict]:
+        """`(human)`-labelled amend commits touching the pack since the pin."""
+        pin_commit = self.state.get("pin_commit") or ""
+        if not pin_commit:
+            return []
+        log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s",
+                   f"{pin_commit}..{upto}", "--", self.acc_rel)
+        out = []
+        for line in log.stdout.splitlines() if log.returncode == 0 else []:
+            sha, _sep, subject = line.partition("\x1f")
+            m = _AMEND_SUBJECT_RE.match(subject)
+            if m and m.group(2) == "human":
+                out.append({"sha": sha, "subject": subject,
+                            "ids": [i.strip() for i in m.group(1).split(",")]})
+        return out
+
+    def _repin_human(self, ids: list[str], amend_shas: list[str], iteration: int) -> str:
+        """Re-pin the committed pack after an authenticated human amendment
+        (humans may change anything) and record it in the driver state."""
+        ta = self.ta
         pin = ta.manifest_sha256(self.acc_dir)
         chain = [list(c) for c in self.state.get("chain") or []] or \
             [[p["sha256"], p["note"]] for p in ta.read_frozen(self.acc_dir).get("pins") or []]
@@ -2326,22 +2400,133 @@ class AcceptanceController:
             text.rstrip("\n") + f"\npin[{len(chain) - 1}]: {pin} {note}\n", encoding="utf-8")
         pin_sha = ta.commit_paths(self.repo, [self.acc_rel],
                                   f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n")
+        head = pin_sha or _git_head(self.repo) or ""
         manifest = ta.load_manifest(self.acc_dir)
         self.state.update({
-            "status": "frozen", "pin": pin, "pin_commit": pin_sha or sha,
+            "status": "frozen", "pin": pin, "pin_commit": head,
             "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN), "chain": chain,
             "checks": len(manifest.get("checks") or []),
+            "human_amends": list(self.state.get("human_amends") or []) + list(amend_shas),
+            "driver_commits": list(self.state.get("driver_commits") or [])
+            + ([pin_sha] if pin_sha else []),
         })
         self._save()
         _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
-                          f"{pin[:16]} @{(pin_sha or sha)[:12]}")
+                          f"{pin[:16]} @{head[:12]}")
         _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: human amendment of "
                                   f"{', '.join(ids)} re-pinned {pin[:12]}")
-        print(f"acceptance re-pinned {pin[:12]} ({note})")
-        return 0
+        return pin
+
+    # ------------------------------------------------------- resume / stop
+
+    def on_resume(self) -> None:
+        """Driver start over an existing pack (never the CLI controller).
+
+        - GOAL.md no longer hashes to the frozen MANIFEST's `goal_sha256`
+          (a reused mailbox with a new GOAL): the old checks must not judge
+          it -> NEEDS_HUMAN (eval-r19 finding 12).
+        - `(human)` amend commits made while the loop was stopped (after
+          the driver's recorded clean stop, pack intact at that stop) are
+          adopted and re-pinned instead of restored as tamper (finding 4).
+        """
+        ta = self.ta
+        if not (self.acc_dir / ta.FROZEN).is_file():
+            return
+        iteration = 0
+        try:
+            iteration = _number(_read_state(self.mailbox / "STATE.md")["iteration"])
+        except Exception:  # noqa: BLE001 - logging only
+            pass
+        try:
+            want = ta.load_manifest(self.acc_dir).get("goal_sha256")
+        except ta.ManifestError:
+            want = None
+        goal = self.mailbox / "GOAL.md"
+        if want and goal.is_file() and ta.file_sha256(goal) != want:
+            self._resume_error = AcceptanceNeedsHuman(
+                "acceptance-goal-changed",
+                f"GOAL.md no longer matches the frozen pack's goal_sha256 {str(want)[:12]}: "
+                "the frozen checks were written for another GOAL; re-author (move "
+                f"{self.acc_rel}/ away and clear the driver state {self.state_path}) or "
+                "restore GOAL.md")
+            self._log(iteration, f"forced NEEDS_HUMAN (acceptance-goal-changed): "
+                                 f"{self._resume_error.detail}")
+            return
+        if self.frozen() and not self.pin_ok():
+            self._adopt_human_amendments(iteration)
+        if "stopped_head" in self.state or "stopped_pin_ok" in self.state:
+            self.state.pop("stopped_head", None)
+            self.state.pop("stopped_pin_ok", None)
+            self._save()
+
+    def _adopt_human_amendments(self, iteration: int) -> bool:
+        labelled = self._human_labelled_since_pin()
+        if not labelled:
+            return False
+        stopped = str(self.state.get("stopped_head") or "")
+        why = None
+        commits: list[dict] = []
+        if not stopped or not self.state.get("stopped_pin_ok"):
+            why = "the driver recorded no clean stop with the pack intact"
+        elif _git(self.repo, "merge-base", "--is-ancestor", stopped, "HEAD").returncode != 0:
+            why = "the recorded stop is not an ancestor of HEAD"
+        elif _git(self.repo, "status", "--porcelain", "--", self.acc_rel).stdout.strip():
+            why = "the pack has uncommitted edits"
+        else:
+            pin_commit = self.state.get("pin_commit") or ""
+            during = _git(self.repo, "log", "--format=%H", f"{pin_commit}..{stopped}",
+                          "--", self.acc_rel).stdout.split()
+            if during:
+                why = "the pack changed while the loop was running"
+            log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s",
+                       f"{stopped}..HEAD", "--", self.acc_rel)
+            for line in log.stdout.splitlines():
+                sha, _sep, subject = line.partition("\x1f")
+                m = _AMEND_SUBJECT_RE.match(subject)
+                if not m or m.group(2) != "human":
+                    why = why or f"{sha[:12]} {subject!r} is not a `(human)` amend commit"
+                    continue
+                ids = [i.strip() for i in m.group(1).split(",")]
+                files = _git(self.repo, "show", "--format=", "--name-only", sha).stdout.split()
+                if any(not f.startswith(self.acc_rel + "/") for f in files):
+                    why = why or f"{sha[:12]} touches files outside {self.acc_rel}/"
+                diff = _git(self.repo, "show", "--format=", "-U0", sha, "--",
+                            f"{self.acc_rel}/{self.ta.AMENDMENTS}").stdout
+                added = set(re.findall(r"^\+##\s+(ACC-[0-9]{1,4})\b", diff, re.MULTILINE))
+                if [i for i in ids if i not in added]:
+                    why = why or f"{sha[:12]} has no AMENDMENTS.md record for its ids"
+                commits.append({"sha": sha, "ids": ids})
+            if not commits and why is None:
+                why = "no `(human)` amend commit after the recorded stop"
+        shas = ", ".join(c["sha"][:12] for c in labelled)
+        if why is not None:
+            self._log(iteration, f"`(human)` amendment {shas} not adopted ({why}); a human "
+                                 "amends with `trioctl omnigent acceptance amend --human` while "
+                                 "the loop is stopped")
+            return False
+        ids = sorted({i for c in commits for i in c["ids"]})
+        pin = self._repin_human(ids, [c["sha"] for c in commits], iteration)
+        self._log(iteration, f"human amendment {shas} adopted on resume (committed while the "
+                             f"loop was stopped); pin {pin[:12]}")
+        return True
+
+    def close(self) -> None:
+        """Record the driver's clean stop (HEAD, pack intact?) so a human
+        amendment committed while the loop is stopped can be told from a
+        role's `(human)`-labelled commit on resume."""
+        if not self.frozen():
+            return
+        try:
+            self.state["stopped_head"] = _git_head(self.repo) or ""
+            self.state["stopped_pin_ok"] = bool(self.pin_ok())
+            self._save()
+        except Exception:  # noqa: BLE001 - never mask the loop's own exit
+            pass
 
     def wait(self, iteration: int, timeout: float | None = None) -> None:
         """Block until the pack is frozen; raise AcceptanceError otherwise."""
+        if self._resume_error is not None:
+            raise self._resume_error
         if self._thread is None and not self.frozen():
             self.start(iteration)
         if self._thread is not None:
@@ -2393,9 +2578,23 @@ class AcceptanceController:
             f"Acceptance-Pin: {self.state.get('pin')}\n")
         if sha:
             self.state["pin_commit"] = sha
+            self.state["driver_commits"] = list(self.state.get("driver_commits") or []) + [sha]
             self._save()
         _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance tamper restored ({role})")
         return sha
+
+    def _count_tamper(self, role: str) -> None:
+        """One restored tamper event; the TAMPER_ESCALATE-th of the loop
+        raises (the caller stops the loop with `status: error`)."""
+        self.breaches += 1
+        n = int(self.state.get("tamper_events", 0)) + 1
+        self.state["tamper_events"] = n
+        self._save()
+        if n >= TAMPER_ESCALATE:
+            raise AcceptanceError(
+                "acceptance-tamper-repeated",
+                f"acceptance/ was edited outside the freeze/amend protocol {n} times in this "
+                f"loop (last: {role}); each edit was restored, the loop stops")
 
     def check_pin(self, iteration: int, role: str) -> bool:
         """True when the pack is the pinned one; else restore and count a breach."""
@@ -2404,7 +2603,7 @@ class AcceptanceController:
         if self.pin_ok():
             return True
         self.restore(iteration, role)
-        self.breaches += 1
+        self._count_tamper(role)
         return False
 
     def coverage(self) -> list[str]:
@@ -2544,9 +2743,17 @@ class AcceptanceController:
         commits = self._explained_by_amendments()
         if commits is None:
             self.restore(iteration, "evaluator")
-            self.breaches += 1
             out["tamper"] = True
+            self._count_tamper("evaluator")
             return out
+        labelled = [c["sha"][:12] for c in commits if c["who"] == "human"]
+        if labelled:
+            # eval-r19 finding 1: the driver is running, so a `(human)`
+            # amend commit is a role's. Human amendments are authenticated
+            # only by `trioctl ... amend --human` (loop stopped), which
+            # re-pins in the driver state and never reaches this path.
+            self._log(iteration, f"unauthenticated `(human)` label on {', '.join(labelled)} "
+                                 "(made while the loop runs); judged as an Evaluator amendment")
         ta = self.ta
         old_rev = self.state.get("pin_commit") or ""
         old_dir = Path(tempfile.mkdtemp(prefix="acc-old-"))
@@ -2564,7 +2771,6 @@ class AcceptanceController:
                        self.acc_rel).stdout.split()
         changed = [c[len(self.acc_rel) + 1:] for c in changed if c.startswith(self.acc_rel + "/")]
         problems = ta.amendment_problems(old_manifest, new_manifest, changed, ids)
-        human = all(c["who"] == "human" for c in commits)
         logged = ta.amendments_logged((self.acc_dir / ta.AMENDMENTS).read_text(
             encoding="utf-8", errors="replace")) if (self.acc_dir / ta.AMENDMENTS).is_file() else []
         old_logged = ta.amendments_logged((old_dir / "acceptance" / ta.AMENDMENTS).read_text(
@@ -2576,17 +2782,15 @@ class AcceptanceController:
         missing = [i for i in ids if i not in new_records]
         if missing:
             problems.append(f"no AMENDMENTS.md record for {', '.join(missing)}")
-        if human:
-            problems = [p for p in problems if "record" in p]  # humans may change anything
         used = int(self.state.get("amendments", 0))
         total = max(1, int(self.state.get("checks") or 1))
-        if not human and (used + len(ids) > MAX_AMENDMENTS
+        if (used + len(ids) > MAX_AMENDMENTS
                           or used + len(ids) > MAX_AMENDMENT_SHARE * total):
             out["over_budget"] = True
             problems.append(f"amendment budget exceeded ({used} used + {len(ids)}; at most "
                             f"{MAX_AMENDMENTS} per loop and {int(MAX_AMENDMENT_SHARE * 100)}% "
                             "of the checks)")
-        if not problems and not human:
+        if not problems:
             # Discrimination preserved: the amended checks must still FAIL at base.
             base = self.state.get("base") or ""
             covered = {c["id"]: c for c in new_manifest.get("checks") or []}
@@ -2605,7 +2809,7 @@ class AcceptanceController:
             return out
         pin = ta.manifest_sha256(self.acc_dir)
         chain = [tuple(x) for x in self.state.get("chain") or []]
-        note = f"amend {', '.join(ids)}" + (" (human)" if human else "")
+        note = f"amend {', '.join(ids)}"
         chain.append((pin, note))
         frozen = ta.read_frozen(self.acc_dir)
         text = (self.acc_dir / ta.FROZEN).read_text(encoding="utf-8", errors="replace")
@@ -2621,7 +2825,8 @@ class AcceptanceController:
             "pin": pin, "pin_commit": sha or _git_head(self.repo) or "",
             "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN),
             "chain": [list(c) for c in chain],
-            "amendments": int(self.state.get("amendments", 0)) + (0 if human else len(ids)),
+            "amendments": int(self.state.get("amendments", 0)) + len(ids),
+            "driver_commits": list(self.state.get("driver_commits") or []) + ([sha] if sha else []),
             "amended_ids": sorted(set(self.state.get("amended_ids") or []) | set(ids)),
             "fail_streak": streak,
         })
@@ -2639,6 +2844,30 @@ class AcceptanceController:
                        state_path: Path) -> tuple[str, object, int | None]:
         """Amendments, anti-thrash, UNAVAILABLE and the SHIP gate for one
         whole-goal verdict. Returns (verdict, scope, terminal code | None)."""
+        out = self._review_verdict(verdict, scope, iteration, evaluated, state_path)
+        if verdict == "SHIP" and out[0] != "SHIP":
+            self._record_ship_refused(iteration, out[0])
+        return out
+
+    def _record_ship_refused(self, iteration: int, became: str) -> None:
+        """eval-r19 finding 13: the Evaluator may already have committed its
+        `loop: iteration N — SHIP` retirement; say so in history too."""
+        why = (self.pending_errors[0] if self.pending_errors else "") or became
+        self._log(iteration, f"SHIP refused by the acceptance gate (verdict becomes {became})")
+        log_rel = f"{self.mailbox_rel}/LOG.md"
+        tracked = _git(self.repo, "ls-files", "--error-unmatch", "--", log_rel)
+        if tracked.returncode != 0:
+            return
+        try:
+            self.ta.commit_paths(
+                self.repo, [log_rel],
+                f"loop: iteration {iteration} — acceptance gate refused SHIP ({became})\n\n"
+                f"{' '.join(str(why).split())[:600]}\n")
+        except RuntimeError as exc:
+            self._log(iteration, f"could not commit the SHIP refusal record ({exc})")
+
+    def _review_verdict(self, verdict: str, scope, iteration: int, evaluated: str,
+                        state_path: Path) -> tuple[str, object, int | None]:
         text = ""
         try:
             text = (self.mailbox / "VERDICT.md").read_text(encoding="utf-8", errors="replace")
@@ -2650,7 +2879,13 @@ class AcceptanceController:
             seen = dict(meta.get("acceptance_verdicts") or {})
             seen[str(iteration)] = section
             self._set_meta("acceptance_verdicts", seen)
-        amend = self.process_amendments(iteration)
+        try:
+            amend = self.process_amendments(iteration)
+        except AcceptanceError as exc:
+            _update_state(state_path, {"status": "error"})
+            _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance stopped the loop "
+                                      f"({exc.reason}): {exc.detail}")
+            return verdict, None, 3
         if amend["over_budget"]:
             return self._needs_human(state_path, iteration, "acceptance-amendments",
                                      "amendment budget exceeded: " +
@@ -2700,7 +2935,15 @@ class AcceptanceController:
 
 def _acceptance_stop(mailbox: Path, state_path: Path, runner, iteration: int,
                      exc: AcceptanceError, *, open_loop: bool = False) -> int:
-    """`status: error` for an acceptance phase that cannot continue."""
+    """`status: error` for an acceptance phase that cannot continue
+    (`status: needs_human`, exit 5, for an AcceptanceNeedsHuman)."""
+    if isinstance(exc, AcceptanceNeedsHuman):
+        _update_state(state_path, {"status": "needs_human", "phase": exc.reason})
+        _append_log(mailbox, f"- iter {iteration} | loop | acceptance stopped the loop "
+                             f"({exc.reason}): {exc.detail}")
+        if not open_loop:
+            _write_driver_state(mailbox, runner, iteration, exc.reason)
+        return 5
     updates = {"status": "error"} if open_loop else {"status": "error", "phase": "error"}
     _update_state(state_path, updates)
     _append_log(mailbox, f"- iter {iteration} | loop | acceptance stopped the loop "
@@ -2714,7 +2957,9 @@ def make_acceptance(mailbox: Path, repo: Path | None, runner, config) -> Accepta
     """The controller when the switch is on, else None (byte-identical)."""
     if not acceptance_enabled(config):
         return None
-    return AcceptanceController(mailbox, repo, runner, config)
+    controller = AcceptanceController(mailbox, repo, runner, config)
+    controller.on_resume()
+    return controller
 
 
 def _run_lockstep(
@@ -2735,6 +2980,7 @@ def _run_lockstep(
     lock = _acquire_lock(mailbox)
     if lock is None:
         return 5
+    acc = None
     try:
         state_path = mailbox / "STATE.md"
         if not (mailbox / "LOG.md").is_file():
@@ -2899,6 +3145,8 @@ def _run_lockstep(
             _write_driver_state(mailbox, runner, iteration, "lead-done")
             state = _read_state(state_path)
     finally:
+        if acc is not None:
+            acc.close()
         _release_lock(lock)
 
 
@@ -3493,7 +3741,12 @@ def _lead_thread_body(
             if queue_errors:
                 context["queue_errors"] = queue_errors
             if acceptance is not None:
-                acceptance.check_pin(iteration, "before lead")
+                try:
+                    acceptance.check_pin(iteration, "before lead")
+                except AcceptanceError as exc:
+                    _open_loop_acceptance_refused(mailbox, state_path, iteration, "before", exc)
+                    result_holder["outcome"] = "acceptance-refused"
+                    return
                 if acceptance.pending_errors:
                     context["acceptance_errors"] = list(acceptance.pending_errors)
                     acceptance.pending_errors = []
@@ -3526,7 +3779,12 @@ def _lead_thread_body(
             if acceptance is not None:
                 # r19: pin intact and every frozen check mapped, else the
                 # pass is refused and re-run once with the refusal text.
-                problems = acceptance.lead_gate(iteration, "lead")
+                try:
+                    problems = acceptance.lead_gate(iteration, "lead")
+                except AcceptanceError as exc:
+                    _open_loop_acceptance_refused(mailbox, state_path, iteration, "after", exc)
+                    result_holder["outcome"] = "acceptance-refused"
+                    return
                 if problems:
                     acceptance_refused += 1
                     if acceptance_refused >= 2:
@@ -3547,6 +3805,17 @@ def _lead_thread_body(
     finally:
         result_holder["finished"] = True
         wake_event.set()
+
+
+def _open_loop_acceptance_refused(mailbox: Path, state_path: Path, iteration: int,
+                                  when: str, exc: AcceptanceError) -> None:
+    """r19: the acceptance phase stopped an open-loop Lead pass."""
+    _update_state(state_path, {"status": "error"})
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | gate breach {when} lead: "
+        f"acceptance {exc.reason}: {exc.detail}",
+    )
 
 
 def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
@@ -3716,6 +3985,7 @@ def run_open_loop(
     if lock is None:
         return 5
     lead_thread: threading.Thread | None = None
+    acc = None
     stop_event = threading.Event()
     concurrent_evals = slice_eval_concurrency > 1
     pool: concurrent.futures.ThreadPoolExecutor | None = None
@@ -4225,7 +4495,12 @@ def run_open_loop(
                 if acc is not None:
                     # r19: pin check before every slice-eval, plus the
                     # slice's covered checks run mechanically at its sha.
-                    acc.check_pin(current_iteration(), "slice-eval")
+                    try:
+                        acc.check_pin(current_iteration(), "slice-eval")
+                    except AcceptanceError as exc:
+                        return finish(_acceptance_stop(
+                            mailbox, state_path, lead_runner, current_iteration(), exc,
+                            open_loop=True))
                     covered = acc.covered_line(slice_id, sha)
                     if covered:
                         context["acceptance_covered"] = covered
@@ -4519,6 +4794,8 @@ def run_open_loop(
                 if lead_thread is not None:
                     lead_thread.join(timeout=5)
             finally:
+                if acc is not None:
+                    acc.close()
                 _release_lock(lock)
 
 
@@ -4645,16 +4922,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     repo = Path.cwd()
-    runner = (
-        _PortableRunner()
-        if args.runner == "portable"
-        else _load_omnigent_runner()(repo=repo)
-    )
-    mode = "open-loop" if args.open_loop else "lockstep" if args.lockstep else "auto"
     enabled = args.acceptance
     if enabled is None:
         enabled = os.environ.get("TRIO_ACCEPTANCE", "").strip().lower() in ("1", "true", "on", "yes")
     extra = {"acceptance": {"enabled": True}} if enabled else {}
+    # eval-r19 finding 7: the runner renders the Lead/Evaluator acceptance
+    # blocks only when it is told the switch is on (off: unchanged call).
+    runner = (
+        _PortableRunner()
+        if args.runner == "portable"
+        else _load_omnigent_runner()(repo=repo, **extra)
+    )
+    mode = "open-loop" if args.open_loop else "lockstep" if args.lockstep else "auto"
     return run_loop(
         args.mailbox,
         args.max_iterations,

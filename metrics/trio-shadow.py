@@ -229,42 +229,86 @@ def pack_hash_at(repo_dir: Path, sha: str, acc_rel: str) -> str | None:
     return digest.hexdigest()
 
 
-def _frozen_base(loop_dir: Path) -> str | None:
-    try:
-        text = (loop_dir / ACCEPTANCE_DIR / "FROZEN").read_text(encoding="utf-8", errors="replace")
-    except OSError:
+def _driver_state(repo_dir: Path, loop_dir: Path) -> dict | None:
+    """The loop driver's acceptance state (outside the repo; written only by
+    the driver and `trioctl ... amend --human`), or None when this process
+    cannot see it (another $TRIO_ACCEPTANCE_STATE/$XDG_STATE_HOME)."""
+    path = Path(__file__).resolve().with_name("trio-acceptance.py")
+    if not path.is_file():
         return None
-    m = re.search(r"^base:\s*([0-9a-f]{7,40})\s*$", text, re.MULTILINE)
-    return m.group(1) if m else None
+    try:
+        spec = importlib.util.spec_from_file_location("trio_acceptance_shadow", path)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        state = module.load_state(module.state_file(repo_dir, loop_dir))
+    except Exception:  # noqa: BLE001 - fall back to the git-only rules
+        return None
+    return state if state.get("freeze_commit") else None
 
 
-def acceptance_offenders(loop_dir: Path, base: str | None = None) -> list[str]:
+def _git_freeze_base(repo_dir: Path, acc_rel: str) -> str | None:
+    """Range start from git objects (never the working tree): the parent
+    of the newest commit that added FROZEN."""
+    proc = _git(repo_dir, "log", "--diff-filter=A", "--format=%H", "-1", "--",
+                f"{acc_rel}/FROZEN")
+    sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not sha:
+        return None
+    parent = _git(repo_dir, "rev-parse", "-q", "--verify", f"{sha}^")
+    if parent.returncode == 0 and parent.stdout.strip():
+        return parent.stdout.strip()
+    return _git(repo_dir, "hash-object", "-t", "tree", "/dev/null").stdout.strip() or None
+
+
+def acceptance_offenders(loop_dir: Path, base: str | None = None,
+                         notes: list[str] | None = None) -> list[str]:
     """r19 §3.3 check 2: commits touching `<mailbox>/acceptance/` that are
     not the freeze, a driver restore/pin, or a valid amend commit. [] when
-    the mailbox has no pack (and no commit touched one)."""
+    the mailbox has no pack (and no commit touched one).
+
+    Anchors (eval-r19 finding 3): the range starts at `--acceptance-base`,
+    else the driver state's `run_head`, else the parent of the commit that
+    added FROZEN -- never the working tree. A commit *subject* proves
+    nothing: with the driver state visible, freeze/pin/restore commits must
+    be the driver's recorded ones and a `(human)` amend must be one the
+    driver recorded; without it, a pin commit may only extend FROZEN after
+    amend commits and a restore must put back an already-pinned pack. Only
+    a genuine restore excuses earlier tamper. Slice commits made before the
+    freeze (a Lead take-over while the author was still working) are
+    tolerated with a note: the author worked from the base export and never
+    saw them (finding 5)."""
     loop_dir = Path(loop_dir).resolve()
     prefix = _mailbox_prefix(loop_dir)
     if prefix is None:
         return []
     acc_rel = f"{prefix}/{ACCEPTANCE_DIR}" if prefix else ACCEPTANCE_DIR
-    base = base or _frozen_base(loop_dir)
-    has_pack = (loop_dir / ACCEPTANCE_DIR).exists()
-    if base is None:
-        if has_pack:
-            return [f"{acc_rel}/ exists but FROZEN names no `base:` (not a driver freeze)"]
-        return []
     top = _git(loop_dir, "rev-parse", "--show-toplevel").stdout.strip()
     repo_dir = Path(top) if top else loop_dir
+    has_pack = (loop_dir / ACCEPTANCE_DIR).exists()
+    driver = _driver_state(repo_dir, loop_dir)
+    if base is None and driver is not None:
+        base = str(driver.get("run_head") or driver.get("base") or "") or None
+    if base is None:
+        base = _git_freeze_base(repo_dir, acc_rel)
+    if base is None:
+        if has_pack:
+            return [f"{acc_rel}/ exists but no commit added {acc_rel}/FROZEN "
+                    "(not a driver freeze)"]
+        return []
+    driver_commits = set(driver.get("driver_commits") or []) if driver else set()
+    human_amends = set(driver.get("human_amends") or []) if driver else set()
     rng = f"{base}..HEAD"
     proc = _git(repo_dir, "log", "--reverse", "--format=%x1e%H%x1f%s%x1f%(trailers:key=Acceptance-Pin,valueonly,separator=%x2c)",
                 "--name-only", rng, "--", acc_rel)
     if proc.returncode != 0:
         return [f"cannot read the acceptance history ({proc.stderr.strip()[-200:]})"]
     offenders: list[str] = []
-    # Tamper offenders a later driver `acceptance: restore` commit put
-    # right (the driver already counted that breach when it restored).
+    # Tamper offenders a later genuine driver `acceptance: restore` commit
+    # put right (the driver already counted that breach when it restored).
     pending_tamper: list[str] = []
     freeze_sha: str | None = None
+    known_pins: set[str] = set()
+    amends_since_pin = 0
     for block in proc.stdout.split("\x1e"):
         if not block.strip():
             continue
@@ -276,21 +320,48 @@ def acceptance_offenders(loop_dir: Path, base: str | None = None) -> list[str]:
         outside = [f for f in _git(repo_dir, "show", "--format=", "--name-only", sha).stdout.splitlines()
                    if f.strip() and not f.startswith(acc_rel + "/")]
         if _ACC_FREEZE_RE.match(subject) or _ACC_DRIVER_RE.match(subject):
-            kind = "freeze" if _ACC_FREEZE_RE.match(subject) else "driver"
+            kind = "freeze" if _ACC_FREEZE_RE.match(subject) else \
+                "restore" if subject.startswith("acceptance: restore") else "pin"
+            genuine = True
             if kind == "freeze":
                 if freeze_sha is not None:
                     offenders.append(f"{label}: a second freeze commit (the pack is frozen once per loop)")
                     continue
+                if driver is not None and sha != driver.get("freeze_commit"):
+                    offenders.append(f"{label}: not the driver's recorded freeze commit "
+                                     f"{str(driver.get('freeze_commit'))[:12]}")
+                    continue
                 freeze_sha = sha
             elif freeze_sha is None:
                 offenders.append(f"{label}: driver acceptance commit before the freeze")
-            restores = subject.startswith("acceptance: restore")
+                genuine = False
+            if kind != "freeze" and driver is not None and sha not in driver_commits:
+                offenders.append(f"{label}: not an acceptance commit the driver recorded "
+                                 "(a subject alone is not a driver commit)")
+                genuine = False
             if outside:
                 offenders.append(f"{label}: touches files outside acceptance/: {', '.join(outside[:5])}")
-            if not pin or pin != pack_hash_at(repo_dir, sha, acc_rel):
+                genuine = False
+            committed = pack_hash_at(repo_dir, sha, acc_rel)
+            if not pin or pin != committed:
                 offenders.append(f"{label}: Acceptance-Pin trailer does not match the committed pack")
-            elif kind == "driver" and restores:
-                pending_tamper.clear()
+                genuine = False
+            elif kind == "pin":
+                if [f for f in files if f != f"{acc_rel}/FROZEN"]:
+                    offenders.append(f"{label}: a pin commit may only extend {acc_rel}/FROZEN "
+                                     f"(also: {', '.join(f for f in files if f != f'{acc_rel}/FROZEN')})")
+                    genuine = False
+                elif not amends_since_pin:
+                    offenders.append(f"{label}: a pin commit with no amend commit to pin")
+                    genuine = False
+            elif kind == "restore" and pin not in known_pins:
+                offenders.append(f"{label}: restores a pack that was never pinned")
+                genuine = False
+            if genuine:
+                known_pins.add(pin)
+                amends_since_pin = 0
+                if kind == "restore":
+                    pending_tamper.clear()
             continue
         m = _ACC_AMEND_RE.match(subject)
         if m:
@@ -309,6 +380,13 @@ def acceptance_offenders(loop_dir: Path, base: str | None = None) -> list[str]:
             removed = re.findall(r"^-(?!--)(.+)$", diff, re.MULTILINE)
             if removed:
                 offenders.append(f"{label}: AMENDMENTS.md is append-only (lines removed)")
+            if m.group(2) == "human" and driver is not None and sha not in human_amends:
+                # A role's commit labelled `(human)`: tamper unless the
+                # driver restored it (finding 1).
+                pending_tamper.append(f"{label}: a `(human)` amendment the driver never "
+                                      "authenticated (humans amend via `trioctl omnigent "
+                                      "acceptance amend --human` while the loop is stopped)")
+            amends_since_pin += 1
             continue
         pending_tamper.append(f"{label}: touches {acc_rel}/ ({', '.join(files[:3])}) -- only the "
                               "driver freeze/restore and amend commits may")
@@ -319,10 +397,18 @@ def acceptance_offenders(loop_dir: Path, base: str | None = None) -> list[str]:
         slices = _git(repo_dir, "log", "--format=%H %s", "--grep=^slice(", rng).stdout.splitlines()
         for line in slices:
             ssha, _sp, subject = line.partition(" ")
-            anc = _git(repo_dir, "merge-base", "--is-ancestor", freeze_sha, ssha)
-            if anc.returncode != 0:
-                offenders.append(f"{ssha[:12]} {subject!r}: slice commit is not preceded by the "
-                                 f"acceptance freeze {freeze_sha[:12]}")
+            if _git(repo_dir, "merge-base", "--is-ancestor", freeze_sha, ssha).returncode == 0:
+                continue
+            if _git(repo_dir, "merge-base", "--is-ancestor", ssha, freeze_sha).returncode == 0:
+                if notes is not None:
+                    notes.append(f"{ssha[:12]} {subject!r} was committed before the acceptance "
+                                 f"freeze {freeze_sha[:12]} (tolerated: the author worked from the "
+                                 "base export and never saw it; make no product commits before "
+                                 "FROZEN)")
+                continue
+            offenders.append(f"{ssha[:12]} {subject!r}: slice commit is on a line that does not "
+                             f"contain the acceptance freeze {freeze_sha[:12]} (acceptance/freeze "
+                             "ordering)")
     return offenders
 
 
@@ -816,7 +902,8 @@ def main(argv: list[str] | None = None) -> int:
         metavar="SHA",
         default=None,
         help="r19: start of the range the frozen-acceptance guard of "
-        "--require-commits checks (default: FROZEN's `base:`).",
+        "--require-commits checks (default: the driver state's run head, else "
+        "the parent of the commit that added FROZEN).",
     )
     parser.add_argument(
         "--slice",
@@ -853,7 +940,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.require_commits:
         # r19: the frozen-acceptance guard (no pack: nothing to check).
         loop_dir = Path(report["plan"]).parent
-        acc_offenders = acceptance_offenders(loop_dir, args.acceptance_base)
+        acc_notes: list[str] = []
+        acc_offenders = acceptance_offenders(loop_dir, args.acceptance_base, acc_notes)
+        for msg in acc_notes:
+            print(f"acceptance note: {msg}")
         for msg in acc_offenders:
             print(f"acceptance gate: {msg}")
         offenders = commit_gate_offenders(report)

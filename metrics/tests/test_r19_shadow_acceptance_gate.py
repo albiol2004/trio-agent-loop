@@ -109,10 +109,31 @@ def test_amend_without_record_or_rewriting_history_fails(tmp_path):
     assert "no AMENDMENTS.md record for ACC-01" in gate(mb).stdout
 
 
-def test_freeze_after_a_slice_commit_fails(tmp_path):
+def test_slice_commit_before_the_freeze_is_tolerated_with_a_note(tmp_path):
+    # eval-r19 finding 5: a Lead take-over committed while the author was
+    # still working is behind the freeze; the author never saw it.
     repo, mb = setup(tmp_path, slice_first=True)
     proc = gate(mb)
-    assert proc.returncode == 1 and "not preceded by the acceptance freeze" in proc.stdout
+    assert proc.returncode == 0, proc.stdout
+    base = git(repo, "rev-list", "--max-parents=0", "HEAD")
+    proc = subprocess.run([sys.executable, str(SHADOW), "--mailbox", str(mb), "--require-commits",
+                           "--acceptance-base", base], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout
+    assert "acceptance note:" in proc.stdout and "before the acceptance freeze" in proc.stdout
+
+
+def test_slice_on_a_line_without_the_freeze_fails_naming_the_ordering(tmp_path):
+    repo, mb = setup(tmp_path)
+    base = git(repo, "rev-list", "--max-parents=0", "HEAD")
+    git(repo, "checkout", "-q", "-b", "side", base)
+    (repo / "side.py").write_text("x\n")
+    git(repo, "add", "side.py")
+    git(repo, "commit", "-qm", "slice(cli): on a side line")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--no-edit", "side")
+    proc = gate(mb)
+    assert proc.returncode == 1
+    assert "acceptance/freeze ordering" in proc.stdout
 
 
 def test_forged_freeze_and_second_freeze_fail(tmp_path):

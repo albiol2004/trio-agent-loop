@@ -103,12 +103,6 @@ TRIO_METRICS_FILES = (
     "trio-acceptance.py",
 )
 MAILBOX_MARKERS = ("QUEUE.md", "STATE.md", "VERDICT.md", "LOG.md")
-#: System prefixes an author session may name without contaminating it.
-AUDIT_SYSTEM_PREFIXES = (
-    "/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/dev/", "/proc/self",
-    "/etc/", "/opt/homebrew/", "/nix/store/",
-)
-AUDIT_FORBIDDEN_TOKENS = ("PLAN.md", "VERDICT.md", "/hidden/", "speed/hard")
 
 
 class ManifestError(ValueError):
@@ -134,6 +128,13 @@ def pack_files(acc_dir: Path) -> list[str]:
                 continue
             out.append(rel)
     return sorted(out)
+
+
+def _pack_copy_ignore(directory: str, names: list[str]) -> set[str]:
+    """shutil ignore callback: everything `pack_files` leaves out of the pin
+    (FROZEN is re-added by callers that need it)."""
+    return {n for n in names
+            if n in HASH_SKIP_DIRS or n == FROZEN or n.endswith((".pyc", ".pyo"))}
 
 
 def manifest_sha256(acc_dir: Path) -> str:
@@ -656,8 +657,9 @@ def run_pack(
                 shutil.rmtree(pack_dst)
             else:
                 pack_dst.unlink()
-        shutil.copytree(acc_src, pack_dst, ignore=shutil.ignore_patterns(
-            FROZEN, "__pycache__", "*.pyc"))
+        # The run sees exactly the hashed pack (eval-r19 finding 8): a
+        # directory the pin skips (node_modules, caches) never reaches it.
+        shutil.copytree(acc_src, pack_dst, symlinks=True, ignore=_pack_copy_ignore)
         work = tmp / "work"
         work.mkdir()
         provided = resolve_setups(manifest, sources, copy_root, result["log"], allow_setup)
@@ -846,36 +848,134 @@ def build_export(repo: Path, base: str, dest: Path, mailbox: Path,
 
 # ------------------------------------------------------------ the audit
 
-_ABS_PATH_RE = re.compile(r"(?<![\w.~$}\-:/])(/(?:[A-Za-z0-9_.@+\-]+/?)+)")
+#: Mailbox files a tool call must never read (outside the export's own
+#: public surface: a product `docs/PLAN.md` kept in the export is fine).
+AUDIT_MAILBOX_FILES = ("PLAN.md", "VERDICT.md", "QUEUE.md", "STATE.md", "LOG.md",
+                       "REPORT.md")
+#: Keys of a transcript row that carry what a tool returned (never
+#: evidence of what the author asked to read).
+_AUDIT_OUTPUT_KEY_RE = re.compile(
+    r"output|result|stdout|stderr|response|observation", re.IGNORECASE)
+_AUDIT_CALL_KIND_RE = re.compile(r"tool|function|command|shell|exec", re.IGNORECASE)
+_AUDIT_RESULT_KIND_RE = re.compile(r"output|result|response", re.IGNORECASE)
+#: Argument keys of a tool call (whatever the runtime nests them under).
+_AUDIT_ARG_KEYS = frozenset({
+    "command", "cmd", "args", "argv", "arguments", "input", "parameters", "params",
+    "file_path", "filepath", "path", "paths", "pattern", "glob", "query", "target",
+    "cwd", "directory", "dir", "filename", "file", "files", "script",
+})
+_AUDIT_TOKEN_RE = re.compile(r"[^\s'\"`;|&<>(){}\[\],=\\]+")
 
 
-def audit_transcript(entries: Iterable[str], export: Path,
+def _audit_inputs(entry: Any) -> list[str]:
+    """The strings a transcript row *asked for*: tool-call arguments.
+
+    Tool results (role ``tool``, an output/result node, or an output key)
+    and chat text are skipped: what a tool printed (a README naming
+    PLAN.md, ``which node``'s toolchain path) or what the model said is not
+    evidence of what the author read. A row that is not JSON is taken as a
+    raw command line."""
+    data: Any = entry
+    if not isinstance(entry, (dict, list)):
+        text = str(entry)
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return [text]
+        if not isinstance(data, (dict, list)):
+            return [text]
+    out: list[str] = []
+
+    def walk(value: Any, in_call: bool) -> None:
+        if isinstance(value, dict):
+            kind = " ".join(str(value.get(k) or "") for k in ("type", "kind"))
+            if str(value.get("role") or "").lower() == "tool" \
+                    or _AUDIT_RESULT_KIND_RE.search(kind):
+                return
+            call = in_call or bool(_AUDIT_CALL_KIND_RE.search(kind))
+            for key, item in value.items():
+                if _AUDIT_OUTPUT_KEY_RE.search(str(key)):
+                    continue
+                walk(item, call or str(key).lower() in _AUDIT_ARG_KEYS)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, in_call)
+        elif isinstance(value, str) and in_call:
+            out.append(value)
+    walk(data, False)
+    return out
+
+
+def _norm(path: Path | str) -> list[str]:
+    """normpath and realpath spellings of *path* (symlinked roots)."""
+    raw = os.path.normpath(str(path))
+    real = os.path.realpath(str(path))
+    return sorted({raw, real})
+
+
+def _under(path: str, roots: Iterable[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def audit_transcript(entries: Iterable[Any], export: Path,
+                     forbidden: Iterable[Path] = (),
                      allowed: Iterable[Path] = ()) -> dict[str, Any]:
     """Mechanical isolation audit of an author session's tool calls (§2.2).
 
-    Any absolute path outside the export, $TMPDIR (and *allowed*) and the
-    system prefixes, or any of PLAN.md / VERDICT.md / /hidden/ / speed/hard,
-    marks the session contaminated."""
-    roots = [str(Path(export).resolve())]
-    tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
-    roots.append(str(Path(tmpdir).resolve()))
-    roots += [str(Path(p).resolve()) for p in allowed]
+    Only evidence that the author *read* the loop's plan or code counts
+    (eval-r19 finding 2): a tool-call argument (never a tool's output) that
+    names a path inside a *forbidden* root (the loop repository, the
+    mailbox), a mailbox file (PLAN.md, VERDICT.md, QUEUE.md, STATE.md,
+    LOG.md, REPORT.md) that is not a file of the export itself, or a lab
+    hidden-pack path (`/hidden/`, `speed/hard`). A URL or route literal
+    (`/api/openrouter/stats`), $TMPDIR, toolchain paths and system
+    prefixes are not reads of the loop and never contaminate."""
+    export_roots = _norm(Path(export).resolve())
+    export_roots += [r for p in allowed for r in _norm(Path(p))]
+    bad_roots = [r for p in forbidden for r in _norm(Path(p))]
     hits: list[str] = []
     for entry in entries:
-        text = str(entry)
-        for token in AUDIT_FORBIDDEN_TOKENS:
-            if token in text:
-                hits.append(f"forbidden reference {token!r}: {text[:160]}")
-        for m in _ABS_PATH_RE.finditer(text):
-            path = m.group(1).rstrip("/.,;:'\")")
-            if not path or path == "/":
-                continue
-            if any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots):
-                continue
-            if any(path.startswith(p) or path + "/" == p for p in AUDIT_SYSTEM_PREFIXES):
-                continue
-            hits.append(f"absolute path outside the export: {path}")
+        for text in _audit_inputs(entry):
+            for token in _AUDIT_TOKEN_RE.findall(text):
+                token = token.strip(".:")
+                if not token or "://" in token:
+                    continue
+                name = token.rsplit("/", 1)[-1]
+                pathish = "/" in token or name in AUDIT_MAILBOX_FILES
+                if not pathish:
+                    continue
+                marked = "/" + token.strip("/") + "/"
+                if "/hidden/" in marked or "/speed/hard/" in marked:
+                    hits.append(f"lab hidden-pack path: {token}")
+                    continue
+                raw = Path(token).expanduser()
+                full = raw if raw.is_absolute() else Path(export_roots[0]) / raw
+                spellings = _norm(full)
+                inside = any(_under(sp, export_roots) for sp in spellings)
+                if inside:
+                    if name in AUDIT_MAILBOX_FILES and not Path(spellings[0]).is_file():
+                        hits.append(f"names mailbox file {name} (not in the export): {token}")
+                    continue
+                if any(_under(sp, bad_roots) for sp in spellings):
+                    hits.append(f"reads inside the loop repository: {token}")
+                elif name in AUDIT_MAILBOX_FILES:
+                    hits.append(f"names mailbox file {name} outside the export: {token}")
     return {"contaminated": bool(hits), "hits": hits[:40]}
+
+
+def audit_output(texts: Iterable[str], forbidden: Iterable[Path]) -> dict[str, Any]:
+    """The limited audit when the runtime exposes no tool-call rows: the
+    authored pack is contaminated only when it spells a forbidden root (the
+    loop repository or mailbox path), which the author could only have
+    learned by looking outside its export. String mentions of PLAN.md or
+    route literals are not evidence of a read."""
+    roots = sorted({r for p in forbidden for r in _norm(Path(p)) if r not in ("/", ".")})
+    hits: list[str] = []
+    for text in texts:
+        for root in roots:
+            if root in text:
+                hits.append(f"authored output names the loop repository path {root}")
+    return {"contaminated": bool(hits), "hits": sorted(set(hits))[:40]}
 
 
 # ------------------------------------------------------------ amendments
@@ -1004,6 +1104,17 @@ def _git_path(top: Path, name: str) -> Path:
     return path if path.is_absolute() else (top / path)
 
 
+def _unhashed_pathspecs(rels: list[str]) -> list[str]:
+    """Exclude pathspecs for what the pin skips, so a driver commit never
+    sweeps a planted node_modules/ or cache into the pack."""
+    out = []
+    for rel in rels:
+        for name in sorted(HASH_SKIP_DIRS):
+            out.append(f":(exclude,glob){rel}/**/{name}/**")
+        out.append(f":(exclude,glob){rel}/**/*.py[co]")
+    return out
+
+
 def commit_paths(repo: Path, rels: list[str], message: str,
                  lock_timeout: float = 120.0) -> str | None:
     """Commit exactly *rels* (repo-relative; additions, edits and deletions)
@@ -1035,7 +1146,7 @@ def commit_paths(repo: Path, rels: list[str], message: str,
         env_head = dict(os.environ, GIT_INDEX_FILE=str(tmp_head))
         if old:
             _git(top, "read-tree", old, env=env_head)
-        _git(top, "add", "-f", "-A", "--", *rels, env=env_head)
+        _git(top, "add", "-f", "-A", "--", *rels, *_unhashed_pathspecs(rels), env=env_head)
         tree = _git(top, "write-tree", env=env_head).stdout.strip()
         if old and tree == _git(top, "rev-parse", f"{old}^{{tree}}").stdout.strip():
             os.close(fd)
@@ -1058,7 +1169,7 @@ def commit_paths(repo: Path, rels: list[str], message: str,
         env_real = dict(os.environ, GIT_INDEX_FILE=str(tmp_real))
         if not index.exists():
             _git(top, "read-tree", sha, env=env_real)
-        _git(top, "add", "-f", "-A", "--", *rels, env=env_real)
+        _git(top, "add", "-f", "-A", "--", *rels, *_unhashed_pathspecs(rels), env=env_real)
         data = tmp_real.read_bytes()
         os.write(fd, data)
         os.close(fd)

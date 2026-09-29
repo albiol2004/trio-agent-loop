@@ -1408,10 +1408,17 @@ def command_acceptance(args: argparse.Namespace) -> int:
         state_path = ta.state_file(repo or mailbox, mailbox)
         while True:
             state = ta.load_state(state_path)
+            frozen = None
             if state.get("status") == "frozen" and (mailbox / "acceptance" / "FROZEN").is_file():
+                frozen = (str(state.get("pin")), str(state.get("pin_commit")))
+            elif state.get("status") != "error":
+                # eval-r19 finding 6: the caller's shell may not see the
+                # driver's state file; a committed freeze is authoritative.
+                frozen = _committed_freeze(ta, repo, mailbox)
+            if frozen is not None:
                 manifest = ta.load_manifest(mailbox / "acceptance")
                 print(f"acceptance frozen: {len(manifest.get('checks') or [])} check(s), "
-                      f"pin {str(state.get('pin'))[:12]} @{str(state.get('pin_commit'))[:12]}")
+                      f"pin {frozen[0][:12]} @{frozen[1][:12]}")
                 for check in manifest.get("checks") or []:
                     print(f"- {check.get('id')} [{check.get('kind')}, {check.get('surface')}] "
                           f"\"{check.get('goal_quote')}\"")
@@ -1490,6 +1497,33 @@ def command_acceptance(args: argparse.Namespace) -> int:
         ids = [i.strip() for i in args.ids.split(",") if i.strip()]
         return controller.human_amend(ids, args.reason)
     raise TrioctlError(f"unknown acceptance command {sub!r}")
+
+
+def _committed_freeze(ta: Any, repo: Path | None, mailbox: Path) -> tuple[str, str] | None:
+    """(pin, commit) when HEAD's history holds the driver's freeze of this
+    mailbox's pack and the working-tree FROZEN is that committed one."""
+    acc = mailbox / "acceptance"
+    if repo is None or not (acc / "FROZEN").is_file():
+        return None
+    try:
+        rel = (acc / "FROZEN").resolve().relative_to(repo).as_posix()
+    except ValueError:
+        return None
+    log = subprocess.run(["git", "-C", str(repo), "log", "--format=%H%x1f%s", "--", rel],
+                         capture_output=True, text=True)
+    freezes = [line.split("\x1f", 1)[0] for line in log.stdout.splitlines()
+               if line.partition("\x1f")[2].startswith("acceptance: freeze ")]
+    if log.returncode != 0 or not freezes:
+        return None
+    dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", rel],
+                           capture_output=True, text=True)
+    if dirty.returncode != 0 or dirty.stdout.strip():
+        return None
+    pin = ta.latest_pin(acc)
+    if not pin:
+        return None
+    last = log.stdout.splitlines()[0].split("\x1f", 1)[0]
+    return pin, last
 
 
 def _live_driver_holds(mailbox: Path) -> bool:
