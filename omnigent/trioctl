@@ -1717,9 +1717,38 @@ def _kill_check_budget(mailbox: Path | None) -> float:
     return KILL_CHECK_DEFAULT_BUDGET_S
 
 
+# r18 measurement fix: a plausible command starts with a known test/build
+# runner, `cd`/`pushd`/`env`, a path, or a leading env-var assignment --
+# never a bare placeholder (`N`, `<n>`, `...`, `ok`, `FAIL`, `Duration`) or
+# one of the TARGETED_CHECK output-format examples the brief's own
+# instruction line quotes in backticks right next to the real command
+# (`N passed[, M failed] in ...`, ` Tests  N passed | M failed`) -- those
+# contain a space and never the literal text "TARGETED_CHECK" either, so
+# the naive "first backtick span with a space" scan used to return them as
+# the command to run (openrouter Q18-r1: `sh: 1: N: not found`, `error`).
+_TARGETED_COMMAND_RUNNER_RE = re.compile(
+    r"^(?:\.{1,2}/|~/|/)"
+    r"|^(?:cd|pushd|env|set|python3?|pytest|unittest|npx|npm|yarn|pnpm|node|go|"
+    r"cargo|mvn|gradle|make|sh|bash|zsh|tsc|vitest|jest|mocha|rspec|ruby|rake|"
+    r"dotnet|swift|deno|bun|tox|nox)\b"
+    r"|^[A-Za-z_][A-Za-z0-9_]*=\S"
+)
+_TARGETED_COMMAND_PLACEHOLDER_RE = re.compile(r"\[.*?\]|\.\.\.|<[^<>]*>")
+
+
+def _plausible_targeted_command(text: str) -> str | None:
+    """*text*, if it plausibly is a runnable command; else None."""
+    text = text.strip()
+    if not text or "TARGETED_CHECK" in text or _TARGETED_COMMAND_PLACEHOLDER_RE.search(text):
+        return None
+    return text if _TARGETED_COMMAND_RUNNER_RE.match(text) else None
+
+
 def _brief_targeted_command(brief: str) -> str | None:
-    """The brief's `## Targeted check` command (a fenced block, else the
-    first inline-code command, else the first plain line), or None."""
+    """The brief's `## Targeted check` command: a fenced block, else the
+    first plausible backticked span, else the first plausible plain line
+    -- or None when nothing in the section looks like a runnable command
+    (the caller then reports `n/a`, never runs a placeholder as `error`)."""
     try:
         lines = _load_trio_check()[0].targeted_check_lines(brief)
     except TrioctlError:
@@ -1738,14 +1767,16 @@ def _brief_targeted_command(brief: str) -> str | None:
         return "\n".join(fenced)
     for ln in lines:
         for span in re.findall(r"`([^`]+)`", ln):
-            span = span.strip()
-            if "TARGETED_CHECK" in span or " " not in span:
-                continue
-            return span
+            command = _plausible_targeted_command(span)
+            if command:
+                return command
     for ln in lines:
         text = re.sub(r"^\s*(?:[-*+]\s+|\$\s+)", "", ln).strip()
-        if text and "TARGETED_CHECK" not in text and not text.lower().startswith("print"):
-            return text
+        if text.lower().startswith("print"):
+            continue
+        command = _plausible_targeted_command(text)
+        if command:
+            return command
     return None
 
 

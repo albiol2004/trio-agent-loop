@@ -16,6 +16,11 @@ fixed semantics asserted instead of xfail'd:
 - r17-rc L-4: a relative `cd ../x` that resolves outside the worktree,
   `env -C <dir>`, `pushd`, and a backtick/`$(...)` cd target are also
   `n/a (leaves worktree)`.
+- r18 measurement: `_brief_targeted_command` extracts the real command from
+  a `## Targeted check` section, never the TARGETED_CHECK output-format
+  instruction's own backtick-quoted placeholder examples (built from the
+  live openrouter Q18-r1 briefs, `.../speed/hard/q-measure/runs/openrouter/
+  Q18-r1/repo/loop-hard/tasks/or-{view,map,api}.md`, read-only).
 """
 from __future__ import annotations
 
@@ -561,3 +566,67 @@ def test_concurrent_builders_isolated(tmp_path, monkeypatch):
     assert recs["s1"]["kill_check"]["outcome"] == "killed"
     assert recs["s2"]["kill_check"]["outcome"] == "killed"
     assert (home / "calc.py").read_text() == GOOD["calc.py"] and "a * b" in (home / "mul.py").read_text()
+
+
+# --------------- r18 measurement: never run a TARGETED_CHECK format hint ---
+
+# The live openrouter Q18-r1 briefs (`.../speed/hard/q-measure/runs/
+# openrouter/Q18-r1/repo/loop-hard/tasks/or-{view,map,api}.md`, read-only)
+# all use exactly this `## Targeted check` shape: a plain (no backticks)
+# command line, followed by the canonical TARGETED_CHECK output-format
+# instruction, which itself quotes several backtick-wrapped placeholder
+# examples containing a space and no literal "TARGETED_CHECK" text --
+# `_brief_targeted_command` used to return the first such example
+# (`N passed[, M failed] in ...`) as if it were the command to run.
+_TARGETED_CHECK_HINT = (
+    "Print `TARGETED_CHECK: <the line stating the pass/fail counts>` after "
+    "running the check (pytest: `N passed[, M failed] in ...`; vitest: "
+    "` Tests  N passed | M failed`, not `Duration`; go test: `ok`/`FAIL`; "
+    "otherwise `TARGETED_CHECK: PASS <n>` or `TARGETED_CHECK: FAILED "
+    "<summary>`)."
+)
+
+
+def _live_brief(command: str) -> str:
+    return f"# Task x\n\n## Targeted check\n\n{command}\n\n{_TARGETED_CHECK_HINT}\n"
+
+
+@pytest.mark.parametrize("command", [
+    "npx tsc --noEmit -p api && npx vitest run api/test/openrouter-view.test.ts",
+    "npx tsc --noEmit -p api && npx vitest run api/test/openrouter-analytics.test.ts "
+    "api/test/dashboard.test.ts",
+    "npx tsc --noEmit -p api && npx vitest run api/test/openrouter-api.test.ts "
+    "api/test/openrouter-route.test.ts api/test/server.test.ts",
+], ids=["or-view", "or-map", "or-api"])
+def test_brief_targeted_command_skips_the_format_hint_placeholders(command):
+    assert T._brief_targeted_command(_live_brief(command)) == command
+
+
+def test_brief_targeted_command_prefers_a_backticked_real_command_too():
+    brief = (
+        "# Task x\n\n## Targeted check\n\n"
+        f"Run `{PYT} tests/test_calc.py`.\n\n{_TARGETED_CHECK_HINT}\n"
+    )
+    assert T._brief_targeted_command(brief) == f"{PYT} tests/test_calc.py"
+
+
+def test_brief_targeted_command_none_when_only_the_hint_is_present():
+    # No real command anywhere in the section -- must not fall back to a
+    # placeholder; the caller then reports `n/a`, never `error`.
+    brief = f"# Task x\n\n## Targeted check\n\n{_TARGETED_CHECK_HINT}\n"
+    assert T._brief_targeted_command(brief) is None
+
+
+def test_kill_check_via_live_brief_shape_is_not_error(tmp_path):
+    """End to end: the same brief shape that produced `error` in the live
+    run (Q18-r1) now runs the real command and reports `killed`, not
+    `sh: 1: N: not found` / `error`."""
+    r, b = repo_at(tmp_path, CALC)
+    w(r, "calc.py", "def add(a, b):\n    return a + b\n")
+    w(r, "tests/test_calc.py", "import sys; sys.path.insert(0, '.')\nfrom calc import add\n\n"
+      "def test_add():\n    assert add(2, 3) == 5\n")
+    brief = _live_brief(f"{PYT} tests/test_calc.py")
+    command = T._brief_targeted_command(brief)
+    assert command == f"{PYT} tests/test_calc.py", command
+    res = kc(r, b, command)
+    assert res["outcome"] == "killed", res
