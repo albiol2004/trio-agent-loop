@@ -613,3 +613,24 @@ def test_harness_garbled_begin_still_runs_end() -> None:
     assert r["status"] == "error" and "begin" in r["reason"]
     assert seq(out) == ["begin", "begin", "end"]
     assert r["lock"] == "released"
+
+
+@needs_node
+@pytest.mark.parametrize("wa,wb,together", [
+    (["src/*.py"], ["src/x.py"], False),
+    (["src/*.py"], ["src/sub/y.py"], False),
+    (["src/**"], ["src"], False),
+    (["*.py"], ["docs/a.md"], False),
+    (["**/*.md"], ["src/x.py"], False),
+    (["src/?.py"], ["src/ab.py"], False),
+    (["docs/*.md"], ["src/x.py"], True),
+    (["src/a/*.py"], ["src/b/*.py"], True),
+    (["srcfoo/*.py"], ["src/x.py"], True),
+])
+def test_harness_glob_writes_never_share_a_wave(wa, wb, together) -> None:
+    """eval-native-v0b N4: a glob overlaps every path under its prefix."""
+    plan = [{"id": "a", "brief": "A", "writes": wa},
+            {"id": "b", "brief": "B", "writes": wb}]
+    out = run({"verdicts": ["SHIP"], "plan": plan})
+    waves = out["result"]["iterations"][0]["waves"]
+    assert waves == ([["a", "b"]] if together else [["a"], ["b"]])

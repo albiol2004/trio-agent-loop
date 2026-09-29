@@ -31,7 +31,7 @@ ln -sfn "$REL/native/agents/trio-step.md" ~/.claude/agents/trio-step.md
 Workflow subagents have **no Agent tool** (probe P4), so the driver owns the builders:
 
 1. **Plan** — one `trio-lead` call with a schema. The Lead updates PLAN.md and returns the iteration's code-changing slices (`id`, `brief`, `writes`, `reads`, `depends`). No product code and no LOG line: each iteration has exactly one `| lead |` line (trio-metrics counts them), written at the end of the pass.
-2. **Waves** — the script groups slices deterministically: a slice joins the earliest wave after its in-plan `depends`, and only if its `writes` are disjoint from the others in that wave (a slice with no product `writes` runs alone).
+2. **Waves** — the script groups slices deterministically: a slice joins the earliest wave after its in-plan `depends`, and only if its `writes` are disjoint from the others in that wave (a slice with no product `writes` runs alone). A glob write (`src/*.py`) counts as every path under its fixed directory prefix (`src/`), and a glob without one (`*.py`) overlaps everything, so globs never share a wave with a path they could match (eval-native-v0b N4).
 3. **Per wave:**
    - `dispatch` returns the Lead's HEAD;
    - one `trio-builder` (Sonnet) per slice runs with `isolation: 'worktree'`, concurrently within the wave, and reports `worktree`, `branch`, `base`, `head`, `commits`, `targeted_check`, `summary`;

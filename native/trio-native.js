@@ -479,11 +479,29 @@ function productWrites(s) {
   return (s.writes || []).map(normPath).filter(p => p && !p.startsWith('api:') && p !== 'loop' && !p.startsWith('loop/'))
 }
 
+// A glob write covers every path under its fixed directory prefix (the
+// segments before the first one with a glob metacharacter); a glob with no
+// fixed prefix (`*.py`, `**/x`) overlaps everything (eval-native-v0b N4).
+function globPrefix(p) {
+  const segs = p.split('/')
+  const i = segs.findIndex(x => /[*?[\]{}]/.test(x))
+  return i < 0 ? null : segs.slice(0, i).join('/')
+}
+
+function pathsOverlap(p, q) {
+  const gp = globPrefix(p)
+  const gq = globPrefix(q)
+  if (gp === '' || gq === '') return true
+  const x = gp === null ? p : gp
+  const y = gq === null ? q : gq
+  return x === y || x.startsWith(y + '/') || y.startsWith(x + '/')
+}
+
 function overlaps(a, b) {
   const wa = productWrites(a)
   const wb = productWrites(b)
   if (!wa.length || !wb.length) return true  // unknown writes: never concurrent
-  return wa.some(p => wb.some(q => p === q || p.startsWith(q + '/') || q.startsWith(p + '/')))
+  return wa.some(p => wb.some(q => pathsOverlap(p, q)))
 }
 
 // Deterministic waves: a slice joins the earliest wave after all its
