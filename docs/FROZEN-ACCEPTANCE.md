@@ -89,8 +89,15 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   own workspace never make a check pass. A `behaviour`/`doc` check that
   PASSes at base, ERRORs, misquotes the GOAL, breaks the schema or exceeds
   the budget is dropped. The 4th and later guards are dropped. UNAVAILABLE
-  checks are kept and flagged. The author gets one retry, with the drop
-  list, when more than 30% were dropped or fewer than 5 checks remain.
+  checks are kept and flagged. A check whose pack code FAILs at base on
+  an import error (the last traceback starts in pack code, a pack script
+  or `-c`, and ends in `ModuleNotFoundError`/`ImportError`; or a pack
+  pytest run whose summary names one) is dropped as `broken-at-base: pack
+  code cannot import (...)`: pack code runs with `-P -s`, so that import
+  fails forever and the check is not discriminating (eval-r19f finding 3;
+  a product traceback the check echoes does not count). The author gets
+  one retry, with the drop list, when more than 30% were dropped, fewer
+  than 5 checks remain, or any check was dropped for a pack import.
 - Tier: the author runs on the Lead/Evaluator model. Without
   `[roles.acceptance]` it inherits `[roles.evaluator]`. With the switch on,
   the doctor FAILs unless lead, evaluator and acceptance resolve to one
@@ -243,6 +250,15 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     v`) and `--`. A nested interpreter (`sh -c "python3 acceptance/..."`,
     `/usr/bin/env python3 ...`) gets no flags and sees only its own view.
     Interpreters older than 3.11 get `-s` only and rely on the views.
+  - pytest run on PACK tests (`python3 -m pytest ... acceptance/...` or
+    `pytest acceptance/...`; eval-r19f finding 1) gets
+    `-p no:cacheprovider --confcutdir=<view> -c /dev/null --rootdir=<view>`
+    in front of pytest's own arguments, and `python3 -m pytest` also gets
+    `-P` (not `-s`: pytest may live in user site). No product
+    `conftest.py`, `pytest.ini`/`pyproject.toml`/`setup.cfg`/`tox.ini`
+    addopts, tree-root `*.dist-info` plugin entry point or `pytest.py`
+    decides a pack test's outcome. pytest on the product's own tests
+    (`python3 -m pytest tests`) is the product's and gets nothing.
     Residual: product code (and every child) still loads user site, so a
     same-uid process that plants a `.pth` there can still affect product
     runs; under `sandbox: none` a hostile check can plant one itself.
@@ -296,6 +312,14 @@ stdout and stderr are captured separately; each stream's first 1 MiB
 patterns never see just that tail. (Before round 5 patterns saw the last
 2 KB of merged stdout+stderr, so a `--help` obligation early in a long help
 text never passed.)
+
+Matching one attempt's patterns is bounded by min(`timeout_s`, 10 s)
+(`MATCH_DEADLINE_S`; eval-r19f finding 2): it runs in a forked child that
+is killed at the deadline, and the check FAILs with reason
+`pattern-timeout` (detail: the pattern). The matching time is part of the
+check's `wall_s`. A backtracking pattern such as `.*"count"` that does not
+match a long single line is quadratic in `re`; before the bound it could
+stall the pack for minutes.
 
 ## Coverage
 

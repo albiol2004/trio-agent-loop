@@ -992,7 +992,8 @@ Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
 PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
 (`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). `expect`
 regexes match the full stream (first 1 MiB): `stdout`, `stderr`, or
-`output` (stdout then stderr); the 2 KB excerpt is evidence only. Each
+`output` (stdout then stderr), within min(`timeout_s`, 10 s) (else FAIL
+`pattern-timeout`); the 2 KB excerpt is evidence only. Each
 check runs in its OWN fresh copy of the tree (no .git/node_modules/caches/
 mailbox) with its own read-only view of the pack: its own files (named by
 its `run`, mentioned by them, or under `checks/<its id>/`) plus the shared
@@ -1005,8 +1006,11 @@ the code it runs comes from the pack (a script under `acceptance/`, `-c`,
 `-m` of an `acceptance/lib/` module; neither the script's directory, the
 tree nor user site is importable by it; `-m acceptance...` is invalid). A
 `run` that starts the product (`python3 app.py`, `python3 -m pkg`,
-`python3 -m pytest`) gets no flag, and flags are not inherited, so the
-product resolves imports normally; shared helpers live in
+`python3 -m pytest tests`) gets no flag, and flags are not inherited, so
+the product resolves imports normally; pytest on pack tests
+(`python3 -m pytest acceptance/...`) gets `-P` and `-p no:cacheprovider
+--confcutdir=<view> -c /dev/null --rootdir=<view>`, so no product
+conftest/ini/plugin applies; shared helpers live in
 `acceptance/lib/`, on `PYTHONPATH`/`NODE_PATH`), a controlled `PATH` (system
 directories plus the interpreter directories the driver resolved at
 start), no symlinks in the pack, env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
