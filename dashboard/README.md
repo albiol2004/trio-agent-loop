@@ -201,7 +201,8 @@ make runs visible.
 `shipped`, `needs_human`, `blocked`, `error`, `needs_retirement`,
 `needs_land`, `held` (Omnigent `.sessions/held-*.json`, or a
 claude-workflow `held_step`), `conflict`, `budget`, `iteration_cap`,
-`interrupted`, `ready` (answered, waiting for its restart), `unknown`. A
+`interrupted`, `answered` (a human answered; waiting for its restart),
+`ready` (not started), `unknown`. A
 claude-workflow result (`.native-result.json`, or for older runs the raw
 session output in `.native-runs/`) is used only when it belongs to the
 latest run and STATE.md was not changed after it. `driver:

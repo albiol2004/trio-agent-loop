@@ -196,7 +196,7 @@ const LOOP_STATE_BADGES = {
   conflict: ["negative", "Conflict"],
   budget: ["warning", "Budget spent"],
   iteration_cap: ["warning", "Iteration cap"],
-  ready: ["neutral", "Ready to restart"],
+  answered: ["warning", "Answered — restart"],
 };
 
 function derivedStateOf(loop) {
@@ -1245,13 +1245,19 @@ function renderActions(data) {
 
   const proposed = (((data.diagnosis || {}).result || {}).proposed_fix || {}).id;
   const list = el("fix-list");
-  list.textContent = "";
-  const unavailable = [];
-  for (const fix of data.fixes || []) {
-    if (!fix.applicable) { unavailable.push(fix); continue; }
-    list.appendChild(fixRow(fix, fix.id === proposed, st));
+  const unavailable = (data.fixes || []).filter((fix) => !fix.applicable);
+  // Rebuild the rows only when the fixes change: a poll must not wipe a
+  // typed max-iterations value or a row's result note.
+  const signature = JSON.stringify([data.loop, data.root, proposed, st.state, st.iteration,
+    (data.fixes || []).filter((f) => f.applicable).map((f) => [f.id, f.commands_preview])]);
+  if (signature !== state.fixSignature) {
+    state.fixSignature = signature;
+    list.textContent = "";
+    for (const fix of data.fixes || []) {
+      if (fix.applicable) list.appendChild(fixRow(fix, fix.id === proposed, st));
+    }
+    if (!list.children.length) list.appendChild(span("caption", "No fix applies right now."));
   }
-  if (!list.children.length) list.appendChild(span("caption", "No fix applies right now."));
   const ul = el("fix-unavailable-list");
   ul.textContent = "";
   for (const fix of unavailable) {
@@ -1374,6 +1380,8 @@ async function applyFix(fix, args, btn, note) {
       note.textContent = "Not applied: " + (data.error || (failed && (failed.error || failed.output)) || "HTTP " + status);
       note.className = "control-note caption control-error";
     }
+    setNote("fix-result", fix.id + ": " + note.textContent,
+      note.className.includes("control-ok") ? "ok" : "error");
   } catch (err) {
     note.textContent = "Request failed: " + err.message;
     note.className = "control-note caption control-error";
@@ -1579,6 +1587,8 @@ async function openDrawer(key) {
   showDrawerTab();
   renderDrawerInbox();
   state.actions = null;
+  state.fixSignature = null;
+  setNote("fix-result", "");
   el("actions-section").hidden = true;
   el("diagnose-harness").textContent = "";
   setNote("diagnose-note", "");

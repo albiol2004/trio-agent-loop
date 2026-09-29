@@ -2229,7 +2229,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         and verdict not in ("SHIP", "NEEDS_HUMAN", "BLOCKED")
         # A known outcome (native held/conflict/budget/error, iteration
         # cap, an answered loop waiting for its restart) is its own item.
-        and dstate in (None, "interrupted", "unknown")
+        and dstate in (None, "interrupted", "unknown", "ready")
     ):
         # Two recorded facts disagree; no idle-time threshold is involved.
         # Without a readable broker, a broker-only loop cannot be ruled out,
@@ -2268,7 +2268,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
 
     _state_inbox_items(derived, add)
 
-    if dstate in ("held", "ready"):
+    if dstate in ("held", "answered"):
         pass  # the hold explains STATE's needs_human; an answer was given
     elif verdict == "NEEDS_HUMAN":
         add("high", "needs_human", "Human verification pending",

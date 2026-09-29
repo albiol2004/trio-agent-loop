@@ -770,7 +770,7 @@ class AnswerBoxTests(_Base):
         self.assertEqual(state["mission"], "keep")
         self.assertEqual([f["id"] for f in data["restart"]], ["rerun"])
         card = self.card("loop")
-        self.assertEqual(card["loop_state"]["state"], "ready")
+        self.assertEqual(card["loop_state"]["state"], "answered")
         kinds = {i["kind"] for i in self.inbox("loop")}
         self.assertNotIn("needs_human", kinds)
         self.assertNotIn("interrupted", kinds)

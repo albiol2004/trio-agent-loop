@@ -489,7 +489,7 @@ RUNNING_WORDS = {"running", "in_progress", "active", "iterating"}
 STATES = (
     "running", "shipped", "needs_human", "blocked", "error", "needs_retirement",
     "needs_land", "held", "conflict", "budget", "iteration_cap", "interrupted",
-    "ready", "unknown",
+    "answered", "ready", "unknown",
 )
 
 UNBLOCK_TABLE = [
@@ -648,7 +648,7 @@ def derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None
         out.update(state="iteration_cap", summary=f"iteration {iteration} of {cap}: cap reached")
         return out
     if word in RUNNING_WORDS and phase.lower() == "idle" and state.get("human_answer"):
-        out.update(state="ready", summary="answered (" + state["human_answer"] + "); ready to restart")
+        out.update(state="answered", summary="answered (" + state["human_answer"] + "); restart the loop")
         return out
     if word in RUNNING_WORDS:
         if native:
