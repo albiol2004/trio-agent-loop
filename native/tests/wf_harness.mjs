@@ -23,6 +23,9 @@ let verdictIdx = 0
 let gateIdx = 0
 let wrongNonceLeft = sc.wrong_nonce_once ? 1 : 0
 let lastVerdict = null
+let lastHead = null
+const answers = {}
+const lossyLeft = Object.assign({}, sc.lossy || {})   // op -> times to drop keys
 
 function stepResult(op, nonce, prompt) {
   const flag = name => {
@@ -31,7 +34,22 @@ function stepResult(op, nonce, prompt) {
   }
   const base = { ok: true, op, nonce }
   switch (op) {
-    case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration, status: 'ready', phase: 'idle' }
+    case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration, status: 'ready', phase: 'idle',
+      lock_owner: 'workflow:x' }
+    case 'dispatch': {
+      lastHead = `H${iteration}w${flag('wave')}`
+      return { ...base, iteration, wave: Number(flag('wave')), head: lastHead }
+    }
+    case 'builders': {
+      const results = JSON.parse(flag('results'))
+      const refused = results.filter(r => r.base !== flag('head') || (sc.refuse_ids || []).includes(r.id))
+        .map(r => ({ id: r.id, reason: `builder ${r.id} forked from ${r.base}, not the Lead's HEAD` }))
+      const accepted = results.filter(r => !refused.some(x => x.id === r.id)).map(r => r.id)
+      return { ...base, accepted, refused, merge: results.filter(r => accepted.includes(r.id) && r.commits.length)
+        .map(r => ({ id: r.id, branch: r.branch })) }
+    }
+    case 'cleanup': return { ...base, removed: (flag('branches') || '').split(',').filter(Boolean)
+      .map(b => ({ branch: b, worktree: `/repo/.claude/worktrees/${b}` })), kept: [] }
     case 'next': {
       if (lastVerdict && ['SHIP', 'BLOCKED', 'NEEDS_HUMAN'].includes(lastVerdict)) {
         return { ...base, action: 'stop', status: lastVerdict.toLowerCase(), code: 0, iteration }
@@ -62,26 +80,44 @@ function stepResult(op, nonce, prompt) {
         code: stop ? { SHIP: 0, BLOCKED: 2, NEEDS_HUMAN: 5 }[word] : null, commit_shas: stop ? ['c0ffee'] : [],
         human_check: word === 'NEEDS_HUMAN' ? '1. look' : null, bound: true }
     }
-    case 'end': return { ...base, lock: 'released', dangling_worktrees: [], iteration }
+    case 'end': return { ...base, lock: 'released', dangling_worktrees: [], eval_worktrees_removed: [], iteration }
   }
   return { ok: false, op, nonce, error: 'unknown op' }
 }
 
 async function agent(prompt, opts = {}) {
   calls.push({ agentType: opts.agentType, model: opts.model, effort: opts.effort, schema: !!opts.schema,
-    label: opts.label, isolation: opts.isolation || null, prompt })
+    label: opts.label, isolation: opts.isolation || null, schemaKeys: opts.schema ? Object.keys(opts.schema.properties) : null,
+    prompt })
   if (opts.agentType === 'trio-step') {
     const m = prompt.match(/op=(\w+), nonce=([^)]+)\)/)
     if (sc.held_op === m[1]) {
-      return { exit_code: -1, result: { ok: false, held: true, op: m[1], nonce: m[2],
-        error: 'permission denied: auto mode classifier blocked the command' } }
+      return { exit_code: -1, stdout: '', held: true,
+        denial: 'Permission to use Bash has been denied by the auto mode classifier' }
     }
-    const res = stepResult(m[1], m[2], prompt)
-    if (wrongNonceLeft > 0) { wrongNonceLeft -= 1; return { exit_code: 0, result: { ...res, nonce: 'stale' } } }
-    return { exit_code: 0, result: res }
+    if (sc.self_refuse_op === m[1]) {
+      return { exit_code: -1, stdout: '', held: true, denial: '' }
+    }
+    // the helper is idempotent: a re-run of the same step gets the same answer
+    const res = answers[m[2]] || (answers[m[2]] = stepResult(m[1], m[2], prompt))
+    if (lossyLeft[m[1]] > 0) {
+      lossyLeft[m[1]] -= 1
+      return { exit_code: 0, stdout: JSON.stringify({ ok: true, op: res.op, nonce: res.nonce }) }
+    }
+    if (wrongNonceLeft > 0) { wrongNonceLeft -= 1; return { exit_code: 0, stdout: JSON.stringify({ ...res, nonce: 'stale' }) } }
+    return { exit_code: 0, stdout: JSON.stringify(res) }
   }
   const role = opts.agentType.replace('trio-', '')
   if ((sc.die || []).includes(role)) return null
+  if (role === 'lead' && opts.schema) {
+    return { slices: sc.plan || [{ id: 'app', brief: 'build app.py', writes: ['app.py'], reads: [], depends: [] }] }
+  }
+  if (role === 'builder') {
+    const id = prompt.match(/slice `([^`]+)`/)[1]
+    const base = (sc.bad_base_ids || []).includes(id) ? 'origin-head' : lastHead
+    return { id, worktree: `/repo/.claude/worktrees/${id}`, branch: `worktree-${id}`, base, head: `T-${id}`,
+      commits: [`T-${id}`], summary: `built ${id}` }
+  }
   return `${role} done`
 }
 

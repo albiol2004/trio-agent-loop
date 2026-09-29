@@ -54,21 +54,27 @@ def test_no_nondeterministic_builtins() -> None:
 
 def test_every_agent_call_carries_model_and_type() -> None:
     calls = [m.start() for m in re.finditer(r"\bagent\(", SRC)]
-    assert len(calls) == 2  # step() and runAgentTwice()
+    assert len(calls) == 3  # step(), runAgentTwice() and the builder wave
     step_call = SRC[calls[0]:calls[0] + 400]
     assert "agentType: 'trio-step'" in step_call
     assert "model: MODELS.step" in step_call
     assert "schema: STEP_SCHEMA" in step_call
     assert "effort: 'low'" in step_call
     # role agents: runAgentTwice gets agentType + model at every call site
-    sites = re.findall(r"runAgentTwice\([^)]*\{\s*(.*?)\}\)", SRC, re.S)
-    assert len(sites) == 2
-    for site in sites:
-        assert "agentType:" in site and "model:" in site
+    sites = [m.start() for m in re.finditer(r"await runAgentTwice\(", SRC)]
+    assert len(sites) == 5  # plan, solo lead, integrate, lead/repair retry, evaluator
+    for start in sites:
+        site = SRC[start:SRC.index("})", start)]
+        assert "agentType:" in site and "model:" in site, site
     assert "lead: 'claude-opus-5-5'" in SRC
     assert "evaluator: 'claude-opus-5-5'" in SRC
     assert "repair: 'claude-sonnet-5'" in SRC
     assert "step: 'claude-sonnet-5'" in SRC
+    assert "builder: 'claude-sonnet-5'" in SRC
+    builder_call = SRC[calls[2]:calls[2] + 400]
+    for key in ("agentType: 'trio-builder'", "model: MODELS.builder",
+                "isolation: 'worktree'", "schema: BUILDER_SCHEMA"):
+        assert key in builder_call
 
 
 def test_max_agents_enforced_in_spend() -> None:
@@ -79,6 +85,8 @@ def test_max_agents_enforced_in_spend() -> None:
         start = SRC.index(fn)
         chunk = SRC[start:SRC.index("agent(prompt", start)]
         assert "spend(" in chunk
+    start = SRC.index("const results = await parallel(")
+    assert "spend(`builder ${s.id}`)" in SRC[start - 200:start]
 
 
 def test_step_agent_definition() -> None:
@@ -115,6 +123,11 @@ def run(scenario: dict) -> dict:
     return json.loads(proc.stdout)
 
 
+ONE_PASS = ["begin", "next", "lead", "dispatch", "builder", "builders", "lead",
+            "cleanup", "gate", "pin", "evaluator", "apply"]
+ITER = ONE_PASS[1:]
+
+
 def seq(out: dict) -> list[str]:
     names = []
     for c in out["calls"]:
@@ -131,17 +144,17 @@ def test_harness_ship() -> None:
     r = out["result"]
     assert r["status"] == "shipped" and r["verdict"] == "SHIP"
     assert r["commit_shas"] == ["c0ffee"] and r["lock"] == "released"
-    assert seq(out) == ["begin", "next", "lead", "gate", "pin", "evaluator",
-                        "apply", "end"]
-    assert r["agents_used"] == 8
+    assert seq(out) == ONE_PASS + ["end"]
+    assert r["agents_used"] == 13
     roles = {c["agentType"]: c for c in out["calls"]}
     assert roles["trio-lead"]["model"] == "claude-opus-5-5"
     assert roles["trio-evaluator"]["model"] == "claude-opus-5-5"
     assert roles["trio-step"]["model"] == "claude-sonnet-5"
     assert all(c["schema"] for c in out["calls"] if c["agentType"] == "trio-step")
     lead = roles["trio-lead"]["prompt"]
-    assert 'isolation: "worktree"' in lead and "git merge" in lead
     assert "does NOT apply inside this role" in lead
+    assert roles["trio-builder"]["isolation"] == "worktree"
+    assert roles["trio-builder"]["model"] == "claude-sonnet-5"
     ev = roles["trio-evaluator"]["prompt"]
     assert ev.startswith("LOCKSTEP CONTEXT: attempt=att1 sha=sha1")
     assert "attempt: att1" in ev and "evaluated: sha1" in ev
@@ -151,20 +164,108 @@ def test_harness_ship() -> None:
 
 
 @needs_node
-def test_harness_lead_prompt_builder_worktree_contract() -> None:
-    """F6: absolute mailbox LOG path, no loop/ commits, exact merge steps."""
+def test_harness_driver_owned_builder_contract() -> None:
+    """Probe blocker 1 + F6: the Lead plans, the driver spawns isolated
+    builders, builders never write LOG or commit loop/, the Lead merges."""
     out = run({"verdicts": ["SHIP"]})
-    lead = next(c for c in out["calls"] if c["agentType"] == "trio-lead")
-    p = lead["prompt"]
-    assert f"absolute mailbox path `{MAILBOX}/LOG.md`" in p
-    assert "never to a `loop/LOG.md` inside your worktree" in p
-    assert "Never edit, `git add` or commit anything under `loop/`" in p
-    assert "`git merge --no-ff --no-edit <builder branch>`" in p
-    assert "from your own checkout, on your branch" in p
-    assert "If the merge conflicts, run `git merge --abort`, stop dispatching, and report" in p
-    assert "After a branch is merged, remove its worktree (`git worktree remove <path>`)" in p
-    assert "`git branch -d <builder branch>`" in p
-    assert 'isolation: "worktree"' in p
+    leads = [c for c in out["calls"] if c["agentType"] == "trio-lead"]
+    plan, integ = leads[0], leads[1]
+    assert plan["schemaKeys"] == ["slices", "notes"]
+    assert "You have no Agent tool" in plan["prompt"]
+    assert "Agent tool option" not in plan["prompt"]
+    assert "Do NOT implement product code" in plan["prompt"]
+    builder = next(c for c in out["calls"] if c["agentType"] == "trio-builder")
+    b = builder["prompt"]
+    assert builder["isolation"] == "worktree"
+    assert "report it as `base`" in b and "The driver requires `base` = H1w1" in b
+    assert "Do NOT write LOG.md" in b and "Never commit `loop/` files" in b
+    assert "the driver writes your LOG line from this result" in b
+    assert "ASSIGNMENT FROM THE LEAD:\nbuild app.py" in b
+    i = integ["prompt"]
+    assert "`git merge --no-ff --no-edit <builder branch>`" in i
+    assert "from your own checkout, on your branch" in i
+    assert "run `git merge --abort`, stop merging, and report" in i
+    assert "branch `worktree-app`" in i
+    assert "Do not remove worktrees or delete branches: the driver does that" in i
+    assert "cat > /work/product/loop/REPORT.md <<'EOF'" in i
+    assert "| lead | <summary>` to /work/product/loop/LOG.md" in i
+    cleanup = next(c["prompt"] for c in out["calls"] if "op=cleanup" in c["prompt"])
+    assert "--branches 'worktree-app'" in cleanup
+    ev = next(c["prompt"] for c in out["calls"] if c["agentType"] == "trio-evaluator")
+    assert "/repo/.claude/worktrees/eval-1-att1 sha1" in ev
+
+
+@needs_node
+def test_harness_disjoint_slices_share_a_wave_overlaps_serialize() -> None:
+    plan = [
+        {"id": "a", "brief": "A", "writes": ["src/a.py"]},
+        {"id": "b", "brief": "B", "writes": ["src/b.py"]},
+        {"id": "c", "brief": "C", "writes": ["src"]},              # overlaps a, b
+        {"id": "d", "brief": "D", "writes": ["docs/d.md"], "depends": ["a"]},
+        {"id": "e", "brief": "E", "writes": []},                   # unknown: alone
+    ]
+    out = run({"verdicts": ["SHIP"], "plan": plan})
+    r = out["result"]
+    assert r["status"] == "shipped"
+    assert r["iterations"][0]["waves"] == [["a", "b"], ["c", "d"], ["e"]]
+    names = seq(out)
+    assert names.count("dispatch") == 3 and names.count("cleanup") == 3
+    assert names.count("lead") == 1 + 3
+    integ = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-lead"][1:]
+    assert "More waves follow" in integ[0] and "(last wave)" in integ[2]
+    bases = [re.search(r"`base` = (\S+) ", c["prompt"]).group(1)
+             for c in out["calls"] if c["agentType"] == "trio-builder"]
+    assert bases == ["H1w1", "H1w1", "H1w2", "H1w2", "H1w3"]
+
+
+@needs_node
+def test_harness_builder_wrong_base_stops_before_integrate() -> None:
+    """Probe blocker 2: a worktree forked from origin/HEAD is refused."""
+    out = run({"verdicts": ["SHIP"], "bad_base_ids": ["app"]})
+    r = out["result"]
+    assert r["status"] == "error" and "baseRef" in r["reason"]
+    assert "origin-head" in r["reason"]
+    assert seq(out) == ["begin", "next", "lead", "dispatch", "builder", "end"]
+
+
+@needs_node
+def test_harness_helper_refusal_stops() -> None:
+    out = run({"verdicts": ["SHIP"], "refuse_ids": ["app"]})
+    r = out["result"]
+    assert r["status"] == "error" and "builders refused" in r["reason"]
+    assert seq(out)[-2:] == ["builders", "end"]
+
+
+@needs_node
+def test_harness_empty_plan_runs_one_solo_lead_call() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": []})
+    assert out["result"]["status"] == "shipped"
+    assert seq(out)[:5] == ["begin", "next", "lead", "lead", "gate"]
+    solo = [c for c in out["calls"] if c["agentType"] == "trio-lead"][1]
+    assert "no code-changing slices" in solo["prompt"]
+
+
+@needs_node
+@pytest.mark.parametrize("op", ["gate", "pin", "apply", "begin", "end", "builders"])
+def test_harness_lossy_step_result_is_rerun(op: str) -> None:
+    """Probe blocker 3: a result missing the op's keys is not accepted."""
+    out = run({"verdicts": ["SHIP"], "lossy": {op: 1}})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["commit_shas"] == ["c0ffee"]
+    assert seq(out).count(op) == 2
+    assert any(f"step {op}: result lacks" in line for line in out["logs"])
+    if op == "end":
+        assert r["lock"] == "released"
+
+
+@needs_node
+def test_harness_self_refusal_is_error_not_held() -> None:
+    """Probe blocker 8: `held` without a harness denial is an error."""
+    out = run({"verdicts": ["SHIP"], "self_refuse_op": "pin"})
+    r = out["result"]
+    assert r["status"] == "error" and r["held_step"] is None
+    assert "declined without a harness permission denial" in r["reason"]
+    assert seq(out).count("pin") == 1
 
 
 @needs_node
@@ -172,9 +273,7 @@ def test_harness_iterate_then_ship() -> None:
     out = run({"verdicts": ["ITERATE", "SHIP"]})
     r = out["result"]
     assert r["status"] == "shipped" and r["iteration"] == 2
-    assert seq(out) == ["begin", "next", "lead", "gate", "pin", "evaluator",
-                        "apply", "next", "lead", "gate", "pin", "evaluator",
-                        "apply", "end"]
+    assert seq(out) == ONE_PASS + ITER + ["end"]
     assert [i["verdict"] for i in r["iterations"]] == ["ITERATE", "SHIP"]
 
 
@@ -182,7 +281,7 @@ def test_harness_iterate_then_ship() -> None:
 def test_harness_scoped_iterate_runs_repair_on_sonnet() -> None:
     out = run({"verdicts": ["ITERATE scope=local:app.py", "SHIP"],
                "args": {"max_agents": 20}})
-    assert seq(out)[7:10] == ["next", "repair", "gate"]
+    assert seq(out)[12:15] == ["next", "repair", "gate"]
     repair = next(c for c in out["calls"] if c["agentType"] == "trio-repair")
     assert repair["model"] == "claude-sonnet-5"
     assert "| repair |" in repair["prompt"]
@@ -193,8 +292,8 @@ def test_harness_scoped_iterate_runs_repair_on_sonnet() -> None:
 def test_harness_gate_fail_retries_lead_once() -> None:
     out = run({"verdicts": ["SHIP"], "gates": [False, True]})
     assert out["result"]["status"] == "shipped"
-    assert seq(out)[:6] == ["begin", "next", "lead", "gate", "lead", "gate"]
-    retry = [c for c in out["calls"] if c["agentType"] == "trio-lead"][1]
+    assert seq(out)[:11] == ONE_PASS[:9] + ["lead", "gate"]
+    retry = [c for c in out["calls"] if c["agentType"] == "trio-lead"][2]
     assert "RETRY (attempt 2 of 2)" in retry["prompt"]
     gates = [c["prompt"] for c in out["calls"] if "op=gate" in c["prompt"]]
     assert "--attempt '1'" in gates[0] and "--attempt '2'" in gates[1]
@@ -205,7 +304,7 @@ def test_harness_gate_fail_twice_stops_with_error() -> None:
     out = run({"verdicts": ["SHIP"], "gates": [False, False]})
     r = out["result"]
     assert r["status"] == "error" and "gate breach" in r["reason"]
-    assert seq(out) == ["begin", "next", "lead", "gate", "lead", "gate", "end"]
+    assert seq(out) == ONE_PASS[:9] + ["lead", "gate", "end"]
 
 
 @needs_node
@@ -214,8 +313,7 @@ def test_harness_max_agents_exhaustion_keeps_end() -> None:
     r = out["result"]
     assert r["status"] == "budget" and "max_agents=9" in r["reason"]
     assert r["agents_used"] == 9 and r["lock"] == "released"
-    assert seq(out) == ["begin", "next", "lead", "gate", "pin", "evaluator",
-                        "apply", "next", "end"]
+    assert seq(out) == ONE_PASS[:8] + ["end"]
 
 
 @needs_node
@@ -278,7 +376,7 @@ def test_harness_no_agent_cap_by_default() -> None:
                "args": {"max_iterations": 10}})
     r = out["result"]
     assert r["status"] == "shipped" and r["iteration"] == 6
-    assert r["agents_used"] == 2 + 6 * 6 and r["max_agents"] is None
+    assert r["agents_used"] == 2 + 6 * 11 and r["max_agents"] is None
 
 
 @needs_node
@@ -287,11 +385,11 @@ def test_harness_token_budget_opt_in() -> None:
                "args": {"token_budget": 5000}})
     r = out["result"]
     assert r["status"] == "budget" and "token_budget=5000" in r["reason"]
-    assert seq(out) == ["begin", "next", "lead", "gate", "pin", "end"]
+    assert seq(out) == ["begin", "next", "lead", "dispatch", "builder", "end"]
 
 
 @needs_node
-@pytest.mark.parametrize("op", ["gate", "apply", "next"])
+@pytest.mark.parametrize("op", ["gate", "apply", "next", "dispatch", "cleanup"])
 def test_harness_held_step_stops_without_retry(op: str) -> None:
     out = run({"verdicts": ["SHIP"], "held_op": op})
     r = out["result"]
