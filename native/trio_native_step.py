@@ -587,6 +587,18 @@ def op_apply(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         {"evaluator_attempt": a.attempt,
          "pinned_sha": state["evaluated_sha"].strip()},
     )
+    if verdict is not None and not bound:
+        # eval-native-v0 F7: a leftover VERDICT.md (an earlier iteration's,
+        # or one the Evaluator did not bind to this pin) is never applied.
+        # Nothing is written: STATE stays lead-done, so a fresh run's `pin`
+        # re-dispatches the Evaluator. trio_loop still applies it (parity
+        # gap recorded as a follow-up; changing the core is out of scope).
+        raise StepError(
+            f"apply: VERDICT.md ({verdict}) is not bound to iteration "
+            f"{a.iteration} attempt {a.attempt} sha "
+            f"{state['evaluated_sha'].strip() or '(none)'}: stale or "
+            f"unbound verdict not applied; STATE left at lead-done"
+        )
     if verdict is None:
         TL._update_state(state_path, {"status": "error", "phase": "error"})
         TL._append_log(

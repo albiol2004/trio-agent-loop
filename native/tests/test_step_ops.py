@@ -452,6 +452,44 @@ def test_apply_and_pin_refuse_wrong_binding(repo: Path) -> None:
     assert p["ok"]
 
 
+def test_apply_refuses_stale_unbound_verdict(repo: Path) -> None:
+    """F7: iteration 2's Evaluator writes nothing; iteration 1's ITERATE
+    is not re-applied."""
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    write_verdict(repo, "VERDICT: ITERATE scope=local:app.py", 1, p)
+    assert step(repo, "apply", iteration=1,
+                attempt=p["evaluator_attempt"])["next_role"] == "repair"
+    n = step(repo, "next", max_iterations=4)
+    lead_pass(repo, 2, role="repair", body="#2")
+    assert step(repo, "gate", role="repair", iteration=2, attempt=1)["pass"]
+    p2 = step(repo, "pin", iteration=2)
+    assert n["action"] == "repair" and p2["skip_evaluator"] is False
+    log_before = (mbox(repo) / "LOG.md").read_text()
+    stale = step(repo, "apply", iteration=2, attempt=p2["evaluator_attempt"])
+    assert not stale["ok"] and "not bound" in stale["error"]
+    assert "iteration: 2" in state(repo) and "phase: lead-done" in state(repo)
+    assert (mbox(repo) / ".repairs").read_text().strip() == "1"
+    assert (mbox(repo) / "LOG.md").read_text() == log_before
+    # a fresh run re-pins (same attempt) and the Evaluator is re-dispatched
+    again = step(repo, "pin", iteration=2)
+    assert again["evaluator_attempt"] == p2["evaluator_attempt"]
+    assert again["skip_evaluator"] is False
+    write_verdict(repo, "VERDICT: ITERATE", 2, again)
+    ok = step(repo, "apply", iteration=2, attempt=again["evaluator_attempt"])
+    assert ok["ok"] and ok["bound"] and ok["next_role"] == "lead"
+
+
+def test_apply_refuses_unbound_ship(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    (mbox(repo) / "VERDICT.md").write_text(
+        "VERDICT: SHIP\n# Verdict — iteration 1\nattempt: someone-else\n")
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert not a["ok"] and "not bound" in a["error"]
+    assert "status: running" in state(repo)
+
+
 # ------------------------------------------------------------ idempotency
 def test_replay_every_op_gives_same_answer(repo: Path) -> None:
     b1, b2 = step(repo, "begin"), step(repo, "begin")
