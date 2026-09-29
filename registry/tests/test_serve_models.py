@@ -113,7 +113,7 @@ class ModelsEndpointTests(DashboardModelsTestCase):
         }
         claude_lead = rows["claude", "trio-lead"]
         self.assertEqual(claude_lead["layer"], "frontmatter")
-        self.assertEqual(claude_lead["model"], "claude-opus-5")
+        self.assertEqual(claude_lead["model"], "claude-opus-5-5")
         for agent in ("trio-omnigent-builder", "trio-omnigent-lead"):
             with self.subTest(agent=agent):
                 self.assertTrue(
