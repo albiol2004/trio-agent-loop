@@ -2270,6 +2270,76 @@ class AcceptanceController:
         self._log(iteration, f"frozen {n} check(s) @{sha[:12]} pin {pin[:12]} "
                              f"(dropped {len(dropped)}; author {model})")
 
+    def freeze_from_export(self, export: Path, author: dict, iteration: int = 0) -> int:
+        """`trioctl omnigent acceptance freeze`: validate an authored export
+        at base (a fresh export) and freeze it -- the driver-side half of
+        the author phase, for manual and native use. 0 frozen, 3 refused."""
+        ta = self.ta
+        if self.frozen() and (self.acc_dir / ta.FROZEN).is_file():
+            print("acceptance is already frozen for this loop", file=sys.stderr)
+            return 3
+        base = self.state.get("base") or _git_head(self.repo) or ""
+        goal = (self.mailbox / "GOAL.md").read_text(encoding="utf-8", errors="replace")
+        notes_path = self.mailbox / "ACCEPTANCE-NOTES.md"
+        notes = notes_path.read_text(encoding="utf-8", errors="replace") if notes_path.is_file() else None
+        acc = Path(export) / ta.PACK_DIR
+        try:
+            manifest = ta.load_manifest(acc)
+        except ta.ManifestError as exc:
+            print(f"acceptance: {exc}", file=sys.stderr)
+            return 3
+        fresh = self.state_path.parent / "validate"
+        info = ta.build_export(self.repo, base, fresh, self.mailbox)
+        base_run = ta.run_pack(acc, fresh, exclude={ta.PACK_DIR, ta.INPUT_DIR}, manifest=manifest)
+        shutil.rmtree(fresh, ignore_errors=True)
+        filtered = ta.freeze_filter(manifest, base_run, goal, notes, acc)
+        for cid, why in filtered["dropped"]:
+            print(f"dropped {cid}: {why}", file=sys.stderr)
+        self._freeze(iteration, Path(export), filtered, author, info, goal, notes)
+        return 0
+
+    def human_amend(self, ids: list[str], reason: str, iteration: int = 0) -> int:
+        """`trioctl omnigent acceptance amend --human`: commit the working-tree
+        pack edits as `acceptance: amend <ids> (human): <reason>` and re-pin
+        (loop stopped; humans may change anything)."""
+        ta = self.ta
+        if not ids or not reason.strip():
+            print("acceptance amend: --ids and --reason are required", file=sys.stderr)
+            return 3
+        amend_path = self.acc_dir / ta.AMENDMENTS
+        with amend_path.open("a", encoding="utf-8") as fh:
+            for cid in ids:
+                fh.write(f"## {cid} · iter {iteration} · human · {ta.utc_now()}\n"
+                         f"change: {reason.strip()}\n")
+        sha = ta.commit_paths(self.repo, [self.acc_rel],
+                              f"acceptance: amend {', '.join(ids)} (human): {reason.strip()}\n")
+        if sha is None:
+            print("acceptance amend: nothing changed", file=sys.stderr)
+            return 3
+        pin = ta.manifest_sha256(self.acc_dir)
+        chain = [list(c) for c in self.state.get("chain") or []] or \
+            [[p["sha256"], p["note"]] for p in ta.read_frozen(self.acc_dir).get("pins") or []]
+        note = f"amend {', '.join(ids)} (human)"
+        chain.append([pin, note])
+        text = (self.acc_dir / ta.FROZEN).read_text(encoding="utf-8", errors="replace")
+        (self.acc_dir / ta.FROZEN).write_text(
+            text.rstrip("\n") + f"\npin[{len(chain) - 1}]: {pin} {note}\n", encoding="utf-8")
+        pin_sha = ta.commit_paths(self.repo, [self.acc_rel],
+                                  f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n")
+        manifest = ta.load_manifest(self.acc_dir)
+        self.state.update({
+            "status": "frozen", "pin": pin, "pin_commit": pin_sha or sha,
+            "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN), "chain": chain,
+            "checks": len(manifest.get("checks") or []),
+        })
+        self._save()
+        _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
+                          f"{pin[:16]} @{(pin_sha or sha)[:12]}")
+        _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: human amendment of "
+                                  f"{', '.join(ids)} re-pinned {pin[:12]}")
+        print(f"acceptance re-pinned {pin[:12]} ({note})")
+        return 0
+
     def wait(self, iteration: int, timeout: float | None = None) -> None:
         """Block until the pack is frozen; raise AcceptanceError otherwise."""
         if self._thread is None and not self.frozen():

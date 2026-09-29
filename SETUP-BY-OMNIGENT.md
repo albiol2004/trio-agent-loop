@@ -170,11 +170,11 @@ The agent should:
 5. Discover Omnigent's deferred `sys_session_create`, `sys_session_close`, and
    `sys_agent_list` tools.
 6. Back up a registry whose `_profile` is not
-   `cursor-grok-4.6-medium+glm-5.2-max-v3`, then register only the two judgment
+   `cursor-grok-4.6-medium+glm-5.2-max-v4-acc`, then register only the two judgment
    roles by creating an idle child from:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-7. Write `_profile: cursor-grok-4.6-medium+glm-5.2-max-v3` plus the exact returned
+7. Write `_profile: cursor-grok-4.6-medium+glm-5.2-max-v4-acc` plus the exact returned
    `agent_id` and `bootstrap_conversation_id` values to
    `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`, keyed by
    `trio-omnigent-{lead,evaluator}`. Leave the idle bootstrap

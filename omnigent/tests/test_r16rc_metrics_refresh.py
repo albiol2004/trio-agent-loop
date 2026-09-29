@@ -62,7 +62,9 @@ def test_refresh_copies_the_set_and_shows_a_diff_summary_without_committing(worl
     assert sorted(git(repo, "diff", "--name-only").splitlines()) == sorted([
         "metrics/trio-metrics.py", "metrics/trio_loop.py",
     ])
-    assert git(repo, "status", "--porcelain", "--untracked-files=all").count("??") == 0
+    # r19: the set gained trio-acceptance.py, new to a pre-r19 repo.
+    assert "metrics/trio-acceptance.py: added" in out or "trio-acceptance.py" in out
+    assert git(repo, "status", "--porcelain", "--untracked-files=all").count("??") == 1
 
 
 def test_refresh_commit_commits_only_the_metrics_files_on_the_current_branch(world, tmp_path):
@@ -75,7 +77,7 @@ def test_refresh_commit_commits_only_the_metrics_files_on_the_current_branch(wor
     assert subject.startswith("chore: vendor trio loop core (") and "METRICS_API 7)" in subject
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/x"
     assert sorted(git(repo, "show", "--name-only", "--format=", "HEAD").splitlines()) == sorted([
-        "metrics/trio-metrics.py", "metrics/trio_loop.py",
+        "metrics/trio-acceptance.py", "metrics/trio-metrics.py", "metrics/trio_loop.py",
     ])
     assert git(repo, "diff", "--cached", "--name-only") == "README.md"  # user's staging kept
     assert "committed " in out and "on feat/x" in out

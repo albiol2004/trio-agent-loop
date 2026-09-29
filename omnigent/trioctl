@@ -28,6 +28,15 @@ from typing import Any, Iterator, NoReturn
 
 VERSION = "0.5.0"
 ROLES = ("lead", "evaluator", "builder", "scout", "docs")
+#: r19: the acceptance author. Optional -- `[roles.acceptance]` may be absent
+#: (it then inherits the Evaluator's provider/model/effort) and it is only
+#: resolved, registered and doctor-checked while the acceptance switch is on.
+ACCEPTANCE_ROLE = "acceptance"
+OPTIONAL_ROLES = (ACCEPTANCE_ROLE,)
+ACCEPTANCE_ENV = "TRIO_ACCEPTANCE"
+#: `trioctl omnigent run builder` refused by the frozen-acceptance guard.
+ACCEPTANCE_REFUSED_EXIT = 10
+DEFAULT_ACCEPTANCE_WAIT_S = 900.0
 DEFAULT_CONFIG = Path(__file__).with_name("trioctl.example.toml")
 CURSOR_WORKER_ROLES = ("builder", "scout", "docs")
 DEFAULT_LOOP_WAIT_TIMEOUT = 3600.0
@@ -40,7 +49,7 @@ _ROLE_VERDICT_RE = re.compile(
 # Registered Omnigent agents persist their bundle prompt at creation time.
 # Bump this marker whenever the Lead/Evaluator config changes materially so a
 # stale anchor is backed up and recreated by the entrypoint preflight.
-REGISTRY_PROFILE = "cursor-grok-4.6-medium+glm-5.2-max-v3"
+REGISTRY_PROFILE = "cursor-grok-4.6-medium+glm-5.2-max-v4-acc"
 CURSOR_ROLE_PROMPTS = {
     "builder": (
         "You are the Trio Builder and primary implementor. Execute exactly one "
@@ -424,8 +433,30 @@ def resolve_role(
     *,
     models: list[dict[str, Any]] | None = None,
     allow_fallback: bool = False,
+    kind: str | None = None,
 ) -> dict[str, Any]:
-    if role not in ROLES:
+    if role == ACCEPTANCE_ROLE and not isinstance(
+        config.get("roles", {}).get(ACCEPTANCE_ROLE), dict
+    ):
+        # r19: no [roles.acceptance] -> the Evaluator's tier, by construction.
+        inherited = resolve_role(
+            "evaluator", config, models=models, allow_fallback=allow_fallback
+        )
+        return {**inherited, "role": ACCEPTANCE_ROLE,
+                "source": f"inherited-evaluator ({inherited.get('source')})"}
+    if role == "evaluator" and kind == "integration-eval":
+        # r19 integration-eval model hook (inert unless configured): an
+        # optional [roles.evaluator.integration] table.
+        table = config.get("roles", {}).get("evaluator", {}).get("integration")
+        if isinstance(table, dict):
+            merged = {k: v for k, v in config["roles"]["evaluator"].items()
+                      if k != "integration"}
+            merged.update(table)
+            view = {**config, "roles": {**config["roles"], "evaluator": merged}}
+            resolved = resolve_role("evaluator", view, models=models,
+                                    allow_fallback=allow_fallback)
+            return {**resolved, "kind": "integration-eval"}
+    if role not in ROLES and role not in OPTIONAL_ROLES:
         raise TrioctlError(f"unknown role: {role}")
     spec = config["roles"][role]
     provider = spec.get("provider")
@@ -681,6 +712,51 @@ def command_models(args: argparse.Namespace) -> int:
             default = " (default)" if model.get("isDefault") else ""
             print(f"  {name}{default}: {detail}")
     return 0
+
+
+def acceptance_settings(
+    config: dict[str, Any] | None, cli: bool | None = None
+) -> dict[str, Any]:
+    """The r19 switch: CLI `--acceptance/--no-acceptance` > env
+    `TRIO_ACCEPTANCE=0|1` > `[acceptance] enabled` (default false)."""
+    table = (config or {}).get("acceptance")
+    table = table if isinstance(table, dict) else {}
+    try:
+        wait_s = float(table.get("wait_s", DEFAULT_ACCEPTANCE_WAIT_S))
+    except (TypeError, ValueError):
+        wait_s = DEFAULT_ACCEPTANCE_WAIT_S
+    if cli is not None:
+        return {"enabled": bool(cli), "wait_s": wait_s, "source": "cli"}
+    env = os.environ.get(ACCEPTANCE_ENV, "").strip().lower()
+    if env in ("1", "true", "on", "yes"):
+        return {"enabled": True, "wait_s": wait_s, "source": "env"}
+    if env in ("0", "false", "off", "no"):
+        return {"enabled": False, "wait_s": wait_s, "source": "env"}
+    return {"enabled": bool(table.get("enabled", False)), "wait_s": wait_s,
+            "source": "config" if "enabled" in table else "default"}
+
+
+_TIER_KEYS = ("provider", "model", "model_family", "effort", "fast")
+
+
+def acceptance_tier_problems(config: dict[str, Any]) -> list[str]:
+    """r19 §5.1: lead, evaluator and acceptance must share one tier (static
+    comparison of the configured tables; the doctor also compares the
+    resolved models)."""
+    roles = config.get("roles", {})
+
+    def tier(name: str) -> tuple:
+        spec = roles.get(name) or {}
+        return tuple(spec.get(k) for k in _TIER_KEYS)
+
+    problems = []
+    if tier("lead") != tier("evaluator"):
+        problems.append("lead and evaluator tiers differ; r19 requires one tier for "
+                        "lead, evaluator and the acceptance author")
+    if isinstance(roles.get(ACCEPTANCE_ROLE), dict) and tier(ACCEPTANCE_ROLE) != tier("evaluator"):
+        problems.append("acceptance author must run on the Lead/Evaluator tier "
+                        "([roles.acceptance] differs from [roles.evaluator])")
+    return problems
 
 
 def command_resolve(args: argparse.Namespace) -> int:
@@ -1018,6 +1094,17 @@ def command_run(args: argparse.Namespace) -> int:
             ) from exc
     if getattr(args, "isolate", False):
         return _command_run_isolated(args, config, prompt)
+    mailbox_arg = getattr(args, "worker_events_mailbox", None)
+    if args.role == "builder" and mailbox_arg:
+        mailbox = _live_mailbox_or(Path(str(mailbox_arg)).expanduser().resolve())
+        if _acceptance_active(mailbox, config):
+            slice_id = getattr(args, "worker_slice", None)
+            refused = _acceptance_refusals(mailbox, slice_id)
+            if refused:
+                for line in refused:
+                    print(f"trioctl: acceptance refused builder {slice_id or ''}: {line}",
+                          file=sys.stderr)
+                return ACCEPTANCE_REFUSED_EXIT
     # r15.x: cwd = --workspace (never inherited), so the physical cwd picks
     # the `.cursor` project root the caller named. r16b: no Trio session
     # runs at a repository root any more, so a one-shot there shares the
@@ -1153,6 +1240,322 @@ def _repo_scope_refusals(
     return module.repo_scope_refusals(
         Path(mailbox), metrics, slice_id=slice_id, brief_text=brief_text
     )
+
+
+# --- r19 frozen acceptance: guards and `trioctl omnigent acceptance` -------
+
+_TRIO_ACCEPTANCE: list[Any] = []
+
+
+def _acceptance_module() -> Any:
+    """This release's trio-acceptance.py (next to trioctl when installed,
+    else `<root>/metrics/`)."""
+    if _TRIO_ACCEPTANCE:
+        return _TRIO_ACCEPTANCE[0]
+    here = Path(__file__).resolve().parent
+    candidates = [here / "trio-acceptance.py", here.parent / "metrics" / "trio-acceptance.py"]
+    path = next((c for c in candidates if c.is_file()), None)
+    if path is None:
+        raise TrioctlError(
+            "frozen acceptance unavailable: trio-acceptance.py is missing "
+            f"(tried {', '.join(str(c) for c in candidates)})"
+        )
+    loader = importlib.machinery.SourceFileLoader("trio_acceptance_ctl", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    loader.exec_module(module)
+    _TRIO_ACCEPTANCE.append(module)
+    return module
+
+
+def _driver_acceptance(mailbox: Path) -> dict[str, Any] | None:
+    """The running driver's `acceptance` record from `.driver.json`."""
+    try:
+        data = json.loads((mailbox / ".driver.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("acceptance") if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def _acceptance_active(mailbox: Path, config: dict[str, Any] | None) -> bool:
+    """Builder dispatch guard switch: the loop driver's record wins; without
+    a driver record, the profile/env switch decides."""
+    record = _driver_acceptance(mailbox)
+    if record is not None:
+        return bool(record.get("enabled"))
+    return bool(acceptance_settings(config)["enabled"])
+
+
+def _acceptance_pin(ta: Any, repo: Path, mailbox: Path) -> str | None:
+    state = ta.load_state(ta.state_file(repo, mailbox))
+    return state.get("pin") or ta.latest_pin(mailbox / "acceptance")
+
+
+def _acceptance_refusals(mailbox: Path, slice_id: str | None) -> list[str]:
+    """r19 §4.3: why a builder may not start ([] = it may)."""
+    ta = _acceptance_module()
+    acc = mailbox / "acceptance"
+    if not (acc / "FROZEN").is_file():
+        return [f"acceptance not frozen yet; run `trioctl omnigent acceptance wait "
+                f"--mailbox {mailbox}` before dispatching builders"]
+    repo = ta.git_toplevel(mailbox) or mailbox
+    problems: list[str] = []
+    plan = mailbox / "PLAN.md"
+    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", str(plan)],
+                            capture_output=True, text=True)
+    if status.returncode != 0 or status.stdout.strip():
+        problems.append("PLAN.md has uncommitted changes; commit the PLAN (with its "
+                        "`covers:` mapping) before dispatching builders")
+    module, metrics = _load_trio_check()
+    problems.extend(module.coverage_refusals(mailbox, metrics))
+    pin = _acceptance_pin(ta, repo, mailbox)
+    now = ta.manifest_sha256(acc)
+    if pin != now:
+        problems.append(f"acceptance/ hash {now[:12]} is not the pinned {str(pin)[:12]} "
+                        "(edited outside the freeze/amend protocol)")
+    return problems
+
+
+def _acceptance_brief(mailbox: Path, slice_id: str, worktree: Path) -> str:
+    """`## Acceptance (frozen; do not edit)` for one builder brief."""
+    try:
+        ta = _acceptance_module()
+        manifest = ta.load_manifest(mailbox / "acceptance")
+        _module, metrics = _load_trio_check()
+        slices = metrics.parse_slices_block(
+            (mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace")) or []
+    except Exception:  # noqa: BLE001 - the brief section is best effort
+        return ""
+    covers = metrics.plan_covers(slices)
+    mine = [c for c in manifest.get("checks") or []
+            if isinstance(c, dict) and slice_id in covers.get(c.get("id"), [])]
+    if not mine:
+        return ""
+    lines = ["## Acceptance (frozen; do not edit)",
+             "Independent black-box checks this slice covers (written from GOAL.md "
+             "before the plan; never edit anything under the mailbox's acceptance/). "
+             "Run them against your worktree:",
+             f"`trioctl omnigent acceptance run --mailbox {mailbox} --tree {worktree} "
+             f"--ids {','.join(c['id'] for c in mine)}`"]
+    for check in mine:
+        lines.append(f"- {check['id']} ({check.get('kind')}): \"{check.get('goal_quote')}\"")
+    lines.append("A covered check that FAILs only because a sibling slice has not landed "
+                 "yet: report `ACCEPTANCE: <id> FAIL (needs <slice>)`. A FAIL on your own "
+                 "surface means the slice is not done.")
+    return "\n".join(lines) + "\n"
+
+
+def _acceptance_controller(mailbox: Path, config: dict[str, Any] | None = None) -> Any:
+    """The loop core's controller for a CLI command (no runner)."""
+    ta = _acceptance_module()
+    repo = ta.git_toplevel(mailbox)
+    if repo is None:
+        raise TrioctlError(f"{mailbox} is not inside a git repository")
+    core = _load_trio_loop(repo) if (repo / "metrics" / "trio_loop.py").is_file() else None
+    if core is None or not hasattr(core, "AcceptanceController"):
+        core = _load_release_loop_core()
+    settings = acceptance_settings(config)
+    return core.AcceptanceController(mailbox, repo, None,
+                                     {"enabled": True, "wait_s": settings["wait_s"]})
+
+
+def _load_release_loop_core() -> Any:
+    here = Path(__file__).resolve().parent
+    for directory in (here.parent / "metrics", here / INSTALLED_METRICS_SET_DIR):
+        path = directory / "trio_loop.py"
+        if path.is_file():
+            loader = importlib.machinery.SourceFileLoader("trio_loop_release", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            loader.exec_module(module)
+            return module
+    raise TrioctlError("this release's metrics/trio_loop.py is missing")
+
+
+def _acceptance_mailbox(args: argparse.Namespace) -> Path:
+    mailbox = Path(args.mailbox).expanduser().resolve()
+    return _live_mailbox_or(mailbox)
+
+
+def _try_config(args: argparse.Namespace) -> dict[str, Any] | None:
+    try:
+        return load_config(config_path(getattr(args, "config", None)))
+    except TrioctlError:
+        return None
+
+
+def command_acceptance(args: argparse.Namespace) -> int:
+    """`trioctl omnigent acceptance export|freeze|wait|run|status|amend`."""
+    ta = _acceptance_module()
+    sub = args.acceptance_command
+    if sub == "validate":
+        # The author's own check (its cwd is the export; no mailbox).
+        return ta.main(["validate", "--export", str(Path(args.export).expanduser())])
+    mailbox = _acceptance_mailbox(args)
+    repo = ta.git_toplevel(mailbox)
+    if sub == "export":
+        if repo is None:
+            raise TrioctlError(f"{mailbox} is not inside a git repository")
+        out = Path(args.out).expanduser() if args.out else \
+            ta.state_file(repo, mailbox).parent / "export"
+        info = ta.build_export(repo, args.base or "HEAD", out, mailbox)
+        print(json.dumps(info, indent=2))
+        return 0
+    if sub == "wait":
+        deadline = time.monotonic() + (args.timeout if args.timeout is not None
+                                       else acceptance_settings(_try_config(args))["wait_s"])
+        state_path = ta.state_file(repo or mailbox, mailbox)
+        while True:
+            state = ta.load_state(state_path)
+            if state.get("status") == "frozen" and (mailbox / "acceptance" / "FROZEN").is_file():
+                manifest = ta.load_manifest(mailbox / "acceptance")
+                print(f"acceptance frozen: {len(manifest.get('checks') or [])} check(s), "
+                      f"pin {str(state.get('pin'))[:12]} @{str(state.get('pin_commit'))[:12]}")
+                for check in manifest.get("checks") or []:
+                    print(f"- {check.get('id')} [{check.get('kind')}, {check.get('surface')}] "
+                          f"\"{check.get('goal_quote')}\"")
+                print(f"Read {mailbox / 'acceptance' / 'MANIFEST.json'} and AUTHOR.md; map every "
+                      "behaviour/doc id in `covers:` or `lead_integration:`; never edit acceptance/.")
+                return 0
+            if state.get("status") == "error":
+                print(f"acceptance failed ({state.get('reason')}): {state.get('detail')}",
+                      file=sys.stderr)
+                return 3
+            if time.monotonic() > deadline:
+                print("acceptance not frozen before the wait timed out", file=sys.stderr)
+                return 4
+            time.sleep(max(0.05, float(getattr(args, "interval", 2.0) or 2.0)))
+    if sub == "run":
+        tree = args.tree or "HEAD"
+        exclude: set[str] = set()
+        if repo is not None:
+            with contextlib.suppress(ValueError):
+                exclude.add(mailbox.relative_to(repo).as_posix())
+        if Path(tree).is_dir():
+            with contextlib.suppress(ValueError):
+                exclude = {mailbox.relative_to(Path(tree).resolve()).as_posix()}
+        _module, metrics = _load_trio_check()
+        bindings = metrics.parse_plan_acceptance(
+            (mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+        )["bindings"] if (mailbox / "PLAN.md").is_file() else {}
+        ids = [i.strip() for i in (args.ids or "").split(",") if i.strip()] or None
+        result = ta.run_pack(mailbox / "acceptance", tree, repo=repo, ids=ids,
+                             exclude=exclude, plan_bindings=bindings)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            for res in result["results"]:
+                print(f"{res['id']} {res['outcome']}"
+                      + (f" ({res['reason']})" if res.get("reason") else ""))
+            print(ta.summary_line(result) + f" (sandbox {result['sandbox']})")
+        return ta.run_exit_code(result)
+    if sub == "status":
+        state = ta.load_state(ta.state_file(repo or mailbox, mailbox)) if repo else {}
+        acc = mailbox / "acceptance"
+        payload: dict[str, Any] = {"mailbox": str(mailbox), "state": state,
+                                   "frozen": (acc / "FROZEN").is_file()}
+        if (acc / "MANIFEST.json").is_file():
+            payload["manifest_sha256"] = ta.manifest_sha256(acc)
+            payload["pin_ok"] = payload["manifest_sha256"] == (
+                state.get("pin") or ta.latest_pin(acc))
+            module, metrics = _load_trio_check()
+            payload["coverage_refusals"] = module.coverage_refusals(mailbox, metrics)
+            payload["pins"] = ta.read_frozen(acc).get("pins")
+        if args.json:
+            print(json.dumps(payload, indent=2, default=str))
+        else:
+            for key in ("frozen", "pin_ok", "manifest_sha256"):
+                if key in payload:
+                    print(f"{key}: {payload[key]}")
+            print(f"status: {state.get('status', 'none')}")
+            for line in payload.get("coverage_refusals") or []:
+                print(f"refusal: {line}")
+        return 0
+    if sub in ("freeze", "amend"):
+        if _live_driver_holds(mailbox):
+            print(f"trioctl: {mailbox} is owned by a live loop driver; stop it first",
+                  file=sys.stderr)
+            return 5
+        controller = _acceptance_controller(mailbox, _try_config(args))
+        if sub == "freeze":
+            code = controller.freeze_from_export(
+                Path(args.export).expanduser().resolve(),
+                {"model": args.model, "session": args.session, "effort": args.effort,
+                 "path": "manual"})
+            return code
+        if not args.human:
+            raise TrioctlError("only `--human` amendments are made from the CLI; the "
+                               "integration Evaluator amends by commit (MAILBOX-SCHEMA.md)")
+        ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+        return controller.human_amend(ids, args.reason)
+    raise TrioctlError(f"unknown acceptance command {sub!r}")
+
+
+def _live_driver_holds(mailbox: Path) -> bool:
+    lock = mailbox / ".lock" / "pid"
+    try:
+        pid = int(lock.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _add_acceptance_arguments(parser_: argparse.ArgumentParser) -> None:
+    group = parser_.add_mutually_exclusive_group()
+    group.add_argument(
+        "--acceptance", dest="acceptance", action="store_true", default=None,
+        help="r19 frozen acceptance ON for this run (overrides TRIO_ACCEPTANCE "
+        "and the profile's [acceptance] enabled; default off)",
+    )
+    group.add_argument("--no-acceptance", dest="acceptance", action="store_false",
+                       help="r19 frozen acceptance OFF for this run")
+
+
+def _add_acceptance_commands(commands: Any) -> None:
+    acc = commands.add_parser(
+        "acceptance", help="r19 frozen acceptance: export, freeze, wait, run, status, amend")
+    sub = acc.add_subparsers(dest="acceptance_command", required=True)
+    for name, text in (("export", "build the author's filtered export"),
+                       ("freeze", "validate an authored export at base and freeze it"),
+                       ("wait", "block until the pack is frozen (Lead step 0)"),
+                       ("run", "run the frozen pack against a tree"),
+                       ("status", "pin, coverage and amendment status"),
+                       ("amend", "human amendment while the loop is stopped")):
+        cmd = sub.add_parser(name, help=text)
+        cmd.add_argument("--mailbox", required=True)
+        cmd.add_argument("--config")
+        if name == "export":
+            cmd.add_argument("--base", help="revision (default HEAD)")
+            cmd.add_argument("--out", help="directory (default: the driver state dir)")
+        if name == "freeze":
+            cmd.add_argument("--export", required=True)
+            cmd.add_argument("--model", default="manual")
+            cmd.add_argument("--effort", default=None)
+            cmd.add_argument("--session", default=None)
+        if name == "wait":
+            cmd.add_argument("--timeout", type=float, default=None)
+            cmd.add_argument("--interval", type=float, default=2.0)
+        if name == "run":
+            cmd.add_argument("--tree", help="directory or revision (default HEAD)")
+            cmd.add_argument("--ids")
+            cmd.add_argument("--json", action="store_true")
+        if name == "status":
+            cmd.add_argument("--json", action="store_true")
+        if name == "amend":
+            cmd.add_argument("--human", action="store_true")
+            cmd.add_argument("--ids", required=True)
+            cmd.add_argument("--reason", required=True)
+    validate = sub.add_parser("validate", help="the author's schema + base-run check "
+                                               "of its export (run from the export)")
+    validate.add_argument("--export", default=".")
+    acc.set_defaults(func=command_acceptance)
 
 
 def _declared_repos_checked(
@@ -1394,6 +1797,16 @@ def _command_run_isolated(
         for line in refusals:
             print(f"trioctl: {line}", file=sys.stderr)
         return REPO_SCOPE_REFUSED_EXIT
+    acceptance_on = _acceptance_active(mailbox, config)
+    if acceptance_on:
+        # r19: no builder starts before the freeze or while a frozen check
+        # is unmapped -- refused before any worktree exists.
+        refused = _acceptance_refusals(mailbox, slice_id)
+        if refused:
+            for line in refused:
+                print(f"trioctl: acceptance refused builder {slice_id}: {line}",
+                      file=sys.stderr)
+            return ACCEPTANCE_REFUSED_EXIT
     home_root = getattr(args, "worktree_root", None)
     root = Path(home_root).expanduser() if home_root else None
     repo_name, declared = _slice_repo(mailbox, slice_id)
@@ -1429,6 +1842,10 @@ def _command_run_isolated(
         path=path, branch=record["branch"], base=record["base"][:12],
         repo=repo, slice=slice_id, mailbox=mailbox,
     )
+    if acceptance_on:
+        brief = _acceptance_brief(mailbox, slice_id, path)
+        if brief:
+            note += "\n" + brief
     if declared is not None:
         note += _ISOLATED_BUILDER_REPO_NOTE.format(
             name=repo_name, repo=repo,
@@ -4609,6 +5026,29 @@ def _omnigent_prompt_dirs(repo: Path) -> list[Path]:
 # whole-goal rules; appended to integration-eval and lockstep evaluator
 # prompts only (slice-evals stay fast).
 INTEGRATION_RIGOR_PROMPT = "integration-rigor"
+#: r19: generated fragments rendered only while the acceptance switch is on.
+ACCEPTANCE_LEAD_PROMPT = "acceptance-lead"
+ACCEPTANCE_EVALUATOR_PROMPT = "acceptance-evaluator"
+_TOOL_ITEM_RE = re.compile(r"tool|function|command|shell|exec", re.IGNORECASE)
+
+
+def _tool_call_texts(items: list[Any]) -> list[str] | None:
+    """Serialized tool-call rows of an author session for the r19 audit.
+
+    None when the history carries no row recognisable as a tool call (the
+    audit is then limited to the export plus a scan of the output)."""
+    out: list[str] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        role = _item_role(item)
+        if role == "tool" or _TOOL_ITEM_RE.search(kind) or _TOOL_ITEM_RE.search(
+            str(data.get("type") or "")
+        ):
+            out.append(json.dumps(item, sort_keys=True, default=str)[:20000])
+    return out or None
 
 
 def _whole_goal_eval(context: dict[str, Any] | None) -> bool:
@@ -5339,6 +5779,7 @@ class OmnigentRunner:
         isolate_workers: dict[str, Any] | None = None,
         end_sessions: bool = True,
         root_free: dict[str, Any] | None = None,
+        acceptance: dict[str, Any] | None = None,
     ) -> None:
         if broker_client is not None and client is not None:
             raise ValueError("provide only one broker client")
@@ -5424,6 +5865,12 @@ class OmnigentRunner:
             # r18a: isolated builders of this loop read it back from
             # `.driver.json` (the Lead's shell may not carry the env var).
             self.driver_meta["kill_check"] = False
+        # r19 frozen acceptance: None/disabled keeps every prompt and
+        # sidecar byte-identical. Enabled, isolated builders read it back
+        # from `.driver.json` (the loop core's controller refreshes it).
+        self._acceptance = acceptance if acceptance and acceptance.get("enabled") else None
+        if self._acceptance is not None:
+            self.driver_meta["acceptance"] = {"enabled": True}
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -5473,19 +5920,24 @@ class OmnigentRunner:
             )
         return agent_id.strip()
 
-    def _resolve_model(self, role: str) -> str:
-        """Resolve a role through trioctl's strict, no-fallback resolver."""
+    def _resolve_model(self, role: str, kind: str | None = None) -> str:
+        """Resolve a role through trioctl's strict, no-fallback resolver.
+
+        *kind* ``integration-eval`` honours the optional (inert by default)
+        ``[roles.evaluator.integration]`` table (r19 §5.1)."""
         config = self._load_config()
-        spec = config["roles"][role]
+        spec = config["roles"].get(role) or config["roles"]["evaluator"]
         provider = spec.get("provider")
+        extra = {"kind": kind} if kind else {}
         if provider in self._models:
             resolved = resolve_role(
                 role,
                 config,
                 models=self._models[provider],
+                **extra,
             )
         else:
-            resolved = resolve_role(role, config)
+            resolved = resolve_role(role, config, **extra)
         model = resolved.get("model")
         if not isinstance(model, str) or not model:
             raise TrioctlError(f"roles.{role}: resolver returned no model")
@@ -5713,7 +6165,106 @@ class OmnigentRunner:
             # data-work re-run, re-executions) rides only on integration-eval
             # and lockstep evaluator prompts, never on slice-evals.
             result = result.rstrip("\n") + "\n\n" + self._integration_rigor()
+        if self.__dict__.get("_acceptance") is not None:
+            result = self._acceptance_prompt(role, mailbox, context, result)
         return result
+
+    # --- r19 frozen acceptance (rendered only while the switch is on) ------
+
+    def _acceptance_fragment(self, name: str, mailbox: Path) -> str:
+        text = self._prompt_path(name).read_text(encoding="utf-8")
+        return text.replace("{mailbox}", str(mailbox.resolve())).rstrip("\n") + "\n"
+
+    def _acceptance_prompt(
+        self, role: str, mailbox: Path, context: dict[str, Any] | None, result: str
+    ) -> str:
+        """Append the ACCEPTANCE blocks of one dispatch (switch on only)."""
+        ctx = context or {}
+        errors = [str(e) for e in ctx.get("acceptance_errors") or []]
+        if role in ("lead", "repair"):
+            block = self._acceptance_fragment(ACCEPTANCE_LEAD_PROMPT, mailbox)
+            if errors:
+                block += ("ACCEPTANCE REFUSAL (the driver refused the previous pass or "
+                          "SHIP; fix this first):\n" + "\n".join(f"- {e}" for e in errors) + "\n")
+            return result.rstrip("\n") + "\n\n" + block
+        if role != "evaluator":
+            return result
+        if ctx.get("kind") == "slice-eval":
+            covered = ctx.get("acceptance_covered")
+            if not covered:
+                return result
+            return result.rstrip("\n") + "\n\n" + (
+                f"{covered}\n"
+                "A `sole-cover` FAIL (a frozen check only this slice covers) is\n"
+                "blocking: ITERATE with scope = this slice. `shared` FAILs are\n"
+                "advisory (a sibling slice may not have landed yet). Never edit\n"
+                f"`{mailbox.resolve()}/acceptance/`.\n")
+        if not _whole_goal_eval(context):
+            return result
+        block = self._acceptance_fragment(ACCEPTANCE_EVALUATOR_PROMPT, mailbox)
+        pre = (ctx.get("acceptance") or {}).get("text")
+        if pre:
+            block = pre.rstrip("\n") + "\n\n" + block
+        return result.rstrip("\n") + "\n\n" + block
+
+    def author(self, export: Path, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Dispatch the acceptance author (r19 §2) in *export*: a fresh
+        broker session on the registered `trio-omnigent-acceptance` agent
+        (Evaluator tier), cwd = the export, the repo path never named."""
+        ctx = dict(context or {})
+        export = Path(export).resolve()
+        agent_id = self._agent_id(ACCEPTANCE_ROLE)
+        model = self._resolve_model(ACCEPTANCE_ROLE)
+        prompt = self._prompt_path(ACCEPTANCE_ROLE).read_text(encoding="utf-8")
+        prompt = prompt.replace("{export}", str(export))
+        if ctx.get("prefix"):
+            prompt = str(ctx["prefix"]).rstrip() + "\n\n" + prompt
+        dropped = ctx.get("dropped") or []
+        fatal = ctx.get("fatal") or []
+        if dropped or fatal:
+            prompt += ("\nRETRY: the driver's validation at base rejected part of your "
+                       "first pack. Fix or replace these and stay within the rules:\n"
+                       + "".join(f"- {i}: {why}\n" for i, why in dropped)
+                       + "".join(f"- pack: {why}\n" for why in fatal))
+        mailbox = Path(str(ctx.get("mailbox") or export))
+        title = (f"trioctl {mailbox.name} {ACCEPTANCE_ROLE}:iteration "
+                 f"{ctx.get('iteration') or 1} author-{ctx.get('attempt') or 1}")
+        dispatch: dict[str, Any] = {
+            "role": ACCEPTANCE_ROLE, "session_id": None, "fence": None, "delivery": None,
+            "meta": {"role": ACCEPTANCE_ROLE, "kind": "acceptance-author",
+                     "slice": None, "sha": None},
+        }
+        client = self._client()
+        started = time.monotonic()
+        try:
+            snapshot, items = self._create_wait_read(
+                client, agent_id, model, prompt, title, ACCEPTANCE_ROLE, started,
+                workspace=str(export), dispatch=dispatch,
+            )
+        finally:
+            session_id = dispatch.get("session_id")
+            with self._own_lock:
+                if session_id:
+                    self._inflight.discard(session_id)
+                    self.__dict__.setdefault("_inflight_meta", {}).pop(session_id, None)
+        session_id = dispatch.get("session_id")
+        history: list[Any] = []
+        if session_id and callable(getattr(client, "get_items", None)):
+            history, _err = _fetch_session_items_paged(client, session_id)
+        transcript = _tool_call_texts(history or _session_items(items))
+        config = self._load_config()
+        effort = None
+        try:
+            resolved = resolve_role(ACCEPTANCE_ROLE, config, models=self._models.get(
+                (config["roles"].get(ACCEPTANCE_ROLE) or config["roles"]["evaluator"]).get("provider")))
+            effort = resolved.get("reasoning_effort") or resolved.get("model_effort")
+        except TrioctlError:
+            pass
+        return {
+            "exit": 1 if _session_status(snapshot) in SESSION_FAILURE_STATUSES else 0,
+            "session": session_id, "model": model, "effort": effort, "path": "omnigent",
+            "transcript": transcript,
+        }
 
     def _integration_rigor(self) -> str:
         """The generated `integration-rigor.md` (r19 C1)."""
@@ -6874,6 +7425,15 @@ class OmnigentRunner:
         registered_role = "lead" if role == "repair" else role
         agent_id = self._agent_id(registered_role)
         model = self._resolve_model(registered_role)
+        if (
+            role == "evaluator" and (context or {}).get("kind") == "integration-eval"
+            and isinstance(self._load_config().get("roles", {}).get("evaluator", {})
+                           .get("integration"), dict)
+        ):
+            # r19 inert hook: a configured integration tier (absent by
+            # default) runs on its own registered anchor.
+            agent_id = self._agent_id("evaluator-integration")
+            model = self._resolve_model(registered_role, kind="integration-eval")
         prompt = self._prompt(role, iteration, mailbox, context)
         # Per-dispatch nonce: no two dispatches share a prompt hash, so a
         # completion receipt's injection sha256 binds to exactly this one.
@@ -8596,7 +9156,8 @@ def _root_free_finish(rf: dict[str, Any], args: argparse.Namespace) -> None:
 
 
 #: The loop core set a repository vendors under `metrics/` (always as a set).
-METRICS_SET = ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py")
+METRICS_SET = ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py",
+               "trio-acceptance.py")
 #: install.sh copies the release's set here (next to trioctl) with a PIN file.
 INSTALLED_METRICS_SET_DIR = "trio-release-metrics"
 METRICS_REFRESH_COMMAND = "trioctl omnigent metrics refresh --commit"
@@ -9076,6 +9637,32 @@ def _command_loop_run(
         loop_core, args, isolation_off=concurrency_off
     )
     lockstep = _loop_is_lockstep(mailbox)
+    # r19 frozen acceptance (default off): switch, old-core and tier guards.
+    acceptance_cfg: dict[str, Any] | None = None
+    try:
+        profile = load_config(config_path(None))
+    except TrioctlError:
+        profile = None
+    settings = acceptance_settings(profile, getattr(args, "acceptance", None))
+    if settings["enabled"]:
+        problems: list[str] = []
+        if (_core_metrics_api(loop_core) < ACCEPTANCE_METRICS_API
+                or not hasattr(loop_core, "AcceptanceController")):
+            problems.append(
+                f"frozen acceptance needs METRICS_API {ACCEPTANCE_METRICS_API} in the loop "
+                f"core; {getattr(loop_core, '__file__', 'metrics/trio_loop.py')} runs "
+                f"{_core_metrics_api(loop_core)}: refresh the repository's metrics/ as a "
+                f"set ({METRICS_REFRESH_COMMAND}) or run with --no-acceptance")
+        if profile is not None:
+            problems.extend(acceptance_tier_problems(profile))
+        if problems:
+            for line in problems:
+                print(f"trioctl: acceptance: {line}", file=sys.stderr)
+            return 3
+        acceptance_cfg = {"enabled": True, "wait_s": settings["wait_s"]}
+        loop_kwargs["acceptance"] = acceptance_cfg
+        print(f"trioctl: frozen acceptance ON ({settings['source']}); the author runs "
+              "with the first Lead pass", file=sys.stderr)
     land_hook = _root_free_land_hook(rf, args) if rf is not None else None
     if land_hook is not None and not lockstep:
         # Open-loop: the loop core lands after its integration SHIP. Lockstep
@@ -9106,6 +9693,8 @@ def _command_loop_run(
         _run_worktree_cleanup(repo, mailbox)
     if rf is not None:
         runner_kwargs["root_free"] = rf["info"]
+    if acceptance_cfg is not None:
+        runner_kwargs["acceptance"] = acceptance_cfg
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
@@ -9879,14 +10468,21 @@ def command_doctor(args: argparse.Namespace) -> int:
                 {"check": f"{provider}:model/list", "ok": False, "detail": str(exc)}
             )
 
+    acceptance = acceptance_settings(config, getattr(args, "acceptance", None))
+    doctor_roles = ROLES + ((ACCEPTANCE_ROLE,) if acceptance["enabled"] else ())
+    resolved_by_role: dict[str, dict[str, Any]] = {}
     if config is not None:
-        for role in ROLES:
+        for role in doctor_roles:
             try:
                 resolved = resolve_role(
                     role,
                     config,
-                    models=catalogs.get(config["roles"][role].get("provider"), []),
+                    models=catalogs.get(
+                    (config["roles"].get(role) or config["roles"]["evaluator"]).get("provider"),
+                    [],
+                ),
                 )
+                resolved_by_role[role] = resolved
                 effort = resolved.get("reasoning_effort") or resolved.get(
                     "model_effort"
                 )
@@ -9904,6 +10500,26 @@ def command_doctor(args: argparse.Namespace) -> int:
                 checks.append(
                     {"check": f"role:{role}", "ok": False, "detail": str(exc)}
                 )
+        if acceptance["enabled"]:
+            # r19 §5.1: the author runs on the Lead/Evaluator tier or not at all.
+            problems = acceptance_tier_problems(config)
+            tiers = {
+                role: (resolved_by_role[role].get("model"),
+                       resolved_by_role[role].get("reasoning_effort")
+                       or resolved_by_role[role].get("model_effort"))
+                for role in ("lead", "evaluator", ACCEPTANCE_ROLE)
+                if role in resolved_by_role
+            }
+            if len(set(tiers.values())) > 1:
+                problems.append("resolved tiers differ: " + ", ".join(
+                    f"{r}={m}/{e}" for r, (m, e) in tiers.items()))
+            checks.append({
+                "check": "acceptance:tier",
+                "ok": not problems,
+                "detail": "; ".join(problems) if problems else
+                "lead, evaluator and acceptance author share "
+                + ", ".join(sorted({f"{m}/{e}" for m, e in tiers.values()})),
+            })
 
     registry = omnigent_registry_path()
     try:
@@ -9911,12 +10527,19 @@ def command_doctor(args: argparse.Namespace) -> int:
         if entries.get("_profile") != REGISTRY_PROFILE:
             raise TrioctlError(
                 "registered role profile is stale; back up registry.json and "
-                "re-register Lead/Evaluator from the current role configs"
+                "re-register Lead/Evaluator (and, for r19 acceptance, the "
+                "acceptance author) from the current role configs"
             )
         # Only the two orchestration roles are durable Omnigent agents. Cursor
         # workers are ephemeral headless CLI runs, avoiding cursor-native's
         # one-chat-per-workspace transcript ownership collision.
         expected = {"trio-omnigent-lead", "trio-omnigent-evaluator"}
+        if acceptance["enabled"]:
+            # r19: the durable acceptance author anchor (only when enabled).
+            expected.add("trio-omnigent-acceptance")
+        if isinstance((config or {}).get("roles", {}).get("evaluator", {}).get("integration"), dict):
+            # r19 inert integration-eval hook: its own anchor once configured.
+            expected.add("trio-omnigent-evaluator-integration")
         missing = sorted(expected - set(entries))
         if missing:
             raise TrioctlError(f"missing: {', '.join(missing)}")
@@ -9994,6 +10617,8 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     products = root.add_subparsers(dest="product", required=True)
     omni = products.add_parser("omnigent", help="manage the Omnigent Trio profile")
+    # r19: `trioctl acceptance ...` is an alias of `trioctl omnigent acceptance ...`.
+    _add_acceptance_commands(products)
     commands = omni.add_subparsers(dest="command", required=True)
 
     configure = commands.add_parser(
@@ -10014,7 +10639,7 @@ def parser() -> argparse.ArgumentParser:
     models.set_defaults(func=command_models)
 
     resolve = commands.add_parser("resolve", help="resolve one role's runtime model")
-    resolve.add_argument("role", choices=ROLES)
+    resolve.add_argument("role", choices=ROLES + OPTIONAL_ROLES)
     resolve.add_argument("--config")
     resolve.add_argument("--json", action="store_true")
     resolve.add_argument("--allow-fallback", action="store_true")
@@ -10290,6 +10915,7 @@ def parser() -> argparse.ArgumentParser:
         "$TRIO_SLICE_EVAL_DRAIN_SECONDS, else min(--wait-timeout, 120))",
     )
     _add_root_free_arguments(loop)
+    _add_acceptance_arguments(loop)
     loop.set_defaults(func=command_loop)
 
     land = commands.add_parser(
@@ -10499,6 +11125,7 @@ def parser() -> argparse.ArgumentParser:
     )
     sessions_prune.set_defaults(func=command_sessions_prune)
 
+    _add_acceptance_commands(commands)
     doctor = commands.add_parser(
         "doctor", help="validate commands, models, and registry"
     )
@@ -10506,6 +11133,7 @@ def parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--timeout", type=float, default=15.0)
     doctor.add_argument("--live-session", action="store_true")
+    _add_acceptance_arguments(doctor)
     doctor.add_argument(
         "--base-url",
         default=broker_http.DEFAULT_BASE_URL,
