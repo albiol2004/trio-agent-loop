@@ -61,7 +61,9 @@ def test_repair_commits_its_fix_and_never_loop(rel: str) -> None:
 def test_evaluator_and_orchestrator_accept_repair_entry() -> None:
     for rel in ("prompts/canonical/evaluator.md",
                 ".claude/agents/trio-evaluator.md",
-                "prompts/canonical/orchestrator.md"):
+                "prompts/canonical/orchestrator.md",
+                # eval-native-v0b N8: the hand-written step-4 LOG gate
+                "omnigent/entrypoints/trio-omnigent/SKILL.md"):
         assert "`- iter N | repair | ...` entry" in _flat(rel), rel
     assert "`ITERATE scope=design` (never `scope=local:`)" in _flat(
         ".claude/agents/trio-evaluator.md")

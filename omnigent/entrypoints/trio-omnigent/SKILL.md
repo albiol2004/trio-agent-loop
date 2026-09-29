@@ -186,8 +186,10 @@ never a builder slice: trioctl and trio-check refuse a slice whose
    with the missing-commit note; if the gate still fails, set `status:
    error` in STATE.md, record the breach in LOG.md, and end the loop. Then
    verify `loop/LOG.md` contains the Lead's `- iter N | lead | ...` entry
-   for this iteration (the LOG.md gate) — the Evaluator cannot SHIP without
-   it; if the append is missing, have the Lead add it first. After SHIP,
+   for this iteration (the LOG.md gate; after a scoped repair pass, the
+   Repair's `- iter N | repair | ...` entry) — the Evaluator cannot SHIP
+   without it; if the append is missing, have the Lead (or Repair) add it
+   first. After SHIP,
    queue exactly one coalesced background documentation task (change summary
    + rationale) by dispatching
    `trioctl omnigent run docs --prompt-file <path> --workspace .`.
