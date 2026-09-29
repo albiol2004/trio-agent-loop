@@ -167,7 +167,7 @@ actor-critic literature (Reflexion, self-preference-bias papers):
   merging the Evaluator away is the one empirically bad move.
 
 ## Tuning
-- **Fable alternative**: change `model: claude-opus-5` → `model: fable` in
+- **Fable alternative**: change `model: claude-opus-5-5` → `model: fable` in
   `trio-lead.md` and/or `trio-evaluator.md` — both roles are judgment-heavy;
   keep workers on Sonnet. Do NOT downgrade the Evaluator below the Lead's
   tier: a weak critic measurably hurts (91.4%→82.8% in one study).
