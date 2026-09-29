@@ -300,3 +300,20 @@ def test_harness_held_step_stops_without_retry(op: str) -> None:
     names = seq(out)
     assert names.count(op) == 1 and names[-1] == "end"
     assert names[-2] == op
+
+
+@needs_node
+def test_harness_held_end_is_surfaced() -> None:
+    """F10: a denied `end` keeps the loop outcome but reports the hold."""
+    out = run({"verdicts": ["SHIP"], "held_op": "end"})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["lock"] == "not_released"
+    assert r["held_step"] == "end"
+    assert "permission denied" in r["end_error"]
+    assert seq(out).count("end") == 1
+
+
+@needs_node
+def test_harness_released_end_has_no_end_error() -> None:
+    r = run({"verdicts": ["SHIP"]})["result"]
+    assert r["end_error"] is None and r["held_step"] is None

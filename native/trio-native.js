@@ -308,7 +308,10 @@ return {
   iteration: end && end.ok ? end.iteration : (iterations.length ? iterations[iterations.length - 1].iteration : null),
   commit_shas: outcome.commit_shas || [],
   human_check: outcome.human_check || null,
-  held_step: outcome.held_step || null,
+  // A held (or failed) `end` is surfaced: the loop outcome stands, but the
+  // lock was not released (eval-native-v0 F10).
+  held_step: outcome.held_step || (end && !end.ok && end.held ? 'end' : null),
+  end_error: end && !end.ok ? (end.error || 'end failed') : null,
   iterations,
   agents_used: agentsUsed,
   max_agents: MAX_AGENTS,

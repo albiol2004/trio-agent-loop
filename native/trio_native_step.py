@@ -70,6 +70,14 @@ SESSION = ".session.json"
 EXCLUDE_LINE = ".claude/worktrees/"
 DEFAULT_STALE_SECONDS = 4 * 3600.0
 DRIVER = "claude-workflow"
+#: Driver/runtime files a run creates inside the mailbox; never product and
+#: never committed. trioctl's MAILBOX_RUNTIME_IGNORES (r14 M-1) plus this
+#: helper's own ``.native.json`` (eval-native-v0 F8).
+MAILBOX_RUNTIME_IGNORES = (
+    ".dispatch/", ".driver.json", ".driver.pid", ".session.json",
+    ".sessions/", "driver.log", ".lock", ".repairs", RECORDS,
+)
+_MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock"})
 OPS = ("begin", "next", "gate", "pin", "apply", "end")
 
 
@@ -324,6 +332,41 @@ def _release(mailbox: Path, token: str) -> str:
     return "released"
 
 
+# ------------------------------------------------------ mailbox ignore
+def _ensure_mailbox_gitignore(mailbox: Path) -> list[str]:
+    """Append the missing runtime lines to ``<mailbox>/.gitignore``.
+
+    Same rule as trioctl's ``_ensure_mailbox_gitignore``: idempotent and
+    append-only, an entry counts as present when an existing line names it
+    (ignoring a leading ``/``, and a trailing ``/`` for directory entries),
+    and a user negation (``!name``) also counts. Returns the lines added.
+    """
+    path = mailbox / ".gitignore"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    present: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.lstrip("!").lstrip("/")
+        name = line.rstrip("/")
+        if line.endswith("/") and name not in _MAILBOX_RUNTIME_DIRS:
+            continue  # a dir-only pattern does not cover a runtime file
+        present.add(name)
+    missing = [e for e in MAILBOX_RUNTIME_IGNORES
+               if e.rstrip("/") not in present]
+    if not missing:
+        return []
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    header = "" if text else "# Trio loop runtime files (added by trio-native)\n"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(prefix + header + "".join(f"{e}\n" for e in missing))
+    return missing
+
+
 # ---------------------------------------------------------- git exclude
 def _ensure_exclude(repo: Path | None) -> str | None:
     """Add `.claude/worktrees/` to the repo's info/exclude exactly once."""
@@ -358,6 +401,7 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             "trio-native v0 (use trio_loop.py run or remove QUEUE.md)"
         )
     _acquire(mailbox, a.token)
+    _ensure_mailbox_gitignore(mailbox)
     if not (mailbox / "LOG.md").is_file():
         (mailbox / "LOG.md").write_text("# Trio loop log\n", encoding="utf-8")
     state = _state(mailbox)

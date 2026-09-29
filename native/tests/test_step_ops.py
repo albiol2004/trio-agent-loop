@@ -156,6 +156,39 @@ def test_begin_adds_exclude_once_and_is_idempotent(repo: Path) -> None:
     assert ".claude" not in git(repo, "status", "--porcelain")
 
 
+def test_begin_gitignores_runtime_files_append_only(repo: Path) -> None:
+    """F8: .native.json, .session.json and .lock/ never reach a commit."""
+    ignore = mbox(repo) / ".gitignore"
+    ignore.write_text("keep-me\n/.lock/\n!.repairs")  # no trailing newline
+    assert step(repo, "begin")["ok"]
+    text = ignore.read_text()
+    assert text.startswith("keep-me\n/.lock/\n!.repairs\n")
+    lines = text.splitlines()
+    for entry in (".native.json", ".session.json", ".driver.json"):
+        assert lines.count(entry) == 1
+    assert ".lock" not in lines and ".repairs" not in lines  # already covered
+    assert step(repo, "begin")["ok"]
+    assert ignore.read_text() == text  # idempotent
+    step(repo, "next", max_iterations=4)
+    git(repo, "add", "loop")
+    staged = git(repo, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged
+                if p.startswith(("loop/.native.json", "loop/.session.json",
+                                 "loop/.lock"))], staged
+
+
+def test_runtime_ignores_cover_trioctl_list() -> None:
+    import re as _re
+    text = (NATIVE.parent / "omnigent" / "trioctl").read_text()
+    block = _re.search(r"MAILBOX_RUNTIME_IGNORES = \((.*?)\)", text, _re.S)
+    trioctl = set(_re.findall(r'"([^"]+)"', block.group(1)))
+    spec = importlib.util.spec_from_file_location("tns_for_test", HELPER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert trioctl <= set(mod.MAILBOX_RUNTIME_IGNORES)
+    assert ".native.json" in mod.MAILBOX_RUNTIME_IGNORES
+
+
 def test_begin_refuses_open_loop_and_missing_goal(repo: Path) -> None:
     (mbox(repo) / "QUEUE.md").write_text("q\n")
     out = step(repo, "begin")
