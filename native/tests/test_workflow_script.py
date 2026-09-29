@@ -151,6 +151,23 @@ def test_harness_ship() -> None:
 
 
 @needs_node
+def test_harness_lead_prompt_builder_worktree_contract() -> None:
+    """F6: absolute mailbox LOG path, no loop/ commits, exact merge steps."""
+    out = run({"verdicts": ["SHIP"]})
+    lead = next(c for c in out["calls"] if c["agentType"] == "trio-lead")
+    p = lead["prompt"]
+    assert f"absolute mailbox path `{MAILBOX}/LOG.md`" in p
+    assert "never to a `loop/LOG.md` inside your worktree" in p
+    assert "Never edit, `git add` or commit anything under `loop/`" in p
+    assert "`git merge --no-ff --no-edit <builder branch>`" in p
+    assert "from your own checkout, on your branch" in p
+    assert "If the merge conflicts, run `git merge --abort`, stop dispatching, and report" in p
+    assert "After a branch is merged, remove its worktree (`git worktree remove <path>`)" in p
+    assert "`git branch -d <builder branch>`" in p
+    assert 'isolation: "worktree"' in p
+
+
+@needs_node
 def test_harness_iterate_then_ship() -> None:
     out = run({"verdicts": ["ITERATE", "SHIP"]})
     r = out["result"]

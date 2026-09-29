@@ -119,7 +119,7 @@ claude -p 'Run the saved workflow trio-native with args {"mailbox": "/abs/path/t
   - the plateau rule;
   - the REPORT builder-provenance retry;
   - the mission collision check.
-- **Isolation relies on the Lead.** Builder isolation is a Lead prompt instruction, not driver-enforced. The driver's gate still requires every code-changing slice commit on HEAD.
+- **Isolation relies on the Lead.** Builder isolation is a Lead prompt instruction, not driver-enforced. The Lead tells each worktree builder to append its LOG line to the absolute `<mailbox>/LOG.md` and never to commit `loop/`, then merges each builder branch with `git merge --no-ff`, aborts and reports on a conflict, and removes the worktree after the merge. The driver's gate still requires every code-changing slice commit on HEAD.
 - **LLM-mediated steps.** Step agents are LLM-mediated. They are schema-bound and nonce-checked, and all ops are idempotent, so a re-run is safe; the steps are still not truly deterministic.
 - **Global CLAUDE.md.** It is injected into every workflow agent. The role prompts carry a per-call "router policy does not apply" clause; the agent bodies do not carry it yet.
 - **Leftover worktrees.** `end` reports leftover `.claude/worktrees/*` in `dangling_worktrees` and never removes them.

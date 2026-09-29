@@ -147,12 +147,19 @@ function rolePrompt(role, n, attempt, gate) {
       'BUILDER ISOLATION (trio-native v0, mandatory):',
       '- Spawn EVERY trio-builder with the Agent tool option `isolation: "worktree"`, so each builder writes in its own git ' +
       'worktree under `.claude/worktrees/` (already git-excluded), never in your checkout.',
-      '- Tell each builder to commit its slice inside its worktree as `slice(<id>): <summary>` and to report its worktree ' +
-      'path, branch (`git rev-parse --abbrev-ref HEAD`) and HEAD sha.',
-      '- Merge each builder\'s branch into your checkout (`git merge --no-edit <branch>`) before dispatching any slice that ' +
-      'depends on it and before you finish; resolve conflicts yourself as a `slice(<id>): fix …` commit. Only run builders ' +
-      'concurrently when their `writes:` are pairwise disjoint.',
-      '- After a branch is merged, remove its worktree (`git worktree remove <path>`) and delete the branch.',
+      '- Tell each builder, verbatim in its assignment:',
+      `  - "Append your one LOG line to the absolute mailbox path \`${MAILBOX}/LOG.md\` — never to a \`loop/LOG.md\` ` +
+      'inside your worktree (that copy is discarded or conflicts at merge)."',
+      '  - "Never edit, `git add` or commit anything under `loop/` (or the mailbox) in your worktree."',
+      '  - "Commit your slice inside your worktree as `slice(<id>): <summary>`, then report your worktree path, branch ' +
+      '(`git rev-parse --abbrev-ref HEAD`) and HEAD sha."',
+      '- Merge procedure, per builder, before dispatching any slice that depends on it and before you finish: from your ' +
+      'own checkout, on your branch, run `git merge --no-ff --no-edit <builder branch>`. If the merge conflicts, run ' +
+      '`git merge --abort`, stop dispatching, and report the builder, its branch and the conflicting files in REPORT.md ' +
+      'and your final message — do not resolve the conflict inside the merge. Only run builders concurrently when their ' +
+      '`writes:` are pairwise disjoint.',
+      '- After a branch is merged, remove its worktree (`git worktree remove <path>`) and delete the branch ' +
+      '(`git branch -d <builder branch>`).',
       '',
       `Before finishing: every code-changing slice has a \`slice(<id>):\` commit reachable from HEAD in ${B.repo || 'the repo'}, ` +
       `and LOG.md has your line \`- iter ${n.iteration} | lead | <summary>\`. The driver checks both mechanically.`,
@@ -161,7 +168,7 @@ function rolePrompt(role, n, attempt, gate) {
     lines.push(
       '',
       `Scoped repair: VERDICT.md says ITERATE ${n.scope ? 'scope=' + n.scope : '(see its first line)'}. Fix exactly that ` +
-      'scope per your role instructions; commit as `slice(<id>): fix …`.',
+      'scope per your role instructions; commit as `slice(<id>): fix …` (never commit `loop/` or mailbox files).',
       `Append \`- iter ${n.iteration} | repair | <one-line summary>\` to LOG.md for this repair (the driver's LOG gate ` +
       'requires the `| repair |` form).',
     )
