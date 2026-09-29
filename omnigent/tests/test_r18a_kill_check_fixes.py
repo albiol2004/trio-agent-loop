@@ -630,3 +630,186 @@ def test_kill_check_via_live_brief_shape_is_not_error(tmp_path):
     assert command == f"{PYT} tests/test_calc.py", command
     res = kc(r, b, command)
     assert res["outcome"] == "killed", res
+
+
+# ------------------------------ eval-r17fix P-1..P-4: the reviewer's table --
+
+# Every real command from the reviewer's case table (VERDICT.md, eval-r17fix)
+# that must survive plain/backticked/fenced extraction unchanged -- the
+# fenced form is legitimate for ALL of them; the reviewer marks plain and
+# backticked legitimate for all but the last (`tests/run.sh`, a bare
+# extension-less relative path with no runner keyword: a pre-existing,
+# non-blocking gap, unchanged by this repair).
+_REAL_COMMANDS = [
+    "npm test -- x",
+    "pnpm vitest run a.test.ts",
+    "uv run pytest",
+    "python -m pytest",
+    "bash scripts/check.sh",
+    "make test",
+    "node --test",
+    "go test ./...",
+    "cargo test",
+    "./gradlew test",
+    "docker compose run --rm app pytest",
+    "FOO=1 pytest",
+    "pytest 'tests/test_a.py::test_x[1-2]'",
+    "poetry run pytest -q",
+    "timeout 120 pytest -q",
+    "(cd api && npx vitest run)",
+    "source .venv/bin/activate && pytest",
+    ". .venv/bin/activate && pytest",
+    "export CI=1 && npx vitest run",
+    "bundle exec rspec",
+    "just test",
+    "npx vitest run -t 'adds <b>'",
+    "go test ./pkg/... -run TestX",
+    "cd api && npm test -- x.test.ts",
+    "Python3 -m pytest",
+]
+
+
+@pytest.mark.parametrize("command", _REAL_COMMANDS)
+def test_case_table_plain_line_real_command(command):
+    assert T._brief_targeted_command(_live_brief(command)) == command
+
+
+@pytest.mark.parametrize("command", _REAL_COMMANDS)
+def test_case_table_backticked_real_command(command):
+    brief = (
+        f"# Task x\n\n## Targeted check\n\nRun `{command}`.\n\n{_TARGETED_CHECK_HINT}\n"
+    )
+    assert T._brief_targeted_command(brief) == command
+
+
+@pytest.mark.parametrize("command", _REAL_COMMANDS + ["tests/run.sh"])
+def test_case_table_fenced_real_command(command):
+    brief = (
+        f"# Task x\n\n## Targeted check\n\n```\n{command}\n```\n\n{_TARGETED_CHECK_HINT}\n"
+    )
+    assert T._brief_targeted_command(brief) == command
+
+
+def test_case_table_plain_bare_word_path_is_pre_existing_gap():
+    # `tests/run.sh` has no leading `./` and no runner keyword: still n/a as
+    # a plain line or a backticked span (pre-existing, non-blocking; only
+    # the fenced form -- tested above -- is required to work).
+    assert T._brief_targeted_command(_live_brief("tests/run.sh")) is None
+    brief = f"# Task x\n\n## Targeted check\n\nRun `tests/run.sh`.\n\n{_TARGETED_CHECK_HINT}\n"
+    assert T._brief_targeted_command(brief) is None
+
+
+@pytest.mark.parametrize("brief, expect", [
+    (_live_brief("npx tsc --noEmit -p api && npx vitest run "
+                 "api/test/openrouter-view.test.ts"),
+     "npx tsc --noEmit -p api && npx vitest run api/test/openrouter-view.test.ts"),
+    (f"# Task x\n\n## Targeted check\n\n"
+     f"See `N passed in 0.1s` then run `pytest -q tests/test_a.py`.\n\n{_TARGETED_CHECK_HINT}\n",
+     "pytest -q tests/test_a.py"),
+    (f"# Task x\n\n## Targeted check\n\n"
+     f"Uses `pytest`: `python3 -m pytest -q tests/test_a.py`\n\n{_TARGETED_CHECK_HINT}\n",
+     "python3 -m pytest -q tests/test_a.py"),
+    (f"# Task x\n\n## Targeted check\n\n"
+     f"Covers `/api/stats` via `npx vitest run api/test/s.test.ts`\n\n{_TARGETED_CHECK_HINT}\n",
+     "npx vitest run api/test/s.test.ts"),
+    (f"# Task x\n\n## Targeted check\n\n"
+     f"From `./api` run `npx vitest run test/s.test.ts`\n\n{_TARGETED_CHECK_HINT}\n",
+     "npx vitest run test/s.test.ts"),
+    (f"# Task x\n\n## Targeted check\n\n"
+     f"make sure the new route is covered\npytest -q tests/test_a.py\n\n{_TARGETED_CHECK_HINT}\n",
+     "pytest -q tests/test_a.py"),
+    (f"# Task x\n\n## Targeted check\n\n`N passed`\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n`<n>`\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n`...`\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n`TARGETED_CHECK: PASS <n>`\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n```\nTARGETED_CHECK: PASS 3\n```\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\n```\npytest -q tests/test_<slice>.py\n```\n\n{_TARGETED_CHECK_HINT}\n", None),
+    (f"# Task x\n\n## Targeted check\n\npytest -q tests/test_<slice>.py\n\n{_TARGETED_CHECK_HINT}\n", None),
+], ids=[
+    "live-or-view", "two-ticks-placeholder-first", "two-ticks-bare-word-span-first",
+    "two-ticks-path-span-first", "two-ticks-dir-span-first", "prose-then-plain-cmd",
+    "placeholder-only-N-passed", "placeholder-only-n", "placeholder-only-ellipsis",
+    "placeholder-TARGETED_CHECK-PASS-n", "hint-only", "fenced-output-example-only",
+    "fence-w-placeholder-cmd", "plain-placeholder-cmd",
+])
+def test_case_table_detailed_rows(brief, expect):
+    assert T._brief_targeted_command(brief) == expect
+
+
+def test_real_corpus_scan_reports_zero_false_na():
+    """r18a repair item 6/acceptance: re-scan the on-disk briefs the
+    reviewer used (read-only; paths per VERDICT.md eval-r17fix) and confirm
+    the new parser introduces no false `n/a` relative to c293c1f -- i.e. no
+    brief where c293c1f found *some* candidate (even a wrong one) but the
+    fixed parser now finds nothing."""
+    import hashlib
+
+    roots = [
+        Path("/home/coder/workflow-lab/.runtime/parallel-worktree-isolation/speed/hard"),
+        Path("/home/coder/workflow-lab/.runtime/parallel-worktree-isolation/eval-r18a"),
+        Path("/home/coder/ekona/syngenta"),
+    ]
+    if not any(root.is_dir() for root in roots):
+        pytest.skip("read-only lab corpus not present in this environment")
+    paths: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            paths.extend(root.rglob("*.md"))
+
+    def c293_command(brief: str) -> str | None:
+        try:
+            lines = T._load_trio_check()[0].targeted_check_lines(brief)
+        except T.TrioctlError:
+            return None
+        fenced: list[str] = []
+        inside = False
+        for ln in lines:
+            if ln.strip().startswith(("```", "~~~")):
+                if inside:
+                    break
+                inside = True
+                continue
+            if inside and ln.strip() and not ln.strip().startswith("#"):
+                fenced.append(ln.rstrip())
+        if fenced:
+            return "\n".join(fenced)
+        import re as _re
+        for ln in lines:
+            for span in _re.findall(r"`([^`]+)`", ln):
+                span = span.strip()
+                if "TARGETED_CHECK" in span or " " not in span:
+                    continue
+                return span
+        for ln in lines:
+            text = _re.sub(r"^\s*(?:[-*+]\s+|\$\s+)", "", ln).strip()
+            if text and "TARGETED_CHECK" not in text and not text.lower().startswith("print"):
+                return text
+        return None
+
+    seen: dict[str, str] = {}
+    for p in paths:
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if "## Targeted check" not in text:
+            continue
+        try:
+            lines = T._load_trio_check()[0].targeted_check_lines(text)
+        except T.TrioctlError:
+            continue
+        section = "\n".join(lines).strip()
+        if not section:
+            continue
+        key = hashlib.sha256(section.encode()).hexdigest()
+        seen.setdefault(key, text)
+
+    assert len(seen) >= 40, f"expected the on-disk corpus to be reachable, got {len(seen)}"
+    false_na = []
+    for key, text in seen.items():
+        old = c293_command(text)
+        new = T._brief_targeted_command(text)
+        if old is not None and new is None:
+            false_na.append(key)
+    assert false_na == [], f"{len(false_na)} brief(s) regressed to a false n/a"

@@ -1717,31 +1717,82 @@ def _kill_check_budget(mailbox: Path | None) -> float:
     return KILL_CHECK_DEFAULT_BUDGET_S
 
 
-# r18 measurement fix: a plausible command starts with a known test/build
-# runner, `cd`/`pushd`/`env`, a path, or a leading env-var assignment --
-# never a bare placeholder (`N`, `<n>`, `...`, `ok`, `FAIL`, `Duration`) or
-# one of the TARGETED_CHECK output-format examples the brief's own
-# instruction line quotes in backticks right next to the real command
-# (`N passed[, M failed] in ...`, ` Tests  N passed | M failed`) -- those
-# contain a space and never the literal text "TARGETED_CHECK" either, so
-# the naive "first backtick span with a space" scan used to return them as
-# the command to run (openrouter Q18-r1: `sh: 1: N: not found`, `error`).
+# r18a repair (eval-r17fix P-1..P-4): every real `## Targeted check` command
+# also sits next to the canonical TARGETED_CHECK output-format hint -- the
+# literal sentence trioctl's own PLAN-guard text tells the Lead to append
+# verbatim ("Print `TARGETED_CHECK: <the line stating the pass/fail
+# counts>` after running the check (pytest: `N passed[, M failed] in ...`;
+# ...)."). The r18 fix tried to tell the hint's quoted examples apart from a
+# real command with a runner allowlist; that rejected many legitimate
+# runners (`uv`, `poetry`, `docker compose`, `timeout`, a `(cd x && ...)`
+# subshell, `source`/`.`, `export`, `bundle exec`, `just`, `grep`, a
+# capitalized `Python3`) as `n/a` -- a regression vs the naive scan. Instead,
+# drop the hint sentence itself before scanning, so almost anything left
+# over that looks like shell syntax can be trusted.
+_TARGETED_CHECK_HINT_RE = re.compile(r"Print\s+`TARGETED_CHECK:.*?\)\.", re.DOTALL)
+
 _TARGETED_COMMAND_RUNNER_RE = re.compile(
-    r"^(?:\.{1,2}/|~/|/)"
-    r"|^(?:cd|pushd|env|set|python3?|pytest|unittest|npx|npm|yarn|pnpm|node|go|"
-    r"cargo|mvn|gradle|make|sh|bash|zsh|tsc|vitest|jest|mocha|rspec|ruby|rake|"
-    r"dotnet|swift|deno|bun|tox|nox)\b"
-    r"|^[A-Za-z_][A-Za-z0-9_]*=\S"
+    r"^(?:\.{1,2}/|~/|/|\()"
+    r"|^\.\s"
+    r"|^(?:cd|pushd|env|set|export|source|timeout|uv|poetry|docker|bundle|just|"
+    r"grep|python3?|pytest|unittest|npx|npm|yarn|pnpm|node|go|cargo|mvn|gradle|"
+    r"make|sh|bash|zsh|tsc|vitest|jest|mocha|rspec|ruby|rake|dotnet|swift|deno|"
+    r"bun|tox|nox)\b"
+    r"|^[A-Za-z_][A-Za-z0-9_]*=\S",
+    re.IGNORECASE,
 )
-_TARGETED_COMMAND_PLACEHOLDER_RE = re.compile(r"\[.*?\]|\.\.\.|<[^<>]*>")
+# A placeholder is one of the hint's own shapes (`N passed`, `M failed`, a
+# bare `...` that is not part of a path like `./...`, or a template
+# `<word>`) -- never a generic `[...]` (that used to reject a pytest param
+# id `[1-2]` and a Python list literal in `python3 -c "..."`). `<...>`
+# placeholders are checked only outside quoted spans, so a real test title
+# like `-t 'adds <b>'` is not mistaken for a template variable.
+_TARGETED_COMMAND_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_TARGETED_COMMAND_PLACEHOLDER_RE = re.compile(
+    r"\bN passed\b|\bM failed\b|(?<![\w./])\.\.\.(?![\w./])|<[^<>]*>"
+)
+# A plain (unquoted, un-backticked) fallback line is rejected as prose, not
+# a command, when its second word is one an English sentence would use
+# right after a runner-shaped verb ("make SURE ...", "set UP ...") and the
+# line carries none of the syntax a real command almost always has.
+_TARGETED_COMMAND_PROSE_STOPWORDS = frozenset({
+    "sure", "up", "into", "out", "certain", "should", "must",
+})
+
+
+def _looks_like_prose(text: str) -> bool:
+    words = text.split()
+    if len(words) < 2:
+        return False
+    second = words[1].strip(".,;:!?").lower()
+    if second not in _TARGETED_COMMAND_PROSE_STOPWORDS:
+        return False
+    return not re.search(r"[/=]|--|&&|['\"]", text)
 
 
 def _plausible_targeted_command(text: str) -> str | None:
     """*text*, if it plausibly is a runnable command; else None."""
     text = text.strip()
-    if not text or "TARGETED_CHECK" in text or _TARGETED_COMMAND_PLACEHOLDER_RE.search(text):
+    if not text or "TARGETED_CHECK" in text:
+        return None
+    unquoted = _TARGETED_COMMAND_QUOTED_RE.sub("", text)
+    if _TARGETED_COMMAND_PLACEHOLDER_RE.search(unquoted):
         return None
     return text if _TARGETED_COMMAND_RUNNER_RE.match(text) else None
+
+
+def _plausible_fenced_command(text: str) -> str | None:
+    """*text*, if a fenced block plausibly is a runnable command; else None.
+
+    A fenced block is already explicit, deliberately-placed code -- unlike a
+    plain or backticked line, it is never rejected just for not starting
+    with a known runner word (that is how a bare `tests/run.sh` is a real,
+    fenced command). It is still rejected as a hint/placeholder example."""
+    text = text.strip()
+    if not text or "TARGETED_CHECK" in text:
+        return None
+    unquoted = _TARGETED_COMMAND_QUOTED_RE.sub("", text)
+    return None if _TARGETED_COMMAND_PLACEHOLDER_RE.search(unquoted) else text
 
 
 def _brief_targeted_command(brief: str) -> str | None:
@@ -1753,6 +1804,10 @@ def _brief_targeted_command(brief: str) -> str | None:
         lines = _load_trio_check()[0].targeted_check_lines(brief)
     except TrioctlError:
         return None
+    # Drop the output-format hint sentence itself before scanning (P-1/P-2):
+    # this may join two source lines into one, which is fine here since the
+    # scan below only cares about fence/backtick/plain-line shapes.
+    lines = _TARGETED_CHECK_HINT_RE.sub("", "\n".join(lines)).split("\n")
     fenced: list[str] = []
     inside = False
     for ln in lines:
@@ -1764,20 +1819,40 @@ def _brief_targeted_command(brief: str) -> str | None:
         if inside and ln.strip() and not ln.strip().startswith("#"):
             fenced.append(ln.rstrip())
     if fenced:
-        return "\n".join(fenced)
+        # Same hint/placeholder filtering as the other forms (pre-existing
+        # gap): a fenced output example or placeholder command is never
+        # returned verbatim; fall through to the backtick/plain scan below.
+        command = _plausible_fenced_command("\n".join(fenced))
+        if command:
+            return command
     for ln in lines:
         for span in re.findall(r"`([^`]+)`", ln):
+            if not re.search(r"\s", span):
+                continue  # P-3: a one-word span is never the real command
             command = _plausible_targeted_command(span)
             if command:
                 return command
     for ln in lines:
         text = re.sub(r"^\s*(?:[-*+]\s+|\$\s+)", "", ln).strip()
-        if text.lower().startswith("print"):
+        if text.lower().startswith("print") or _looks_like_prose(text):
             continue
         command = _plausible_targeted_command(text)
         if command:
             return command
     return None
+
+
+def _no_targeted_command_reason(brief: str) -> str:
+    """`run_kill_check`'s `n/a` reason when `_brief_targeted_command(brief)`
+    is None: distinguishes a missing `## Targeted check` section from one
+    that is present but has nothing plausible in it (r18a repair item 6)."""
+    try:
+        lines = _load_trio_check()[0].targeted_check_lines(brief)
+    except TrioctlError:
+        return "no `## Targeted check` command in the brief"
+    if any(ln.strip() for ln in lines):
+        return "no plausible targeted command in the section"
+    return "no `## Targeted check` command in the brief"
 
 
 def _kill_ls_files(path: Path) -> list[str]:
@@ -2185,10 +2260,13 @@ def _isolated_kill_check(
         except Exception:  # noqa: BLE001 - best effort; the mailbox is never product
             mailbox_rel = None
         try:
+            command = _brief_targeted_command(brief)
             result = run_kill_check(
-                path, str(record["base"]), _brief_targeted_command(brief),
+                path, str(record["base"]), command,
                 mailbox_rel=mailbox_rel, budget=_kill_check_budget(mailbox),
             )
+            if command is None:
+                result["reason"] = _no_targeted_command_reason(brief)
         except Exception as exc:  # noqa: BLE001 - shadow: never break a dispatch
             result = {"mode": "shadow", "outcome": "error",
                       "reason": f"{type(exc).__name__}: {exc}"}
