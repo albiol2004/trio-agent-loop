@@ -118,7 +118,11 @@ class NestedMailboxBoardTests(unittest.TestCase):
 
 
 class BoardJsInPlacePatchTests(unittest.TestCase):
-    """renderBoard must patch cards in place instead of wiping the grid."""
+    """renderBoard must patch rows in place instead of wiping the table.
+
+    Rows are keyed by workspace root + mailbox name (``loop.key``) because
+    the board shows every workspace at once.
+    """
 
     def test_board_uses_fact_only_tabs_and_has_no_loop_state(self):
         source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
@@ -137,7 +141,7 @@ class BoardJsInPlacePatchTests(unittest.TestCase):
         self.assertIsNotNone(match)
         body = match.group(1)
         self.assertNotIn('grid.textContent = "";\n  if (!state.loops.length)', body)
-        for marker in ("boardSignature", "patchCard", "existing.get(loop.name)",
+        for marker in ("boardSignature", "patchCard", "existing.get(loop.key)",
                        "insertBefore"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, body)

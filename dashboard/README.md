@@ -44,6 +44,57 @@ Adjust the zone to the one holding `tailscale0`; no rule is needed if that inter
 
 There is no authentication in v1 — the tailnet ACL is the access boundary. Do not expose `--host 0.0.0.0` on untrusted networks without an auth layer.
 
+## Workspace service (always-on)
+
+`dashboard/service/` holds a supervised setup for the workspace `svc`
+manager (`~/.services/<name>/run`):
+
+- `run` — starts `serve.py` on `127.0.0.1:$TRIO_DASH_PORT` (default 9470),
+  restarts it on exit with 2–60 s backoff, probes `/healthz` every 20 s and
+  restarts after 3 consecutive failures, and maps tailnet-only HTTPS on the
+  same port with `tailscale serve --bg --https=9470` (the workspace's `/` and
+  `/auth` mappings are untouched).
+- `env.example` — pinned checkout path, port, `TRIO_DASH_SCAN_ROOTS`
+  (directories whose children are auto-discovered, e.g. `~/personal`), and
+  fixed `--workspace` arguments plus `--discover`.
+- `install-service.sh <commit>` — creates `~/.services/trio-dash` with a
+  detached worktree pinned at `<commit>`; leaves the service disabled.
+
+```bash
+dashboard/service/install-service.sh <commit>
+svc enable trio-dash && svc start trio-dash
+curl -s http://127.0.0.1:9470/healthz
+# https://<workspace-host>.<tailnet>:9470/
+```
+
+`serve.py` also accepts `--discover` to keep auto-discovery on alongside
+explicit `--workspace` paths. Discovery settings: `TRIO_DASH_SCAN_ROOTS`
+(`os.pathsep` separated; replaces the defaults; HOME and `/` are refused),
+`TRIO_DASH_SCAN_DEPTH` (default 3: direct children always, deeper dirs only
+when they hold a `loop*/` dir; dot-dirs and dependency/build dirs are
+skipped; at most 4000 dirs per root), and `TRIO_DASH_WORKSPACES` for
+explicitly registered workspaces (shown in full).
+
+Linked git worktrees found by the walk appear as `<repo> (worktree <name>)`
+with only the mailboxes that are theirs. Ownership is git ancestry, never
+file mtimes: with `mb = merge-base(worktree HEAD, base tip)` (base tip = the
+main checkout's HEAD; for a bare repository `main`/`master`/`origin/HEAD`),
+a mailbox is `new on branch` (absent at `mb`) or `committed on branch` /
+`deleted on branch` when one of its own changes since `mb` is still not in
+the base tip — so a needs-human commit survives merge, rebase, reset and
+stash, a committed deletion counts, and already-merged or identical edits
+and touched files do not. `modified` / `untracked` come from `git status`
+(`--no-optional-locks`, reused up to ~90–135 s unless the index changes);
+`runtime files present` (untracked or ignored sidecars/locks — tracked ones
+do not count) shows a mailbox only alongside other evidence or while its
+STATE/VERDICT says running or needs a person; `live` is argv, a broker
+session with `workspace` = the worktree, or a live sidecar. With no
+merge-base (unrelated history, no base branch) actionable loops are shown as
+`no common base (…)` rather than hidden. Ancestry is cached on the (HEAD,
+base tip) commit ids read from ref files. Worktree drilldown works;
+worktrees are not listed as registry workspaces. Broker liveness:
+`TRIO_BOARD_BROKER_URL` (the service env sets `http://127.0.0.1:6767`).
+
 ## Running from the repo checkout (development)
 
 ```bash
@@ -52,15 +103,22 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 
 ## What it shows
 
-- **Status board** — nested mailbox discovery: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped). One card per mailbox; cards patch in place on poll with no full re-render. Cards show status fact (from STATE.md status word), verdict fact (latest VERDICT.md word), RUNNING tag (when running_sources union is non-empty), ARCHIVED tag (loop-archive-* directory), phase label when non-idle, iteration count, mission, verdict-history strip (S/I/H/B tiles — the loop's fingerprint), and last activity. Running detection polls three sources: driver pid, /proc cmdline referencing the mailbox path, and .session.json sidecar with live pid; a dead-pid sidecar becomes an 'orphaned' inbox item. Dead pids and a broker probe on running_sources.
-- **Tabs** — Running (running loops first), Attention (unflagged inbox items), All (all mailboxes), Archived (loop-archive-*). Refreshes every 5 seconds.
+- **Board (every workspace at once)** — one `/api/overview` poll every 5 seconds covers every discovered workspace. Top to bottom: a verdict sentence ("2 loops need you; nothing is running."), four tiles (needs you, running now, shipped in the last 7 days, loops tracked), **Needs you**, **Running now**, an **All loops** table, and collapsed **Review notes**. Loops are keyed by workspace root + mailbox name. Nested mailbox discovery is unchanged: every `loop*/` directory and its direct subdirectories that are mailboxes (contain any of LOG.md, GOAL.md, STATE.md, VERDICT.md, PLAN.md; briefs/ and evidence* are skipped).
+- **Facts only** — a loop's state badge is derived from facts in this order: live evidence (`running_sources`: driver pid or lock, /proc cmdline naming the mailbox, live `.session.json` pid, opt-in broker probe) → "Running"; else the latest verdict (Shipped / Needs human / Blocked / Iterating); else the STATE.md status word. Every badge has an icon and text; the tooltip lists the underlying facts. Titles come from GOAL.md's first heading (`# Mission: X` → "X"); generic headings such as `# Goal` fall back to the mission's first clause.
+- **Needs you vs review notes** — unread attention items are grouped per loop. Kinds `needs_human`, `blocked`, `interrupted`, `orphaned`, `queue_fault`, any high-severity item, and any item on a running loop go to **Needs you**; drift/overlap/repair notes on loops that are not running go to **Review notes**. `interrupted` fires only when STATE.md claims `running`/`in_progress`/`active`/`iterating`, no liveness source is live, no orphaned sidecar exists and the verdict is not terminal — two recorded facts disagreeing, no idle-time threshold. It is a medium "Needs you" item only when the broker listing was read (`broker: ok`) and no loop-worker process runs inside the workspace; otherwise it is a low-severity review note. Loop workers are positively worker-shaped commands only: `trioctl … run|loop`, `trio_loop.py`, `portable/driver.sh`, and headless harness runs (`claude -p/--print`, `codex … exec`, `cursor-agent -p/--print`, `opencode run`, `omp -p`). Interactive sessions, MCP servers and unknown processes never soften it. A STATE.md status of `needs_human`/`awaiting_human`/`awaiting_user` or `blocked` raises the matching high item even when VERDICT.md is older, and sets the state badge.
+- **Liveness facts** — `driver`: live `.driver.json` or `.lock/pid` process that is not a zombie and started before its record was last written (a recycled PID is not the owner); `proc`: a live process whose argv element (or `--opt=value`, or a relative option value / path with a separator resolved against its cwd) is the mailbox or a file in it, but not a file inside a child mailbox; `session`: live `.session.json` pid (same reuse check); `broker`: sidecar session ids reported running by `GET /v1/sessions/<id>`, or a running session in the paginated `GET /v1/sessions` listing whose `workspace` is this workspace and whose title starts `trioctl <mailbox-dir> ` (ambiguous dir names in one workspace are never attributed).
+- **All loops table** — sortable by loop, workspace and last activity; filtered by search, workspace, and the fact-only segments Running / Attention / All / Archived (preferences persist in `localStorage` when available). Rows patch in place on poll.
 - **Attention inbox** — stable item ids (sha256 hash of root, loop_name, kind, anchor) and per-workspace read/unread state persisted in `~/.local/share/trio-agent-loop/inbox-state.json` (POST /api/inbox/read or /api/inbox/unread). Read items are hidden by default; unread count remains the inbox badge.
-- **Loop detail drawer** — click a card: full mission, fact grid, large verdict history, and an activity timeline parsed from LOG.md (role, per-action duration, summaries, verdicts).
-- **Sessions & transcripts** — collapsed by default inside the drawer: matched omp sessions (parents + nested subagents) with live SSE transcript tailing and pause/resume follow.
+- **Loop detail drawer** — click any row, attention item or running card (deep link `#root=<workspace>&loop=<mailbox>`; the older `#loop=<mailbox>` still works): why the loop is flagged, full mission, fact grid, verdict history, commits (first 8, then "Show all"), slices, and an activity timeline parsed from LOG.md. Start/Stop live here. Their availability and reason come from the card's `controls` and are enforced by the API: Start needs `<root>/loop`, GOAL.md, the driver entrypoint in this dashboard checkout (drivers run from here with `cwd=<workspace>`), no live evidence, and survival past a 1.5 s startup grace (otherwise 502 with the log tail, and `.driver.json` is left untouched; an existing iteration/session cursor is kept). Stop needs a live driver/lock PID whose command line is a loop driver, and asks for confirmation. The server keeps each mailbox's last action (`last_action`: started, failed, finished, stopped, with exit code) and reaps drivers it started. The drawer is modal: focus moves in, Escape closes it and focus returns.
+- **States** — skeletons while loading, an empty state, an error banner with Retry that keeps the last data on screen, a Stale indicator when data is older than 30 s, and a partial-failure banner naming any workspace that could not be read.
+- **Timeline** — one card per iteration: verdict badge, lifecycle, a Compare toggle (pick two for the side-by-side panel), a wall-clock track with a role legend when LOG.md entries carry timings, one row per entry with its duration (summaries clamp to three lines; a Show more / Show less button expands one in place by keyboard or touch), and PLAN.md slice chips that open the Graph tab.
+- **Sessions & transcripts** — the Transcripts tab lists the loop's Omnigent session exports (`<loop>/.sessions/*.jsonl`, written by trioctl; label, role agent and time from each file's header line) together with matched omp sessions (parents + nested subagents), newest first, and opens the newest one. trioctl writes an export when it archives a role's session, usually soon after the role finishes and otherwise at the end of the run, so an active session is not listed yet; the tab says so in a one-line note whose details expand. An open transcript is tailed over SSE (lines appended to the file appear; pause/resume follow), which is not live streaming of a running broker session. Omnigent `input_text`/`output_text` messages, resource events and compactions render alongside omp records, and a record with a malformed field is skipped without dropping the rest of its batch. The transcript endpoint only reads files under `~/.omp/agent/sessions/` or `.sessions/*.jsonl` exports of a loop in the requested workspace; a `.sessions` directory that is a symlink lists nothing, and file symlinks out of `.sessions/` are neither listed nor streamed. Loops whose driver records neither say so in place of an empty pane.
 
 ## Pages
 
-- `/` — status board with tabs: **Running** (running loops), **Attention** (inbox items not yet read), **All** (all mailboxes), **Archived** (loop-archive-* directories). Each card shows status and verdict facts, iteration count, mission, verdict history, and last activity. Fact tags are STATE.md status word, latest verdict word, RUNNING (when running_sources is non-empty), and ARCHIVED (for loop-archive-* paths); phase label appears when non-idle. **Start/Stop buttons** control loop execution
+Every page shares the loop board's app bar, page container, panels and controls from `app.css` (tokens only, no page-level styles); the registry pages carry the workspace selector in the app bar.
+
+- `/` — loop board across all workspaces (see "What it shows")
 - `/skills.html` — skill registry editor: frontmatter forms, validation, generated files marked read-only, and scoped creation
 - `/agents.html` — canonical-agent definitions and per-harness install matrix with sync status
 - `/topology.html` — layered SVG graphs of harness wiring;
@@ -69,6 +127,18 @@ python3 dashboard/serve.py            # 127.0.0.1, first free port 9470-9479, ro
 - `/health.html` — registry lineage, manifest drift, installed harnesses, dangling artifacts, and generate.py check result
 
 ## API Endpoints
+
+Board and service:
+- `GET /api/overview` — every workspace's board in one response:
+  `{workspaces: [{root, name, loops, inbox, elapsed_ms, error?}], scanned, updated_at, elapsed_ms}`.
+  Workspaces without loops are omitted (counted in `scanned`). The first
+  request builds synchronously; later requests return the last build at once
+  and trigger one background rebuild when it is older than 4 s. One /proc
+  snapshot and one git slice attribution per loop are shared per build.
+- Control routes require an explicit `root` (400 otherwise). Start is also disabled while broker liveness is unknown (`unreachable`/`truncated`). `--config` values in argv are not mailbox evidence.
+- `GET /healthz` — `{ok, uptime_seconds, version, workspaces, overview_age_seconds, broker}` for supervisors.
+- Rebuilds: a poll older than 15 s triggers one background rebuild (cache expiries are jittered per path so refreshes spread out); git-backed derivations (slice attribution, iterations, commits) and parsed card facts are reused while the mailbox files and the repo's HEAD/reflog are unchanged; one `/proc` read and one broker listing are shared per build; the server pre-warms the overview at startup; hidden tabs stop polling.
+- Request guards (all routes): the Host must be an IP literal, `localhost` or a name in `TRIO_DASH_ALLOWED_HOSTS` (DNS-rebinding defence, 421 otherwise). POST/PUT/DELETE with an `Origin` must be same-origin or listed in `TRIO_DASH_ALLOWED_ORIGINS`; `Sec-Fetch-Site: cross-site` is refused; a request body must be `application/json` (415 otherwise).
 
 Loop control:
 - `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`)

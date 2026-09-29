@@ -2,15 +2,26 @@
 
 /* Trio Loop Dashboard — frontend.
  * No build step, no external dependencies. Talks to the backend at
- * /api/board, /api/loop, /api/transcript (SSE), and loop controls. */
+ * /api/overview (every workspace's board), /api/loop, /api/transcript (SSE),
+ * and loop controls. Loops are keyed by workspace root + mailbox name. */
 
 const state = {
   boardTimer: null,
   loops: [],
   inbox: [],
+  workspaces: [],
+  scanned: 0,
+  byKey: new Map(),
   showReadInbox: false,
   updatedAt: null,
+  lastOk: null,
+  loaded: false,
   tab: "all",
+  workspace: "",
+  query: "",
+  sort: { key: "activity", dir: "desc" },
+  actionNotes: new Map(),
+  broker: "disabled",
 
   /* drawer */
   activeLoop: null,
@@ -19,6 +30,8 @@ const state = {
   drawerTab: "overview",
   graphSel: null,
   compare: [],
+  tlOpen: new Set(),
+  tlSignature: null,
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -26,25 +39,22 @@ const state = {
   es: null,
   offset: 0,
   size: null,
+  records: 0,
   follow: true,
   pendingLines: [],
   rafPending: false,
 };
 
-/* Loop name to auto-open via `#loop=<name>` once board data confirms it
- * exists (set in init(), consumed once by refreshBoard()). */
+/* Loop to auto-open via `#loop=<name>` or `#root=<path>&loop=<name>` once
+ * board data confirms it exists (set in init(), consumed by refreshBoard()). */
 let pendingLoopHash = null;
 
+/* Workspace of the loop open in the drawer; detail requests carry it. */
 let currentRoot = "";
 function withRoot(url) {
   if (!currentRoot) return url;
   return url + (url.includes("?") ? "&" : "?") + "root=" + encodeURIComponent(currentRoot);
 }
-window.addEventListener("trio:workspace", (event) => {
-  currentRoot = event.detail && event.detail.path ? event.detail.path : "";
-  clearTimeout(state.boardTimer);
-  refreshBoard();
-});
 
 const BOARD_POLL_MS = 5000;
 const TABS = ["running", "attention", "all", "archived"];
@@ -166,76 +176,383 @@ function latestVerdict(loop) {
   return seq.length ? String(seq[seq.length - 1]).toUpperCase() : null;
 }
 
-function loopTagElements(loop) {
-  const tags = [
-    span("status-label status-status", statusWord(loop)),
-  ];
-  const verdict = latestVerdict(loop);
-  if (verdict) {
-    // Map SHIP onto the existing .status-shipped color, not a missing .status-ship.
-    const tone = {
-      ship: "shipped",
-      iterate: "iterate",
-      blocked: "blocked",
-      needs_human: "needs_human",
-    }[normVerdict(verdict)];
-    tags.push(
-      span(
-        "status-label status-verdict" + (tone ? " status-" + tone : ""),
-        verdict
-      )
-    );
-  }
-  if (Boolean(loop.running)) {
-    const running = span("status-label status-running", "RUNNING");
-    running.title = (loop.running_sources || []).join(", ");
-    tags.push(running);
-  }
-  if (isArchived(loop)) {
-    tags.push(span("status-label status-archived", "ARCHIVED"));
-  }
-  return tags;
-}
-
-function appendLoopTags(container, loop) {
-  container.textContent = "";
-  for (const tag of loopTagElements(loop)) container.appendChild(tag);
-}
-
-/* Segmented verdict bar: one hairline segment per verdict. */
-function segbarEl(seq, large) {
-  const bar = document.createElement("div");
-  bar.className = "segbar" + (large ? " segbar-large" : "");
-  if (!seq.length) {
-    const empty = document.createElement("div");
-    empty.className = "segbar-empty";
-    bar.appendChild(empty);
-    return bar;
-  }
-  for (const v of seq) {
-    bar.appendChild(span("seg seg-" + v, ""));
-  }
-  return bar;
-}
-
-/* Mono sequence legend: S→I→S with per-verdict coloring. */
-function seqLegendEl(seq) {
-  const legend = document.createElement("span");
-  legend.className = "seg-seq";
-  const letter = { ship: "S", iterate: "I", blocked: "B" };
-  seq.forEach((v, i) => {
-    if (i > 0) legend.appendChild(document.createTextNode("→"));
-    legend.appendChild(span("seq-" + v, letter[v]));
-  });
-  return legend;
-}
-
 /* ------------------------------ board ------------------------------ */
+
+/* Attention kinds that ask for a decision now; everything else on a
+ * finished loop is a review note (still listed, just not at the top). */
+const NEEDS_KINDS = new Set([
+  "needs_human", "blocked", "interrupted", "orphaned", "queue_fault",
+]);
+const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
+const STORE_KEY = "trio.board.v2";
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const STALE_AFTER_MS = 30 * 1000;
+
+function loopKey(root, name) {
+  return root + "::" + name;
+}
+
+function isNeedsItem(item, loop) {
+  // A low-severity "interrupted" means liveness was not fully checked
+  // (broker unknown), so it is a note, not a call to act.
+  if (item.severity === "low" && item.kind === "interrupted") return false;
+  if (NEEDS_KINDS.has(item.kind) || item.severity === "high") return true;
+  return Boolean(loop && loop.running);
+}
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (TABS.includes(saved.tab)) state.tab = saved.tab;
+    if (typeof saved.workspace === "string") state.workspace = saved.workspace;
+    if (saved.sort && typeof saved.sort.key === "string") state.sort = saved.sort;
+  } catch (err) {
+    /* private window or blocked storage: defaults are fine */
+  }
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      tab: state.tab, workspace: state.workspace, sort: state.sort,
+    }));
+  } catch (err) {
+    /* ignore */
+  }
+}
+
+/* GOAL.md heading, else the mission's first clause, else the mailbox name. */
+function loopTitle(loop) {
+  if (loop.title) return loop.title;
+  const mission = String(loop.mission || "").split(/(?<=[.;:])\s/)[0].trim();
+  return mission ? oneLine(mission, 90) : loop.name;
+}
+
+const HUMAN_STATUS = new Set(["needs_human", "awaiting_human", "awaiting_user"]);
+
+/* One state word per loop, from facts only: live evidence first, then a
+ * STATE.md hand-off to a person (or blocked), then the latest verdict, then
+ * the STATE.md status word. */
+function stateBadge(loop) {
+  const badge = document.createElement("span");
+  let tone = "neutral";
+  let text = statusWord(loop);
+  const verdict = normVerdict(latestVerdict(loop));
+  const status = String(loop.status || "").trim().toLowerCase().replace(/-/g, "_");
+  if (loop.running) {
+    tone = "live";
+    text = "Running";
+  } else if (HUMAN_STATUS.has(status)) {
+    // STATE.md handing the loop to a person outranks an older verdict file.
+    tone = "warning";
+    text = "Needs human";
+  } else if (status === "blocked") {
+    tone = "negative";
+    text = "Blocked";
+  } else if (verdict === "ship") {
+    tone = "positive";
+    text = "Shipped";
+  } else if (verdict === "needs_human") {
+    tone = "warning";
+    text = "Needs human";
+  } else if (verdict === "blocked") {
+    tone = "negative";
+    text = "Blocked";
+  } else if (verdict === "iterate") {
+    text = "Iterating";
+  }
+  badge.className = "badge badge-" + tone;
+  badge.appendChild(span("badge-icon", { live: "●", positive: "✓", warning: "!", negative: "✕", neutral: "○" }[tone]));
+  badge.appendChild(document.createTextNode(text));
+  const facts = ["STATE.md: " + statusWord(loop)];
+  if (latestVerdict(loop)) facts.push("verdict: " + latestVerdict(loop));
+  if (loop.running) facts.push("live via " + (loop.running_sources || []).join(", "));
+  badge.title = facts.join(" · ");
+  return badge;
+}
+
+function iterationText(loop) {
+  if (loop.iteration == null) return "—";
+  return loop.max_iterations != null
+    ? loop.iteration + " of " + loop.max_iterations
+    : String(loop.iteration);
+}
+
+/* The driver phase is only current while the loop is live; a stale
+ * sidecar's phase ("lead done", "blocked") would contradict the badge. */
+function phaseText(loop) {
+  if (!loop.running) return "";
+  const phase = String(loop.driver_phase || "").trim();
+  const sub = loop.running_substate;
+  const parts = [];
+  if (phase && phase.toLowerCase() !== "idle") parts.push(phase.replace(/[-_]/g, " "));
+  if (sub) parts.push(sub === "both" ? "lead and evaluator active" : sub + " active");
+  return parts.join(" · ");
+}
+
+function historyEl(loop) {
+  const seq = verdictSeq(loop);
+  const wrap = document.createElement("span");
+  wrap.className = "hist";
+  if (!seq.length) {
+    wrap.appendChild(span("hist-none", "—"));
+    wrap.title = "No evaluator verdicts parsed from LOG.md";
+    return wrap;
+  }
+  const letter = { ship: "S", iterate: "I", blocked: "B", needs_human: "H" };
+  const shown = seq.slice(-12);
+  for (const v of shown) wrap.appendChild(span("hist-cell hist-" + v, letter[v] || "?"));
+  wrap.title = "Verdicts, oldest to newest: " + seq.map((v) => letter[v]).join(" ");
+  wrap.setAttribute("aria-label", wrap.title);
+  return wrap;
+}
+
+function ageMs(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isNaN(t) ? null : Date.now() - t;
+}
+
+/* ---------------------------- data ---------------------------- */
+
+function ingestOverview(data) {
+  const loops = [];
+  const inbox = [];
+  const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+  for (const ws of workspaces) {
+    for (const loop of ws.loops || []) {
+      loop.root = ws.root;
+      loop.workspace = ws.name;
+      loop.worktree = Boolean(ws.worktree);
+      loop.key = loopKey(ws.root, loop.name);
+      loops.push(loop);
+    }
+    for (const item of ws.inbox || []) {
+      item.root = ws.root;
+      item.workspace = ws.name;
+      item.key = loopKey(ws.root, item.loop);
+      inbox.push(item);
+    }
+  }
+  state.workspaces = workspaces;
+  state.scanned = data.scanned || workspaces.length;
+  state.broker = data.broker || "disabled";
+  state.worktreesScanned = data.worktrees_scanned || 0;
+  state.loops = loops;
+  state.inbox = inbox;
+  state.byKey = new Map(loops.map((loop) => [loop.key, loop]));
+  state.updatedAt = data.updated_at || null;
+}
+
+async function refreshBoard() {
+  clearTimeout(state.boardTimer);
+  try {
+    const res = await fetch("/api/overview", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    ingestOverview(data);
+    state.lastOk = Date.now();
+    state.loaded = true;
+    hideBoardError();
+    renderAll();
+    if (pendingLoopHash) {
+      const target = resolveHashLoop(pendingLoopHash);
+      if (target) {
+        pendingLoopHash = null;
+        openDrawer(target.key);
+      }
+    }
+    if (state.activeLoop) refreshDetail({ quiet: true });
+  } catch (err) {
+    showBoardError(
+      state.loaded
+        ? "Lost contact with the dashboard server (" + err.message + "). Showing the last data received; retrying every 5 seconds."
+        : "Cannot reach the dashboard server (" + err.message + "). Retrying every 5 seconds."
+    );
+    renderLive();
+  }
+  schedulePoll();
+}
+
+/* Poll every 5 s while visible; hidden tabs stop polling (the server only
+ * rebuilds when someone asks). A build older than the server's rebuild
+ * interval means a fresh one is on its way, so look again sooner, once. */
+function schedulePoll() {
+  clearTimeout(state.boardTimer);
+  if (document.hidden) return;
+  const age = ageMs(state.updatedAt);
+  const soon = state.loaded && age != null && age > 18000 && !state.quickRepoll;
+  state.quickRepoll = soon;
+  state.boardTimer = setTimeout(refreshBoard, soon ? 1500 : BOARD_POLL_MS);
+}
+
+function resolveHashLoop(hash) {
+  if (hash.root) return state.byKey.get(loopKey(hash.root, hash.name)) || null;
+  return state.loops.find((loop) => loop.name === hash.name) || null;
+}
+
+function showBoardError(msg) {
+  el("board-error").hidden = false;
+  el("board-error-text").textContent = msg;
+}
+
+function hideBoardError() {
+  el("board-error").hidden = true;
+}
+
+/* ---------------------------- render ---------------------------- */
+
+function renderAll() {
+  const groups = attentionGroups();
+  renderLive();
+  renderSummary(groups);
+  renderNeeds(groups);
+  renderRunning();
+  renderWorkspaceFilter();
+  renderTabs();
+  renderBoard();
+  renderNotes(groups);
+  renderDrawerInbox();
+}
+
+function renderLive() {
+  const live = el("live");
+  const text = el("live-text");
+  const buildAge = ageMs(state.updatedAt);
+  const sinceOk = state.lastOk ? Date.now() - state.lastOk : null;
+  let cls = "live-ok";
+  let label;
+  if (!state.lastOk) {
+    cls = el("board-error").hidden ? "live-connecting" : "live-offline";
+    label = el("board-error").hidden ? "Connecting" : "Offline";
+  } else if (!el("board-error").hidden) {
+    cls = "live-offline";
+    label = "Offline · data from " + fmtClock(state.updatedAt);
+  } else if ((buildAge != null && buildAge > STALE_AFTER_MS) || sinceOk > STALE_AFTER_MS) {
+    cls = "live-stale";
+    label = "Stale · data from " + fmtClock(state.updatedAt);
+  } else {
+    label = "Live · " + fmtClock(state.updatedAt);
+  }
+  live.className = "live " + cls;
+  text.textContent = label;
+  live.title = "Polls every " + BOARD_POLL_MS / 1000 + " s. Data built at " +
+    (state.updatedAt ? new Date(state.updatedAt).toLocaleString() : "—");
+}
+
+/* Unread attention grouped per loop, split into "needs you" and notes. */
+function attentionGroups() {
+  const needs = new Map();
+  const notes = new Map();
+  let readCount = 0;
+  for (const item of state.inbox) {
+    if (item.read) {
+      readCount += 1;
+      if (!state.showReadInbox) continue;
+    }
+    const loop = state.byKey.get(item.key);
+    const target = isNeedsItem(item, loop) ? needs : notes;
+    if (!target.has(item.key)) target.set(item.key, { key: item.key, loop, items: [] });
+    target.get(item.key).items.push(item);
+  }
+  const order = (g) => Math.min(...g.items.map((i) => SEVERITY_RANK[i.severity] ?? 3));
+  const sortGroups = (map) => Array.from(map.values()).sort((a, b) =>
+    order(a) - order(b) ||
+    String(b.loop?.last_activity || "").localeCompare(String(a.loop?.last_activity || "")));
+  for (const g of [...needs.values(), ...notes.values()]) {
+    g.items.sort((a, b) => (SEVERITY_RANK[a.severity] ?? 3) - (SEVERITY_RANK[b.severity] ?? 3));
+  }
+  return { needs: sortGroups(needs), notes: sortGroups(notes), readCount };
+}
+
+function plural(n, word, many) {
+  return n + " " + (n === 1 ? word : many || word + "s");
+}
+
+/* "2 via driver · 1 process only": distinct phases, else evidence counts. */
+function runningContext(running) {
+  const phases = Array.from(new Set(running.map(phaseText).filter(Boolean)));
+  if (phases.length) return phases.slice(0, 2).join(", ") + (phases.length > 2 ? "…" : "");
+  const byDriver = running.filter((l) => (l.running_sources || []).includes("driver")).length;
+  const other = running.length - byDriver;
+  return [byDriver ? byDriver + " via driver" : "", other ? other + " via process or session" : ""]
+    .filter(Boolean).join(" · ");
+}
+
+function renderSummary(groups) {
+  const loops = state.loops;
+  const running = loops.filter((l) => l.running);
+  const needsLoops = groups.needs.filter((g) => g.items.some((i) => !i.read));
+  const shipped7 = loops.filter((l) => normVerdict(latestVerdict(l)) === "ship" &&
+    (ageMs(l.verdict_mtime) ?? Infinity) <= WEEK_MS);
+  const wsCount = state.workspaces.length;
+
+  let verdict;
+  if (!loops.length) {
+    verdict = "No loop mailboxes found yet.";
+  } else if (needsLoops.length) {
+    verdict = plural(needsLoops.length, "loop") + (needsLoops.length === 1 ? " needs" : " need") + " you" +
+      (running.length ? "; " + plural(running.length, "loop") + " running." : "; none running.");
+  } else if (running.length) {
+    verdict = "All clear: " + plural(running.length, "loop") + " running, nothing needs you.";
+  } else {
+    verdict = "All clear. No loop is running and nothing needs you.";
+  }
+  el("verdict").textContent = verdict;
+  const latest = loops.slice().sort((a, b) =>
+    String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
+  const wtShown = state.workspaces.filter((w) => w.worktree).length;
+  const coverage = "Covers " + plural(wsCount - wtShown, "workspace") +
+    (wtShown ? " and " + plural(wtShown, "worktree") : "") + " with loops (" +
+    plural(state.scanned, "workspace") + (state.worktreesScanned ? " and " + plural(state.worktreesScanned, "worktree") : "") +
+    " scanned).";
+  el("verdict-sub").textContent = (latest
+    ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + ". "
+    : "Start a loop with /trio-init in a project; it appears here on the next poll. ") + coverage;
+  const brokerNote = el("broker-note");
+  const brokerText = {
+    disabled: "Broker liveness is not configured, so loops driven only through Omnigent broker sessions cannot show as running.",
+    unreachable: "The Omnigent broker did not answer; loops driven only through broker sessions may be running but show as not running.",
+    truncated: "The Omnigent broker session list was too long to read in full; some broker-only loops may not show as running.",
+  }[state.broker];
+  brokerNote.hidden = !brokerText;
+  brokerNote.textContent = brokerText || "";
+
+  const partial = state.workspaces.filter((w) => w.error);
+  el("board-partial").hidden = partial.length === 0;
+  el("board-partial").textContent = partial.length
+    ? "Could not read " + partial.map((w) => w.name).join(", ") + ". Other workspaces are shown."
+    : "";
+
+  const kpis = el("kpis");
+  kpis.textContent = "";
+  const unread = groups.needs.reduce((n, g) => n + g.items.filter((i) => !i.read).length, 0);
+  const tile = (label, value, context, tone, target) => {
+    const node = document.createElement(target ? "a" : "div");
+    node.className = "kpi" + (tone ? " kpi-" + tone : "");
+    if (target) node.href = target;
+    node.appendChild(span("eyebrow", label));
+    node.appendChild(span("kpi-value", String(value)));
+    node.appendChild(span("kpi-context", context));
+    kpis.appendChild(node);
+  };
+  tile("Needs you", needsLoops.length,
+    needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
+    needsLoops.length ? "warning" : "", "#needs");
+  tile("Running now", running.length,
+    running.length ? runningContext(running) : "No live driver, process or session",
+    running.length ? "live" : "", "#running");
+  tile("Shipped, last 7 days", shipped7.length,
+    plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null);
+  tile("Loops tracked", loops.length,
+    "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops");
+}
 
 function inboxMarkButton(item) {
   const mark = document.createElement("button");
   mark.type = "button";
-  mark.className = "inbox-mark";
+  mark.className = "btn btn-ghost btn-small";
   mark.textContent = item.read ? "Mark unread" : "Mark read";
   mark.setAttribute(
     "aria-label",
@@ -243,171 +560,217 @@ function inboxMarkButton(item) {
   );
   mark.addEventListener("click", (event) => {
     event.stopPropagation();
-    setInboxRead(item, !item.read);
+    setInboxRead([item], !item.read);
   });
   return mark;
 }
 
-function inboxRow(item, opensDrawer) {
-  const row = document.createElement("div");
-  row.className = "inbox-item inbox-" + cssClass(item.severity || "low");
-  if (item.read) row.classList.add("is-read");
-  row.setAttribute("role", "button");
-  row.tabIndex = 0;
+function severityBadge(item) {
+  const sev = item.severity || "low";
+  const label = { high: "Action", medium: "Check", low: "Note" }[sev] || sev;
+  const tone = { high: "negative", medium: "warning", low: "neutral" }[sev] || "neutral";
+  const badge = span("badge badge-" + tone, "");
+  badge.appendChild(span("badge-icon", { high: "!", medium: "▲", low: "•" }[sev] || "•"));
+  badge.appendChild(document.createTextNode(label));
+  return badge;
+}
 
-  row.appendChild(span("inbox-sev", (item.severity || "").toUpperCase()));
-  const main = document.createElement("span");
-  main.className = "inbox-main";
-  const head = document.createElement("span");
-  head.className = "inbox-headline";
-  head.appendChild(span("inbox-loop", item.loop || "?"));
-  head.appendChild(document.createTextNode(item.headline || ""));
-  main.appendChild(head);
-  if (item.detail) {
-    const det = span("inbox-detail", item.detail);
-    det.title = item.detail;
-    main.appendChild(det);
+/* One row per loop: the most severe item leads, the rest are counted. */
+function attentionRow(group) {
+  const lead = group.items[0];
+  const loop = group.loop;
+  const row = document.createElement("div");
+  row.className = "attn-row";
+  if (group.items.every((i) => i.read)) row.classList.add("is-read");
+  row.dataset.key = group.key;
+
+  row.appendChild(severityBadge(lead));
+
+  const main = document.createElement("div");
+  main.className = "attn-main";
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "attn-open";
+  open.textContent = loop ? loopTitle(loop) : lead.loop;
+  open.setAttribute("aria-label", "Open " + (loop ? loopTitle(loop) : lead.loop) + ": " + lead.headline);
+  open.addEventListener("click", () => openDrawer(group.key));
+  main.appendChild(open);
+  main.appendChild(span("attn-where mono", lead.workspace + " / " + lead.loop));
+  const reason = document.createElement("p");
+  reason.className = "attn-reason";
+  reason.textContent = lead.headline || "";
+  if (group.items.length > 1) {
+    reason.appendChild(span("attn-more", " + " + plural(group.items.length - 1, "more item")));
+  }
+  main.appendChild(reason);
+  if (lead.detail) {
+    const detail = span("attn-detail", oneLine(lead.detail, 220));
+    detail.title = lead.detail;
+    main.appendChild(detail);
   }
   row.appendChild(main);
-  row.appendChild(inboxMarkButton(item));
 
-  if (opensDrawer) {
-    row.addEventListener("click", () => openDrawer(item.loop));
-    row.addEventListener("keydown", (event) => {
-      if (event.target !== row) return;
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      openDrawer(item.loop);
-    });
-  }
+  const side = document.createElement("div");
+  side.className = "attn-side";
+  side.appendChild(span("caption", loop && loop.last_activity ? relTime(loop.last_activity) : ""));
+  const mark = document.createElement("button");
+  mark.type = "button";
+  mark.className = "btn btn-ghost btn-small";
+  const allRead = group.items.every((i) => i.read);
+  mark.textContent = allRead ? "Mark unread" : (group.items.length > 1 ? "Mark all read" : "Mark read");
+  mark.setAttribute("aria-label", mark.textContent + ": " + (loop ? loopTitle(loop) : lead.loop));
+  mark.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setInboxRead(group.items, !allRead);
+  });
+  side.appendChild(mark);
+  row.appendChild(side);
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    openDrawer(group.key);
+  });
   return row;
 }
 
-function renderDrawerInbox() {
-  const section = el("drawer-inbox-section");
-  const list = el("drawer-inbox-list");
-  if (!section || !list) return;
-  list.textContent = "";
-  const items = state.inbox.filter((item) => item.loop === state.activeLoop);
-  section.hidden = items.length === 0;
-  for (const item of items) list.appendChild(inboxRow(item, false));
+function emptyState(icon, text) {
+  const node = document.createElement("div");
+  node.className = "empty";
+  node.appendChild(span("empty-icon", icon));
+  node.appendChild(span("", text));
+  return node;
 }
 
-function renderInbox(inbox) {
-  const section = el("inbox");
-  const list = el("inbox-list");
-  const items = Array.isArray(inbox) ? inbox : [];
-  const readCount = items.filter((item) => item.read).length;
-  const unreadCount = items.length - readCount;
+function renderNeeds(groups) {
+  const list = el("needs-list");
   const toggle = el("inbox-toggle");
-
-  /* Keep the badge as unread work even while read history is revealed. */
-  el("inbox-count").textContent = String(unreadCount);
-  toggle.hidden = readCount === 0;
-  toggle.textContent = (state.showReadInbox ? "hide read (" : "show read (") +
-    readCount + ")";
+  const unreadGroups = groups.needs.filter((g) => g.items.some((i) => !i.read));
+  el("needs-count").textContent = unreadGroups.length ? String(unreadGroups.length) : "";
+  toggle.hidden = groups.readCount === 0;
+  toggle.textContent = (state.showReadInbox ? "Hide read (" : "Show read (") + groups.readCount + ")";
   toggle.setAttribute("aria-expanded", String(state.showReadInbox));
-  section.hidden = items.length === 0;
   list.textContent = "";
-
-  const visible = state.showReadInbox
-    ? items
-    : items.filter((item) => !item.read);
-  for (const item of visible) list.appendChild(inboxRow(item, true));
-  renderDrawerInbox();
-}
-
-async function setInboxRead(item, read) {
-  try {
-    const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ids: [item.id], root: currentRoot}),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
-    await refreshBoard();
-  } catch (err) {
-    showBoardError("Inbox update failed: " + err.message);
+  if (!groups.needs.length) {
+    list.appendChild(emptyState("✓", "Nothing needs you. Loops that block, ask for human verification or stop mid-loop appear here."));
+    return;
   }
+  for (const group of groups.needs) list.appendChild(attentionRow(group));
 }
 
-async function refreshBoard() {
-  try {
-    const res = await fetch(withRoot("/api/board"), { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    state.loops = Array.isArray(data.loops) ? data.loops : [];
-    state.inbox = Array.isArray(data.inbox) ? data.inbox : [];
-    renderInbox(state.inbox);
-    state.updatedAt = data.updated_at || null;
-    setBoardStatus("live", "live");
-    hideBoardError();
-    renderTabs();
-    renderBoard();
-    if (pendingLoopHash && state.loops.some((l) => l.name === pendingLoopHash)) {
-      const target = pendingLoopHash;
-      pendingLoopHash = null;
-      openDrawer(target);
+function renderNotes(groups) {
+  const details = el("notes");
+  details.hidden = groups.notes.length === 0;
+  const count = groups.notes.reduce((n, g) => n + g.items.length, 0);
+  el("notes-count").textContent = String(count);
+  el("notes-sub").textContent = "Drift, overlap, repair and unconfirmed-stop notes on " + plural(groups.notes.length, "loop") + " that are not running";
+  const list = el("notes-list");
+  list.textContent = "";
+  for (const group of groups.notes) list.appendChild(attentionRow(group));
+}
+
+function renderRunning() {
+  const list = el("running-list");
+  const running = state.loops.filter((l) => l.running)
+    .sort((a, b) => String(b.last_activity || "").localeCompare(String(a.last_activity || "")));
+  el("running-count").textContent = running.length ? String(running.length) : "";
+  list.textContent = "";
+  const busy = state.workspaces.filter((w) => w.unattributed_processes > 0);
+  for (const ws of busy) {
+    const note = document.createElement("p");
+    note.className = "run-note";
+    note.textContent = plural(ws.unattributed_processes, "process", "processes") +
+      " working in " + ws.name + " name no mailbox, so no loop there is marked running.";
+    list.appendChild(note);
+  }
+  if (!running.length) {
+    list.appendChild(emptyState("○", "No loop is running. A loop shows here while its driver, lock, process or session is live."));
+    return;
+  }
+  for (const loop of running) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "run-card";
+    card.dataset.key = loop.key;
+    card.addEventListener("click", () => openDrawer(loop.key));
+    const top = document.createElement("span");
+    top.className = "run-top";
+    top.appendChild(stateBadge(loop));
+    top.appendChild(span("caption", "last write " + relTime(loop.last_activity)));
+    card.appendChild(top);
+    card.appendChild(span("run-title", loopTitle(loop)));
+    card.appendChild(span("attn-where mono", loop.workspace + " / " + loop.name));
+    const meta = document.createElement("span");
+    meta.className = "run-meta";
+    meta.appendChild(span("", "Iteration " + iterationText(loop)));
+    const phase = phaseText(loop);
+    if (phase) meta.appendChild(span("", phase));
+    card.appendChild(meta);
+    if (loop.iteration != null && loop.max_iterations) {
+      const bar = document.createElement("span");
+      bar.className = "meter";
+      bar.setAttribute("role", "img");
+      bar.setAttribute("aria-label", "Iteration " + loop.iteration + " of " + loop.max_iterations);
+      const fill = document.createElement("span");
+      fill.className = "meter-fill";
+      fill.style.width = Math.min(100, (loop.iteration / loop.max_iterations) * 100) + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
     }
-    if (state.activeLoop) refreshDetail({ quiet: true });
-  } catch (err) {
-    setBoardStatus("error", "offline");
-    showBoardError("Cannot reach the dashboard server: " + err.message);
+    card.appendChild(span("caption", "Live via " + (loop.running_sources || []).join(", ")));
+    list.appendChild(card);
   }
-  state.boardTimer = setTimeout(refreshBoard, BOARD_POLL_MS);
 }
 
-function setBoardStatus(cls, text) {
-  el("board-status").className = "board-status status-" + cls;
-  el("board-status-text").textContent = text;
+function renderWorkspaceFilter() {
+  const select = el("workspace-filter");
+  const names = state.workspaces.map((w) => [w.root, w.name, (w.loops || []).length]);
+  const sig = JSON.stringify(names);
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.textContent = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All workspaces";
+    select.appendChild(all);
+    for (const [root, name, count] of names) {
+      const option = document.createElement("option");
+      option.value = root;
+      option.textContent = name + " (" + count + ")";
+      option.title = root;
+      select.appendChild(option);
+    }
+  }
+  if (state.workspace && !names.some(([root]) => root === state.workspace)) state.workspace = "";
+  select.value = state.workspace;
 }
 
-function showBoardError(msg) {
-  const node = el("board-error");
-  node.hidden = false;
-  node.textContent = msg;
-}
-
-function hideBoardError() {
-  el("board-error").hidden = true;
-}
-
-function updateAggregates() {
-  const total = state.loops.length;
-  const active = state.loops.filter((l) => Boolean(l.running)).length;
-  el("agg-loops").textContent = total + (total === 1 ? " loop" : " loops");
-  el("agg-active").textContent = active + " active";
-  el("agg-active").classList.toggle("is-active", active > 0);
-  const at = state.updatedAt ? fmtClock(state.updatedAt) : null;
-  el("updated-at").textContent = "updated " + (at || "—");
+function hasUnreadAttention(loop) {
+  return state.inbox.some((item) => item.key === loop.key && !item.read);
 }
 
 function matchesTab(tab, loop) {
   if (tab === "running") return Boolean(loop.running);
-  if (tab === "attention") {
-    return state.inbox.some((item) => item.loop === loop.name && !item.read);
-  }
+  if (tab === "attention") return hasUnreadAttention(loop);
   if (tab === "archived") return isArchived(loop);
   return true;
 }
 
+const TAB_LABELS = { running: "Running", attention: "Attention", all: "All", archived: "Archived" };
+
 function renderTabs() {
   const nav = el("tabs");
+  const scoped = state.loops.filter(matchesFilters);
   nav.textContent = "";
   for (const tab of TABS) {
-    const count = state.loops.filter((loop) => matchesTab(tab, loop)).length;
+    const count = scoped.filter((loop) => matchesTab(tab, loop)).length;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "tab";
-    if (state.tab === tab) btn.classList.add("active");
-    if (count === 0) btn.classList.add("tab-empty");
-    btn.textContent = tab;
-    btn.appendChild(span("tab-count", String(count)));
+    btn.className = "seg-btn";
+    btn.textContent = TAB_LABELS[tab];
+    btn.appendChild(span("seg-count", String(count)));
     btn.setAttribute("aria-pressed", String(state.tab === tab));
     btn.addEventListener("click", () => {
       state.tab = tab;
-      history.replaceState(null, "", tab === "all" ? "#" : "#" + tab);
+      savePrefs();
       renderTabs();
       renderBoard();
     });
@@ -415,249 +778,349 @@ function renderTabs() {
   }
 }
 
+function matchesFilters(loop) {
+  if (state.workspace && loop.root !== state.workspace) return false;
+  const q = state.query.trim().toLowerCase();
+  if (!q) return true;
+  return [loop.title, loop.name, loop.workspace, loop.mission, loop.status]
+    .some((v) => String(v || "").toLowerCase().includes(q));
+}
+
 function visibleLoops() {
+  const { key, dir } = state.sort;
+  const sign = dir === "asc" ? 1 : -1;
+  const value = (loop) => key === "loop" ? loopTitle(loop).toLowerCase()
+    : key === "workspace" ? (loop.workspace + "/" + loop.name).toLowerCase()
+    : String(loop.last_activity || "");
   return state.loops
-    .filter((l) => matchesTab(state.tab, l))
+    .filter((l) => matchesFilters(l) && matchesTab(state.tab, l))
     .sort((a, b) => {
       const running = Number(Boolean(b.running)) - Number(Boolean(a.running));
-      if (running !== 0) return running;
-      return String(b.verdict_mtime || "").localeCompare(
-        String(a.verdict_mtime || "")
-      );
+      if (key === "activity" && running !== 0) return running;
+      return sign * value(a).localeCompare(value(b));
     });
 }
 
 function boardSignature(loops) {
   return JSON.stringify(
     loops.map((loop) => [
-      loop.name,
+      loop.key,
+      loop.title || "",
       loop.status ?? null,
       loop.final_verdict ?? null,
       Boolean(loop.running),
       loop.running_sources || [],
-      isArchived(loop),
-      loop.verdict_mtime ?? null,
+      loop.last_activity ?? null,
       loop.iteration,
       loop.max_iterations,
-      loop.mission || "",
       verdictSeq(loop),
       loop.driver_phase ?? null,
-      loop.driver ?? null,
+      hasUnreadAttention(loop),
+      state.activeLoop === loop.key,
     ])
   );
 }
 
-function boardEmpty(text) {
-  const empty = document.createElement("div");
-  empty.className = "board-empty";
-  empty.textContent = text;
-  return empty;
-}
-
 function renderBoard() {
-  updateAggregates();
-  const grid = el("card-grid");
+  const body = el("loop-rows");
   const loops = state.loops.length ? visibleLoops() : [];
   const emptyText = !state.loops.length
-    ? "No loop mailboxes found. Start one with /trio-init in this project."
-    : loops.length ? "" : "No " + state.tab + " loops.";
+    ? "No loop mailboxes found. Start one with /trio-init in a project."
+    : loops.length ? "" : "No loops match these filters.";
+  for (const th of document.querySelectorAll(".loop-table th[aria-sort]")) {
+    const key = th.querySelector(".th-sort")?.dataset.sort;
+    th.setAttribute("aria-sort", key === state.sort.key
+      ? (state.sort.dir === "asc" ? "ascending" : "descending") : "none");
+  }
   const sig = state.tab + "|" + emptyText + "|" + boardSignature(loops);
   if (sig === state.boardSignature) return;
   state.boardSignature = sig;
 
   if (emptyText) {
-    grid.textContent = "";
-    grid.appendChild(boardEmpty(emptyText));
+    body.textContent = "";
+    const tr = document.createElement("tr");
+    tr.className = "row-empty";
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.appendChild(emptyState("○", emptyText));
+    tr.appendChild(td);
+    body.appendChild(tr);
     return;
   }
-  for (const stale of Array.from(grid.querySelectorAll(".board-empty"))) stale.remove();
+  for (const stale of Array.from(body.querySelectorAll(".row-empty, .row-loading"))) stale.remove();
 
   const existing = new Map();
-  for (const card of grid.querySelectorAll(".loop-card")) {
-    existing.set(card.dataset.loop, card);
-  }
-  const wanted = new Set(loops.map((loop) => loop.name));
-  for (const [name, card] of existing) {
-    if (!wanted.has(name)) {
-      card.remove();
-      existing.delete(name);
+  for (const row of body.querySelectorAll(".loop-row")) existing.set(row.dataset.key, row);
+  const wanted = new Set(loops.map((loop) => loop.key));
+  for (const [key, row] of existing) {
+    if (!wanted.has(key)) {
+      row.remove();
+      existing.delete(key);
     }
   }
-  let added = 0;
   const ordered = loops.map((loop) => {
-    const old = existing.get(loop.name);
+    const old = existing.get(loop.key);
     if (old) {
       patchCard(old, loop);
       return old;
     }
-    const card = cardEl(loop);
-    card.style.animationDelay = Math.min(added * 40, 320) + "ms";
-    added += 1;
-    return card;
+    return cardEl(loop);
   });
-  let cursor = grid.firstElementChild;
-  for (const card of ordered) {
-    if (card === cursor) {
+  let cursor = body.firstElementChild;
+  for (const row of ordered) {
+    if (row === cursor) {
       cursor = cursor.nextElementSibling;
       continue;
     }
-    grid.insertBefore(card, cursor);
+    body.insertBefore(row, cursor);
   }
 }
 
-function patchCard(card, loop) {
+/* Rows patch in place: only cells whose content changed are replaced, so
+ * focus and hover survive the 5 s poll. */
+function patchCard(row, loop) {
   const fresh = cardEl(loop);
-  fresh.classList.remove("active");
-  card.className = fresh.className;
-  if (state.activeLoop === loop.name) card.classList.add("active");
-  card.setAttribute("aria-label", fresh.getAttribute("aria-label"));
-  for (const sel of [".card-top", ".card-name", ".card-mission", ".card-bottom", ".card-controls"]) {
-    const oldPart = card.querySelector(sel);
-    const newPart = fresh.querySelector(sel);
-    if (oldPart && newPart) {
-      if (!oldPart.isEqualNode(newPart)) oldPart.replaceWith(newPart);
-    } else if (oldPart) {
-      oldPart.remove();
-    } else if (newPart) {
-      const controls = card.querySelector(".card-controls");
-      const bottom = card.querySelector(".card-bottom");
-      const anchor = sel === ".card-mission" ? bottom || controls : controls;
-      card.insertBefore(newPart, anchor);
-    }
-  }
+  row.className = fresh.className;
+  const oldCells = Array.from(row.children);
+  const newCells = Array.from(fresh.children);
+  newCells.forEach((cell, i) => {
+    if (!oldCells[i]) row.appendChild(cell);
+    else if (!oldCells[i].isEqualNode(cell)) oldCells[i].replaceWith(cell);
+  });
 }
 
 function cardEl(loop) {
-  const card = document.createElement("article");
-  card.className = "loop-card";
-  card.dataset.loop = loop.name;
-  if (state.activeLoop === loop.name) card.classList.add("active");
-  card.setAttribute("role", "group");
-  card.tabIndex = 0;
-  card.setAttribute("aria-label", "Open detail for " + loop.name);
+  const row = document.createElement("tr");
+  row.className = "loop-row" + (state.activeLoop === loop.key ? " active" : "") +
+    (isArchived(loop) ? " is-archived" : "");
+  row.dataset.key = loop.key;
 
-  const top = document.createElement("div");
-  top.className = "card-top";
-  const tags = document.createElement("div");
-  tags.className = "card-tags";
-  appendLoopTags(tags, loop);
-  const phase = String(loop.driver_phase || loop.phase || "").trim();
-  // An idle phase is not a useful board tag; do not reintroduce an inference.
-  if (phase && phase.toLowerCase() !== "idle") {
-    tags.appendChild(
-      span(
-        "status-label status-phase",
-        phase.replace(/[-_]/g, " ").toUpperCase()
-      )
-    );
+  const nameCell = document.createElement("th");
+  nameCell.scope = "row";
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "row-open";
+  open.textContent = loopTitle(loop);
+  open.title = loop.mission || loopTitle(loop);
+  open.addEventListener("click", () => openDrawer(loop.key));
+  nameCell.appendChild(open);
+  const sub = document.createElement("span");
+  sub.className = "row-sub mono";
+  sub.textContent = loop.name;
+  nameCell.appendChild(sub);
+  if (hasUnreadAttention(loop)) {
+    const n = state.inbox.filter((i) => i.key === loop.key && !i.read).length;
+    nameCell.appendChild(span("row-flag", plural(n, "unread item")));
   }
-  top.appendChild(tags);
-  const iter = document.createElement("span");
-  iter.className = "card-iter";
-  const cur = loop.iteration != null ? loop.iteration : "–";
-  const max = loop.max_iterations != null ? loop.max_iterations : "–";
-  const current = document.createElement("strong");
-  current.textContent = cur;
-  iter.appendChild(current);
-  iter.appendChild(document.createTextNode(" / " + max + " iter"));
-  top.appendChild(iter);
-  card.appendChild(top);
-
-  const name = document.createElement("h3");
-  name.className = "card-name";
-  name.textContent = loop.name;
-  card.appendChild(name);
-
-  if (loop.mission) {
-    const mission = document.createElement("p");
-    mission.className = "card-mission";
-    mission.textContent = loop.mission;
-    mission.title = loop.mission;
-    card.appendChild(mission);
+  if (isArchived(loop)) nameCell.appendChild(span("row-flag row-flag-muted", "Archived"));
+  if (loop.worktree && (loop.worktree_reasons || []).length) {
+    const tag = span("row-flag row-flag-muted", "Worktree: " + loop.worktree_reasons.join(", "));
+    tag.title = "Shown because this linked worktree's copy is " + loop.worktree_reasons.join(", ") +
+      "; untouched committed copies of the main checkout's mailboxes are hidden.";
+    nameCell.appendChild(tag);
   }
+  row.appendChild(nameCell);
 
-  const bottom = document.createElement("div");
-  bottom.className = "card-bottom";
-  bottom.appendChild(segbarEl(verdictSeq(loop), false));
-  bottom.appendChild(
-    span(
-      "card-activity",
-      "updated " + (loop.verdict_mtime ? relTime(loop.verdict_mtime) : "—")
-    )
-  );
-  card.appendChild(bottom);
+  const ws = document.createElement("td");
+  ws.className = "col-ws";
+  ws.textContent = loop.workspace;
+  ws.title = loop.root;
+  row.appendChild(ws);
 
-  const controls = document.createElement("div");
-  controls.className = "card-controls";
-  const driver = loop.driver === "omnigent" ? "omnigent" : "portable";
-  const start = document.createElement("button");
-  start.type = "button";
-  start.textContent = "Start";
-  start.title = "Start " + driver + " loop";
-  start.disabled = Boolean(loop.running);
-  start.addEventListener("click", (event) => {
-    event.stopPropagation();
-    controlLoop("start", driver);
-  });
-  const stop = document.createElement("button");
-  stop.type = "button";
-  stop.textContent = "Stop";
-  stop.title = "Stop " + driver + " loop";
-  stop.disabled = !loop.running;
-  stop.addEventListener("click", (event) => {
-    event.stopPropagation();
-    controlLoop("stop", driver);
-  });
-  controls.appendChild(start);
-  controls.appendChild(stop);
-  card.appendChild(controls);
+  const st = document.createElement("td");
+  st.appendChild(stateBadge(loop));
+  const phase = phaseText(loop);
+  if (phase) st.appendChild(span("row-sub", phase));
+  row.appendChild(st);
 
-  card.addEventListener("click", () => openDrawer(loop.name));
-  card.addEventListener("keydown", (event) => {
-    if (event.target !== card) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    openDrawer(loop.name);
+  const it = document.createElement("td");
+  it.className = "num col-iter";
+  it.textContent = iterationText(loop);
+  row.appendChild(it);
+
+  const hist = document.createElement("td");
+  hist.className = "col-hist";
+  hist.appendChild(historyEl(loop));
+  row.appendChild(hist);
+
+  const act = document.createElement("td");
+  act.className = "num";
+  const time = document.createElement("time");
+  time.dateTime = loop.last_activity || "";
+  time.textContent = loop.last_activity ? relTime(loop.last_activity) : "—";
+  time.title = loop.last_activity ? new Date(loop.last_activity).toLocaleString() : "No activity recorded";
+  act.appendChild(time);
+  row.appendChild(act);
+
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("button, a")) return;
+    openDrawer(loop.key);
   });
-  return card;
+  return row;
 }
 
-async function controlLoop(action, driver) {
+async function setInboxRead(items, read) {
+  const byRoot = new Map();
+  for (const item of items) {
+    if (!byRoot.has(item.root)) byRoot.set(item.root, []);
+    byRoot.get(item.root).push(item.id);
+  }
+  try {
+    for (const [root, ids] of byRoot) {
+      const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids, root }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+    }
+    for (const item of items) item.read = read;
+    renderAll();
+  } catch (err) {
+    showBoardError("Could not update the attention list: " + err.message);
+  }
+}
+
+function renderDrawerInbox() {
+  const section = el("drawer-inbox-section");
+  const list = el("drawer-inbox-list");
+  if (!section || !list) return;
+  list.textContent = "";
+  const items = state.inbox.filter((item) => item.key === state.activeLoop);
+  section.hidden = items.length === 0;
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "attn-row attn-row-compact" + (item.read ? " is-read" : "");
+    row.appendChild(severityBadge(item));
+    const main = document.createElement("div");
+    main.className = "attn-main";
+    main.appendChild(span("attn-reason", item.headline || ""));
+    if (item.detail) main.appendChild(span("attn-detail", item.detail));
+    row.appendChild(main);
+    row.appendChild(inboxMarkButton(item));
+    list.appendChild(row);
+  }
+}
+
+/* Action feedback survives polls: a local note (in flight, or refused
+ * before the server recorded anything) wins until the server's own record
+ * for the mailbox is newer. */
+function actionNote(loop) {
+  const local = state.actionNotes.get(loop.key);
+  const server = loop.last_action;
+  if (local && (!server || !server.updated_at ||
+      Date.parse(server.updated_at) < local.at || local.pending)) {
+    return local;
+  }
+  if (!server) return null;
+  const tone = { failed: "error", exited: "error", running: "ok", finished: "ok", stopped: "ok", stopping: "pending" }[server.outcome] || "ok";
+  const when = server.updated_at ? " · " + relTime(server.updated_at) : "";
+  return { text: (server.message || server.outcome) + when, tone };
+}
+
+async function controlLoop(action) {
+  const loop = state.byKey.get(state.activeLoop);
+  if (!loop) return;
+  const controls = loop.controls || {};
+  const driver = controls.driver || "portable";
+  if (!(controls[action] && controls[action].enabled)) return;
+  if (action === "stop" && !window.confirm("Stop " + loopTitle(loop) + "? " + controls.stop.reason)) return;
+  const key = loop.key;
+  state.actionNotes.set(key, { text: action === "start" ? "Starting the " + driver + " driver…" : "Stopping…", tone: "pending", pending: true, at: Date.now() });
+  renderDrawerControls(loop);
+  let note;
   try {
     const res = await fetch("/api/loop/" + action, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root: currentRoot, driver }),
+      body: JSON.stringify({ root: loop.root, driver }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
-    await refreshBoard();
+    note = { text: action === "start" ? "Started (PID " + data.pid + ")." : "Stop requested for PID " + data.pid + ".", tone: "ok", at: Date.now() };
   } catch (err) {
-    showBoardError("Loop " + action + " failed: " + err.message);
+    note = { text: "Loop " + action + " failed: " + err.message, tone: "error", at: Date.now() };
+  }
+  state.actionNotes.set(key, note);
+  renderDrawerControls(state.byKey.get(key) || loop);
+  await refreshBoard();
+}
+
+/* Capabilities come from the server (`controls`), which also enforces them. */
+function renderDrawerControls(loop) {
+  const wrap = el("drawer-controls");
+  if (!loop) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  const controls = loop.controls || {
+    start: { enabled: false, reason: "Controls unavailable." },
+    stop: { enabled: false, reason: "Controls unavailable." },
+  };
+  const pending = Boolean(state.actionNotes.get(loop.key)?.pending);
+  const start = el("loop-start");
+  const stop = el("loop-stop");
+  start.disabled = pending || !controls.start.enabled;
+  stop.disabled = pending || !controls.stop.enabled;
+  start.title = controls.start.reason;
+  stop.title = controls.stop.reason || controls.start.reason;
+  const note = el("loop-control-note");
+  const status = actionNote(loop);
+  if (status) {
+    note.textContent = status.text;
+    note.className = "control-note control-" + status.tone;
+    note.setAttribute("role", status.tone === "error" ? "alert" : "status");
+  } else {
+    note.textContent = controls.start.enabled ? "" : controls.start.reason;
+    if (!controls.start.enabled && controls.stop.enabled) note.textContent = controls.stop.reason;
+    note.className = "control-note caption";
+    note.setAttribute("role", "status");
   }
 }
 
 function markActiveCard() {
-  for (const card of document.querySelectorAll(".loop-card")) {
-    card.classList.toggle("active", card.dataset.loop === state.activeLoop);
+  for (const row of document.querySelectorAll(".loop-row")) {
+    row.classList.toggle("active", row.dataset.key === state.activeLoop);
   }
 }
 
 /* ------------------------------ drawer ------------------------------ */
 
-async function openDrawer(name) {
-  if (!el("drawer").hidden && state.activeLoop === name) return;
+/* The drawer is modal: the board behind it leaves the tab order and the
+ * accessibility tree while it is open. */
+function setBackgroundInert(on) {
+  for (const node of document.querySelectorAll(".appbar, #main, .skip-link")) {
+    node.inert = on;
+  }
+}
+
+async function openDrawer(key) {
+  const loop = state.byKey.get(key);
+  if (!loop) return;
+  if (!el("drawer").hidden && state.activeLoop === key) return;
   closeStream();
-  state.activeLoop = name;
-  history.replaceState(null, "", "#loop=" + encodeURIComponent(name));
+  state.activeLoop = key;
+  state.returnFocus = document.activeElement;
+  currentRoot = loop.root;
+  const name = loop.name;
+  history.replaceState(null, "", "#root=" + encodeURIComponent(loop.root) +
+    "&loop=" + encodeURIComponent(name));
   state.detail = null;
   state.compare = [];
+  state.tlOpen.clear();
+  state.tlSignature = null;
   state.sessions = [];
   state.activePath = null;
   state.drawerTab = "overview";
   state.graphSel = null;
 
-  el("drawer-name").textContent = name;
+  el("drawer-name").textContent = loopTitle(loop);
+  el("drawer-where").textContent = loop.workspace + " / " + name;
+  el("drawer-where").title = loop.root + "/" + name;
+  el("loop-control-note").textContent = "";
+  renderDrawerControls(loop);
   el("drawer-badge").className = "status-tags";
   el("drawer-badge").textContent = "LOADING";
   el("drawer-mission").textContent = "";
@@ -671,10 +1134,16 @@ async function openDrawer(name) {
   el("drawer-timeline").appendChild(span("timeline-empty", "Loading…"));
   el("session-list").textContent = "";
   setPaneStatus("idle", "loading…");
+  state.offset = 0;
+  state.size = null;
+  state.records = 0;
+  setOffsetHint();
   renderTranscript();
 
   el("drawer").hidden = false;
   el("drawer-scrim").hidden = false;
+  setBackgroundInert(true);
+  el("drawer-close").focus();
   markActiveCard();
   renderDrawerTabs();
   showDrawerTab();
@@ -687,6 +1156,8 @@ function closeDrawer() {
   state.activeLoop = null;
   state.detail = null;
   state.compare = [];
+  state.tlOpen.clear();
+  state.tlSignature = null;
   state.sessions = [];
   state.activePath = null;
   state.pendingLines = [];
@@ -694,23 +1165,32 @@ function closeDrawer() {
   state.graphSel = null;
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
+  setBackgroundInert(false);
+  history.replaceState(null, "", location.pathname);
   markActiveCard();
+  const back = state.returnFocus;
+  state.returnFocus = null;
+  if (back && document.contains(back)) back.focus();
 }
 
 async function refreshDetail({ quiet }) {
-  const name = state.activeLoop;
-  if (!name) return;
+  const key = state.activeLoop;
+  const loop = state.byKey.get(key);
+  if (!loop) return;
+  renderDrawerControls(loop);
   try {
-    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(name)), {
+    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(loop.name)), {
       cache: "no-store",
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    if (state.activeLoop !== name) return;
+    if (state.activeLoop !== key) return;
     const detail = await res.json();
     state.detail = detail;
+    const before = sessionSignature(state.sessions);
     state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
     renderDetail(detail);
-    if (!quiet) renderSessionList();
+    if (!quiet || sessionSignature(state.sessions) !== before) renderSessionList();
+    if (state.drawerTab === "transcripts") openDefaultSession();
   } catch (err) {
     if (!quiet) {
       el("drawer-timeline").textContent = "";
@@ -764,7 +1244,8 @@ function iterLifecycle(n) {
  * chips go through lifecycleChip(n), which delegates here). */
 function lifecycleChipFor(st) {
   const s = String(st || "");
-  return span("lifecycle-chip lifecycle-" + s, s.replace("_", " "));
+  const label = s.replace("_", " ");
+  return span("lifecycle-chip lifecycle-" + s, label.charAt(0).toUpperCase() + label.slice(1));
 }
 
 function lifecycleChip(n) {
@@ -786,7 +1267,12 @@ function toggleCompare(n) {
 function renderDetail(detail) {
   const badge = el("drawer-badge");
   badge.className = "status-tags";
-  appendLoopTags(badge, detail);
+  badge.textContent = "";
+  const live = state.byKey.get(state.activeLoop) || {};
+  badge.appendChild(stateBadge(Object.assign({}, detail, {
+    running: live.running ?? detail.running,
+    running_sources: live.running_sources || detail.running_sources,
+  })));
 
   const missionEl = el("drawer-mission");
   missionEl.textContent = detail.mission || "No mission recorded.";
@@ -807,17 +1293,22 @@ function renderDetail(detail) {
   const strip = el("drawer-strip");
   strip.textContent = "";
   const seq = verdictSeq(detail);
-  strip.appendChild(segbarEl(seq, true));
-  strip.appendChild(
-    seq.length ? seqLegendEl(seq) : span("seg-seq", "no verdicts yet")
-  );
+  if (seq.length) {
+    strip.appendChild(historyEl(detail));
+    strip.appendChild(span("caption", " S shipped · I iterate · B blocked · H needs human, oldest first"));
+  } else {
+    strip.appendChild(span("caption", "No evaluator verdicts parsed from LOG.md. Latest recorded verdict: " +
+      (detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "none") + "."));
+  }
 
   const commits = Array.isArray(detail.commits) ? detail.commits : [];
   const csec = el("commits-section");
   const clist = el("commit-list");
   clist.textContent = "";
   csec.hidden = commits.length === 0;
-  for (const c of commits) {
+  const COMMIT_PREVIEW = 8;
+  const showAll = state.showAllCommits === state.activeLoop;
+  for (const c of showAll ? commits : commits.slice(0, COMMIT_PREVIEW)) {
     const row = document.createElement("div");
     row.className = "commit-row";
     const sha = span("commit-sha", c.short || (c.sha || "").slice(0, 7));
@@ -828,6 +1319,17 @@ function renderDetail(detail) {
     subj.title = c.subject || "";
     row.appendChild(subj);
     clist.appendChild(row);
+  }
+  if (commits.length > COMMIT_PREVIEW) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "btn btn-ghost btn-small";
+    more.textContent = showAll ? "Show fewer commits" : "Show all " + commits.length + " commits";
+    more.addEventListener("click", () => {
+      state.showAllCommits = showAll ? null : state.activeLoop;
+      renderDetail(state.detail);
+    });
+    clist.appendChild(more);
   }
 
   renderSlices(detail);
@@ -999,7 +1501,7 @@ function renderDrawerTabs() {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "drawer-tab" + (state.drawerTab === tab ? " active" : "");
-    btn.textContent = tab;
+    btn.textContent = tab.charAt(0).toUpperCase() + tab.slice(1);
     btn.setAttribute("aria-pressed", String(state.drawerTab === tab));
     btn.addEventListener("click", () => {
       state.drawerTab = tab;
@@ -1020,6 +1522,7 @@ function showDrawerTab() {
   renderTimelineView();
   renderFilesView();
   renderGraphView();
+  if (state.drawerTab === "transcripts") openDefaultSession();
 }
 
 function appendEmpty(view, msg) {
@@ -1079,16 +1582,6 @@ function tlRole(entry) {
   return String(entry.role || "?").toLowerCase();
 }
 
-function tickStep(rangeMs, plotW) {
-  const steps = [
-    30e3, 60e3, 120e3, 300e3, 600e3, 900e3, 1800e3, 3600e3, 7200e3,
-    10800e3, 21600e3, 43200e3, 86400e3,
-  ];
-  for (const s of steps) {
-    if (s / Math.max(1, rangeMs) * plotW >= 80) return s;
-  }
-  return steps[steps.length - 1];
-}
 
 function scopeLabel(scope) {
   const s = String(scope);
@@ -1102,33 +1595,66 @@ function scopeLabel(scope) {
   return s.length > 18 ? s.slice(0, 17) + "…" : s;
 }
 
-function shortSlice(id) {
-  const s = String(id);
-  return s.length > 16 ? s.slice(0, 15) + "…" : s;
-}
 
-function fitText(text, px) {
-  const max = Math.max(1, Math.floor(px / 5.6));
-  const s = String(text);
-  return s.length > max ? s.slice(0, Math.max(1, max - 1)) + "…" : s;
-}
 
 /* --------------------------- Timeline view --------------------------- */
 
-/* Iteration-centric swimlane: one row per iteration, entries in seq order
- * as role-colored blocks (wall-clock positioned when timings exist), the
- * row's last verdict at the right edge, and PLAN.md slice pills beneath. */
+/* Iteration cards in the board's vocabulary: a header with verdict badge,
+ * lifecycle and a Compare toggle; a proportional time track when entries
+ * carry timings (legend above, tooltip per segment); one row per LOG entry
+ * with a right-aligned duration; PLAN.md slice chips that open the graph. */
+const TL_ROLES = ["lead", "builder", "evaluator", "repair"];
+
+function verdictTone(v) {
+  return { ship: "positive", needs_human: "warning", blocked: "negative" }[v] || "neutral";
+}
+
+function verdictBadge(raw) {
+  const v = normVerdict(raw);
+  const tone = verdictTone(v);
+  const b = span("badge badge-" + tone, "");
+  b.appendChild(span("badge-icon", { positive: "✓", warning: "!", negative: "✕", neutral: "↻" }[tone]));
+  b.appendChild(document.createTextNode(
+    { ship: "Ship", iterate: "Iterate", blocked: "Blocked", needs_human: "Needs human" }[v] ||
+    String(raw)));
+  return b;
+}
+
+function tlRoleClass(role) {
+  return TL_ROLES.includes(role) ? role : "other";
+}
+
 function renderTimelineView() {
   const view = el("view-timeline");
   if (view.hidden) return;
+  /* The detail poll re-renders every 5 s. Skip when nothing the timeline
+   * shows has changed, so focused controls are not replaced; when it has,
+   * focus returns to the same control (by data-focus-key) without scrolling. */
+  const signature = JSON.stringify([state.detail, state.compare]);
+  if (signature === state.tlSignature && view.childElementCount) {
+    requestAnimationFrame(() => syncSummaryToggles(view));
+    return;
+  }
+  state.tlSignature = signature;
+  const focused = view.contains(document.activeElement)
+    ? document.activeElement.dataset.focusKey : null;
+  renderTimelineContent(view);
+  if (focused) {
+    const again = [...view.querySelectorAll("[data-focus-key]")]
+      .find((n) => n.dataset.focusKey === focused);
+    if (again) again.focus({ preventScroll: true });
+  }
+}
+
+function renderTimelineContent(view) {
   view.textContent = "";
   if (!state.detail) {
-    appendEmpty(view, "Loading…");
+    appendEmpty(view, "Loading timeline…");
     return;
   }
   const entries = Array.isArray(state.detail.timeline) ? state.detail.timeline : [];
   if (!entries.length) {
-    appendEmpty(view, "No log entries yet.");
+    appendEmpty(view, "No LOG.md entries yet. Each role appends one line per pass; they appear here as iterations.");
     return;
   }
   const slices = Array.isArray(state.detail.slices) ? state.detail.slices : [];
@@ -1143,35 +1669,6 @@ function renderTimelineView() {
     }
   }
   iters.sort((x, y) => (x == null ? 1e9 : x) - (y == null ? 1e9 : y));
-
-  const timed = entries.some((e) => tlSpan(e));
-  const W = Math.max(360, view.clientWidth - 2);
-  const ML = 148;
-  const MR = 100;
-  const MT = 8;
-  const MB = timed ? 24 : 10;
-  const BLOCK_H = 22;
-  const PILL_H = 12;
-  const ROW_GAP = 12;
-  const plotW = W - ML - MR;
-
-  let minT = Infinity;
-  let maxT = -Infinity;
-  if (timed) {
-    for (const e of entries) {
-      const sp = tlSpan(e);
-      if (sp) {
-        minT = Math.min(minT, sp.start);
-        maxT = Math.max(maxT, sp.end);
-      }
-    }
-    if (!(maxT > minT)) {
-      minT = 0;
-      maxT = 1;
-    }
-  }
-  const xTime = (t) => ML + ((t - minT) / (maxT - minT)) * plotW;
-
   const rows = iters.map((it) => ({
     it,
     entries: entries.filter(
@@ -1181,210 +1678,27 @@ function renderTimelineView() {
       (sl) => sl && sl.iteration != null && Number(sl.iteration) === it
     ),
   }));
-  const maxCount = Math.max(1, ...rows.map((r) => r.entries.length));
-  const seqW = Math.max(28, Math.min(110, plotW / maxCount - 6));
+  const timed = entries.some((e) => tlSpan(e));
 
-  let totalH = 0;
-  const yOf = rows.map((r) => {
-    const y = totalH;
-    totalH += BLOCK_H + (r.slices.length ? PILL_H + 5 : 0) + ROW_GAP;
-    return y;
-  });
-  const H = MT + totalH + MB;
-  const svg = svgEl("svg", {
-    class: "tl-svg",
-    viewBox: "0 0 " + W + " " + H,
-    width: W,
-    height: H,
-    role: "img",
-    "aria-label": "Loop timeline",
-  });
-
-  rows.forEach((row, ri) => {
-    const y = MT + yOf[ri];
-    if (ri > 0) {
-      svg.appendChild(
-        svgEl("line", {
-          class: "tl-rowline",
-          x1: 0, x2: W, y1: y - ROW_GAP / 2, y2: y - ROW_GAP / 2,
-        })
-      );
-    }
-    if (row.it == null) {
-      const lab = svgEl("text", {
-        class: "tl-lane",
-        x: ML - 8,
-        y: y + BLOCK_H / 2 + 3.5,
-        "text-anchor": "end",
-      });
-      lab.textContent = "—";
-      svg.appendChild(lab);
-    } else {
-      const fo = svgEl("foreignObject", {
-        x: 0, y: y, width: ML - 8, height: BLOCK_H,
-      });
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "tl-lanebtn" +
-        (state.compare.includes(row.it) ? " selected" : "");
-      btn.setAttribute("aria-pressed", String(state.compare.includes(row.it)));
-      btn.title = "Click to compare iteration " + row.it;
-      btn.appendChild(span("tl-lanebtn-label", "iter " + row.it));
-      btn.appendChild(lifecycleChip(row.it));
-      btn.addEventListener("click", () => toggleCompare(row.it));
-      fo.appendChild(btn);
-      svg.appendChild(fo);
-    }
-
-    let untimedN = 0;
-    row.entries.forEach((entry, i) => {
-      const role = tlRole(entry);
-      const sp = timed ? tlSpan(entry) : null;
-      if (timed && !sp) {
-        /* Untimed entries in a timed chart: gutter markers right of the plot. */
-        const mx = ML + plotW + 6 + untimedN * 8;
-        untimedN++;
-        const m = svgEl("rect", {
-          class: "tl-untimed",
-          x: mx, y: y + BLOCK_H / 2 - 3, width: 6, height: 6,
-        });
-        const tip = svgEl("title", {});
-        tip.textContent = entryTitle(entry) + " · no timestamps";
-        m.appendChild(tip);
-        svg.appendChild(m);
-        return;
-      }
-      let bx;
-      let bw;
-      if (timed) {
-        bx = xTime(sp.start);
-        bw = Math.max(3, xTime(sp.end) - bx);
-      } else {
-        bx = ML + i * (seqW + 6);
-        bw = seqW;
-      }
-      const g = svgEl("g", {});
-      const seg = svgEl("rect", {
-        class: "tl-seg tl-role-" + cssClass(role),
-        x: bx, y: y, width: bw, height: BLOCK_H, rx: 4,
-      });
-      const tip = svgEl("title", {});
-      tip.textContent = entryTitle(entry);
-      seg.appendChild(tip);
-      g.appendChild(seg);
-      if (bw >= 44) {
-        const t = svgEl("text", {
-          class: "tl-block-label",
-          x: bx + 5,
-          y: y + BLOCK_H / 2 + 3.5,
-        });
-        t.textContent = fitText(entry.slice ? "bld " + shortSlice(entry.slice) : role, bw - 10);
-        g.appendChild(t);
-        if (entry.duration_sec != null && bw >= 92) {
-          const d = svgEl("text", {
-            class: "tl-block-dur",
-            x: bx + bw - 5,
-            y: y + BLOCK_H / 2 + 3.5,
-            "text-anchor": "end",
-          });
-          d.textContent = fmtDuration(entry.duration_sec);
-          g.appendChild(d);
-        }
-      }
-      if (entry.scope) {
-        const sc = svgEl("text", {
-          class: "tl-scope",
-          x: bx + bw + 5,
-          y: y + BLOCK_H / 2 + 3.5,
-        });
-        sc.textContent = scopeLabel(entry.scope);
-        const stip = svgEl("title", {});
-        stip.textContent = String(entry.scope);
-        sc.appendChild(stip);
-        g.appendChild(sc);
-      }
-      svg.appendChild(g);
-    });
-
-    /* Last verdict of the iteration at the right edge. */
-    const vEntry = [...row.entries].reverse().find((e) => e.verdict);
-    if (vEntry) {
-      const vc = normVerdict(vEntry.verdict);
-      const v = svgEl("text", {
-        class: "tl-verdict tl-verdict-" + vc,
-        x: W - 4,
-        y: y + BLOCK_H / 2 + 3.5,
-        "text-anchor": "end",
-      });
-      v.textContent = String(vEntry.verdict).toUpperCase();
-      const vtip = svgEl("title", {});
-      vtip.textContent = entryTitle(vEntry);
-      v.appendChild(vtip);
-      svg.appendChild(v);
-    }
-
-    /* Slice pills beneath the row; click jumps to the graph node. */
-    if (row.slices.length) {
-      let px = ML;
-      const py = y + BLOCK_H + 5;
-      for (const sl of row.slices) {
-        const id = String(sl.id ?? "");
-        const st = normSliceStatus(sl.status);
-        const wpx = Math.min(190, Math.max(44, id.length * 5.6 + 14));
-        if (px + wpx > ML + plotW + 30) break;
-        const pill = svgEl("g", { class: "tl-pill", cursor: "pointer" });
-        pill.appendChild(
-          svgEl("rect", {
-            class: "tl-pill-rect tl-pill-" + st,
-            x: px, y: py, width: wpx, height: PILL_H, rx: 6,
-          })
-        );
-        const pt = svgEl("text", {
-          class: "tl-pill-label",
-          x: px + 7,
-          y: py + PILL_H / 2 + 3,
-        });
-        pt.textContent = fitText(id, wpx - 12);
-        pill.appendChild(pt);
-        const ptip = svgEl("title", {});
-        ptip.textContent =
-          id + " · " + st.replace("_", " ") +
-          " · writes: " + (Array.isArray(sl.writes) ? sl.writes.length : 0) +
-          " · reads: " + (Array.isArray(sl.reads) ? sl.reads.length : 0);
-        pill.appendChild(ptip);
-        pill.addEventListener("click", () => {
-          state.graphSel = id;
-          state.drawerTab = "graph";
-          renderDrawerTabs();
-          showDrawerTab();
-        });
-        svg.appendChild(pill);
-        px += wpx + 6;
-      }
-    }
-  });
-
+  const head = document.createElement("div");
+  head.className = "tl-head";
+  head.appendChild(span("caption",
+    rows.length + (rows.length === 1 ? " iteration · " : " iterations · ") +
+    entries.length + (entries.length === 1 ? " entry" : " entries") +
+    (rows.some((r) => r.it != null) ? " · select two iterations to compare" : "")));
   if (timed) {
-    const step = tickStep(maxT - minT, plotW);
-    for (let t = Math.floor(minT / step) * step; t <= maxT; t += step) {
-      const gx = xTime(t);
-      svg.appendChild(
-        svgEl("line", { class: "tl-grid", x1: gx, y1: MT, x2: gx, y2: MT + totalH })
-      );
-      const lab = svgEl("text", {
-        class: "tl-axis-label",
-        x: gx,
-        y: MT + totalH + 14,
-        "text-anchor": "middle",
-      });
-      lab.textContent = fmtHm(t);
-      svg.appendChild(lab);
+    const legend = document.createElement("div");
+    legend.className = "tl-legend";
+    legend.setAttribute("aria-label", "Role colours");
+    for (const role of [...TL_ROLES, "other"]) {
+      const item = span("tl-legend-item", "");
+      item.appendChild(span("tl-swatch tl-role-" + role, ""));
+      item.appendChild(document.createTextNode(role));
+      legend.appendChild(item);
     }
+    head.appendChild(legend);
   }
-
-  const wrap = document.createElement("div");
-  wrap.className = "tl-wrap";
-  wrap.appendChild(svg);
+  view.appendChild(head);
 
   const overlaps =
     state.detail && Array.isArray(state.detail.overlaps) ? state.detail.overlaps : [];
@@ -1408,11 +1722,189 @@ function renderTimelineView() {
     view.appendChild(bar);
   }
 
-  if (state.compare.length) {
-    view.appendChild(comparePanel());
-  }
+  if (state.compare.length) view.appendChild(comparePanel());
 
-  view.appendChild(wrap);
+  for (const row of rows) view.appendChild(timelineIteration(row));
+  requestAnimationFrame(() => syncSummaryToggles(view));
+}
+
+/* Summaries clamp to three lines. A "Show more" button (keyboard and touch,
+ * not a hover-only tooltip) expands one in place; it is hidden when the text
+ * already fits. Open state survives the detail poll's re-render. */
+const TL_SUMMARY_TOGGLE_MIN = 80;
+let tlSummarySeq = 0;
+
+function timelineSummary(text, key) {
+  const frag = document.createDocumentFragment();
+  const body = span("tl-summary", text || "—");
+  frag.appendChild(body);
+  if (text.length < TL_SUMMARY_TOGGLE_MIN) return frag;
+  body.id = "tl-summary-" + ++tlSummarySeq;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn btn-ghost btn-small tl-more";
+  btn.dataset.focusKey = "more:" + key;
+  btn.setAttribute("aria-controls", body.id);
+  const setOpen = (open) => {
+    body.classList.toggle("is-open", open);
+    btn.setAttribute("aria-expanded", String(open));
+    btn.textContent = open ? "Show less" : "Show more";
+  };
+  setOpen(state.tlOpen.has(key));
+  btn.addEventListener("click", () => {
+    const open = !state.tlOpen.has(key);
+    if (open) state.tlOpen.add(key);
+    else state.tlOpen.delete(key);
+    setOpen(open);
+  });
+  frag.appendChild(btn);
+  return frag;
+}
+
+function syncSummaryToggles(view) {
+  if (!view || view.hidden) return;
+  for (const btn of view.querySelectorAll(".tl-more")) {
+    const body = document.getElementById(btn.getAttribute("aria-controls"));
+    if (!body || body.classList.contains("is-open")) continue;
+    btn.hidden = body.scrollHeight <= body.clientHeight + 1;
+  }
+}
+
+let tlResizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(tlResizeTimer);
+  tlResizeTimer = setTimeout(() => syncSummaryToggles(el("view-timeline")), 150);
+});
+
+function timelineIteration(row) {
+  const card = document.createElement("section");
+  card.className = "tl-iter";
+  const selected = row.it != null && state.compare.includes(row.it);
+  if (selected) card.classList.add("is-selected");
+
+  const head = document.createElement("header");
+  head.className = "tl-iter-head";
+  const title = document.createElement("h3");
+  title.className = "tl-iter-title";
+  title.textContent = row.it == null ? "Unattributed" : "Iteration " + row.it;
+  head.appendChild(title);
+  const vEntry = [...row.entries].reverse().find((e) => e.verdict);
+  if (vEntry) head.appendChild(verdictBadge(vEntry.verdict));
+  if (row.it != null) head.appendChild(lifecycleChip(row.it));
+  const spans = row.entries.map(tlSpan).filter(Boolean);
+  const total = row.entries.reduce(
+    (acc, e) => acc + (Number.isFinite(Number(e.duration_sec)) ? Number(e.duration_sec) : 0), 0);
+  const meta = [row.entries.length + (row.entries.length === 1 ? " entry" : " entries")];
+  if (total > 0) meta.push(fmtDuration(total) + " logged");
+  head.appendChild(span("tl-iter-meta", meta.join(" · ")));
+  if (row.it != null) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-ghost btn-small tl-compare";
+    btn.dataset.focusKey = "compare:" + row.it;
+    btn.textContent = selected ? "Comparing" : "Compare";
+    btn.setAttribute("aria-pressed", String(selected));
+    btn.setAttribute("aria-label", "Compare iteration " + row.it);
+    btn.title = "Select up to two iterations to compare side by side";
+    btn.addEventListener("click", () => toggleCompare(row.it));
+    head.appendChild(btn);
+  }
+  card.appendChild(head);
+
+  if (spans.length) card.appendChild(timelineTrack(row.entries, spans));
+
+  const list = document.createElement("ol");
+  list.className = "tl-entries";
+  for (const entry of row.entries) {
+    const li = document.createElement("li");
+    li.className = "tl-entry";
+    const role = tlRole(entry);
+    li.appendChild(span("tl-role tl-role-" + tlRoleClass(role), role));
+    const text = document.createElement("div");
+    text.className = "tl-entry-text";
+    let summary = String(entry.summary || "");
+    if (entry.verdict) {
+      summary = summary.replace(
+        /^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i, "");
+    }
+    if (entry.slice) text.appendChild(span("chip", String(entry.slice)));
+    if (entry.scope) {
+      const sc = span("chip chip-warning", scopeLabel(entry.scope));
+      sc.title = "Repair scope: " + String(entry.scope);
+      text.appendChild(sc);
+    }
+    text.appendChild(timelineSummary(
+      summary, row.it + "\u0000" + role + "\u0000" + summary));
+    li.appendChild(text);
+    const side = document.createElement("div");
+    side.className = "tl-entry-side";
+    if (entry.verdict) side.appendChild(verdictBadge(entry.verdict));
+    side.appendChild(span("tl-dur", entry.duration_sec != null ? fmtDuration(entry.duration_sec) : "—"));
+    li.appendChild(side);
+    list.appendChild(li);
+  }
+  card.appendChild(list);
+
+  if (row.slices.length) {
+    const chips = document.createElement("div");
+    chips.className = "tl-slices";
+    chips.appendChild(span("caption", "Slices"));
+    for (const sl of row.slices) {
+      const id = String(sl.id ?? "");
+      const st = normSliceStatus(sl.status);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip chip-btn chip-" + st;
+      chip.dataset.focusKey = "slice:" + row.it + ":" + id;
+      chip.textContent = id;
+      chip.title =
+        id + " · " + st.replace("_", " ") +
+        " · writes: " + (Array.isArray(sl.writes) ? sl.writes.length : 0) +
+        " · reads: " + (Array.isArray(sl.reads) ? sl.reads.length : 0) +
+        " · open in graph";
+      chip.addEventListener("click", () => {
+        state.graphSel = id;
+        state.drawerTab = "graph";
+        renderDrawerTabs();
+        showDrawerTab();
+      });
+      chips.appendChild(chip);
+    }
+    card.appendChild(chips);
+  }
+  return card;
+}
+
+/* One horizontal track for an iteration: each timed entry is a segment
+ * positioned by wall clock; start/end clock labels underneath. */
+function timelineTrack(entries, spans) {
+  const minT = Math.min(...spans.map((sp) => sp.start));
+  const maxT = Math.max(...spans.map((sp) => sp.end));
+  const range = Math.max(1, maxT - minT);
+  const wrap = document.createElement("div");
+  wrap.className = "tl-track-wrap";
+  const track = document.createElement("div");
+  track.className = "tl-track";
+  track.setAttribute("role", "img");
+  track.setAttribute("aria-label", "Wall-clock span of each timed entry");
+  for (const entry of entries) {
+    const sp = tlSpan(entry);
+    if (!sp) continue;
+    const seg = document.createElement("span");
+    seg.className = "tl-seg tl-role-" + tlRoleClass(tlRole(entry));
+    seg.style.left = ((sp.start - minT) / range) * 100 + "%";
+    seg.style.width = Math.max(0.8, ((sp.end - sp.start) / range) * 100) + "%";
+    seg.title = entryTitle(entry);
+    track.appendChild(seg);
+  }
+  wrap.appendChild(track);
+  const axis = document.createElement("div");
+  axis.className = "tl-axis";
+  axis.appendChild(span("", fmtHm(minT)));
+  axis.appendChild(span("", fmtDuration((maxT - minT) / 1000)));
+  axis.appendChild(span("", fmtHm(maxT)));
+  wrap.appendChild(axis);
+  return wrap;
 }
 
 /* Side-by-side compare of up to two selected iterations. */
@@ -1425,7 +1917,7 @@ function comparePanel() {
   head.appendChild(span("section-label", "Compare iterations"));
   const clear = document.createElement("button");
   clear.type = "button";
-  clear.className = "follow-btn";
+  clear.className = "btn btn-ghost btn-small";
   clear.textContent = "Clear selection";
   clear.addEventListener("click", () => {
     state.compare = [];
@@ -1581,6 +2073,24 @@ function renderFilesView() {
     }
   }
 
+  const head0 = document.createElement("div");
+  head0.className = "tl-head";
+  head0.appendChild(span("caption",
+    rowKeys.length + (rowKeys.length === 1 ? " file" : " files") +
+    " written by PLAN.md slices, per iteration"));
+  const legend = document.createElement("div");
+  legend.className = "tl-legend";
+  const more = span("tl-legend-item", "");
+  more.appendChild(span("tl-swatch heat-swatch", ""));
+  more.appendChild(document.createTextNode("darker = more slices"));
+  legend.appendChild(more);
+  const drift = span("tl-legend-item", "");
+  drift.appendChild(span("tl-swatch heat-swatch-drift", ""));
+  drift.appendChild(document.createTextNode("written but undeclared"));
+  legend.appendChild(drift);
+  head0.appendChild(legend);
+  view.appendChild(head0);
+
   const wrap = document.createElement("div");
   wrap.className = "heat-wrap";
   const grid = document.createElement("div");
@@ -1588,17 +2098,18 @@ function renderFilesView() {
   grid.setAttribute("role", "table");
   grid.setAttribute("aria-label", "Slice file writes per iteration");
   grid.style.gridTemplateColumns =
-    "minmax(110px, 1fr) repeat(" + iterCols.length + ", 34px)";
+    "minmax(160px, 480px) repeat(" + iterCols.length + ", 40px)";
 
   const head = document.createElement("div");
   head.className = "heat-file heat-hdr";
   head.setAttribute("role", "columnheader");
-  head.textContent = "file";
+  head.textContent = "File";
   grid.appendChild(head);
   for (const it of iterCols) {
     const h = document.createElement("div");
     h.className = "heat-hdr";
-    h.textContent = it;
+    h.textContent = it === "—" ? "—" : "It " + it;
+    h.title = it === "—" ? "Unplanned" : "Iteration " + it;
     h.setAttribute("role", "columnheader");
     grid.appendChild(h);
   }
@@ -1619,7 +2130,7 @@ function renderFilesView() {
         (c && c.drift ? " drift" : "");
       if (c) {
         const a = 0.1 + 0.65 * (c.count / maxCount);
-        cell.style.background = "rgba(232, 163, 61, " + a.toFixed(3) + ")";
+        cell.style.setProperty("--heat", (a * 100).toFixed(1) + "%");
         cell.title = label + (it === "—" ? " · unplanned" : " · iter " + it) +
           " — " + c.ids.join(", ") +
           (c.drift ? " (undeclared)" : "");
@@ -1861,10 +2372,40 @@ function renderGraphView() {
 
 /* --------------------------- sessions --------------------- */
 
+function sessionSignature(sessions) {
+  return sessions.map((s) => s.path + ":" + s.size).join("|");
+}
+
+/* Transcripts tab with nothing selected: open the newest session so the
+ * tab never opens onto a blank pane. */
+function openDefaultSession() {
+  if (state.activePath || !state.detail) {
+    if (!state.detail) showTranscriptNotice("Loading sessions…");
+    return;
+  }
+  if (!state.sessions.length) {
+    showTranscriptNotice(
+      "No session transcripts for this loop yet. Sessions appear when " +
+      "archived, usually after a role finishes; active sessions are not " +
+      "listed yet. Omnigent drivers export them to the mailbox's .sessions/ " +
+      "folder and omp runs keep theirs under ~/.omp."
+    );
+    return;
+  }
+  const first = state.sessions.find((s) => s.kind !== "subagent") || state.sessions[0];
+  openSession(first.path);
+}
+
 function renderSessionList() {
   const list = el("session-list");
   list.textContent = "";
-  if (!state.sessions.length) return;
+  /* Mailbox exports are written when a role's session is archived; say so
+   * rather than let the list read as a live view of the broker session. */
+  el("sessions-note").hidden = !state.sessions.some((s) => s.source === "mailbox");
+  if (!state.sessions.length) {
+    list.appendChild(span("session-empty", state.detail ? "No sessions recorded" : "Loading…"));
+    return;
+  }
 
   if (!state.sessions.some((s) => s.kind === "subagent")) {
     const frag = document.createDocumentFragment();
@@ -1930,6 +2471,7 @@ function sessionItem(s, depth = 0, subCount = 0) {
 
   const label = s.label ? String(s.label).replace(/\.jsonl$/, "") : s.id;
   const meta = [relTime(s.timestamp), fmtSize(s.size)];
+  if (s.agent) meta.unshift(String(s.agent).replace(/^trio-omnigent-/, ""));
   if (isSub) {
     meta.push("sub");
   } else if (subCount > 0) {
@@ -1951,6 +2493,7 @@ function openSession(path) {
   state.activePath = path;
   state.offset = 0;
   state.size = null;
+  state.records = 0;
   state.follow = true;
   updateFollowBtn();
   setOffsetHint();
@@ -1965,7 +2508,7 @@ function openSession(path) {
   state.es = es;
 
   es.addEventListener("open", () => {
-    if (state.es === es) setPaneStatus("connected", "live");
+    if (state.es === es) setPaneStatus("connected", "following file");
   });
 
   es.addEventListener("init", (ev) => {
@@ -1975,6 +2518,7 @@ function openSession(path) {
       state.offset = Number(data.offset) || 0;
       state.size = data.size != null ? Number(data.size) : null;
       setOffsetHint();
+      showTranscriptNotice(state.size ? "Loading transcript…" : "This session file is empty so far; new records appear here as they are written.");
     } catch { /* malformed init — ignore */ }
   });
 
@@ -2036,18 +2580,43 @@ function flushLines() {
   state.pendingLines = [];
   if (!lines.length) return;
   const view = el("transcript-view");
-  for (const rec of lines) appendRecord(view, rec);
+  for (const rec of lines) {
+    /* One malformed record must not drop the rest of the batch. */
+    try {
+      appendRecord(view, rec);
+    } catch (err) {
+      console.warn("transcript record skipped", err);
+    }
+  }
+  state.records += lines.length;
+  if (!view.childElementCount) {
+    showTranscriptNotice(state.records + " records read, none of them messages yet.");
+  }
   if (state.follow) view.scrollTop = view.scrollHeight;
 }
 
+/* ISO time of a record, or null. Out-of-range epochs ("1e20") make an
+ * Invalid Date, whose toISOString() throws. */
+function recordTime(rec) {
+  if (!rec) return null;
+  if (rec.timestamp) return rec.timestamp;
+  const epoch = Number(rec.created_at);
+  if (!Number.isFinite(epoch) || epoch <= 0) return null;
+  const date = new Date(epoch * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
 function timeEl(rec) {
-  const t = fmtClock(rec && rec.timestamp);
+  const t = fmtClock(recordTime(rec));
   return t ? span("tr-time", t) : null;
 }
 
+/* omp writes `text` parts; Omnigent exports `input_text` / `output_text`. */
+const TEXT_PARTS = new Set(["text", "input_text", "output_text"]);
+
 function textOf(parts) {
   return (Array.isArray(parts) ? parts : [])
-    .filter((p) => p && p.type === "text" && typeof p.text === "string")
+    .filter((p) => p && TEXT_PARTS.has(p.type) && typeof p.text === "string")
     .map((p) => p.text)
     .join("\n")
     .trim();
@@ -2057,6 +2626,26 @@ function textOf(parts) {
 function appendRecord(view, rec) {
   if (!rec || typeof rec !== "object") return;
   hideTranscriptNotice();
+
+  /* Omnigent session header: the first line, with no `type`. */
+  if (!rec.type && (rec.agent_name || rec.title)) {
+    const who = rec.agent_name ? String(rec.agent_name) : "";
+    metaRow(view, rec, "session", [who, rec.title].filter(Boolean).join(" · "));
+    return;
+  }
+  if (rec.type === "resource_event") {
+    const kind = String(rec.event_type || "").split(".").pop();
+    const res = rec.resource || {};
+    const name = res.name || rec.resource_id || rec.resource_type || "";
+    metaRow(view, rec, (rec.resource_type || "resource") + " " + (kind || "event"), name);
+    return;
+  }
+  /* Omnigent messages carry role and content at the top level. */
+  if (rec.type === "message" && !rec.message && rec.role) {
+    const text = textOf(rec.content);
+    if (text) view.appendChild(msgBlock(rec, rec.role === "user" ? "user" : "assistant", rec.role, text));
+    return;
+  }
 
   if (rec.type === "message") {
     const msg = rec.message || {};
@@ -2072,7 +2661,7 @@ function appendRecord(view, rec) {
     if (role === "assistant") {
       for (const part of parts) {
         if (!part || typeof part !== "object") continue;
-        if (part.type === "text" && part.text && part.text.trim()) {
+        if (TEXT_PARTS.has(part.type) && part.text && part.text.trim()) {
           view.appendChild(msgBlock(rec, "assistant", "assistant", part.text.trim()));
         } else if (part.type === "thinking" && part.thinking) {
           view.appendChild(thinkingBlock(rec, part.thinking));
@@ -2122,7 +2711,9 @@ function appendRecord(view, rec) {
     return;
   }
   if (rec.type === "compaction") {
-    metaRow(view, rec, "compacted", oneLine(rec.summary || "", 120));
+    const n = Array.isArray(rec.compacted_messages) ? rec.compacted_messages.length : 0;
+    const text = rec.summary ? oneLine(rec.summary, 120) : n ? n + " earlier messages folded" : "";
+    metaRow(view, rec, "compacted", text);
     return;
   }
 
@@ -2257,6 +2848,13 @@ function updateFollowBtn() {
 }
 
 function setOffsetHint() {
+  const follow = el("follow-btn");
+  follow.disabled = !state.activePath;
+  follow.title = state.activePath ? "" : "Open a session to follow it";
+  if (!state.activePath) {
+    el("offset-hint").textContent = "";
+    return;
+  }
   const parts = ["offset " + state.offset];
   if (state.size != null) parts.push("size " + fmtSize(state.size));
   el("offset-hint").textContent = parts.join(" · ");
@@ -2264,32 +2862,90 @@ function setOffsetHint() {
 
 /* ------------------------------- boot ------------------------------- */
 
-function init() {
-  const hash = location.hash.replace(/^#/, "");
-  const loopMatch = /^loop=(.+)$/.exec(hash);
-  if (loopMatch) {
-    pendingLoopHash = decodeURIComponent(loopMatch[1]);
-  } else if (TABS.includes(hash)) {
-    state.tab = hash;
+function parseHash() {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const name = params.get("loop");
+  return name ? { root: params.get("root") || "", name } : null;
+}
+
+function trapDrawerFocus(ev) {
+  if (ev.key !== "Tab" || el("drawer").hidden) return;
+  const focusable = Array.from(el("drawer").querySelectorAll(
+    'button:not([disabled]), [href], input, select, [tabindex]:not([tabindex="-1"])'
+  )).filter((node) => node.offsetParent !== null);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault();
+    last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault();
+    first.focus();
   }
+}
+
+function init() {
+  loadPrefs();
+  pendingLoopHash = parseHash();
 
   el("drawer-close").addEventListener("click", closeDrawer);
   el("drawer-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
+    trapDrawerFocus(ev);
   });
   el("inbox-toggle").addEventListener("click", () => {
     state.showReadInbox = !state.showReadInbox;
-    renderInbox(state.inbox);
+    renderAll();
   });
   el("follow-btn").addEventListener("click", () => {
     state.follow = !state.follow;
     updateFollowBtn();
   });
-
-  const grid = el("card-grid");
-  grid.textContent = "";
-  grid.appendChild(boardEmpty("Loading loops…"));
+  window.addEventListener("hashchange", () => {
+    const target = parseHash();
+    if (!target) {
+      if (!el("drawer").hidden) closeDrawer();
+      return;
+    }
+    const loop = state.loaded ? resolveHashLoop(target) : null;
+    if (loop) openDrawer(loop.key);
+    else pendingLoopHash = target;
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearTimeout(state.boardTimer);
+    else refreshBoard();
+  });
+  el("board-retry").addEventListener("click", refreshBoard);
+  el("loop-start").addEventListener("click", () => controlLoop("start"));
+  el("loop-stop").addEventListener("click", () => controlLoop("stop"));
+  el("loop-search").addEventListener("input", (ev) => {
+    state.query = ev.target.value;
+    renderTabs();
+    renderBoard();
+  });
+  el("workspace-filter").addEventListener("change", (ev) => {
+    state.workspace = ev.target.value;
+    savePrefs();
+    renderTabs();
+    renderBoard();
+  });
+  for (const btn of document.querySelectorAll(".th-sort")) {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.sort;
+      state.sort = state.sort.key === key
+        ? { key, dir: state.sort.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "activity" ? "desc" : "asc" };
+      savePrefs();
+      renderBoard();
+    });
+  }
+  /* Relative times ("4m ago") keep moving between polls. */
+  setInterval(() => {
+    if (!state.loaded) return;
+    renderLive();
+  }, 5000);
   refreshBoard();
 }
 

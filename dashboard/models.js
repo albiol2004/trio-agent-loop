@@ -125,7 +125,9 @@ if (typeof module !== "undefined" && module.exports) {
       const save = createElement("button", "Save", "model-save");
       save.type = "button";
       save.addEventListener("click", () => saveModel(row, select, save));
-      cell.append(select, customControl, save);
+      const controls = createElement("div", "", "model-cell-controls");
+      controls.append(select, customControl, save);
+      cell.append(controls);
     } else {
       cell.append(createElement("span", row.model || "—"));
       if (row.override_file) {
@@ -165,6 +167,10 @@ if (typeof module !== "undefined" && module.exports) {
             : "model-availability-unknown",
         ),
       );
+      const labels = ["Harness", "Agent", "Model", "Layer", "Availability"];
+      [...tableRow.children].forEach((cell, index) => {
+        cell.dataset.label = labels[index];
+      });
       tableBody.append(tableRow);
     });
     setPageState(`${rows.length} model selections`);
