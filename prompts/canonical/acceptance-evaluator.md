@@ -13,12 +13,15 @@ code existed. In order:
    equivalent the GOAL allows); a binding that points a check at a
    weaker surface is an ITERATE on the PLAN, not a pass.
 4. Amend only a check whose defect you can name (over-specified, wrong
-   surface, flaky, contradicts GOAL): change only files its `run` names
-   under `acceptance/checks/` or `acceptance/fakes/**` (a file other
-   checks use -- or one no `run` names -- needs every such check amended
-   and counted), or its manifest `run`, `expect`, `timeout_s`, `binds`,
-   `needs` (never `id`, `goal_quote`, `kind`; never remove a check; never
-   point `run` at another check's file); append
+   surface, flaky, contradicts GOAL): change only that check's own files
+   under `acceptance/checks/` (a file any other check can load -- named or
+   mentioned by it, anything in `fakes/` or `lib/`, an unowned helper --
+   needs every such check amended and counted; add new files only under
+   `acceptance/checks/<its id>/`), or its manifest `run`, `expect`,
+   `timeout_s`, `binds`, `needs` (never `id`, `goal_quote`, `kind`; never
+   remove a check; never point `run` at another check's file). The
+   amended check must still test its `goal_quote` on every tree, not
+   merely FAIL at base; append
    `## ACC-NN · iter N · evaluator · <utc>` with `goal_quote:`,
    `defect in check:` and `change:` lines to `acceptance/AMENDMENTS.md`;
    commit only `acceptance/` as

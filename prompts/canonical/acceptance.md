@@ -88,8 +88,13 @@ acceptance/
   failure; it exits 77 when an environment it needs is missing (that is
   UNAVAILABLE and goes to a human, never to the builders). A hang is a
   FAIL. Checks run from the tree's root with `ACC_TREE`, `ACC_DIR`,
-  `ACC_WORK` (scratch), `ACC_ID` and `ACC_BIND_<NAME>` set, in a copy of
-  the tree, loopback only.
+  `ACC_WORK` (scratch), `ACC_ID` and `ACC_BIND_<NAME>` set, each in its
+  own copy of the tree, loopback only, with a read-only `acceptance/`
+  that holds only its own files and the shared ones (`fakes/`, `lib/`).
+  A script's own directory is not importable (Python runs with
+  `PYTHONSAFEPATH`): put shared helpers in `acceptance/lib/` (on
+  `PYTHONPATH` and `NODE_PATH`) and name a check's own extra files in its
+  `run` or keep them under `acceptance/checks/ACC-NN/`.
 - `setup` entries are the only step allowed network access (a package
   registry) and run only when their `provides` directory is absent.
 
