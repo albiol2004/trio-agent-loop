@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from test_step_ops import (TOKEN, git, lead_pass, mbox, repo, retire, state,
@@ -18,7 +19,7 @@ def lead_running(repo: Path) -> dict:
 
 def builder_branch(repo: Path, name: str, *, base: str = "HEAD",
                    files: dict | None = None, loop_residue: bool = True,
-                   extra_dirt: bool = False) -> dict:
+                   extra_dirt: bool = False, sid: str | None = None) -> dict:
     wt = repo / ".claude" / "worktrees" / name
     git(repo, "worktree", "add", "-q", "-b", f"worktree-{name}", str(wt), base)
     base_sha = git(wt, "rev-parse", "HEAD")
@@ -26,16 +27,43 @@ def builder_branch(repo: Path, name: str, *, base: str = "HEAD",
         (wt / rel).parent.mkdir(parents=True, exist_ok=True)
         (wt / rel).write_text(text)
         git(wt, "add", rel)
-    git(wt, "commit", "-q", "-m", f"slice({name}): build")
+    git(wt, "commit", "-q", "-m", f"slice({sid or name}): build")
     if loop_residue:  # the builder role's habit: an uncommitted LOG line
         with (wt / "loop" / "LOG.md").open("a") as fh:
             fh.write(f"- iter 1 | builder | {name}\n")
     if extra_dirt:
         (wt / "scratch.txt").write_text("wip\n")
-    return {"id": name, "worktree": str(wt), "branch": f"worktree-{name}",
-            "base": base_sha, "head": git(wt, "rev-parse", "HEAD"),
-            "commits": [git(wt, "rev-parse", "HEAD")],
-            "summary": f"built {name}"}
+    out = {"id": sid or name, "worktree": str(wt), "branch": f"worktree-{name}",
+           "base": base_sha, "head": git(wt, "rev-parse", "HEAD"),
+           "commits": [git(wt, "rev-parse", "HEAD")],
+           "summary": f"built {name}"}
+    m = _WF_NAME.fullmatch(name)
+    if m:  # the harness's isolation name: the script passes its agent index
+        out["agent_index"] = int(m.group(1))
+    return out
+
+
+_WF_NAME = re.compile(r"wf_[A-Za-z0-9_-]+?-([0-9]+)")
+
+
+def owned_wave(repo: Path, specs: dict, *, rid: str = "wf_T", iteration: int = 1,
+               wave: int = 1, first: int = 5) -> dict:
+    """Dispatch one wave and create one workflow isolation worktree per
+    label (``<rid>-<n>``, agent index ``n`` from ``first``), verified by the
+    ``builders`` op, so each is ledger-owned. Returns {label: result}."""
+    head = step(repo, "dispatch", iteration=iteration, wave=wave)["head"]
+    out = {}
+    for i, (label, kw) in enumerate(specs.items()):
+        b = builder_branch(repo, f"{rid}-{first + i}", sid=label, **(kw or {}))
+        out[label] = b
+    res = step(repo, "builders", iteration=iteration, wave=wave, head=head,
+               results=json.dumps(list(out.values())))
+    assert res["ok"], res
+    owned = {x["id"] for x in res["builders"]}
+    assert owned == set(out), res
+    for b in out.values():
+        b["dispatch_head"] = head
+    return out
 
 
 def test_dispatch_returns_lead_head_and_needs_lead_running(repo: Path) -> None:
@@ -111,22 +139,38 @@ def test_builder_without_commits_is_accepted_without_merge(repo: Path) -> None:
 def test_cleanup_removes_merged_worktrees_force_only_for_loop_residue(
         repo: Path) -> None:
     lead_running(repo)
-    b1 = builder_branch(repo, "b1")                   # loop/ residue only
-    b2 = builder_branch(repo, "b2", extra_dirt=True)  # product dirt
-    b3 = builder_branch(repo, "b3")                   # never merged
+    w = owned_wave(repo, {"b1": {},                        # loop/ residue only
+                          "b2": {"extra_dirt": True},      # product dirt
+                          "b3": {}})                       # never merged
+    b1, b2, b3 = w["b1"], w["b2"], w["b3"]
     for b in (b1, b2):
         git(repo, "merge", "--no-ff", "--no-edit", "-q", b["branch"])
-    out = step(repo, "cleanup",
-               branches="worktree-b1,worktree-b2,worktree-b3,worktree-nope")
+    out = step(repo, "cleanup", branches=",".join(
+        [b1["branch"], b2["branch"], b3["branch"], "worktree-nope"]))
     assert out["ok"]
     removed = {r["branch"] for r in out["removed"]}
     kept = {k["branch"]: k["reason"] for k in out["kept"]}
-    assert removed == {"worktree-b1", "worktree-nope"}
-    assert "outside the mailbox" in kept["worktree-b2"]
-    assert kept["worktree-b3"] == "not merged into HEAD"
+    assert removed == {b1["branch"], "worktree-nope"}
+    assert "outside the mailbox" in kept[b2["branch"]]
+    assert kept[b3["branch"]] == "not merged into HEAD"
     assert not Path(b1["worktree"]).exists()
-    assert "worktree-b1" not in git(repo, "branch")
+    assert b1["branch"] not in git(repo, "branch")
     assert Path(b2["worktree"]).exists() and Path(b3["worktree"]).exists()
+
+
+def test_cleanup_never_removes_a_merged_branch_it_does_not_own(
+        repo: Path) -> None:
+    """v01 fix: a merged builder-looking branch that no `builders` call
+    proved to be this mailbox's (another mailbox's, a user's `claude -w`)
+    is kept, merged or not."""
+    lead_running(repo)
+    other = builder_branch(repo, "wf_OTHER-5")
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", other["branch"])
+    out = step(repo, "cleanup", branches=other["branch"])
+    assert out["removed"] == []
+    assert "no ownership-ledger entry" in out["kept"][0]["reason"]
+    assert Path(other["worktree"]).exists()
+    assert other["branch"] in git(repo, "branch")
 
 
 def test_gate_requires_report_rewrite(repo: Path) -> None:
@@ -172,11 +216,17 @@ def test_fold_skips_when_other_paths_dirty(repo: Path) -> None:
 
 def test_end_removes_eval_pin_worktrees(repo: Path) -> None:
     step(repo, "begin")
-    wt = repo / ".claude" / "worktrees" / "eval-1-abcd1234"
-    git(repo, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    p = to_lead_done(repo)
+    wt = Path(p["eval_worktree"])
+    assert wt.parent == repo / ".claude" / "worktrees"
+    git(repo, "worktree", "add", "-q", "--detach", str(wt), p["sha"])
     (wt / "build.pyc").write_text("junk")
     other = repo / ".claude" / "worktrees" / "b9"
     git(repo, "worktree", "add", "-q", "-b", "worktree-b9", str(other), "HEAD")
+    # another mailbox's (or an older prompt's) eval pin worktree: reported
+    foreign = repo / ".claude" / "worktrees" / "eval-1-abcd1234"
+    git(repo, "worktree", "add", "-q", "--detach", str(foreign), "HEAD")
     e = step(repo, "end")
     assert e["eval_worktrees_removed"] == [str(wt)] and not wt.exists()
-    assert e["dangling_worktrees"] == [str(other)]
+    assert e["eval_worktrees_left"] == [str(foreign)] and foreign.exists()
+    assert e["dangling_worktrees"] == sorted([str(other), str(foreign)])

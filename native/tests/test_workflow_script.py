@@ -53,7 +53,14 @@ def test_no_nondeterministic_builtins() -> None:
 
 
 def test_every_agent_call_carries_model_and_type() -> None:
-    calls = [m.start() for m in re.finditer(r"\bagent\(", SRC)]
+    # v01 fix: every agent() call goes through callAgent(), which counts
+    # the calls (the builders' agent_index); agent( itself appears once.
+    code = "\n".join(ln for ln in SRC.splitlines()
+                     if not ln.lstrip().startswith("//"))
+    assert len(re.findall(r"\bagent\(", code)) == 1
+    assert "agentCalls += 1\n  return agent(prompt, opts)" in SRC
+    calls = [m.start() for m in re.finditer(r"\bcallAgent\(", SRC)
+             if not SRC[:m.start()].endswith("function ")]
     # step(), runAgentTwice(), the builder wave and the builder re-report (v01)
     assert len(calls) == 4
     step_call = SRC[calls[0]:calls[0] + 400]
@@ -89,7 +96,7 @@ def test_max_agents_enforced_in_spend() -> None:
     # every agent() path goes through spend()
     for fn in ("async function step(", "async function runAgentTwice("):
         start = SRC.index(fn)
-        chunk = SRC[start:SRC.index("agent(prompt", start)]
+        chunk = SRC[start:SRC.index("callAgent(prompt", start)]
         assert "spend(" in chunk
     start = SRC.index("const results = await parallel(")
     assert "spend(`builder ${s.id}`)" in SRC[start - 200:start]
@@ -882,3 +889,98 @@ def test_v01_lead_and_evaluator_prompt_notes() -> None:
     ev = next(c["prompt"] for c in out["calls"] if c["agentType"] == "trio-evaluator")
     assert "is not a reason for NEEDS_HUMAN on offline fixtures" in ev
     assert "## Remaining real-world steps" in ev
+
+
+# ------------------------------------------------ v01 fix (ownership ledger)
+def _results_of(prompt: str) -> list[dict]:
+    m = re.search(r"--results '([^']*)'", prompt)
+    return json.loads(m.group(1))
+
+
+@needs_node
+@pytest.mark.parametrize("scenario", [{}, {"wrong_nonce_once": True},
+                                      {"report_refuse": {"beta": 1}}])
+def test_fix_builders_carry_the_harness_agent_number(scenario: dict) -> None:
+    """agent_index = the 1-based number of that builder's agent() call in
+    the run (step retries and role calls included), the harness's
+    `<runId>-<n>` worktree number."""
+    out = run(dict({"verdicts": ["SHIP"], "plan": [
+        {"id": "alpha", "brief": "A", "writes": ["a.py"]},
+        {"id": "beta", "brief": "B", "writes": ["b.py"]}]}, **scenario))
+    assert out["result"]["status"] == "shipped"
+    number = {}
+    for i, c in enumerate(out["calls"], 1):
+        if c["agentType"] == "trio-builder" and c["isolation"] == "worktree":
+            number[c["label"].split()[1]] = i
+    first = [c for c in out["calls"] if "op=builders" in c["prompt"]]
+    for c in first:
+        for r in _results_of(c["prompt"]):
+            assert r["agent_index"] == number[r["id"]], (r, number)
+
+
+@needs_node
+def test_fix_unowned_refused_branch_is_never_superseded() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": TWO, "report_refuse": {"beta": 2},
+               "unowned_ids": ["beta"]})
+    assert out["result"]["status"] == "shipped"
+    redo = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-builder"
+            and "RE-DISPATCH" in c["prompt"]]
+    assert len(redo) == 1 and "git diff HEAD..." not in redo[0]
+    cleanups = [c["prompt"] for c in out["calls"] if "op=cleanup" in c["prompt"]]
+    assert not any("--drop-unmerged" in c for c in cleanups)
+
+
+@needs_node
+def test_fix_conflict_then_refusal_have_separate_budgets() -> None:
+    """eval-v01 finding 7: a slice re-dispatched for a conflict still gets
+    its one refusal re-dispatch (two in total)."""
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "conflicts": {"beta": ["registry.py"]},
+               "refuse_branches": ["worktree-beta-r2"]})
+    r = out["result"]
+    assert r["status"] == "shipped", r
+    assert r["iterations"][0]["waves"] == [["alpha", "beta"], ["beta"], ["beta"]]
+    builders = [c for c in out["calls"] if c["agentType"] == "trio-builder"
+                and c["isolation"] == "worktree"]
+    assert len(builders) == 4
+
+
+@needs_node
+def test_fix_second_refusal_still_stops() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "refuse_branches": ["worktree-beta", "worktree-beta-r2"]})
+    r = out["result"]
+    assert r["status"] == "error" and "refused after a re-dispatch" in r["reason"]
+    assert r["lock"] == "released"
+
+
+@needs_node
+def test_fix_refusal_then_conflict_then_anything_stops_at_two() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "refuse_branches": ["worktree-beta"],
+               "conflicts": {"beta": ["registry.py"]}, "conflict_again": ["beta"]})
+    r = out["result"]
+    assert r["status"] == "conflict"
+    builders = [c for c in out["calls"] if c["agentType"] == "trio-builder"
+                and c["isolation"] == "worktree"]
+    assert len(builders) == 4   # alpha, beta, beta-r2 (refusal), beta-r3 (conflict)
+
+
+@needs_node
+def test_fix_prompts_name_the_helper_created_scratch() -> None:
+    tmp = "/repo/.claude/worktrees/tmp-0123456789abcdef0123456789abcdef"
+    out = run({"verdicts": ["SHIP"], "tmpdir": tmp, "eval_places": True,
+               "scratch_left": ["/repo/.claude/worktrees/tmpX"],
+               "eval_worktrees_left": ["/repo/.claude/worktrees/eval-1-x"]})
+    by = {}
+    for c in out["calls"]:
+        by.setdefault(c["agentType"], []).append(c["prompt"])
+    for role in ("trio-lead", "trio-builder", "trio-evaluator"):
+        assert f"export TMPDIR={tmp}" in by[role][0], role
+    ev = by["trio-evaluator"][0]
+    assert "worktree add --detach /repo/.claude/worktrees/eval-EXEC-1-att1 sha1" in ev
+    assert "under `/repo/.claude/worktrees/eval-EXEC-1-att1-scratch`" in ev
+    assert "the driver removes `.claude/worktrees/eval-*`" not in ev
+    r = out["result"]
+    assert r["scratch_left"] == ["/repo/.claude/worktrees/tmpX"]
+    assert any("left in place: /repo/.claude/worktrees/eval-1-x" in x for x in out["logs"])

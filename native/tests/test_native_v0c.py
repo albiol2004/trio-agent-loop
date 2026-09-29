@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from test_step_ops import git, git_env, mbox, repo, step  # noqa: F401
-from test_waves import builder_branch, lead_running
+from test_waves import builder_branch, lead_running, owned_wave
 
 NATIVE = Path(__file__).resolve().parents[1]
 HELPER = NATIVE / "trio_native_step.py"
@@ -90,11 +90,12 @@ def test_cleanup_marker_check_resolves_symlinked_marker_dir(
     (repo / ".claude").mkdir(parents=True, exist_ok=True)
     os.symlink(real_storage, repo / ".claude" / "worktrees")
     lead_running(repo)
-    wt = repo / ".claude" / "worktrees" / "b1"
-    git(repo, "worktree", "add", "-q", "-b", "worktree-b1", str(wt), "HEAD")
-    out = step(repo, "cleanup", branches="worktree-b1")
+    b1 = owned_wave(repo, {"b1": {"loop_residue": False}})["b1"]
+    wt = Path(b1["worktree"])
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", b1["branch"])
+    out = step(repo, "cleanup", branches=b1["branch"])
     assert out["ok"] and [r["branch"] for r in out["removed"]] == [
-        "worktree-b1"]
+        b1["branch"]]
     assert not wt.exists()
 
 

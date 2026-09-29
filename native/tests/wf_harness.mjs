@@ -43,6 +43,7 @@ function stepResult(op, nonce, prompt) {
     case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration: sc.begin_iteration || iteration,
       status: 'ready', phase: 'idle', lock_owner: 'workflow:x',
       ...(sc.reclaimed ? { reclaimed: sc.reclaimed } : {}),
+      ...(sc.tmpdir ? { tmpdir: sc.tmpdir } : {}),
       ...(sc.no_exec_id ? {} : { exec_id: sc.exec_id || '0123456789abcdef0123456789abcdef' }) }
     case 'dispatch': {
       lastHead = `H${iteration}w${flag('wave')}`
@@ -58,11 +59,15 @@ function stepResult(op, nonce, prompt) {
       const corrected = []
       for (const r of results) {
         verifyRuns[r.id] = (verifyRuns[r.id] || 0) + 1
-        if (r.base !== flag('head') || (sc.refuse_ids || []).includes(r.id)) {
-          refused.push({ id: r.id, kind: 'work', own_branch: r.branch,
+        // v01 fix: own_branch only for a ledger-owned branch; sc.unowned_ids
+        // models builders whose ownership git did not prove.
+        const own = (sc.unowned_ids || []).includes(r.id) ? null : r.branch
+        if (r.base !== flag('head') || (sc.refuse_ids || []).includes(r.id) ||
+            (sc.refuse_branches || []).includes(r.branch)) {
+          refused.push({ id: r.id, kind: 'work', own_branch: own,
             reason: `builder ${r.id} forked from ${r.base}, not the Lead's HEAD` })
         } else if (verifyRuns[r.id] <= ((sc.report_refuse || {})[r.id] || 0)) {
-          refused.push({ id: r.id, kind: 'report', own_branch: r.branch,
+          refused.push({ id: r.id, kind: 'report', own_branch: own,
             reason: `builder ${r.id}: reported head ${r.head} but branch ${r.branch} is at X` })
         } else if ((sc.correct || {})[r.id]) {
           corrected.push({ id: r.id, branch: r.branch, ...sc.correct[r.id] })
@@ -110,6 +115,8 @@ function stepResult(op, nonce, prompt) {
     }
     case 'pin': return { ...base, iteration, evaluator_attempt: `att${iteration}`, sha: `sha${iteration}`,
       skip_evaluator: false, context_block: `LOCKSTEP CONTEXT: attempt=att${iteration} sha=sha${iteration}\n`,
+      ...(sc.eval_places ? { eval_worktree: `/repo/.claude/worktrees/eval-EXEC-${iteration}-att${iteration}`,
+        eval_scratch: `/repo/.claude/worktrees/eval-EXEC-${iteration}-att${iteration}-scratch`, tmpdir: sc.tmpdir || null } : {}),
       ...(sc.human ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}) }
     case 'apply': {
       const v = sc.verdicts[verdictIdx++]
@@ -122,7 +129,8 @@ function stepResult(op, nonce, prompt) {
         human_check: word === 'NEEDS_HUMAN' ? '1. look' : null, bound: true }
     }
     case 'end': return { ...base, lock: 'released', dangling_worktrees: [], eval_worktrees_removed: [], iteration,
-      scratch_removed: sc.scratch_removed || [], scratch_kept: sc.scratch_kept || [] }
+      scratch_removed: sc.scratch_removed || [], scratch_kept: sc.scratch_kept || [],
+      scratch_left: sc.scratch_left || [], eval_worktrees_left: sc.eval_worktrees_left || [] }
   }
   return { ok: false, op, nonce, error: 'unknown op' }
 }

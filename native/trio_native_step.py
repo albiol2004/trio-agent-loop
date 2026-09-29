@@ -20,15 +20,21 @@ commits) and writes the builders' LOG lines; ``cleanup`` removes merged
 builder worktrees (``--force`` only for ``loop/`` residue) and branches.
 Beyond ``trio_loop``'s gate, a Lead pass must rewrite REPORT.md; a SHIP
 folds the driver's final STATE into the retirement commit; ``end`` removes
-Evaluator pin worktrees under ``.claude/worktrees/eval-*``.
+the Evaluator pin worktree ``pin`` assigned to this execution.
 
 native-v01 (after N0): ``builders`` corrects a mis-reported builder sha
 from git when the branch holds one well-formed slice commit, and tags every
 refusal ``kind: report|work`` (the script re-asks / re-dispatches); ``end``
-also removes the ``eval-*``/``tmp*`` scratch dirs this run execution
-created under ``.claude/worktrees/``; ``begin`` of a fresh run reuses
-(merges) or cleans up the builder worktrees an earlier run of this mailbox
-left behind.
+removes the scratch dirs this run execution created; ``begin`` of a fresh
+run reuses (merges) or cleans up the builder worktrees an earlier run of
+this mailbox left behind.
+
+native-v01 fix (eval-v01): every merge, removal or deletion the helper does
+is authorised only by its ownership ledger (``<git-common-dir>/trio-native/
+<mailbox key>/owned.jsonl``, see "ownership ledger" below): builder pairs
+git proved from the script's agent index, scratch dirs and Evaluator pin
+paths the helper itself created or assigned. Names, role reports and
+runtime files never authorise anything.
 
 This file holds no loop semantics. Gates, verdict parsing, the repair
 counter, the evaluator pin/attempt and SHIP retirement are the functions of
@@ -625,6 +631,373 @@ def _is_artefact(path: str) -> bool:
                for i in range(len(parts) - 1))
 
 
+# ------------------------------------------ ownership ledger (v01 fix)
+#: The governing rule (eval-v01): the driver merges, removes or deletes a
+#: worktree, branch or directory only when a record THIS helper wrote proves
+#: that one of this mailbox's runs owns it — never because of its name, a
+#: role's report or a runtime file a role could write.
+#:
+#: The ledger is ``<git-common-dir>/trio-native/<mailbox key>/owned.jsonl``
+#: (mailbox key = ``registry_path``'s sha256 of the mailbox realpath), an
+#: append-only JSON-lines file inside the git dir, where no role writes in
+#: normal operation. Entry kinds:
+#:
+#: * ``dispatch`` — not ownable: the names under ``.claude/worktrees/`` when
+#:   a wave was dispatched (so a builder worktree must be new since then);
+#: * ``run`` — not ownable: the workflow run id this execution's isolated
+#:   builders were proven to carry (pinned once, see ``_own_builder_pair``);
+#: * ``builder`` — a builder worktree + branch git proved to be the
+#:   workflow's isolation worktree of this dispatch (``_own_builder_pair``);
+#: * ``scratch`` — a directory this helper created itself (with the
+#:   execution id in its name; ``st_dev``/``st_ino`` recorded);
+#: * ``eval-worktree`` — the Evaluator pin worktree path this helper
+#:   assigned at ``pin`` (exec id in the name) and its pinned sha; ``end``
+#:   removes it only after git lists it there, detached at that sha;
+#: * ``released`` — ownership of ``branch``/``path`` ended (removed).
+#:
+#: Every entry has ``exec_id``, ``run_id``, ``kind``, ``path``, ``branch``,
+#: ``created_at`` and ``verified_by``.
+LEDGER_DIR = "trio-native"
+LEDGER_FILE = "owned.jsonl"
+_WF_WORKTREE_RE = re.compile(r"^(wf_[A-Za-z0-9_-]{1,64})-([1-9][0-9]{0,6})$")
+_O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _mailbox_key(mailbox: Path) -> str:
+    return hashlib.sha256(str(Path(mailbox).resolve()).encode()).hexdigest()[:16]
+
+
+def _git_common_dir(repo: Path | None) -> Path | None:
+    if repo is None:
+        return None
+    out = TL._git(repo, "rev-parse", "--path-format=absolute",
+                  "--git-common-dir")
+    path = out.stdout.strip()
+    return Path(path) if out.returncode == 0 and path else None
+
+
+def _ledger_path(mailbox: Path, repo: Path | None) -> Path | None:
+    common = _git_common_dir(repo)
+    if common is None:
+        return None
+    return common / LEDGER_DIR / _mailbox_key(mailbox) / LEDGER_FILE
+
+
+def _real_dir(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _ledger_append(mailbox: Path, repo: Path | None, entry: dict) -> bool:
+    """Append one entry (one ``write`` under an flock, fsync'd). The ledger
+    dirs and file are never followed through a symlink. False when the
+    ledger cannot be written (then nothing is ownable)."""
+    path = _ledger_path(mailbox, repo)
+    if path is None:
+        return False
+    try:
+        for d in (path.parent.parent, path.parent):
+            try:
+                os.mkdir(d, 0o700)
+            except FileExistsError:
+                pass
+            if not _real_dir(d):
+                return False
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        record = {"created_at": _now_iso(), "exec_id": None, "run_id": None,
+                  "path": None, "branch": None, "verified_by": None, **entry}
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _ledger_read(path: Path) -> list[dict]:
+    raw = _read_bytes(path)
+    out = []
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("kind"), str):
+            out.append(item)
+    return out
+
+
+def _ledger(mailbox: Path, repo: Path | None) -> list[dict]:
+    path = _ledger_path(mailbox, repo)
+    if path is None or not _real_dir(path.parent):
+        return []
+    return _ledger_read(path)
+
+
+def _foreign_run_ids(mailbox: Path, repo: Path | None) -> set[str]:
+    """Run ids another mailbox's ledger (in the same repository) holds."""
+    common = _git_common_dir(repo)
+    if common is None or not _real_dir(common / LEDGER_DIR):
+        return set()
+    own = _mailbox_key(mailbox)
+    ids: set[str] = set()
+    try:
+        keys = os.listdir(common / LEDGER_DIR)
+    except OSError:
+        return ids
+    for key in keys:
+        if key == own or not _real_dir(common / LEDGER_DIR / key):
+            continue
+        for e in _ledger_read(common / LEDGER_DIR / key / LEDGER_FILE):
+            if e.get("run_id"):
+                ids.add(str(e["run_id"]))
+    return ids
+
+
+def _current_exec_id(mailbox: Path) -> str:
+    exec_id = str(_read_json(mailbox / SESSION).get("exec_id") or "")
+    return exec_id if _EXEC_ID_RE.fullmatch(exec_id) else ""
+
+
+def _owned(entries: list[dict], kind: str, *, exec_id: str | None = None
+           ) -> list[dict]:
+    """Live ownership entries of ``kind`` (latest per branch/path, not
+    released afterwards), optionally of one execution only."""
+    live: dict[tuple, dict] = {}
+    for e in entries:
+        k = e.get("kind")
+        ident = (e.get("branch") or None, e.get("path") or None)
+        if k == "released":
+            for key in list(live):
+                if ((ident[0] and key[0] == ident[0])
+                        or (ident[1] and key[1] == ident[1])):
+                    del live[key]
+        elif k == kind:
+            live[ident] = e
+    return [e for e in live.values()
+            if exec_id is None or e.get("exec_id") == exec_id]
+
+
+def _owned_branch(mailbox: Path, repo: Path | None, branch: str, *,
+                  exec_id: str | None = None) -> dict | None:
+    for e in _owned(_ledger(mailbox, repo), "builder", exec_id=exec_id):
+        if e.get("branch") == branch:
+            return e
+    return None
+
+
+def _release_owned(mailbox: Path, repo: Path | None, entry: dict,
+                   why: str) -> None:
+    _ledger_append(mailbox, repo, {
+        "kind": "released", "exec_id": _current_exec_id(mailbox) or None,
+        "run_id": entry.get("run_id"), "path": entry.get("path"),
+        "branch": entry.get("branch"), "verified_by": why})
+
+
+# ------------------------------------------ fd-based directory handling
+def _open_dir_at(parent_fd: int, name: str, expect: os.stat_result | None
+                 ) -> int:
+    """An O_RDONLY directory fd for ``name`` under ``parent_fd``, never
+    through a symlink. A directory without read/search permission for us
+    (mode 000, e.g. a permission test's leftover) is opened ``O_PATH``,
+    verified (same dev/ino as ``expect``) and made 0700 through
+    ``/proc/self/fd`` — the chmod reaches exactly that inode, which lies
+    inside the tree being removed — then reopened and verified again."""
+    try:
+        fd = os.open(name, _O_DIR, dir_fd=parent_fd)
+    except PermissionError:
+        pfd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+                      | os.O_CLOEXEC, dir_fd=parent_fd)
+        try:
+            st = os.fstat(pfd)
+            if expect is not None and (st.st_dev, st.st_ino) != (
+                    expect.st_dev, expect.st_ino):
+                raise OSError(f"{name} changed while being removed")
+            os.chmod(f"/proc/self/fd/{pfd}", stat.S_IMODE(st.st_mode)
+                     | stat.S_IRWXU)
+        finally:
+            os.close(pfd)
+        fd = os.open(name, _O_DIR, dir_fd=parent_fd)
+    st = os.fstat(fd)
+    if expect is not None and (st.st_dev, st.st_ino) != (expect.st_dev,
+                                                          expect.st_ino):
+        os.close(fd)
+        raise OSError(f"{name} changed while being removed")
+    return fd
+
+
+def _rm_contents(dfd: int, dev: int, depth: int = 0) -> list[str]:
+    """Remove everything inside the open directory ``dfd``; every entry is
+    handled (and its failure recorded) on its own. Only directories inside
+    this tree are ever chmod-ed (``fchmod`` on an fd of this walk), symlinks
+    are unlinked, never followed, and another filesystem is never entered."""
+    errors: list[str] = []
+    if depth > 256:
+        return ["directory tree deeper than 256 levels"]
+    try:
+        st = os.fstat(dfd)
+        if stat.S_IMODE(st.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
+            os.fchmod(dfd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+        names = os.listdir(dfd)
+    except Exception as exc:  # noqa: BLE001 - reported per entry
+        return [f"{type(exc).__name__}: {exc}"]
+    for name in names:
+        try:
+            est = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if stat.S_ISDIR(est.st_mode):
+                if est.st_dev != dev:
+                    errors.append(f"{name}: another filesystem, not entered")
+                    continue
+                cfd = _open_dir_at(dfd, name, est)
+                try:
+                    sub = _rm_contents(cfd, dev, depth + 1)
+                finally:
+                    os.close(cfd)
+                if sub:
+                    errors.extend(f"{name}/{e}" for e in sub)
+                    continue
+                os.rmdir(name, dir_fd=dfd)
+            else:
+                os.unlink(name, dir_fd=dfd)
+        except Exception as exc:  # noqa: BLE001 - reported per entry
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    return errors
+
+
+def _worktrees_dir_fd(repo: Path, create: bool = False) -> int | None:
+    """An fd of ``<repo>/.claude/worktrees`` opened component by component
+    without following a symlink (None when missing or a symlink)."""
+    try:
+        fd = os.open(str(repo), _O_DIR)
+    except OSError:
+        return None
+    try:
+        for part in WORKTREES_DIR.split("/"):
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nfd = os.open(part, _O_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def _remove_owned_dir(repo: Path, entry: dict) -> list[str]:
+    """Remove one ledger-owned scratch directory; [] on success, else why
+    (it is then left in place). It must still be a real directory directly
+    under ``.claude/worktrees/`` with the recorded dev/ino, and neither be
+    nor contain a registered git worktree."""
+    name = os.path.basename(str(entry.get("path") or ""))
+    if not name or name in (".", "..") or str(entry.get("path")) != str(
+            repo / WORKTREES_DIR / name):
+        return ["not a directory directly under .claude/worktrees/"]
+    mfd = _worktrees_dir_fd(repo)
+    if mfd is None:
+        return [".claude/worktrees/ is missing or a symlink"]
+    try:
+        try:
+            st = os.stat(name, dir_fd=mfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return []
+        if not stat.S_ISDIR(st.st_mode):
+            return ["not a real directory (a symlink or a file)"]
+        if (st.st_dev, st.st_ino) != (entry.get("dev"), entry.get("ino")):
+            return ["not the directory this run created (dev/inode differ)"]
+        real = os.path.join(os.path.realpath(str(repo / WORKTREES_DIR)), name)
+        for t in _worktrees(repo):
+            r = os.path.realpath(t.get("path") or "/")
+            if r == real or r.startswith(real + os.sep):
+                return [f"contains the git worktree {t.get('path')}"]
+        dfd = _open_dir_at(mfd, name, st)
+        try:
+            errors = _rm_contents(dfd, st.st_dev)
+        finally:
+            os.close(dfd)
+        if errors:
+            return errors[:5]
+        os.rmdir(name, dir_fd=mfd)
+        return []
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return [f"{type(exc).__name__}: {exc}"]
+    finally:
+        os.close(mfd)
+
+
+def _make_scratch(mailbox: Path, repo: Path | None, exec_id: str,
+                  name: str, purpose: str) -> str | None:
+    """Create ``.claude/worktrees/<name>`` (the name carries the exec id)
+    and record it as this execution's scratch. An existing directory is
+    reused only when the ledger already lists it for this execution with
+    the same dev/ino. Returns the path, or None."""
+    if repo is None or not exec_id or exec_id not in name:
+        return None
+    path = str(repo / WORKTREES_DIR / name)
+    for e in _owned(_ledger(mailbox, repo), "scratch", exec_id=exec_id):
+        if e.get("path") == path:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                break
+            if (stat.S_ISDIR(st.st_mode)
+                    and (st.st_dev, st.st_ino) == (e.get("dev"), e.get("ino"))):
+                return path
+            return None
+    mfd = _worktrees_dir_fd(repo, create=True)
+    if mfd is None:
+        return None
+    try:
+        try:
+            os.mkdir(name, 0o700, dir_fd=mfd)
+        except FileExistsError:
+            return None  # not created by this helper: never claimed
+        st = os.stat(name, dir_fd=mfd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(mfd)
+    ok = _ledger_append(mailbox, repo, {
+        "kind": "scratch", "exec_id": exec_id, "path": path,
+        "dev": st.st_dev, "ino": st.st_ino, "purpose": purpose,
+        "verified_by": "created by the helper (mkdir)"})
+    return path if ok else None
+
+
+def _operation_in_progress(root: Path) -> str | None:
+    """The in-progress git operation of the checkout (merge, rebase,
+    cherry-pick, revert), or None."""
+    names = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge",
+             "rebase-apply")
+    args = ["rev-parse", "--path-format=absolute"]
+    for n in names:
+        args += ["--git-path", n]
+    out = TL._git(root, *args)
+    paths = out.stdout.splitlines()
+    if out.returncode != 0 or len(paths) != len(names):
+        return "git state unreadable"
+    for n, p in zip(names, paths):
+        if os.path.lexists(p):
+            return n
+    return None
+
+
 # ------------------------------------------------------------------- ops
 def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     if not (mailbox / "GOAL.md").is_file():
@@ -645,10 +1018,15 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     exec_id = uuid.uuid4().hex
     _write_session(mailbox, a.token, snap["phase"], done=False, exec_id=exec_id)
     # v01 item 3: this run holds the lock, so every builder worktree an
-    # earlier run of this mailbox left is dead; reuse or clean it up.
+    # earlier run of this mailbox left is dead; reuse or clean up the ones
+    # the ownership ledger proves are this mailbox's (nothing else).
     reclaimed = _reclaim_builders(mailbox, repo)
-    # v01 item 2: after the reclaim, so `end` removes only this run's scratch.
-    _record_scratch_baseline(mailbox, repo, exec_id)
+    # v01 item 2: scratch dirs earlier executions of this mailbox created
+    # (ledger-owned; e.g. a run that crashed before `end`), then this
+    # execution's own TMPDIR, created and recorded by the helper.
+    stale = _remove_exec_scratch(mailbox, repo, exclude_exec=exec_id)
+    reclaimed["scratch_removed"], reclaimed["scratch_kept"] = stale
+    tmpdir = _make_scratch(mailbox, repo, exec_id, f"tmp-{exec_id}", "tmpdir")
     _register(mailbox, replace=True, repo=str(repo) if repo else None,
               helper=str(Path(__file__).resolve()), run_token=a.token,
               holder_pid=_holder_pid(), state="running",
@@ -660,6 +1038,7 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         "exec_id": exec_id,
         "exclude_path": exclude,
         "reclaimed": reclaimed,
+        "tmpdir": tmpdir,
         **snap,
     }
 
@@ -851,6 +1230,38 @@ def _context_block(mailbox: Path, ctx: dict) -> str:
     )
 
 
+def _eval_places(mailbox: Path, repo: Path | None, iteration: int,
+                 attempt: str, sha: str) -> dict:
+    """``pin``: the Evaluator's pin-worktree path and scratch dir, both named
+    with this execution's id. The scratch dir is created and recorded here;
+    the worktree path is recorded as assigned (with the pinned sha) and is
+    removed at ``end`` only when git lists a worktree exactly there,
+    detached at that sha."""
+    exec_id = _current_exec_id(mailbox)
+    tag = re.sub(r"[^0-9A-Za-z]", "", attempt)[:8] or "0"
+    out: dict = {"eval_worktree": None, "eval_scratch": None,
+                 "tmpdir": None}
+    if repo is None or not exec_id:
+        return out
+    base = f"eval-{exec_id}-{iteration}-{tag}"
+    out["eval_scratch"] = _make_scratch(mailbox, repo, exec_id,
+                                        base + "-scratch", "eval-scratch")
+    path = str(repo / WORKTREES_DIR / base)
+    entries = _ledger(mailbox, repo)
+    assigned = any(e.get("path") == path and e.get("sha") == sha for e in
+                   _owned(entries, "eval-worktree", exec_id=exec_id))
+    if assigned or (sha and _ledger_append(mailbox, repo, {
+            "kind": "eval-worktree", "exec_id": exec_id, "path": path,
+            "sha": sha, "iteration": iteration,
+            "verified_by": "assigned by the helper at pin; removed only when "
+                           "git lists it here detached at sha"})):
+        out["eval_worktree"] = path
+    for e in _owned(entries, "scratch", exec_id=exec_id):
+        if e.get("purpose") == "tmpdir":
+            out["tmpdir"] = e.get("path")
+    return out
+
+
 def op_pin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     """Persist the evaluator pin + attempt (``_lockstep_eval_context``)."""
     _require_lock(mailbox, a.token)
@@ -866,6 +1277,9 @@ def op_pin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     )
     _write_session(mailbox, a.token, "evaluator-running", done=False)
     return {
+        **_eval_places(mailbox, repo, a.iteration,
+                       str(ctx["evaluator_attempt"] or ""),
+                       str(ctx["pinned_sha"] or "")),
         "iteration": a.iteration,
         "evaluator_attempt": ctx["evaluator_attempt"],
         "sha": ctx["pinned_sha"],
@@ -988,6 +1402,13 @@ def op_dispatch(mailbox: Path, repo: Path | None,
     head = TL._git_head(root)
     if head is None:
         raise StepError("dispatch: repository has no HEAD commit")
+    # What already exists under .claude/worktrees/: a builder worktree of
+    # this wave must be new since now (`_own_builder_pair`).
+    _ledger_append(mailbox, root, {
+        "kind": "dispatch", "exec_id": _current_exec_id(mailbox) or None,
+        "iteration": a.iteration, "wave": a.wave, "head": head,
+        "names": _worktrees_dir_entries(root) or [],
+        "verified_by": "listing of .claude/worktrees/ at dispatch"})
     return {"iteration": a.iteration, "wave": a.wave, "head": head}
 
 
@@ -1043,12 +1464,108 @@ def _refusal(reason: str, kind: str, own_branch: str | None = None) -> dict:
     """A builder refusal: ``kind`` is ``report`` when only the builder's
     report is in doubt (asking it to report again may resolve it) and
     ``work`` when git shows the work itself is unusable. ``own_branch`` is
-    set only when git confirmed the reported worktree is on that branch."""
+    set only when the refused branch is this dispatch's own, ledger-owned
+    builder branch (``_own_builder_pair``) — the only branch a re-dispatch
+    may supersede."""
     return {"reason": reason, "kind": kind, "own_branch": own_branch}
 
 
+def _branch_created_at(repo: Path, branch: str) -> str | None:
+    """The sha the branch was created at (its oldest reflog entry), or None
+    when git keeps no reflog for it."""
+    out = TL._git(repo, "reflog", "show", "--format=%H", f"refs/heads/{branch}",
+                  "--")
+    shas = out.stdout.split() if out.returncode == 0 else []
+    return shas[-1] if shas else None
+
+
+def _own_builder_pair(mailbox: Path, root: Path, exec_id: str,
+                      iteration: int, wave: int, head: str, index: object,
+                      trees: list[dict], reported: tuple[str, str] = ("", "")
+                      ) -> tuple[dict | None, str]:
+    """The workflow's isolation worktree of builder agent ``index`` of this
+    dispatch, proven from git alone (never from the builder's report):
+    ``(entry, "")`` or ``(None, why)``.
+
+    The harness names an isolated agent's worktree ``<repo>/.claude/
+    worktrees/<runId>-<n>`` on branch ``worktree-<runId>-<n>``, ``n`` being
+    the 1-based number of the ``agent()`` call in the run (probe P4; N0
+    vps-pool r1: builders 5..9 after begin, next, lead plan, dispatch). The
+    script counts its own ``agent()`` calls and passes ``n`` as the result's
+    ``agent_index``. A worktree qualifies only when ``git worktree list``
+    has it at exactly that path (real path, directly under the marker, not a
+    symlink) on exactly that branch, it did not exist at this wave's
+    ``dispatch`` (ledger snapshot), and the branch was created at the
+    dispatch HEAD (its reflog; without a reflog it must contain that HEAD).
+    ``runId`` is not visible to the script: the first unambiguous match of
+    an execution pins it in the ledger (``run``); a run id another
+    mailbox's ledger or an earlier execution holds never qualifies, and more
+    than one candidate is ambiguous (nothing owned). Before the run id is
+    pinned, the builder's report must also name that same worktree and
+    branch (a necessary, never a sufficient, condition)."""
+    try:
+        n = int(str(index))
+    except (TypeError, ValueError):
+        return None, "no agent index from the script"
+    if n < 1 or not exec_id:
+        return None, "no agent index from the script"
+    entries = _ledger(mailbox, root)
+    snaps = [e for e in entries if e.get("kind") == "dispatch"
+             and e.get("exec_id") == exec_id and e.get("iteration") == iteration
+             and e.get("wave") == wave and e.get("head") == head]
+    if not snaps:
+        return None, "no dispatch record of this wave in the ownership ledger"
+    before = set(snaps[-1].get("names") or [])
+    pinned = [e.get("run_id") for e in entries
+              if e.get("kind") == "run" and e.get("exec_id") == exec_id]
+    taken = _foreign_run_ids(mailbox, root) | {
+        str(e["run_id"]) for e in entries
+        if e.get("run_id") and e.get("exec_id") != exec_id}
+    marker = os.path.realpath(str(root / WORKTREES_DIR))
+    found = []
+    for t in trees:
+        path, branch = t.get("path") or "", t.get("branch") or ""
+        name = os.path.basename(path)
+        m = _WF_WORKTREE_RE.fullmatch(name)
+        if not m or int(m.group(2)) != n or branch != f"worktree-{name}":
+            continue
+        rid = m.group(1)
+        if (pinned and rid != pinned[-1]) or rid in taken or name in before:
+            continue
+        if (os.path.realpath(os.path.dirname(path)) != marker
+                or os.path.realpath(path) != os.path.join(marker, name)
+                or not _real_dir(Path(path))):
+            continue
+        created = _branch_created_at(root, branch)
+        if created is not None and created != head:
+            continue
+        tip = _branch_sha(root, branch)
+        if tip is None or not TL._git_is_ancestor(root, head, tip):
+            continue
+        found.append({"run_id": rid, "path": path, "branch": branch,
+                      "tip": tip, "agent_index": n,
+                      "reflog": created is not None})
+    if len(found) != 1:
+        return None, (f"no isolation worktree <runId>-{n} of this dispatch"
+                      if not found else
+                      f"{len(found)} candidate worktrees for agent {n}: ambiguous")
+    own = found[0]
+    if not pinned:
+        rep_path, rep_branch = reported
+        if (not rep_path or rep_branch != own["branch"]
+                or os.path.realpath(rep_path) != os.path.realpath(own["path"])):
+            return None, ("the run id is not pinned yet and the report does "
+                          f"not name {own['path']} on {own['branch']}")
+        _ledger_append(mailbox, root, {
+            "kind": "run", "exec_id": exec_id, "run_id": own["run_id"],
+            "verified_by": f"the one new isolation worktree for agent {n} "
+                           f"at dispatch HEAD {head[:12]}"})
+    return own, ""
+
+
 def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
-                   res: dict, worktree_branches: dict[str, str | None]
+                   res: dict, worktree_branches: dict[str, str | None],
+                   own: dict | None = None
                    ) -> tuple[dict | None, dict | None]:
     """``(refusal, correction)`` for one builder result; both None = ok.
 
@@ -1074,11 +1591,21 @@ def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
     if not commits:
         return None, None  # nothing to merge
     branch = str(res.get("branch") or "").strip()
+    worktree = str(res.get("worktree") or "").strip()
+    if own is not None and (branch != own["branch"] or not worktree or
+                            os.path.realpath(worktree)
+                            != os.path.realpath(own["path"])):
+        # git knows this dispatch's own worktree: a report naming another
+        # pair is refused (the builder is asked again), never trusted.
+        return _refusal(f"builder {sid}: reported worktree {worktree or '(none)'} "
+                        f"on {branch or '(none)'} is not this dispatch's "
+                        f"isolation worktree {own['path']} on {own['branch']}",
+                        "report"), None
+    mine = own["branch"] if own is not None else None
     tip = _branch_sha(repo, branch) if branch else None
     if tip is None:
         return _refusal(f"builder {sid}: branch {branch or '(none)'} does "
                         "not exist", "report"), None
-    worktree = str(res.get("worktree") or "").strip()
     if not worktree:
         return _refusal(f"builder {sid}: no worktree reported for branch "
                         f"{branch}", "report"), None
@@ -1092,7 +1619,7 @@ def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
     if not TL._git_is_ancestor(repo, head, tip):
         return _refusal(f"builder {sid}: branch {branch} does not contain "
                         f"the Lead's HEAD {head[:12]}: {BASE_REF_HINT}",
-                        "work", branch), None
+                        "work", mine), None
     listed = TL._git(repo, "rev-list", f"{head}..{tip}").stdout.split()
     for sha in listed:
         loop_paths = [p for p in TL._commit_paths(repo, sha)
@@ -1101,7 +1628,7 @@ def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
             return _refusal(f"builder {sid}: commit {sha[:12]} commits "
                             f"mailbox files ({', '.join(loop_paths[:3])}); "
                             "builders never commit loop/", "work",
-                            branch), None
+                            mine), None
     reported = str(res.get("head") or "").strip()
     if reported and not TL._sha_matches(reported, tip):
         if _single_slice_commit(repo, head, tip, sid):
@@ -1111,7 +1638,7 @@ def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
                         f"branch {branch} is at {tip[:12]} ({len(listed)} "
                         "commit(s) since the dispatch HEAD, not one "
                         f"well-formed slice({sid}): commit)", "report",
-                        branch), None
+                        mine), None
     return None, None
 
 
@@ -1152,13 +1679,42 @@ def op_builders(mailbox: Path, repo: Path | None,
     if not head:
         raise StepError("builders: --head (the dispatch HEAD) is required")
     mailbox_rel = TL._mailbox_rel(root, mailbox)
+    trees = _worktrees(root)
     worktree_branches = {os.path.realpath(t["path"]): t.get("branch")
-                         for t in _worktrees(root) if t.get("path")}
+                         for t in trees if t.get("path")}
+    exec_id = _current_exec_id(mailbox)
     accepted, refused, merge, corrected = [], [], [], []
+    owned, unowned = [], []
     for res in results:
         sid = _one_line(res.get("id"), 64) or "?"
+        own, why = _own_builder_pair(
+            mailbox, root, exec_id, a.iteration, a.wave, head,
+            res.get("agent_index"), trees,
+            (str(res.get("worktree") or "").strip(),
+             str(res.get("branch") or "").strip()))
+        if own is not None:
+            # Ownership is git's (and the script's agent index), not the
+            # report's: recorded whether or not the report is accepted.
+            if _owned_branch(mailbox, root, own["branch"],
+                             exec_id=exec_id) is None:
+                _ledger_append(mailbox, root, {
+                    "kind": "builder", "exec_id": exec_id,
+                    "run_id": own["run_id"], "path": own["path"],
+                    "branch": own["branch"], "id": sid,
+                    "iteration": a.iteration, "wave": a.wave, "head": head,
+                    "tip": own["tip"], "agent_index": own["agent_index"],
+                    "verified_by": "git worktree list: <runId>-<agent index> "
+                                   "isolation worktree, new since dispatch, "
+                                   + ("branch reflog created at the dispatch "
+                                      "HEAD" if own["reflog"] else
+                                      "branch contains the dispatch HEAD "
+                                      "(no reflog)")})
+            owned.append({"id": sid, "branch": own["branch"],
+                          "worktree": own["path"]})
+        elif res.get("commits"):
+            unowned.append({"id": sid, "reason": why})
         refusal, correction = _check_builder(root, mailbox_rel, head, res,
-                                             worktree_branches)
+                                             worktree_branches, own)
         if refusal:
             refused.append({"id": sid, **refusal})
             continue
@@ -1188,15 +1744,13 @@ def op_builders(mailbox: Path, repo: Path | None,
                     f"{_one_line(res.get('summary'))}{where}")
             if line not in logged:
                 TL._append_log(mailbox, line)
-    # Every builder that reported commits, accepted or not, so a fresh run
-    # after an error can find its worktree again (v01 item 3).
-    seen = [{"id": _one_line(r.get("id"), 64) or "?",
-             "branch": str(r.get("branch") or "").strip(),
-             "worktree": str(r.get("worktree") or "").strip()}
-            for r in results if r.get("commits") and r.get("branch")]
+    # `builders`: the ledger-owned pairs (what a fresh run may reclaim);
+    # `unowned`: builders with commits whose ownership git did not prove —
+    # never merged, removed or deleted by the driver (reported only).
     result = {"iteration": a.iteration, "wave": a.wave, "head": head,
               "accepted": accepted, "refused": refused, "merge": merge,
-              "corrected": corrected, "builders": seen}
+              "corrected": corrected, "builders": owned,
+              "unowned": unowned}
     _record(mailbox, "builders", key, result)
     return result
 
@@ -1282,8 +1836,8 @@ def _is_builder_branch(root: Path, trees: dict, branch: str) -> bool:
     return bool(path) and _under_worktrees_marker(root, path)
 
 
-def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
-                     spec: str, trees: dict) -> dict:
+def _drop_superseded(mailbox: Path, root: Path, mailbox_rel: str | None,
+                     head: str | None, spec: str, trees: dict) -> dict:
     """Drop one unmerged builder branch superseded by a re-dispatch.
 
     ``spec`` must be ``old=new`` (eval-native-v0c C3: the bare ``old`` form
@@ -1301,6 +1855,11 @@ def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
     or no worktree and a ``worktree-*`` name. The branch is then
     force-deleted (``git branch -D``): its commits are superseded by
     ``new``, not merged themselves.
+
+    v01 fix (eval-v01 finding 4): both ``old`` and ``new`` must be builder
+    branches the ownership ledger lists for THIS execution, and ``old``'s
+    worktree (if any) must be the ledger's path. A branch a builder merely
+    reported (another run's, or a user's) is never dropped.
     """
     old, sep, new = (x.strip() for x in spec.partition("="))
     entry: dict = {"branch": old, "superseded_by": new or None}
@@ -1308,9 +1867,20 @@ def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
         return {**entry, "dropped": False,
                 "reason": "drop_unmerged requires 'old=new': the bare "
                           "'old' form is refused"}
+    exec_id = _current_exec_id(mailbox)
+    old_own = _owned_branch(mailbox, root, old, exec_id=exec_id or "-")
+    if old_own is None:
+        return {**entry, "dropped": False,
+                "reason": f"{old} is not a builder branch this run owns "
+                          "(no ownership-ledger entry): never dropped"}
     tip = _branch_sha(root, old)
     if tip is None:
+        _release_owned(mailbox, root, old_own, "branch already gone")
         return {**entry, "dropped": True, "note": "branch already gone"}
+    if _owned_branch(mailbox, root, new, exec_id=exec_id or "-") is None:
+        return {**entry, "dropped": False,
+                "reason": f"{new} is not a builder branch this run owns "
+                          "(no ownership-ledger entry)"}
     if not _is_builder_branch(root, trees, new):
         return {**entry, "dropped": False,
                 "reason": f"{new} is not a builder branch (no worktree-* "
@@ -1330,6 +1900,9 @@ def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
         if Path(path).resolve() == root.resolve():
             return {**entry, "dropped": False,
                     "reason": "checked out in the repo"}
+        if os.path.realpath(path) != os.path.realpath(str(old_own["path"])):
+            return {**entry, "dropped": False, "worktree": path,
+                    "reason": "checked out outside its ledger worktree"}
         why = _remove_worktree(root, path, mailbox_rel)
         if why:
             return {**entry, "dropped": False, "worktree": path,
@@ -1339,6 +1912,7 @@ def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
         return {**entry, "dropped": False, "worktree": path,
                 "reason": "git branch -D failed: "
                           + deleted.stderr.strip()[:200]}
+    _release_owned(mailbox, root, old_own, f"superseded by {new}; dropped")
     return {**entry, "dropped": True, "worktree": path, "tip": tip}
 
 
@@ -1359,7 +1933,7 @@ def op_cleanup(mailbox: Path, repo: Path | None,
     trees = {t.get("branch"): t for t in _worktrees(root)}
     # Superseded branches first: an `old=new` pair checks that `new` is
     # merged before the loop below deletes the merged `new` branch.
-    dropped = [_drop_superseded(root, mailbox_rel, head, d, trees)
+    dropped = [_drop_superseded(mailbox, root, mailbox_rel, head, d, trees)
                for d in drops]
     removed, kept = [], []
     for branch in wanted:
@@ -1384,6 +1958,20 @@ def op_cleanup(mailbox: Path, repo: Path | None,
                         "reason": f"worktree {path} is not under "
                                   f"{root}/{WORKTREES_DIR}/"})
             continue
+        own = _owned_branch(mailbox, root, branch)
+        if own is None:
+            # v01 fix: merged or not, only a ledger-owned builder branch of
+            # this mailbox is ever removed by the driver.
+            kept.append({"branch": branch, "worktree": path,
+                         "reason": "not owned by this mailbox's runs (no "
+                                   "ownership-ledger entry)"})
+            continue
+        if path and os.path.realpath(path) != os.path.realpath(
+                str(own.get("path") or "")):
+            kept.append({"branch": branch, "worktree": path,
+                         "reason": "checked out outside its ledger worktree "
+                                   f"{own.get('path')}"})
+            continue
         if path:
             why = _remove_worktree(root, path, mailbox_rel)
             if why:
@@ -1396,16 +1984,54 @@ def op_cleanup(mailbox: Path, repo: Path | None,
                          "reason": "git branch -d failed: "
                          + deleted.stderr.strip()[:200]})
             continue
+        _release_owned(mailbox, root, own, "merged; removed by cleanup")
         removed.append({"branch": branch, "worktree": path})
     return {"removed": removed, "kept": kept, "dropped": dropped}
 
 
-def _eval_worktrees(repo: Path | None) -> list[str]:
-    if repo is None:
-        return []
+def _remove_eval_worktrees(mailbox: Path, repo: Path, exec_id: str
+                           ) -> tuple[list[str], list[dict], list[str]]:
+    """``end``: remove the Evaluator pin worktrees this execution was
+    assigned at ``pin`` (ledger ``eval-worktree``), each only when git lists
+    a worktree at exactly that path (real path, not a symlink), detached at
+    the pinned sha. Returns ``(removed, kept, left)``; ``left`` = other
+    ``eval-*`` worktrees under ``.claude/worktrees/`` (another execution's,
+    another mailbox's or a user's): reported, never touched (eval-v01
+    finding 8)."""
+    rel = TL._mailbox_rel(repo, mailbox)
+    removed, kept = [], []
+    trees = _worktrees(repo)
+    handled: set[str] = set()
+    for e in _owned(_ledger(mailbox, repo), "eval-worktree", exec_id=exec_id):
+        path = str(e.get("path") or "")
+        match = [t for t in trees if t.get("path") and os.path.realpath(
+            t["path"]) == os.path.realpath(path)]
+        if not match:
+            continue  # never created (graded in place) or already gone
+        handled.add(path)
+        t = match[0]
+        real = os.path.realpath(path)
+        if (real != os.path.join(os.path.realpath(str(repo / WORKTREES_DIR)),
+                                 os.path.basename(path))
+                or not _real_dir(Path(path))):
+            kept.append({"worktree": path, "reason": "not a real directory "
+                         "at its assigned path"})
+            continue
+        if t.get("branch") or t.get("head") != e.get("sha"):
+            kept.append({"worktree": path, "reason": "not detached at the "
+                         f"pinned sha {str(e.get('sha'))[:12]}"})
+            continue
+        why = _remove_worktree(repo, path, rel, force_any=True)
+        if why:
+            kept.append({"worktree": path, "reason": why})
+        else:
+            _release_owned(mailbox, repo, e, "eval pin worktree removed at end")
+            removed.append(path)
     marker = f"{repo}/{WORKTREES_DIR}/{EVAL_WORKTREE_PREFIX}"
-    return sorted(t["path"] for t in _worktrees(repo)
-                  if t.get("path", "").startswith(marker))
+    left = sorted(t["path"] for t in trees
+                  if t.get("path", "").startswith(marker)
+                  and t["path"] not in handled)
+    return removed, kept, left
 
 
 # ------------------------------------------------ retirement fold
@@ -1508,11 +2134,10 @@ def _dangling_worktrees(repo: Path | None) -> list[str]:
 
 
 # ------------------------------------------ run scratch (v01 item 2)
-#: Scratch a run's roles leave under ``.claude/worktrees/`` that is not a
-#: git worktree: an Evaluator's ``eval-*`` scratch copy and ``tmp*`` dirs of
-#: roles running with ``TMPDIR`` there (N0 subusage r1, vps-pool r2).
+#: Scratch names roles leave under ``.claude/worktrees/`` that are not git
+#: worktrees (N0 subusage r1, vps-pool r2). Used only to REPORT such dirs
+#: (``scratch_left``); what ``end`` removes comes from the ledger alone.
 SCRATCH_RE = re.compile(r"^(?:eval-|tmp)[^/]*$")
-SCRATCH_KEY = "scratch_baseline"
 
 
 def _worktrees_dir_entries(repo: Path | None) -> list[str] | None:
@@ -1529,119 +2154,64 @@ def _worktrees_dir_entries(repo: Path | None) -> list[str] | None:
         return None
 
 
-def _record_scratch_baseline(mailbox: Path, repo: Path | None,
-                             exec_id: str) -> None:
-    """``begin``: what already sits under ``.claude/worktrees/``, so ``end``
-    removes only scratch this run execution created."""
-    data = _records(mailbox)
-    data[SCRATCH_KEY] = {"exec_id": exec_id,
-                         "names": _worktrees_dir_entries(repo) or []}
-    _write_json(mailbox / RECORDS, data)
-
-
-def _rmtree_writable(path: Path) -> None:
-    """``shutil.rmtree`` (symlink-safe fd walk) that makes read-only dirs
-    writable first (npm/go caches are often 0555)."""
-    import shutil
-
-    def fix(func, target, _exc):
-        parent = os.path.dirname(target)
-        for p in (parent, target):
-            try:
-                if not os.path.islink(p):
-                    os.chmod(p, stat.S_IRWXU)
-            except OSError:
-                pass
-        func(target)
-
-    shutil.rmtree(str(path), onexc=fix) if sys.version_info >= (3, 12) \
-        else shutil.rmtree(str(path), onerror=fix)
-
-
-def _remove_run_scratch(mailbox: Path, repo: Path | None
-                        ) -> tuple[list[str], list[dict], list[str]]:
-    """``end``: remove the run's non-worktree scratch dirs.
-
-    Only a directory directly under ``<repo>/.claude/worktrees/`` that
-    (a) matches ``eval-*`` or ``tmp*``, (b) was not there at this run
-    execution's ``begin`` (baseline in ``.native.json``, same ``exec_id`` as
-    ``.session.json``), (c) is a real directory, not a symlink, and
-    (d) neither is nor contains a registered git worktree. No baseline for
-    this execution: nothing is removed. Returns ``(removed, kept, left)``:
-    ``left`` = matching dirs that predate this run (reported, never
-    removed)."""
+def _remove_exec_scratch(mailbox: Path, repo: Path | None, *,
+                         exec_id: str | None = None,
+                         exclude_exec: str | None = None
+                         ) -> tuple[list[str], list[dict]]:
+    """Remove the ledger-owned scratch dirs of ``exec_id`` (``end``) or of
+    every execution but ``exclude_exec`` (``begin``: earlier executions of
+    this mailbox, dead since this run holds the lock). Nothing matched by a
+    name pattern alone is ever removed. Returns ``(removed, kept)``."""
+    removed, kept = [], []
     if repo is None:
-        return [], [], []
-    base = _records(mailbox).get(SCRATCH_KEY)
-    session = _read_json(mailbox / SESSION)
-    if (not isinstance(base, dict) or not base.get("exec_id")
-            or base.get("exec_id") != session.get("exec_id")):
-        return [], [], []
-    before = set(base.get("names") or [])
-    names = _worktrees_dir_entries(repo) or []
+        return removed, kept
+    for e in _owned(_ledger(mailbox, repo), "scratch"):
+        if exec_id is not None and e.get("exec_id") != exec_id:
+            continue
+        if exclude_exec is not None and e.get("exec_id") == exclude_exec:
+            continue
+        path = str(e.get("path") or "")
+        errors = _remove_owned_dir(repo, e)
+        if errors:
+            kept.append({"path": path, "reason": "; ".join(errors)[:400]})
+            continue
+        _release_owned(mailbox, repo, e, "scratch removed")
+        removed.append(path)
+    return removed, kept
+
+
+def _scratch_left(repo: Path | None) -> list[str]:
+    """``eval-*``/``tmp*`` directories still under ``.claude/worktrees/``
+    that are not themselves git worktrees: reported, never removed by
+    name."""
+    if repo is None:
+        return []
     marker = os.path.realpath(str(repo / WORKTREES_DIR))
     registered = [os.path.realpath(t["path"]) for t in _worktrees(repo)
                   if t.get("path")]
-    removed, kept, left = [], [], []
-    for name in names:
-        if not SCRATCH_RE.match(name):
-            continue
+    out = []
+    for name in _worktrees_dir_entries(repo) or []:
         path = repo / WORKTREES_DIR / name
-        if name in before:
-            left.append(str(path))
-            continue
-        try:
-            if not stat.S_ISDIR(os.lstat(path).st_mode):
-                continue  # a symlink or a file: never ours to remove
-        except OSError:
-            continue
         real = os.path.join(marker, name)
-        if any(r == real or r.startswith(real + os.sep) for r in registered):
-            continue  # a git worktree (eval pin worktrees are removed above)
-        try:
-            _rmtree_writable(path)
-            removed.append(str(path))
-        except OSError as exc:
-            kept.append({"path": str(path), "reason": f"{type(exc).__name__}: {exc}"})
-    return removed, kept, left
+        if SCRATCH_RE.match(name) and _real_dir(path) and real not in registered:
+            out.append(str(path))
+    return out
 
 
 # ----------------------------- previous run's builders (v01 item 3)
-_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
-
-
-def _previous_builders(mailbox: Path, trees: dict) -> list[dict]:
-    """Builder branches an earlier run of this mailbox left behind:
-
-    * every builder the ``builders`` op saw (accepted or refused; older
-      records only list the accepted ``merge`` branches), with the
-      iteration it belonged to — ``verified: True``;
-    * a worktree on a ``worktree-<run_id>-<n>`` branch, where ``run_id`` is
-      the last launched run of this mailbox (``.native-result.json``): a
-      builder of a killed wave that never reported — ``verified: False``
-      (never merged, only cleaned up).
-    """
+def _previous_builders(mailbox: Path, repo: Path, exec_id: str
+                       ) -> list[dict]:
+    """The builder branches earlier executions of this mailbox own: live
+    ``builder`` entries of the ownership ledger (never a name pattern, a
+    builder report, ``.native.json`` or ``.native-result.json`` — eval-v01
+    findings 1 and 9)."""
     out: dict[str, dict] = {}
-    for key, rec in _records(mailbox)["builders"].items():
-        if not isinstance(rec, dict):
+    for e in _owned(_ledger(mailbox, repo), "builder"):
+        if e.get("exec_id") == exec_id:
             continue
-        iteration = TL._number(str(key).split(":", 1)[0])
-        entries = rec.get("builders")
-        if not isinstance(entries, list):
-            entries = [{"id": m.get("id"), "branch": m.get("branch")}
-                       for m in rec.get("merge") or [] if isinstance(m, dict)]
-        for b in entries:
-            branch = str((b or {}).get("branch") or "").strip()
-            if branch and branch not in out:
-                out[branch] = {"id": str(b.get("id") or "?"), "branch": branch,
-                               "iteration": iteration, "verified": True}
-    run_id = str(_read_json(mailbox / RESULT).get("run_id") or "")
-    if _RUN_ID_RE.match(run_id):
-        pat = re.compile(rf"^worktree-{re.escape(run_id)}-\d+$")
-        for branch in trees:
-            if branch and pat.match(branch) and branch not in out:
-                out[branch] = {"id": "?", "branch": branch, "iteration": None,
-                               "verified": False}
+        branch = str(e.get("branch") or "")
+        if branch:
+            out[branch] = e
     return list(out.values())
 
 
@@ -1661,36 +2231,57 @@ def _drop_builder(root: Path, mailbox_rel: str | None, branch: str,
 
 def _reclaim_builders(mailbox: Path, repo: Path | None) -> dict:
     """``begin`` of a fresh run: reuse or clean up the committed builder
-    worktrees an earlier run of this mailbox left (v01 item 3).
+    worktrees earlier runs of this mailbox left (v01 item 3).
 
-    Only branches of this mailbox's own records (or its last run id) that
-    are builder branches with no worktree or a worktree under
-    ``.claude/worktrees/`` (real path) are touched:
+    Candidates are ledger-owned builder branches only (``_previous_builders``);
+    each must still be checked out, if at all, in its ledger worktree:
 
     * already merged into HEAD -> worktree removed, branch deleted;
     * STATE is ``lead-running`` of the branch's iteration (the pass will be
-      re-planned), the builder was verified-reported, its commits descend
-      from HEAD (as it was when ``begin`` started), none commits ``loop/``,
-      and the checkout has no staged or tracked changes outside the
-      mailbox -> ``git merge --no-ff --no-edit`` into HEAD, then removed; a
-      conflicting merge is aborted and the branch discarded;
+      re-planned), its commits descend from HEAD (as it was when ``begin``
+      started), none commits ``loop/``, and the checkout has no staged or
+      tracked changes outside the mailbox -> ``git merge --no-ff --no-edit``
+      into HEAD, then removed; a conflicting merge (of ours) is aborted and
+      the branch discarded;
     * otherwise -> discarded (worktree removed, branch force-deleted; the
       tip sha is logged).
 
-    A worktree with product dirt is never removed (kept, and still in
-    ``dangling_worktrees``). Every action gets a ``| loop |`` LOG line.
+    Nothing at all happens while the checkout has an in-progress merge,
+    rebase, cherry-pick or revert (eval-v01 finding 5): every candidate is
+    kept, and that operation is never aborted. A worktree with product dirt
+    is never removed (kept, and still in ``dangling_worktrees``). Every
+    action gets a ``| loop |`` LOG line.
     """
     result: dict = {"merged": [], "removed": [], "discarded": [], "kept": []}
     if repo is None:
         return result
     root = repo
-    trees = {t.get("branch"): t for t in _worktrees(root) if t.get("branch")}
-    candidates = _previous_builders(mailbox, trees)
+    candidates = _previous_builders(mailbox, root, _current_exec_id(mailbox))
     if not candidates:
         return result
+    trees = {t.get("branch"): t for t in _worktrees(root) if t.get("branch")}
     mailbox_rel = TL._mailbox_rel(root, mailbox)
     snap = _snapshot(_state(mailbox))
     head0 = TL._git_head(root)
+
+    def note(kind: str, entry: dict, text: str) -> None:
+        result[kind].append(entry)
+        TL._append_log(mailbox, f"- iter {snap['iteration']} | loop | "
+                                f"previous-run builder {text}")
+
+    busy = _operation_in_progress(root)
+    if busy:
+        for c in candidates:
+            result["kept"].append({
+                "id": c.get("id") or "?", "branch": c.get("branch"),
+                "tip": _branch_sha(root, str(c.get("branch"))),
+                "worktree": c.get("path"),
+                "reason": f"the checkout has an in-progress operation "
+                          f"({busy}); nothing reclaimed"})
+        TL._append_log(mailbox, f"- iter {snap['iteration']} | loop | "
+                                f"previous-run builders kept: the checkout has "
+                                f"an in-progress operation ({busy})")
+        return result
     dirty = _dirty_entries(str(root))
     staged = TL._diff_paths(root, "--cached", "HEAD")
     mergeable_tree = (
@@ -1698,37 +2289,38 @@ def _reclaim_builders(mailbox: Path, repo: Path | None) -> dict:
         and not any(code != "??" and not TL._path_in_mailbox(p, mailbox_rel)
                     for code, p in dirty))
 
-    def note(kind: str, entry: dict, text: str) -> None:
-        result[kind].append(entry)
-        TL._append_log(mailbox, f"- iter {snap['iteration']} | loop | "
-                                f"previous-run builder {text}")
-
     for c in candidates:
-        branch = c["branch"]
+        branch = str(c["branch"])
+        cid = str(c.get("id") or "?")
         tip = _branch_sha(root, branch)
-        if tip is None or head0 is None:
+        if tip is None:
+            _release_owned(mailbox, root, c, "branch gone before reclaim")
+            continue
+        if head0 is None:
             continue
         tree = trees.get(branch)
         path = tree.get("path") if tree else None
-        entry = {"id": c["id"], "branch": branch, "tip": tip,
-                 "worktree": path}
+        entry = {"id": cid, "branch": branch, "tip": tip, "worktree": path}
         if path and (Path(path).resolve() == root.resolve()
+                     or os.path.realpath(path)
+                     != os.path.realpath(str(c.get("path") or ""))
                      or not _under_worktrees_marker(root, path)):
-            continue  # not a builder worktree of ours: never touched
-        if not _is_builder_branch(root, trees, branch):
+            result["kept"].append({**entry, "reason": "checked out outside "
+                                   f"its ledger worktree {c.get('path')}"})
             continue
         if TL._git_is_ancestor(root, tip, head0):
             why = _drop_builder(root, mailbox_rel, branch, path, merged=True)
             if why:
                 result["kept"].append({**entry, "reason": why})
             else:
+                _release_owned(mailbox, root, c, "reclaimed: already merged")
                 note("removed", entry, f"{branch}@{tip[:12]}: already merged; "
                                        "worktree removed")
             continue
         listed = TL._git(root, "rev-list", f"{head0}..{tip}").stdout.split()
         reusable = bool(
-            c["verified"] and snap["phase"] == "lead-running"
-            and c["iteration"] == snap["iteration"]
+            snap["phase"] == "lead-running"
+            and c.get("iteration") == snap["iteration"]
             and TL._git_is_ancestor(root, head0, tip) and listed
             and not any(TL._path_in_mailbox(p, mailbox_rel)
                         for sha in listed for p in TL._commit_paths(root, sha))
@@ -1747,9 +2339,13 @@ def _reclaim_builders(mailbox: Path, repo: Path | None) -> dict:
                                     merged=True)
                 if why:
                     entry["reason"] = why
-                note("merged", entry, f"{branch}@{tip[:12]} ({c['id']}): "
+                else:
+                    _release_owned(mailbox, root, c, "reclaimed: merged")
+                note("merged", entry, f"{branch}@{tip[:12]} ({cid}): "
                                       "merged into HEAD for re-planning")
                 continue
+            # No operation was in progress before this merge (checked
+            # above), so a MERGE_HEAD now is this merge's own.
             in_merge = TL._git(root, "rev-parse", "-q", "--verify",
                                "MERGE_HEAD").returncode == 0
             if not in_merge:
@@ -1762,27 +2358,45 @@ def _reclaim_builders(mailbox: Path, repo: Path | None) -> dict:
         if why:
             result["kept"].append({**entry, "reason": why})
         else:
+            _release_owned(mailbox, root, c, "reclaimed: discarded")
             note("discarded", entry,
-                 f"{branch}@{tip[:12]} ({c['id']}): discarded "
+                 f"{branch}@{tip[:12]} ({cid}): discarded "
                  f"({entry.get('reason') or 'not reusable'}; tip {tip})")
     return result
 
 
 def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
-    eval_removed, eval_kept = [], []
+    """Remove this execution's ledger-owned Evaluator pin worktrees and
+    scratch dirs, then release the lock and write the session, result and
+    registry records. Cleanup can never prevent the release or the records
+    (eval-v01 finding 3): any failure is reported (``scratch_kept`` /
+    ``eval_worktrees_kept``) and the dir stays in ``scratch_left``."""
+    eval_removed, eval_kept, eval_left = [], [], []
     scratch_removed, scratch_kept, scratch_left = [], [], []
     lock_dir = mailbox / ".lock"
     ours = (lock_dir.is_dir() and _lock_owner(lock_dir) == _owner(a.token)
             and not _foreign_live_pid(lock_dir))
-    if repo is not None and ours:
-        rel = TL._mailbox_rel(repo, mailbox)
-        for path in _eval_worktrees(repo):
-            why = _remove_worktree(repo, path, rel, force_any=True)
-            (eval_kept if why else eval_removed).append(
-                {"worktree": path, "reason": why} if why else path)
-        scratch_removed, scratch_kept, scratch_left = _remove_run_scratch(
-            mailbox, repo)
-    lock = _release(mailbox, a.token)
+    try:
+        exec_id = _current_exec_id(mailbox)
+        if repo is not None and ours and exec_id:
+            try:
+                eval_removed, eval_kept, eval_left = _remove_eval_worktrees(
+                    mailbox, repo, exec_id)
+            except Exception as exc:  # noqa: BLE001 - reported
+                eval_kept.append({"worktree": None,
+                                  "reason": f"{type(exc).__name__}: {exc}"})
+            try:
+                scratch_removed, scratch_kept = _remove_exec_scratch(
+                    mailbox, repo, exec_id=exec_id)
+            except Exception as exc:  # noqa: BLE001 - reported
+                scratch_kept.append({"path": None,
+                                     "reason": f"{type(exc).__name__}: {exc}"})
+        try:
+            scratch_left = _scratch_left(repo)
+        except Exception:  # noqa: BLE001 - a report only
+            scratch_left = []
+    finally:
+        lock = _release(mailbox, a.token)
     snap = _snapshot(_state(mailbox))
     session = _read_json(mailbox / SESSION)
     # Only the lock owner closes the session record: `end` also runs after
@@ -1811,6 +2425,7 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     return {"lock": lock, "dangling_worktrees": dangling,
             "eval_worktrees_removed": eval_removed,
             "eval_worktrees_kept": eval_kept,
+            "eval_worktrees_left": eval_left,
             "scratch_removed": scratch_removed,
             "scratch_kept": scratch_kept,
             "scratch_left": scratch_left, **snap}

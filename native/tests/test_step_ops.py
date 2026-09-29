@@ -90,7 +90,16 @@ def step(repo: Path, op: str, *, token: str = TOKEN, env=None, **kw) -> dict:
 def same(a: dict, b: dict) -> bool:
     # ``exec_id``: every ``begin`` mints a fresh run-execution id (eval4
     # finding 1); everything else a replayed op answers is identical.
-    strip = lambda d: {k: v for k, v in d.items() if k not in ("nonce", "exec_id")}
+    # ``tmpdir`` (v01 fix) carries the exec id, and a later ``begin``
+    # reclaims the earlier execution's scratch (``reclaimed.scratch_*``).
+    def strip(d: dict) -> dict:
+        out = {k: v for k, v in d.items()
+               if k not in ("nonce", "exec_id", "tmpdir", "eval_worktree",
+                            "eval_scratch")}
+        if isinstance(out.get("reclaimed"), dict):
+            out["reclaimed"] = {k: v for k, v in out["reclaimed"].items()
+                                if not k.startswith("scratch_")}
+        return out
     return strip(a) == strip(b)
 
 
@@ -557,6 +566,9 @@ def test_replay_every_op_gives_same_answer(repo: Path) -> None:
     # the gate record of a finished pass is replayed after state moved on
     assert same(g1, step(repo, "gate", role="lead", iteration=1, attempt=2))
     e1, e2 = step(repo, "end"), step(repo, "end")
+    # the first `end` removed this execution's own scratch (v01 fix)
+    assert e1["scratch_removed"] and e2["scratch_removed"] == []
+    e1["scratch_removed"] = []
     assert same(e1, e2) and e1["lock"] == "released"
 
 

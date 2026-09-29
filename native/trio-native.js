@@ -180,6 +180,20 @@ const MAILBOX_WRITES = `Write mailbox files (PLAN.md, REPORT.md, VERDICT.md, LOG
 // ------------------------------------------------------------- plumbing
 let agentsUsed = 0
 let seq = 0
+// v01 fix: the number of agent() calls made so far. The harness names an
+// isolated agent's worktree `<repo>/.claude/worktrees/<runId>-<n>` (branch
+// `worktree-<runId>-<n>`), n = the 1-based number of that agent() call in
+// the run (N0 vps-pool r1: builders 5..9 after begin, next, lead plan,
+// dispatch; a journal resume replays the same calls, so the same n). The
+// script passes each builder's n to `builders` as `agent_index`: the helper
+// derives the builder's own worktree from git with it (the ownership
+// ledger), never from the builder's report.
+let agentCalls = 0
+
+function callAgent(prompt, opts) {
+  agentCalls += 1
+  return agent(prompt, opts)
+}
 // The run-execution id `begin` mints (random, per script execution): every
 // later step nonce carries it, so the helper's pin retry allowance
 // (`native:{exec_id}:{nonce}@{iteration}`) never matches across runs.
@@ -273,7 +287,7 @@ async function step(op, extra, reserved) {
     `COMMAND:\n${cmd}\nEND COMMAND\n`
   for (let tries = 1; tries <= 2; tries++) {
     spend(`step ${op}`, reserved)
-    const r = await agent(prompt, {
+    const r = await callAgent(prompt, {
       label: `step ${op}#${seq}` + (tries > 1 ? ' (retry)' : ''),
       agentType: 'trio-step',
       model: MODELS.step,
@@ -288,6 +302,16 @@ async function step(op, extra, reserved) {
   return { ok: false, op, nonce, error: `step ${op} returned no matching result twice` }
 }
 
+// v01 fix: the run's TMPDIR, created and recorded by the helper at `begin`
+// (`.claude/worktrees/tmp-<exec id>`); `end` removes only helper-created dirs.
+function tmpNote() {
+  if (!B || typeof B.tmpdir !== 'string' || !B.tmpdir) return []
+  const t = promptPath(B.tmpdir)
+  return ['Temporary files: use `' + t + '` (e.g. `export TMPDIR=' + t + '`) instead of /tmp or a new directory; do ' +
+    'not create other directories under `.claude/worktrees/` — the driver removes only the directories it created ' +
+    'itself, at the end of the run.']
+}
+
 function header(role, n) {
   return [
     `MAILBOX OVERRIDE: this run uses \`${MAILBOX_Q}/\` as the loop mailbox — every \`loop/\` path in the instructions below resolves to \`${MAILBOX_Q}/\`.`,
@@ -296,7 +320,7 @@ function header(role, n) {
     `Mailbox (absolute): ${MAILBOX_Q}. Product repo: ${repoShown()}.`,
     NOT_ROUTER,
     REPORT_DENIALS,
-  ]
+  ].concat(tmpNote())
 }
 
 // The driver-verified human answer (helper `next` / `pin`, from trio-dash's
@@ -362,6 +386,7 @@ function builderPrompt(n, s, head) {
     `You are the trio-builder for slice \`${s.id}\` of iteration ${n.iteration} of a Trio loop driven by the trio-native workflow.`,
     NOT_ROUTER,
     REPORT_DENIALS,
+  ].concat(tmpNote(), [
     '',
     'Your cwd is an isolated git worktree created for you. Before anything else:',
     `1. Run \`pwd -P\`, \`git rev-parse --show-toplevel\`, \`git rev-parse HEAD\` and \`git status --porcelain\`.`,
@@ -389,7 +414,7 @@ function builderPrompt(n, s, head) {
     'Return through the structured output: `id`, `worktree` (`pwd`), `branch` (`git rev-parse --abbrev-ref HEAD`), ' +
     '`base`, `head` (`git rev-parse HEAD` after your last commit), `commits` (your commit shas, oldest first), ' +
     '`targeted_check` (the counts line of your targeted check), `summary` (one line).',
-  ].join('\n')
+  ]).join('\n')
 }
 
 function integratePrompt(n, k, last, bl, results) {
@@ -477,12 +502,19 @@ function repairPrompt(n, attempt, gate) {
 
 function evaluatorPrompt(n, pin) {
   const attempt8 = String(pin.evaluator_attempt).slice(0, 8)
+  // v01 fix: the helper names the pin worktree and scratch dir with this
+  // execution's id and records them; `end` removes only those.
+  const pinWt = typeof pin.eval_worktree === 'string' && pin.eval_worktree
+    ? promptPath(pin.eval_worktree)
+    : (B.repo ? promptPath(B.repo + '/.claude/worktrees/eval-' + n.iteration + '-' + attempt8) : '<repo>/.claude/worktrees/eval-' + n.iteration + '-' + attempt8)
+  const scratch = typeof pin.eval_scratch === 'string' && pin.eval_scratch ? promptPath(pin.eval_scratch) : null
   return [
     pin.context_block,
     `You are the trio-evaluator for iteration ${n.iteration} of a lockstep Trio loop driven by the trio-native workflow.`,
     `Mailbox (absolute): ${MAILBOX_Q}. Product repo: ${repoShown()}.`,
     NOT_ROUTER,
     REPORT_DENIALS,
+    ...tmpNote(),
     '',
     'Verify the iteration against PLAN.md acceptance criteria and write VERDICT.md per your role instructions ' +
     '(own execution first, web checks for API currency). You have no Agent tool in this workflow: do scoped ' +
@@ -498,8 +530,10 @@ function evaluatorPrompt(n, pin) {
     'offline, list those steps under a `## Remaining real-world steps` section of VERDICT.md, and give the verdict ' +
     'the offline evidence supports.',
     `If you grade in a separate worktree, create it only as \`git -C ${B.repo ? promptPath(B.repo) : '<repo>'} worktree add --detach ` +
-    `${B.repo ? promptPath(B.repo + '/.claude/worktrees/eval-' + n.iteration + '-' + attempt8) : '<repo>/.claude/worktrees/eval-' + n.iteration + '-' + attempt8} ${pin.sha}\` (never a sibling directory); ` +
-    'the driver removes `.claude/worktrees/eval-*` at the end of the run.',
+    `${pinWt} ${pin.sha}\` (never a sibling directory) and do not commit in it; the driver removes that worktree ` +
+    '(and only that one) at the end of the run.' +
+    (scratch ? ` Put any scratch copy, build output or other temporary directory under \`${scratch}\` (the driver removes it ` +
+      'at the end of the run); never create other directories under `.claude/worktrees/`.' : ''),
     `VERDICT.md must record \`attempt: ${pin.evaluator_attempt}\` and \`evaluated: ${pin.sha}\` exactly. A SHIP includes ` +
     `your retirement commit: product changes as \`slice(<id>): …\`, then the mailbox as \`loop: iteration ${n.iteration} — SHIP\`, ` +
     'with the `commit:` shas appended to VERDICT.md. Do not change product files after the pin.',
@@ -539,7 +573,7 @@ async function runAgentTwice(label, prompt, opts) {
   // failure is; a second death stops the run with STATE left resumable.
   for (let tries = 1; tries <= 2; tries++) {
     spend(label)
-    const out = await agent(prompt, Object.assign({ label: tries > 1 ? `${label} (retry)` : label }, opts))
+    const out = await callAgent(prompt, Object.assign({ label: tries > 1 ? `${label} (retry)` : label }, opts))
     noteDenials(label, out)
     if (out !== null && out !== undefined) return out
     log(`${label}: agent returned no result (try ${tries})`)
@@ -653,8 +687,10 @@ function redispatchSlice(s, c) {
 
 // v01 item 1: a slice whose builder stayed refused gets one new builder,
 // forked from the Lead's HEAD after this wave's merges. `supersedes` only
-// when git confirmed the refused branch is that builder's own (cleanup then
-// drops it once the new branch is merged).
+// when the helper's `own_branch` names it: set only for a branch the
+// ownership ledger proves is this dispatch's own isolation worktree (eval-v01
+// finding 4); cleanup then drops it once the new branch is merged, and
+// itself refuses to drop any branch the ledger does not list for this run.
 function redispatchRefused(s, x) {
   return Object.assign({}, s, {
     depends: [],
@@ -726,7 +762,10 @@ async function leadPass(n, rec) {
   log(`iteration ${n.iteration} plan: ${plan.slices.length} slice(s); driver waves ${rec.planned_waves.map(w => '[' + w.join(', ') + ']').join(' ')}` +
     (rec.plan_notes ? `; lead notes: ${rec.plan_notes.slice(0, 400)}` : ''))
   rec.conflicts = []
-  const redispatched = new Set()
+  // v01 fix (eval-v01 finding 7): separate re-dispatch budgets per slice —
+  // at most one for a conflict and one for a refusal, two in total.
+  const redispatched = { conflict: new Set(), refusal: new Set() }
+  const redispatchesOf = id => (redispatched.conflict.has(id) ? 1 : 0) + (redispatched.refusal.has(id) ? 1 : 0)
   const kept = new Map()  // branch -> reason, across this pass's cleanups
   if (!waves.length) {
     const out = await runAgentTwice(`lead it${n.iteration}`, soloLeadPrompt(n, 1, null,
@@ -741,8 +780,9 @@ async function leadPass(n, rec) {
     if (!d.ok) return stepFail('dispatch', d)
     log(`iteration ${n.iteration} wave ${k}: ${wave.map(s => s.id).join(', ')} from ${String(d.head).slice(0, 12)}`)
     for (const s of wave) spend(`builder ${s.id}`)  // before the barrier: a cap stops cleanly
-    const results = await parallel(wave.map(s => () => {
-      return agent(builderPrompt(n, s, d.head), {
+    const agentIndex = []
+    const results = await parallel(wave.map((s, i) => () => {
+      const call = callAgent(builderPrompt(n, s, d.head), {
         label: `builder ${s.id} it${n.iteration}`,
         agentType: 'trio-builder',
         model: MODELS.builder,
@@ -750,6 +790,8 @@ async function leadPass(n, rec) {
         isolation: 'worktree',
         schema: BUILDER_SCHEMA,
       })
+      agentIndex[i] = agentCalls
+      return call
     }))
     wave.forEach((s, i) => noteDenials(`builder ${s.id} it${n.iteration}`, results[i]))
     const dead = wave.filter((s, i) => !results[i])
@@ -762,6 +804,7 @@ async function leadPass(n, rec) {
     const compact = results.map((r, i) => ({
       id: wave[i].id, branch: r.branch, worktree: r.worktree, base: r.base, head: r.head,
       commits: r.commits || [], summary: String(r.summary || '').slice(0, 160),
+      agent_index: agentIndex[i],
     }))
     const bl = await step('builders', { iteration: n.iteration, wave: k, head: d.head, results: JSON.stringify(compact) })
     if (!bl.ok) return stepFail('builders', bl)
@@ -775,7 +818,7 @@ async function leadPass(n, rec) {
       for (const x of reask) spend(`builder ${x.id} report`)
       const again = await parallel(reask.map(x => () => {
         const i = compact.findIndex(c => c.id === x.id)
-        return agent(reportAgainPrompt(n, wave[i], results[i], x, d.head), {
+        return callAgent(reportAgainPrompt(n, wave[i], results[i], x, d.head), {
           label: `builder ${x.id} it${n.iteration} report`,
           agentType: 'trio-builder',
           model: MODELS.builder,
@@ -793,7 +836,7 @@ async function leadPass(n, rec) {
         results[i] = Object.assign({}, results[i], r, { id: x.id })
         compact[i] = { id: x.id, branch: r.branch || compact[i].branch, worktree: r.worktree || compact[i].worktree,
           base: r.base || compact[i].base, head: String(r.head || ''), commits: r.commits || compact[i].commits,
-          summary: compact[i].summary }
+          summary: compact[i].summary, agent_index: compact[i].agent_index }
         return compact[i]
       })
       let still = reask.filter(x => !answered.includes(x))
@@ -813,13 +856,13 @@ async function leadPass(n, rec) {
     // stops the run (STATE stays lead-running; a fresh run re-plans).
     if (refused.length) {
       rec.refused = (rec.refused || []).concat(refused.map(x => ({ id: x.id, reason: x.reason })))
-      const again = refused.filter(x => redispatched.has(x.id))
+      const again = refused.filter(x => redispatched.refusal.has(x.id) || redispatchesOf(x.id) >= 2)
       if (again.length) {
         return { status: 'error', reason: 'builders refused after a re-dispatch: ' + again.map(x => x.reason).join('; ') }
       }
       const byId = new Map(wave.map(s => [s.id, s]))
       waves.splice(k, 0, ...refused.map(x => [redispatchRefused(byId.get(x.id), x)]))
-      for (const x of refused) redispatched.add(x.id)
+      for (const x of refused) redispatched.refusal.add(x.id)
       rec.waves = waves.map(w => w.map(s => s.id))
       log(`iteration ${n.iteration} wave ${k}: builder refused ${refused.map(x => `${x.id} (${x.reason})`).join('; ')}; re-dispatching from the Lead's HEAD`)
     }
@@ -849,13 +892,13 @@ async function leadPass(n, rec) {
     if (!conflicts.length) continue
     rec.conflicts.push(...conflicts)
     const describe = cs => cs.map(c => `${c.id} (${c.branch}) on ${c.files.join(', ') || 'unreported files'}`).join('; ')
-    const again = conflicts.filter(c => redispatched.has(c.id))
+    const again = conflicts.filter(c => redispatched.conflict.has(c.id) || redispatchesOf(c.id) >= 2)
     if (again.length) {
       return { status: 'conflict', reason: `merge conflict after a re-dispatch: ${describe(again)}`, conflicts }
     }
     const byId = new Map(wave.map(s => [s.id, s]))
     const extra = conflicts.map(c => [redispatchSlice(byId.get(c.id), c)])
-    for (const c of conflicts) redispatched.add(c.id)
+    for (const c of conflicts) redispatched.conflict.add(c.id)
     waves.splice(k, 0, ...extra)
     rec.waves = waves.map(w => w.map(s => s.id))
     log(`iteration ${n.iteration} wave ${k}: merge conflict ${describe(conflicts)}; re-dispatching from the new HEAD`)
@@ -988,10 +1031,14 @@ if (began) {
   }
 }
 if (end && end.ok) {
-  // v01 item 2: `end` removes only the eval-*/tmp* scratch dirs this run
-  // created under .claude/worktrees/; worktrees are still only reported.
+  // v01 item 2 (fix): `end` removes only the scratch dirs and Evaluator pin
+  // worktrees the helper's ownership ledger lists for this execution;
+  // anything else under .claude/worktrees/ is reported, never removed.
   if ((end.scratch_removed || []).length) log(`end removed run scratch: ${end.scratch_removed.join(', ')}`)
   for (const k of end.scratch_kept || []) log(`end could not remove scratch ${k.path}: ${k.reason}`)
+  for (const k of end.eval_worktrees_kept || []) log(`end kept eval worktree ${k.worktree}: ${k.reason}`)
+  if ((end.scratch_left || []).length) log(`scratch not created by this run, left in place: ${end.scratch_left.join(', ')}`)
+  if ((end.eval_worktrees_left || []).length) log(`eval worktrees not owned by this run, left in place: ${end.eval_worktrees_left.join(', ')}`)
 }
 
 return {
@@ -1019,5 +1066,6 @@ return {
   dangling_worktrees: end && end.ok ? end.dangling_worktrees : [],
   eval_worktrees_removed: end && end.ok ? (end.eval_worktrees_removed || []) : [],
   scratch_removed: end && end.ok ? (end.scratch_removed || []) : [],
+  scratch_left: end && end.ok ? (end.scratch_left || []) : [],
   reclaimed_builders: B.reclaimed || null,
 }
