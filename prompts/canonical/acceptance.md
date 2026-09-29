@@ -26,11 +26,16 @@ at modules that do not exist yet.
    service, credentials, device) or `not-testable` (process or wording).
    Write this inventory to `acceptance/AUTHOR.md`.
 2. For each testable sentence write 1–3 checks. Each check drives the
-   product through its **public surface**: a CLI subprocess; an HTTP
-   request to a server the check starts itself; or a public function or
-   entry point named in the GOAL or existing at base, called through
-   `python3 -c`, `node -e` or `tsx`. Checks never import product code into
-   the checker's own process.
+   product through its **public surface**, the way its users run it: a
+   CLI subprocess; an HTTP request to a server the check starts itself; or
+   a public function or entry point named in the GOAL or existing at base,
+   called from a CHILD process your check starts (`python3 -c`, `node -e`
+   or `tsx` launched by the check script, not the manifest's `run`). A
+   `run: ["python3", "-c", ...]` is pack code, not the product: it cannot
+   import product modules. Pack code never imports product code, its own
+   directory's files or user-site libraries into the checker's own
+   process; a check that fails at base on such an import is dropped at
+   freeze.
 3. Surface naming: use the names the GOAL gives (routes, flags, env vars).
    When the GOAL allows alternatives ("equivalent coherent routes
    acceptable"), declare a *binding* in the manifest with the GOAL's name
@@ -101,8 +106,12 @@ acceptance/
   by its path, never `python3 -m acceptance...`. Run the product the way
   its users do, either directly in `run` (`python3 app.py`,
   `python3 template/build/test_x.py`, `python3 -m pkg`,
-  `python3 -m pytest`) or as a child of your check: the product and every
-  process a check starts resolve imports normally, user site included.
+  `python3 -m pytest tests/...`) or as a child of your check: the product
+  and every process a check starts resolve imports normally, user site
+  included. Pytest run on pack tests (`python3 -m pytest acceptance/...`)
+  gets `-P` plus `-c /dev/null`, `--rootdir` and `--confcutdir` at the pack
+  view: no product `conftest.py`, `pytest.ini` or `pyproject.toml` applies,
+  and the tests cannot import the product.
   `PATH` holds the system directories and the interpreters only; put fake
   CLIs under `acceptance/fakes/` and prepend them yourself.
 - `expect` (optional besides `exit: 0`) holds regex lists matched with
@@ -110,7 +119,8 @@ acceptance/
   `stdout` (stdout only), `stderr` (stderr only), `output` (stdout
   followed by stderr). Use `stdout` for a `--help` or output obligation;
   stderr noise does not disturb it. The excerpt in reports is only the
-  last 2 KB.
+  last 2 KB. Matching gets min(`timeout_s`, 10 s); a pattern still running
+  then FAILs (`pattern-timeout`), so avoid a leading `.*` on long lines.
 - Load pack files by explicit paths (`$ACC_DIR/checks/ACC-07/cases.json`),
   never by a computed name or a glob: a check sees only the files its
   text names plus `fakes/` and `lib/`. No symlinks in the pack.
