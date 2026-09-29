@@ -66,8 +66,10 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,19 +186,79 @@ def _holder_pid() -> int:
     return os.getppid()
 
 
-def _read_json(path: Path) -> dict:
+def _read_bytes(path: Path) -> bytes | None:
+    """A regular file's bytes, opened without following a symlink (None when
+    absent, a symlink, not a regular file or unreadable)."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _read_json(path: Path) -> dict:
+    raw = _read_bytes(path)
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
-                   encoding="utf-8")
+    """Atomic replace: a ``mkstemp`` file in the same directory (never a
+    fixed temp name) and a rename. A target that is a symlink or not a
+    regular file is refused (OSError), never written through."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise OSError(f"{path} is a symlink or not a regular file; refusing it")
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                               dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o644)
+        os.write(fd, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
+
+
+def _human_answer(mailbox: Path, iteration: int) -> dict:
+    """The driver-verified human answer for a Lead / Evaluator dispatch of
+    ``iteration`` (``metrics/human_ledger.py``): ``{human_answer: <block or
+    "">, human_notes: [...]}``, or ``{}`` — no keys at all — when the
+    mailbox has no HUMAN.md (every result, and so every prompt, is then
+    unchanged). The script logs the notes; roles see only the block."""
+    try:
+        os.lstat(mailbox / "HUMAN.md")
+    except OSError:
+        return {}
+    path = METRICS_DIR / "human_ledger.py"
+    try:
+        spec = importlib.util.spec_from_file_location("trio_native_human_ledger", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        return {"human_answer": "",
+                "human_notes": [f"HUMAN.md ignored: no answer ledger module ({exc})"]}
+    answer, notes = module.verified_answer(mailbox, iteration)
+    return {"human_answer": module.driver_block(answer), "human_notes": notes}
 
 
 def _runs_dir() -> Path:
@@ -230,7 +292,9 @@ def _register(mailbox: Path, *, replace: bool = False,
         path = registry_path(mailbox)
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.with_name(path.name + ".lock")
-        with open(lock_path, "a+", encoding="utf-8") as lockf:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                          | os.O_CLOEXEC, 0o600)
+        with os.fdopen(lock_fd, "a+", encoding="utf-8") as lockf:
             fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
             try:
                 data = {} if replace else _read_json(path)
@@ -1425,6 +1489,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise StepError("gate --attempt must be 1 or 2") from exc
         repo = _repo_for(mailbox, a.repo)
         body = HANDLERS[a.op](mailbox, repo, a)
+        if a.op == "next" and body.get("action") == "lead":
+            body.update(_human_answer(mailbox, int(body.get("iteration") or 0)))
+        elif a.op == "pin":
+            body.update(_human_answer(mailbox, a.iteration))
         out.update(body)
         out["ok"] = True
     except StepError as exc:

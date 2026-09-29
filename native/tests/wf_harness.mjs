@@ -76,7 +76,11 @@ function stepResult(op, nonce, prompt) {
       }
       iteration += 1
       const scoped = lastVerdict === 'ITERATE scope=local:app.py'
-      return { ...base, action: scoped ? 'repair' : 'lead', iteration, attempt: 1, scope: scoped ? 'local:app.py' : null }
+      // sc.human = {answer, notes}: the helper's verified-answer keys (only
+      // present when the mailbox has HUMAN.md).
+      const human = (sc.human && !scoped) ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}
+      return { ...base, action: scoped ? 'repair' : 'lead', iteration, attempt: 1, scope: scoped ? 'local:app.py' : null,
+        ...human }
     }
     case 'gate': {
       const pass = (sc.gates || [])[gateIdx++] ?? true
@@ -86,7 +90,8 @@ function stepResult(op, nonce, prompt) {
         detail: pass ? [] : ["commit gate: slice 'app' ... no slice(app): commit"], status: final ? 'error' : 'running' }
     }
     case 'pin': return { ...base, iteration, evaluator_attempt: `att${iteration}`, sha: `sha${iteration}`,
-      skip_evaluator: false, context_block: `LOCKSTEP CONTEXT: attempt=att${iteration} sha=sha${iteration}\n` }
+      skip_evaluator: false, context_block: `LOCKSTEP CONTEXT: attempt=att${iteration} sha=sha${iteration}\n`,
+      ...(sc.human ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}) }
     case 'apply': {
       const v = sc.verdicts[verdictIdx++]
       lastVerdict = v

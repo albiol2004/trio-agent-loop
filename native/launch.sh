@@ -15,7 +15,10 @@
 #         --resume and asks for resumeFromRunId with the byte-identical args:
 #         workflow journals live under the launching session. After a
 #         held / error / budget result, use `start` again (a journal resume
-#         would replay the same stop).
+#         would replay the same stop). The record is validated first (it is
+#         mailbox data): canonical-UUID session_id, wf_ run id, args with only
+#         the workflow's keys (mailbox = this one, bounded caps, allowlisted
+#         models, this release's helper, a run_token); else exit 2.
 #
 # Flags: --permission-mode auto (auto mode; no permission-skipping flag is
 # used or needed), --settings '{"worktree":{"baseRef":"head"}}' (isolated
@@ -54,7 +57,7 @@ MODEL="claude-opus-5-5"
 SETTINGS='{"worktree":{"baseRef":"head"}}'
 SUFFIX='Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop.'
 
-usage() { sed -n '2,28p' "$0" >&2; exit 2; }
+usage() { sed -n '2,31p' "$0" >&2; exit 2; }
 
 [ $# -ge 1 ] || usage
 mode="$1"; shift
@@ -75,80 +78,228 @@ while [ $# -gt 0 ]; do
 done
 case "$mailbox" in /*) ;; *) echo "launch.sh: --mailbox must be an absolute path" >&2; exit 2 ;; esac
 [ -d "$mailbox" ] || { echo "launch.sh: $mailbox is not a directory" >&2; exit 2; }
+[[ "$timeout_s" =~ ^[0-9]{1,6}$ ]] || { echo "launch.sh: --timeout must be whole seconds" >&2; exit 2; }
+# The helper and this launcher always come from the same directory (one
+# resolved release root): the workflow never falls back to CURRENT's helper.
+self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+own_helper="$self_dir/trio_native_step.py"
 repo="$(git -C "$mailbox" rev-parse --show-toplevel)"
 record="$mailbox/.native-launch.json"
 runs="$mailbox/.native-runs"
-mkdir -p "$runs"
+
+# prepare (python): every value that reaches the claude argv or prompt is
+# validated here against a strict schema, and every mailbox file is read and
+# written without following symlinks (README "Launcher hardening"). Mailbox
+# data (a committed .native-launch.json) never chooses a flag, a helper, a
+# session outside the canonical-UUID form, or free prompt text. Prints
+# session, token, args JSON, previous-record copy and the pre-launch claim
+# snapshot, one per line; exit 2 (nothing written) on any refusal.
+prep="$(python3 - "$mode" "$mailbox" "$max_iterations" "$helper" "$run_token" "$run_id" \
+  "$session" "$own_helper" <<'PY'
+import hashlib, json, os, re, stat, sys, tempfile, uuid
+mode, mailbox, max_it, helper, token, run_id, session, own_helper = sys.argv[1:9]
+SAFE_PATH = re.compile(r"/[A-Za-z0-9._/+@-]*")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+RUN_ID_RE = re.compile(r"wf_[A-Za-z0-9_-]{1,64}")
+KEYS = ("mailbox", "max_iterations", "max_agents", "token_budget", "helper", "run_token", "models")
+CAPS = {"max_iterations": (1, 200), "max_agents": (1, 1000), "token_budget": (1, 10_000_000_000)}
+ROLES = ("lead", "evaluator", "builder", "repair", "step")
+MODELS = ("claude-opus-5-5", "claude-sonnet-5")
+SIDECARS = (".native-launch.json", ".native-launch.json.tmp", ".native-result.json",
+            ".session.json", ".native-runs", ".lock")
+
+
+def refuse(msg):
+    print("launch.sh: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def read_nofollow(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        refuse(f"{path}: {exc} (a symlink is never followed)")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            refuse(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=d)
+    try:
+        os.fchmod(fd, 0o644)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def digest(path):
+    try:
+        raw = read_nofollow(path)
+    except SystemExit:
+        return "refused"
+    return hashlib.sha256(raw).hexdigest() if raw is not None else "-"
+
+
+real = os.path.realpath(mailbox)
+if not SAFE_PATH.fullmatch(mailbox) or not SAFE_PATH.fullmatch(real):
+    refuse("--mailbox has characters outside [A-Za-z0-9._/+@-]; it would reach the "
+           "session prompt (rename the directory)")
+for name in SIDECARS:
+    path = os.path.join(mailbox, name)
+    if os.path.islink(path):
+        refuse(f"{path} is a symlink; refusing to read or write through it")
+runs = os.path.join(mailbox, ".native-runs")
+for sub in (runs, os.path.join(mailbox, ".lock")):
+    if os.path.isdir(sub) and not os.path.islink(sub):
+        for entry in os.scandir(sub):
+            if entry.is_symlink():
+                refuse(f"{entry.path} is a symlink; refusing to run in this mailbox")
+own_helper_real = os.path.realpath(own_helper)
+record = os.path.join(mailbox, ".native-launch.json")
+
+
+def check_helper(value, what):
+    if not isinstance(value, str) or not os.path.isabs(value) \
+            or os.path.realpath(value) != own_helper_real:
+        refuse(f"{what} is not this release's helper ({own_helper_real}); the helper always "
+               "comes from the launcher's own release directory")
+
+
+if mode == "start":
+    if helper:
+        check_helper(helper, "--helper")
+    if not SAFE_PATH.fullmatch(own_helper_real):
+        refuse(f"the helper path {own_helper_real!r} has characters outside [A-Za-z0-9._/+@-]")
+    if not re.fullmatch(r"[0-9]{1,3}", max_it) or not 1 <= int(max_it) <= 200:
+        refuse("--max-iterations must be an integer 1..200")
+    session = str(uuid.uuid4())
+    # A run_token that trio-native.js's own validation would reject is
+    # treated as not given, so the token we track is the one begin uses.
+    if not TOKEN_RE.fullmatch(token or ""):
+        token = "ls-" + session.replace("-", "")[:12]
+    args = {"mailbox": mailbox, "max_iterations": int(max_it), "helper": own_helper_real,
+            "run_token": token}
+    args_json = json.dumps(args, separators=(",", ":"))
+    # Keep the previous record (a start that never began the workflow
+    # restores it); copied without following links, to a fresh name.
+    prev = ""
+    old = read_nofollow(record)
+    if not os.path.exists(runs):
+        os.mkdir(runs)
+    if old is not None:
+        prev = os.path.join(runs, f"launch-record.{session}.prev.json")
+        fd = os.open(prev, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, old)
+        finally:
+            os.close(fd)
+    write_atomic(record, (json.dumps({"session_id": session, "args": args_json}, indent=2)
+                          + "\n").encode("utf-8"))
+else:
+    if not RUN_ID_RE.fullmatch(run_id or ""):
+        refuse("resume needs --run-id wf_[A-Za-z0-9_-]{1,64}")
+    raw = read_nofollow(record)
+    if raw is None:
+        refuse(f"no {record}: nothing to resume (use start)")
+    try:
+        rec = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        refuse(f"{record} is not JSON; use start")
+    if not isinstance(rec, dict):
+        refuse(f"{record} is not a JSON object; use start")
+    recorded = rec.get("session_id")
+    if not isinstance(recorded, str) or not UUID_RE.fullmatch(recorded) \
+            or str(uuid.UUID(recorded)) != recorded:
+        refuse("the recorded session_id is not a canonical UUID; use start")
+    if session and (not UUID_RE.fullmatch(session) or str(uuid.UUID(session)) != session):
+        refuse("--session must be a canonical UUID")
+    session = session or recorded
+    try:
+        args = json.loads(rec.get("args")) if isinstance(rec.get("args"), str) else None
+    except ValueError:
+        args = None
+    if not isinstance(args, dict):
+        refuse("the recorded args are not a JSON object; use start")
+    for key, value in args.items():
+        if key not in KEYS:
+            refuse(f"the recorded args carry an unknown key {key[:40]!r}; use start")
+        if key == "mailbox":
+            if not isinstance(value, str) or os.path.realpath(value) != real \
+                    or not SAFE_PATH.fullmatch(value):
+                refuse("the recorded args.mailbox is not this mailbox; use start")
+        elif key in CAPS:
+            lo, hi = CAPS[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+                refuse(f"the recorded args.{key} is not an integer {lo}..{hi}; use start")
+        elif key == "helper":
+            check_helper(value, "the recorded args.helper")
+        elif key == "run_token":
+            if not isinstance(value, str) or not TOKEN_RE.fullmatch(value):
+                refuse("the recorded args.run_token is not [A-Za-z0-9._-]{1,64}; use start")
+        elif key == "models":
+            if not isinstance(value, dict) or any(r not in ROLES or m not in MODELS
+                                                  for r, m in value.items()):
+                refuse("the recorded args.models is outside the allowlist; use start")
+    if "mailbox" not in args or "max_iterations" not in args:
+        refuse("the recorded args lack mailbox / max_iterations; use start")
+    if "run_token" not in args:
+        # A pre-run_token record resumes under the default token every
+        # interactive run shares: it could adopt another live run's records.
+        refuse("the recorded launch predates run tokens; a resume cannot tell its own run "
+               "from another (use start)")
+    token = args["run_token"]
+    args_json = json.dumps(args, separators=(",", ":"))  # rebuilt from validated fields
+    prev = ""
+if not os.path.exists(runs):
+    os.mkdir(runs)  # only once every check passed: a refusal writes nothing
+snapshot = "|".join(digest(os.path.join(mailbox, n)) for n in (".session.json", ".lock/pid"))
+for value in (session, token, args_json, prev, snapshot):
+    if "\n" in value:
+        refuse("internal: multi-line value")
+print(session)
+print(token)
+print(args_json)
+print(prev)
+print(snapshot)
+PY
+)" || exit 2
+{ read -r session; read -r our_token; read -r args_json; read -r prev_record; read -r claim_snapshot; } <<<"$prep"
 
 if [ "$mode" = start ]; then
-  session="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-  # A run_token that trio-native.js's own validation (^[A-Za-z0-9._-]{1,64}$)
-  # would reject is treated as not given, so the token we track here always
-  # matches the one the workflow actually begins with.
-  if [[ ! "$run_token" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then run_token=""; fi
-  if [ -z "$run_token" ]; then
-    hex="${session//-/}"
-    run_token="ls-${hex:0:12}"
-  fi
-  args_json="$(python3 - "$mailbox" "$max_iterations" "$helper" "$run_token" <<'PY'
-import json, sys
-mailbox, max_it, helper, token = sys.argv[1:5]
-args = {"mailbox": mailbox, "max_iterations": int(max_it)}
-if helper:
-    args["helper"] = helper
-args["run_token"] = token
-print(json.dumps(args, separators=(",", ":")))
-PY
-)"
-  our_token="$run_token"
-  # Keep the previous record: a start that never actually began the
-  # workflow restores it, so a later `resume` never targets a session that
-  # never ran (eval-native-v0b N7; extended to every not-started start).
-  prev_record="$runs/launch-record.$session.prev.json"
-  if [ -f "$record" ]; then cp "$record" "$prev_record"; fi
-  python3 - "$record" "$session" "$args_json" <<'PY'
-import json, os, sys
-path, session, args = sys.argv[1:4]
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump({"session_id": session, "args": args}, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
-PY
   prompt="Run the saved workflow trio-native with args ${args_json}. ${SUFFIX}"
   session_flags=(--session-id "$session")
 else
-  [ -n "$run_id" ] || { echo "launch.sh: resume needs --run-id" >&2; exit 2; }
-  [ -f "$record" ] || { echo "launch.sh: no $record: nothing to resume (use start)" >&2; exit 2; }
-  recorded_session="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["session_id"])' "$record")"
-  args_json="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["args"])' "$record")"
-  session="${session:-$recorded_session}"
-  # The token our own recorded start began with (or, for a pre-run_token
-  # record, the default trio-native.js would have computed for it — see
-  # README.md "Run registry and result").
-  our_token="$(python3 - "$args_json" "$mailbox" <<'PY'
-import json, re, sys
-args_json, mailbox = sys.argv[1:3]
-try:
-    args = json.loads(args_json)
-except ValueError:
-    args = {}
-token = args.get("run_token") if isinstance(args, dict) else None
-if isinstance(token, str) and token:
-    print(token)
-else:
-    mailbox = mailbox.rstrip("/")
-    parts = [p for p in mailbox.split("/") if p]
-    tail = re.sub(r"[^A-Za-z0-9._-]", "_", "-".join(parts[-2:]))
-    print("trio-native-" + tail[:48])
-PY
-)"
   prompt="Resume the saved workflow trio-native with resumeFromRunId \"${run_id}\" and the byte-identical args ${args_json}. ${SUFFIX}"
+  # A canonical UUID (validated above) is a single value, never a flag.
   session_flags=(--resume "$session")
 fi
 
 raw="$runs/${session}.$(date -u +%Y%m%dT%H%M%SZ).$mode.json"
-launcher_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# Fresh output files, created exclusively and without following a link.
+python3 - "$raw" "$raw.err" <<'PY' || exit 2
+import os, sys
+for path in sys.argv[1:]:
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except OSError as exc:
+        print(f"launch.sh: cannot create {path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+PY
+launcher_path="$self_dir/$(basename "$0")"
 claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 launched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
@@ -162,20 +313,72 @@ set +e
   --model "$MODEL" \
   --permission-mode auto \
   --settings "$SETTINGS" \
-  --output-format json) >"$raw" 2>"$raw.err"
+  --output-format json) >>"$raw" 2>>"$raw.err"
 rc=$?
 set -e
 
 python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" \
   "$mailbox" "$claude_dir" "${run_id:-}" "$launcher_path" "$launched_at" \
-  "$our_token" <<'PY'
-import fcntl, glob, hashlib, json, os, re, sys, time
+  "$our_token" "$claim_snapshot" "$self_dir" <<'PY'
+import fcntl, glob, hashlib, json, os, re, stat, sys, tempfile, time
 from pathlib import Path
 raw, rc, session, mode, record, prev = sys.argv[1:7]
 mailbox, claude_dir, given_run_id, launcher_path, launched_at = sys.argv[7:12]
-our_token = sys.argv[12]
+our_token, claim_snapshot, self_dir = sys.argv[12:15]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
+
+
+def _read_bytes(path) -> bytes | None:
+    """A regular file's bytes without following a symlink (None otherwise)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _read_json(path):
+    data = _read_bytes(path)
+    try:
+        value = json.loads(data.decode("utf-8")) if data is not None else None
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _regular_or_absent(path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+# The saved workflow script should be this release's (README "Launcher
+# hardening"): reported, never enforced (a checkout run is legitimate).
+try:
+    saved = os.path.realpath(os.path.join(claude_dir, "workflows", "trio-native.js"))
+    ours = os.path.join(self_dir, "trio-native.js")
+    launcher["workflow_script"] = saved
+    launcher["workflow_script_is_release"] = (
+        saved == os.path.realpath(ours)
+        or (_read_bytes(saved) is not None and _read_bytes(saved) == _read_bytes(ours)))
+except OSError:
+    pass
 
 
 def _runs_dir() -> Path:
@@ -189,31 +392,57 @@ def _registry_path() -> Path:
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
+    """mkstemp in the target's directory + rename (never a fixed temp name);
+    a target that is a symlink or not a regular file is refused."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not _regular_or_absent(path):
+        raise OSError(f"{path} is a symlink or not a regular file")
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o644)
+        os.write(fd, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
+
+
+def _claim_digest(name) -> str:
+    data = _read_bytes(Path(mailbox, name))
+    return hashlib.sha256(data).hexdigest() if data is not None else "-"
 
 
 def started() -> bool:
     """The workflow actually began iff its `begin` wrote our own run_token
-    into <mailbox>/.session.json (README.md "Run registry and result")."""
-    try:
-        data = json.loads(Path(mailbox, ".session.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    into <mailbox>/.session.json (README.md "Run registry and result"). A
+    resume must also have re-taken the mailbox: .session.json or the lock
+    pid changed during this launch (a stale record of the killed run with
+    the same token never counts)."""
+    data = _read_json(Path(mailbox, ".session.json"))
+    if not (data and data.get("driver") == "claude-workflow"
+            and data.get("session") == our_token):
         return False
-    return (isinstance(data, dict) and data.get("driver") == "claude-workflow"
-            and data.get("session") == our_token)
+    if mode == "resume":
+        now = "|".join(_claim_digest(n) for n in (".session.json", ".lock/pid"))
+        return now != claim_snapshot
+    return True
 
 
 STARTED = started()
 
 
 def _restore_or_remove_record() -> None:
-    """A start that did not actually begin the workflow must not leave a
+    """A START that did not actually begin the workflow must not leave a
     session/args record a later `resume` could target (eval-native-v0b N7,
-    extended to every not-started start, not only a lock refusal)."""
-    if prev and os.path.isfile(prev):
+    extended to every not-started start, not only a lock refusal). A resume
+    never touches the record: a failed or refused resume keeps the only
+    resume record (eval2 finding 4)."""
+    if mode != "start":
+        launcher["record"] = "kept"
+        return
+    if not _regular_or_absent(record):
+        launcher["record"] = "left (not a regular file)"
+        return
+    if prev and _regular_or_absent(prev) and os.path.isfile(prev):
         os.replace(prev, record)
         launcher["record"] = "restored"
     else:
@@ -255,14 +484,14 @@ def _update_registry(fields: dict) -> None:
     reg.parent.mkdir(parents=True, exist_ok=True)
     lock_path = reg.with_name(reg.name + ".lock")
     try:
-        with open(lock_path, "a+", encoding="utf-8") as lockf:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          0o600)
+        with os.fdopen(lock_fd, "a+", encoding="utf-8") as lockf:
             fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
             try:
-                try:
-                    data = json.loads(reg.read_text(encoding="utf-8"))
-                    data = data if isinstance(data, dict) else {}
-                except (OSError, ValueError):
-                    data = {}
+                if not _regular_or_absent(reg):
+                    return
+                data = _read_json(reg) or {}
                 existing_token = data.get("run_token")
                 if existing_token not in (None, our_token) and data.get("state") != "finished":
                     return
@@ -280,11 +509,7 @@ def persist(result):
     """<mailbox>/.native-result.json and the run registry, for a run that
     actually started (never fatal)."""
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    try:
-        session_rec = json.loads(Path(mailbox, ".session.json").read_text(encoding="utf-8"))
-        session_rec = session_rec if isinstance(session_rec, dict) else {}
-    except (OSError, ValueError):
-        session_rec = {}
+    session_rec = _read_json(Path(mailbox, ".session.json")) or {}
     run_id = find_run_id()
     lau = result.get("launcher") if isinstance(result.get("launcher"), dict) else {}
     keep = ("status", "verdict", "code", "reason", "iteration", "held_step",
@@ -331,10 +556,7 @@ def persist_not_started(result):
         pass
 
 
-try:
-    err = open(raw + ".err", encoding="utf-8", errors="replace").read()
-except OSError:
-    err = ""
+err = (_read_bytes(raw + ".err") or b"").decode("utf-8", errors="replace")
 # claude -p's bg-wait ceiling killed the Workflow (probe 3 blocker E); the
 # run is recoverable with `launch.sh resume --run-id` or a fresh start.
 bg_killed = "Background tasks still running" in err
@@ -360,10 +582,7 @@ def fail(reason, head=None):
     sys.exit(3)
 
 
-try:
-    body = open(raw, encoding="utf-8", errors="replace").read()
-except OSError:
-    body = ""
+body = (_read_bytes(raw) or b"").decode("utf-8", errors="replace")
 try:
     outer = json.loads(body)
 except ValueError:
@@ -408,7 +627,7 @@ if not results:
     fail("no fenced result JSON in the session output", head or None)
 result = results[-1]
 if STARTED:
-    if prev and os.path.isfile(prev):
+    if prev and _regular_or_absent(prev) and os.path.isfile(prev):
         try:
             os.remove(prev)
         except OSError:

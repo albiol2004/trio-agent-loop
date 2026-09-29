@@ -26,7 +26,8 @@ if os.environ.get("FAKE_NO_BEGIN") != "1":
     token = os.environ.get("TRIO_NATIVE_LAUNCH_TOKEN")
     if mailbox and token:
         with open(os.path.join(mailbox, ".session.json"), "w") as sf:
-            json.dump({"driver": "claude-workflow", "session": token,
+            # the real helper re-stamps its holder pid on every (re)start
+            json.dump({"driver": "claude-workflow", "session": token, "pid": os.getpid(),
                       "started_at": "2026-01-01T00:00:00Z"}, sf)
 body = os.environ.get("FAKE_RESULT", "")
 if "FAKE_STDERR" in os.environ:
