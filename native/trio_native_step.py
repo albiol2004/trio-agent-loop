@@ -237,12 +237,17 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _human_answer(mailbox: Path, iteration: int) -> dict:
+def _human_answer(mailbox: Path, iteration: int, *, consume: bool = False,
+                  nonce: str = "") -> dict:
     """The driver-verified human answer for a Lead / Evaluator dispatch of
     ``iteration`` (``metrics/human_ledger.py``): ``{human_answer: <block or
     "">, human_notes: [...]}``, or ``{}`` — no keys at all — when the
     mailbox has no HUMAN.md (every result, and so every prompt, is then
-    unchanged). The script logs the notes; roles see only the block."""
+    unchanged). The script logs the notes; roles see only the block.
+    ``consume`` (``pin``: the Evaluator that rules on the answer) marks it
+    consumed in the ledger, so it is never delivered again — except to a
+    retry of the same step (same ``nonce``: the script re-runs a step whose
+    stdout came back garbled)."""
     try:
         os.lstat(mailbox / "HUMAN.md")
     except OSError:
@@ -257,7 +262,10 @@ def _human_answer(mailbox: Path, iteration: int) -> dict:
     except (ImportError, OSError, SyntaxError) as exc:
         return {"human_answer": "",
                 "human_notes": [f"HUMAN.md ignored: no answer ledger module ({exc})"]}
-    answer, notes = module.verified_answer(mailbox, iteration)
+    key = f"native:{nonce}@{iteration}" if nonce else ""
+    answer, notes = module.verified_answer(mailbox, iteration, consume=consume,
+                                           role="evaluator" if consume else "lead",
+                                           consume_key=key)
     return {"human_answer": module.driver_block(answer), "human_notes": notes}
 
 
@@ -1492,7 +1500,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.op == "next" and body.get("action") == "lead":
             body.update(_human_answer(mailbox, int(body.get("iteration") or 0)))
         elif a.op == "pin":
-            body.update(_human_answer(mailbox, a.iteration))
+            body.update(_human_answer(mailbox, a.iteration, consume=True,
+                                      nonce=str(a.nonce or "")))
         out.update(body)
         out["ok"] = True
     except StepError as exc:

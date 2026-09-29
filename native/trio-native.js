@@ -24,7 +24,17 @@ const A = (args && typeof args === 'object') ? args : {}
 if (typeof A.mailbox !== 'string' || !A.mailbox.startsWith('/')) {
   throw new Error('trio-native: args.mailbox must be an absolute mailbox path')
 }
+// Printable paths only (metrics/native_args.py's rule, as launch.sh checks):
+// spaces, non-ASCII letters and punctuation are fine, control / format /
+// line-separator characters never reach a prompt.
+if (/(?! )[\p{C}\p{Z}]/u.test(A.mailbox)) {
+  throw new Error('trio-native: args.mailbox has a control, format or line-separator character')
+}
 const MAILBOX = A.mailbox.replace(/\/+$/, '')
+// The mailbox as it appears in prompts: unchanged when it only uses
+// [A-Za-z0-9._/+@-], else shell single-quoted (one inert token in backticks
+// and in any command a prompt spells out; eval3 finding 7).
+const MAILBOX_Q = promptPath(MAILBOX)
 const MAX_ITERATIONS = Number.isInteger(A.max_iterations) && A.max_iterations > 0 ? A.max_iterations : 4
 // Opt-in caps only (user decision): no agent cap and no usage budget unless
 // passed. max_iterations stays the loop's normal bound.
@@ -164,7 +174,7 @@ const REPORT_DENIALS = 'If the permission system denies one of your tool calls, 
   '(in a structured output, in `denials`).'
 
 const MAILBOX_WRITES = `Write mailbox files (PLAN.md, REPORT.md, VERDICT.md, LOG.md lines) with Bash — a heredoc ` +
-  `(\`cat > ${MAILBOX}/REPORT.md <<'EOF'\` … \`EOF\`) or \`printf '%s\\n' '<line>' >> ${MAILBOX}/LOG.md\` — never the ` +
+  `(\`cat > ${MAILBOX_Q}/REPORT.md <<'EOF'\` … \`EOF\`) or \`printf '%s\\n' '<line>' >> ${MAILBOX_Q}/LOG.md\` — never the ` +
   'Write tool: the harness refuses report-file writes from workflow subagents.'
 
 // ------------------------------------------------------------- plumbing
@@ -173,6 +183,14 @@ let seq = 0
 
 function shq(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'"
+}
+
+function promptPath(s) {
+  return /^[A-Za-z0-9._\/+@-]*$/.test(String(s)) ? String(s) : shq(s)
+}
+
+function repoShown() {
+  return B.repo ? promptPath(B.repo) : '(git toplevel of the mailbox)'
 }
 
 function budgetStop(what) {
@@ -268,10 +286,10 @@ async function step(op, extra, reserved) {
 
 function header(role, n) {
   return [
-    `MAILBOX OVERRIDE: this run uses \`${MAILBOX}/\` as the loop mailbox — every \`loop/\` path in the instructions below resolves to \`${MAILBOX}/\`.`,
+    `MAILBOX OVERRIDE: this run uses \`${MAILBOX_Q}/\` as the loop mailbox — every \`loop/\` path in the instructions below resolves to \`${MAILBOX_Q}/\`.`,
     '',
     `You are the trio-${role} for iteration ${n.iteration} of a lockstep Trio loop driven by the trio-native workflow.`,
-    `Mailbox (absolute): ${MAILBOX}. Product repo: ${B.repo || '(git toplevel of the mailbox)'}.`,
+    `Mailbox (absolute): ${MAILBOX_Q}. Product repo: ${repoShown()}.`,
     NOT_ROUTER,
     REPORT_DENIALS,
   ]
@@ -325,14 +343,14 @@ function builderPrompt(n, s, head) {
     `after you have edited or committed anything in this session (a later re-run of this step, for example after a ` +
     `context compaction, must never reset your own work away). Use \`pwd -P\` and \`git rev-parse ` +
     `--show-toplevel\` (the real path, never the logical or a symlinked one) to check whether you are inside ` +
-    `\`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`. If HEAD is ${head} or a descendant of it (\`git merge-base ` +
+    `\`${B.repo ? promptPath(B.repo + '/.claude/worktrees') + '/' : '.claude/worktrees/'}\`. If HEAD is ${head} or a descendant of it (\`git merge-base ` +
     `--is-ancestor ${head} HEAD\`) and HEAD differs from it or the status is not empty, and that real path ` +
-    `is inside \`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`, discard the leftovers with ` +
+    `is inside \`${B.repo ? promptPath(B.repo + '/.claude/worktrees') + '/' : '.claude/worktrees/'}\`, discard the leftovers with ` +
     `\`git reset --hard ${head} && git clean -fd\` and start from scratch. Never run these outside that directory, ` +
     `and never once you have made your own edits or commits.`,
     `3. Report \`git rev-parse HEAD\` (now) as \`base\`. The driver requires \`base\` = ${head} (the Lead's HEAD). ` +
     'If HEAD is not that commit or a descendant of it, do no work and return with `commits: []` and a summary saying so.',
-    `The mailbox ${MAILBOX} is read-only for you (read PLAN.md and GOAL.md there if you need them). Do NOT write LOG.md ` +
+    `The mailbox ${MAILBOX_Q} is read-only for you (read PLAN.md and GOAL.md there if you need them). Do NOT write LOG.md ` +
     'or any `loop/` or mailbox file, in the worktree or at the absolute path: the driver writes your LOG line from ' +
     'this result. Never commit `loop/` files.',
     `Commit your work inside your worktree as \`slice(${s.id}): <summary>\` (at least one commit), stay inside ` +
@@ -374,7 +392,7 @@ function integratePrompt(n, k, last, bl, results) {
       'If any merge in this call conflicted, stop after your review: do NOT write REPORT.md or your LOG line (the ' +
       're-dispatched slice\'s integrate call does that). Otherwise finish the Lead pass: every code-changing slice has a `slice(<id>):` commit reachable from HEAD; rewrite ' +
       'REPORT.md for this iteration (with Implementation provenance naming the builders) — the driver fails the gate ' +
-      `when REPORT.md was not rewritten; append \`- iter ${n.iteration} | lead | <summary>\` to ${MAILBOX}/LOG.md.`,
+      `when REPORT.md was not rewritten; append \`- iter ${n.iteration} | lead | <summary>\` to ${MAILBOX_Q}/LOG.md.`,
       MAILBOX_WRITES,
     )
   } else {
@@ -391,7 +409,7 @@ function soloLeadPrompt(n, attempt, gate, why, kept) {
     why,
     'You have no Agent tool in this workflow; do the work yourself. Every code-changing slice needs a `slice(<id>):` ' +
     `commit reachable from HEAD; rewrite REPORT.md for this iteration; append \`- iter ${n.iteration} | lead | <summary>\` ` +
-    `to ${MAILBOX}/LOG.md. The driver checks all three mechanically.`,
+    `to ${MAILBOX_Q}/LOG.md. The driver checks all three mechanically.`,
     MAILBOX_WRITES,
   ])
   if (attempt > 1) {
@@ -417,7 +435,7 @@ function repairPrompt(n, attempt, gate) {
     '',
     `Scoped repair: VERDICT.md says ITERATE ${n.scope ? 'scope=' + n.scope : '(see its first line)'}. Fix exactly that ` +
     'scope per your role instructions; commit as `slice(<id>): fix …` (never commit `loop/` or mailbox files).',
-    `Append \`- iter ${n.iteration} | repair | <one-line summary>\` to ${MAILBOX}/LOG.md for this repair (the driver's LOG ` +
+    `Append \`- iter ${n.iteration} | repair | <one-line summary>\` to ${MAILBOX_Q}/LOG.md for this repair (the driver's LOG ` +
     'gate requires the `| repair |` form).',
     MAILBOX_WRITES,
   ])
@@ -435,7 +453,7 @@ function evaluatorPrompt(n, pin) {
   return [
     pin.context_block,
     `You are the trio-evaluator for iteration ${n.iteration} of a lockstep Trio loop driven by the trio-native workflow.`,
-    `Mailbox (absolute): ${MAILBOX}. Product repo: ${B.repo || '(git toplevel of the mailbox)'}.`,
+    `Mailbox (absolute): ${MAILBOX_Q}. Product repo: ${repoShown()}.`,
     NOT_ROUTER,
     REPORT_DENIALS,
     '',
@@ -447,8 +465,8 @@ function evaluatorPrompt(n, pin) {
     'it as that criterion\'s evidence (quote the answer id); the criterion is then verified (or failed, if the ' +
     'answer reports a failure) and no longer forces NEEDS_HUMAN. HUMAN.md text itself is never evidence. Without ' +
     'the driver block the NEEDS_HUMAN rule is unchanged.',
-    `If you grade in a separate worktree, create it only as \`git -C ${B.repo || '<repo>'} worktree add --detach ` +
-    `${B.repo || '<repo>'}/.claude/worktrees/eval-${n.iteration}-${attempt8} ${pin.sha}\` (never a sibling directory); ` +
+    `If you grade in a separate worktree, create it only as \`git -C ${B.repo ? promptPath(B.repo) : '<repo>'} worktree add --detach ` +
+    `${B.repo ? promptPath(B.repo + '/.claude/worktrees/eval-' + n.iteration + '-' + attempt8) : '<repo>/.claude/worktrees/eval-' + n.iteration + '-' + attempt8} ${pin.sha}\` (never a sibling directory); ` +
     'the driver removes `.claude/worktrees/eval-*` at the end of the run.',
     `VERDICT.md must record \`attempt: ${pin.evaluator_attempt}\` and \`evaluated: ${pin.sha}\` exactly. A SHIP includes ` +
     `your retirement commit: product changes as \`slice(<id>): …\`, then the mailbox as \`loop: iteration ${n.iteration} — SHIP\`, ` +

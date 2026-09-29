@@ -96,16 +96,8 @@ runs="$mailbox/.native-runs"
 # snapshot, one per line; exit 2 (nothing written) on any refusal.
 prep="$(python3 - "$mode" "$mailbox" "$max_iterations" "$helper" "$run_token" "$run_id" \
   "$session" "$own_helper" <<'PY'
-import hashlib, json, os, re, stat, sys, tempfile, uuid
+import hashlib, importlib.util, json, os, re, stat, sys, tempfile, uuid
 mode, mailbox, max_it, helper, token, run_id, session, own_helper = sys.argv[1:9]
-SAFE_PATH = re.compile(r"/[A-Za-z0-9._/+@-]*")
-UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
-RUN_ID_RE = re.compile(r"wf_[A-Za-z0-9_-]{1,64}")
-KEYS = ("mailbox", "max_iterations", "max_agents", "token_budget", "helper", "run_token", "models")
-CAPS = {"max_iterations": (1, 200), "max_agents": (1, 1000), "token_budget": (1, 10_000_000_000)}
-ROLES = ("lead", "evaluator", "builder", "repair", "step")
-MODELS = ("claude-opus-5-5", "claude-sonnet-5")
 SIDECARS = (".native-launch.json", ".native-launch.json.tmp", ".native-result.json",
             ".session.json", ".native-runs", ".lock")
 
@@ -113,6 +105,19 @@ SIDECARS = (".native-launch.json", ".native-launch.json.tmp", ".native-result.js
 def refuse(msg):
     print("launch.sh: " + msg, file=sys.stderr)
     sys.exit(2)
+
+
+# The one resume-args / mailbox-path validator, shared byte-identically with
+# trio-dash (eval3 findings 4, 6, 7): this release's metrics/native_args.py,
+# next to this launcher's native/ dir (never a repository's copy).
+_na_path = os.path.join(os.path.dirname(os.path.dirname(own_helper)), "metrics", "native_args.py")
+try:
+    _spec = importlib.util.spec_from_file_location("launch_native_args", _na_path)
+    NA = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(NA)
+except (OSError, ImportError, SyntaxError, AttributeError) as exc:
+    refuse(f"this release has no usable {_na_path} ({exc})")
+TOKEN_RE = NA.RUN_TOKEN_RE
 
 
 def read_nofollow(path):
@@ -155,9 +160,16 @@ def digest(path):
 
 
 real = os.path.realpath(mailbox)
-if not SAFE_PATH.fullmatch(mailbox) or not SAFE_PATH.fullmatch(real):
-    refuse("--mailbox has characters outside [A-Za-z0-9._/+@-]; it would reach the "
-           "session prompt (rename the directory)")
+if len(mailbox) > 1:
+    mailbox = mailbox.rstrip("/") or "/"
+problem = NA.path_problem(mailbox) or NA.path_problem(real)
+if not problem and not NA.is_canonical_path(mailbox):
+    problem = "is not canonical (a '.', '..' or empty component)"
+if problem:
+    # Printable paths (spaces, non-ASCII, punctuation) are fine: the path is
+    # one argv element and reaches prompts only JSON-encoded (args) or
+    # shell-quoted (trio-native.js); control characters never do.
+    refuse(f"--mailbox {problem}")
 for name in SIDECARS:
     path = os.path.join(mailbox, name)
     if os.path.islink(path):
@@ -182,8 +194,9 @@ def check_helper(value, what):
 if mode == "start":
     if helper:
         check_helper(helper, "--helper")
-    if not SAFE_PATH.fullmatch(own_helper_real):
-        refuse(f"the helper path {own_helper_real!r} has characters outside [A-Za-z0-9._/+@-]")
+    problem = NA.path_problem(own_helper_real)
+    if problem:
+        refuse(f"the helper path {own_helper_real!r} {problem}")
     if not re.fullmatch(r"[0-9]{1,3}", max_it) or not 1 <= int(max_it) <= 200:
         refuse("--max-iterations must be an integer 1..200")
     session = str(uuid.uuid4())
@@ -210,59 +223,38 @@ if mode == "start":
     write_atomic(record, (json.dumps({"session_id": session, "args": args_json}, indent=2)
                           + "\n").encode("utf-8"))
 else:
-    if not RUN_ID_RE.fullmatch(run_id or ""):
+    if not NA.RUN_ID_RE.fullmatch(run_id or ""):
         refuse("resume needs --run-id wf_[A-Za-z0-9_-]{1,64}")
     raw = read_nofollow(record)
     if raw is None:
         refuse(f"no {record}: nothing to resume (use start)")
     try:
         rec = json.loads(raw.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         refuse(f"{record} is not JSON; use start")
     if not isinstance(rec, dict):
         refuse(f"{record} is not a JSON object; use start")
-    recorded = rec.get("session_id")
-    if not isinstance(recorded, str) or not UUID_RE.fullmatch(recorded) \
-            or str(uuid.UUID(recorded)) != recorded:
-        refuse("the recorded session_id is not a canonical UUID; use start")
-    if session and (not UUID_RE.fullmatch(session) or str(uuid.UUID(session)) != session):
-        refuse("--session must be a canonical UUID")
-    session = session or recorded
     try:
-        args = json.loads(rec.get("args")) if isinstance(rec.get("args"), str) else None
-    except ValueError:
-        args = None
-    if not isinstance(args, dict):
+        recorded = NA.canonical_session_id(rec.get("session_id"))
+    except NA.NativeArgsError:
+        refuse("the recorded session_id is not a canonical UUID; use start")
+    if session:
+        try:
+            NA.canonical_session_id(session)
+        except NA.NativeArgsError:
+            refuse("--session must be a canonical UUID")
+    session = session or recorded
+    # The same schema trio-dash previews with (metrics/native_args.py).
+    raw_args = rec.get("args")
+    if not isinstance(raw_args, str):
         refuse("the recorded args are not a JSON object; use start")
-    for key, value in args.items():
-        if key not in KEYS:
-            refuse(f"the recorded args carry an unknown key {key[:40]!r}; use start")
-        if key == "mailbox":
-            if not isinstance(value, str) or os.path.realpath(value) != real \
-                    or not SAFE_PATH.fullmatch(value):
-                refuse("the recorded args.mailbox is not this mailbox; use start")
-        elif key in CAPS:
-            lo, hi = CAPS[key]
-            if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
-                refuse(f"the recorded args.{key} is not an integer {lo}..{hi}; use start")
-        elif key == "helper":
-            check_helper(value, "the recorded args.helper")
-        elif key == "run_token":
-            if not isinstance(value, str) or not TOKEN_RE.fullmatch(value):
-                refuse("the recorded args.run_token is not [A-Za-z0-9._-]{1,64}; use start")
-        elif key == "models":
-            if not isinstance(value, dict) or any(r not in ROLES or m not in MODELS
-                                                  for r, m in value.items()):
-                refuse("the recorded args.models is outside the allowlist; use start")
-    if "mailbox" not in args or "max_iterations" not in args:
-        refuse("the recorded args lack mailbox / max_iterations; use start")
-    if "run_token" not in args:
-        # A pre-run_token record resumes under the default token every
-        # interactive run shares: it could adopt another live run's records.
-        refuse("the recorded launch predates run tokens; a resume cannot tell its own run "
-               "from another (use start)")
+    try:
+        args = NA.validate_args(raw_args, mailbox=mailbox, helper=own_helper_real,
+                                require_run_token=True)
+    except NA.NativeArgsError as exc:
+        refuse(f"the recorded {exc}; use start")
     token = args["run_token"]
-    args_json = json.dumps(args, separators=(",", ":"))  # rebuilt from validated fields
+    args_json = NA.resume_args_json(args)  # rebuilt from validated fields
     prev = ""
 if not os.path.exists(runs):
     os.mkdir(runs)  # only once every check passed: a refusal writes nothing
