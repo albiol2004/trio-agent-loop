@@ -1,5 +1,5 @@
 """Live-probe round 2 blockers on real git: build artefacts (A), the
-conflict re-dispatch cleanup (B)."""
+conflict re-dispatch cleanup (B), the needs_retirement finish (D)."""
 from __future__ import annotations
 
 import subprocess
@@ -208,3 +208,24 @@ def test_drop_unmerged_keeps_worktree_with_product_dirt(repo: Path) -> None:
     assert out["dropped"][0]["dropped"] is False
     assert "scratch.txt" in out["dropped"][0]["reason"]
     assert Path(old["worktree"], "scratch.txt").exists()
+
+
+# --------------------------------------- D: finish from needs_retirement
+def test_next_finishing_needs_retirement_reports_shas_and_fold(
+        repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    git(repo, "add", "loop")
+    (repo / "helper.py").write_text("x = 1\n")  # blocks retirement
+    retire(repo, 1, p)
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "needs_retirement"
+    (repo / "helper.py").unlink()  # the operator removes it, then starts
+    n = step(repo, "next", max_iterations=4)
+    assert n["action"] == "stop" and n["status"] == "shipped", n
+    assert n["code"] == 0 and n["commit_shas"] == [p["sha"]]
+    assert n["retirement_fold"] == "amended" and n["human_check"] is None
+    assert git(repo, "status", "--porcelain") == ""
+    again = step(repo, "next", max_iterations=4)
+    assert again["commit_shas"] == [p["sha"]]
+    assert again["retirement_fold"] is None  # nothing finalized this time

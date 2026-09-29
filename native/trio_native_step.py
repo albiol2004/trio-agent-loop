@@ -497,14 +497,22 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     verdict, scope = TL._first_verdict(mailbox / "VERDICT.md")
     if terminal is not None:
         code = terminal
+        fold = None
         if status_word == "needs_retirement":
             code = TL._finalize_ship(
                 mailbox, state_path, iteration, repo, context="resume"
             )
             if code == 0:
-                _fold_final_state(mailbox, repo, iteration)
+                fold = _fold_final_state(mailbox, repo, iteration)
         after = _snapshot(_state(mailbox))
-        return {"action": "stop", "code": code, "verdict": verdict, **after}
+        # Probe 2 finding D: a run that finishes from needs_retirement (or
+        # re-reads a finished mailbox) reports the verdict's product
+        # commits and the fold, as `apply` does.
+        text = _verdict_text(mailbox)
+        return {"action": "stop", "code": code, "verdict": verdict,
+                "commit_shas": TL._verdict_commit_shas(text),
+                "retirement_fold": fold,
+                "human_check": _section(text, "Human check"), **after}
     phase = state["phase"].strip().lower()
     if phase == "lead-done":
         return {"action": "evaluate", "iteration": iteration, "attempt": 1,
@@ -535,6 +543,14 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     _write_session(mailbox, a.token, f"{role}-running", done=False)
     return {"action": role, "iteration": iteration, "attempt": 1,
             "scope": scope if role == "repair" else None}
+
+
+def _verdict_text(mailbox: Path) -> str:
+    try:
+        return (mailbox / "VERDICT.md").read_text(encoding="utf-8",
+                                                  errors="replace")
+    except OSError:
+        return ""
 
 
 def _gate_failures(mailbox: Path, iteration: int, role: str) -> int:

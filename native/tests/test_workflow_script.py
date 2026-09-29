@@ -517,3 +517,18 @@ def test_harness_builder_discards_untrusted_leftovers() -> None:
     assert "is inside `/repo/.claude/worktrees/`" in b
     assert "Never run these outside that directory" in b
     assert "git clean -fdx" not in b
+
+
+@needs_node
+def test_harness_finish_from_needs_retirement_reports_shas_and_fold() -> None:
+    """Probe 2 finding D: the p4b recovery reported commit_shas [] and
+    retirement_fold null."""
+    out = run({"verdicts": [], "first_next_stop": {
+        "status": "shipped", "code": 0, "verdict": "SHIP",
+        "commit_shas": ["14973e7"], "retirement_fold": "amended",
+        "human_check": None}})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["code"] == 0
+    assert r["commit_shas"] == ["14973e7"]
+    assert r["retirement_fold"] == "amended" and r["human_check"] is None
+    assert seq(out) == ["begin", "next", "end"]

@@ -631,7 +631,14 @@ try {
       const n = await step('next', { max_iterations: MAX_ITERATIONS })
       if (!n.ok) { outcome = stepFail('next', n); break }
       if (n.action === 'stop') {
-        outcome = { status: n.status, code: n.code, verdict: n.verdict, reason: 'stop' }
+        // probe 2 finding D: a finish from needs_retirement carries the
+        // SHIP's commit shas and the retirement fold.
+        outcome = {
+          status: n.status, code: n.code, verdict: n.verdict, reason: 'stop',
+          commit_shas: Array.isArray(n.commit_shas) ? n.commit_shas : [],
+          retirement_fold: n.retirement_fold || null,
+          human_check: n.verdict === 'SHIP' ? null : (n.human_check || null),
+        }
         break
       }
       const rec = { iteration: n.iteration, role: n.action === 'evaluate' ? null : n.action }

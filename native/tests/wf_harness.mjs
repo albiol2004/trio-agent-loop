@@ -67,6 +67,7 @@ function stepResult(op, nonce, prompt) {
         }) }
     }
     case 'next': {
+      if (sc.first_next_stop && iteration === 0) return { ...base, action: 'stop', iteration: 1, ...sc.first_next_stop }
       if (lastVerdict && ['SHIP', 'BLOCKED', 'NEEDS_HUMAN'].includes(lastVerdict)) {
         return { ...base, action: 'stop', status: lastVerdict.toLowerCase(), code: 0, iteration }
       }
