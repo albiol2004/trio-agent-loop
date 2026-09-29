@@ -95,7 +95,7 @@ By default there is **no agent cap and no usage budget** (user decision, 2026-09
 - `max_agents` is opt-in and enforced by the script only when passed. Every `agent()` call counts, including step agents and builders. One agent is reserved for `end`, so the lock is released. On exhaustion the status is `budget`, and the state is resumable.
 - Agent count per iteration, for sizing `max_agents`:
   - A clean one-slice Lead iteration costs 11 agents: `next`, plan, `dispatch`, builder, `builders`, integrate, `cleanup`, `gate`, `pin`, the Evaluator and `apply`. Each extra slice in a wave adds 1; each extra wave adds 4 (`dispatch`, `builders`, integrate, `cleanup`) plus its builders. A repair iteration costs 6. `begin` and `end` add 2 per run.
-  - A gate retry adds 2 agents, and a step re-run (nonce mismatch or missing keys) adds 1.
+  - A gate retry adds 2 agents (3 when `cleanup` kept builder branches), and a step re-run (nonce mismatch or missing keys) adds 1. A conflict re-dispatch adds 5 per slice (`dispatch`, builder, `builders`, integrate, `cleanup`).
 - `token_budget` is opt-in: output tokens, from `budget.spent()`. It stops before the next non-`end` agent once it is reached, with status `budget`.
 - A user `+Nk` directive stays the runtime's own hard ceiling.
 
@@ -122,7 +122,7 @@ Unattended or headless runs use Claude Code **auto mode** (`--permission-mode au
 
 ## Live probe status
 
-The 2026-09-29 probes (`PROBE-REPORT.md`) answered P0–P9. The blockers they found are addressed in this tree: driver-owned builders, the `baseRef` launcher flag and base check, raw step stdout with per-op keys, the per-session resume contract, `cleanup`, heredoc mailbox writes with the REPORT gate, the SHIP state fold and eval worktrees, and the launcher. Still to confirm live: a two-builder wave through `dispatch → builders → integrate → cleanup`, the REPORT gate on a real Lead, and the fold on a real retirement commit.
+The 2026-09-29 probes (`PROBE-REPORT.md`) answered P0–P9. The blockers they found are addressed in this tree: driver-owned builders, the `baseRef` launcher flag and base check, raw step stdout with per-op keys, the per-session resume contract, `cleanup`, heredoc mailbox writes with the REPORT gate, the SHIP state fold and eval worktrees, and the launcher. Live probe 2 (`PROBE2-REPORT.md`) confirmed the wave, merge, fold, repair, resume, held and step-fidelity mechanics; its blockers A–D and minors are addressed in this tree (build-artefact excludes, conflict re-dispatch, untrusted builder leftovers, the `needs_retirement` finish result, one lead LOG line, `role_denials`). Still to confirm live: the conflict re-dispatch and `cleanup` with pytest droppings on a real run.
 
 ## Known gaps (v0)
 
