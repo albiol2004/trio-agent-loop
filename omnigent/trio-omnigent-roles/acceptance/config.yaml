@@ -113,15 +113,26 @@ prompt: |
     `ACC_WORK` (scratch), `ACC_ID` and `ACC_BIND_<NAME>` set, each in its
     own copy of the tree, loopback only, with a read-only `acceptance/`
     that holds only its own files and the shared ones (`fakes/`, `lib/`).
-    A check script's own directory is not importable by it (a Python
-    check runs as `python3 -P`): put shared helpers in `acceptance/lib/` (on
-    `PYTHONPATH` and `NODE_PATH`) and name a check's own extra files in its
-    `run` or keep them under `acceptance/checks/ACC-NN/`. Run the product
-    the way its users do (`python3 app.py`, `python3 -m pkg`,
-    `python3 -m pytest`, `node bin/x.mjs`): the product resolves its own
-    imports normally. `PATH` holds the system directories and the
-    interpreters only; put fake CLIs under `acceptance/fakes/` and prepend
-    them yourself.
+    Python code from the pack (a script under `acceptance/`, a `python3 -c`
+    run, `python3 -m <module in acceptance/lib/>`) runs as `python3 -P -s`:
+    neither the script's own directory, the tree root nor user
+    site-packages is importable by the check's own interpreter, so use the
+    standard library there and put shared helpers in `acceptance/lib/` (on
+    `PYTHONPATH` and `NODE_PATH`); name a check's own extra files in its
+    `run` or keep them under `acceptance/checks/ACC-NN/`. Run a pack script
+    by its path, never `python3 -m acceptance...`. Run the product the way
+    its users do, either directly in `run` (`python3 app.py`,
+    `python3 template/build/test_x.py`, `python3 -m pkg`,
+    `python3 -m pytest`) or as a child of your check: the product and every
+    process a check starts resolve imports normally, user site included.
+    `PATH` holds the system directories and the interpreters only; put fake
+    CLIs under `acceptance/fakes/` and prepend them yourself.
+  - `expect` (optional besides `exit: 0`) holds regex lists matched with
+    `re.search` (multi-line) against the WHOLE stream, up to its first 1 MiB:
+    `stdout` (stdout only), `stderr` (stderr only), `output` (stdout
+    followed by stderr). Use `stdout` for a `--help` or output obligation;
+    stderr noise does not disturb it. The excerpt in reports is only the
+    last 2 KB.
   - Load pack files by explicit paths (`$ACC_DIR/checks/ACC-07/cases.json`),
     never by a computed name or a glob: a check sees only the files its
     text names plus `fakes/` and `lib/`. No symlinks in the pack.
