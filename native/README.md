@@ -24,7 +24,7 @@ ln -sfn "$REL/native/agents/trio-step.md" ~/.claude/agents/trio-step.md
 
 - Roles use the regenerated `~/.claude/agents/trio-{lead,evaluator,repair,builder,scout}.md` from this release (r18a prompt pack, Opus pin `claude-opus-5-5`). The repair and evaluator prompts changed in the eval-native-v0 fixes (F5), so the agents and skills must be refreshed from the release.
 - By default the script finds the helper at `<release CURRENT>/native/trio_native_step.py`. To run from a checkout, pass `args.helper` (an absolute path).
-- `begin` adds `.claude/worktrees/` to the product repo's `.git/info/exclude`, and the driver's runtime files (`.native.json`, `.session.json`, `.lock/`, `.native-launch.json`, `.native-runs/`, plus trioctl's list) to `<mailbox>/.gitignore` (append-only).
+- `begin` adds `.claude/worktrees/` and the build/test artefacts that are never product (`__pycache__/`, `*.py[cod]`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `node_modules/.cache/`, `node_modules/.vite/`; not `node_modules/` itself) to the product repo's `.git/info/exclude` (idempotent; the file is in the common git dir, so it covers every builder and Evaluator worktree), so a role's pytest run neither blocks `cleanup` nor trips the SHIP retirement check (probe 2 blocker A). `launch.sh` also exports `PYTHONDONTWRITEBYTECODE=1`. It adds the driver's runtime files (`.native.json`, `.session.json`, `.lock/`, `.native-launch.json`, `.native-runs/`, plus trioctl's list) to `<mailbox>/.gitignore` (append-only).
 
 ## How a Lead pass runs
 
@@ -37,7 +37,7 @@ Workflow subagents have **no Agent tool** (probe P4), so the driver owns the bui
    - one `trio-builder` (Sonnet) per slice runs with `isolation: 'worktree'`, concurrently within the wave, and reports `worktree`, `branch`, `base`, `head`, `commits`, `targeted_check`, `summary`;
    - the script refuses a builder whose `base` is not that HEAD, and `builders` re-checks on git (the branch must contain the HEAD and must not commit `loop/`) and writes each builder's `- iter N | builder | <id>: …` LOG line — builders never write LOG.md or commit `loop/`;
    - a `trio-lead` **integrate** call merges each branch (`git merge --no-ff --no-edit`, a conflict is aborted and reported), reviews and corrects; the last wave also rewrites REPORT.md and appends the `| lead |` LOG line;
-   - `cleanup` removes the merged worktrees (forced only when their only dirt is `loop/` residue) and deletes the branches.
+   - `cleanup` removes the merged worktrees and deletes the branches. It forces the removal only when the only dirt is `loop/` residue or untracked build artefacts; a tracked change or any other untracked file keeps the worktree (ignored files never block a removal).
 4. **Gate** — `_commit_gate` + `_log_gate` as in `trio_loop`, plus: REPORT.md must have been rewritten in this pass. A failure retries once with one solo Lead call; a plan with no slices is also one solo Lead call.
 
 Roles write mailbox files with Bash heredocs: the harness refuses report-file `Write`s from workflow subagents (probe P5). The Evaluator creates any pin worktree under `.claude/worktrees/eval-*`, and `end` removes those.

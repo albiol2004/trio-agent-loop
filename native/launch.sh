@@ -28,6 +28,9 @@
 set -euo pipefail
 
 CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
+# Roles run pytest in the checkout and in builder worktrees: no .pyc files
+# (probe 2 blocker A; `begin` also excludes the artefacts in info/exclude).
+export PYTHONDONTWRITEBYTECODE=1
 MODEL="claude-opus-5-5"
 SETTINGS='{"worktree":{"baseRef":"head"}}'
 SUFFIX='Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop.'

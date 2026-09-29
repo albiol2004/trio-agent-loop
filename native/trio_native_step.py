@@ -79,6 +79,18 @@ METRICS_DIR = Path(
 RECORDS = ".native.json"
 SESSION = ".session.json"
 EXCLUDE_LINE = ".claude/worktrees/"
+#: Build/test artefacts that are never product (live probe 2 blocker A):
+#: added to ``info/exclude`` (the common git dir, so every builder and
+#: Evaluator worktree too) so they neither block ``cleanup`` nor trip the
+#: SHIP retirement check (``git ls-files -o --exclude-standard``).
+#: ``node_modules/`` itself is deliberately not listed.
+ARTEFACT_EXCLUDES = (
+    "__pycache__/", "*.py[cod]", ".pytest_cache/", ".mypy_cache/",
+    ".ruff_cache/", "node_modules/.cache/", "node_modules/.vite/",
+)
+EXCLUDE_HEADER = "# trio-native: loop worktrees and build artefacts"
+_ARTEFACT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache",
+                            ".ruff_cache"})
 DEFAULT_STALE_SECONDS = 4 * 3600.0
 DRIVER = "claude-workflow"
 #: Driver/runtime files a run creates inside the mailbox; never product and
@@ -398,7 +410,11 @@ def _ensure_mailbox_gitignore(mailbox: Path) -> list[str]:
 
 # ---------------------------------------------------------- git exclude
 def _ensure_exclude(repo: Path | None) -> str | None:
-    """Add `.claude/worktrees/` to the repo's info/exclude exactly once."""
+    """Add `.claude/worktrees/` and the build artefacts to info/exclude.
+
+    Idempotent and append-only: each line is added once. ``info/`` lives in
+    the common git dir, so the lines cover every linked worktree as well.
+    """
     if repo is None:
         return None
     result = subprocess.run(
@@ -414,10 +430,29 @@ def _ensure_exclude(repo: Path | None) -> str | None:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         text = ""
-    if EXCLUDE_LINE not in (line.strip() for line in text.splitlines()):
+    present = {line.strip() for line in text.splitlines()}
+    missing = [e for e in (EXCLUDE_LINE, *ARTEFACT_EXCLUDES)
+               if e not in present]
+    if missing:
         sep = "" if not text or text.endswith("\n") else "\n"
-        path.write_text(f"{text}{sep}{EXCLUDE_LINE}\n", encoding="utf-8")
+        header = "" if EXCLUDE_HEADER in present else EXCLUDE_HEADER + "\n"
+        path.write_text(text + sep + header
+                        + "".join(f"{e}\n" for e in missing),
+                        encoding="utf-8")
     return str(path)
+
+
+def _is_artefact(path: str) -> bool:
+    """True for a build/test artefact path (see ``ARTEFACT_EXCLUDES``)."""
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts:
+        return False
+    if any(p in _ARTEFACT_DIRS for p in parts):
+        return True
+    if re.search(r"\.py[cod]$", parts[-1]):
+        return True
+    return any(parts[i] == "node_modules" and parts[i + 1] in (".cache", ".vite")
+               for i in range(len(parts) - 1))
 
 
 # ------------------------------------------------------------------- ops
@@ -875,7 +910,9 @@ def op_builders(mailbox: Path, repo: Path | None,
     return result
 
 
-def _dirty_paths(worktree: str) -> list[str] | None:
+def _dirty_entries(worktree: str) -> list[tuple[str, str]] | None:
+    """``git status --porcelain`` as [(XY code, path)] (ignored files are
+    not listed: they never block ``git worktree remove``)."""
     result = subprocess.run(
         ["git", "-C", worktree, "status", "--porcelain",
          "--untracked-files=all"],
@@ -883,26 +920,36 @@ def _dirty_paths(worktree: str) -> list[str] | None:
     )
     if result.returncode != 0:
         return None
-    paths = []
+    entries = []
     for line in result.stdout.splitlines():
         entry = line[3:]
         if " -> " in entry:
             entry = entry.split(" -> ", 1)[1]
-        paths.append(entry.strip().strip('"'))
-    return paths
+        entries.append((line[:2], entry.strip().strip('"')))
+    return entries
+
+
+def _dirty_paths(worktree: str) -> list[str] | None:
+    entries = _dirty_entries(worktree)
+    return None if entries is None else [p for _c, p in entries]
 
 
 def _remove_worktree(repo: Path, path: str, mailbox_rel: str | None,
                      force_any: bool = False) -> str | None:
     """Remove a worktree; None on success, else why it was kept.
 
-    ``--force`` only when every uncommitted path is mailbox residue (or,
-    for an Evaluator pin worktree, always: it never holds product edits).
+    ``--force`` only when every uncommitted path is mailbox residue or an
+    *untracked* build artefact (``_is_artefact``: never a tracked change,
+    never another untracked file), or, for an Evaluator pin worktree,
+    always (it never holds product edits). Ignored/excluded files are not
+    dirt: ``git worktree remove`` does not refuse on them.
     """
-    dirty = _dirty_paths(path)
+    dirty = _dirty_entries(path)
     if dirty is None:
         return "git status failed in the worktree"
-    outside = [p for p in dirty if not TL._path_in_mailbox(p, mailbox_rel)]
+    outside = [p for code, p in dirty
+               if not TL._path_in_mailbox(p, mailbox_rel)
+               and not (code == "??" and _is_artefact(p))]
     if outside and not force_any:
         return ("uncommitted changes outside the mailbox: "
                 + ", ".join(outside[:5]))
