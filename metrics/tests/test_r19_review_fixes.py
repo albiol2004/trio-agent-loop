@@ -223,35 +223,47 @@ def _resume(mb):
     (mb / "STATE.md").write_text(st)
 
 
-def test_R4_manual_human_amend_while_stopped_is_adopted_on_resume(tmp_path):
+def test_R4_manual_human_amend_is_adopted_only_by_the_explicit_command(tmp_path):
+    """eval-r19b finding 2: a human's own `(human)` commit made while the
+    loop is stopped is adopted by `trioctl ... amend --human --adopt <sha>`
+    (recorded in the driver state and a pin trailer), never by resume."""
     repo, mb, missing = _stop_needs_human(tmp_path)
-    assert state_of(repo, mb)["stopped_pin_ok"] is True
     acc = mb / "acceptance"
     (acc / "checks" / "acc_08.py").write_text("import sys\nsys.exit(1)\n# human fix\n")
     with (acc / "AMENDMENTS.md").open("a") as fh:
         fh.write("## ACC-08 · iter 1 · human · t\nchange: fix\n")
     T.git(repo, "add", "-A", "--", "loop/acceptance")
     T.git(repo, "commit", "-qm", "acceptance: amend ACC-08 (human): fix the check")
+    own = T.git(repo, "rev-parse", "HEAD")
+    ctl = trio_loop.AcceptanceController(mb, repo, None, {"enabled": True})
+    # Without naming the commit the amend is refused (explicit adoption only).
+    assert ctl.human_amend(["ACC-08"], "fix the check", iteration=1) == 3
+    assert ctl.human_amend(["ACC-08"], "fix the check", iteration=1, adopt=[own[:12]]) == 0
+    st = state_of(repo, mb)
+    assert own in st["human_amends"]
+    adoption = st["human_adoptions"][-1]
+    assert own in adoption["amends"] and adoption["pin_commit"] == T.git(repo, "rev-parse", "HEAD")
+    body = T.git(repo, "log", "-1", "--format=%B")
+    assert f"Acceptance-Human-Amend: {own}" in body
     _resume(mb)
     fake2 = T.Fake(repo, mb, lead_script=[{"features": missing}, {"features": missing}],
                    eval_script=[{"verdict": "NEEDS_HUMAN"}])
     T.run(mb, fake2)
     lg = T.log(mb)
     assert "# human fix" in (acc / "checks" / "acc_08.py").read_text(), lg[-1500:]
-    assert "adopted on resume" in lg
     assert "acceptance tamper restored" not in lg
     st = state_of(repo, mb)
     assert st["pin"] == TA.manifest_sha256(acc) and st["tamper_events"] == 0
-    proc = shadow(mb)
+    assert shadow(mb).returncode == 0, shadow(mb).stdout
+    # trio-shadow recognises the adoption from the trailer without the state.
+    import os
+    blind = dict(os.environ, TRIO_ACCEPTANCE_STATE=str(tmp_path / "elsewhere"))
+    proc = shadow(mb, blind)
     assert proc.returncode == 0, proc.stdout
 
 
-def test_R4b_human_labelled_commit_without_a_clean_stop_is_not_adopted(tmp_path):
+def test_R4b_resume_never_adopts_a_human_labelled_commit(tmp_path):
     repo, mb, missing = _stop_needs_human(tmp_path)
-    st_path = TA.state_file(repo, mb)
-    st = TA.load_state(st_path)
-    st.pop("stopped_head")  # e.g. the driver was killed
-    TA.save_state(st_path, st)
     acc = mb / "acceptance"
     (acc / "checks" / "acc_08.py").write_text("raise SystemExit(0)\n")
     with (acc / "AMENDMENTS.md").open("a") as fh:
@@ -263,7 +275,9 @@ def test_R4b_human_labelled_commit_without_a_clean_stop_is_not_adopted(tmp_path)
                    eval_script=[{"verdict": "NEEDS_HUMAN"}])
     T.run(mb, fake2)
     lg = T.log(mb)
-    assert "not adopted (the driver recorded no clean stop" in lg
+    assert "not adopted: resume never adopts" in lg
+    assert "adopted on resume" not in lg
+    assert "acceptance tamper restored" in lg
     assert "SystemExit(0)" not in (acc / "checks" / "acc_08.py").read_text()
 
 
@@ -402,8 +416,8 @@ def test_audit_honest_http_author_transcript_is_clean(tmp_path):
     "grep -rn stats {repo}/src",
     '{{"type": "tool_use", "name": "Read", "input": {{"file_path": "{repo}/src/app.py"}}}}',
     '{{"role": "assistant", "type": "message", "content": [{{"type": "tool_use", '
-    '"name": "Read", "input": {{"file_path": "/work/other/loop-hard/VERDICT.md"}}}}]}}',
-    "cat ../../loop/PLAN.md",
+    '"name": "Read", "input": {{"file_path": "{repo}/loop/VERDICT.md"}}}}]}}',
+    "cat ../repo/loop/PLAN.md",
     "find / -name PLAN.md",
     "cat /lab/speed/hard/hidden/pack/check.py",
 ])

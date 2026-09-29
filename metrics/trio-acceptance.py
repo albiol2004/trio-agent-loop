@@ -917,49 +917,140 @@ def _under(path: str, roots: Iterable[str]) -> bool:
     return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
 
 
+#: Shell commands that read or search what their path arguments name (an
+#: ancestor of the loop repository given to one of them reaches the repo).
+_AUDIT_READ_CMDS = frozenset({
+    "cat", "head", "tail", "less", "more", "bat", "strings", "xxd", "od", "nl", "wc",
+    "sed", "awk", "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "tree",
+    "du", "ls", "stat", "file", "diff",
+})
+#: Of those, the recursive searchers: even `/` given to them reaches the repo.
+_AUDIT_RECURSIVE_CMDS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "tree", "du",
+})
+_AUDIT_PREFIX_WORDS = frozenset({"sudo", "time", "nohup", "env", "command", "exec",
+                                 "xargs", "nice", "builtin"})
+_AUDIT_SEGMENT_RE = re.compile(r"&&|\|\||[;|\n]")
+_AUDIT_PROC_RE = re.compile(r"^/proc/[^/]+/(?:cwd|root)(?:/|$)")
+
+
+def _audit_expand(token: str, cwd: str | None) -> tuple[str | None, str | None]:
+    """(absolute normalized path, or None when unresolvable; hit reason)."""
+    if token.startswith(("$OLDPWD", "${OLDPWD}")):
+        return None, "names $OLDPWD (the previous working directory)"
+    if _AUDIT_PROC_RE.match(token):
+        return None, "reads a process's cwd/root through /proc"
+    home = os.environ.get("HOME", "")
+    for pre in ("${HOME}", "$HOME"):
+        if home and (token == pre or token.startswith(pre + "/")):
+            token = home + token[len(pre):]
+    for pre in ("${PWD}", "$PWD"):
+        if token == pre or token.startswith(pre + "/"):
+            if cwd is None:
+                return None, None
+            token = cwd + token[len(pre):]
+    if token.startswith("~"):
+        token = os.path.expanduser(token)
+    if token.startswith("$") or "$(" in token or "`" in token:
+        return None, None
+    if not token.startswith("/"):
+        if cwd is None:
+            return None, None
+        token = os.path.join(cwd, token)
+    return os.path.normpath(token), None
+
+
+def _ancestor_of(path: str, roots: Iterable[str]) -> bool:
+    base = path.rstrip("/") + "/" if path != "/" else "/"
+    return any(r != path and r.startswith(base) for r in roots)
+
+
 def audit_transcript(entries: Iterable[Any], export: Path,
                      forbidden: Iterable[Path] = (),
                      allowed: Iterable[Path] = ()) -> dict[str, Any]:
     """Mechanical isolation audit of an author session's tool calls (§2.2).
 
-    Only evidence that the author *read* the loop's plan or code counts
-    (eval-r19 finding 2): a tool-call argument (never a tool's output) that
-    names a path inside a *forbidden* root (the loop repository, the
-    mailbox), a mailbox file (PLAN.md, VERDICT.md, QUEUE.md, STATE.md,
-    LOG.md, REPORT.md) that is not a file of the export itself, or a lab
-    hidden-pack path (`/hidden/`, `speed/hard`). A URL or route literal
-    (`/api/openrouter/stats`), $TMPDIR, toolchain paths and system
-    prefixes are not reads of the loop and never contaminate."""
+    Best-effort (DESIGN §10): only evidence that the author *read* the
+    loop's plan or code counts. A tool-call argument (never a tool's output
+    or chat text) contaminates when it
+
+    - resolves inside a *forbidden* root (the loop repository, its git dir
+      or main checkout, the mailbox) -- relative paths resolve against the
+      tracked `cd` of the command line (the export by default), `$HOME`,
+      `${HOME}`, `~` and `$PWD` are expanded;
+    - is an *ancestor* of a forbidden root given to a reading/searching
+      command (cat, grep, find, rg, ...) or as a bare tool path (Grep,
+      Glob, Read, LS); `/` counts only for recursive searchers;
+    - is `cd <root or ancestor>`, names `$OLDPWD`, or `/proc/<pid>/cwd|root`;
+    - names a lab hidden-pack path (`/hidden/`, `speed/hard`).
+
+    A mailbox file name (PLAN.md, REPORT.md, LOG.md, ...) counts only when
+    it resolves inside a forbidden root (eval-r19b finding 5/E10: a product
+    that writes REPORT.md to a scratch dir is not the loop's mailbox). URL
+    and route literals, $TMPDIR and toolchain paths never contaminate."""
+    export_root = _norm(Path(export).resolve())[0]
     export_roots = _norm(Path(export).resolve())
     export_roots += [r for p in allowed for r in _norm(Path(p))]
-    bad_roots = [r for p in forbidden for r in _norm(Path(p))]
+    bad_roots = sorted({r for p in forbidden for r in _norm(Path(p))})
     hits: list[str] = []
+
+    def is_bad(path: str) -> bool:
+        spellings = _norm(path)
+        if any(_under(sp, export_roots) for sp in spellings):
+            return False
+        return any(_under(sp, bad_roots) for sp in spellings)
+
+    def is_ancestor(path: str) -> bool:
+        return any(_ancestor_of(sp, bad_roots) for sp in _norm(path))
+
     for entry in entries:
         for text in _audit_inputs(entry):
-            for token in _AUDIT_TOKEN_RE.findall(text):
-                token = token.strip(".:")
-                if not token or "://" in token:
+            bare = len(text.split()) == 1  # a tool's own path argument
+            cwd: str | None = export_root
+            prev: str | None = None
+            for segment in _AUDIT_SEGMENT_RE.split(text):
+                words = segment.strip().lstrip("({").split()
+                while words and (words[0] in _AUDIT_PREFIX_WORDS
+                                 or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])):
+                    words = words[1:]
+                cmd = os.path.basename(words[0]) if words else ""
+                if cmd == "cd":
+                    arg = words[1].strip("'\"") if len(words) > 1 else "~"
+                    if arg == "-":
+                        cwd, prev = prev, cwd
+                        continue
+                    path, why = _audit_expand(arg, cwd)
+                    if why:
+                        hits.append(f"{why}: {segment.strip()[:120]}")
+                    if path is not None and (is_bad(path) or (path != "/" and is_ancestor(path))):
+                        hits.append(f"cd into the loop repository or an ancestor of it: {arg}")
+                    prev, cwd = cwd, path
                     continue
-                name = token.rsplit("/", 1)[-1]
-                pathish = "/" in token or name in AUDIT_MAILBOX_FILES
-                if not pathish:
-                    continue
-                marked = "/" + token.strip("/") + "/"
-                if "/hidden/" in marked or "/speed/hard/" in marked:
-                    hits.append(f"lab hidden-pack path: {token}")
-                    continue
-                raw = Path(token).expanduser()
-                full = raw if raw.is_absolute() else Path(export_roots[0]) / raw
-                spellings = _norm(full)
-                inside = any(_under(sp, export_roots) for sp in spellings)
-                if inside:
-                    if name in AUDIT_MAILBOX_FILES and not Path(spellings[0]).is_file():
-                        hits.append(f"names mailbox file {name} (not in the export): {token}")
-                    continue
-                if any(_under(sp, bad_roots) for sp in spellings):
-                    hits.append(f"reads inside the loop repository: {token}")
-                elif name in AUDIT_MAILBOX_FILES:
-                    hits.append(f"names mailbox file {name} outside the export: {token}")
+                recursive = cmd in _AUDIT_RECURSIVE_CMDS or (
+                    cmd == "ls" and any(w.startswith("-") and "R" in w for w in words[1:]))
+                reader = recursive or cmd in _AUDIT_READ_CMDS
+                for token in _AUDIT_TOKEN_RE.findall(segment):
+                    token = token.rstrip(".:").lstrip(":")
+                    if not token or "://" in token:
+                        continue
+                    marked = "/" + token.strip("/") + "/"
+                    if "/hidden/" in marked or "/speed/hard/" in marked:
+                        hits.append(f"lab hidden-pack path: {token}")
+                        continue
+                    name = token.rsplit("/", 1)[-1]
+                    if not ("/" in token or token.startswith(("~", "$"))
+                            or name in AUDIT_MAILBOX_FILES):
+                        continue
+                    path, why = _audit_expand(token, cwd)
+                    if why:
+                        hits.append(f"{why}: {token}")
+                        continue
+                    if path is None:
+                        continue
+                    if is_bad(path):
+                        hits.append(f"reads inside the loop repository: {token}")
+                    elif is_ancestor(path) and (bare or (reader and (path != "/" or recursive))):
+                        hits.append(f"searches an ancestor of the loop repository: {token}")
     return {"contaminated": bool(hits), "hits": hits[:40]}
 
 
@@ -981,13 +1072,62 @@ def audit_output(texts: Iterable[str], forbidden: Iterable[Path]) -> dict[str, A
 # ------------------------------------------------------------ amendments
 
 
+#: A pack path named inside a check's `run` argv (`acceptance/checks/x.py`,
+#: `$ACC_DIR/fakes/y`, also inside an `sh -c` string).
+_PACK_REF_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_.@+/-])" + re.escape(PACK_DIR) + r"|\$\{?ACC_DIR\}?)/"
+    r"([A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]*)")
+
+
+def run_references(check: Any) -> set[str]:
+    """Pack-relative paths (files or directories) a check's `run` names."""
+    out: set[str] = set()
+    if not isinstance(check, dict):
+        return out
+    for arg in check.get("run") or []:
+        if not isinstance(arg, str):
+            continue
+        for m in _PACK_REF_RE.finditer(arg):
+            rel = os.path.normpath(m.group(1)).strip("/")
+            if rel and rel != "." and not rel.startswith(".."):
+                out.add(rel)
+    return out
+
+
+def _ref_covers(ref: str, rel: str) -> bool:
+    """True when *ref* (a run reference) names *rel* or a directory holding it."""
+    return rel == ref or rel.startswith(ref.rstrip("/") + "/")
+
+
+def file_owners(manifests: Iterable[dict[str, Any]], rel: str) -> set[str]:
+    """Ids whose `run` (in any of *manifests*) names *rel* or its directory."""
+    owners: set[str] = set()
+    for manifest in manifests:
+        for check in manifest.get("checks") or []:
+            if isinstance(check, dict) and check.get("id"):
+                if any(_ref_covers(ref, rel) or _ref_covers(rel, ref)
+                       for ref in run_references(check)):
+                    owners.add(check["id"])
+    return owners
+
+
 def amendment_problems(old: dict[str, Any], new: dict[str, Any],
-                       changed_files: Iterable[str], amended: Iterable[str]) -> list[str]:
-    """Mechanical scope rule of one Evaluator amendment (§3.4 rule 1)."""
+                       changed_files: Iterable[str], amended: Iterable[str],
+                       old_files: Iterable[str] | None = None) -> list[str]:
+    """Mechanical scope rule of one Evaluator amendment (§3.4 rule 1).
+
+    eval-r19b finding 1: every changed pack file is attributed to the checks
+    whose `run` names it (a file no `run` names -- a shared helper any check
+    may import -- belongs to every check), and each of those checks must be
+    one of the amended (named, counted) ids. An amended check's `run` may
+    not be pointed at a file another check's `run` names, nor at an existing
+    pack file no check names (a shared helper)."""
     probs: list[str] = []
     old_by = {c["id"]: c for c in old.get("checks") or [] if isinstance(c, dict) and "id" in c}
     new_by = {c["id"]: c for c in new.get("checks") or [] if isinstance(c, dict) and "id" in c}
     amended = set(amended)
+    all_ids = set(old_by) | set(new_by)
+    old_set = set(old_files) if old_files is not None else None
     removed = sorted(set(old_by) - set(new_by))
     if removed:
         probs.append(f"check(s) removed: {', '.join(removed)}")
@@ -1012,10 +1152,36 @@ def amendment_problems(old: dict[str, Any], new: dict[str, Any],
         if key == "checks" or old.get(key) == new.get(key):
             continue
         probs.append(f"manifest `{key}` may not be amended")
-    for rel in changed_files:
-        if rel in (MANIFEST, AMENDMENTS) or rel.startswith(("checks/", "fakes/")):
+    for rel in sorted(set(changed_files)):
+        if rel in (MANIFEST, AMENDMENTS):
             continue
-        probs.append(f"{rel} is outside the amendable pack files")
+        if not rel.startswith(("checks/", "fakes/")):
+            probs.append(f"{rel} is outside the amendable pack files")
+            continue
+        owners = file_owners((old, new), rel)
+        shared = not owners
+        if shared:
+            owners = set(all_ids)
+        others = sorted(owners - amended)
+        if others:
+            why = ("is named by no check's `run` (a shared helper any check may use)"
+                   if shared else "is used by")
+            probs.append(f"{rel} {why} {', '.join(others[:8])}"
+                         f"{' ...' if len(others) > 8 else ''}, which the amendment does not "
+                         "name (every check whose files change must be amended and counted)")
+    for cid in sorted(amended):
+        before, after = old_by.get(cid), new_by.get(cid)
+        if before is None or after is None or before.get("run") == after.get("run"):
+            continue
+        for ref in sorted(run_references(after)):
+            others = sorted(file_owners((old,), ref) - {cid})
+            if others:
+                probs.append(f"{cid}: `run` now points at {ref}, which belongs to "
+                             f"{', '.join(others[:8])}")
+            elif old_set is not None and any(_ref_covers(ref, f) for f in old_set) \
+                    and not file_owners((old,), ref):
+                probs.append(f"{cid}: `run` now points at {ref}, a shared pack file "
+                             "no check's `run` named")
     return probs
 
 
@@ -1198,11 +1364,400 @@ def restore_pack_files(repo: Path, rev: str, acc_rel: str, acc_dir: Path) -> Non
         if archive.wait() != 0 or tar.returncode != 0:
             raise RuntimeError(f"cannot read {acc_rel} at {rev[:12]}")
         acc_dir = Path(acc_dir)
-        if acc_dir.exists():
-            shutil.rmtree(acc_dir)
-        shutil.copytree(stage / acc_rel, acc_dir, symlinks=True)
+        # Build the new pack next to the old one and swap by rename, so a
+        # reader never sees a half-copied pack (eval-r19b finding 4).
+        acc_dir.parent.mkdir(parents=True, exist_ok=True)
+        tag = f"{os.getpid()}-{time.monotonic_ns()}"
+        fresh = acc_dir.with_name(f".{acc_dir.name}.restore-{tag}")
+        old = acc_dir.with_name(f".{acc_dir.name}.old-{tag}")
+        shutil.copytree(stage / acc_rel, fresh, symlinks=True)
+        try:
+            if acc_dir.exists() or acc_dir.is_symlink():
+                os.replace(acc_dir, old)
+            os.replace(fresh, acc_dir)
+        finally:
+            shutil.rmtree(fresh, ignore_errors=True)
+            if old.is_symlink():
+                old.unlink()
+            else:
+                shutil.rmtree(old, ignore_errors=True)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+
+
+def pack_hash_at(repo: Path, rev: str, acc_rel: str) -> str | None:
+    """manifest_sha256 of the pack as committed in *rev* (git objects only)."""
+    proc = _git(repo, "ls-tree", "-r", "-z", rev, "--", acc_rel + "/", check=False)
+    if proc.returncode != 0:
+        return None
+    entries = []
+    for raw in proc.stdout.split("\0"):
+        if not raw.strip():
+            continue
+        meta, _tab, path = raw.partition("\t")
+        mode, _type, blob = meta.split()
+        rel = path[len(acc_rel) + 1:]
+        parts = rel.split("/")
+        if rel == FROZEN or any(p in HASH_SKIP_DIRS for p in parts[:-1]) \
+                or rel.endswith((".pyc", ".pyo")):
+            continue
+        entries.append((rel, mode, blob))
+    digest = hashlib.sha256()
+    for rel, mode, blob in sorted(entries):
+        data = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
+                              capture_output=True).stdout
+        if mode == "120000":
+            data = b"symlink:" + data
+        digest.update(rel.encode("utf-8") + b"\0" + data + b"\0")
+    return digest.hexdigest()
+
+
+# ------------------------------------------------ git-derived pin chain
+
+FREEZE_SUBJECT_RE = re.compile(r"^acceptance: freeze \d+ checks?\b")
+RESTORE_SUBJECT_RE = re.compile(r"^acceptance: restore\b")
+PIN_SUBJECT_RE = re.compile(r"^acceptance: pin\b")
+AMEND_SUBJECT_RE = re.compile(
+    r"^acceptance: amend (ACC-[0-9]{1,4}(?:\s*,\s*ACC-[0-9]{1,4})*) "
+    r"\((evaluator|human)\b[^)]*\): \S")
+PIN_TRAILER = "Acceptance-Pin"
+HUMAN_TRAILER = "Acceptance-Human-Amend"
+#: The Evaluator amendment budget (§3.4; trio_loop uses the same numbers).
+AMEND_MAX = 2
+AMEND_SHARE = 0.25
+
+
+def _show(repo: Path, rev: str, rel: str) -> str | None:
+    proc = _git(repo, "show", f"{rev}:{rel}", check=False)
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _object_ids(repo: Path, specs: list[str]) -> list[str | None]:
+    """`git cat-file --batch-check` for many `<rev>:<path>` specs at once."""
+    if not specs:
+        return []
+    proc = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch-check"],
+                          input="\n".join(specs) + "\n", capture_output=True, text=True)
+    out: list[str | None] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        out.append(parts[0] if len(parts) >= 2 and parts[-1] != "missing" else None)
+    return out + [None] * (len(specs) - len(out))
+
+
+def _amend_diff_problems(repo: Path, sha: str, acc_rel: str, ids: list[str]) -> list[str]:
+    diff = _git(repo, "show", "--format=", "-U0", sha, "--",
+                f"{acc_rel}/{AMENDMENTS}", check=False).stdout
+    probs = []
+    added = set(re.findall(r"^\+##\s+(ACC-[0-9]{1,4})\b", diff, re.MULTILINE))
+    missing = [i for i in ids if i not in added]
+    if missing:
+        probs.append(f"no AMENDMENTS.md record for {', '.join(missing)}")
+    if re.findall(r"^-(?!--)(.+)$", diff, re.MULTILINE):
+        probs.append("AMENDMENTS.md is append-only (lines removed)")
+    return probs
+
+
+def base_fails_lost(repo: Path, acc_rel: str, ref_rev: str, new_rev: str,
+                    base: str) -> list[str]:
+    """Ids that FAIL at *base* with the pack of *ref_rev* but not with the
+    pack of *new_rev* (both read from git objects; whole pack each)."""
+    repo = Path(repo)
+    mailbox_rel = acc_rel.rsplit("/", 1)[0] if "/" in acc_rel else ""
+    exclude = {mailbox_rel} if mailbox_rel else set()
+    work = Path(tempfile.mkdtemp(prefix="trio-acceptance-verify-"))
+    try:
+        runs = []
+        for tag, rev in (("ref", ref_rev), ("new", new_rev)):
+            acc = work / tag / PACK_DIR
+            restore_pack_files(repo, rev, acc_rel, acc)
+            runs.append(run_pack(acc, base, repo=repo, exclude=exclude))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    after = {r["id"]: r["outcome"] for r in runs[1]["results"]}
+    return sorted(r["id"] for r in runs[0]["results"]
+                  if r["outcome"] == "FAIL" and after.get(r["id"]) != "FAIL")
+
+
+def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
+                     head: str = "HEAD", driver_commits: Iterable[str] | None = None,
+                     human_amends: Iterable[str] | None = None,
+                     verify: bool = False) -> dict[str, Any]:
+    """The pack's legitimate pin chain, from git objects alone (eval-r19b
+    findings 2 and 3; never the working tree, never a subject by itself).
+
+    Walks the first-parent chain ``start..head`` (the whole history when
+    *start* is None). The freeze is the FIRST commit that adds
+    ``<acc_rel>/FROZEN``; it must be a structural driver freeze (subject,
+    ``Acceptance-Pin`` trailer equal to the committed pack hash, FROZEN's
+    pin[0] equal to it, nothing outside the pack). After it:
+
+    - ``acceptance: restore``: genuine when it puts back the current pin
+      (trailer == committed pack == current pin), touching only the pack;
+      it excuses the tamper and rejected amend commits before it.
+    - ``acceptance: amend ...``: pending until a pin; structurally checked.
+    - ``acceptance: pin``: genuine when it changes only FROZEN (extending
+      it with one pin line), its trailer is the committed pack, and the
+      pending amend commits form a legitimate amendment: either an adopted
+      human amendment (an ``Acceptance-Human-Amend`` trailer naming every
+      pending amend commit) or an Evaluator amendment passing
+      ``amendment_problems``, its records and the loop budget.
+    - anything else touching the pack (a second freeze, a FROZEN re-add, a
+      slice commit) is tamper until a genuine restore.
+
+    *driver_commits* / *human_amends* (the driver's record, when visible)
+    only add strictness: a freeze/pin/restore not in it, or an adopted
+    human amend not in it, is an offender. With *verify*, every Evaluator
+    amendment pin is also re-checked for discrimination: the whole pack
+    runs at the frozen base before and after, and every check that FAILed
+    before must still FAIL (the driver's own rule, eval-r19b finding 1).
+
+    Returns ``{"freeze_commit", "base", "pin", "anchor", "pins": [...],
+    "problems": [...], "pending_tamper": [...], "pending_amends": [...],
+    "head_pack", "multiple_freezes", "amend_used", "amended_ids",
+    "tamper_restores", "driver_commits": [...], "human_amends": [...],
+    "frozen_text"}``; ``freeze_commit`` is None when no valid freeze exists.
+    """
+    repo = Path(repo)
+    recorded = set(driver_commits) if driver_commits is not None else None
+    humans = set(human_amends) if human_amends is not None else None
+    out: dict[str, Any] = {
+        "freeze_commit": None, "base": None, "pin": None, "anchor": None, "pins": [],
+        "problems": [], "pending_tamper": [], "pending_amends": [], "head_pack": None,
+        "multiple_freezes": False, "amend_used": 0, "amended_ids": [],
+        "tamper_restores": 0, "driver_commits": [], "human_amends": [], "frozen_text": None,
+    }
+    rng = f"{start}..{head}" if start else head
+    proc = _git(repo, "rev-list", "--first-parent", "--reverse", rng, check=False)
+    if proc.returncode != 0:
+        out["problems"].append(f"cannot read the history {rng} ({proc.stderr.strip()[-200:]})")
+        return out
+    chain = [c for c in proc.stdout.split() if c]
+    out["head_pack"] = pack_hash_at(repo, head, acc_rel) if chain or start else None
+    first_parent = start
+    if chain and start is None:
+        first_parent = _git(repo, "rev-parse", "-q", "--verify", f"{chain[0]}^",
+                            check=False).stdout.strip() or None
+    revs = ([first_parent] if first_parent else []) + chain
+    trees = _object_ids(repo, [f"{r}:{acc_rel}" for r in revs])
+    frozen_ids = _object_ids(repo, [f"{r}:{acc_rel}/{FROZEN}" for r in revs])
+    if not first_parent:
+        trees, frozen_ids = [None] + trees, [None] + frozen_ids
+    touching: list[tuple[str, str | None, bool]] = []
+    for i, sha in enumerate(chain):
+        prev_tree, tree = trees[i], trees[i + 1]
+        if prev_tree != tree:
+            touching.append((sha, first_parent if i == 0 else chain[i - 1],
+                             frozen_ids[i] is None and frozen_ids[i + 1] is not None))
+    if not touching:
+        return out
+    info: dict[str, tuple[str, str, str]] = {}
+    fmt = (f"%x1e%H%x1f%s%x1f%(trailers:key={PIN_TRAILER},valueonly,separator=%x20)"
+           f"%x1f%(trailers:key={HUMAN_TRAILER},valueonly,separator=%x20)")
+    shas = [t[0] for t in touching]
+    for i in range(0, len(shas), 200):
+        log = _git(repo, "log", "--no-walk=unsorted", f"--format={fmt}", *shas[i:i + 200],
+                   check=False)
+        for block in log.stdout.split("\x1e"):
+            if not block.strip():
+                continue
+            parts = (block.strip("\n").split("\x1f") + ["", "", ""])[:4]
+            info[parts[0]] = (parts[1], parts[2].strip(), parts[3].strip())
+
+    def files_of(sha: str, parent: str | None) -> list[str]:
+        args = ["diff-tree", "-r", "--no-commit-id", "--name-only"]
+        args += [parent, sha] if parent else ["--root", sha]
+        return [f for f in _git(repo, *args, check=False).stdout.splitlines() if f.strip()]
+
+    problems: list[str] = out["problems"]
+    pending_tamper: list[str] = []
+    pending_amends: list[dict[str, Any]] = []
+    freeze = None
+    cur_pin = None
+    anchor = None
+    anchor_manifest: dict[str, Any] | None = None
+    anchor_files: list[str] = []
+    checks_total = 1
+    amend_used = 0
+    amended_ids: set[str] = set()
+    frozen_adds = 0
+    for sha, parent, adds_frozen in touching:
+        subject, pin, human = info.get(sha, ("", "", ""))
+        label = f"{sha[:12]} {subject!r}"
+        files = files_of(sha, parent)
+        outside = [f for f in files if not f.startswith(acc_rel + "/")]
+        pack_only = [f for f in files if f.startswith(acc_rel + "/")]
+        frozen_adds += int(adds_frozen)
+        if freeze is None:
+            if not (adds_frozen or FREEZE_SUBJECT_RE.match(subject)):
+                if start is not None:
+                    if RESTORE_SUBJECT_RE.match(subject) or PIN_SUBJECT_RE.match(subject):
+                        problems.append(f"{label}: driver acceptance commit before the freeze")
+                    elif AMEND_SUBJECT_RE.match(subject):
+                        problems.append(f"{label}: amend before the freeze")
+                    else:
+                        problems.append(f"{label}: touches {acc_rel}/ before the freeze")
+                continue
+            why = []
+            if not FREEZE_SUBJECT_RE.match(subject):
+                why.append("adds FROZEN but is not a driver freeze commit")
+            if outside:
+                why.append(f"touches files outside acceptance/: {', '.join(outside[:5])}")
+            committed = pack_hash_at(repo, sha, acc_rel)
+            if not pin or pin != committed:
+                why.append("Acceptance-Pin trailer does not match the committed pack")
+            text = _show(repo, sha, f"{acc_rel}/{FROZEN}") or ""
+            pins0 = re.findall(r"^pin\[0\]:\s*([0-9a-f]{64})", text, re.MULTILINE)
+            if not why and (not pins0 or pins0[0] != pin):
+                why.append("FROZEN's pin[0] is not the committed pack")
+            if recorded is not None and sha not in recorded:
+                why.append("not the driver's recorded freeze commit")
+            if why:
+                problems.append(f"{label}: " + "; ".join(why))
+                if adds_frozen:
+                    # The FIRST FROZEN add is the freeze; a forged one
+                    # leaves the loop without a valid freeze.
+                    break
+                continue
+            freeze = anchor = sha
+            cur_pin = pin
+            out["freeze_commit"] = sha
+            base_m = re.search(r"^base:\s*(\S+)", text, re.MULTILINE)
+            out["base"] = base_m.group(1) if base_m else None
+            out["pins"].append({"sha256": pin, "commit": sha, "note": "freeze", "kind": "freeze"})
+            out["driver_commits"].append(sha)
+            anchor_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
+            anchor_files = _git(repo, "ls-tree", "-r", "--name-only", sha, "--",
+                                acc_rel + "/", check=False).stdout.split()
+            checks_total = max(1, len(anchor_manifest.get("checks") or []))
+            continue
+        # ---- after the freeze
+        if adds_frozen or FREEZE_SUBJECT_RE.match(subject):
+            pending_tamper.append(f"{label}: a second freeze commit (the pack is frozen once "
+                                  "per loop" + ("; FROZEN was re-added" if adds_frozen else "")
+                                  + ")")
+            continue
+        m = AMEND_SUBJECT_RE.match(subject)
+        if m:
+            ids = [i.strip() for i in m.group(1).split(",")]
+            why = []
+            if outside:
+                why.append(f"an amend commit may touch only acceptance/ (also: {', '.join(outside[:5])})")
+            why += _amend_diff_problems(repo, sha, acc_rel, ids)
+            if why:
+                problems.append(f"{label}: " + "; ".join(why))
+            pending_amends.append({"sha": sha, "ids": ids, "who": m.group(2), "label": label})
+            continue
+        if RESTORE_SUBJECT_RE.match(subject) or PIN_SUBJECT_RE.match(subject):
+            kind = "restore" if RESTORE_SUBJECT_RE.match(subject) else "pin"
+            why = []
+            if recorded is not None and sha not in recorded:
+                why.append("not an acceptance commit the driver recorded (a subject alone is "
+                           "not a driver commit)")
+            if outside:
+                why.append(f"touches files outside acceptance/: {', '.join(outside[:5])}")
+            committed = pack_hash_at(repo, sha, acc_rel)
+            if not pin or pin != committed:
+                why.append("Acceptance-Pin trailer does not match the committed pack")
+            elif kind == "restore":
+                if pin != cur_pin:
+                    why.append("restores a pack that was never pinned"
+                               if pin not in {p["sha256"] for p in out["pins"]}
+                               else "restores a superseded pin")
+            else:
+                extra = [f for f in pack_only if f != f"{acc_rel}/{FROZEN}"]
+                if extra:
+                    why.append(f"a pin commit may only extend {acc_rel}/FROZEN "
+                               f"(also: {', '.join(extra[:5])})")
+                elif not pending_amends:
+                    why.append("a pin commit with no amend commit to pin")
+                elif pending_tamper:
+                    why.append("pins over a pack edit that is not an amend commit")
+                else:
+                    before = _show(repo, anchor, f"{acc_rel}/{FROZEN}") or ""
+                    after = _show(repo, sha, f"{acc_rel}/{FROZEN}") or ""
+                    new_lines = after[len(before.rstrip("\n")):].strip().splitlines() \
+                        if after.startswith(before.rstrip("\n")) else None
+                    if new_lines is None or len(new_lines) != 1 \
+                            or not re.match(rf"^pin\[\d+\]:\s*{pin}\b", new_lines[0]):
+                        why.append(f"a pin commit must extend {acc_rel}/FROZEN by exactly its "
+                                   "own pin line")
+            if not why and kind == "pin":
+                amend_shas = [a["sha"] for a in pending_amends]
+                listed = [s for s in re.split(r"[\s,]+", human) if s]
+                ids = sorted({i for a in pending_amends for i in a["ids"]})
+                if listed:
+                    if sorted(set(listed)) != sorted(set(amend_shas)):
+                        why.append(f"its {HUMAN_TRAILER} trailer does not name exactly the "
+                                   "amend commits it pins")
+                    elif humans is not None and [s for s in listed if s not in humans]:
+                        why.append("a human adoption the driver state does not record")
+                    else:
+                        out["pins"].append({"sha256": pin, "commit": sha, "kind": "human",
+                                            "note": f"amend {', '.join(ids)} (human)",
+                                            "amends": amend_shas})
+                        out["human_amends"].extend(amend_shas)
+                else:
+                    new_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
+                    # What the amend commits changed (the pin commit itself
+                    # only extends FROZEN).
+                    changed = [f[len(acc_rel) + 1:] for f in _git(
+                        repo, "diff", "--name-only", anchor, parent or sha, "--", acc_rel,
+                        check=False).stdout.split()]
+                    old_rel = [f[len(acc_rel) + 1:] for f in anchor_files]
+                    why += amendment_problems(anchor_manifest or {}, new_manifest, changed, ids,
+                                              old_rel)
+                    if amend_used + len(ids) > AMEND_MAX \
+                            or amend_used + len(ids) > AMEND_SHARE * checks_total:
+                        why.append(f"amendment budget exceeded ({amend_used} used + {len(ids)})")
+                    if not why and verify:
+                        if not out["base"]:
+                            why.append("the freeze names no base to re-check the amendment at")
+                        else:
+                            try:
+                                lost = base_fails_lost(repo, acc_rel, anchor, sha, out["base"])
+                            except (OSError, RuntimeError, ManifestError) as exc:
+                                lost = None
+                                why.append(f"cannot re-check the amendment at base ({exc})")
+                            if lost:
+                                why.append(f"{', '.join(lost)} no longer FAIL at base")
+                    if not why:
+                        amend_used += len(ids)
+                        amended_ids |= set(ids)
+                        out["pins"].append({"sha256": pin, "commit": sha, "kind": "amend",
+                                            "note": f"amend {', '.join(ids)}",
+                                            "amends": amend_shas})
+            if why:
+                pending_tamper.append(f"{label}: " + "; ".join(why))
+                continue
+            out["driver_commits"].append(sha)
+            if kind == "restore":
+                if "(tamper" in subject:
+                    out["tamper_restores"] += 1
+                pending_tamper.clear()
+                pending_amends.clear()
+            else:
+                cur_pin = pin
+                pending_amends.clear()
+                anchor_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
+                anchor_files = _git(repo, "ls-tree", "-r", "--name-only", sha, "--",
+                                    acc_rel + "/", check=False).stdout.split()
+                if out["pins"][-1]["kind"] == "human":
+                    checks_total = max(1, len(anchor_manifest.get("checks") or []))
+            anchor = sha
+            continue
+        pending_tamper.append(f"{label}: touches {acc_rel}/ ({', '.join(pack_only[:3])}) -- "
+                              "only the driver freeze/restore and amend commits may")
+    out["multiple_freezes"] = frozen_adds > 1
+    out["pin"] = cur_pin
+    out["anchor"] = anchor
+    out["amend_used"] = amend_used
+    out["amended_ids"] = sorted(amended_ids)
+    out["pending_tamper"] = pending_tamper
+    out["pending_amends"] = pending_amends
+    if anchor is not None:
+        out["frozen_text"] = _show(repo, anchor, f"{acc_rel}/{FROZEN}")
+    return out
 
 
 def file_sha256(path: Path) -> str | None:

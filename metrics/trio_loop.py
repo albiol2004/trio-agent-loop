@@ -2058,6 +2058,11 @@ class AcceptanceController:
         self._thread: threading.Thread | None = None
         self._error: AcceptanceError | None = None
         self._lock = threading.Lock()
+        # eval-r19b finding 4: check_pin / restore / _count_tamper /
+        # process_amendments run on the Lead and dispatch threads at once in
+        # open-loop; one re-entrant lock serialises them.
+        self._gate_lock = threading.RLock()
+        self._counted_tamper: set = set()
         self.breaches = 0
         self.pending_errors: list[str] = []
         self.last_run: dict | None = None
@@ -2110,25 +2115,17 @@ class AcceptanceController:
             raise self._resume_error
         if self._thread is not None:
             return
-        if self.frozen() and (self.acc_dir / self.ta.FROZEN).is_file():
+        if self.frozen():
+            # A missing or edited working-tree pack is check_pin's to restore.
             self._publish()
             return
-        if (self.acc_dir / self.ta.FROZEN).is_file() and not self.state.get("pin"):
-            # Driver state lost: re-derive the pin from the committed pack.
-            head_pin = self.ta.latest_pin(self.acc_dir)
-            if head_pin and head_pin == self.ta.manifest_sha256(self.acc_dir):
-                self.state.update({
-                    "status": "frozen", "pin": head_pin,
-                    "frozen_sha256": self.ta.file_sha256(self.acc_dir / self.ta.FROZEN),
-                    "pin_commit": _git_head(self.repo) or "",
-                    "chain": [[p["sha256"], p["note"]] for p in
-                              self.ta.read_frozen(self.acc_dir).get("pins") or []],
-                    "base": self.ta.read_frozen(self.acc_dir).get("base", ""),
-                })
-                self._save()
-                self._log(iteration, f"pin re-derived from FROZEN {head_pin[:12]} "
-                                     "(driver state was missing)")
-                return
+        if self._has_pack():
+            # on_resume() reconciles an existing pack with git (or refuses);
+            # a pack with no reconciled pin is never re-authored over.
+            raise AcceptanceNeedsHuman(
+                "acceptance-state-lost",
+                f"{self.acc_rel}/ exists but the driver has no pin for it; resume through "
+                "the loop driver (it re-derives the pin from git) or move the pack away")
         if not callable(getattr(self.runner, "author", None)):
             raise AcceptanceError("acceptance-unavailable",
                                   "the role runner has no author() hook")
@@ -2342,16 +2339,60 @@ class AcceptanceController:
         self._freeze(iteration, Path(export), filtered, author, info, goal, notes)
         return 0
 
-    def human_amend(self, ids: list[str], reason: str, iteration: int = 0) -> int:
-        """`trioctl omnigent acceptance amend --human`: commit the pack edits
-        (working tree, or already committed by the human since the pin) as
-        `acceptance: amend <ids> (human): <reason>` and re-pin. The caller
-        refuses while a live driver holds the mailbox; the amend commit is
-        recorded in the driver state (outside the repo), which is what makes
-        it a *human* amendment -- a `(human)` subject alone never is."""
+    def human_amend(self, ids: list[str], reason: str, iteration: int = 0,
+                    adopt: list[str] | None = None) -> int:
+        """`trioctl omnigent acceptance amend --human`: the only way a human
+        amendment enters the pin chain (eval-r19b finding 2). The caller
+        refuses while a live driver holds the mailbox.
+
+        The working-tree pack edits are committed as `acceptance: amend <ids>
+        (human): <reason>` and re-pinned. Pack commits the human already made
+        since the last driver pin are adopted only when named with *adopt*
+        (after review); any other commit since the pin refuses the amend. The
+        adoption is recorded in the driver state (amend shas, pin commit) and
+        in the pin commit's `Acceptance-Human-Amend:` trailer."""
         ta = self.ta
         if not ids or not reason.strip():
             print("acceptance amend: --ids and --reason are required", file=sys.stderr)
+            return 3
+        try:
+            self._reconcile_with_git(iteration, announce=False)
+        except AcceptanceError as exc:
+            print(f"acceptance amend: refused ({exc.reason}): {exc.detail}", file=sys.stderr)
+            return 3
+        anchor = str(self.state.get("pin_commit") or "")
+        since = []
+        log = _git(self.repo, "log", "--first-parent", "--reverse", "--format=%H%x1f%s",
+                   f"{anchor}..HEAD", "--", self.acc_rel)
+        for line in log.stdout.splitlines():
+            sha, _sep, subject = line.partition("\x1f")
+            since.append({"sha": sha, "subject": subject})
+        wanted: list[str] = []
+        for ref in adopt or []:
+            full = _git(self.repo, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}").stdout.strip()
+            if not full:
+                print(f"acceptance amend: --adopt {ref} is not a commit", file=sys.stderr)
+                return 3
+            wanted.append(full)
+        shas = [c["sha"] for c in since]
+        stray = [w for w in wanted if w not in shas]
+        if stray:
+            print("acceptance amend: --adopt names commits that did not change the pack since "
+                  f"the last driver pin {anchor[:12]}: {', '.join(s[:12] for s in stray)}",
+                  file=sys.stderr)
+            return 3
+        unlisted = [c for c in since if c["sha"] not in wanted]
+        not_amend = [c for c in since if c["sha"] in wanted
+                     and not _AMEND_SUBJECT_RE.match(c["subject"])]
+        if unlisted or not_amend:
+            for c in unlisted:
+                print(f"acceptance amend: {c['sha'][:12]} {c['subject']!r} changed the pack since "
+                      f"the last driver pin {anchor[:12]}; review it (git show {c['sha'][:12]}) "
+                      "and name it with --adopt, or revert it", file=sys.stderr)
+            for c in not_amend:
+                print(f"acceptance amend: {c['sha'][:12]} {c['subject']!r} is not an `acceptance: "
+                      "amend` commit; revert it and amend the pack from the working tree",
+                      file=sys.stderr)
             return 3
         amend_path = self.acc_dir / ta.AMENDMENTS
         with amend_path.open("a", encoding="utf-8") as fh:
@@ -2360,53 +2401,44 @@ class AcceptanceController:
                          f"change: {reason.strip()}\n")
         sha = ta.commit_paths(self.repo, [self.acc_rel],
                               f"acceptance: amend {', '.join(ids)} (human): {reason.strip()}\n")
-        if sha is None:
+        amends = shas + ([sha] if sha and sha not in shas else [])
+        if not amends:
             print("acceptance amend: nothing changed", file=sys.stderr)
             return 3
-        # The human vouches for every `(human)` amend since the pin (edits
-        # they committed themselves before running this command) and this one.
-        shas = [c["sha"] for c in self._human_labelled_since_pin()]
-        pin = self._repin_human(ids, shas + [sha] if sha not in shas else shas, iteration)
-        print(f"acceptance re-pinned {pin[:12]} (amend {', '.join(ids)} (human))")
+        pin = self._repin_human(ids, amends, iteration, reason.strip())
+        print(f"acceptance re-pinned {pin[:12]} (amend {', '.join(ids)} (human); adopted "
+              f"{', '.join(a[:12] for a in amends)})")
         return 0
 
-    def _human_labelled_since_pin(self, upto: str = "HEAD") -> list[dict]:
-        """`(human)`-labelled amend commits touching the pack since the pin."""
-        pin_commit = self.state.get("pin_commit") or ""
-        if not pin_commit:
-            return []
-        log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s",
-                   f"{pin_commit}..{upto}", "--", self.acc_rel)
-        out = []
-        for line in log.stdout.splitlines() if log.returncode == 0 else []:
-            sha, _sep, subject = line.partition("\x1f")
-            m = _AMEND_SUBJECT_RE.match(subject)
-            if m and m.group(2) == "human":
-                out.append({"sha": sha, "subject": subject,
-                            "ids": [i.strip() for i in m.group(1).split(",")]})
-        return out
-
-    def _repin_human(self, ids: list[str], amend_shas: list[str], iteration: int) -> str:
-        """Re-pin the committed pack after an authenticated human amendment
-        (humans may change anything) and record it in the driver state."""
+    def _repin_human(self, ids: list[str], amend_shas: list[str], iteration: int,
+                     reason: str = "") -> str:
+        """Re-pin the committed pack after an explicit human amendment
+        (humans may change anything) and record the adoption in the driver
+        state and in the pin commit's trailer (finding 6); human amendments
+        never count toward the Evaluator budget."""
         ta = self.ta
         pin = ta.manifest_sha256(self.acc_dir)
-        chain = [list(c) for c in self.state.get("chain") or []] or \
-            [[p["sha256"], p["note"]] for p in ta.read_frozen(self.acc_dir).get("pins") or []]
+        chain = [list(c) for c in self.state.get("chain") or []]
         note = f"amend {', '.join(ids)} (human)"
         chain.append([pin, note])
         text = (self.acc_dir / ta.FROZEN).read_text(encoding="utf-8", errors="replace")
         (self.acc_dir / ta.FROZEN).write_text(
             text.rstrip("\n") + f"\npin[{len(chain) - 1}]: {pin} {note}\n", encoding="utf-8")
-        pin_sha = ta.commit_paths(self.repo, [self.acc_rel],
-                                  f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n")
+        pin_sha = ta.commit_paths(
+            self.repo, [self.acc_rel],
+            f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n"
+            f"{ta.HUMAN_TRAILER}: {' '.join(amend_shas)}\n")
         head = pin_sha or _git_head(self.repo) or ""
         manifest = ta.load_manifest(self.acc_dir)
+        adoptions = list(self.state.get("human_adoptions") or [])
+        adoptions.append({"amends": list(amend_shas), "pin_commit": head, "pin": pin,
+                          "ids": list(ids), "reason": reason, "utc": ta.utc_now()})
         self.state.update({
             "status": "frozen", "pin": pin, "pin_commit": head,
             "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN), "chain": chain,
             "checks": len(manifest.get("checks") or []),
             "human_amends": list(self.state.get("human_amends") or []) + list(amend_shas),
+            "human_adoptions": adoptions,
             "driver_commits": list(self.state.get("driver_commits") or [])
             + ([pin_sha] if pin_sha else []),
         })
@@ -2414,23 +2446,123 @@ class AcceptanceController:
         _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
                           f"{pin[:16]} @{head[:12]}")
         _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: human amendment of "
-                                  f"{', '.join(ids)} re-pinned {pin[:12]}")
+                                  f"{', '.join(ids)} re-pinned {pin[:12]} (adopted "
+                                  f"{', '.join(s[:12] for s in amend_shas)})")
         return pin
 
     # ------------------------------------------------------- resume / stop
 
+    def _has_pack(self) -> bool:
+        """A pack in the working tree or in HEAD (git objects)."""
+        if (self.acc_dir / self.ta.FROZEN).is_file():
+            return True
+        return _git(self.repo, "cat-file", "-e",
+                    f"HEAD:{self.acc_rel}/{self.ta.FROZEN}").returncode == 0
+
+    def _extract(self, rev: str, dest: Path) -> Path:
+        """The pack as committed in *rev* (git objects), under *dest*."""
+        acc = dest / self.ta.PACK_DIR
+        self.ta.restore_pack_files(self.repo, rev, self.acc_rel, acc)
+        return acc
+
+    def _reconcile_with_git(self, iteration: int, announce: bool = True) -> None:
+        """Check the driver state against the pin chain derived from git
+        alone (eval-r19b finding 2); raise AcceptanceNeedsHuman when they
+        disagree or the chain is ambiguous.
+
+        The state file lives outside the repo but any same-uid process can
+        write it, so nothing in it relaxes a check: its pin must be the last
+        legitimate pin in git, and a lost state is re-derived from git
+        (HEAD's objects, the first FROZEN add on the first-parent history,
+        structurally verified driver pin/restore commits) -- never from the
+        working-tree FROZEN. Commits after the last driver pin are never
+        adopted here; check_pin restores them as tamper."""
+        ta = self.ta
+        lost = not self.state.get("pin")
+        reason = "acceptance-state-lost" if lost else "acceptance-state-mismatch"
+        start = str(self.state.get("run_head") or "") or None
+        if start and _git(self.repo, "merge-base", "--is-ancestor", start, "HEAD").returncode != 0:
+            if not lost:
+                raise AcceptanceNeedsHuman(
+                    reason, f"the driver state's run head {start[:12]} is not an ancestor of HEAD")
+            start = None
+        chain = ta.derive_pin_chain(self.repo, self.acc_rel, start, verify=True)
+        if chain["freeze_commit"] is None:
+            raise AcceptanceNeedsHuman(
+                reason, f"git history has no valid driver freeze of {self.acc_rel}/"
+                + (f" ({'; '.join(chain['problems'][:2])[:300]})" if chain["problems"] else ""))
+        if start is None and chain["multiple_freezes"]:
+            raise AcceptanceNeedsHuman(
+                reason, f"{self.acc_rel}/FROZEN was added more than once on the first-parent "
+                "history, so this run's freeze is ambiguous; restore the driver state or move "
+                "the pack away")
+        if not lost:
+            recorded = self.state.get("freeze_commit")
+            if recorded and recorded != chain["freeze_commit"]:
+                raise AcceptanceNeedsHuman(
+                    reason, f"the driver state's freeze {str(recorded)[:12]} is not the freeze in "
+                    f"git {chain['freeze_commit'][:12]}")
+            if self.state.get("pin") != chain["pin"]:
+                raise AcceptanceNeedsHuman(
+                    reason, f"the driver state's pin {str(self.state.get('pin'))[:12]} is not the "
+                    f"last legitimate pin in git {str(chain['pin'])[:12]} (the state file was "
+                    "edited, or the driver stopped between a commit and its state write)")
+        anchor = chain["anchor"]
+        frozen_blob = subprocess.run(
+            ["git", "-C", str(self.repo), "cat-file", "blob", f"{anchor}:{self.acc_rel}/{ta.FROZEN}"],
+            capture_output=True).stdout
+        manifest = json.loads(_git(self.repo, "show", f"{anchor}:{self.acc_rel}/{ta.MANIFEST}").stdout
+                              or "{}")
+        dc = list(self.state.get("driver_commits") or [])
+        ha = list(self.state.get("human_amends") or [])
+        self.state.update({
+            "status": "frozen", "pin": chain["pin"], "pin_commit": anchor,
+            "frozen_sha256": hashlib.sha256(frozen_blob).hexdigest(),
+            "chain": [[p["sha256"], p["note"]] for p in chain["pins"]],
+            "freeze_commit": chain["freeze_commit"],
+            "base": chain["base"] or self.state.get("base") or "",
+            "checks": len(manifest.get("checks") or []),
+            "driver_commits": dc + [c for c in chain["driver_commits"] if c not in dc],
+            "human_amends": ha + [c for c in chain["human_amends"] if c not in ha],
+            "amendments": max(int(self.state.get("amendments", 0) or 0), chain["amend_used"]),
+            "amended_ids": sorted(set(self.state.get("amended_ids") or [])
+                                  | set(chain["amended_ids"])),
+            "tamper_events": max(int(self.state.get("tamper_events", 0) or 0),
+                                 chain["tamper_restores"]),
+        })
+        for key in ("stopped_head", "stopped_pin_ok"):
+            self.state.pop(key, None)
+        self._save()
+        if lost:
+            self._log(iteration, f"pin re-derived from git history {chain['pin'][:12]} "
+                                 f"@{anchor[:12]} (driver state was missing)")
+        trailing = [a["label"] for a in chain["pending_amends"]] + chain["pending_tamper"]
+        if trailing and announce:
+            human = [a["sha"][:12] for a in chain["pending_amends"] if a["who"] == "human"]
+            self._log(iteration, "pack commits after the last driver pin "
+                                 f"{anchor[:12]} are not adopted and are restored as tamper"
+                                 + (f" (`(human)` amendment {', '.join(human)} not adopted: "
+                                    "resume never adopts; a human runs `trioctl omnigent "
+                                    "acceptance amend --human --adopt <sha>` while the loop is "
+                                    "stopped)" if human else "")
+                                 + ": " + "; ".join(t[:120] for t in trailing[:3]))
+
     def on_resume(self) -> None:
         """Driver start over an existing pack (never the CLI controller).
 
+        - The state is reconciled with the pin chain derived from git
+          (`_reconcile_with_git`): a mismatch, a lost state that git cannot
+          re-derive unambiguously, or an ambiguous freeze -> NEEDS_HUMAN.
+          Resume never adopts an amendment: a `(human)` amend commit made
+          while the loop was stopped is restored as tamper unless a human
+          ran `trioctl omnigent acceptance amend --human` (eval-r19b
+          finding 2).
         - GOAL.md no longer hashes to the frozen MANIFEST's `goal_sha256`
-          (a reused mailbox with a new GOAL): the old checks must not judge
-          it -> NEEDS_HUMAN (eval-r19 finding 12).
-        - `(human)` amend commits made while the loop was stopped (after
-          the driver's recorded clean stop, pack intact at that stop) are
-          adopted and re-pinned instead of restored as tamper (finding 4).
+          (read from git, a reused mailbox with a new GOAL): the old checks
+          must not judge it -> NEEDS_HUMAN (eval-r19 finding 12).
         """
         ta = self.ta
-        if not (self.acc_dir / ta.FROZEN).is_file():
+        if not self._has_pack() and not self.state.get("pin"):
             return
         iteration = 0
         try:
@@ -2438,8 +2570,16 @@ class AcceptanceController:
         except Exception:  # noqa: BLE001 - logging only
             pass
         try:
-            want = ta.load_manifest(self.acc_dir).get("goal_sha256")
-        except ta.ManifestError:
+            self._reconcile_with_git(iteration)
+        except AcceptanceError as exc:
+            self._resume_error = exc if isinstance(exc, AcceptanceNeedsHuman) else \
+                AcceptanceNeedsHuman(exc.reason, exc.detail)
+            self._log(iteration, f"forced NEEDS_HUMAN ({exc.reason}): {exc.detail}")
+            return
+        try:
+            want = json.loads(_git(self.repo, "show", f"{self.state['pin_commit']}:"
+                                   f"{self.acc_rel}/{ta.MANIFEST}").stdout or "{}").get("goal_sha256")
+        except (json.JSONDecodeError, AttributeError):
             want = None
         goal = self.mailbox / "GOAL.md"
         if want and goal.is_file() and ta.file_sha256(goal) != want:
@@ -2451,77 +2591,27 @@ class AcceptanceController:
                 "restore GOAL.md")
             self._log(iteration, f"forced NEEDS_HUMAN (acceptance-goal-changed): "
                                  f"{self._resume_error.detail}")
-            return
-        if self.frozen() and not self.pin_ok():
-            self._adopt_human_amendments(iteration)
-        if "stopped_head" in self.state or "stopped_pin_ok" in self.state:
-            self.state.pop("stopped_head", None)
-            self.state.pop("stopped_pin_ok", None)
-            self._save()
-
-    def _adopt_human_amendments(self, iteration: int) -> bool:
-        labelled = self._human_labelled_since_pin()
-        if not labelled:
-            return False
-        stopped = str(self.state.get("stopped_head") or "")
-        why = None
-        commits: list[dict] = []
-        if not stopped or not self.state.get("stopped_pin_ok"):
-            why = "the driver recorded no clean stop with the pack intact"
-        elif _git(self.repo, "merge-base", "--is-ancestor", stopped, "HEAD").returncode != 0:
-            why = "the recorded stop is not an ancestor of HEAD"
-        elif _git(self.repo, "status", "--porcelain", "--", self.acc_rel).stdout.strip():
-            why = "the pack has uncommitted edits"
-        else:
-            pin_commit = self.state.get("pin_commit") or ""
-            during = _git(self.repo, "log", "--format=%H", f"{pin_commit}..{stopped}",
-                          "--", self.acc_rel).stdout.split()
-            if during:
-                why = "the pack changed while the loop was running"
-            log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s",
-                       f"{stopped}..HEAD", "--", self.acc_rel)
-            for line in log.stdout.splitlines():
-                sha, _sep, subject = line.partition("\x1f")
-                m = _AMEND_SUBJECT_RE.match(subject)
-                if not m or m.group(2) != "human":
-                    why = why or f"{sha[:12]} {subject!r} is not a `(human)` amend commit"
-                    continue
-                ids = [i.strip() for i in m.group(1).split(",")]
-                files = _git(self.repo, "show", "--format=", "--name-only", sha).stdout.split()
-                if any(not f.startswith(self.acc_rel + "/") for f in files):
-                    why = why or f"{sha[:12]} touches files outside {self.acc_rel}/"
-                diff = _git(self.repo, "show", "--format=", "-U0", sha, "--",
-                            f"{self.acc_rel}/{self.ta.AMENDMENTS}").stdout
-                added = set(re.findall(r"^\+##\s+(ACC-[0-9]{1,4})\b", diff, re.MULTILINE))
-                if [i for i in ids if i not in added]:
-                    why = why or f"{sha[:12]} has no AMENDMENTS.md record for its ids"
-                commits.append({"sha": sha, "ids": ids})
-            if not commits and why is None:
-                why = "no `(human)` amend commit after the recorded stop"
-        shas = ", ".join(c["sha"][:12] for c in labelled)
-        if why is not None:
-            self._log(iteration, f"`(human)` amendment {shas} not adopted ({why}); a human "
-                                 "amends with `trioctl omnigent acceptance amend --human` while "
-                                 "the loop is stopped")
-            return False
-        ids = sorted({i for c in commits for i in c["ids"]})
-        pin = self._repin_human(ids, [c["sha"] for c in commits], iteration)
-        self._log(iteration, f"human amendment {shas} adopted on resume (committed while the "
-                             f"loop was stopped); pin {pin[:12]}")
-        return True
 
     def close(self) -> None:
-        """Record the driver's clean stop (HEAD, pack intact?) so a human
-        amendment committed while the loop is stopped can be told from a
-        role's `(human)`-labelled commit on resume."""
-        if not self.frozen():
+        """Loop stop (clean or error): best-effort sweep of the role process
+        groups the runner started, so a background job a role left behind
+        cannot edit the pack after the driver lets go of the mailbox
+        (eval-r19b finding 2). Only runners that track their role processes
+        expose ``sweep_role_processes()``; OmnigentRunner's roles run inside
+        broker-owned sessions, not the driver's process tree, so it has none
+        (DESIGN §11)."""
+        sweep = getattr(self.runner, "sweep_role_processes", None)
+        if not callable(sweep):
             return
         try:
-            self.state["stopped_head"] = _git_head(self.repo) or ""
-            self.state["stopped_pin_ok"] = bool(self.pin_ok())
-            self._save()
-        except Exception:  # noqa: BLE001 - never mask the loop's own exit
-            pass
+            swept = sweep()
+        except Exception as exc:  # noqa: BLE001 - never mask the loop's own exit
+            _append_log(self.mailbox, f"- iter ? | loop | acceptance: role process sweep "
+                                      f"failed ({type(exc).__name__}: {exc})")
+            return
+        if swept:
+            _append_log(self.mailbox, f"- iter ? | loop | acceptance: swept {swept} role "
+                                      "process group(s) at stop")
 
     def wait(self, iteration: int, timeout: float | None = None) -> None:
         """Block until the pack is frozen; raise AcceptanceError otherwise."""
@@ -2563,48 +2653,87 @@ class AcceptanceController:
         return commits
 
     def pin_ok(self) -> bool:
-        return (self.ta.manifest_sha256(self.acc_dir) == self.state.get("pin")
-                and self.ta.file_sha256(self.acc_dir / self.ta.FROZEN)
-                == self.state.get("frozen_sha256"))
+        try:
+            return (self.ta.manifest_sha256(self.acc_dir) == self.state.get("pin")
+                    and self.ta.file_sha256(self.acc_dir / self.ta.FROZEN)
+                    == self.state.get("frozen_sha256"))
+        except OSError:  # a pack file vanished mid-read: not the pin
+            return False
 
     def restore(self, iteration: int, role: str, why: str = "tamper") -> str | None:
-        """Put the pinned pack back (driver commit) and log it."""
-        pin_commit = self.state.get("pin_commit") or ""
-        head = _git_head(self.repo) or ""
-        self.ta.restore_pack_files(self.repo, pin_commit, self.acc_rel, self.acc_dir)
-        sha = self.ta.commit_paths(
-            self.repo, [self.acc_rel],
-            f"acceptance: restore ({why} after {head[:12]})\n\n"
-            f"Acceptance-Pin: {self.state.get('pin')}\n")
-        if sha:
-            self.state["pin_commit"] = sha
-            self.state["driver_commits"] = list(self.state.get("driver_commits") or []) + [sha]
-            self._save()
-        _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance tamper restored ({role})")
-        return sha
+        """Put the pinned pack back (driver commit) and log it.
 
-    def _count_tamper(self, role: str) -> None:
+        Serialised with every other pin check (finding 4); a filesystem or
+        git failure is retried, then the loop stops (fail closed)."""
+        with self._gate_lock:
+            pin_commit = self.state.get("pin_commit") or ""
+            head = _git_head(self.repo) or ""
+            last: BaseException | None = None
+            sha = None
+            for attempt in range(3):
+                try:
+                    self.ta.restore_pack_files(self.repo, pin_commit, self.acc_rel, self.acc_dir)
+                    sha = self.ta.commit_paths(
+                        self.repo, [self.acc_rel],
+                        f"acceptance: restore ({why} after {head[:12]})\n\n"
+                        f"Acceptance-Pin: {self.state.get('pin')}\n")
+                    if self.pin_ok():
+                        last = None
+                        break
+                    last = RuntimeError("the pack still differs from the pin after the restore")
+                except (OSError, shutil.Error, RuntimeError) as exc:
+                    last = exc
+                time.sleep(0.1 * (attempt + 1))
+            if last is not None:
+                raise AcceptanceError(
+                    "acceptance-restore-failed",
+                    f"could not restore the pinned pack ({type(last).__name__}: {last}); "
+                    "the loop stops")
+            if sha:
+                self.state["pin_commit"] = sha
+                self.state["driver_commits"] = list(self.state.get("driver_commits") or []) + [sha]
+                self._save()
+            _append_log(self.mailbox,
+                        f"- iter {iteration} | loop | acceptance tamper restored ({role})")
+            return sha
+
+    def _count_tamper(self, role: str, key=None) -> None:
         """One restored tamper event; the TAMPER_ESCALATE-th of the loop
-        raises (the caller stops the loop with `status: error`)."""
-        self.breaches += 1
-        n = int(self.state.get("tamper_events", 0)) + 1
-        self.state["tamper_events"] = n
-        self._save()
+        raises (the caller stops the loop with `status: error`). *key* (the
+        detected pack state) dedupes one tamper seen by two threads."""
+        with self._gate_lock:
+            if key is not None:
+                if key in self._counted_tamper:
+                    return
+                self._counted_tamper.add(key)
+            self.breaches += 1
+            n = int(self.state.get("tamper_events", 0)) + 1
+            self.state["tamper_events"] = n
+            self._save()
         if n >= TAMPER_ESCALATE:
             raise AcceptanceError(
                 "acceptance-tamper-repeated",
                 f"acceptance/ was edited outside the freeze/amend protocol {n} times in this "
                 f"loop (last: {role}); each edit was restored, the loop stops")
 
+    def _tamper_key(self) -> tuple:
+        return (self.ta.manifest_sha256(self.acc_dir) if self.acc_dir.is_dir() else None,
+                self.ta.file_sha256(self.acc_dir / self.ta.FROZEN), _git_head(self.repo))
+
     def check_pin(self, iteration: int, role: str) -> bool:
         """True when the pack is the pinned one; else restore and count a breach."""
         if not self.frozen():
             return True
-        if self.pin_ok():
-            return True
-        self.restore(iteration, role)
-        self._count_tamper(role)
-        return False
+        with self._gate_lock:
+            try:
+                if self.pin_ok():
+                    return True
+                key = self._tamper_key()
+            except OSError:
+                key = None
+            self.restore(iteration, role)
+            self._count_tamper(role, key)
+            return False
 
     def coverage(self) -> list[str]:
         if self.tc is None:
@@ -2636,7 +2765,7 @@ class AcceptanceController:
 
     # ------------------------------------------------------------ runs
 
-    def _run(self, rev: str, ids=None) -> dict:
+    def _run(self, rev: str, ids=None, acc: Path | None = None) -> dict:
         exclude = {self.mailbox_rel}
         plan_bindings = {}
         try:
@@ -2645,8 +2774,8 @@ class AcceptanceController:
             plan_bindings = parsed.get("bindings") or {}
         except OSError:
             pass
-        return self.ta.run_pack(self.acc_dir, rev, repo=self.repo, ids=ids, exclude=exclude,
-                                plan_bindings=plan_bindings)
+        return self.ta.run_pack(acc or self.acc_dir, rev, repo=self.repo, ids=ids,
+                                exclude=exclude, plan_bindings=plan_bindings)
 
     def covered_line(self, slice_id: str, sha: str) -> str | None:
         """`ACCEPTANCE (covered): ...` for one slice-eval (None: nothing covered)."""
@@ -2732,19 +2861,26 @@ class AcceptanceController:
     # ------------------------------------------------------ amendments
 
     def process_amendments(self, iteration: int) -> dict:
-        """Validate Evaluator/human amend commits since the pin (§3.4).
+        """Validate Evaluator amend commits since the pin (§3.4).
 
         Returns ``{"accepted": [ids], "rejected": [(ids, why)],
-        "over_budget": bool, "tamper": bool}``.
+        "over_budget": bool, "tamper": bool}``. Serialised with the pin
+        checks (finding 4). Everything is judged on git objects (the pinned
+        pack at the driver's pin commit, the amended pack at HEAD).
         """
+        with self._gate_lock:
+            return self._process_amendments(iteration)
+
+    def _process_amendments(self, iteration: int) -> dict:
         out = {"accepted": [], "rejected": [], "over_budget": False, "tamper": False}
         if not self.frozen() or self.pin_ok():
             return out
         commits = self._explained_by_amendments()
         if commits is None:
+            key = self._tamper_key()
             self.restore(iteration, "evaluator")
             out["tamper"] = True
-            self._count_tamper("evaluator")
+            self._count_tamper("evaluator", key)
             return out
         labelled = [c["sha"][:12] for c in commits if c["who"] == "human"]
         if labelled:
@@ -2756,83 +2892,114 @@ class AcceptanceController:
                                  "(made while the loop runs); judged as an Evaluator amendment")
         ta = self.ta
         old_rev = self.state.get("pin_commit") or ""
-        old_dir = Path(tempfile.mkdtemp(prefix="acc-old-"))
+        head = _git_head(self.repo) or ""
+        work = Path(tempfile.mkdtemp(prefix="acc-amend-"))
         try:
-            ta.restore_pack_files(self.repo, old_rev, self.acc_rel, old_dir / "acceptance")
-            old_manifest = ta.load_manifest(old_dir / "acceptance")
-            new_manifest = ta.load_manifest(self.acc_dir)
+            return self._judge_amendment(iteration, commits, old_rev, head, work, out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _judge_amendment(self, iteration: int, commits: list[dict], old_rev: str, head: str,
+                         work: Path, out: dict) -> dict:
+        ta = self.ta
+        try:
+            old_acc = self._extract(old_rev, work / "old")
+            new_acc = self._extract(head, work / "new")
+            old_manifest = ta.load_manifest(old_acc)
+            new_manifest = ta.load_manifest(new_acc)
         except Exception as exc:  # noqa: BLE001
-            shutil.rmtree(old_dir, ignore_errors=True)
             self.restore(iteration, "evaluator", "rejected amendment")
             out["rejected"].append(([], f"unreadable amended pack ({exc})"))
             return out
         ids = sorted({i for c in commits for i in c["ids"]})
-        changed = _git(self.repo, "diff", "--name-only", f"{old_rev}..HEAD", "--",
+        changed = _git(self.repo, "diff", "--name-only", f"{old_rev}..{head}", "--",
                        self.acc_rel).stdout.split()
         changed = [c[len(self.acc_rel) + 1:] for c in changed if c.startswith(self.acc_rel + "/")]
-        problems = ta.amendment_problems(old_manifest, new_manifest, changed, ids)
-        logged = ta.amendments_logged((self.acc_dir / ta.AMENDMENTS).read_text(
-            encoding="utf-8", errors="replace")) if (self.acc_dir / ta.AMENDMENTS).is_file() else []
-        old_logged = ta.amendments_logged((old_dir / "acceptance" / ta.AMENDMENTS).read_text(
-            encoding="utf-8", errors="replace")) if (old_dir / "acceptance" / ta.AMENDMENTS).is_file() else []
-        new_records = list(logged)
-        for rec in old_logged:
-            if rec in new_records:
-                new_records.remove(rec)
-        missing = [i for i in ids if i not in new_records]
-        if missing:
-            problems.append(f"no AMENDMENTS.md record for {', '.join(missing)}")
+        old_files = [f[len(self.acc_rel) + 1:] for f in _git(
+            self.repo, "ls-tree", "-r", "--name-only", old_rev, "--",
+            self.acc_rel + "/").stdout.split()]
+        problems = ta.amendment_problems(old_manifest, new_manifest, changed, ids, old_files)
+        for c in commits:
+            problems += [f"{c['sha'][:12]}: {p}" for p in
+                         ta._amend_diff_problems(self.repo, c["sha"], self.acc_rel, c["ids"])]
+            outside = [f for f in _git(self.repo, "show", "--format=", "--name-only",
+                                       c["sha"]).stdout.split()
+                       if not f.startswith(self.acc_rel + "/")]
+            if outside:
+                problems.append(f"{c['sha'][:12]} touches files outside {self.acc_rel}/")
         used = int(self.state.get("amendments", 0))
         total = max(1, int(self.state.get("checks") or 1))
         if (used + len(ids) > MAX_AMENDMENTS
-                          or used + len(ids) > MAX_AMENDMENT_SHARE * total):
+                or used + len(ids) > MAX_AMENDMENT_SHARE * total):
             out["over_budget"] = True
             problems.append(f"amendment budget exceeded ({used} used + {len(ids)}; at most "
                             f"{MAX_AMENDMENTS} per loop and {int(MAX_AMENDMENT_SHARE * 100)}% "
                             "of the checks)")
         if not problems:
-            # Discrimination preserved: the amended checks must still FAIL at base.
+            # Discrimination preserved (eval-r19b finding 1): the WHOLE pack
+            # re-runs at base; every check that FAILed there with the pinned
+            # pack must still FAIL, and every amended behaviour/doc check
+            # must FAIL cleanly.
             base = self.state.get("base") or ""
-            covered = {c["id"]: c for c in new_manifest.get("checks") or []}
-            run_ids = [i for i in ids if covered.get(i, {}).get("kind") in ta.COVERED_KINDS]
-            if run_ids and base:
-                res = self._run(base, ids=run_ids)
-                for r in res["results"]:
-                    if r["outcome"] != "FAIL" or r.get("error"):
-                        problems.append(f"{r['id']} no longer FAILs at base ({r['outcome']})")
-        shutil.rmtree(old_dir, ignore_errors=True)
+            if not base:
+                problems.append("the pack names no base to re-check the amendment at")
+            else:
+                before = self._run(base, acc=old_acc)
+                after = self._run(base, acc=new_acc)
+                by = {r["id"]: r for r in after["results"]}
+                for r in before["results"]:
+                    if r["outcome"] == "FAIL":
+                        now = (by.get(r["id"]) or {}).get("outcome", "missing")
+                        if now != "FAIL":
+                            problems.append(f"{r['id']} no longer FAILs at base ({now})")
+                kinds = {c["id"]: c.get("kind") for c in new_manifest.get("checks") or []}
+                for cid in ids:
+                    r = by.get(cid) or {}
+                    if kinds.get(cid) in ta.COVERED_KINDS and (
+                            r.get("outcome") != "FAIL" or r.get("error")):
+                        msg = f"{cid} no longer FAILs at base ({r.get('outcome', 'missing')}" \
+                              + (", error)" if r.get("error") else ")")
+                        if not any(p.startswith(f"{cid} no longer") for p in problems):
+                            problems.append(msg)
         if problems:
             self.restore(iteration, "evaluator", "rejected amendment")
             out["rejected"].append((ids, "; ".join(problems)))
             self._log(iteration, f"amendment of {', '.join(ids) or '?'} rejected: "
                                  + "; ".join(problems)[:400])
             return out
-        pin = ta.manifest_sha256(self.acc_dir)
+        # The working tree must be HEAD's pack before FROZEN is extended.
+        ta.restore_pack_files(self.repo, head, self.acc_rel, self.acc_dir)
+        pin = ta.manifest_sha256(new_acc)
         chain = [tuple(x) for x in self.state.get("chain") or []]
         note = f"amend {', '.join(ids)}"
         chain.append((pin, note))
-        frozen = ta.read_frozen(self.acc_dir)
         text = (self.acc_dir / ta.FROZEN).read_text(encoding="utf-8", errors="replace")
         text = text.rstrip("\n") + f"\npin[{len(chain) - 1}]: {pin} {note}\n"
         (self.acc_dir / ta.FROZEN).write_text(text, encoding="utf-8")
         sha = ta.commit_paths(self.repo, [self.acc_rel],
                               f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n")
-        del frozen
+        if not sha or ta.pack_hash_at(self.repo, sha, self.acc_rel) != pin:
+            # Something changed the pack between the check and the commit.
+            self.restore(iteration, "evaluator", "rejected amendment")
+            out["rejected"].append((ids, "the pack changed while the amendment was judged"))
+            self._log(iteration, f"amendment of {', '.join(ids)} rejected: the pack changed "
+                                 "while it was judged")
+            return out
         streak = dict(self.state.get("fail_streak") or {})
         for i in ids:
             streak.pop(i, None)
         self.state.update({
-            "pin": pin, "pin_commit": sha or _git_head(self.repo) or "",
+            "pin": pin, "pin_commit": sha,
             "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN),
             "chain": [list(c) for c in chain],
             "amendments": int(self.state.get("amendments", 0)) + len(ids),
-            "driver_commits": list(self.state.get("driver_commits") or []) + ([sha] if sha else []),
+            "driver_commits": list(self.state.get("driver_commits") or []) + [sha],
             "amended_ids": sorted(set(self.state.get("amended_ids") or []) | set(ids)),
             "fail_streak": streak,
         })
         self._save()
         _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
-                          f"{pin[:16]} @{(sha or '')[:12]}")
+                          f"{pin[:16]} @{sha[:12]}")
         out["accepted"] = ids
         self._log(iteration, f"amendment of {', '.join(ids)} accepted; pin[{len(chain) - 1}] "
                              f"{pin[:12]}")

@@ -381,7 +381,7 @@ def test_drop_at_freeze_and_one_retry_with_drop_list(tmp_path):
 
 def test_author_contamination_rerun_then_error(tmp_path):
     repo, mb = make_repo(tmp_path)
-    bad = {"transcript": ["cat /work/repo/loop-hard/PLAN.md"]}
+    bad = {"transcript": [f"cat {repo}/loop/PLAN.md"]}
     fake = Fake(repo, mb, lead_script=[{}], eval_script=[{"verdict": "SHIP"}],
                 author=[bad, {}])
     assert run(mb, fake) == 0
@@ -389,6 +389,7 @@ def test_author_contamination_rerun_then_error(tmp_path):
     assert authors[1]["contaminated_retry"] and "DISCARDED" in authors[1]["prefix"]
     assert "author session contaminated" in log(mb)
     repo2, mb2 = make_repo(tmp_path / "b")
+    bad = {"transcript": [f"cat {repo2}/loop/PLAN.md"]}
     fake2 = Fake(repo2, mb2, lead_script=[{}], eval_script=[], author=[bad, bad])
 
     def lead_no_wait(iteration, context):  # the Lead never sees a freeze

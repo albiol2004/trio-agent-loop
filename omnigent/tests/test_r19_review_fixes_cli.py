@@ -132,3 +132,32 @@ def test_R9_genuine_9342a57_core_switch_off_runs_and_on_refused(tmp_path, monkey
     assert world.run_loop(spec, "--acceptance") == 3
     assert "frozen acceptance needs METRICS_API 7" in capsys.readouterr().err
     assert world.run_loop(spec) == 0
+
+
+def test_amend_human_cli_adopts_only_named_commits(tmp_path):
+    """eval-r19b finding 2: `trioctl omnigent acceptance amend --human` is the
+    one explicit adoption act; a pack commit made while the loop was stopped
+    is adopted only when named with --adopt."""
+    import json as _json
+    repo, mb = T.make_repo(tmp_path)
+    fake = T.Fake(repo, mb, lead_script=[{"features": [f"f{k}" for k in range(1, 8)]}],
+                  eval_script=[{"verdict": "NEEDS_HUMAN"}])
+    assert T.run(mb, fake) == 5
+    acc = mb / "acceptance"
+    (acc / "checks" / "acc_08.py").write_text("import sys\nsys.exit(1)\n# human\n")
+    with (acc / "AMENDMENTS.md").open("a") as fh:
+        fh.write("## ACC-08 · iter 1 · human · t\nchange: fix\n")
+    T.git(repo, "add", "-A", "--", "loop/acceptance")
+    T.git(repo, "commit", "-qm", "acceptance: amend ACC-08 (human): fix")
+    own = T.git(repo, "rev-parse", "HEAD")
+    base = [sys.executable, str(TRIOCTL), "omnigent", "acceptance", "amend", "--mailbox",
+            str(mb), "--human", "--ids", "ACC-08", "--reason", "fix the check"]
+    refused = subprocess.run(base, capture_output=True, text=True)
+    assert refused.returncode == 3 and "--adopt" in refused.stderr, refused.stderr
+    done = subprocess.run(base + ["--adopt", own[:12]], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    ta = trio_loop._load_sibling("ta_cli_r2", "trio-acceptance.py")
+    state = ta.load_state(ta.state_file(repo, mb))
+    assert own in state["human_amends"] and own in state["human_adoptions"][-1]["amends"]
+    assert f"Acceptance-Human-Amend: {own}" in T.git(repo, "log", "-1", "--format=%B")
+    assert _json.loads(_json.dumps(state))["pin"] == ta.manifest_sha256(acc)

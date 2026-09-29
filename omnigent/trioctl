@@ -1495,7 +1495,8 @@ def command_acceptance(args: argparse.Namespace) -> int:
             raise TrioctlError("only `--human` amendments are made from the CLI; the "
                                "integration Evaluator amends by commit (MAILBOX-SCHEMA.md)")
         ids = [i.strip() for i in args.ids.split(",") if i.strip()]
-        return controller.human_amend(ids, args.reason)
+        adopt = [a.strip() for a in (getattr(args, "adopt", None) or "").split(",") if a.strip()]
+        return controller.human_amend(ids, args.reason, adopt=adopt)
     raise TrioctlError(f"unknown acceptance command {sub!r}")
 
 
@@ -1586,6 +1587,9 @@ def _add_acceptance_commands(commands: Any) -> None:
             cmd.add_argument("--human", action="store_true")
             cmd.add_argument("--ids", required=True)
             cmd.add_argument("--reason", required=True)
+            cmd.add_argument("--adopt", default=None,
+                             help="comma-separated pack commits made since the last driver "
+                             "pin (reviewed) to adopt as part of this human amendment")
     validate = sub.add_parser("validate", help="the author's schema + base-run check "
                                                "of its export (run from the export)")
     validate.add_argument("--export", default=".")

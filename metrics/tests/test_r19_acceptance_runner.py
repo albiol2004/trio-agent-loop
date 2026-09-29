@@ -278,8 +278,13 @@ def test_audit_flags_paths_outside_export_and_forbidden_names(tmp_path, monkeypa
         "/usr/bin/python3 -c 'print(1)'", f"ls {tmp_path}/tmp/x", "curl http://127.0.0.1:8080/api"],
         export)
     assert clean == {"contaminated": False, "hits": []}
-    dirty = TA.audit_transcript(["cat /work/repo/loop-hard/PLAN.md"], export)
+    dirty = TA.audit_transcript(["cat /work/repo/loop-hard/PLAN.md"], export,
+                                forbidden=[Path("/work/repo")])
     assert dirty["contaminated"] and any("PLAN.md" in h for h in dirty["hits"])
+    # eval-r19b finding 5 (E10): a mailbox-named file that does not resolve
+    # inside the loop repository (a product's own REPORT.md) is not a read.
+    assert not TA.audit_transcript(["cat /work/scratch/loop-hard/PLAN.md"], export,
+                                   forbidden=[Path("/work/repo")])["contaminated"]
     # eval-r19 finding 2: only a read of the loop repository (a forbidden
     # root) contaminates; any other absolute path does not.
     assert not TA.audit_transcript(["ls /home/coder/elsewhere"], export)["contaminated"]

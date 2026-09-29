@@ -91,7 +91,25 @@ def test_valid_amend_passes_and_amend_touching_product_fails(tmp_path):
     (acc / "checks" / "acc_01.py").write_text("raise SystemExit(1)  # wider regex\n")
     (acc / "AMENDMENTS.md").write_text("## ACC-01 · iter 1 · evaluator · t\ngoal_quote: prints hello\n")
     git(repo, "commit", "-qam", "acceptance: amend ACC-01 (evaluator, iter 1): over-specified")
-    assert gate(mb).returncode == 0
+    # eval-r19b finding 3: an amend no driver pin follows is not the pack
+    # HEAD may carry ...
+    proc = gate(mb)
+    assert proc.returncode == 1 and "is not the last legitimate pin" in proc.stdout, proc.stdout
+    # ... and an Evaluator pin of a 1-check pack is over the 25% budget ...
+    amend = git(repo, "rev-parse", "HEAD")
+    pin = TA.manifest_sha256(acc)
+    frozen = (acc / "FROZEN").read_text()
+    (acc / "FROZEN").write_text(frozen + f"pin[1]: {pin} amend ACC-01\n")
+    git(repo, "commit", "-qm", f"acceptance: pin {pin[:12]} (amend ACC-01)", "-m",
+        f"Acceptance-Pin: {pin}", "--", "loop/acceptance/FROZEN")
+    proc = gate(mb)
+    assert proc.returncode == 1 and "amendment budget exceeded" in proc.stdout, proc.stdout
+    # ... while an adopted human amendment (trailer naming the amend) pins it.
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    (acc / "FROZEN").write_text(frozen + f"pin[1]: {pin} amend ACC-01 (human)\n")
+    git(repo, "commit", "-qm", f"acceptance: pin {pin[:12]} (amend ACC-01 (human))", "-m",
+        f"Acceptance-Pin: {pin}\nAcceptance-Human-Amend: {amend}", "--", "loop/acceptance/FROZEN")
+    assert gate(mb).returncode == 0, gate(mb).stdout
     (acc / "checks" / "acc_01.py").write_text("raise SystemExit(1)  # again\n")
     with (acc / "AMENDMENTS.md").open("a") as fh:
         fh.write("## ACC-01 · iter 2 · evaluator · t\n")
