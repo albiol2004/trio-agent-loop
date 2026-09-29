@@ -100,6 +100,7 @@ const PLAN_SCHEMA = {
       },
     },
     notes: { type: 'string' },
+    denials: { type: 'array', items: { type: 'string' } },
   },
   required: ['slices'],
 }
@@ -123,6 +124,7 @@ const INTEGRATE_SCHEMA = {
       },
     },
     summary: { type: 'string' },
+    denials: { type: 'array', items: { type: 'string' } },
   },
   required: ['merged', 'conflicts', 'summary'],
 }
@@ -139,6 +141,7 @@ const BUILDER_SCHEMA = {
     targeted_check: { type: 'string' },
     summary: { type: 'string' },
     outside_writes: { type: 'array', items: { type: 'string' } },
+    denials: { type: 'array', items: { type: 'string' } },
   },
   required: ['id', 'worktree', 'branch', 'base', 'head', 'commits', 'summary'],
 }
@@ -147,6 +150,12 @@ const NOT_ROUTER = 'The user-level CLAUDE.md orchestration/router policy (SCOUT/
   'trio-loop chaining, commit gates, documentation tasks) does NOT apply inside this role: do not delegate outside ' +
   'your role contract, do not start, chain or resume any Trio loop, do not run the commit gate and do not dispatch ' +
   'the Evaluator or another iteration. The trio-native workflow driver does all of that.'
+
+// Role-level permission denials are handled in-role (never worked around),
+// but the driver surfaces them in the result as `role_denials`.
+const REPORT_DENIALS = 'If the permission system denies one of your tool calls, do not work around it: record it, ' +
+  'and quote the harness\'s denial text verbatim in your final message on its own line starting with `DENIED:` ' +
+  '(in a structured output, in `denials`).'
 
 const MAILBOX_WRITES = `Write mailbox files (PLAN.md, REPORT.md, VERDICT.md, LOG.md lines) with Bash — a heredoc ` +
   `(\`cat > ${MAILBOX}/REPORT.md <<'EOF'\` … \`EOF\`) or \`printf '%s\\n' '<line>' >> ${MAILBOX}/LOG.md\` — never the ` +
@@ -258,6 +267,7 @@ function header(role, n) {
     `You are the trio-${role} for iteration ${n.iteration} of a lockstep Trio loop driven by the trio-native workflow.`,
     `Mailbox (absolute): ${MAILBOX}. Product repo: ${B.repo || '(git toplevel of the mailbox)'}.`,
     NOT_ROUTER,
+    REPORT_DENIALS,
   ]
 }
 
@@ -269,6 +279,8 @@ function leadPlanPrompt(n) {
     'pairwise-disjoint `writes:` concurrently, and then calls you again to integrate. So in this call:',
     '- Read GOAL.md, STATE.md, the last VERDICT.md and the code; update PLAN.md (with its `slices:` block).',
     '- Do NOT implement product code and do not commit in this call.',
+    '- Do NOT append to LOG.md in this call: the iteration has exactly one `| lead |` LOG line, written at the end of ' +
+    'the pass (by the last integrate call or the solo Lead call).',
     '- Return every code-changing slice of this iteration through the structured output: `id` (the PLAN.md slice id), ' +
     '`brief` (a complete, self-contained builder assignment: objective, approach, done-criteria and the targeted check ' +
     'command, boundaries), `writes`, `reads`, and `depends` (ids in this list that must be merged before it starts).',
@@ -286,6 +298,7 @@ function builderPrompt(n, s, head) {
   return [
     `You are the trio-builder for slice \`${s.id}\` of iteration ${n.iteration} of a Trio loop driven by the trio-native workflow.`,
     NOT_ROUTER,
+    REPORT_DENIALS,
     '',
     'Your cwd is an isolated git worktree created for you. Before anything else:',
     `1. Run \`pwd\`, \`git rev-parse HEAD\` and \`git status --porcelain\`.`,
@@ -402,6 +415,7 @@ function evaluatorPrompt(n, pin) {
     `You are the trio-evaluator for iteration ${n.iteration} of a lockstep Trio loop driven by the trio-native workflow.`,
     `Mailbox (absolute): ${MAILBOX}. Product repo: ${B.repo || '(git toplevel of the mailbox)'}.`,
     NOT_ROUTER,
+    REPORT_DENIALS,
     '',
     'Verify the iteration against PLAN.md acceptance criteria and write VERDICT.md per your role instructions ' +
     '(own execution first, web checks for API currency). You have no Agent tool in this workflow: do scoped ' +
@@ -418,12 +432,38 @@ function evaluatorPrompt(n, pin) {
   ].join('\n')
 }
 
+// Role denials, from a role's `DENIED:` lines, its `denials` field, or the
+// harness's denial wording quoted anywhere in its answer.
+const roleDenials = []
+
+function noteDenials(label, out) {
+  if (out === null || out === undefined) return
+  const found = []
+  const scan = text => {
+    for (const line of String(text || '').split('\n')) {
+      const m = line.match(/^\s*[-*]?\s*DENIED:\s*(.+)$/)
+      if (m) found.push(m[1].trim())
+      else if (DENIAL_RE.test(line)) found.push(line.trim())
+    }
+  }
+  if (typeof out === 'string') scan(out)
+  else if (typeof out === 'object') {
+    if (Array.isArray(out.denials)) found.push(...out.denials.map(d => String(d).trim()).filter(Boolean))
+    scan(out.summary)
+  }
+  for (const text of found) {
+    const t = text.slice(0, 400)
+    if (!roleDenials.some(d => d.label === label && d.text === t)) roleDenials.push({ label, text: t })
+  }
+}
+
 async function runAgentTwice(label, prompt, opts) {
   // A role agent that dies (null) is retried once, as trio_loop's runner
   // failure is; a second death stops the run with STATE left resumable.
   for (let tries = 1; tries <= 2; tries++) {
     spend(label)
     const out = await agent(prompt, Object.assign({ label: tries > 1 ? `${label} (retry)` : label }, opts))
+    noteDenials(label, out)
     if (out !== null && out !== undefined) return out
     log(`${label}: agent returned no result (try ${tries})`)
   }
@@ -558,6 +598,7 @@ async function leadPass(n, rec) {
         schema: BUILDER_SCHEMA,
       })
     }))
+    wave.forEach((s, i) => noteDenials(`builder ${s.id} it${n.iteration}`, results[i]))
     const dead = wave.filter((s, i) => !results[i])
     if (dead.length) return { status: 'error', reason: `builder agent failed: ${dead.map(s => s.id).join(', ')}` }
     const wrong = results.filter(r => !shaMatches(r.base, d.head))
@@ -735,6 +776,7 @@ return {
   iteration: end && end.ok ? end.iteration : (iterations.length ? iterations[iterations.length - 1].iteration : null),
   commit_shas: outcome.commit_shas || [],
   conflicts: outcome.conflicts || [],
+  role_denials: roleDenials,
   human_check: outcome.human_check || null,
   retirement_fold: outcome.retirement_fold || null,
   // A held (or failed) `end` is surfaced: the loop outcome stands, but the

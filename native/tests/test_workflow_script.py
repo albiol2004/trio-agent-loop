@@ -170,7 +170,7 @@ def test_harness_driver_owned_builder_contract() -> None:
     out = run({"verdicts": ["SHIP"]})
     leads = [c for c in out["calls"] if c["agentType"] == "trio-lead"]
     plan, integ = leads[0], leads[1]
-    assert plan["schemaKeys"] == ["slices", "notes"]
+    assert plan["schemaKeys"] == ["slices", "notes", "denials"]
     assert "You have no Agent tool" in plan["prompt"]
     assert "Agent tool option" not in plan["prompt"]
     assert "Do NOT implement product code" in plan["prompt"]
@@ -186,7 +186,7 @@ def test_harness_driver_owned_builder_contract() -> None:
     assert "from your own checkout, on your branch" in i
     assert "run `git merge --abort` and go on with the next branch" in i
     assert "the driver re-dispatches it to a new builder" in i
-    assert integ["schemaKeys"] == ["merged", "conflicts", "summary"]
+    assert integ["schemaKeys"] == ["merged", "conflicts", "summary", "denials"]
     assert "branch `worktree-app`" in i
     assert "Do not remove worktrees or delete branches: the driver does that" in i
     assert "cat > /work/product/loop/REPORT.md <<'EOF'" in i
@@ -567,3 +567,39 @@ def test_harness_denial_wording_is_held(text: str) -> None:
                "self_refuse_text": text})
     r = out["result"]
     assert r["status"] == "held" and r["held_step"] == "pin", r
+
+
+@needs_node
+def test_harness_plan_call_writes_no_lead_log_line() -> None:
+    """Probe 2 minor: one `| lead |` line per iteration (trio-metrics)."""
+    out = run({"verdicts": ["SHIP"]})
+    plan = next(c for c in out["calls"] if c["agentType"] == "trio-lead")
+    assert "Do NOT append to LOG.md in this call" in plan["prompt"]
+    assert "| lead | <summary>" not in plan["prompt"]
+
+
+@needs_node
+def test_harness_role_denials_are_surfaced() -> None:
+    """Probe 2 P7: classifier denials inside roles reached the caller only
+    through VERDICT/human_check."""
+    ev_text = ("NEEDS_HUMAN: GOAL 2 housekeeping was denied.\n"
+               "DENIED: Permission for this action was denied by the Claude "
+               "Code auto mode classifier. Reason: [Irreversible Local "
+               "Destruction].")
+    out = run({"verdicts": ["NEEDS_HUMAN"],
+               "role_text": {"evaluator": ev_text},
+               "plan_denials": ["Permission to use Bash with command rm -rf x has been denied."]})
+    r = out["result"]
+    assert r["status"] == "needs_human"
+    assert r["role_denials"] == [
+        {"label": "lead plan it1",
+         "text": "Permission to use Bash with command rm -rf x has been denied."},
+        {"label": "evaluator it1",
+         "text": "Permission for this action was denied by the Claude Code "
+                 "auto mode classifier. Reason: [Irreversible Local "
+                 "Destruction]."}]
+    for c in out["calls"]:
+        if c["agentType"] in ("trio-lead", "trio-builder", "trio-evaluator"):
+            assert "starting with `DENIED:`" in c["prompt"]
+    clean = run({"verdicts": ["SHIP"]})["result"]
+    assert clean["role_denials"] == []

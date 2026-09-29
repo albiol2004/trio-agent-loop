@@ -30,7 +30,7 @@ ln -sfn "$REL/native/agents/trio-step.md" ~/.claude/agents/trio-step.md
 
 Workflow subagents have **no Agent tool** (probe P4), so the driver owns the builders:
 
-1. **Plan** — one `trio-lead` call with a schema. The Lead updates PLAN.md and returns the iteration's code-changing slices (`id`, `brief`, `writes`, `reads`, `depends`). No product code.
+1. **Plan** — one `trio-lead` call with a schema. The Lead updates PLAN.md and returns the iteration's code-changing slices (`id`, `brief`, `writes`, `reads`, `depends`). No product code and no LOG line: each iteration has exactly one `| lead |` line (trio-metrics counts them), written at the end of the pass.
 2. **Waves** — the script groups slices deterministically: a slice joins the earliest wave after its in-plan `depends`, and only if its `writes` are disjoint from the others in that wave (a slice with no product `writes` runs alone).
 3. **Per wave:**
    - `dispatch` returns the Lead's HEAD;
@@ -66,8 +66,8 @@ Optional args:
 - `helper`: an absolute path to the helper.
 - `max_agents`, `token_budget`: opt-in caps. See **Caps**.
 
-The result is `{status, verdict, code, reason, iteration, commit_shas, conflicts, human_check, retirement_fold, held_step, end_error, iterations[], agents_used, lock, dangling_worktrees, eval_worktrees_removed}`. `iterations[]` records each pass's slices and waves. The launching session:
-- surfaces NEEDS_HUMAN (`human_check`) and BLOCKED;
+The result is `{status, verdict, code, reason, iteration, commit_shas, conflicts, role_denials, human_check, retirement_fold, held_step, end_error, iterations[], agents_used, lock, dangling_worktrees, eval_worktrees_removed}`. `iterations[]` records each pass's slices and waves. The launching session:
+- surfaces NEEDS_HUMAN (`human_check`) and BLOCKED. Like `trio_loop`, the driver commits nothing on NEEDS_HUMAN or BLOCKED (only a SHIP has a retirement commit): STATE.md, LOG.md and VERDICT.md stay uncommitted in the mailbox for the human, who resolves the check and starts a fresh run;
 - announces the SHIP `commit_shas`;
 - queues the one post-SHIP documentation task (CLAUDE.md policy).
 
@@ -106,7 +106,7 @@ Unattended or headless runs use Claude Code **auto mode** (`--permission-mode au
   - still runs `end`, unless `end` itself is denied (then `held_step: "end"`, `end_error`, `lock: "not_released"`);
   - leaves STATE.md at its resumable cursor.
 - **A step agent that declines on its own** (no harness denial text) is `status: "error"`, not `held` (probe P3). The denial is recognised only by the harness's own wording ("Permission to use <Tool> … has been denied", "Permission for this action was denied by the Claude Code auto mode classifier", "… requested permissions to use <Tool>, but you haven't granted it yet"); a step agent's own words such as "not allowed", "permission" or "denied" do not make a hold (eval-native-v0b N1).
-- **Role agents handle their own denials.** A denial inside a role agent (Lead, Evaluator, builders) is handled by that agent. If it leaves the gate unmet, the gate retries the role once and then stops with `error`, so it never loops.
+- **Role agents handle their own denials.** A denial inside a role agent (Lead, Evaluator, builders) is handled by that agent, never worked around. If it leaves the gate unmet, the gate retries the role once and then stops with `error`, so it never loops. Roles quote each denial on a `DENIED:` line of their final message (or in a schema's `denials`); the driver collects those lines, and any line in a role's answer carrying the harness's denial wording, into `role_denials: [{label, text}]` of the result (probe 2 P7: before, they reached the caller only through VERDICT and `human_check`). This is best effort: a role that neither quotes nor mentions a denial is not seen.
 
 ## Lock
 
