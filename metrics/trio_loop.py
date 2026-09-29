@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
@@ -21,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -491,10 +493,26 @@ def _invoke_runner(
         return runner.run(role, iteration, mailbox, context)
     return runner.run(role, iteration, mailbox)
 
-def _run_role(mailbox, iteration, role, runner, repo, state_path) -> bool:
-    """Run a Lead/repair role, retrying a failed gate once."""
+def _run_role(mailbox, iteration, role, runner, repo, state_path,
+              acceptance=None) -> bool:
+    """Run a Lead/repair role, retrying a failed gate once.
+
+    r19: with ``acceptance`` (the frozen-acceptance controller) the pin is
+    checked before the pass and a third gate follows the commit and LOG
+    gates (pin intact, every frozen check mapped); a refusal re-runs the
+    role once with ``acceptance_errors`` in its context.
+    """
+    context: dict = {}
     for _attempt in range(2):
-        result = _invoke_runner(runner, role, iteration, mailbox, {})
+        if acceptance is not None:
+            try:
+                acceptance.check_pin(iteration, f"before {role}")
+            except AcceptanceError:
+                pass
+            if acceptance.pending_errors:
+                context = {"acceptance_errors": list(acceptance.pending_errors)}
+                acceptance.pending_errors = []
+        result = _invoke_runner(runner, role, iteration, mailbox, context)
         if result != 0:
             raise RuntimeError(f"{role} runner failed with exit {result}")
         checks = (
@@ -502,6 +520,20 @@ def _run_role(mailbox, iteration, role, runner, repo, state_path) -> bool:
             _log_gate(mailbox, iteration, role),
         )
         failures = [note for ok, note in checks if not ok]
+        if acceptance is not None:
+            try:
+                problems = acceptance.lead_gate(iteration, role)
+            except AcceptanceError as exc:
+                _update_state(state_path, {"status": "error", "phase": "error"})
+                _append_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | gate breach after {role}: "
+                    f"acceptance {exc.reason}: {exc.detail}",
+                )
+                return False
+            if problems:
+                failures.append("acceptance: " + "; ".join(problems)[:400])
+                context = {"acceptance_errors": problems}
         if not failures:
             return True
     _update_state(state_path, {"status": "error", "phase": "error"})
@@ -1880,12 +1912,748 @@ def _open_loop_integration_context(
     return context
 
 
+# --- r19 frozen acceptance (behind the `acceptance` switch) -----------------
+# MAILBOX-SCHEMA.md "Frozen acceptance (r19)". Every hook below is reached
+# only when the caller passes ``acceptance=`` (a config dict); without it the
+# lockstep and open-loop paths are byte-identical to r17-rc.
+
+#: Default bound for the driver's wait on the author (and the Lead's
+#: `trioctl acceptance wait`).
+DEFAULT_ACCEPTANCE_WAIT_S = 900.0
+#: At most this many Evaluator amendments per loop, and this share of checks.
+MAX_AMENDMENTS = 2
+MAX_AMENDMENT_SHARE = 0.25
+#: Integration-evals a check may FAIL in a row before NEEDS_HUMAN.
+ANTI_THRASH_STREAK = 2
+_AMEND_SUBJECT_RE = re.compile(
+    r"^acceptance: amend (ACC-[0-9]{1,4}(?:\s*,\s*ACC-[0-9]{1,4})*) "
+    r"\((evaluator|human)\b[^)]*\): \S"
+)
+_ACC_STATE_LINE_RE = re.compile(r"^\s*(?:-\s+)?acceptance_pin\s*:\s*(.*)$", re.IGNORECASE)
+_FROZEN_SECTION_RE = re.compile(r"^##\s+Frozen acceptance\s*$", re.IGNORECASE | re.MULTILINE)
+CONTAMINATION_PREFIX = (
+    "YOUR PREVIOUS ATTEMPT WAS DISCARDED: its tool calls named paths outside "
+    "your workspace (or the plan/verdict of the loop). Work ONLY inside the "
+    "current directory and $TMPDIR; the repository path is intentionally "
+    "unknown to you; never look for PLAN.md, VERDICT.md, hidden packs or any "
+    "other mailbox."
+)
+
+
+def _load_sibling(name: str, filename: str):
+    path = Path(__file__).resolve().with_name(filename)
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class AcceptanceError(RuntimeError):
+    """The acceptance phase cannot continue (``status: error``)."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+def acceptance_enabled(config) -> bool:
+    return isinstance(config, dict) and bool(config.get("enabled"))
+
+
+def _write_state_line(state_path: Path, regex: re.Pattern, key: str, value: str) -> None:
+    """Set (or replace) one driver-owned STATE.md line outside STATE_RE."""
+    try:
+        lines = state_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    out: list[str] = []
+    done = False
+    for line in lines:
+        if regex.match(line):
+            if not done:
+                out.append(f"{key}: {value}")
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(f"{key}: {value}")
+    state_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def frozen_acceptance_section(text: str) -> dict | None:
+    """The integration verdict's `## Frozen acceptance` fields (telemetry)."""
+    text = _integration_verdict_text(text)
+    m = _FROZEN_SECTION_RE.search(text)
+    if m is None:
+        return None
+    fields: dict = {}
+    for line in text[m.end():].splitlines():
+        if line.startswith("## "):
+            break
+        key, sep, value = line.strip().partition(":")
+        if sep and key.strip() in ("acceptance", "disputes", "amendments"):
+            fields[key.strip()] = value.strip()[:300]
+    return fields
+
+
+class AcceptanceController:
+    """Author phase, pin, coverage, pre-runs, amendments and the SHIP gate.
+
+    Runner-agnostic: the only runner hook is ``runner.author(export,
+    context)`` (exit code or ``{exit, session, model, effort, path,
+    transcript}``). Pins live in the driver's state file outside the repo
+    (``trio-acceptance.state_file``) and in FROZEN; every mismatch the
+    amendment protocol does not explain is restored by a driver commit and
+    counted as a gate breach.
+    """
+
+    def __init__(self, mailbox: Path, repo: Path | None, runner, config: dict) -> None:
+        self.mailbox = Path(mailbox).resolve()
+        self.runner = runner
+        self.config = dict(config or {})
+        self.wait_s = float(self.config.get("wait_s") or DEFAULT_ACCEPTANCE_WAIT_S)
+        self.ta = _load_sibling("trio_acceptance", "trio-acceptance.py")
+        if self.ta is None:
+            raise AcceptanceError("acceptance-unavailable",
+                                  "metrics/trio-acceptance.py is missing (refresh metrics/ as a set)")
+        root = _git_root(Path(repo)) if repo is not None else None
+        root = root or self.ta.git_toplevel(self.mailbox)
+        if root is None:
+            raise AcceptanceError("acceptance-unavailable",
+                                  f"{self.mailbox} is not inside a git repository")
+        self.repo = Path(root).resolve()
+        self.tc = _load_sibling("trio_check_acceptance", "trio-check.py")
+        self.acc_dir = self.mailbox / self.ta.PACK_DIR
+        rel = _mailbox_rel(self.repo, self.mailbox)
+        self.mailbox_rel = rel or self.mailbox.name
+        self.acc_rel = f"{self.mailbox_rel}/{self.ta.PACK_DIR}"
+        self.state_path = self.ta.state_file(self.repo, self.mailbox)
+        self.state = self.ta.load_state(self.state_path)
+        self._thread: threading.Thread | None = None
+        self._error: AcceptanceError | None = None
+        self._lock = threading.Lock()
+        self.breaches = 0
+        self.pending_errors: list[str] = []
+        self.last_run: dict | None = None
+        self.last_pin_sha: str | None = None
+
+    # ------------------------------------------------------------ state
+
+    def _save(self) -> None:
+        with self._lock:
+            self.ta.save_state(self.state_path, self.state)
+        self._publish()
+
+    def _publish(self) -> None:
+        meta = getattr(self.runner, "driver_meta", None)
+        if isinstance(meta, dict):
+            self._set_meta("acceptance", {
+                "enabled": True,
+                "status": self.state.get("status"),
+                "pin": self.state.get("pin"),
+                "pin_commit": self.state.get("pin_commit"),
+                "state_file": str(self.state_path),
+                "checks": self.state.get("checks"),
+                "amendments": self.state.get("amendments", 0),
+            })
+
+    def _set_meta(self, key: str, value) -> None:
+        """Replace (never mutate) the runner's driver_meta: sidecar writers
+        on other threads iterate it."""
+        meta = getattr(self.runner, "driver_meta", None)
+        if isinstance(meta, dict):
+            try:
+                self.runner.driver_meta = {**meta, key: value}
+            except AttributeError:
+                pass
+
+    def frozen(self) -> bool:
+        return self.state.get("status") == "frozen" and bool(self.state.get("pin"))
+
+    def _log(self, iteration: int, text: str) -> None:
+        _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: {text}")
+
+    # ------------------------------------------------------ author phase
+
+    def start(self, iteration: int) -> None:
+        """Resume a frozen pack, or start the author in the background
+        (idempotent: a running author or a frozen pack is left alone)."""
+        if self._thread is not None:
+            return
+        if self.frozen() and (self.acc_dir / self.ta.FROZEN).is_file():
+            self._publish()
+            return
+        if (self.acc_dir / self.ta.FROZEN).is_file() and not self.state.get("pin"):
+            # Driver state lost: re-derive the pin from the committed pack.
+            head_pin = self.ta.latest_pin(self.acc_dir)
+            if head_pin and head_pin == self.ta.manifest_sha256(self.acc_dir):
+                self.state.update({
+                    "status": "frozen", "pin": head_pin,
+                    "frozen_sha256": self.ta.file_sha256(self.acc_dir / self.ta.FROZEN),
+                    "pin_commit": _git_head(self.repo) or "",
+                    "chain": [[p["sha256"], p["note"]] for p in
+                              self.ta.read_frozen(self.acc_dir).get("pins") or []],
+                    "base": self.ta.read_frozen(self.acc_dir).get("base", ""),
+                })
+                self._save()
+                self._log(iteration, f"pin re-derived from FROZEN {head_pin[:12]} "
+                                     "(driver state was missing)")
+                return
+        if not callable(getattr(self.runner, "author", None)):
+            raise AcceptanceError("acceptance-unavailable",
+                                  "the role runner has no author() hook")
+        # The base is captured now, before the Lead's first pass can commit.
+        base = _git_head(self.repo)
+        if not base:
+            raise AcceptanceError("acceptance-error", "the loop repository has no HEAD")
+        self.state.update({"status": "authoring", "started_utc": self.ta.utc_now(),
+                           "base": base})
+        self._save()
+        self._thread = threading.Thread(target=self._author_thread, args=(iteration, base),
+                                        name="acceptance-author", daemon=True)
+        self._thread.start()
+
+    def _author_thread(self, iteration: int, base: str) -> None:
+        try:
+            self._author_phase(iteration, base)
+        except AcceptanceError as exc:
+            self._error = exc
+        except Exception as exc:  # noqa: BLE001 - surfaced as status error
+            self._error = AcceptanceError("acceptance-error", f"{type(exc).__name__}: {exc}")
+        if self._error is not None:
+            self.state.update({"status": "error", "reason": self._error.reason,
+                               "detail": self._error.detail})
+            self._save()
+            self._log(iteration, f"error ({self._error.reason}): {self._error.detail}")
+
+    def _call_author(self, export: Path, context: dict) -> dict:
+        result = self.runner.author(export, context)
+        if isinstance(result, int):
+            result = {"exit": result}
+        if not isinstance(result, dict):
+            result = {"exit": 1}
+        return result
+
+    def _audit(self, export: Path, result: dict) -> dict:
+        transcript = result.get("transcript")
+        if transcript is None:
+            # No transcript: layer 1 plus a scan of the authored output.
+            texts = []
+            acc = export / self.ta.PACK_DIR
+            for path in sorted(acc.rglob("*")) if acc.is_dir() else []:
+                if path.is_file() and path.stat().st_size < 512_000:
+                    texts.append(path.read_text(encoding="utf-8", errors="replace"))
+            audit = self.ta.audit_transcript(texts, export)
+            audit["limited"] = True
+            return audit
+        audit = self.ta.audit_transcript([str(x) for x in transcript], export)
+        audit["limited"] = False
+        return audit
+
+    def _author_phase(self, iteration: int, base: str) -> None:
+        ta = self.ta
+        work = self.state_path.parent
+        export = work / "export"
+        info = ta.build_export(self.repo, base, export, self.mailbox)
+        goal = (self.mailbox / "GOAL.md").read_text(encoding="utf-8", errors="replace")
+        notes_path = self.mailbox / "ACCEPTANCE-NOTES.md"
+        notes = notes_path.read_text(encoding="utf-8", errors="replace") if notes_path.is_file() else None
+        self.state.update({"base": info["base"], "run_head": base})
+        self._save()
+        contaminated_once = False
+        retried = False
+        filtered = None
+        author: dict = {}
+        attempt = 0
+        while True:
+            attempt += 1
+            ctx = {"mailbox": str(self.mailbox), "export": str(export), "base": info["base"],
+                   "iteration": iteration, "attempt": attempt,
+                   "contaminated_retry": contaminated_once,
+                   "prefix": CONTAMINATION_PREFIX if contaminated_once else "",
+                   "dropped": list(filtered["dropped"]) if filtered and retried else [],
+                   "fatal": list(filtered["fatal"]) if filtered and retried else []}
+            result = self._call_author(export, ctx)
+            author = {k: result.get(k) for k in ("session", "model", "effort", "path")}
+            audit = self._audit(export, result)
+            self.state.setdefault("audits", []).append(
+                {"attempt": attempt, "contaminated": audit["contaminated"],
+                 "limited": audit.get("limited"), "hits": audit["hits"][:10]})
+            self._save()
+            if audit["contaminated"]:
+                self._log(iteration, "author session contaminated "
+                                     f"({'; '.join(audit['hits'][:3])}); discarded")
+                if contaminated_once:
+                    raise AcceptanceError("acceptance-contaminated",
+                                          "the re-run author session was contaminated too")
+                contaminated_once = True
+                info = ta.build_export(self.repo, base, export, self.mailbox)
+                continue
+            if result.get("exit") not in (0, None):
+                self._log(iteration, f"author session exited {result.get('exit')}")
+            acc = export / ta.PACK_DIR
+            try:
+                manifest = ta.load_manifest(acc)
+            except ta.ManifestError as exc:
+                manifest = None
+                self._log(iteration, f"author wrote no usable manifest ({exc})")
+            if manifest is not None:
+                fresh = work / "validate"
+                ta.build_export(self.repo, base, fresh, self.mailbox)
+                base_run = ta.run_pack(acc, fresh, exclude={ta.PACK_DIR, ta.INPUT_DIR},
+                                       manifest=manifest)
+                shutil.rmtree(fresh, ignore_errors=True)
+                filtered = ta.freeze_filter(manifest, base_run, goal, notes, acc)
+            else:
+                filtered = {"manifest": None, "dropped": [], "unavailable_at_base": [],
+                            "retry": True, "fatal": ["no manifest"]}
+            if filtered["retry"] and not retried:
+                retried = True
+                self._log(iteration, "author retry: "
+                          + (f"{len(filtered['dropped'])} dropped" if filtered["dropped"]
+                             else "; ".join(filtered["fatal"][:2]) or "too few checks"))
+                continue
+            break
+        self._freeze(iteration, export, filtered, author, info, goal, notes)
+
+    def _freeze(self, iteration: int, export: Path, filtered: dict, author: dict,
+                info: dict, goal: str, notes: str | None) -> None:
+        ta = self.ta
+        manifest = filtered.get("manifest")
+        if manifest is None:
+            manifest = {"acceptance_version": ta.MANIFEST_VERSION, "checks": [],
+                        "budget_s": ta.DEFAULT_BUDGET_S, "setup": [], "bindings": {}}
+        manifest = dict(manifest)
+        manifest.update({
+            "acceptance_version": ta.MANIFEST_VERSION,
+            "goal_sha256": info["goal_sha256"],
+            "notes_sha256": hashlib.sha256(notes.encode()).hexdigest() if notes else None,
+            "base": info["base"],
+            "author": {"role": "acceptance", "model": author.get("model"),
+                       "effort": author.get("effort"), "session": author.get("session"),
+                       "path": author.get("path")},
+        })
+        src = export / ta.PACK_DIR
+        if not src.is_dir():
+            src.mkdir(parents=True)
+        pin = ta.write_frozen_pack(src, self.acc_dir, manifest)
+        model = author.get("model") or "unknown-model"
+        dropped = [tuple(d) for d in filtered.get("dropped") or []]
+        extra = {}
+        if filtered.get("unavailable_at_base"):
+            extra["unavailable_at_base"] = ", ".join(filtered["unavailable_at_base"])
+        (self.acc_dir / ta.FROZEN).write_text(ta.frozen_text(
+            pin, info["base"], f"{model} {author.get('session') or '-'}", dropped,
+            [(pin, "freeze")], extra=extra), encoding="utf-8")
+        n = len(manifest["checks"])
+        sha = ta.commit_paths(self.repo, [self.acc_rel],
+                              f"acceptance: freeze {n} checks ({model})\n\n"
+                              f"Acceptance-Pin: {pin}\n")
+        sha = sha or _git_head(self.repo) or ""
+        self.state.update({
+            "status": "frozen", "pin": pin, "pin_commit": sha,
+            "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN),
+            "chain": [[pin, "freeze"]], "checks": n, "dropped": dropped,
+            "author": author, "amendments": 0, "amended_ids": [], "fail_streak": {},
+            "frozen_utc": ta.utc_now(),
+        })
+        self._save()
+        _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
+                          f"{pin[:16]} @{sha[:12]}")
+        if n == 0:
+            self._log(iteration, "empty (0 checks survived validation; coverage is vacuous)")
+        self._log(iteration, f"frozen {n} check(s) @{sha[:12]} pin {pin[:12]} "
+                             f"(dropped {len(dropped)}; author {model})")
+
+    def wait(self, iteration: int, timeout: float | None = None) -> None:
+        """Block until the pack is frozen; raise AcceptanceError otherwise."""
+        if self._thread is None and not self.frozen():
+            self.start(iteration)
+        if self._thread is not None:
+            self._thread.join(timeout=self.wait_s if timeout is None else timeout)
+            if self._thread.is_alive():
+                raise AcceptanceError("acceptance-timeout",
+                                      f"the author did not finish within {self.wait_s:g}s")
+        if self._error is not None:
+            raise self._error
+        if not self.frozen():
+            raise AcceptanceError("acceptance-error", "the pack is not frozen")
+
+    # --------------------------------------------------------- integrity
+
+    def _explained_by_amendments(self) -> list[dict] | None:
+        """Amend commits since the pin commit, or None if any other commit
+        (or an uncommitted edit) touched the pack."""
+        pin_commit = self.state.get("pin_commit") or ""
+        status = _git(self.repo, "status", "--porcelain", "--", self.acc_rel)
+        if status.returncode != 0 or status.stdout.strip():
+            return None
+        log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s", f"{pin_commit}..HEAD",
+                   "--", self.acc_rel)
+        if log.returncode != 0:
+            return None
+        commits = []
+        for line in log.stdout.splitlines():
+            sha, _sep, subject = line.partition("\x1f")
+            m = _AMEND_SUBJECT_RE.match(subject)
+            if not m:
+                return None
+            commits.append({"sha": sha, "subject": subject, "who": m.group(2),
+                            "ids": [i.strip() for i in m.group(1).split(",")]})
+        return commits
+
+    def pin_ok(self) -> bool:
+        return (self.ta.manifest_sha256(self.acc_dir) == self.state.get("pin")
+                and self.ta.file_sha256(self.acc_dir / self.ta.FROZEN)
+                == self.state.get("frozen_sha256"))
+
+    def restore(self, iteration: int, role: str, why: str = "tamper") -> str | None:
+        """Put the pinned pack back (driver commit) and log it."""
+        pin_commit = self.state.get("pin_commit") or ""
+        head = _git_head(self.repo) or ""
+        self.ta.restore_pack_files(self.repo, pin_commit, self.acc_rel, self.acc_dir)
+        sha = self.ta.commit_paths(
+            self.repo, [self.acc_rel],
+            f"acceptance: restore ({why} after {head[:12]})\n\n"
+            f"Acceptance-Pin: {self.state.get('pin')}\n")
+        if sha:
+            self.state["pin_commit"] = sha
+            self._save()
+        _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance tamper restored ({role})")
+        return sha
+
+    def check_pin(self, iteration: int, role: str) -> bool:
+        """True when the pack is the pinned one; else restore and count a breach."""
+        if not self.frozen():
+            return True
+        if self.pin_ok():
+            return True
+        self.restore(iteration, role)
+        self.breaches += 1
+        return False
+
+    def coverage(self) -> list[str]:
+        if self.tc is None:
+            return ["trio-check.py is missing; acceptance coverage cannot be checked"]
+        try:
+            return list(self.tc.coverage_refusals(self.mailbox))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            return [f"coverage check failed: {type(exc).__name__}: {exc}"]
+
+    def lead_gate(self, iteration: int, role: str) -> list[str]:
+        """Post-pass gate: freeze reached, pin intact, every check mapped.
+
+        Raises AcceptanceError when the author phase failed (no retry of the
+        Lead can fix that)."""
+        self.wait(iteration)
+        problems: list[str] = []
+        if not self.check_pin(iteration, role):
+            problems.append("acceptance/ was edited outside the freeze/amend protocol "
+                            "(restored from the pin)")
+        if role == "lead":
+            refusals = self.coverage()
+            if refusals:
+                self._log(iteration, "lead pass refused: coverage ("
+                          + "; ".join(r[:160] for r in refusals[:3]) + ")")
+                _append_log(self.mailbox, f"- iter {iteration} | loop | lead pass refused: "
+                                          "acceptance coverage")
+                problems.extend(refusals)
+        return problems
+
+    # ------------------------------------------------------------ runs
+
+    def _run(self, rev: str, ids=None) -> dict:
+        exclude = {self.mailbox_rel}
+        plan_bindings = {}
+        try:
+            parsed = _METRICS.parse_plan_acceptance(
+                (self.mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace"))
+            plan_bindings = parsed.get("bindings") or {}
+        except OSError:
+            pass
+        return self.ta.run_pack(self.acc_dir, rev, repo=self.repo, ids=ids, exclude=exclude,
+                                plan_bindings=plan_bindings)
+
+    def covered_line(self, slice_id: str, sha: str) -> str | None:
+        """`ACCEPTANCE (covered): ...` for one slice-eval (None: nothing covered)."""
+        if not self.frozen():
+            return None
+        slices = _METRICS.parse_slices_block(
+            (self.mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace")) or []
+        covers = _METRICS.plan_covers(slices)
+        lead = _METRICS.parse_plan_acceptance(
+            (self.mailbox / "PLAN.md").read_text(encoding="utf-8", errors="replace"))["lead_integration"]
+        mine = [cid for cid, owners in covers.items() if slice_id in owners]
+        if not mine:
+            return None
+        result = self._run(sha, ids=mine)
+        parts = []
+        for res in result["results"]:
+            owners = covers.get(res["id"], [])
+            tag = "sole-cover" if owners == [slice_id] and res["id"] not in lead else "shared"
+            excerpt = ""
+            if res["outcome"] != "PASS":
+                excerpt = " " + " ".join((res.get("reason") or "").split())[:120]
+            parts.append(f"{res['id']} {res['outcome']}{excerpt} [{tag}]")
+        return "ACCEPTANCE (covered): " + " · ".join(parts)
+
+    def integration_context(self, sha: str, iteration: int) -> dict:
+        """Driver pre-run of the whole pack at the pinned sha (§6.1 step 5)."""
+        self.wait(iteration)
+        if not self.check_pin(iteration, "integration-eval"):
+            _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: pin restored "
+                                      "before the integration-eval")
+        result = self._run(sha)
+        self.last_run = result
+        self.last_pin_sha = sha
+        if self.state.get("last_prerun_sha") != sha:
+            # A resumed evaluation of the same pin is not a second FAIL.
+            streak = dict(self.state.get("fail_streak") or {})
+            for res in result["results"]:
+                if res["outcome"] == "FAIL":
+                    streak[res["id"]] = int(streak.get(res["id"], 0)) + 1
+                else:
+                    streak.pop(res["id"], None)
+            self.state["fail_streak"] = streak
+            self.state["last_prerun_sha"] = sha
+            self._save()
+        self._log(iteration, f"integration pre-run @{sha[:12]}: {self.ta.summary_line(result)}"
+                             f" · unavailable={result['unavailable']}")
+        frozen = self.ta.read_frozen(self.acc_dir)
+        lines = [f"FROZEN ACCEPTANCE @{sha[:12]}: {result['passed']}/{result['total']} PASS "
+                 f"(manifest {self.state.get('pin', '')[:12]}; sandbox {result['sandbox']})"]
+        for res in result["results"]:
+            line = f"- {res['id']} {res['outcome']}"
+            if res.get("reason"):
+                line += f" ({' '.join(str(res['reason']).split())[:160]})"
+            lines.append(line)
+        chain = "; ".join(f"pin[{p['n']}] {p['sha256'][:12]} {p['note']}"
+                          for p in frozen.get("pins") or [])
+        lines.append(f"pin chain: {chain or 'none'}")
+        disputes = self.disputes()
+        lines.append("disputes: " + ("; ".join(disputes) if disputes else "none"))
+        author_md = self.acc_dir / self.ta.AUTHOR_NOTES
+        if author_md.is_file():
+            lines.append(f"author inventory (drops, live-only, uncovered GOAL sentences): {author_md}")
+        if frozen.get("dropped") and frozen.get("dropped") != "none":
+            lines.append(f"dropped at freeze: {frozen['dropped']}")
+        return {"text": "\n".join(lines), "passed": result["passed"], "total": result["total"],
+                "failed": result["failed"], "unavailable": result["unavailable"],
+                "amendments_left": self.amendments_left()}
+
+    def disputes(self) -> list[str]:
+        try:
+            text = (self.mailbox / "REPORT.md").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        return [ln.strip()[len("ACCEPTANCE-DISPUTE:"):].strip()[:200]
+                for ln in text.splitlines() if ln.strip().startswith("ACCEPTANCE-DISPUTE:")]
+
+    def amendments_left(self) -> int:
+        n = int(self.state.get("amendments", 0))
+        total = max(1, int(self.state.get("checks") or 0))
+        share_cap = int(MAX_AMENDMENT_SHARE * total)
+        return max(0, min(MAX_AMENDMENTS, share_cap) - n) if total else 0
+
+    # ------------------------------------------------------ amendments
+
+    def process_amendments(self, iteration: int) -> dict:
+        """Validate Evaluator/human amend commits since the pin (§3.4).
+
+        Returns ``{"accepted": [ids], "rejected": [(ids, why)],
+        "over_budget": bool, "tamper": bool}``.
+        """
+        out = {"accepted": [], "rejected": [], "over_budget": False, "tamper": False}
+        if not self.frozen() or self.pin_ok():
+            return out
+        commits = self._explained_by_amendments()
+        if commits is None:
+            self.restore(iteration, "evaluator")
+            self.breaches += 1
+            out["tamper"] = True
+            return out
+        ta = self.ta
+        old_rev = self.state.get("pin_commit") or ""
+        old_dir = Path(tempfile.mkdtemp(prefix="acc-old-"))
+        try:
+            ta.restore_pack_files(self.repo, old_rev, self.acc_rel, old_dir / "acceptance")
+            old_manifest = ta.load_manifest(old_dir / "acceptance")
+            new_manifest = ta.load_manifest(self.acc_dir)
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(old_dir, ignore_errors=True)
+            self.restore(iteration, "evaluator", "rejected amendment")
+            out["rejected"].append(([], f"unreadable amended pack ({exc})"))
+            return out
+        ids = sorted({i for c in commits for i in c["ids"]})
+        changed = _git(self.repo, "diff", "--name-only", f"{old_rev}..HEAD", "--",
+                       self.acc_rel).stdout.split()
+        changed = [c[len(self.acc_rel) + 1:] for c in changed if c.startswith(self.acc_rel + "/")]
+        problems = ta.amendment_problems(old_manifest, new_manifest, changed, ids)
+        human = all(c["who"] == "human" for c in commits)
+        logged = ta.amendments_logged((self.acc_dir / ta.AMENDMENTS).read_text(
+            encoding="utf-8", errors="replace")) if (self.acc_dir / ta.AMENDMENTS).is_file() else []
+        old_logged = ta.amendments_logged((old_dir / "acceptance" / ta.AMENDMENTS).read_text(
+            encoding="utf-8", errors="replace")) if (old_dir / "acceptance" / ta.AMENDMENTS).is_file() else []
+        new_records = list(logged)
+        for rec in old_logged:
+            if rec in new_records:
+                new_records.remove(rec)
+        missing = [i for i in ids if i not in new_records]
+        if missing:
+            problems.append(f"no AMENDMENTS.md record for {', '.join(missing)}")
+        if human:
+            problems = [p for p in problems if "record" in p]  # humans may change anything
+        used = int(self.state.get("amendments", 0))
+        total = max(1, int(self.state.get("checks") or 1))
+        if not human and (used + len(ids) > MAX_AMENDMENTS
+                          or used + len(ids) > MAX_AMENDMENT_SHARE * total):
+            out["over_budget"] = True
+            problems.append(f"amendment budget exceeded ({used} used + {len(ids)}; at most "
+                            f"{MAX_AMENDMENTS} per loop and {int(MAX_AMENDMENT_SHARE * 100)}% "
+                            "of the checks)")
+        if not problems and not human:
+            # Discrimination preserved: the amended checks must still FAIL at base.
+            base = self.state.get("base") or ""
+            covered = {c["id"]: c for c in new_manifest.get("checks") or []}
+            run_ids = [i for i in ids if covered.get(i, {}).get("kind") in ta.COVERED_KINDS]
+            if run_ids and base:
+                res = self._run(base, ids=run_ids)
+                for r in res["results"]:
+                    if r["outcome"] != "FAIL" or r.get("error"):
+                        problems.append(f"{r['id']} no longer FAILs at base ({r['outcome']})")
+        shutil.rmtree(old_dir, ignore_errors=True)
+        if problems:
+            self.restore(iteration, "evaluator", "rejected amendment")
+            out["rejected"].append((ids, "; ".join(problems)))
+            self._log(iteration, f"amendment of {', '.join(ids) or '?'} rejected: "
+                                 + "; ".join(problems)[:400])
+            return out
+        pin = ta.manifest_sha256(self.acc_dir)
+        chain = [tuple(x) for x in self.state.get("chain") or []]
+        note = f"amend {', '.join(ids)}" + (" (human)" if human else "")
+        chain.append((pin, note))
+        frozen = ta.read_frozen(self.acc_dir)
+        text = (self.acc_dir / ta.FROZEN).read_text(encoding="utf-8", errors="replace")
+        text = text.rstrip("\n") + f"\npin[{len(chain) - 1}]: {pin} {note}\n"
+        (self.acc_dir / ta.FROZEN).write_text(text, encoding="utf-8")
+        sha = ta.commit_paths(self.repo, [self.acc_rel],
+                              f"acceptance: pin {pin[:12]} ({note})\n\nAcceptance-Pin: {pin}\n")
+        del frozen
+        streak = dict(self.state.get("fail_streak") or {})
+        for i in ids:
+            streak.pop(i, None)
+        self.state.update({
+            "pin": pin, "pin_commit": sha or _git_head(self.repo) or "",
+            "frozen_sha256": ta.file_sha256(self.acc_dir / ta.FROZEN),
+            "chain": [list(c) for c in chain],
+            "amendments": int(self.state.get("amendments", 0)) + (0 if human else len(ids)),
+            "amended_ids": sorted(set(self.state.get("amended_ids") or []) | set(ids)),
+            "fail_streak": streak,
+        })
+        self._save()
+        _write_state_line(self.mailbox / "STATE.md", _ACC_STATE_LINE_RE, "acceptance_pin",
+                          f"{pin[:16]} @{(sha or '')[:12]}")
+        out["accepted"] = ids
+        self._log(iteration, f"amendment of {', '.join(ids)} accepted; pin[{len(chain) - 1}] "
+                             f"{pin[:12]}")
+        return out
+
+    # ------------------------------------------------------- verdicts
+
+    def review_verdict(self, verdict: str, scope, iteration: int, evaluated: str,
+                       state_path: Path) -> tuple[str, object, int | None]:
+        """Amendments, anti-thrash, UNAVAILABLE and the SHIP gate for one
+        whole-goal verdict. Returns (verdict, scope, terminal code | None)."""
+        text = ""
+        try:
+            text = (self.mailbox / "VERDICT.md").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        section = frozen_acceptance_section(text)
+        meta = getattr(self.runner, "driver_meta", None)
+        if isinstance(meta, dict) and section is not None:
+            seen = dict(meta.get("acceptance_verdicts") or {})
+            seen[str(iteration)] = section
+            self._set_meta("acceptance_verdicts", seen)
+        amend = self.process_amendments(iteration)
+        if amend["over_budget"]:
+            return self._needs_human(state_path, iteration, "acceptance-amendments",
+                                     "amendment budget exceeded: " +
+                                     "; ".join(w for _ids, w in amend["rejected"])[:300])
+        last = self.last_run or {}
+        if verdict in ("ITERATE", "SHIP"):
+            streak = self.state.get("fail_streak") or {}
+            thrash = sorted(i for i, n in streak.items()
+                            if int(n) >= ANTI_THRASH_STREAK and i not in amend["accepted"])
+            if thrash:
+                return self._needs_human(
+                    state_path, iteration, "acceptance-thrash",
+                    f"{', '.join(thrash)} failed {ANTI_THRASH_STREAK} consecutive "
+                    "integration-evals with no accepted amendment")
+        if last and verdict == "ITERATE" and not last.get("failed") and last.get("unavailable"):
+            self._log(iteration, "acceptance-unavailable-iterate (an ITERATE whose frozen "
+                                 "pre-run had only UNAVAILABLE non-passes)")
+        if last:
+            self._log(iteration, f"unavailable={last.get('unavailable', 0)}")
+        if verdict != "SHIP":
+            return verdict, scope, None
+        sha = evaluated or _git_head(self.repo) or ""
+        result = self._run(sha)
+        self.last_run = result
+        if result["failed"]:
+            bad = [f"{r['id']} {r['outcome']} ({r.get('reason') or ''})".strip()
+                   for r in result["results"] if r["outcome"] == "FAIL"]
+            self.pending_errors = [
+                "The driver refused the SHIP: the frozen acceptance checks fail at "
+                f"{sha[:12]}: " + "; ".join(bad)[:600]]
+            self._log(iteration, f"ship_unaccepted (acceptance): {self.ta.summary_line(result)}")
+            return "ITERATE", None, None
+        if result["unavailable"]:
+            return self._needs_human(
+                state_path, iteration, "acceptance-unavailable",
+                "SHIP refused: UNAVAILABLE frozen checks need a human: " +
+                ", ".join(r["id"] for r in result["results"] if r["outcome"] == "UNAVAILABLE"))
+        self._log(iteration, f"SHIP gate: {result['passed']}/{result['total']} PASS @{sha[:12]}")
+        return verdict, scope, None
+
+    def _needs_human(self, state_path: Path, iteration: int, phase: str,
+                     detail: str) -> tuple[str, object, int]:
+        _update_state(state_path, {"status": "needs_human", "phase": phase})
+        self._log(iteration, f"forced NEEDS_HUMAN ({phase}): {detail}")
+        return "NEEDS_HUMAN", None, 5
+
+
+def _acceptance_stop(mailbox: Path, state_path: Path, runner, iteration: int,
+                     exc: AcceptanceError, *, open_loop: bool = False) -> int:
+    """`status: error` for an acceptance phase that cannot continue."""
+    updates = {"status": "error"} if open_loop else {"status": "error", "phase": "error"}
+    _update_state(state_path, updates)
+    _append_log(mailbox, f"- iter {iteration} | loop | acceptance stopped the loop "
+                         f"({exc.reason}): {exc.detail}")
+    if not open_loop:
+        _write_driver_state(mailbox, runner, iteration, "error")
+    return 3
+
+
+def make_acceptance(mailbox: Path, repo: Path | None, runner, config) -> AcceptanceController | None:
+    """The controller when the switch is on, else None (byte-identical)."""
+    if not acceptance_enabled(config):
+        return None
+    return AcceptanceController(mailbox, repo, runner, config)
+
+
 def _run_lockstep(
     mailbox: Path,
     max_iterations: int,
     runner: RoleRunner,
     *,
     repo: Path | None = None,
+    acceptance: dict | None = None,
 ) -> int:
     """Run the durable Lead/repair -> Evaluator state machine.
 
@@ -1905,6 +2673,9 @@ def _run_lockstep(
             )
         state = _read_state(state_path)
         repair_path = mailbox / ".repairs"
+        # r19: None unless the acceptance switch is on (then byte-identical
+        # paths below gain the frozen-acceptance hooks).
+        acc = make_acceptance(mailbox, repo, runner, acceptance)
         _write_driver_state(
             mailbox,
             runner,
@@ -1946,6 +2717,13 @@ def _run_lockstep(
                 context = _lockstep_eval_context(
                     mailbox, repo, iteration, state, state_path
                 )
+                if acc is not None:
+                    try:
+                        context["acceptance"] = acc.integration_context(
+                            context["pinned_sha"], iteration
+                        )
+                    except AcceptanceError as exc:
+                        return _acceptance_stop(mailbox, state_path, runner, iteration, exc)
                 # Skip Evaluator only when the artifact names this
                 # attempt and pin; leftover same-iteration SHIP is not.
                 if not _fresh_evaluator_artifact(
@@ -1973,6 +2751,17 @@ def _run_lockstep(
                     )
                     _write_driver_state(mailbox, runner, iteration, "error")
                     return 3
+                if acc is not None:
+                    verdict, scope, forced = acc.review_verdict(
+                        verdict, scope, iteration,
+                        _read_state(state_path)["evaluated_sha"], state_path,
+                    )
+                    if forced is not None:
+                        _write_driver_state(
+                            mailbox, runner, iteration,
+                            _read_state(state_path)["phase"].strip(),
+                        )
+                        return forced
                 code = _apply_verdict(
                     mailbox,
                     state_path,
@@ -2014,8 +2803,17 @@ def _run_lockstep(
                 },
             )
             _write_driver_state(mailbox, runner, iteration, f"{role}-running")
+            role_extra: dict = {}
+            if acc is not None:
+                # r19: the author starts with the first Lead turn and runs
+                # alongside it; builders stay gated until the freeze.
+                try:
+                    acc.start(iteration)
+                except AcceptanceError as exc:
+                    return _acceptance_stop(mailbox, state_path, runner, iteration, exc)
+                role_extra["acceptance"] = acc
             if not _run_role(
-                mailbox, iteration, role, runner, repo, state_path
+                mailbox, iteration, role, runner, repo, state_path, **role_extra
             ):
                 state = _read_state(state_path)
                 _write_driver_state(
@@ -2045,8 +2843,13 @@ def run_loop(
     slice_eval_concurrency: int = 1,
     slice_eval_drain_seconds: float | None = None,
     land=None,
+    acceptance: dict | None = None,
 ) -> int:
     """Dispatch to open-loop or lockstep (api: engine entry points).
+
+    ``acceptance`` (r19; None or ``{"enabled": False}`` = unchanged) turns
+    on frozen acceptance in either mode: ``{"enabled": True, "wait_s":
+    <author bound>}``. The runner must then implement ``author()``.
 
     ``land`` (r16 root-free open-loop only; ignored by lockstep) is passed
     through to `run_open_loop`.
@@ -2067,6 +2870,9 @@ def run_loop(
     mailbox_path = Path(mailbox).resolve()
     has_queue = (mailbox_path / "QUEUE.md").is_file()
     if mode == "lockstep" or (mode == "auto" and not has_queue):
+        if acceptance_enabled(acceptance):
+            return _run_lockstep(mailbox, max_iterations, runner, repo=repo,
+                                 acceptance=acceptance)
         return _run_lockstep(mailbox, max_iterations, runner, repo=repo)
     if not has_queue:
         print(
@@ -2082,6 +2888,8 @@ def run_loop(
         extra["slice_eval_drain_seconds"] = slice_eval_drain_seconds
     if land is not None:
         extra["land"] = land
+    if acceptance_enabled(acceptance):
+        extra["acceptance"] = acceptance
     return run_open_loop(
         mailbox,
         max_iterations,
@@ -2543,6 +3351,7 @@ def _lead_thread_body(
     gate_held_logged: set | None = None,
     gate_held_lock: threading.Lock | None = None,
     empty_passes: dict | None = None,
+    acceptance=None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
@@ -2567,13 +3376,16 @@ def _lead_thread_body(
     # the integration-eval forever).
     counter = empty_passes if empty_passes is not None else {}
     counter.setdefault("n", 0)
+    # r19: consecutive acceptance-refused passes (tamper or coverage).
+    acceptance_refused = 0
+    force_next = False
     try:
         first = True
         while True:
             if stop_event.is_set():
                 result_holder["outcome"] = "stopped"
                 return
-            if not (first and force_first_pass):
+            if not (first and force_first_pass) and not force_next:
                 slice_ids = _read_plan_slice_ids(mailbox)
                 queue = _read_queue(mailbox)
                 retired_ids = _gate_retired_ids(queue)
@@ -2590,6 +3402,7 @@ def _lead_thread_body(
                     result_holder["outcome"] = "done"
                     return
             first = False
+            force_next = False
             state = _read_state(state_path)
             iteration = _number(state["iteration"]) + 1
             if iteration > max_iterations:
@@ -2609,6 +3422,11 @@ def _lead_thread_body(
             queue_errors = _queue_fault_errors(_read_queue(mailbox))
             if queue_errors:
                 context["queue_errors"] = queue_errors
+            if acceptance is not None:
+                acceptance.check_pin(iteration, "before lead")
+                if acceptance.pending_errors:
+                    context["acceptance_errors"] = list(acceptance.pending_errors)
+                    acceptance.pending_errors = []
             snapshot_before = _lead_pass_snapshot(mailbox, repo)
             result = _invoke_runner(lead_runner, "lead", iteration, mailbox, context)
             if result != 0:
@@ -2635,6 +3453,25 @@ def _lead_thread_body(
             _update_state(
                 state_path, {"iteration": str(iteration), "status": "running"}
             )
+            if acceptance is not None:
+                # r19: pin intact and every frozen check mapped, else the
+                # pass is refused and re-run once with the refusal text.
+                problems = acceptance.lead_gate(iteration, "lead")
+                if problems:
+                    acceptance_refused += 1
+                    if acceptance_refused >= 2:
+                        _update_state(state_path, {"status": "error"})
+                        _append_log(
+                            mailbox,
+                            f"- iter {iteration} | loop | gate breach after lead: "
+                            "acceptance: " + "; ".join(problems)[:400],
+                        )
+                        result_holder["outcome"] = "acceptance-refused"
+                        return
+                    acceptance.pending_errors = list(problems)
+                    force_next = True
+                    continue
+                acceptance_refused = 0
     except BaseException as exc:  # noqa: BLE001 - propagated to the poll loop
         result_holder["error"] = exc
     finally:
@@ -2765,6 +3602,7 @@ def run_open_loop(
     slice_eval_concurrency: int = 1,
     slice_eval_drain_seconds: float | None = None,
     land=None,
+    acceptance: dict | None = None,
 ) -> int:
     """Run the open-loop Lead+Evaluator state machine against a QUEUE.md
     mailbox: one stdlib Lead thread plus an Evaluator poll loop on the
@@ -2942,6 +3780,8 @@ def run_open_loop(
             )
         _read_state(state_path)
         started_at = _iso_now()
+        # r19: None unless the acceptance switch is on.
+        acc = make_acceptance(mailbox, repo, lead_runner, acceptance)
 
         # The Lead thread writes the sidecars too: with concurrent evals
         # snapshot+write happen under one lock and the last-written
@@ -3095,6 +3935,7 @@ def run_open_loop(
                     gate_held_lock,
                     lead_empty_passes,
                 ),
+                kwargs={"acceptance": acc} if acc is not None else {},
                 daemon=True,
             )
             thread.start()
@@ -3121,6 +3962,14 @@ def run_open_loop(
                 return finish(code)
             lead_result: dict = {"finished": True, "outcome": "done"}
         else:
+            if acc is not None:
+                # r19: the author runs alongside the first Lead pass; the
+                # Lead cannot dispatch builders until the freeze.
+                try:
+                    acc.start(current_iteration() + 1)
+                except AcceptanceError as exc:
+                    return finish(_acceptance_stop(mailbox, state_path, lead_runner,
+                                                   current_iteration(), exc, open_loop=True))
             write_sidecar("lead", current_iteration(), True, True)
             # First-ever Lead spawn of the run always runs a pass: on a fresh
             # mailbox PLAN.md is empty/missing, so the "all slices retired"
@@ -3303,6 +4152,13 @@ def run_open_loop(
                     "sha": sha,
                     "kind": "slice-eval",
                 }
+                if acc is not None:
+                    # r19: pin check before every slice-eval, plus the
+                    # slice's covered checks run mechanically at its sha.
+                    acc.check_pin(current_iteration(), "slice-eval")
+                    covered = acc.covered_line(slice_id, sha)
+                    if covered:
+                        context["acceptance_covered"] = covered
                 entry_repo = str(entry.get("repo") or "").strip()
                 if entry_repo and entry_repo != "home":
                     # r15: the sha is a commit of this declared repo.
@@ -3377,6 +4233,9 @@ def run_open_loop(
                     # The Lead thread already set status: error and logged
                     # the failure itself (open-loop Lead-pass output
                     # verification) after 3 consecutive no-op passes.
+                    return finish(3)
+                if lead_result.get("outcome") == "acceptance-refused":
+                    # r19: second refused pass; status: error already set.
                     return finish(3)
                 # outcome == "done": re-check with fresh data before
                 # trusting it -- a slice-eval just above may have opened a
@@ -3453,6 +4312,16 @@ def run_open_loop(
                     context = _open_loop_integration_context(
                         mailbox, repo, iteration_now, state_path
                     )
+                    if acc is not None:
+                        try:
+                            context["acceptance"] = acc.integration_context(
+                                context["pinned_sha"] or _git_head(_git_root(repo) or mailbox) or "HEAD",
+                                iteration_now,
+                            )
+                        except AcceptanceError as exc:
+                            return finish(_acceptance_stop(
+                                mailbox, state_path, lead_runner, iteration_now, exc,
+                                open_loop=True))
                     integration_attempts = 0
                     while True:
                         verdict_snapshot = (
@@ -3516,6 +4385,13 @@ def run_open_loop(
                             "integration verdict",
                         )
                         return finish(3)
+                    if acc is not None:
+                        verdict, scope, forced = acc.review_verdict(
+                            verdict, scope, iteration_now, context["pinned_sha"], state_path
+                        )
+                        if forced is not None:
+                            _write_state_verdict(state_path, verdict)
+                            return finish(forced)
                     _write_state_verdict(state_path, verdict)
                     code = _apply_verdict(
                         mailbox,
@@ -3679,6 +4555,13 @@ def main(argv: list[str] | None = None) -> int:
         f"slice-evals (default: ${SLICE_EVAL_DRAIN_ENV}, else "
         "min(role timeout, 120))",
     )
+    acc_group = run.add_mutually_exclusive_group()
+    acc_group.add_argument(
+        "--acceptance", dest="acceptance", action="store_true", default=None,
+        help="r19 frozen acceptance on (default: $TRIO_ACCEPTANCE, else off); "
+        "needs a runner with an author() hook",
+    )
+    acc_group.add_argument("--no-acceptance", dest="acceptance", action="store_false")
     mode_group = run.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--open-loop",
@@ -3698,6 +4581,10 @@ def main(argv: list[str] | None = None) -> int:
         else _load_omnigent_runner()(repo=repo)
     )
     mode = "open-loop" if args.open_loop else "lockstep" if args.lockstep else "auto"
+    enabled = args.acceptance
+    if enabled is None:
+        enabled = os.environ.get("TRIO_ACCEPTANCE", "").strip().lower() in ("1", "true", "on", "yes")
+    extra = {"acceptance": {"enabled": True}} if enabled else {}
     return run_loop(
         args.mailbox,
         args.max_iterations,
@@ -3707,6 +4594,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=mode,
         slice_eval_concurrency=args.slice_eval_concurrency,
         slice_eval_drain_seconds=args.slice_eval_drain_seconds,
+        **extra,
     )
 
 if __name__ == "__main__":

@@ -995,6 +995,112 @@ def write_frozen_pack(src_acc: Path, dst_acc: Path, manifest: dict[str, Any]) ->
     return manifest_sha256(dst_acc)
 
 
+# ------------------------------------------------------- driver commits
+
+
+def _git_path(top: Path, name: str) -> Path:
+    raw = _git(top, "rev-parse", "--git-path", name).stdout.strip()
+    path = Path(raw)
+    return path if path.is_absolute() else (top / path)
+
+
+def commit_paths(repo: Path, rels: list[str], message: str,
+                 lock_timeout: float = 120.0) -> str | None:
+    """Commit exactly *rels* (repo-relative; additions, edits and deletions)
+    on HEAD as the driver, under git's own index.lock.
+
+    The commit's tree is HEAD's tree plus the working-tree state of *rels*
+    only -- never anything else the Lead has staged -- and the real index
+    gets the same entries, so a concurrent `git add -A && git commit` in
+    the same worktree can neither sweep the pack into its own commit nor
+    drop it. Another git process holding the lock is waited for (bounded).
+    Returns the new commit sha, or None when *rels* are unchanged.
+    """
+    top = git_toplevel(repo) or Path(repo).resolve()
+    index = _git_path(top, "index")
+    lock = index.with_name(index.name + ".lock")
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{lock} stayed locked for {lock_timeout:g}s")
+            time.sleep(0.2)
+    tmp_head = index.with_name(f"trio-acceptance-head.{os.getpid()}")
+    tmp_real = index.with_name(f"trio-acceptance-real.{os.getpid()}")
+    try:
+        old = _git(top, "rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
+        env_head = dict(os.environ, GIT_INDEX_FILE=str(tmp_head))
+        if old:
+            _git(top, "read-tree", old, env=env_head)
+        _git(top, "add", "-f", "-A", "--", *rels, env=env_head)
+        tree = _git(top, "write-tree", env=env_head).stdout.strip()
+        if old and tree == _git(top, "rev-parse", f"{old}^{{tree}}").stdout.strip():
+            os.close(fd)
+            fd = -1
+            lock.unlink(missing_ok=True)
+            return None
+        args = ["commit-tree", tree, "-F", "-"] + (["-p", old] if old else [])
+        new = subprocess.run(["git", "-C", str(top), *args], input=message,
+                             capture_output=True, text=True)
+        if new.returncode != 0:
+            raise RuntimeError(f"git commit-tree: {new.stderr.strip()[-300:]}")
+        sha = new.stdout.strip()
+        subject = message.splitlines()[0] if message else "acceptance"
+        update = ["update-ref", "-m", f"commit: {subject}", "HEAD", sha]
+        if old:
+            update.append(old)
+        _git(top, *update)
+        if index.exists():
+            shutil.copy2(index, tmp_real)
+        env_real = dict(os.environ, GIT_INDEX_FILE=str(tmp_real))
+        if not index.exists():
+            _git(top, "read-tree", sha, env=env_real)
+        _git(top, "add", "-f", "-A", "--", *rels, env=env_real)
+        data = tmp_real.read_bytes()
+        os.write(fd, data)
+        os.close(fd)
+        fd = -1
+        os.replace(lock, index)
+        return sha
+    finally:
+        if fd != -1:
+            os.close(fd)
+            lock.unlink(missing_ok=True)
+        tmp_head.unlink(missing_ok=True)
+        tmp_real.unlink(missing_ok=True)
+
+
+def restore_pack_files(repo: Path, rev: str, acc_rel: str, acc_dir: Path) -> None:
+    """Replace the working-tree pack with *acc_rel* as committed in *rev*."""
+    top = git_toplevel(repo) or Path(repo).resolve()
+    stage = Path(tempfile.mkdtemp(prefix="trio-acceptance-restore-"))
+    try:
+        archive = subprocess.Popen(["git", "-C", str(top), "archive", "--format=tar", rev,
+                                    "--", acc_rel], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        tar = subprocess.run(["tar", "-x", "-C", str(stage)], stdin=archive.stdout,
+                             capture_output=True)
+        archive.stdout.close()  # type: ignore[union-attr]
+        if archive.wait() != 0 or tar.returncode != 0:
+            raise RuntimeError(f"cannot read {acc_rel} at {rev[:12]}")
+        acc_dir = Path(acc_dir)
+        if acc_dir.exists():
+            shutil.rmtree(acc_dir)
+        shutil.copytree(stage / acc_rel, acc_dir, symlinks=True)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 # ------------------------------------------------------------------ CLI
 
 
