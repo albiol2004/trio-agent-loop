@@ -37,6 +37,11 @@ coordinator.
    them by calling `sys_session_create(config_path=...)` once for each:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
+   - `omnigent/trio-omnigent-roles/acceptance` (r19 acceptance author,
+     registry key `trio-omnigent-acceptance`; its model is templated from
+     the evaluator's, so it runs on the same tier; needed only while
+     `[acceptance] enabled`, but register it with the others so switching
+     it on needs no second registration)
    Create them idle and write each returned `agent_id` and
    `bootstrap_conversation_id` to the registry JSON, keyed by the exact role
    name, and write the exact `_profile` marker above. These idle sessions are
@@ -45,7 +50,9 @@ coordinator.
    `sys_session_close` on them. They MUST keep titles WITHOUT the
    `trioctl <mailbox.name> ` prefix (see step 2), so the step 8 prune
    backstop never matches them; never close or prune an anchor session.
-4. Require both exact names in the registry. Never choose by partial name.
+4. Require both exact names in the registry (and
+   `trio-omnigent-acceptance` when the acceptance switch is on; the doctor
+   checks it only then). Never choose by partial name.
    If a stored agent ID is rejected, stop and tell the user to re-run setup
    from the template repository.
 5. If roles remain missing outside the template repository, stop with setup
@@ -58,7 +65,10 @@ coordinator.
    `trioctl omnigent resolve lead --json`,
    `trioctl omnigent resolve evaluator --json`,
    `trioctl omnigent resolve builder --json`, and
-   `trioctl omnigent resolve scout --json`. Use the returned `model` and
+   `trioctl omnigent resolve scout --json` (with acceptance on, also
+   `trioctl omnigent resolve acceptance --json`: it must equal the
+   evaluator's model and effort; `trioctl omnigent doctor --acceptance`
+   FAILs otherwise). Use the returned `model` and
    `model` and `model_effort` values exactly. Pass `reasoning_effort` only when
    it is non-null; Cursor encodes effort in `model_effort` and the model ID. Never use
    `--allow-fallback` during a loop: unavailable or unentitled models must fail
