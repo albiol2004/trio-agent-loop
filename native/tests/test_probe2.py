@@ -278,3 +278,23 @@ def test_fold_skips_verdict_edited_beyond_commit_lines(repo: Path) -> None:
     assert a["status"] == "shipped"
     assert a["retirement_fold"] == ("skipped: other uncommitted paths: "
                                     "loop/VERDICT.md")
+
+
+# --------------------------------- N9: builders crash before its record
+def test_builders_replay_without_record_logs_once(repo: Path) -> None:
+    import json as _json
+    lead_running(repo)
+    head = step(repo, "dispatch", iteration=1)["head"]
+    b1 = builder_branch(repo, "b1")
+    results = _json.dumps([b1])
+    assert step(repo, "builders", iteration=1, wave=1, head=head,
+                results=results)["accepted"] == ["b1"]
+    records = mbox(repo) / ".native.json"
+    data = _json.loads(records.read_text())
+    data["builders"] = {}          # the crash hit before _record
+    records.write_text(_json.dumps(data))
+    again = step(repo, "builders", iteration=1, wave=1, head=head,
+                 results=results)
+    assert again["accepted"] == ["b1"]
+    log = (mbox(repo) / "LOG.md").read_text()
+    assert log.count("| builder | b1:") == 1

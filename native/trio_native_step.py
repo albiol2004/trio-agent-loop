@@ -909,17 +909,24 @@ def op_builders(mailbox: Path, repo: Path | None,
         accepted.append(sid)
         if res.get("commits"):
             merge.append({"id": sid, "branch": str(res["branch"]).strip()})
+    # The record is written after the LOG lines; a crash in between is
+    # replayed without a record, so a line already in LOG.md is not
+    # appended again (eval-native-v0b N9).
+    try:
+        logged = set((mailbox / "LOG.md").read_text(
+            encoding="utf-8").splitlines())
+    except OSError:
+        logged = set()
     for res in results:
         sid = _one_line(res.get("id"), 64) or "?"
         if sid in accepted:
             tip = str(res.get("head") or "")[:7]
             where = (f" ({res.get('branch')}@{tip})" if res.get("commits")
                      else " (no commits)")
-            TL._append_log(
-                mailbox,
-                f"- iter {a.iteration} | builder | {sid}: "
-                f"{_one_line(res.get('summary'))}{where}",
-            )
+            line = (f"- iter {a.iteration} | builder | {sid}: "
+                    f"{_one_line(res.get('summary'))}{where}")
+            if line not in logged:
+                TL._append_log(mailbox, line)
     result = {"iteration": a.iteration, "wave": a.wave, "head": head,
               "accepted": accepted, "refused": refused, "merge": merge}
     _record(mailbox, "builders", key, result)
