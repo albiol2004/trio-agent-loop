@@ -166,6 +166,26 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     driver's `gate breach` LOG line quotes the first acceptance reason.
 - Runs copy the pack without what the pin skips (`node_modules/`, caches,
   `*.pyc`), and driver commits never add those paths.
+- **No symlinks in the pack (eval-r19d finding 7).** Validation reports a
+  symlink as a pack error (the author gets one retry), the frozen pack
+  never contains one (`write_frozen_pack` skips them), and amendments,
+  human amendments and pin commits that contain one are refused. Use a
+  real file.
+- **Path lists are NUL-safe (eval-r19d findings 2 and 3).** Every place
+  the driver, `derive_pin_chain` and trio-shadow list commit or pack paths
+  uses `-z` with `core.quotePath=false`, so a non-ASCII or space-containing
+  file name is one path (git would otherwise print it quoted, and the
+  driver's own freeze would look like it touched files outside the
+  pack).
+- **Author guidance: explicit paths, no computed paths or globs.** A check
+  sees only the pack files attributed to it (its own, the shared ones).
+  Attribution is a static text scan: a file loaded through a computed
+  name (`f"case_{n}.json"`) or a directory glob is attributed only if some
+  text names it; otherwise it is absent from the check's view, and the
+  check FAILs at base and forever (FileNotFoundError), invisibly at
+  freeze. Name every pack file a check loads by an explicit path
+  (`$ACC_DIR/checks/ACC-07/cases.json`), or put shared data under
+  `fakes/` or `lib/` (in every view).
 - **Per-check isolation (eval-r19c finding 1).** A check's outcome depends
   only on its own pinned files, the shared pinned files and the product
   tree:
@@ -177,15 +197,48 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     ones (`pack_attribution`/`check_view`); MANIFEST, AMENDMENTS, AUTHOR
     and FROZEN are in no view. Under bwrap only its copy and scratch are
     writable and the view is bind-mounted read-only; with `sandbox: none`
-    the view is chmod read-only and the masters are re-verified (ctime
-    signature) after every check: a change FAILs every later check with
-    reason `isolation`;
-  - Python runs with `PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`, so a
-    script's own directory is not importable; the explicit, pinned helper
-    path is `acceptance/lib/` (on `PYTHONPATH` and `NODE_PATH`, shared by
-    every check). Implicit-load variables of the driver's environment
-    (`PYTHONPATH`, `PYTHONSTARTUP`, `NODE_PATH`, `NODE_OPTIONS`, `BASH_ENV`,
-    `ENV`, `PERL5LIB`, `RUBYLIB`, ...) are not inherited;
+    the view is chmod read-only, the masters are re-verified (ctime
+    signature) after every check, and immediately before each check runs
+    its prepared copy AND its pack view are compared by content with the
+    masters (eval-r19d finding 6: the next copy is prepared while the
+    previous check runs, so an unsandboxed check could otherwise rewrite
+    it). Any change FAILs that check and every later one with reason
+    `isolation`. This is detection, not enforcement: a process that
+    escapes a check under `sandbox: none` can still race a check after its
+    copy was verified; only bwrap enforces isolation;
+  - the check's OWN Python runs with `-P` when its `run` starts a Python
+    interpreter on a script (`python3 [opts] acceptance/checks/x.py`), so
+    the script's directory (its pack view) is not importable by it
+    (eval-r19c F2). `-P` is a flag, not an environment variable: the
+    PRODUCT and every Python the check starts (`python3 app.py` importing
+    a sibling module, `python3 -m pkg`, `python3 -m pytest`, a standalone
+    `python3 tests/test_x.py`) resolve imports normally, including
+    user-site (`~/.local`) packages (eval-r19d finding 1; round 3 exported
+    `PYTHONSAFEPATH`/`PYTHONNOUSERSITE`, which every child inherited, so
+    correct products could never pass). `-m`/`-c` runs are left as they
+    are (their `sys.path[0]` is the tree copy, not the pack); a nested
+    `sh -c "python3 acceptance/checks/x.py"` gets no `-P` and sees only
+    its own view. Interpreters older than 3.11 rely on the views alone.
+    The explicit, pinned helper path is `acceptance/lib/` (on `PYTHONPATH`
+    and `NODE_PATH`, shared by every check). Implicit-load variables of
+    the driver's environment (`PYTHONPATH`, `PYTHONSTARTUP`, `NODE_PATH`,
+    `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `PERL5LIB`, `RUBYLIB`, ...) are not
+    inherited;
+  - checks run with a controlled `PATH` (eval-r19d finding 4): the system
+    directories (`/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`,
+    `/usr/bin`, `/sbin`, `/bin`) plus the directory of each interpreter
+    (`python3`, `node`, `sh`, `bash`, `git`, `make`, ...) the DRIVER
+    resolved on its own `PATH` when it started. The driver keeps it in
+    memory (its state file records it but it is never read back), so a
+    user-writable directory early on the driver's `PATH` (`~/.local/bin`)
+    is not searched by checks unless an interpreter itself was resolved
+    there, and a shim written there after the driver started never runs
+    as a check's interpreter. This closes the cheap part of the same-uid
+    limit; a same-uid process can still replace what the driver resolves
+    before it starts (or the driver's own `git`). Tools a check needs
+    beyond that belong in the pack (`fakes/bin`, prepended by the check)
+    or in `needs`; `python3 -m pytest` finds a user-site pytest through the
+    interpreter, not through `PATH`;
   - driver runs (slice-eval covered checks, integration pre-run, the SHIP
     gate) read the pinned pack from git at the driver's pin commit and
     verify its hash, never the working tree a role can edit mid-run
@@ -237,8 +290,17 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
     `needs`. Every changed pack file is attributed (`pack_attribution`, in
     the pinned and the amended pack) to every check that can load it: the
     checks whose `run` names it, whose `run` strings or used files mention
-    it by basename, stem or per-check directory (transitively), and, for a
-    SHARED file, every check. Shared: `fakes/**`, `lib/**`, any directory
+    it (transitively), and, for a SHARED file, every check. A top-level
+    `checks/` file is mentioned by its basename or stem. A per-check file
+    (`checks/<ID>/...`) is mentioned only path-like (eval-r19d finding 5):
+    `<ID>/<its path under checks/<ID>/>` in the text, or the token `<ID>`
+    together with its basename (or its stem, for an importable extension
+    such as `.py`, `.mjs`, `.json`). A bare common token (`check`,
+    `expected`, `server`, `data`) in another check or in `lib/`/`fakes/`
+    no longer makes `checks/<ID>/check.py` another check's or shared:
+    another check cannot reach `checks/<ID>/` without naming it, and a file
+    not attributed to a check is absent from its view. Per-check files
+    named like a standard-library module keep the bare-stem rule. Shared: `fakes/**`, `lib/**`, any directory
     other than `checks/` and `checks/<ID>/`, interpreter-loaded names
     (`__init__.py`, `conftest.py`, `sitecustomize.py`, `*.pth`,
     `package.json`, `tsconfig.json`, `.npmrc`, `pyproject.toml`, shell rc
@@ -251,6 +313,10 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
     it. An amended `run` may not point at another check's file or at an
     unowned top-level `checks/` file (eval-r19b finding 1, eval-r19c
     finding 1);
+  - no symlinks: an amendment that adds or keeps a symlink in the pack is
+    rejected, and a pin commit whose pack holds one is tamper (eval-r19d
+    finding 7; the pin hashes a link's text, not its target, so a link
+    out of the pack could retarget a check with no further amend commit);
   - an AMENDMENTS.md record per id;
   - discrimination: the WHOLE pack re-runs at base with the pinned and the
     amended pack, and every check that FAILed before must still FAIL;

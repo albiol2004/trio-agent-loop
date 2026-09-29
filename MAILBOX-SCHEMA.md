@@ -998,9 +998,13 @@ ones (`fakes/`, `lib/`, interpreter-loaded names, unowned helpers); the
 view omits the metadata files and what the pin skips (`node_modules/`,
 `__pycache__/`, `.pytest_cache/`, `*.pyc`). No check can change another
 check's inputs. Loopback-only under bwrap when available (else `sandbox:
-none` with a dead proxy), Python with `PYTHONSAFEPATH` (a script's own
-directory is not importable; shared helpers live in `acceptance/lib/`, on
-`PYTHONPATH`/`NODE_PATH`), env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
+none` with a dead proxy), the check's own Python run with `-P` when its
+`run` starts a Python script (the script's directory is not importable by
+it; the flag is not inherited, so the product, `python3 -m pkg` and
+`python3 -m pytest` resolve imports normally; shared helpers live in
+`acceptance/lib/`, on `PYTHONPATH`/`NODE_PATH`), a controlled `PATH` (system
+directories plus the interpreter directories the driver resolved at
+start), no symlinks in the pack, env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
 `*_PASSWORD`/proxies and implicit-load variables (`PYTHONPATH`,
 `NODE_OPTIONS`, `BASH_ENV`, ...), with `ACC_TREE`, `ACC_DIR`, `ACC_WORK`,
 `ACC_ID`, `ACC_BIND_<NAME>`.
