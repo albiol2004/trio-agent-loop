@@ -61,10 +61,21 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   **read** the loop's plan or code. Only tool-call arguments count, never a
   tool's output and never chat text. A session is flagged when an argument
   names any of:
-  - a path inside the loop repository (its checkout, git dir or mailbox);
-  - a mailbox file (`PLAN.md`, `VERDICT.md`, `QUEUE.md`, `STATE.md`,
-    `LOG.md`, `REPORT.md`) that is not a file of the export itself;
+  - a path inside the loop repository (its checkout, git dir or mailbox).
+    Relative paths resolve against the command line's tracked `cd` (the
+    export by default); `$HOME`, `${HOME}`, `~` and `$PWD` are expanded;
+  - an ancestor of the repository given to a reading or searching command
+    (`cat`, `grep`, `find`, `rg`, ...) or as a bare tool path (Grep, Glob,
+    Read, LS); `/` counts only for recursive searchers;
+  - `cd` into the repository or an ancestor of it, `$OLDPWD`, or
+    `/proc/<pid>/cwd|root`;
   - a lab hidden-pack path (`/hidden/`, `speed/hard`).
+
+  A mailbox file name (`PLAN.md`, `REPORT.md`, `LOG.md`, ...) counts only
+  when it resolves inside the loop repository: a product that writes its
+  own `REPORT.md` to a scratch dir is not the mailbox (eval-r19b finding 5).
+  The audit is best-effort (DESIGN §10): a determined author can still
+  hide a read.
 
   Route literals such as `/api/openrouter/stats`, `$TMPDIR`, toolchain
   paths (`~/.nvm/...`) and system paths never contaminate (eval-r19
@@ -112,20 +123,31 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   (`freeze_commit`, `driver_commits`) and every authenticated human
   amendment (`human_amends`). A commit subject or trailer proves nothing
   by itself.
-- `trio-shadow.py --require-commits` also rejects every commit that
-  touches the pack, unless it is one of:
-  - the single freeze commit;
-  - a driver restore or pin commit;
-  - a valid amend commit.
-
-  The range starts at `--acceptance-base`, else the driver state's run
-  head, else the parent of the commit that added FROZEN. It never starts
-  from the working tree.
-  - With the driver state visible, driver commits must be in its record,
-    and `(human)` amends must be authenticated ones.
-  - Without the driver state, a pin commit may only extend FROZEN after
-    amend commits, and a restore must put back a pack that was already
-    pinned.
+- Open-loop runs `check_pin`, restore, the tamper count and amendment
+  processing on two threads; one controller lock serialises them and a
+  tamper seen by both threads is counted once. A restore swaps the pack in
+  by rename, retries a filesystem error, then stops the loop
+  (`acceptance-restore-failed`) (eval-r19b finding 4).
+- `trio-shadow.py --require-commits` derives the pin chain from git objects
+  alone (`trio-acceptance.derive_pin_chain`), walking the first-parent
+  history from `--acceptance-base`, else the driver state's run head, else
+  the root:
+  - the freeze is the *first* commit that adds FROZEN; a `git rm` and
+    re-add, or a second freeze subject, is tamper and never moves the base;
+  - a driver restore must put back the current pin;
+  - a driver pin must extend FROZEN only and pin a legitimate amendment:
+    the Evaluator rules (scope by file attribution, records, budget, and
+    discrimination re-checked by running the pack at the frozen base
+    before and after), or an adopted human amendment named in its
+    `Acceptance-Human-Amend:` trailer;
+  - HEAD's committed pack must equal the last legitimate pin, so an amend
+    commit no pin follows, or a forged pin, fails (eval-r19b finding 3).
+  - With the driver state visible it only adds strictness: freeze, pin and
+    restore commits must be in its record, adopted human amendments must be
+    recorded, and its pin must be the chain's. The state is never used to
+    relax a check.
+  - Mailbox reuse (an older pack at the same path) needs
+    `--acceptance-base` when the driver state is not visible.
   - Only a genuine restore excuses the earlier tamper.
   - A `slice(<id>):` commit behind the freeze (a Lead take-over made while
     the author was still working) is tolerated with an `acceptance note:`.
@@ -172,10 +194,18 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
   - aims its independent probe at the GOAL sentences no check covers;
   - writes `## Frozen acceptance` in VERDICT.md.
 - **After the verdict, amendments.** Amend commits since the pin are
-  validated for scope (only a check's script, the fakes, `run`, `expect`,
-  `timeout_s`, `binds`, `needs`), for an AMENDMENTS.md record per id, and
-  for still FAILing at base. They are limited to at most 2 per loop and 25%
-  of the checks.
+  validated on git objects (the pinned pack at the driver's pin commit,
+  the amended pack at HEAD):
+  - scope: only a check's script, the fakes, `run`, `expect`, `timeout_s`,
+    `binds`, `needs`. Every changed pack file is attributed to the checks
+    whose `run` names it (a file no `run` names is a shared helper and
+    belongs to every check), and every one of those checks must be named
+    and counted. An amended `run` may not point at another check's file or
+    at a shared helper (eval-r19b finding 1);
+  - an AMENDMENTS.md record per id;
+  - discrimination: the WHOLE pack re-runs at base with the pinned and the
+    amended pack, and every check that FAILed before must still FAIL;
+  - at most 2 per loop and 25% of the checks; no check removed.
   - A valid amendment extends the pin chain (`acceptance: pin <sha12>
     (amend ACC-..)`).
   - An invalid one is reverted.
@@ -207,19 +237,35 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
 ## Human amendments and resume
 
 - A human amends only while the loop is stopped, with
-  `trioctl omnigent acceptance amend --human --ids ACC-.. --reason "..."`.
-  The command refuses while a live driver holds the mailbox. It commits the
-  working-tree edits, or edits already committed since the pin, re-pins,
-  and records the amend commit in the driver state. That record, not the
-  `(human)` subject, is what authenticates a human amendment.
-- A hand-made `acceptance: amend <ids> (human): <reason>` commit is adopted
-  on resume only when all of these hold:
-  - the driver recorded a clean stop (`stopped_head`) with the pack intact;
-  - every pack commit since that stop is such a `(human)` amend;
-  - each of those commits has its AMENDMENTS.md records and touches only
-    `acceptance/`.
-
-  Otherwise it is logged `not adopted (...)` and restored.
+  `trioctl omnigent acceptance amend --human --ids ACC-.. --reason "..."
+  [--adopt <sha>,...]`. The command refuses while a live driver holds the
+  mailbox. It commits the working-tree edits as `acceptance: amend <ids>
+  (human): <reason>` and re-pins with a pin commit whose
+  `Acceptance-Human-Amend:` trailer names the adopted amend commits, and it
+  records the adoption (amend shas, pin commit) in the driver state
+  (`human_amends`, `human_adoptions`). Pack commits the human already made
+  since the last driver pin are adopted only when named with `--adopt`
+  after review; any other pack commit since the pin refuses the command.
+  Human amendments never count toward the Evaluator budget.
+- Resume never adopts anything (eval-r19b finding 2). A `(human)` amend
+  commit made while the loop was stopped (by a human who skipped the
+  command, or by a background job a role left behind) is logged
+  `not adopted: resume never adopts` and restored as tamper.
+- Resume reconciles the driver state with the pin chain derived from git
+  (HEAD's objects, the first FROZEN add, structurally verified driver
+  pin/restore commits; never the working-tree FROZEN):
+  - a state whose pin or freeze differs from the git chain forces
+    NEEDS_HUMAN (`acceptance-state-mismatch`);
+  - a lost state is re-derived from git (`pin re-derived from git
+    history`), unless the freeze is ambiguous (FROZEN added more than once)
+    or missing, which forces NEEDS_HUMAN (`acceptance-state-lost`).
+- At every loop stop the driver calls the runner's
+  `sweep_role_processes()` when it has one, a best-effort kill of the role
+  process groups it started. OmnigentRunner has none: its roles run in
+  broker-owned sessions outside the driver's process tree. A same-uid
+  process that survives the stop can still do whatever the human can
+  (including running the amend command); the explicit command is the
+  boundary.
 - Resume compares the frozen MANIFEST's `goal_sha256` with the current
   GOAL.md. On a mismatch (a reused mailbox with a new GOAL) the loop stops
   with `status: needs_human`, `phase: acceptance-goal-changed` (finding
@@ -252,7 +298,7 @@ trioctl omnigent acceptance freeze   --mailbox <mb> --export <dir> [--model m]  
 trioctl omnigent acceptance wait     --mailbox <mb> [--timeout S]               # 0 frozen, 3 author error, 4 timeout
 trioctl omnigent acceptance run      --mailbox <mb> [--tree <dir|rev>] [--ids ...] [--json]
 trioctl omnigent acceptance status   --mailbox <mb> [--json]
-trioctl omnigent acceptance amend    --mailbox <mb> --human --ids ACC-.. --reason "..."   # loop stopped
+trioctl omnigent acceptance amend    --mailbox <mb> --human --ids ACC-.. --reason "..." [--adopt <sha>,...]   # loop stopped
 trioctl omnigent acceptance validate --export .                                  # the author's own check
 ```
 
