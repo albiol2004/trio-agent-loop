@@ -242,9 +242,10 @@ class MailboxSessionTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 self.assertEqual(sessions, [])
                 status, detail = _get(self._url("/api/loop", name=name))
-                self.assertEqual(status, 200)
+                # eval2: a mailbox whose .sessions is itself a symlink is
+                # refused as a whole (403), never read.
+                self.assertEqual(status, 403)
                 body = json.dumps(detail)
-                self.assertEqual(detail["sessions"], [])
                 self.assertNotIn(str(outside), body)
                 self.assertNotIn(leaked.name, body)
                 events = _sse_events(

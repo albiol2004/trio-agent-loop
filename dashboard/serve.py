@@ -907,12 +907,44 @@ def _live_driver_summary(metrics, root_dir: Path) -> dict | None:
     return {key: entry.get(key) for key in keys}
 
 
+def _read_mailbox_text(path: Path) -> str:
+    """A mailbox file's text, opened without following a symlink; OSError
+    when it is absent, a symlink or not a regular file (eval2 finding 2:
+    a link planted in a repo never makes the board read a file outside it)."""
+    import stat as _stat
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
+def _mailbox_symlinks(loop_dir: Path) -> list[str]:
+    """Symlinked entries of a mailbox (loop_actions.mailbox_symlinks)."""
+    try:
+        return load_loop_actions_module().mailbox_symlinks(loop_dir)
+    except Exception:  # noqa: BLE001 - treat an unreadable mailbox as linked
+        return ["<unreadable>"]
+
+
+def _io_lines(path: Path):
+    """A text stream over a mailbox file read without following a link."""
+    import io
+    return io.StringIO(_read_mailbox_text(path))
+
+
 def _read_driver_state(loop_dir: Path) -> dict | None:
     """Read the loop driver's private state file when it is valid JSON."""
     try:
-        payload = json.loads(
-            (loop_dir / ".driver.json").read_text(
-                encoding="utf-8", errors="replace"))
+        payload = json.loads(_read_mailbox_text(loop_dir / ".driver.json"))
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -961,9 +993,9 @@ def _live_lock_pid(mailbox: Path) -> int | None:
     """Return a live lock owner PID, ignoring malformed or stale locks."""
     lock = mailbox / ".lock"
     try:
-        if not lock.exists():
+        if lock.is_symlink() or not lock.exists():
             return None
-        pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+        pid = int(_read_mailbox_text(lock / "pid").strip())
     except (OSError, ValueError):
         return None
     return pid if _record_pid_live(pid, lock / "pid") else None
@@ -972,11 +1004,7 @@ def _live_lock_pid(mailbox: Path) -> int | None:
 def _read_session_sidecar(loop_dir: Path) -> dict | None:
     """Read the optional wrapper-owned session sidecar."""
     try:
-        payload = json.loads(
-            (loop_dir / ".session.json").read_text(
-                encoding="utf-8", errors="replace"
-            )
-        )
+        payload = json.loads(_read_mailbox_text(loop_dir / ".session.json"))
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -1530,10 +1558,10 @@ def _seed_driver_state(mailbox: Path, pid: int, driver: str) -> None:
     state.update({"pid": pid, "driver": driver, "phase": "starting"})
     state.setdefault("iteration", 0)
     state.setdefault("session_ids", {})
-    tmp = path.with_name(".driver.json.dashboard-tmp")
     try:
-        tmp.write_text(json.dumps(state) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        # mkstemp + rename, refusing a linked target (never a fixed temp name).
+        load_loop_actions_module()._write_atomic_nofollow(
+            path, (json.dumps(state) + "\n").encode("utf-8"))
     except OSError:
         traceback.print_exc()
 
@@ -1578,6 +1606,9 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
     elif not is_root_loop:
         start = (False, "Start and stop act on a workspace's loop/ mailbox "
                         "only; use the Actions panel for this one.")
+    elif _mailbox_symlinks(loop_dir):
+        start = (False, "The mailbox contains symlinks; nothing in it is read or "
+                        "started (eval2 finding 2).")
     elif not (loop_dir / "GOAL.md").is_file():
         start = (False, "GOAL.md is missing.")
     elif not Path(entrypoints[chosen]).is_file():
@@ -1661,7 +1692,7 @@ def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
         return ""
     heading = None
     try:
-        with goal_path.open("r", encoding="utf-8", errors="replace") as fh:
+        with _io_lines(goal_path) as fh:
             for raw in fh:
                 line = raw.strip()
                 if not line:
@@ -1701,7 +1732,7 @@ def _goal_title(goal_path: Path, limit: int = 120) -> str:
     the mailbox name instead of showing a meaningless word.
     """
     try:
-        with goal_path.open("r", encoding="utf-8", errors="replace") as fh:
+        with _io_lines(goal_path) as fh:
             for raw in fh:
                 line = raw.strip()
                 if not line.startswith("#"):
@@ -1790,7 +1821,7 @@ def _loop_slices(loop_dir: Path) -> list[dict] | None:
     """
     plan_path = loop_dir / "PLAN.md"
     try:
-        text = plan_path.read_text(encoding="utf-8", errors="replace")
+        text = _read_mailbox_text(plan_path)
     except OSError:
         return None
     return load_metrics_module().parse_slices_block(text)
@@ -1823,8 +1854,7 @@ def _loop_slices_derived(loop_dir: Path, mode: str, commits: list[dict]) -> list
         metrics = load_metrics_module()
         queue = metrics.read_queue(loop_dir)
         try:
-            verdict_text = (loop_dir / "VERDICT.md").read_text(
-                encoding="utf-8", errors="replace")
+            verdict_text = _read_mailbox_text(loop_dir / "VERDICT.md")
         except OSError:
             verdict_text = ""
         commit_subjects = [f"slice({c['slice']}): {c['subject']}" for c in commits]
@@ -1991,7 +2021,7 @@ def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
 def _compute_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     try:
         shadow = load_shadow_module()
-        text = (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+        text = _read_mailbox_text(loop_dir / "PLAN.md")
         slices = shadow.parse_slices(shadow.find_slices_block(text))
     except Exception:
         return None
@@ -2030,13 +2060,11 @@ def _compute_loop_iterations(loop_dir: Path, root: Path) -> tuple[list[dict], li
         timeline = metrics.parse_timeline(loop_dir / "LOG.md")
         slices = _loop_slices(loop_dir) or []
         try:
-            verdict_text = (loop_dir / "VERDICT.md").read_text(
-                encoding="utf-8", errors="replace")
+            verdict_text = _read_mailbox_text(loop_dir / "VERDICT.md")
         except OSError:
             verdict_text = ""
         try:
-            report_text = (loop_dir / "REPORT.md").read_text(
-                encoding="utf-8", errors="replace")
+            report_text = _read_mailbox_text(loop_dir / "REPORT.md")
         except OSError:
             report_text = ""
         activity = _loop_slice_activity(loop_dir, root)
@@ -2302,8 +2330,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
 
     plan = loop_dir / "PLAN.md"
     try:
-        has_slices = "slices:" in plan.read_text(
-            encoding="utf-8", errors="replace")
+        has_slices = "slices:" in _read_mailbox_text(plan)
     except OSError:
         has_slices = False
     if has_slices:
@@ -2397,7 +2424,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
             traceback.print_exc()
 
     try:
-        repairs = int((loop_dir / ".repairs").read_text().strip())
+        repairs = int(_read_mailbox_text(loop_dir / ".repairs").strip())
     except (OSError, ValueError):
         repairs = 0
     if repairs >= 1:
@@ -4236,6 +4263,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         loop_dirs = [read for _root_dir, read in pairs]
         loops = []
         for root_dir, loop_dir in pairs:
+            links = _mailbox_symlinks(loop_dir) + (
+                [] if loop_dir == root_dir else _mailbox_symlinks(root_dir))
+            if links:
+                # eval2 finding 2: a mailbox with symlinks is never read.
+                name = metrics.loop_name(root, root_dir)
+                loops.append({
+                    "name": name, "path": name, "mission": "", "title": "",
+                    "iteration": None, "max_iterations": None, "status": "unknown",
+                    "final_verdict": None, "last_activity": None, "verdict_mtime": None,
+                    "last_entry_summary": "refused: the mailbox contains symlinks ("
+                    + ", ".join(links[:5]) + "); nothing in it is read",
+                    "segments": [], "refused": "mailbox contains symlinks",
+                })
+                continue
             try:
                 card = self._loop_card(loop_dir, metrics, root)
                 if loop_dir != root_dir:
@@ -4271,6 +4312,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 card["worktree_reasons"] = only.get(str(root_dir), [])
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):
+            if card.get("refused"):
+                continue
             try:
                 inbox.extend(_inbox_items(loop_dir, card, root))
             except Exception:
@@ -4370,6 +4413,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         loop_dir = self._find_loop_dir(name, root)
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
+        links = _mailbox_symlinks(loop_dir)
+        if links:
+            return self._send_json(403, {"error": "the mailbox contains symlinks ("
+                                         + ", ".join(links[:5]) + "); nothing in it is read",
+                                         "refused": True})
         card = self._loop_card(loop_dir, self.server.metrics, root)
         card["name"] = card["path"] = name  # r16: a live copy keeps the root name
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
@@ -4708,7 +4756,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "live_mailbox": str(ctx.live_mailbox), "driver": ctx.driver,
             "live": ctx.live, "state": ctx.derived,
             "native": {k: native.get(k) for k in (
-                "session_id", "run_id", "session_live", "lock", "result", "args")}
+                "session_id", "run_id", "session_live", "lock", "result", "args", "errors")}
             if native else None,
             "native_launcher": str(la.native_launcher(HOME) or "") or None,
             "fixes": la.available_fixes(ctx), "unblock": la.UNBLOCK_TABLE,
@@ -5676,16 +5724,14 @@ _ACTIONABLE_STATUS = (_RUNNING_STATUS_WORDS | _HUMAN_STATUS_WORDS
 def _mailbox_actionable(mailbox: Path) -> bool:
     """STATE.md or VERDICT.md says the loop is running or needs a person."""
     try:
-        state = (mailbox / "STATE.md").read_text(
-            encoding="utf-8", errors="replace")
+        state = _read_mailbox_text(mailbox / "STATE.md")
         m = re.search(r"(?im)^status:\s*([\w-]+)", state)
         if m and m.group(1).strip().lower() in _ACTIONABLE_STATUS:
             return True
     except OSError:
         pass
     try:
-        head = (mailbox / "VERDICT.md").read_text(
-            encoding="utf-8", errors="replace")[:200].upper()
+        head = _read_mailbox_text(mailbox / "VERDICT.md")[:200].upper()
         return "NEEDS_HUMAN" in head or "BLOCKED" in head
     except OSError:
         return False

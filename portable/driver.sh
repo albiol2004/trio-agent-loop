@@ -66,6 +66,11 @@ build_prompt() {
     printf 'MAILBOX OVERRIDE: this run uses `%s/` as the loop mailbox — every `loop/` path in the instructions below resolves to `%s/`.\n\n' "$LOOP_DIR" "$LOOP_DIR"
   fi
   cat "$1"
+  # Driver-verified human answer (trio_loop.human_answer_block): set only
+  # when HUMAN.md exists and its newest ledger answer is current.
+  if [[ -n "${TRIO_HUMAN_ANSWER:-}" ]]; then
+    printf '\n%s' "$TRIO_HUMAN_ANSWER"
+  fi
 }
 
 # run_role <prompt-file>  — one fresh-context invocation of the chosen harness
@@ -98,7 +103,8 @@ run_role() {
     generic) local cmd_var; [[ "$prompt_file" == *lead* || "$prompt_file" == *repair* ]] && cmd_var="${RUN_LEAD:?set RUN_LEAD}" || cmd_var="${RUN_EVAL:?set RUN_EVAL}"
              local pf="$prompt_file"
              if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" \
-                   || -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
+                   || -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" \
+                   || -n "${TRIO_HUMAN_ANSWER:-}" ]]; then
                pf="$(mktemp)"
                build_prompt "$prompt_file" > "$pf"
              fi

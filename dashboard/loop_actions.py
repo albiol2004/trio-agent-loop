@@ -31,7 +31,9 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -176,19 +178,55 @@ def harnesses(home: Path) -> dict:
 # Small readers
 # --------------------------------------------------------------------------
 
-def read_json(path: Path) -> dict | None:
+READ_LIMIT = 8 * 1024 * 1024
+
+
+def read_bytes_nofollow(path: Path, limit: int = READ_LIMIT) -> bytes | None:
+    """A regular file's bytes, opened without following a symlink (None when
+    absent, a symlink, not a regular file, unreadable or over ``limit``).
+
+    Every mailbox, sidecar, lock, registry and state file the dashboard
+    reads goes through here (eval2 finding 2): a symlink planted in a repo
+    never makes the dashboard read (and serve) a file outside it."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def read_json(path: Path) -> dict | None:
+    raw = read_bytes_nofollow(path)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
 
 
 def read_text(path: Path, limit: int | None = None) -> str | None:
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    raw = read_bytes_nofollow(path)
+    if raw is None:
         return None
+    text = raw.decode("utf-8", errors="replace")
     if limit is not None and len(text) > limit:
         return text[:limit] + f"\n… [truncated, {len(text)} chars]"
     return text
@@ -262,7 +300,7 @@ def pid_alive(pid) -> bool:
 
 def lock_info(mailbox: Path) -> dict | None:
     lock = Path(mailbox) / ".lock"
-    if not lock.is_dir():
+    if lock.is_symlink() or not lock.is_dir():
         return None
     pid = to_int(read_text(lock / "pid"))
     owner = (read_text(lock / "owner") or "").strip() or None
@@ -408,8 +446,93 @@ def result_from_raw(mailbox: Path, launch: dict | None) -> dict | None:
     return out
 
 
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+RUN_ID_RE = re.compile(r"wf_[A-Za-z0-9_-]{1,64}")
+RUN_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+NATIVE_ARG_KEYS = ("mailbox", "max_iterations", "max_agents", "token_budget", "helper",
+                   "run_token", "models")
+NATIVE_MODEL_ROLES = ("lead", "evaluator", "builder", "repair", "step")
+NATIVE_MODELS = frozenset({"claude-opus-5-5", "claude-sonnet-5"})
+"""Models a recorded native run may name (the workflow's defaults); a resume
+of a record naming anything else is refused (never replayed)."""
+NATIVE_CAPS = {"max_iterations": (1, 200), "max_agents": (1, 1000),
+               "token_budget": (1, 10_000_000_000)}
+
+
+class NativeArgsError(ValueError):
+    """A recorded native launch field that fails the strict schema."""
+
+
+def canonical_session_id(value) -> str:
+    """The recorded Claude session id, only as a canonical lowercase UUID
+    (never a flag, never free text)."""
+    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+        raise NativeArgsError("session_id is not a canonical UUID")
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise NativeArgsError("session_id is not a canonical UUID")
+    except ValueError:
+        raise NativeArgsError("session_id is not a canonical UUID") from None
+    return value
+
+
+def validate_native_args(raw, *, mailbox: Path, helper: Path | None) -> dict:
+    """The recorded workflow args as a validated dict (key order kept), or
+    NativeArgsError. Schema (native/trio-native.js ``meta.whenToUse``):
+    ``mailbox`` (required; must BE this mailbox), ``max_iterations``
+    (required int 1..200), optional ``max_agents`` / ``token_budget``
+    (bounded ints), ``run_token`` ([A-Za-z0-9._-]{1,64}), ``helper`` (only
+    the installed release's own helper) and ``models`` ({role: allowlisted
+    model}). Nothing else; never a string that is not a JSON object."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise NativeArgsError("args is not JSON") from None
+    if not isinstance(raw, dict):
+        raise NativeArgsError("args is not a JSON object")
+    unknown = [k for k in raw if k not in NATIVE_ARG_KEYS]
+    if unknown:
+        raise NativeArgsError("args has unknown keys: " + ", ".join(sorted(map(str, unknown)))[:200])
+    out: dict = {}
+    for key, value in raw.items():
+        if key == "mailbox":
+            if not isinstance(value, str) or not os.path.isabs(value) \
+                    or os.path.realpath(value) != os.path.realpath(str(mailbox)):
+                raise NativeArgsError("args.mailbox is not this mailbox")
+        elif key in NATIVE_CAPS:
+            lo, hi = NATIVE_CAPS[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+                raise NativeArgsError(f"args.{key} must be an integer {lo}..{hi}")
+        elif key == "run_token":
+            if not isinstance(value, str) or not RUN_TOKEN_RE.fullmatch(value):
+                raise NativeArgsError("args.run_token is not [A-Za-z0-9._-]{1,64}")
+        elif key == "helper":
+            if not isinstance(value, str) or helper is None or not os.path.isabs(value) \
+                    or not _same_file(value, helper):
+                raise NativeArgsError("args.helper is not the installed release's helper")
+        elif key == "models":
+            if not isinstance(value, dict) or any(
+                    r not in NATIVE_MODEL_ROLES or m not in NATIVE_MODELS
+                    for r, m in value.items()):
+                raise NativeArgsError("args.models names a role or model outside the allowlist ("
+                                      + ", ".join(sorted(NATIVE_MODELS)) + ")")
+            value = dict(value)
+        out[key] = value
+    if "mailbox" not in out:
+        raise NativeArgsError("args.mailbox is missing")
+    if "max_iterations" not in out:
+        raise NativeArgsError("args.max_iterations is missing")
+    return out
+
+
 def native_facts(mailbox: Path, home: Path | None = None) -> dict | None:
-    """The claude-workflow driver's files in a mailbox, or None."""
+    """The claude-workflow driver's files in a mailbox, or None.
+
+    Every value that could later steer a command (the recorded session id,
+    the workflow args, the run id) is validated here against a strict schema;
+    the raw records are display-only. ``args``/``session_id``/``run_id`` are
+    None (with ``*_error``) when they fail it (eval2 finding 1)."""
     mailbox = Path(mailbox)
     session = read_json(mailbox / ".session.json")
     launch = read_json(mailbox / ".native-launch.json")
@@ -419,28 +542,39 @@ def native_facts(mailbox: Path, home: Path | None = None) -> dict | None:
         or launch or (result and result.get("driver", NATIVE_DRIVER) == NATIVE_DRIVER))
     if not is_native:
         return None
-    if (not result or result.get("source") == "end") and launch:
-        recovered = result_from_raw(mailbox, launch)
+    errors: dict[str, str] = {}
+    session_id = None
+    raw_session = (launch or {}).get("session_id") if launch else (result or {}).get("session_id")
+    if raw_session is not None:
+        try:
+            session_id = canonical_session_id(raw_session)
+        except NativeArgsError as exc:
+            errors["session_id"] = str(exc)
+    if (not result or result.get("source") == "end") and launch and session_id:
+        recovered = result_from_raw(mailbox, {"session_id": session_id})
         if recovered is not None:
             if result:  # keep the end op's lock/dangling facts
                 recovered.setdefault("dangling_worktrees", result.get("dangling_worktrees"))
             result = recovered
-    args = {}
-    if launch and isinstance(launch.get("args"), str):
+    args = None
+    if launch is not None:
         try:
-            args = json.loads(launch["args"])
-        except ValueError:
-            args = {}
+            args = validate_native_args(launch.get("args"), mailbox=mailbox,
+                                        helper=native_helper(home) if home is not None else None)
+        except NativeArgsError as exc:
+            errors["args"] = str(exc)
     session_live = bool(session and session.get("driver") == NATIVE_DRIVER
                         and not session.get("done") and pid_alive(session.get("pid")))
     lock = lock_info(mailbox)
-    session_id = (launch or {}).get("session_id") or (result or {}).get("session_id")
     run_id = (result or {}).get("run_id")
-    if home is not None and session_id and not run_id:
+    if run_id is not None and not (isinstance(run_id, str) and RUN_ID_RE.fullmatch(run_id)):
+        errors["run_id"] = "run_id is not wf_[A-Za-z0-9_-]{1,64}"
+        run_id = None
+    if home is not None and session_id and not run_id and "run_id" not in errors:
         run_id = find_run_id(home, session_id)
     return {
         "session": session, "launch": launch, "result": result, "args": args,
-        "lock": lock, "session_live": session_live,
+        "errors": errors, "lock": lock, "session_live": session_live,
         "session_id": session_id, "run_id": run_id,
         "running": session_live or bool(lock and lock["alive"]
                                         and str(lock.get("owner") or "").startswith("workflow:")),
@@ -742,7 +876,10 @@ def derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None
         if native:
             sess = native.get("session") or {}
             lock = native.get("lock")
-            out["detail"]["resumable"] = bool(native.get("run_id") and native.get("launch"))
+            args = native.get("args") or {}
+            out["detail"]["resumable"] = bool(native.get("run_id") and native.get("session_id")
+                                              and isinstance(args, dict) and args.get("run_token")
+                                              and not native.get("errors"))
             out.update(state="interrupted", summary=(
                 "claude-workflow run is not live" + (
                     f" (lock pid {lock['pid']} dead)" if lock and not lock["alive"] else "")
@@ -764,7 +901,8 @@ FIXES = {
     "rerun": {"title": "Re-run the loop (installed trioctl)", "destructive": False},
     "rerun_more_iterations": {"title": "Re-run with a higher --max-iterations", "destructive": False},
     "reset_and_rerun": {"title": "Reset STATE (status running, phase idle) and re-run", "destructive": True},
-    "native_resume": {"title": "Resume the claude-workflow run (launch.sh resume)", "destructive": False},
+    "native_resume": {"title": "Resume the claude-workflow run (launch.sh resume)", "destructive": False,
+                      "confirm": True},
     "native_start": {"title": "Start a fresh claude-workflow run (launch.sh start)", "destructive": False},
     "native_reset_and_start": {"title": "Reset STATE and start a fresh claude-workflow run", "destructive": True},
     "land": {"title": "Land the verified root-free branch (trioctl omnigent land)", "destructive": True},
@@ -796,30 +934,89 @@ class PathEscape(FixRefused):
     symlink out of the checkout): never read for an agent, never written."""
 
 
-def _lead_worktree_roots(root: Path) -> list[Path]:
-    """Real paths of the git worktrees of the workspace's repository (root-free
-    loops keep their live mailbox in a Lead worktree outside the root)."""
+def workspace_repo(root: Path) -> Path | None:
+    """The workspace's own git toplevel: the root itself or a checkout inside
+    it. An enclosing repository above the root (a git-versioned HOME, a lab
+    repo around a scratch dir) never counts (eval2 finding 5)."""
     top = git_toplevel(root)
     if top is None:
+        return None
+    try:
+        top = top.resolve()
+    except OSError:
+        return None
+    return top if _under(top, root) else None
+
+
+def _common_dir(path: Path) -> Path | None:
+    try:
+        out = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = out.stdout.strip()
+    if out.returncode != 0 or not value:
+        return None
+    try:
+        return Path(value).resolve()
+    except OSError:
+        return None
+
+
+def trio_worktree_base(home: Path) -> Path:
+    """The Trio worktree root convention's base
+    (``omnigent/worker_worktrees.default_worktree_root``):
+    ``$TRIO_WORKTREE_ROOT``, else ``$XDG_STATE_HOME`` (or ``~/.local/state``)
+    ``/trio-agent-loop/worktrees``."""
+    env = os.environ.get("TRIO_WORKTREE_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    return (Path(xdg) if xdg else Path(home) / ".local" / "state") / "trio-agent-loop" / "worktrees"
+
+
+def _lead_worktree_roots(root: Path, home: Path | None = None) -> list[Path]:
+    """Real paths of the workspace repository's git worktrees that may hold a
+    root-free loop's live mailbox (eval2 finding 5): listed by ``git worktree
+    list --porcelain`` of the workspace's OWN repository (never an enclosing
+    one), not prunable, really a worktree of that repository (its own
+    ``--git-common-dir`` is the repository's), and located under the
+    workspace or under the Trio worktree root convention
+    (``<base>/<repo name>-<sha256(common dir)[:12]>``)."""
+    top = workspace_repo(root)
+    if top is None:
         return []
+    common = _common_dir(top)
+    if common is None:
+        return []
+    allowed = [Path(root)]
+    if home is not None:
+        key = hashlib.sha256(str(common).encode()).hexdigest()[:12]
+        allowed.append(trio_worktree_base(home) / f"{top.name}-{key}")
     out = []
     for tree in worktree_list(top):
         path = tree.get("worktree")
-        if isinstance(path, str) and path:
-            try:
-                out.append(Path(path).resolve())
-            except OSError:
-                continue
+        if not isinstance(path, str) or not path or tree.get("prunable") or tree.get("bare"):
+            continue
+        try:
+            real = Path(path).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not any(_under(real, base) for base in allowed):
+            continue
+        if _common_dir(real) != common:
+            continue
+        out.append(real)
     return out
 
 
-def check_mailbox_paths(root: Path, root_mailbox: Path, live_mailbox: Path) -> tuple[Path, Path]:
+def check_mailbox_paths(root: Path, root_mailbox: Path, live_mailbox: Path,
+                        home: Path | None = None) -> tuple[Path, Path]:
     """(real root mailbox, real live mailbox), or PathEscape.
 
     The root mailbox must resolve inside the resolved workspace root; the
-    live copy inside the root or inside one of the repository's git
-    worktrees (a root-free Lead worktree). A symlinked mailbox pointing
-    elsewhere is refused (eval finding 4)."""
+    live copy inside the root or inside one of the workspace repository's
+    accepted Lead worktrees (``_lead_worktree_roots``). A symlinked mailbox
+    pointing elsewhere is refused (eval finding 4)."""
     try:
         root_real = Path(root).resolve(strict=True)
         rbox = Path(root_mailbox).resolve(strict=True)
@@ -829,12 +1026,39 @@ def check_mailbox_paths(root: Path, root_mailbox: Path, live_mailbox: Path) -> t
     if not _under(rbox, root_real) or not rbox.is_dir():
         raise PathEscape(f"mailbox {root_mailbox} resolves outside the workspace ({rbox})")
     if lbox != rbox and not _under(lbox, root_real):
-        if not any(_under(lbox, wt) for wt in _lead_worktree_roots(root_real)):
+        if not any(_under(lbox, wt) for wt in _lead_worktree_roots(root_real, home)):
             raise PathEscape(f"live mailbox {live_mailbox} resolves outside the workspace "
-                             f"and its git worktrees ({lbox})")
+                             f"and its accepted Lead worktrees ({lbox})")
     if not lbox.is_dir():
         raise PathEscape(f"live mailbox {live_mailbox} is not a directory")
     return rbox, lbox
+
+
+MAILBOX_SUBDIRS = (".lock", ".native-runs")
+
+
+def mailbox_symlinks(mailbox: Path) -> list[str]:
+    """Symlinks directly in a mailbox (files and subdirectories alike) and
+    inside the driver sidecar directories ``.lock`` and ``.native-runs``. A
+    mailbox with any is refused as a whole: nothing in it is read for a
+    role, an agent or a peer, and nothing is written (eval2 finding 2).
+    Deeper files (``.sessions/*`` exports, held records) are read only
+    through the no-follow readers, which skip a link."""
+    out = []
+    try:
+        with os.scandir(mailbox) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    out.append(entry.name)
+                elif entry.name in MAILBOX_SUBDIRS and entry.is_dir(follow_symlinks=False):
+                    try:
+                        with os.scandir(entry.path) as sub:
+                            out += [f"{entry.name}/{e.name}" for e in sub if e.is_symlink()]
+                    except OSError:
+                        continue
+    except OSError:
+        return out
+    return sorted(out)
 
 
 def mailbox_file(mailbox: Path, name: str) -> Path:
@@ -853,23 +1077,19 @@ def mailbox_file(mailbox: Path, name: str) -> Path:
 
 def _safe_read(mailbox: Path, name: str) -> str | None:
     """Mailbox file text without following a symlink (None when absent,
-    a symlink, or unreadable)."""
-    try:
-        fd = os.open(str(Path(mailbox) / name), os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            return fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
+    a symlink, not a regular file, or unreadable)."""
+    raw = read_bytes_nofollow(Path(mailbox) / name)
+    return None if raw is None else raw.decode("utf-8", errors="replace")
 
 
 def append_nofollow(path: Path, text: str, *, header: str | None = None) -> None:
     """Append to a mailbox file without following a symlink (O_NOFOLLOW);
     ``header`` is written first when the file is created."""
-    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                 | os.O_NONBLOCK | os.O_CLOEXEC, 0o644)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
         if header is not None and os.fstat(fd).st_size == 0:
             os.write(fd, header.encode("utf-8"))
         os.write(fd, text.encode("utf-8"))
@@ -886,7 +1106,13 @@ class LoopContext:
         self.home = Path(home)
         self.root = Path(root)
         self.name = name
-        check_mailbox_paths(root, root_mailbox, live_mailbox)
+        check_mailbox_paths(root, root_mailbox, live_mailbox, home)
+        links = mailbox_symlinks(live_mailbox) + (
+            [] if Path(root_mailbox) == Path(live_mailbox) else
+            [f"(root) {n}" for n in mailbox_symlinks(root_mailbox)])
+        if links:
+            raise PathEscape("the mailbox contains symlinks (" + ", ".join(
+                display_name(n, 80) for n in links[:8]) + "); nothing in it is read or acted on")
         self.root_mailbox = Path(root_mailbox)
         self.live_mailbox = Path(live_mailbox)
         self.detection = detection or {}
@@ -900,8 +1126,11 @@ class LoopContext:
                                     last_action=last_action, native=self.native)
         # The workspace's own checkout; an enclosing repository above the
         # workspace root (e.g. a lab repo around a scratch dir) never counts.
-        top = git_toplevel(self.root_mailbox)
-        self.repo_root = top if top is not None and _under(top, self.root) else self.root
+        top = workspace_repo(self.root)
+        mailbox_top = git_toplevel(self.root_mailbox)
+        if mailbox_top is not None and _under(mailbox_top, self.root):
+            top = mailbox_top
+        self.repo_root = top if top is not None else self.root
         if self.live_mailbox == self.root_mailbox:
             self.live_repo = self.repo_root
         else:
@@ -958,43 +1187,76 @@ def _driver_cmd(ctx: LoopContext, max_iterations: int) -> tuple[list[str], Path]
         entry = rel / "metrics" / "trio_loop.py" if rel else None
         if entry is None or not entry.is_file():
             raise FixRefused("the portable driver is not installed (no release trio_loop.py)")
+        require_prompt_safe_path(ctx.root_mailbox)
         return (["python3", str(entry), "run", "--mailbox", str(ctx.root_mailbox),
                  "--max-iterations", str(max_iterations), "--runner", "portable"], ctx.repo_root)
     trioctl = trioctl_path(ctx.home)
     if trioctl is None:
         raise FixRefused("the installed trioctl is missing (~/.local/bin/trioctl or TRIO_DASH_TRIOCTL)")
+    require_prompt_safe_path(ctx.root_mailbox)
+    require_prompt_safe_path(ctx.live_mailbox, "live mailbox")
     return ([str(trioctl), "omnigent", "loop", "--mailbox", str(ctx.root_mailbox),
              "--max-iterations", str(max_iterations)], ctx.repo_root)
+
+
+PROMPT_SAFE_PATH = re.compile(r"/[A-Za-z0-9._/+@-]*")
+"""Characters a mailbox path may use before it reaches a driver's prompt
+(launch.sh and trioctl embed it): no spaces, quotes, newlines or shell and
+markdown punctuation, so a repo-controlled directory name cannot carry
+instructions into a role prompt (eval2 finding 6)."""
+
+
+def require_prompt_safe_path(path: Path, what: str = "mailbox") -> None:
+    if not PROMPT_SAFE_PATH.fullmatch(str(path)):
+        raise FixRefused(f"the {what} path {display_name(str(path))} has characters outside "
+                         "[A-Za-z0-9._/+@-]; it would reach a role prompt — rename it to start a driver")
+
+
+def display_name(text: str, limit: int = 200) -> str:
+    """Display-only form of a repo-controlled name (a loop dir, a path):
+    characters outside [A-Za-z0-9._/+@ -] become ``?``."""
+    return re.sub(r"[^A-Za-z0-9._/+@ -]", "?", str(text))[:limit]
+
+
+def native_resume_args(ctx: LoopContext) -> tuple[str, str, dict]:
+    """(session_id, run_id, args) of a resumable native run, all validated;
+    FixRefused with the reason otherwise (eval2 findings 1 and 4)."""
+    native = ctx.native or {}
+    errors = native.get("errors") or {}
+    if not native.get("launch"):
+        raise FixRefused("no .native-launch.json: nothing to resume")
+    for key in ("session_id", "args", "run_id"):
+        if key in errors:
+            raise FixRefused(f"the recorded launch is not resumable ({errors[key]}); "
+                             "use a fresh start")
+    run_id = native.get("run_id")
+    if not run_id:
+        raise FixRefused("no workflow run id recorded for this session; use a fresh start")
+    session_id, args = native.get("session_id"), native.get("args")
+    if not session_id or not isinstance(args, dict):
+        raise FixRefused("the recorded launch has no valid session id and args; use a fresh start")
+    if "run_token" not in args:
+        raise FixRefused("the recorded launch predates run tokens: a resume cannot tell its "
+                         "own run from another; use a fresh start")
+    return session_id, run_id, args
 
 
 def _native_cmd(ctx: LoopContext, mode: str, max_iterations: int | None = None) -> tuple[list[str], Path]:
     """The installed release's launch.sh, and nothing a mailbox, the run
     registry or a result record names: no ``--helper`` is ever passed (the
-    workflow then uses the release's own helper), and a resume — which
-    replays the recorded args byte-identically — is refused when those args
-    name any helper other than the release's (eval finding 1)."""
+    release's launch.sh uses its own helper). A resume runs only on a
+    recorded session id, run id and args that pass the strict schema
+    (``native_resume_args``); launch.sh re-validates them itself and
+    rebuilds the prompt from the validated fields."""
     launcher = native_launcher(ctx.home)
     if launcher is None:
         raise FixRefused("the installed release has no native launcher (install a release, or "
                          "configure TRIO_DASH_RELEASE_NATIVE)")
+    require_prompt_safe_path(ctx.live_mailbox)
     if mode == "resume":
-        run_id = (ctx.native or {}).get("run_id")
-        if not run_id or not re.fullmatch(r"wf_[\w-]+", run_id):
-            raise FixRefused("no workflow run id recorded for this session; use a fresh start")
-        if not (ctx.native or {}).get("launch"):
-            raise FixRefused("no .native-launch.json: nothing to resume")
-        args = (ctx.native or {}).get("args") or {}
-        if not isinstance(args, dict):
-            raise FixRefused("the recorded launch args are not an object; use a fresh start")
-        helper = args.get("helper")
-        if helper is not None and not _same_file(helper, native_helper(ctx.home)):
-            raise FixRefused("the recorded run used a helper that is not the installed release's "
-                             f"({helper}); a resume would replay it — use a fresh start")
-        mailbox_arg = args.get("mailbox")
-        if mailbox_arg is not None and not _same_file(mailbox_arg, ctx.live_mailbox):
-            raise FixRefused("the recorded launch args name another mailbox; use a fresh start")
+        session_id, run_id, _args = native_resume_args(ctx)
         return (["bash", str(launcher), "resume", "--mailbox", str(ctx.live_mailbox),
-                 "--run-id", run_id], ctx.live_repo)
+                 "--run-id", run_id, "--session", session_id], ctx.live_repo)
     return (["bash", str(launcher), "start", "--mailbox", str(ctx.live_mailbox),
              "--max-iterations", str(max_iterations)], ctx.live_repo)
 
@@ -1118,6 +1380,12 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
             raise FixRefused("resume is only for an interrupted run (killed mid-run); "
                              "after held/error/budget use a fresh start")
         steps.append(_cmd_step(*_native_cmd(ctx, "resume"), detached=True))
+        session_id, run_id, rargs = native_resume_args(ctx)
+        shown = json.dumps(rargs, separators=(",", ":"))
+        steps[-1]["resume"] = {"session_id": session_id, "run_id": run_id, "args": rargs}
+        steps[-1]["display"] += f"\n  # resumes session {session_id}, run {run_id}, validated args {shown}"
+        notes.append(f"resume replays the validated workflow args {shown} in Claude session "
+                     f"{session_id} (launch.sh re-validates them and rebuilds its prompt from them)")
     elif fix_id == "native_start":
         if word in ("shipped", "blocked", "needs_human", "error"):
             raise FixRefused(f"STATE.md status is {word}: " + (
@@ -1236,7 +1504,7 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
     basis = plan_basis(ctx)
     return {
         "id": fix_id, "title": spec["title"], "destructive": spec["destructive"],
-        "requires_confirm": spec["destructive"], "steps": steps,
+        "requires_confirm": spec["destructive"] or bool(spec.get("confirm")), "steps": steps,
         "commands_preview": [s["display"] for s in steps], "notes": notes,
         "basis": basis, "confirm_token": plan_token(ctx, fix_id, steps, basis),
     }
@@ -1247,20 +1515,43 @@ def _file_digest(mailbox: Path, name: str) -> str | None:
     return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
 
 
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+BASIS_SIDECARS = (".native-launch.json", ".native-result.json", ".session.json", ".repairs",
+                  ".driver.json")
+
+
+def _rev(repo: Path, ref: str) -> str | None:
+    try:
+        return git(repo, "rev-parse", "-q", "--verify", "--end-of-options",
+                   ref + "^{commit}").stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def plan_basis(ctx: LoopContext) -> dict:
-    """The state a plan was made from: the live checkout's HEAD and the
-    STATE.md / VERDICT.md / HUMAN.md digests (eval finding 3). Computed
-    once per LoopContext (a context is gathered per request)."""
+    """The state a plan was made from (eval findings 3 and eval2 6): the live
+    checkout's HEAD, the root checkout's HEAD and the land target's sha when
+    they differ (root-free loops), the STATE.md / VERDICT.md / HUMAN.md
+    digests, the native sidecars, ``.repairs`` and the run-registry record.
+    Computed once per LoopContext (a context is gathered per request)."""
     cached = getattr(ctx, "_plan_basis", None)
     if cached is not None:
         return dict(cached)
-    try:
-        head = git(ctx.live_repo, "rev-parse", "-q", "--verify", "HEAD").stdout.strip() or None
-    except (OSError, subprocess.TimeoutExpired):
-        head = None
+    head = _rev(ctx.live_repo, "HEAD")
     basis = {"head": head, "state": _file_digest(ctx.live_mailbox, "STATE.md"),
              "verdict": _file_digest(ctx.live_mailbox, "VERDICT.md"),
              "human": _file_digest(ctx.live_mailbox, "HUMAN.md")}
+    if Path(ctx.repo_root) != Path(ctx.live_repo):
+        basis["root_head"] = _rev(ctx.repo_root, "HEAD")
+    target = str(ctx.state.get("target_ref") or "").strip()
+    if target:
+        basis["land_target"] = {"ref": display_name(target),
+                                "sha": _rev(ctx.repo_root, target) if _REF_RE.fullmatch(target)
+                                and ".." not in target else None}
+    basis["sidecars"] = {name: _file_digest(ctx.live_mailbox, name) for name in BASIS_SIDECARS}
+    if ctx.registry:
+        basis["registry"] = hashlib.sha256(json.dumps(ctx.registry, sort_keys=True,
+                                                      default=str).encode()).hexdigest()
     ctx._plan_basis = dict(basis)
     return basis
 
@@ -1272,7 +1563,7 @@ def plan_token(ctx: LoopContext, action_id: str, steps: list[dict], basis: dict,
     confirm never runs commands (or against a state) the human did not see."""
     payload = {
         "loop": ctx.key, "live_mailbox": str(ctx.live_mailbox), "action": action_id,
-        "steps": [{k: s.get(k) for k in ("kind", "argv", "cwd", "path", "changes", "text")}
+        "steps": [{k: s.get(k) for k in ("kind", "argv", "cwd", "path", "changes", "text", "resume")}
                   for s in steps],
         "basis": basis, "extra": extra or {},
     }
@@ -1309,10 +1600,14 @@ def available_fixes(ctx: LoopContext) -> list[dict]:
             plan = plan_fix(ctx, fix_id, {})
             out.append({"id": fix_id, "title": plan["title"], "applicable": True,
                         "destructive": plan["destructive"],
+                        "requires_confirm": plan["requires_confirm"],
                         "commands_preview": plan["commands_preview"], "notes": plan["notes"]})
         except FixRefused as exc:
-            out.append({"id": fix_id, "title": FIXES[fix_id]["title"], "applicable": False,
-                        "destructive": FIXES[fix_id]["destructive"], "reason": str(exc)})
+            spec = FIXES[fix_id]
+            out.append({"id": fix_id, "title": spec["title"], "applicable": False,
+                        "destructive": spec["destructive"],
+                        "requires_confirm": spec["destructive"] or bool(spec.get("confirm")),
+                        "reason": str(exc)})
     return out
 
 
@@ -1354,17 +1649,34 @@ def read_actions(home: Path, key: str, limit: int = 50) -> list[dict]:
     return out
 
 
-def _write_atomic_nofollow(path: Path, data: bytes) -> None:
-    """Replace a mailbox file atomically: a fresh temp file (O_EXCL|O_NOFOLLOW)
-    in the same directory, then rename over the target (never through a
-    symlink)."""
-    tmp = path.with_name(f".{path.name}.dash-{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+def _write_atomic_nofollow(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Replace a file atomically: a fresh ``mkstemp`` file in the same
+    directory (never a fixed temp name), then a rename over the target. A
+    target that is a symlink or not a regular file is refused (the rename
+    would replace the link, but such a file is never ours to replace)."""
+    path = Path(path)
     try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path} is a symlink or not a regular file; refusing to replace it")
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
         os.write(fd, data)
-    finally:
         os.close(fd)
-    os.replace(tmp, path)
+        fd = -1
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def edit_state(path: Path, changes: dict) -> dict:
@@ -1430,6 +1742,7 @@ def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | N
     results = []
     ok = True
     state_before: dict[str, bytes] = {}
+    state_after: dict[str, bytes] = {}
     reason_before = ctx.state.get("reason")
     for step in plan["steps"]:
         if step["kind"] == "run":
@@ -1447,6 +1760,9 @@ def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | N
                     state_before[step["path"]] = raw.encode("utf-8")
                 results.append({"step": step["display"], "ok": True,
                                 "change": edit_state(Path(step["path"]), step["changes"])})
+                after = _safe_read(Path(step["path"]).parent, Path(step["path"]).name)
+                if after is not None:
+                    state_after[step["path"]] = after.encode("utf-8")
             except (OSError, FixRefused) as exc:
                 results.append({"step": step["display"], "ok": False, "error": str(exc)})
                 ok = False
@@ -1461,7 +1777,10 @@ def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | N
                 ok = False
                 break
         elif step["detached"]:
-            res = _start_detached(ctx, plan["id"], step, who, processes, on_exit)
+            restore = {path: (state_before[path], state_after[path]) for path in state_before
+                       if path in state_after}
+            res = _start_detached(ctx, plan["id"], step, who, processes, on_exit,
+                                  restore=restore, reason=reason_before)
             results.append(res)
             if not res["ok"]:
                 ok = False
@@ -1498,12 +1817,50 @@ def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | N
     return {"ok": ok, "results": results, "log_id": entry["id"]}
 
 
+CLAIM_FILES = (".lock/pid", ".lock/owner", ".session.json", ".driver.json")
+"""Files a started driver writes when it takes the mailbox (its lock and its
+session / driver record)."""
+CLAIM_POLL_SECONDS = 0.25
+
+
+def _claim_snapshot(mailbox: Path) -> dict:
+    return {name: _file_digest(mailbox, name) for name in CLAIM_FILES}
+
+
+def _restore_unclaimed(ctx: LoopContext, fix_id: str, restore: dict, reason) -> list[dict]:
+    """Put STATE.md back byte for byte after a driver that exited nonzero
+    without ever taking the mailbox; only when STATE.md is still exactly what
+    the dashboard wrote (a driver that changed it owns it)."""
+    out = []
+    for path, (before, after) in restore.items():
+        p = Path(path)
+        current = _safe_read(p.parent, p.name)
+        if current is None or current.encode("utf-8") != after:
+            out.append({"path": path, "restored": False,
+                        "why": "STATE.md changed after the reset (the driver owns it)"})
+            continue
+        try:
+            _write_atomic_nofollow(mailbox_file(p.parent, p.name), before)
+            out.append({"path": path, "restored": True})
+        except (OSError, FixRefused) as exc:
+            out.append({"path": path, "restored": False, "why": str(exc)})
+    return out
+
+
 def _start_detached(ctx: LoopContext, fix_id: str, step: dict, who: dict,
-                    processes: dict | None, on_exit=None) -> dict:
+                    processes: dict | None, on_exit=None, *, restore: dict | None = None,
+                    reason=None) -> dict:
+    """Start a detached driver. It must survive LAUNCH_GRACE_SECONDS; after
+    that a reaper keeps watching it until it has taken the mailbox (its lock
+    or session/driver record changed) or exited. A driver that exits nonzero
+    before taking the mailbox gets the dashboard's STATE.md edit rolled back
+    (``restore``: {path: (before, after)} bytes), keeping ``reason:``
+    (eval2 finding 7)."""
     runs = loop_state_dir(ctx.home, ctx.key) / "runs"
     runs.mkdir(exist_ok=True)
     log_path = runs / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{fix_id}.log"
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    baseline = _claim_snapshot(ctx.live_mailbox)
     try:
         with open(log_path, "ab") as log:
             process = subprocess.Popen(step["argv"], cwd=step["cwd"], start_new_session=True,
@@ -1522,21 +1879,45 @@ def _start_detached(ctx: LoopContext, fix_id: str, step: dict, who: dict,
     if processes is not None:
         processes[process.pid] = process
 
+    def claimed() -> bool:
+        if _claim_snapshot(ctx.live_mailbox) != baseline:
+            return True
+        for path, (_before, after) in (restore or {}).items():
+            p = Path(path)
+            current = _safe_read(p.parent, p.name)
+            if current is not None and current.encode("utf-8") != after:
+                return True
+        return False
+
     def reap() -> None:
+        taken = not restore
         try:
-            rc = process.wait()
+            while True:
+                try:
+                    rc = process.wait(timeout=None if taken else CLAIM_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    taken = claimed()
         except Exception:  # noqa: BLE001 - best effort
             return
+        if not taken:
+            taken = claimed()
         if processes is not None:
             processes.pop(process.pid, None)
+        restored = None
+        if restore and rc != 0 and not taken:
+            restored = _restore_unclaimed(ctx, fix_id, restore, reason)
         if on_exit is not None:
             try:
                 on_exit(process.pid, rc)
             except Exception:  # noqa: BLE001 - logging must not fail
                 pass
-        log_action(ctx.home, ctx.key, {
-            "action": "fix-exit", "fix": fix_id, "pid": process.pid, "exit_code": rc,
-            "log": str(log_path), "output": tail_text(log_path, 1500)})
+        entry = {"action": "fix-exit", "fix": fix_id, "pid": process.pid, "exit_code": rc,
+                 "log": str(log_path), "output": tail_text(log_path, 1500),
+                 "took_mailbox": taken}
+        if restored is not None:
+            entry.update(state_restored=restored, reason=reason)
+        log_action(ctx.home, ctx.key, entry)
 
     if code is None:
         threading.Thread(target=reap, daemon=True).start()
@@ -1555,38 +1936,51 @@ HUMAN_HEADER = (
     "box. Each entry starts with a server-written header line\n"
     "`## <UTC time> — answer <id> — iteration <N> — trio-dash <sig>`; the answer\n"
     "text follows as `> `-quoted lines, so no answer text can start a header.\n"
-    "The Lead applies only the newest such entry, and only when N is the\n"
-    "iteration that just stopped; older entries are informational. Agents never\n"
-    "edit this file. Format: MAILBOX-SCHEMA.md \"HUMAN.md\".\n"
+    "Roles never act on this file directly: the loop driver verifies the newest\n"
+    "entry against trio-dash's answer ledger and passes only a verified answer\n"
+    "into the Lead / Evaluator prompt (\"## Verified human answer (driver)\").\n"
+    "Agents never edit this file. Format: MAILBOX-SCHEMA.md \"HUMAN.md\".\n"
 )
 ANSWER_LIMIT = 20_000
-ENTRY_RE = re.compile(
-    r"^## (?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) — answer (?P<id>[0-9a-f]{8,16}) — "
-    r"iteration (?P<iteration>\d+|\?) — trio-dash (?P<sig>[0-9a-f]{16,64})$", re.M)
+LEDGER_PATH = Path(__file__).resolve().parent.parent / "metrics" / "human_ledger.py"
+_LEDGER_MODULE: dict = {}
 
 
-def _answer_key(home: Path) -> bytes:
-    """The dashboard's HMAC key for HUMAN.md entry headers (created once,
-    0600, outside every workspace)."""
-    path = state_dir(home) / "answer-key"
+class AnswerKeyUnusable(FixRefused):
+    """The answer key cannot be used (corrupt, empty, symlink, too open):
+    answers are refused with the reason, never signed with a bad key."""
+
+
+def ledger():
+    """metrics/human_ledger.py of this release (shared with the drivers)."""
+    module = _LEDGER_MODULE.get("m")
+    if module is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("trio_dash_human_ledger", LEDGER_PATH)
+        if spec is None or spec.loader is None:
+            raise FixRefused(f"the answer ledger module is missing ({LEDGER_PATH})")
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except (OSError, SyntaxError) as exc:
+            raise FixRefused(f"the answer ledger module is unusable ({LEDGER_PATH}: {exc})") from None
+        _LEDGER_MODULE["m"] = module
+    return module
+
+
+def _answer_key(home: Path, *, create: bool = False) -> bytes:
+    """The dashboard's HMAC key (``answer-key`` in its state dir, 0600).
+    Generated securely when missing (``create``); a corrupt, empty, linked
+    or group-readable key raises AnswerKeyUnusable (eval2 finding 3)."""
+    lg = ledger()
     try:
-        return bytes.fromhex(path.read_text(encoding="ascii").strip())
-    except (OSError, ValueError):
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    key = os.urandom(32)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="ascii") as fh:
-            fh.write(key.hex() + "\n")
-        return key
-    except FileExistsError:
-        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+        return lg.load_key(state_dir(home), create=create)
+    except lg.AnswerKeyError as exc:
+        raise AnswerKeyUnusable(str(exc)) from None
 
 
 def _entry_sig(home: Path, at: str, answer_id: str, iteration, body: str) -> str:
-    msg = "\n".join([at, answer_id, str(iteration), hashlib.sha256(body.encode()).hexdigest()])
-    return hmac.new(_answer_key(home), msg.encode(), hashlib.sha256).hexdigest()[:24]
+    return ledger().entry_sig(_answer_key(home, create=True), at, answer_id, iteration, body)
 
 
 def quote_body(text: str) -> str:
@@ -1595,19 +1989,31 @@ def quote_body(text: str) -> str:
 
 
 def human_entries(home: Path, mailbox: Path) -> list[dict]:
-    """Server-written HUMAN.md entries, oldest first, each with ``verified``
-    (its HMAC matches: written by this dashboard, header and text intact)."""
+    """Server-written HUMAN.md entries, oldest first, each with ``verified``:
+    its header signature matches AND the dashboard's answer ledger holds a
+    record (valid MAC, this mailbox) with its id, time, iteration and text
+    digest — the same check the loop drivers make. ``key_error`` is set
+    when the key is unusable (every entry is then unverified)."""
+    try:
+        lg = ledger()
+    except FixRefused:
+        return []
     text = _safe_read(mailbox, HUMAN_FILE) or ""
-    matches = list(ENTRY_RE.finditer(text))
+    entries = lg.parse_entries(text)
+    key_error = None
+    try:
+        key = _answer_key(home)
+        records = lg.read_records(state_dir(home))
+    except AnswerKeyUnusable as exc:
+        key, records, key_error = None, [], str(exc)
+    except OSError as exc:
+        key, records, key_error = None, [], f"answer ledger unreadable: {exc}"
+    real = os.path.realpath(mailbox)
     out = []
-    for i, m in enumerate(matches):
-        chunk = text[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-        body_lines = [line[2:] if line.startswith("> ") else "" for line in chunk.splitlines()
-                      if line.startswith(">")]
-        body = "\n".join(body_lines).strip("\n").replace("\r\n", "\n")
-        sig = _entry_sig(home, m["at"], m["id"], m["iteration"], body)
-        out.append({"at": m["at"], "id": m["id"], "iteration": m["iteration"],
-                    "verified": hmac.compare_digest(sig, m["sig"]), "header": m.group(0)})
+    for e in entries:
+        verified = bool(key) and lg.entry_verified(key, e, records, real)
+        out.append({"at": e["at"], "id": e["id"], "iteration": e["iteration"],
+                    "verified": verified, "header": e["header"], "key_error": key_error})
     return out
 
 
@@ -1637,7 +2043,17 @@ def answer_context(ctx: LoopContext) -> dict:
         reset_reason = ("held dispatch records exist: reconcile them first "
                         "(the answer is still recorded, STATE is not reset)")
     entries = human_entries(ctx.home, ctx.live_mailbox)
-    return {"allowed": reason is None, "reason": reason, "stop": stop,
+    key_error = None
+    try:
+        _answer_key(ctx.home)
+    except AnswerKeyUnusable as exc:
+        if "is missing" not in str(exc):
+            key_error = str(exc)
+    except FixRefused as exc:
+        key_error = str(exc)
+    if reason is None and key_error:
+        reason = "answers cannot be signed: " + key_error
+    return {"allowed": reason is None, "reason": reason, "stop": stop, "key_error": key_error,
             "reset_allowed": reset_reason is None, "reset_reason": reset_reason,
             "path": str(ctx.live_mailbox / HUMAN_FILE),
             "entries": [f"{e['at']} — answer {e['id']} — iteration {e['iteration']}"
@@ -1663,7 +2079,11 @@ def plan_answer(ctx: LoopContext, text: str, reset: bool, who: dict) -> dict:
     answer_id = hashlib.sha256((body + at + uuid.uuid4().hex).encode()).hexdigest()[:12]
     iteration = info["iteration"] if info["iteration"] is not None else "?"
     by = re.sub(r"[\r\n]+", " ", str(who.get("user") or who.get("addr") or "unknown"))[:120]
-    sig = _entry_sig(ctx.home, at, answer_id, iteration, body)
+    key = _answer_key(ctx.home, create=True)
+    lg = ledger()
+    sig = lg.entry_sig(key, at, answer_id, iteration, body)
+    record = lg.make_record(key, answer_id=answer_id, loop=ctx.key, mailbox=ctx.live_mailbox,
+                            root_mailbox=ctx.root_mailbox, iteration=iteration, at=at, body=body)
     entry = (f"\n## {at} — answer {answer_id} — iteration {iteration} — trio-dash {sig}\n"
              f"in-reply-to: {info['stop']} (iteration {iteration})\n"
              f"source: trio-dash ({by})\n\n{quote_body(body)}")
@@ -1677,6 +2097,7 @@ def plan_answer(ctx: LoopContext, text: str, reset: bool, who: dict) -> dict:
     token = plan_token(ctx, "answer", [{"kind": "answer", "text": body},
                                        {"kind": "reset", "changes": reset}], basis)
     return {"id": "answer", "answer_id": answer_id, "entry": entry, "steps": steps,
+            "ledger_record": record,
             "commands_preview": [s["display"] for s in steps], "destructive": reset,
             "requires_confirm": True, "reset": reset, "basis": basis, "confirm_token": token}
 
@@ -1685,6 +2106,9 @@ def execute_answer(ctx: LoopContext, plan: dict, who: dict) -> dict:
     results = []
     try:
         path = mailbox_file(ctx.live_mailbox, HUMAN_FILE)
+        # The ledger record first: a HUMAN.md entry that exists is always
+        # verifiable; a failed HUMAN.md append leaves only an unused record.
+        ledger().append_record(state_dir(ctx.home), plan["ledger_record"])
         append_nofollow(path, plan["entry"], header=HUMAN_HEADER)
         results.append({"step": plan["steps"][0]["display"], "ok": True})
         for step in plan["steps"][1:]:
@@ -1731,8 +2155,11 @@ def build_context(ctx: LoopContext) -> dict:
         if text is not None:
             sidecars[name] = text[:4000]
     return {
-        "loop": ctx.name, "root": str(ctx.root), "root_mailbox": str(ctx.root_mailbox),
-        "live_mailbox": str(ctx.live_mailbox), "driver": ctx.driver,
+        # Repo-controlled names reach the agent's prompt only in a
+        # display-safe form (eval2 finding 6).
+        "loop": display_name(ctx.name), "root": display_name(str(ctx.root), 400),
+        "root_mailbox": display_name(str(ctx.root_mailbox), 400),
+        "live_mailbox": display_name(str(ctx.live_mailbox), 400), "driver": ctx.driver,
         "derived_state": ctx.derived, "liveness": {
             "running_sources": ctx.running_sources, "lock": lock_info(box),
             "broker": ctx.detection.get("broker"),
@@ -1876,9 +2303,7 @@ def cursor_isolation(home: Path) -> tuple[dict, Path]:
     if current.get("permissions") != CURSOR_ISOLATED_CONFIG["permissions"] \
             or current.get("approvalMode") != "allowlist":
         current.update(CURSOR_ISOLATED_CONFIG)
-        tmp = cfg.with_name(f".cli-config.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
-        os.replace(tmp, cfg)
+        _write_atomic_nofollow(cfg, json.dumps(current, indent=1).encode("utf-8"), 0o600)
     stray = fake_home / ".cursor" / "mcp.json"
     if stray.exists() or stray.is_symlink():
         stray.unlink()  # never a user MCP config in the isolated home
@@ -1988,9 +2413,8 @@ class DiagnosisManager:
 
     def _save(self, home: Path, key: str, record: dict) -> None:
         path = loop_state_dir(home, key) / "diagnosis.json"
-        tmp = path.with_name(f".diagnosis.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(record, indent=1, sort_keys=True, default=str), encoding="utf-8")
-        os.replace(tmp, path)
+        _write_atomic_nofollow(path, json.dumps(record, indent=1, sort_keys=True,
+                                                default=str).encode("utf-8"), 0o600)
 
     def start(self, ctx: LoopContext, harness: str, who: dict, *,
               accept_exposure: bool = False) -> dict:

@@ -227,9 +227,13 @@ Endpoints:
 - `POST /api/loop/fix {root, loop, fix, args?, confirm?, confirm_token?}` —
   400 for an id outside the allowlist (logged), 409 `{refused}` when a
   precondition fails, 409 `{confirm_required, plan: {commands_preview, notes,
-  confirm_token, basis}}` for a destructive fix; the confirm must carry that
-  `confirm_token` = hash(loop, fix id, exact steps, HEAD sha, STATE.md /
-  VERDICT.md / HUMAN.md digests). The server re-plans under the loop's
+  confirm_token, basis}}` for a destructive fix (and for `native_resume`);
+  the confirm must carry that `confirm_token` = hash(loop, fix id, exact
+  steps incl. a resume's validated session/run id/args, the live HEAD, the
+  root HEAD and the land target's sha for root-free loops, STATE.md /
+  VERDICT.md / HUMAN.md, `.native-launch.json` / `.native-result.json` /
+  `.session.json` / `.driver.json` / `.repairs` digests and the registry
+  record). The server re-plans under the loop's
   action lock (the loop context is gathered only after the lock is taken)
   and compares: a mismatch is 409 `{plan_changed, plan}` with the new
   preview, and nothing runs. 200/502 with per-step results otherwise.
@@ -237,10 +241,19 @@ Endpoints:
   confirm_token?}` — 409 preview first (the exact HUMAN.md entry and STATE
   changes, and its token), then writes with the same token rule; the
   response lists the restart fixes that now apply.
-- A mailbox (or its STATE.md / VERDICT.md / HUMAN.md) that resolves outside
-  the workspace root and its git worktrees — a symlink out of the checkout —
-  gets 403 on every action endpoint; its files are never read into a
-  diagnosis prompt nor written.
+- A mailbox that resolves outside the workspace root and its accepted Lead
+  worktrees (listed by the workspace repository's own `git worktree list`,
+  really of that repository, under the workspace or the Trio worktree root
+  `$TRIO_WORKTREE_ROOT` / `~/.local/state/trio-agent-loop/worktrees/
+  <repo>-<hash>`; an enclosing repository never counts), or that contains
+  any symlink (directly, or in `.lock/` or `.native-runs/`), gets 403 on every action endpoint and a "refused" board
+  card; nothing in it is read (every mailbox, sidecar and registry read is
+  `O_NOFOLLOW`, regular files only) or written (writes are `mkstemp` +
+  rename, never through a link).
+- Mailbox data never chooses what runs: a mailbox path with characters
+  outside `[A-Za-z0-9._/+@-]` (it would reach a driver prompt) refuses
+  every driver start, and the diagnosis context shows repo-controlled names
+  in a display-safe form.
 
 **Fix allowlist** (server-side; a diagnosis only proposes an id). Every fix
 first requires that nothing is live (no driver/lock pid, no live session
@@ -252,7 +265,7 @@ pid, no running broker session, broker liveness known). Destructive ones
 | `rerun` | non-terminal STATE, no holds (Omnigent/portable) | `trioctl omnigent loop --mailbox <root mailbox> --max-iterations N` |
 | `rerun_more_iterations` | stopped at the iteration cap; N > iteration | same, higher N |
 | `reset_and_rerun` ★ | STATE `error` | driver preflighted, STATE → running/idle (reason removed; kept in the action log), then `rerun`; STATE is restored byte-for-byte if the driver does not start |
-| `native_resume` | claude-workflow run killed mid-run, run id known, recorded args name no helper but the release's | `<release>/native/launch.sh resume --mailbox … --run-id wf_…` |
+| `native_resume` (confirm) | claude-workflow run killed mid-run; the recorded session id is a canonical UUID, the run id `wf_…`, and the args pass the strict schema (only the workflow's keys, this mailbox, bounded caps, allowlisted models, the release's helper, a `run_token` — a pre-run_token record offers `native_start` instead) | `<release>/native/launch.sh resume --mailbox … --run-id wf_… --session <uuid>` (launch.sh re-validates and rebuilds its prompt; the preview shows the validated args) |
 | `native_start` | claude-workflow held/conflict/budget/cap/interrupted | `<release>/native/launch.sh start --mailbox … --max-iterations N` (never `--helper`) |
 | `native_reset_and_start` ★ | claude-workflow STATE `error` | `native_start`'s launcher preflighted, STATE reset, then `native_start` |
 | `land` ★ | STATE `needs_land`, no unresolved merge in the Lead worktree | `trioctl omnigent land --mailbox …` |
@@ -275,7 +288,19 @@ reconciliation without receipt proof, land-conflict resolution, `abandon`,
 `sessions prune`, `acceptance amend --human`, permission/settings changes.
 Driver starts run detached in their own session; output goes to
 `~/.local/state/trio-dash/loops/<key>/runs/*.log` and their exit code is
-appended to the action log.
+appended to the action log. A reset STATE.md is restored byte for byte
+(with `reason:`) when the driver exits nonzero at any time before it took
+the mailbox (its `.lock/pid`/`owner`, `.session.json` or `.driver.json`
+changed, or STATE.md moved on); the reaper watches it until then.
+
+**Answers** are recorded in the dashboard's ledger before HUMAN.md is
+appended (`answer-key` 0600 + `answers.jsonl` in the state dir; format and
+the same-uid limit: MAILBOX-SCHEMA.md "HUMAN.md"). An entry is verified only
+when its header signature and a ledger record match; the drivers pass only
+a ledger-verified, current answer to the roles as a `## Verified human
+answer (driver)` block. An empty, corrupt, linked or group-readable key is
+never replaced or used: answers are refused with the reason (never a 500);
+a missing key is generated atomically.
 
 **Diagnose** runs a read-only agent — never Claude — with the loop's mailbox
 files, sidecars and driver result, lock/liveness, held records, git state,

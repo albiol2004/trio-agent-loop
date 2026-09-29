@@ -3575,6 +3575,32 @@ def run_open_loop(
                 _release_lock(lock)
 
 
+def human_answer_block(mailbox: Path, iteration: int, role: str) -> str:
+    """The driver-verified human answer block for a Lead / Evaluator prompt,
+    or "" (always "" without ``<mailbox>/HUMAN.md``; see
+    ``metrics/human_ledger.py``). Ignored entries are reported on stderr;
+    a missing ledger module means no answer is ever passed (fail closed)."""
+    if role not in ("lead", "evaluator"):
+        return ""
+    try:
+        os.lstat(Path(mailbox) / "HUMAN.md")
+    except OSError:
+        return ""
+    path = Path(__file__).resolve().parent / "human_ledger.py"
+    try:
+        spec = importlib.util.spec_from_file_location("trio_human_ledger", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        print(f"trio_loop: HUMAN.md ignored: no answer ledger module ({exc})", file=sys.stderr)
+        return ""
+    return module.answer_block(
+        Path(mailbox), iteration,
+        log=lambda note: print(f"trio_loop: {note}", file=sys.stderr))
+
+
 class _PortableRunner:
     def run(
         self,
@@ -3617,6 +3643,13 @@ class _PortableRunner:
             if attempt or sha:
                 environment["TRIO_ATTEMPT"] = attempt
                 environment["TRIO_PINNED_SHA"] = sha
+        # A driver-verified human answer (only when HUMAN.md exists and its
+        # newest ledger answer is current); never HUMAN.md text itself.
+        block = human_answer_block(Path(mailbox), iteration, role)
+        if block:
+            environment["TRIO_HUMAN_ANSWER"] = block
+        else:
+            environment.pop("TRIO_HUMAN_ANSWER", None)
         # The shell shim only runs one role. Gates, verdicts, repairs, and
         # resume stay in run_loop so this runner never parses VERDICT.md.
         result = subprocess.run(

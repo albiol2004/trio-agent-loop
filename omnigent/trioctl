@@ -5290,6 +5290,35 @@ def _crosswired_sibling(
     return None
 
 
+def _human_answer_block(mailbox: Path, iteration: int, role: str) -> str:
+    """The driver-verified human answer for a Lead / Evaluator prompt, or "".
+
+    Verified with THIS release's ``metrics/human_ledger.py`` (never the
+    repository's vendored loop core): the newest trio-dash ledger answer for
+    the mailbox, only when it answers iteration ``iteration - 1`` and its
+    HUMAN.md entry is intact. Nothing is read without ``HUMAN.md``; ignored
+    entries are reported on stderr; no ledger module means no answer."""
+    if role not in ("lead", "evaluator"):
+        return ""
+    try:
+        os.lstat(Path(mailbox) / "HUMAN.md")
+    except OSError:
+        return ""
+    path = Path(__file__).resolve().parent.parent / "metrics" / "human_ledger.py"
+    try:
+        spec = importlib.util.spec_from_file_location("trioctl_human_ledger", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        print(f"trioctl: HUMAN.md ignored: no answer ledger module ({exc})", file=sys.stderr)
+        return ""
+    return module.answer_block(
+        Path(mailbox), iteration,
+        log=lambda note: print(f"trioctl: {note}", file=sys.stderr))
+
+
 class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
@@ -5684,6 +5713,12 @@ class OmnigentRunner:
             note = self._root_free_lockstep_note("evaluator", mailbox)
             if note:
                 result = note + "\n" + result
+        # A driver-verified human answer (only when HUMAN.md exists and the
+        # newest trio-dash ledger answer for this mailbox is current);
+        # the roles never act on HUMAN.md text itself.
+        block = _human_answer_block(mailbox, iteration, role)
+        if block:
+            result = result.rstrip("\n") + "\n\n" + block
         return result
 
     def _root_free_lockstep_note(self, role: str, mailbox: Path) -> str:

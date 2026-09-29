@@ -1305,6 +1305,7 @@ function fixRow(fix, isProposed, st) {
   head.appendChild(span("fix-title", fix.title));
   head.appendChild(span("fix-id mono caption", fix.id));
   if (fix.destructive) head.appendChild(span("fix-tag fix-tag-destructive", "needs confirm"));
+  else if (fix.requires_confirm) head.appendChild(span("fix-tag", "needs confirm"));
   if (isProposed) head.appendChild(span("fix-tag", "proposed by diagnosis"));
   row.appendChild(head);
   if ((fix.commands_preview || []).length) {
@@ -1336,7 +1337,7 @@ function fixRow(fix, isProposed, st) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "btn " + (fix.destructive ? "btn-destructive" : "btn-secondary");
-  btn.textContent = fix.destructive ? "Review & apply…" : "Apply";
+  btn.textContent = fix.destructive || fix.requires_confirm ? "Review & apply…" : "Apply";
   const note = document.createElement("span");
   note.className = "control-note caption";
   note.setAttribute("role", "status");
