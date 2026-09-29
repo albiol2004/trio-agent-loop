@@ -24,10 +24,12 @@ Files (outside every workspace unless noted):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -103,30 +105,69 @@ def release_dir(home: Path) -> Path | None:
     return path if path.is_dir() else None
 
 
+CURSOR_MODELS = frozenset({"cursor-grok-4.6-low"})
+"""Cursor models a diagnosis may use (``TRIO_DASH_CURSOR_MODEL`` must be one;
+never a Claude model: diagnosis is never Claude)."""
+CODEX_MODELS = frozenset({"gpt-6-luna"})
+CODEX_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+CURSOR_WARNING = (
+    "Cursor cannot be fully isolated. The dashboard runs it in ask mode with its own "
+    "empty HOME and config dir (your ~/.cursor/mcp.json servers, approvals and "
+    "allowlist are not loaded; writes and shell are denied by config), but the agent "
+    "still has Cursor's built-in WebFetch/WebSearch (they run on Cursor's servers and "
+    "can reach any public URL), the Task subagent, dynamic tools, and the MCP servers "
+    "of plugins synced from your Cursor account (verified 2026-09-29: Playwright, "
+    "Outlook, Higgsfield). Mailbox text the agent reads could steer it into those. "
+    "Codex (OS read-only sandbox, no network) is the default; choose Cursor only if "
+    "you accept that exposure.")
+
+def _allowed_env(name: str, default: str, allowed: frozenset) -> tuple[str, str | None]:
+    """(value, error): an env override outside the allowlist is ignored and
+    reported, never used."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default, None
+    if raw in allowed:
+        return raw, None
+    return default, f"{name}={raw!r} is not allowed (allowed: {', '.join(sorted(allowed))}); using {default}"
+
+
 def harnesses(home: Path) -> dict:
-    """Diagnosis harness catalog: binary, model, availability."""
+    """Diagnosis harness catalog: binary, model, availability.
+
+    Codex is the default: it runs in its OS read-only sandbox without network.
+    Cursor is opt-in (``TRIO_DASH_DIAGNOSE_HARNESS=cursor`` or the drawer's
+    picker) and carries ``warning``: its read-only mode is model-level and its
+    built-in tools cannot be removed (see ``CURSOR_WARNING``)."""
     cursor = _executable(_env_path("TRIO_DASH_CURSOR_AGENT")
                          or home / ".local" / "bin" / "cursor-agent")
     codex = _executable(_env_path("TRIO_DASH_CODEX")
                         or home / ".local" / "bin" / "codex")
-    default = os.environ.get("TRIO_DASH_DIAGNOSE_HARNESS", "cursor").strip()
+    default = os.environ.get("TRIO_DASH_DIAGNOSE_HARNESS", "codex").strip()
     if default not in ("cursor", "codex"):
-        default = "cursor"
+        default = "codex"
+    cursor_model, cursor_err = _allowed_env("TRIO_DASH_CURSOR_MODEL", DEFAULT_CURSOR_MODEL,
+                                            CURSOR_MODELS)
+    codex_model, codex_err = _allowed_env("TRIO_DASH_CODEX_MODEL", DEFAULT_CODEX_MODEL,
+                                          CODEX_MODELS)
+    effort, effort_err = _allowed_env("TRIO_DASH_CODEX_EFFORT", DEFAULT_CODEX_EFFORT,
+                                      CODEX_EFFORTS)
     return {
         "default": default,
         "cursor": {
             "available": cursor is not None, "bin": str(cursor) if cursor else None,
-            "model": os.environ.get("TRIO_DASH_CURSOR_MODEL", "").strip()
-            or DEFAULT_CURSOR_MODEL,
-            "mode": "ask (read-only)",
+            "model": cursor_model,
+            "mode": "ask (model-level read-only; isolated HOME/config, no MCP)",
+            "warning": CURSOR_WARNING,
+            "config_errors": [e for e in (cursor_err,) if e],
         },
         "codex": {
             "available": codex is not None, "bin": str(codex) if codex else None,
-            "model": os.environ.get("TRIO_DASH_CODEX_MODEL", "").strip()
-            or DEFAULT_CODEX_MODEL,
-            "effort": os.environ.get("TRIO_DASH_CODEX_EFFORT", "").strip()
-            or DEFAULT_CODEX_EFFORT,
-            "mode": "exec --sandbox read-only",
+            "model": codex_model,
+            "effort": effort,
+            "mode": "exec --sandbox read-only (OS sandbox, no network)",
+            "config_errors": [e for e in (codex_err, effort_err) if e],
         },
     }
 
@@ -271,11 +312,11 @@ def native_registry(home: Path) -> list[dict]:
     The registry is written by native/launch.sh and the helper's begin/end
     (native-dash); it only makes runs *visible*. Nothing is executed from a
     record without re-validating it (see ``native_launcher``)."""
-    runs = []
+    by_mailbox: dict[str, dict] = {}
     try:
         files = sorted(native_runs_dir(home).glob("*.json"))
     except OSError:
-        return runs
+        return []
     for path in files:
         record = read_json(path)
         if not record or record.get("driver", NATIVE_DRIVER) != NATIVE_DRIVER:
@@ -283,16 +324,46 @@ def native_registry(home: Path) -> list[dict]:
         mailbox = record.get("mailbox")
         if not isinstance(mailbox, str) or not os.path.isabs(mailbox):
             continue
-        mbox = Path(mailbox)
+        try:
+            mbox = Path(mailbox).resolve()
+        except OSError:
+            continue
         if not is_mailbox(mbox):
             continue
-        repo = record.get("repo")
-        repo_path = Path(repo) if isinstance(repo, str) and os.path.isabs(repo) else None
-        if repo_path is None or not repo_path.is_dir():
-            repo_path = git_toplevel(mbox)
-        runs.append({**record, "mailbox": str(mbox), "repo": str(repo_path) if repo_path else None,
-                     "registry_file": str(path)})
-    return runs
+        repo_path = registry_repo(home, mbox, record.get("repo"))
+        if repo_path is None:
+            continue
+        entry = {**record, "mailbox": str(mbox), "repo": str(repo_path),
+                 "registry_file": str(path)}
+        # One record per real mailbox: the most recently updated wins.
+        prev = by_mailbox.get(str(mbox))
+        if prev is None or str(entry.get("updated_at") or "") >= str(prev.get("updated_at") or ""):
+            by_mailbox[str(mbox)] = entry
+    return [by_mailbox[k] for k in sorted(by_mailbox)]
+
+
+def registry_repo(home: Path, mailbox: Path, claimed) -> Path | None:
+    """The repo a registry record may add as a workspace seed: the real git
+    toplevel of the mailbox. A claimed ``repo`` is accepted only when it IS
+    that toplevel; ``/``, the home directory and any ancestor of it are never
+    seeds (eval finding 7). None when the mailbox is in no git checkout."""
+    top = git_toplevel(mailbox)
+    if top is None:
+        return None
+    try:
+        top = top.resolve()
+        home_real = Path(home).resolve()
+    except OSError:
+        return None
+    if top == Path(top.anchor) or top == home_real or _under(home_real, top):
+        return None
+    if isinstance(claimed, str) and claimed:
+        try:
+            if Path(claimed).resolve() != top:
+                return None
+        except OSError:
+            return None
+    return top
 
 
 _FENCE_RE = re.compile(r"```(?:jsonc?|json5)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S | re.I)
@@ -396,34 +467,51 @@ def find_run_id(home: Path, session_id: str) -> str | None:
     return max(found)[1] if found else None
 
 
-def native_launcher(home: Path, facts: dict, registry: dict | None) -> Path | None:
-    """launch.sh to use for a native fix: ``TRIO_DASH_NATIVE_LAUNCH``, else
-    the one this run was launched with (registry record, result record, or
-    the recorded helper's sibling — a resume must use the same launcher),
-    else the installed release's; only a ``launch.sh`` that sits next to
-    trio_native_step.py and trio-native.js counts."""
-    candidates = [_env_path("TRIO_DASH_NATIVE_LAUNCH")]
-    if registry and isinstance(registry.get("launcher"), str):
-        candidates.append(Path(registry["launcher"]))
-    result = facts.get("result") or {}
-    if isinstance(result.get("launcher"), str):
-        candidates.append(Path(result["launcher"]))
-    helper = (facts.get("args") or {}).get("helper")
-    if isinstance(helper, str) and os.path.isabs(helper):
-        candidates.append(Path(helper).parent / "launch.sh")
-    rel = release_dir(home)
-    if rel is not None:
-        candidates.append(rel / "native" / "launch.sh")
-    for path in candidates:
-        if path is None or not path.is_absolute() or path.name != "launch.sh":
-            continue
-        try:
-            if (path.is_file() and (path.parent / "trio_native_step.py").is_file()
-                    and (path.parent / "trio-native.js").is_file()):
-                return path
-        except OSError:
-            continue
+def release_native_dir(home: Path) -> Path | None:
+    """The INSTALLED release's ``native/`` directory — the only source of the
+    launcher and helper a dashboard fix ever runs.
+
+    ``TRIO_DASH_RELEASE_NATIVE`` (a native dir; server configuration, never
+    a mailbox value) wins, then the legacy ``TRIO_DASH_NATIVE_LAUNCH`` (its
+    ``launch.sh``), then ``<release>/native``. Launcher paths found in the
+    run registry, ``.native-result.json`` or ``.native-launch.json`` are
+    display-only and never consulted here (eval finding 1)."""
+    configured = _env_path("TRIO_DASH_RELEASE_NATIVE")
+    if configured is None:
+        legacy = _env_path("TRIO_DASH_NATIVE_LAUNCH")
+        configured = legacy.parent if legacy is not None and legacy.name == "launch.sh" else None
+    if configured is None:
+        rel = release_dir(home)
+        configured = rel / "native" if rel is not None else None
+    if configured is None or not configured.is_absolute():
+        return None
+    try:
+        real = configured.resolve()
+        if all((real / name).is_file() for name in ("launch.sh", "trio_native_step.py",
+                                                    "trio-native.js")):
+            return real
+    except OSError:
+        return None
     return None
+
+
+def native_launcher(home: Path) -> Path | None:
+    """The installed release's native ``launch.sh`` (see ``release_native_dir``)."""
+    native = release_native_dir(home)
+    return native / "launch.sh" if native is not None else None
+
+
+def native_helper(home: Path) -> Path | None:
+    """The installed release's ``trio_native_step.py``."""
+    native = release_native_dir(home)
+    return native / "trio_native_step.py" if native is not None else None
+
+
+def _same_file(a, b) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -703,6 +791,92 @@ class FixRefused(Exception):
     """A fix whose server-side preconditions do not hold (never executed)."""
 
 
+class PathEscape(FixRefused):
+    """A mailbox or mailbox file that resolves outside its workspace (a
+    symlink out of the checkout): never read for an agent, never written."""
+
+
+def _lead_worktree_roots(root: Path) -> list[Path]:
+    """Real paths of the git worktrees of the workspace's repository (root-free
+    loops keep their live mailbox in a Lead worktree outside the root)."""
+    top = git_toplevel(root)
+    if top is None:
+        return []
+    out = []
+    for tree in worktree_list(top):
+        path = tree.get("worktree")
+        if isinstance(path, str) and path:
+            try:
+                out.append(Path(path).resolve())
+            except OSError:
+                continue
+    return out
+
+
+def check_mailbox_paths(root: Path, root_mailbox: Path, live_mailbox: Path) -> tuple[Path, Path]:
+    """(real root mailbox, real live mailbox), or PathEscape.
+
+    The root mailbox must resolve inside the resolved workspace root; the
+    live copy inside the root or inside one of the repository's git
+    worktrees (a root-free Lead worktree). A symlinked mailbox pointing
+    elsewhere is refused (eval finding 4)."""
+    try:
+        root_real = Path(root).resolve(strict=True)
+        rbox = Path(root_mailbox).resolve(strict=True)
+        lbox = Path(live_mailbox).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PathEscape(f"mailbox path does not resolve: {exc}") from None
+    if not _under(rbox, root_real) or not rbox.is_dir():
+        raise PathEscape(f"mailbox {root_mailbox} resolves outside the workspace ({rbox})")
+    if lbox != rbox and not _under(lbox, root_real):
+        if not any(_under(lbox, wt) for wt in _lead_worktree_roots(root_real)):
+            raise PathEscape(f"live mailbox {live_mailbox} resolves outside the workspace "
+                             f"and its git worktrees ({lbox})")
+    if not lbox.is_dir():
+        raise PathEscape(f"live mailbox {live_mailbox} is not a directory")
+    return rbox, lbox
+
+
+def mailbox_file(mailbox: Path, name: str) -> Path:
+    """``<mailbox>/<name>`` for reading or writing, refused (PathEscape) when
+    it is a symlink or resolves outside the mailbox."""
+    path = Path(mailbox) / name
+    try:
+        if path.is_symlink():
+            raise PathEscape(f"{name} in {mailbox} is a symlink; refusing to follow it")
+        if path.exists() and path.resolve().parent != Path(mailbox).resolve():
+            raise PathEscape(f"{name} resolves outside {mailbox}")
+    except OSError as exc:
+        raise PathEscape(f"{name}: {exc}") from None
+    return path
+
+
+def _safe_read(mailbox: Path, name: str) -> str | None:
+    """Mailbox file text without following a symlink (None when absent,
+    a symlink, or unreadable)."""
+    try:
+        fd = os.open(str(Path(mailbox) / name), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def append_nofollow(path: Path, text: str, *, header: str | None = None) -> None:
+    """Append to a mailbox file without following a symlink (O_NOFOLLOW);
+    ``header`` is written first when the file is created."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        if header is not None and os.fstat(fd).st_size == 0:
+            os.write(fd, header.encode("utf-8"))
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
 class LoopContext:
     """Everything a fix or a diagnosis reads about one loop, gathered once."""
 
@@ -712,6 +886,7 @@ class LoopContext:
         self.home = Path(home)
         self.root = Path(root)
         self.name = name
+        check_mailbox_paths(root, root_mailbox, live_mailbox)
         self.root_mailbox = Path(root_mailbox)
         self.live_mailbox = Path(live_mailbox)
         self.detection = detection or {}
@@ -793,24 +968,50 @@ def _driver_cmd(ctx: LoopContext, max_iterations: int) -> tuple[list[str], Path]
 
 
 def _native_cmd(ctx: LoopContext, mode: str, max_iterations: int | None = None) -> tuple[list[str], Path]:
-    launcher = native_launcher(ctx.home, ctx.native or {}, ctx.registry)
+    """The installed release's launch.sh, and nothing a mailbox, the run
+    registry or a result record names: no ``--helper`` is ever passed (the
+    workflow then uses the release's own helper), and a resume — which
+    replays the recorded args byte-identically — is refused when those args
+    name any helper other than the release's (eval finding 1)."""
+    launcher = native_launcher(ctx.home)
     if launcher is None:
-        raise FixRefused("no valid native launch.sh (configure TRIO_DASH_NATIVE_LAUNCH or install the release)")
+        raise FixRefused("the installed release has no native launcher (install a release, or "
+                         "configure TRIO_DASH_RELEASE_NATIVE)")
     if mode == "resume":
         run_id = (ctx.native or {}).get("run_id")
         if not run_id or not re.fullmatch(r"wf_[\w-]+", run_id):
             raise FixRefused("no workflow run id recorded for this session; use a fresh start")
         if not (ctx.native or {}).get("launch"):
             raise FixRefused("no .native-launch.json: nothing to resume")
+        args = (ctx.native or {}).get("args") or {}
+        if not isinstance(args, dict):
+            raise FixRefused("the recorded launch args are not an object; use a fresh start")
+        helper = args.get("helper")
+        if helper is not None and not _same_file(helper, native_helper(ctx.home)):
+            raise FixRefused("the recorded run used a helper that is not the installed release's "
+                             f"({helper}); a resume would replay it — use a fresh start")
+        mailbox_arg = args.get("mailbox")
+        if mailbox_arg is not None and not _same_file(mailbox_arg, ctx.live_mailbox):
+            raise FixRefused("the recorded launch args name another mailbox; use a fresh start")
         return (["bash", str(launcher), "resume", "--mailbox", str(ctx.live_mailbox),
                  "--run-id", run_id], ctx.live_repo)
-    cmd = ["bash", str(launcher), "start", "--mailbox", str(ctx.live_mailbox),
-           "--max-iterations", str(max_iterations)]
-    helper = (ctx.native or {}).get("args", {}).get("helper")
-    if isinstance(helper, str) and os.path.isabs(helper) and Path(helper).name == "trio_native_step.py" \
-            and Path(helper).is_file():
-        cmd += ["--helper", helper]
-    return cmd, ctx.live_repo
+    return (["bash", str(launcher), "start", "--mailbox", str(ctx.live_mailbox),
+             "--max-iterations", str(max_iterations)], ctx.live_repo)
+
+
+def native_launcher_note(ctx: LoopContext) -> str | None:
+    """Display-only: the launcher a record says the last run used, when it is
+    not the installed release's (it is never executed)."""
+    recorded = []
+    for source in ((ctx.registry or {}).get("launcher"), ((ctx.native or {}).get("result") or {}).get("launcher")):
+        if isinstance(source, str) and source:
+            recorded.append(source)
+    release = native_launcher(ctx.home)
+    for path in recorded:
+        if release is None or not _same_file(path, release):
+            return (f"the last run was launched with {path}; dashboard fixes always use the "
+                    f"installed release's launcher ({release or 'none installed'})")
+    return None
 
 
 def _state_reset_step(ctx: LoopContext, extra: dict | None = None) -> dict:
@@ -878,6 +1079,8 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
     native = ctx.driver == NATIVE_DRIVER
     notes: list[str] = []
 
+    for name in ("STATE.md", "VERDICT.md"):
+        mailbox_file(ctx.live_mailbox, name)  # PathEscape: never follow a symlink out
     if fix_id in ("rerun", "rerun_more_iterations", "reset_and_rerun", "land",
                   "reconcile_dry_run", "reconcile_apply") and native:
         raise FixRefused("this is a claude-workflow loop; use the native fixes")
@@ -979,7 +1182,7 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
         text = read_text(ctx.live_mailbox / "VERDICT.md") or ""
         if not re.search(r"^commit:\s*[0-9a-f]{7,40}\s*$", text, re.M):
             head = git(Path(repo), "rev-parse", "HEAD").stdout.strip()
-            steps.append({"kind": "append", "path": str(ctx.live_mailbox / "VERDICT.md"),
+            steps.append({"kind": "append", "path": str(mailbox_file(ctx.live_mailbox, "VERDICT.md")),
                           "text": f"commit: {head}\n",
                           "display": f"append 'commit: {head}' to {rel}/VERDICT.md (clean tree: HEAD)"})
         steps.append(_cmd_step(["git", "-C", str(repo), "add", "--", rel], Path(repo), detached=False))
@@ -1026,11 +1229,54 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
                 steps.append(_cmd_step(["git", "-C", str(ctx.live_repo), "branch", "-d", c["branch"]],
                                        ctx.live_repo, detached=False))
         notes += [f"kept {c['path']}: {c['reason']}" for c in candidates if not c["ok"]]
+    if native and fix_id.startswith("native_") or (native and fix_id == "repair_scope"):
+        note = native_launcher_note(ctx)
+        if note:
+            notes.append(note)
+    basis = plan_basis(ctx)
     return {
         "id": fix_id, "title": spec["title"], "destructive": spec["destructive"],
         "requires_confirm": spec["destructive"], "steps": steps,
         "commands_preview": [s["display"] for s in steps], "notes": notes,
+        "basis": basis, "confirm_token": plan_token(ctx, fix_id, steps, basis),
     }
+
+
+def _file_digest(mailbox: Path, name: str) -> str | None:
+    text = _safe_read(mailbox, name)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
+
+
+def plan_basis(ctx: LoopContext) -> dict:
+    """The state a plan was made from: the live checkout's HEAD and the
+    STATE.md / VERDICT.md / HUMAN.md digests (eval finding 3). Computed
+    once per LoopContext (a context is gathered per request)."""
+    cached = getattr(ctx, "_plan_basis", None)
+    if cached is not None:
+        return dict(cached)
+    try:
+        head = git(ctx.live_repo, "rev-parse", "-q", "--verify", "HEAD").stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        head = None
+    basis = {"head": head, "state": _file_digest(ctx.live_mailbox, "STATE.md"),
+             "verdict": _file_digest(ctx.live_mailbox, "VERDICT.md"),
+             "human": _file_digest(ctx.live_mailbox, "HUMAN.md")}
+    ctx._plan_basis = dict(basis)
+    return basis
+
+
+def plan_token(ctx: LoopContext, action_id: str, steps: list[dict], basis: dict,
+               extra: dict | None = None) -> str:
+    """hash(loop, action id, exact steps, basis): a confirm must present the
+    token of the preview it saw; the server re-plans and compares, so a
+    confirm never runs commands (or against a state) the human did not see."""
+    payload = {
+        "loop": ctx.key, "live_mailbox": str(ctx.live_mailbox), "action": action_id,
+        "steps": [{k: s.get(k) for k in ("kind", "argv", "cwd", "path", "changes", "text")}
+                  for s in steps],
+        "basis": basis, "extra": extra or {},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:32]
 
 
 def reconcile_decision(ctx: LoopContext, base: list[str]) -> dict:
@@ -1108,10 +1354,27 @@ def read_actions(home: Path, key: str, limit: int = 50) -> list[dict]:
     return out
 
 
+def _write_atomic_nofollow(path: Path, data: bytes) -> None:
+    """Replace a mailbox file atomically: a fresh temp file (O_EXCL|O_NOFOLLOW)
+    in the same directory, then rename over the target (never through a
+    symlink)."""
+    tmp = path.with_name(f".{path.name}.dash-{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
 def edit_state(path: Path, changes: dict) -> dict:
-    """Rewrite STATE.md keys in place (None removes the key's line)."""
-    text = read_text(path) or ""
-    lines = text.splitlines()
+    """Rewrite STATE.md keys (None removes the key's line); refuses a
+    symlinked STATE.md."""
+    path = mailbox_file(Path(path).parent, Path(path).name)
+    text = _safe_read(path.parent, path.name)
+    if text is None and path.exists():
+        raise OSError(f"cannot read {path} without following a link")
+    lines = (text or "").splitlines()
     seen, before = set(), {}
     out = []
     for line in lines:
@@ -1129,36 +1392,71 @@ def edit_state(path: Path, changes: dict) -> dict:
         if key not in seen and value is not None:
             out.append(f"{key}: {value}")
             before[key] = None
-    tmp = path.with_name(f".{path.name}.dash-{os.getpid()}.tmp")
-    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    _write_atomic_nofollow(path, ("\n".join(out) + "\n").encode("utf-8"))
     return {"before": before, "after": {k: v for k, v in changes.items()}}
+
+
+def _preflight(step: dict) -> str | None:
+    """Why a run step cannot start (None when it can): the executable (or the
+    script ``bash`` runs) and the cwd must exist. Checked for every step
+    before anything is changed (eval finding 11)."""
+    argv = step.get("argv") or []
+    if not argv:
+        return "empty command"
+    if not Path(step.get("cwd") or "").is_dir():
+        return f"working directory {step.get('cwd')} is missing"
+    exe = argv[0]
+    if os.path.isabs(exe):
+        if _executable(Path(exe)) is None:
+            return f"{exe} is not an executable file"
+    elif shutil.which(exe) is None:
+        return f"{exe} is not on PATH"
+    if os.path.basename(exe) == "bash" and len(argv) > 1 and not Path(argv[1]).is_file():
+        return f"{argv[1]} is missing"
+    return None
 
 
 def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | None = None,
                  on_exit=None) -> dict:
     """Run a planned fix's steps in order; stop at the first failure.
 
-    Detached steps (loop drivers, land) start in their own session with
-    output to ``runs/<ts>-<fix>.log`` and must survive a short startup
-    grace; their exit is appended to the action log by a reaper thread."""
+    Every run step is preflighted before anything changes. A STATE.md edit
+    that precedes a driver start is rolled back (the exact previous bytes)
+    when the driver does not start, so a failed start never leaves STATE
+    ``running`` with its ``reason:`` gone; the previous reason is always in
+    the action log. Detached steps (loop drivers, land) start in their own
+    session with output to ``runs/<ts>-<fix>.log`` and must survive a short
+    startup grace; their exit is appended to the action log by a reaper."""
     results = []
     ok = True
+    state_before: dict[str, bytes] = {}
+    reason_before = ctx.state.get("reason")
     for step in plan["steps"]:
+        if step["kind"] == "run":
+            problem = _preflight(step)
+            if problem:
+                results.append({"step": step["display"], "ok": False,
+                                "error": "preflight: " + problem})
+                ok = False
+                break
+    for step in plan["steps"] if ok else []:
         if step["kind"] == "state":
             try:
+                raw = _safe_read(Path(step["path"]).parent, Path(step["path"]).name)
+                if raw is not None:
+                    state_before[step["path"]] = raw.encode("utf-8")
                 results.append({"step": step["display"], "ok": True,
                                 "change": edit_state(Path(step["path"]), step["changes"])})
-            except OSError as exc:
+            except (OSError, FixRefused) as exc:
                 results.append({"step": step["display"], "ok": False, "error": str(exc)})
                 ok = False
                 break
         elif step["kind"] == "append":
             try:
-                with open(step["path"], "a", encoding="utf-8") as fh:
-                    fh.write(step["text"])
+                append_nofollow(mailbox_file(Path(step["path"]).parent, Path(step["path"]).name),
+                                step["text"])
                 results.append({"step": step["display"], "ok": True})
-            except OSError as exc:
+            except (OSError, FixRefused) as exc:
                 results.append({"step": step["display"], "ok": False, "error": str(exc)})
                 ok = False
                 break
@@ -1183,11 +1481,19 @@ def execute_plan(ctx: LoopContext, plan: dict, *, who: dict, processes: dict | N
                 results.append({"step": step["display"], "ok": False, "error": str(exc)})
                 ok = False
                 break
+    if not ok and state_before:
+        for path, data in state_before.items():
+            try:
+                _write_atomic_nofollow(mailbox_file(Path(path).parent, Path(path).name), data)
+                results.append({"step": f"restore {path} (the driver did not start)", "ok": True})
+            except (OSError, FixRefused) as exc:
+                results.append({"step": f"restore {path}", "ok": False, "error": str(exc)})
     entry = log_action(ctx.home, ctx.key, {
         "action": "fix", "fix": plan["id"], "who": who, "mailbox": str(ctx.root_mailbox),
         "live_mailbox": str(ctx.live_mailbox), "commands": plan["commands_preview"],
         "confirmed": bool(plan.get("confirmed")), "ok": ok, "results": results,
-        "state_before": ctx.derived.get("state"),
+        "state_before": ctx.derived.get("state"), "reason": reason_before,
+        "confirm_token": plan.get("confirm_token"), "basis": plan.get("basis"),
     })
     return {"ok": ok, "results": results, "log_id": entry["id"]}
 
@@ -1245,12 +1551,64 @@ def _start_detached(ctx: LoopContext, fix_id: str, step: dict, who: dict,
 HUMAN_FILE = "HUMAN.md"
 HUMAN_HEADER = (
     "# Human answers\n\n"
-    "Append-only answers from a person to the loop (trio-dash answer box or by\n"
-    "hand). The Lead reads this file at the start of every pass; the newest\n"
-    "entry answers the NEEDS_HUMAN/BLOCKED stop that preceded the current run.\n"
-    "Agents never edit it. Format: MAILBOX-SCHEMA.md \"HUMAN.md\".\n"
+    "Append-only answers from a person to the loop, written by trio-dash's answer\n"
+    "box. Each entry starts with a server-written header line\n"
+    "`## <UTC time> — answer <id> — iteration <N> — trio-dash <sig>`; the answer\n"
+    "text follows as `> `-quoted lines, so no answer text can start a header.\n"
+    "The Lead applies only the newest such entry, and only when N is the\n"
+    "iteration that just stopped; older entries are informational. Agents never\n"
+    "edit this file. Format: MAILBOX-SCHEMA.md \"HUMAN.md\".\n"
 )
 ANSWER_LIMIT = 20_000
+ENTRY_RE = re.compile(
+    r"^## (?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) — answer (?P<id>[0-9a-f]{8,16}) — "
+    r"iteration (?P<iteration>\d+|\?) — trio-dash (?P<sig>[0-9a-f]{16,64})$", re.M)
+
+
+def _answer_key(home: Path) -> bytes:
+    """The dashboard's HMAC key for HUMAN.md entry headers (created once,
+    0600, outside every workspace)."""
+    path = state_dir(home) / "answer-key"
+    try:
+        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.urandom(32)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(key.hex() + "\n")
+        return key
+    except FileExistsError:
+        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+
+
+def _entry_sig(home: Path, at: str, answer_id: str, iteration, body: str) -> str:
+    msg = "\n".join([at, answer_id, str(iteration), hashlib.sha256(body.encode()).hexdigest()])
+    return hmac.new(_answer_key(home), msg.encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def quote_body(text: str) -> str:
+    """Every answer line quoted (``> ``): the answer can never forge a header."""
+    return "\n".join(("> " + line) if line else ">" for line in text.split("\n")) + "\n"
+
+
+def human_entries(home: Path, mailbox: Path) -> list[dict]:
+    """Server-written HUMAN.md entries, oldest first, each with ``verified``
+    (its HMAC matches: written by this dashboard, header and text intact)."""
+    text = _safe_read(mailbox, HUMAN_FILE) or ""
+    matches = list(ENTRY_RE.finditer(text))
+    out = []
+    for i, m in enumerate(matches):
+        chunk = text[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+        body_lines = [line[2:] if line.startswith("> ") else "" for line in chunk.splitlines()
+                      if line.startswith(">")]
+        body = "\n".join(body_lines).strip("\n").replace("\r\n", "\n")
+        sig = _entry_sig(home, m["at"], m["id"], m["iteration"], body)
+        out.append({"at": m["at"], "id": m["id"], "iteration": m["iteration"],
+                    "verified": hmac.compare_digest(sig, m["sig"]), "header": m.group(0)})
+    return out
 
 
 def answer_context(ctx: LoopContext) -> dict:
@@ -1266,18 +1624,25 @@ def answer_context(ctx: LoopContext) -> dict:
         stop = f"VERDICT.md {verdict}"
     holds = held_records(ctx.live_mailbox)
     reason = None
-    if ctx.live:
+    try:
+        mailbox_file(ctx.live_mailbox, HUMAN_FILE)
+    except PathEscape as exc:
+        reason = str(exc)
+    if reason is None and ctx.live:
         reason = "the loop is live; answers are only written to a stopped loop"
-    elif stop is None:
+    elif reason is None and stop is None:
         reason = "the loop is not stopped at NEEDS_HUMAN or BLOCKED"
     reset_reason = None
     if holds:
         reset_reason = ("held dispatch records exist: reconcile them first "
                         "(the answer is still recorded, STATE is not reset)")
-    entries = re.findall(r"^## (.+)$", read_text(ctx.live_mailbox / HUMAN_FILE) or "", re.M)
+    entries = human_entries(ctx.home, ctx.live_mailbox)
     return {"allowed": reason is None, "reason": reason, "stop": stop,
             "reset_allowed": reset_reason is None, "reset_reason": reset_reason,
-            "path": str(ctx.live_mailbox / HUMAN_FILE), "entries": entries[-5:],
+            "path": str(ctx.live_mailbox / HUMAN_FILE),
+            "entries": [f"{e['at']} — answer {e['id']} — iteration {e['iteration']}"
+                        + ("" if e["verified"] else " (UNVERIFIED: not written by this dashboard)")
+                        for e in entries[-5:]],
             "verdict": verdict, "iteration": to_int(ctx.state.get("iteration"))}
 
 
@@ -1292,42 +1657,48 @@ def plan_answer(ctx: LoopContext, text: str, reset: bool, who: dict) -> dict:
         raise FixRefused(f"the answer is longer than {ANSWER_LIMIT} characters")
     if reset and not info["reset_allowed"]:
         raise FixRefused(info["reset_reason"])
-    answer_id = hashlib.sha256((text + _now()).encode()).hexdigest()[:8]
+    mailbox_file(ctx.live_mailbox, "STATE.md")
     at = _now()
-    by = who.get("user") or who.get("addr") or "unknown"
-    body = text.strip().replace("\r\n", "\n")
-    entry = (f"\n## {at} — answer {answer_id}\n"
-             f"in-reply-to: {info['stop']} (iteration {info['iteration']})\n"
-             f"source: trio-dash ({by})\n\n{body}\n")
+    body = text.strip().replace("\r\n", "\n").replace("\r", "\n")
+    answer_id = hashlib.sha256((body + at + uuid.uuid4().hex).encode()).hexdigest()[:12]
+    iteration = info["iteration"] if info["iteration"] is not None else "?"
+    by = re.sub(r"[\r\n]+", " ", str(who.get("user") or who.get("addr") or "unknown"))[:120]
+    sig = _entry_sig(ctx.home, at, answer_id, iteration, body)
+    entry = (f"\n## {at} — answer {answer_id} — iteration {iteration} — trio-dash {sig}\n"
+             f"in-reply-to: {info['stop']} (iteration {iteration})\n"
+             f"source: trio-dash ({by})\n\n{quote_body(body)}")
     steps = [{"kind": "append", "path": info["path"], "text": entry,
               "display": f"append answer {answer_id} to {info['path']}"}]
     if reset:
         steps.append(_state_reset_step(ctx, {"human_answer": f"HUMAN.md#{answer_id} ({at})"}))
+    basis = plan_basis(ctx)
+    # The token binds the text, reset choice and state, not the entry's
+    # timestamp/id (a confirm writes a fresh entry for the same answer).
+    token = plan_token(ctx, "answer", [{"kind": "answer", "text": body},
+                                       {"kind": "reset", "changes": reset}], basis)
     return {"id": "answer", "answer_id": answer_id, "entry": entry, "steps": steps,
             "commands_preview": [s["display"] for s in steps], "destructive": reset,
-            "requires_confirm": True, "reset": reset}
+            "requires_confirm": True, "reset": reset, "basis": basis, "confirm_token": token}
 
 
 def execute_answer(ctx: LoopContext, plan: dict, who: dict) -> dict:
-    path = Path(plan["steps"][0]["path"])
     results = []
     try:
-        if not path.exists():
-            path.write_text(HUMAN_HEADER, encoding="utf-8")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(plan["entry"])
+        path = mailbox_file(ctx.live_mailbox, HUMAN_FILE)
+        append_nofollow(path, plan["entry"], header=HUMAN_HEADER)
         results.append({"step": plan["steps"][0]["display"], "ok": True})
         for step in plan["steps"][1:]:
             results.append({"step": step["display"], "ok": True,
                             "change": edit_state(Path(step["path"]), step["changes"])})
         ok = True
-    except OSError as exc:
+    except (OSError, FixRefused) as exc:
         results.append({"ok": False, "error": str(exc)})
         ok = False
     entry = log_action(ctx.home, ctx.key, {
         "action": "answer", "who": who, "answer_id": plan["answer_id"], "reset": plan["reset"],
         "mailbox": str(ctx.live_mailbox), "ok": ok, "results": results,
-        "chars": len(plan["entry"])})
+        "chars": len(plan["entry"]), "reason": ctx.state.get("reason"),
+        "confirm_token": plan.get("confirm_token")})
     return {"ok": ok, "results": results, "answer_id": plan["answer_id"], "log_id": entry["id"]}
 
 
@@ -1347,15 +1718,18 @@ def build_context(ctx: LoopContext) -> dict:
                               ("VERDICT.md", 10000, False), ("PLAN.md", 10000, False),
                               ("REPORT.md", 6000, False), ("LOG.md", 6000, True),
                               ("QUEUE.md", 4000, False), (HUMAN_FILE, 4000, True)):
-        text = tail_text(box / name, limit) if tail else read_text(box / name, limit)
+        text = _safe_read(box, name)  # a symlink out of the mailbox is never read
+        if text is not None and len(text) > limit:
+            text = (f"[… {len(text) - limit} earlier chars]\n" + text[-limit:] if tail
+                    else text[:limit] + f"\n… [truncated, {len(text)} chars]")
         if text is not None:
             files[name] = text
     sidecars = {}
     for name in (".session.json", ".driver.json", ".native-launch.json", ".native-result.json",
                  ".repairs"):
-        text = read_text(box / name, 4000)
+        text = _safe_read(box, name)
         if text is not None:
-            sidecars[name] = text
+            sidecars[name] = text[:4000]
     return {
         "loop": ctx.name, "root": str(ctx.root), "root_mailbox": str(ctx.root_mailbox),
         "live_mailbox": str(ctx.live_mailbox), "driver": ctx.driver,
@@ -1469,36 +1843,133 @@ def validate_diagnosis(raw: dict | None) -> dict:
     return out
 
 
-def harness_command(harness: str, cfg: dict, repo: Path, prompt: str, last_path: Path) -> tuple[list[str], str | None]:
-    """argv (and stdin) of one read-only diagnosis run."""
+CURSOR_ISOLATED_CONFIG = {
+    "version": 1,
+    "permissions": {"allow": [], "deny": ["Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]},
+    "approvalMode": "allowlist",
+}
+"""cli-config.json of the isolated Cursor config dir: nothing pre-approved."""
+
+
+def cursor_isolation(home: Path) -> tuple[dict, Path]:
+    """(env overrides, isolation dir) of a Cursor diagnosis run.
+
+    Cursor reads MCP servers (``~/.cursor/mcp.json``), plugins, per-project
+    MCP approvals and its permission allowlist from ``$HOME/.cursor`` and
+    ``CURSOR_CONFIG_DIR``; the run gets a fresh, empty HOME, config and data
+    dir under the dashboard's state dir. Authentication is the CLI's own: it
+    reads ``$XDG_CONFIG_HOME/cursor/auth.json``, so XDG_CONFIG_HOME keeps
+    pointing at the real ``~/.config`` (the dashboard never reads or copies
+    the token). Verified (cursor-agent 2026.09.28, FIX-REPORT.md):
+    ``cursor-agent mcp list`` → "No MCP servers configured", ``status`` →
+    logged in, and in one real run the user's railway/notion/opendesign/github
+    servers were gone and a write was "Blocked by permissions configuration".
+    NOT removable: plugins synced from the Cursor account (their MCP servers
+    load again) and the built-in WebFetch/WebSearch/Task/dynamic tools —
+    hence Codex is the default and Cursor carries ``CURSOR_WARNING``."""
+    base = state_dir(home) / "cursor-isolated"
+    fake_home, config, data = base / "home", base / "config", base / "data"
+    for path in (fake_home, config, data):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg = config / "cli-config.json"
+    current = read_json(cfg) or {}
+    if current.get("permissions") != CURSOR_ISOLATED_CONFIG["permissions"] \
+            or current.get("approvalMode") != "allowlist":
+        current.update(CURSOR_ISOLATED_CONFIG)
+        tmp = cfg.with_name(f".cli-config.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(current, indent=1), encoding="utf-8")
+        os.replace(tmp, cfg)
+    stray = fake_home / ".cursor" / "mcp.json"
+    if stray.exists() or stray.is_symlink():
+        stray.unlink()  # never a user MCP config in the isolated home
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip() or str(Path(home) / ".config")
+    env = {"HOME": str(fake_home), "XDG_CONFIG_HOME": xdg, "CURSOR_CONFIG_DIR": str(config),
+           "CURSOR_DATA_DIR": str(data)}
+    return env, base
+
+
+def harness_command(harness: str, cfg: dict, repo: Path, prompt: str, last_path: Path,
+                    home: Path | None = None) -> tuple[list[str], str | None, dict]:
+    """argv, stdin and env overrides of one read-only diagnosis run."""
     if harness == "cursor":
+        env = cursor_isolation(home)[0] if home is not None else {}
         return ([cfg["bin"], "-p", "--mode", "ask", "--output-format", "stream-json",
                  "--model", cfg["model"], "--workspace", str(repo), "--trust",
-                 "--sandbox", "enabled", prompt], None)
+                 "--sandbox", "enabled", prompt], None, env)
     if harness == "codex":
         return ([cfg["bin"], "exec", "-m", cfg["model"],
                  "-c", f'model_reasoning_effort="{cfg["effort"]}"',
                  "-s", "read-only", "-c", 'approval_policy="never"',
                  "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
-                 "-C", str(repo), "--json", "-o", str(last_path), "-"], prompt)
+                 "--ignore-rules",
+                 "-C", str(repo), "--json", "-o", str(last_path), "-"], prompt, {})
     raise ValueError(f"unknown harness {harness}")
 
 
+SNAPSHOT_FILE_LIMIT = 5000
+
+
 def _snapshot_files(ctx: LoopContext) -> dict:
-    snap = {}
+    """Integrity snapshot: every file under the live mailbox (recursively,
+    symlinks recorded as links, never followed), the checkout's HEAD, index
+    (``git ls-files -s`` + the index file's digest) and full status including
+    ignored files (eval finding 10)."""
+    snap: dict[str, str] = {}
+    box = ctx.live_mailbox
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(box, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames) + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, box)
+            count += 1
+            if count > SNAPSHOT_FILE_LIMIT:
+                snap["<truncated>"] = str(count)
+                break
+            try:
+                if os.path.islink(path):
+                    snap[rel] = "link:" + os.readlink(path)
+                    continue
+                st = os.stat(path)
+                digest = hashlib.sha256()
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        digest.update(chunk)
+                snap[rel] = f"{digest.hexdigest()}:{st.st_mode:o}"
+            except OSError as exc:
+                snap[rel] = "error:" + type(exc).__name__
+    repo = ctx.live_repo
     try:
-        for path in sorted(ctx.live_mailbox.iterdir()):
-            if path.is_file():
-                snap[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        pass
-    try:
-        snap["<git status>"] = hashlib.sha256(
-            git(ctx.live_repo, "status", "--porcelain=v1").stdout.encode()).hexdigest()
-        snap["<git HEAD>"] = git(ctx.live_repo, "rev-parse", "HEAD").stdout.strip()
+        snap["<git HEAD>"] = git(repo, "rev-parse", "HEAD").stdout.strip()
+        snap["<git index>"] = hashlib.sha256(git(repo, "ls-files", "-s").stdout.encode()).hexdigest()
+        index_path = git(repo, "rev-parse", "--git-path", "index").stdout.strip()
+        if index_path:
+            full = Path(index_path) if os.path.isabs(index_path) else Path(repo) / index_path
+            try:
+                snap["<git index file>"] = hashlib.sha256(full.read_bytes()).hexdigest()
+            except OSError:
+                pass
+        snap["<git status>"] = hashlib.sha256(git(
+            repo, "status", "--porcelain=v1", "--untracked-files=all", "--ignored").stdout.encode()).hexdigest()
+        snap["<git diff>"] = hashlib.sha256(git(repo, "diff", "HEAD", "--binary").stdout.encode()).hexdigest()
+        snap["<git refs>"] = hashlib.sha256(git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout.encode()).hexdigest()
     except (OSError, subprocess.TimeoutExpired):
         pass
     return snap
+
+
+MAX_CONCURRENT_DIAGNOSES = 2
+"""Diagnoses running at once across all loops (cost cap); more get 429."""
+
+
+class DiagnosisBusy(FixRefused):
+    """Too many diagnoses are running (HTTP 429)."""
+
+
+class CursorExposure(FixRefused):
+    """Cursor was requested without accepting ``CURSOR_WARNING`` (HTTP 409
+    with ``accept_exposure_required``)."""
 
 
 class DiagnosisManager:
@@ -1521,21 +1992,35 @@ class DiagnosisManager:
         tmp.write_text(json.dumps(record, indent=1, sort_keys=True, default=str), encoding="utf-8")
         os.replace(tmp, path)
 
-    def start(self, ctx: LoopContext, harness: str, who: dict) -> dict:
+    def start(self, ctx: LoopContext, harness: str, who: dict, *,
+              accept_exposure: bool = False) -> dict:
         catalog = harnesses(ctx.home)
         if harness not in ("cursor", "codex"):
             raise FixRefused("harness must be cursor or codex")
         cfg = catalog[harness]
         if not cfg["available"]:
             raise FixRefused(f"{harness} CLI not found")
+        if harness == "cursor" and not accept_exposure:
+            raise CursorExposure(CURSOR_WARNING)
+        for err in cfg.get("config_errors") or []:
+            raise FixRefused("diagnosis configuration refused: " + err)
+        limit = MAX_CONCURRENT_DIAGNOSES
+        try:
+            limit = max(1, int(os.environ.get("TRIO_DASH_MAX_DIAGNOSES", "") or limit))
+        except ValueError:
+            pass
         with self._lock:
             if ctx.key in self._running:
                 raise FixRefused("a diagnosis is already running for this loop")
+            if len(self._running) >= limit:
+                raise DiagnosisBusy(f"{len(self._running)} diagnoses are already running "
+                                    f"(limit {limit}); try again when one finishes")
             record = {
                 "id": uuid.uuid4().hex[:12], "status": "running", "harness": harness,
                 "model": cfg["model"], "effort": cfg.get("effort"), "started_at": _now(),
                 "who": who, "events": 0, "last_event": "starting", "loop": ctx.name,
                 "loop_live": ctx.live,
+                "warning": cfg.get("warning"),
             }
             self._running[ctx.key] = record
         self._save(ctx.home, ctx.key, record)
@@ -1559,9 +2044,10 @@ class DiagnosisManager:
             context = build_context(ctx)
             prompt = build_prompt(context)
             before = _snapshot_files(ctx)
-            argv, stdin_text = harness_command(harness, cfg, ctx.live_repo, prompt, last_path)
+            argv, stdin_text, env_over = harness_command(harness, cfg, ctx.live_repo, prompt,
+                                                         last_path, ctx.home)
             timeout = float(os.environ.get("TRIO_DASH_DIAGNOSE_TIMEOUT") or DIAGNOSE_TIMEOUT_SECONDS)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1")
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", **env_over)
             proc = subprocess.Popen(argv, cwd=str(ctx.live_repo), stdin=subprocess.PIPE if stdin_text
                                     else subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, env=env,

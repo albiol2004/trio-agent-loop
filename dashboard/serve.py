@@ -865,7 +865,18 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
                 known.add(mbox)
     except OSError:
         pass
+    try:
+        root_real = Path(root).resolve()
+    except OSError:
+        root_real = Path(root)
     for loop_dir in found:
+        # A mailbox dir that is a symlink out of the workspace is not one of
+        # its loops (eval finding 4): never listed, never acted on.
+        try:
+            if not _path_is_under(Path(loop_dir).resolve(), root_real):
+                continue
+        except OSError:
+            continue
         live = None
         if live_fn is not None:
             try:
@@ -4618,8 +4629,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             ((p, read) for p, read in _live_loop_dirs(metrics, root)
              if metrics.loop_name(root, p) == name), None)
 
-    def _loop_context(self, root: Path, name):
-        pair = self._find_loop_pair(name, root)
+    def _loop_context(self, root: Path, name, pair=None):
+        """LoopContext of a loop, or None (unknown). Raises the module's
+        PathEscape for a mailbox that resolves outside the workspace."""
+        pair = pair or self._find_loop_pair(name, root)
         if pair is None:
             return None
         root_dir, live = pair
@@ -4631,28 +4644,53 @@ class DashboardHandler(BaseHTTPRequestHandler):
             last_action=_last_action(live),
             registry=_native_registry_entry(live))
 
-    def _post_loop_context(self):
-        """(payload, ctx) of a POST naming {root, loop}; sends the error."""
+    def _post_loop_target(self):
+        """(payload, root, name, pair) of a POST naming {root, loop}; sends
+        the error and returns None when it does not resolve. The context
+        itself is built later, under the loop's action lock."""
         payload = self._read_loop_body()
         if payload is None:
-            return None, None
+            return None
         root = self._resolve_loop_root(payload)
         if root is None:
-            return None, None
-        ctx = self._loop_context(root, payload.get("loop"))
+            return None
+        name = payload.get("loop")
+        pair = self._find_loop_pair(name, root)
+        if pair is None:
+            self._send_json(404, {"error": "unknown loop"})
+            return None
+        return payload, root, name, pair
+
+    def _locked_context(self, root: Path, name, pair):
+        """Build the LoopContext (after the caller took the action lock), or
+        send 403 for a mailbox outside the workspace and return None."""
+        la = load_loop_actions_module()
+        try:
+            ctx = self._loop_context(root, name, pair)
+        except la.PathEscape as exc:
+            self._send_json(403, {"error": str(exc), "refused": True})
+            return None
         if ctx is None:
             self._send_json(404, {"error": "unknown loop"})
-            return None, None
-        return payload, ctx
+        return ctx
 
     def _handle_loop_actions(self, query: dict, root: Path) -> None:
         name = (query.get("loop") or [None])[0]
-        ctx = self._loop_context(root, name)
+        la = load_loop_actions_module()
+        try:
+            ctx = self._loop_context(root, name)
+        except la.PathEscape as exc:
+            return self._send_json(403, {"error": str(exc), "refused": True})
         if ctx is None:
             return self._send_json(404, {"error": "unknown loop"})
-        la = load_loop_actions_module()
         diagnosis = _diagnoses().status(HOME, ctx.key)
         proposed = ((diagnosis or {}).get("result") or {}).get("proposed_fix") or {}
+        if proposed:
+            # Agent-authored text is never shown as a command: only what the
+            # server itself plans (server_commands) is; the agent's own
+            # preview is kept apart, labelled, for the record (finding 10).
+            proposed["agent_commands_preview"] = proposed.pop("commands_preview", []) or []
+            proposed["server_commands"] = []
         if proposed.get("id") in la.FIXES and not proposed.get("rejected"):
             if proposed["id"] == "reconcile_apply":
                 proposed["server_check"] = "re-checked (dry run must be ready) on apply"
@@ -4672,6 +4710,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "native": {k: native.get(k) for k in (
                 "session_id", "run_id", "session_live", "lock", "result", "args")}
             if native else None,
+            "native_launcher": str(la.native_launcher(HOME) or "") or None,
             "fixes": la.available_fixes(ctx), "unblock": la.UNBLOCK_TABLE,
             "never_automated": la.NEVER_AUTOMATED,
             "answer": la.answer_context(ctx), "diagnosis": diagnosis,
@@ -4688,45 +4727,75 @@ class DashboardHandler(BaseHTTPRequestHandler):
             HOME, la.loop_key(pair[0]))})
 
     def _handle_loop_diagnose(self) -> None:
-        payload, ctx = self._post_loop_context()
+        target = self._post_loop_target()
+        if target is None:
+            return
+        payload, root, name, pair = target
+        ctx = self._locked_context(root, name, pair)
         if ctx is None:
             return
         la = load_loop_actions_module()
         harness = payload.get("harness") or la.harnesses(HOME)["default"]
+        accept = payload.get("accept_exposure") is True
         try:
-            record = _diagnoses().start(ctx, harness, self._who())
+            record = _diagnoses().start(ctx, harness, self._who(), accept_exposure=accept)
+        except la.DiagnosisBusy as exc:
+            return self._send_json(429, {"error": str(exc)})
+        except la.CursorExposure as exc:
+            return self._send_json(409, {"error": "Cursor needs accept_exposure: true",
+                                         "accept_exposure_required": True,
+                                         "warning": str(exc)})
         except la.FixRefused as exc:
             return self._send_json(409, {"error": str(exc)})
         self._send_json(202, {"diagnosis": record})
 
     def _handle_loop_fix(self) -> None:
-        payload, ctx = self._post_loop_context()
-        if ctx is None:
+        target = self._post_loop_target()
+        if target is None:
             return
+        payload, root, name, pair = target
         la = load_loop_actions_module()
+        key = la.loop_key(pair[0])
         fix_id = payload.get("fix")
         args = payload.get("args") or {}
         if not isinstance(fix_id, str) or fix_id not in la.FIXES:
-            la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": str(fix_id)[:80],
-                                          "who": self._who(), "reason": "unknown fix id"})
+            la.log_action(HOME, key, {"action": "fix-refused", "fix": str(fix_id)[:80],
+                                      "who": self._who(), "reason": "unknown fix id"})
             return self._send_json(400, {"error": "unknown fix id",
                                          "allowlist": sorted(la.FIXES)})
         if not isinstance(args, dict):
             return self._send_json(400, {"error": "args must be an object"})
-        lock = _action_lock(ctx.key)
+        token = payload.get("confirm_token")
+        lock = _action_lock(key)
         if not lock.acquire(blocking=False):
             return self._send_json(409, {"error": "another action on this loop is in progress"})
         try:
+            # The context is gathered only now, under the lock (finding 3).
+            ctx = self._locked_context(root, name, pair)
+            if ctx is None:
+                return
             try:
                 plan = la.plan_fix(ctx, fix_id, args)
             except la.FixRefused as exc:
                 la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": fix_id,
                                               "who": self._who(), "reason": str(exc)})
                 return self._send_json(409, {"error": str(exc), "refused": True})
-            preview = {k: plan[k] for k in ("id", "title", "destructive", "commands_preview", "notes")}
-            if plan["requires_confirm"] and payload.get("confirm") is not True:
-                return self._send_json(409, {"confirm_required": True, "plan": preview,
-                                             "error": "confirm required: review the commands"})
+            preview = {k: plan[k] for k in ("id", "title", "destructive", "commands_preview",
+                                            "notes", "confirm_token", "basis")}
+            if plan["requires_confirm"]:
+                if payload.get("confirm") is not True or not isinstance(token, str):
+                    return self._send_json(409, {"confirm_required": True, "plan": preview,
+                                                 "error": "confirm required: review the commands "
+                                                          "and confirm with their confirm_token"})
+                if token != plan["confirm_token"]:
+                    la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": fix_id,
+                                                  "who": self._who(),
+                                                  "reason": "confirm token does not match the "
+                                                            "current plan (state changed)"})
+                    return self._send_json(409, {
+                        "confirm_required": True, "plan_changed": True, "plan": preview,
+                        "error": "the plan changed since the preview (commands or loop state); "
+                                 "review the new commands"})
             plan["confirmed"] = payload.get("confirm") is True
             live_mailbox = ctx.live_mailbox
 
@@ -4749,29 +4818,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(200 if result["ok"] else 502, {"plan": preview, **result})
 
     def _handle_loop_answer(self) -> None:
-        payload, ctx = self._post_loop_context()
-        if ctx is None:
+        target = self._post_loop_target()
+        if target is None:
             return
+        payload, root, name, pair = target
         la = load_loop_actions_module()
         reset = payload.get("reset", True)
         if not isinstance(reset, bool):
             return self._send_json(400, {"error": "reset must be a boolean"})
-        lock = _action_lock(ctx.key)
+        token = payload.get("confirm_token")
+        lock = _action_lock(la.loop_key(pair[0]))
         if not lock.acquire(blocking=False):
             return self._send_json(409, {"error": "another action on this loop is in progress"})
         try:
+            ctx = self._locked_context(root, name, pair)
+            if ctx is None:
+                return
             try:
                 plan = la.plan_answer(ctx, payload.get("answer"), reset, self._who())
             except la.FixRefused as exc:
                 return self._send_json(409, {"error": str(exc), "refused": True})
-            preview = {k: plan[k] for k in ("answer_id", "entry", "commands_preview", "reset", "destructive")}
-            if payload.get("confirm") is not True:
+            preview = {k: plan[k] for k in ("answer_id", "entry", "commands_preview", "reset",
+                                            "destructive", "confirm_token", "basis")}
+            if payload.get("confirm") is not True or not isinstance(token, str):
                 return self._send_json(409, {"confirm_required": True, "plan": preview,
-                                             "error": "confirm required: review the changes"})
+                                             "error": "confirm required: review the changes "
+                                                      "and confirm with their confirm_token"})
+            if token != plan["confirm_token"]:
+                return self._send_json(409, {
+                    "confirm_required": True, "plan_changed": True, "plan": preview,
+                    "error": "the loop changed since the preview; review the new changes"})
             result = la.execute_answer(ctx, plan, self._who())
         finally:
             lock.release()
-        fresh = self._loop_context(ctx.root, ctx.name)
+        try:
+            fresh = self._loop_context(ctx.root, ctx.name)
+        except la.PathEscape:
+            fresh = None
         restart = []
         if fresh is not None:
             restart = [f for f in la.available_fixes(fresh)

@@ -219,15 +219,28 @@ Endpoints:
   fixes: [{id, title, applicable, destructive, commands_preview | reason}],
   unblock (table), never_automated, answer: {allowed, reason, stop,
   reset_allowed}, diagnosis, harnesses, log (last 50 actions)}`.
-- `POST /api/loop/diagnose {root, loop, harness?}` → 202; 409 while one runs
-  for that loop. `GET /api/loop/diagnosis?root=&loop=` polls it.
-- `POST /api/loop/fix {root, loop, fix, args?, confirm?}` — 400 for an id
-  outside the allowlist (logged), 409 `{refused}` when a precondition fails,
-  409 `{confirm_required, plan: {commands_preview, notes}}` for a destructive
-  fix without `confirm: true`; 200/502 with per-step results otherwise.
-- `POST /api/loop/answer {root, loop, answer, reset?=true, confirm?}` — 409
-  preview first (the exact HUMAN.md entry and STATE changes), then writes;
-  the response lists the restart fixes that now apply.
+- `POST /api/loop/diagnose {root, loop, harness?, accept_exposure?}` → 202;
+  409 while one runs for that loop; 409 `{accept_exposure_required,
+  warning}` for Cursor without `accept_exposure: true`; 429 when
+  `TRIO_DASH_MAX_DIAGNOSES` (default 2) diagnoses already run across all
+  loops. `GET /api/loop/diagnosis?root=&loop=` polls it.
+- `POST /api/loop/fix {root, loop, fix, args?, confirm?, confirm_token?}` —
+  400 for an id outside the allowlist (logged), 409 `{refused}` when a
+  precondition fails, 409 `{confirm_required, plan: {commands_preview, notes,
+  confirm_token, basis}}` for a destructive fix; the confirm must carry that
+  `confirm_token` = hash(loop, fix id, exact steps, HEAD sha, STATE.md /
+  VERDICT.md / HUMAN.md digests). The server re-plans under the loop's
+  action lock (the loop context is gathered only after the lock is taken)
+  and compares: a mismatch is 409 `{plan_changed, plan}` with the new
+  preview, and nothing runs. 200/502 with per-step results otherwise.
+- `POST /api/loop/answer {root, loop, answer, reset?=true, confirm?,
+  confirm_token?}` — 409 preview first (the exact HUMAN.md entry and STATE
+  changes, and its token), then writes with the same token rule; the
+  response lists the restart fixes that now apply.
+- A mailbox (or its STATE.md / VERDICT.md / HUMAN.md) that resolves outside
+  the workspace root and its git worktrees — a symlink out of the checkout —
+  gets 403 on every action endpoint; its files are never read into a
+  diagnosis prompt nor written.
 
 **Fix allowlist** (server-side; a diagnosis only proposes an id). Every fix
 first requires that nothing is live (no driver/lock pid, no live session
@@ -238,16 +251,24 @@ pid, no running broker session, broker liveness known). Destructive ones
 |---|---|---|
 | `rerun` | non-terminal STATE, no holds (Omnigent/portable) | `trioctl omnigent loop --mailbox <root mailbox> --max-iterations N` |
 | `rerun_more_iterations` | stopped at the iteration cap; N > iteration | same, higher N |
-| `reset_and_rerun` ★ | STATE `error` | STATE → running/idle (reason removed), then `rerun` |
-| `native_resume` | claude-workflow run killed mid-run, run id known | `launch.sh resume --mailbox … --run-id wf_…` |
-| `native_start` | claude-workflow held/conflict/budget/cap/interrupted | `launch.sh start --mailbox … --max-iterations N [--helper …]` |
-| `native_reset_and_start` ★ | claude-workflow STATE `error` | STATE reset, then `native_start` |
+| `reset_and_rerun` ★ | STATE `error` | driver preflighted, STATE → running/idle (reason removed; kept in the action log), then `rerun`; STATE is restored byte-for-byte if the driver does not start |
+| `native_resume` | claude-workflow run killed mid-run, run id known, recorded args name no helper but the release's | `<release>/native/launch.sh resume --mailbox … --run-id wf_…` |
+| `native_start` | claude-workflow held/conflict/budget/cap/interrupted | `<release>/native/launch.sh start --mailbox … --max-iterations N` (never `--helper`) |
+| `native_reset_and_start` ★ | claude-workflow STATE `error` | `native_start`'s launcher preflighted, STATE reset, then `native_start` |
 | `land` ★ | STATE `needs_land`, no unresolved merge in the Lead worktree | `trioctl omnigent land --mailbox …` |
 | `reconcile_dry_run` | held-dispatch records exist | `trioctl omnigent reconcile --mailbox … --json --dry-run` |
 | `reconcile_apply` ★ | a fresh dry run (run by the server) says `ready` | `… reconcile --json --apply` |
 | `retire_ship` ★ | `needs_retirement`, VERDICT SHIP, product tree clean outside the mailbox | `commit: <HEAD>` in VERDICT.md; `git add <mailbox>`; `git commit -m "loop: iteration N — SHIP"` |
 | `repair_scope` | VERDICT `ITERATE scope=local:…`, `.repairs` 1–2 | the driver with `--max-iterations iteration+1` |
 | `cleanup_worktrees` ★ | dangling builder worktrees that are clean and merged | `git worktree remove <path>`; `git branch -d <branch>` |
+
+Native fixes run ONLY the installed release's launcher and helper:
+`TRIO_DASH_RELEASE_NATIVE` (a release `native/` dir; legacy
+`TRIO_DASH_NATIVE_LAUNCH`, its `launch.sh`) or
+`~/.local/share/trio-agent-loop/releases/<CURRENT>/native`. Launcher or
+helper paths in the run registry, `.native-result.json` or
+`.native-launch.json` are display-only (a note in the fix row); a
+mailbox-supplied helper is never passed.
 
 Never automated (no id exists): resolving a NEEDS_HUMAN check,
 reconciliation without receipt proof, land-conflict resolution, `abandon`,
@@ -262,32 +283,54 @@ the unblock table and the allowlist, and stores its JSON answer
 (`{diagnosis, state, evidence[], proposed_fix: {id, args, commands_preview,
 destructive}, needs_human_input, question?}`) per loop. Unknown or
 never-automated ids are marked `rejected`; `destructive` is taken from the
-allowlist. Harnesses (`TRIO_DASH_DIAGNOSE_HARNESS`, default `cursor`):
-- Cursor: `cursor-agent -p --mode ask --output-format stream-json --model
-  cursor-grok-4.6-low --workspace <repo> --trust --sandbox enabled` (ask mode
-  is read-only; no `--force`). `TRIO_DASH_CURSOR_AGENT`,
-  `TRIO_DASH_CURSOR_MODEL`.
-- Codex: `codex exec -m gpt-6-luna -c model_reasoning_effort="high" -s
-  read-only -c approval_policy="never" --ephemeral --skip-git-repo-check
-  --ignore-user-config -C <repo> --json -o <file> -` (prompt on stdin).
-  `TRIO_DASH_CODEX`, `TRIO_DASH_CODEX_MODEL`, `TRIO_DASH_CODEX_EFFORT`.
-The server hashes the mailbox files and `git status`/HEAD before and after
-and flags any change while the loop was stopped. Timeout
-`TRIO_DASH_DIAGNOSE_TIMEOUT` (900 s).
+allowlist. The drawer shows only the commands the server planned itself
+("Server-validated commands"); the agent's own command text sits under a
+collapsed, labelled "Agent said (unverified agent text …)" section.
+Harnesses (`TRIO_DASH_DIAGNOSE_HARNESS`, default `codex`):
+- Codex (default): `codex exec -m gpt-6-luna -c model_reasoning_effort="high"
+  -s read-only -c approval_policy="never" --ephemeral --skip-git-repo-check
+  --ignore-user-config --ignore-rules -C <repo> --json -o <file> -` (prompt
+  on stdin; OS read-only sandbox, no network, no user MCP config, no
+  execpolicy rules). `TRIO_DASH_CODEX`, `TRIO_DASH_CODEX_MODEL` (allowlist:
+  `gpt-6-luna`), `TRIO_DASH_CODEX_EFFORT` (low/medium/high/xhigh/max).
+- Cursor (opt-in, needs `accept_exposure: true` after the UI shows its
+  warning): `cursor-agent -p --mode ask --output-format stream-json --model
+  cursor-grok-4.6-low --workspace <repo> --trust --sandbox enabled` with an
+  isolated `HOME`, `CURSOR_CONFIG_DIR` and `CURSOR_DATA_DIR` under
+  `~/.local/state/trio-dash/cursor-isolated/` (a `cli-config.json` with no
+  allowed tools and Shell/Write/WebFetch/MCP denied); `XDG_CONFIG_HOME`
+  stays the user's so the CLI finds its own login. Verified: the user's
+  `~/.cursor/mcp.json` servers and approvals are gone and writes are
+  "Blocked by permissions configuration". NOT removable from the CLI:
+  plugins synced from the Cursor account (their MCP servers load again) and
+  the built-in WebFetch/WebSearch/Task/dynamic tools — hence the warning.
+  `TRIO_DASH_CURSOR_AGENT`, `TRIO_DASH_CURSOR_MODEL` (allowlist:
+  `cursor-grok-4.6-low`). An override outside an allowlist refuses the
+  diagnosis (never a Claude model).
+The server snapshots every file under the live mailbox (recursively,
+without following links) plus the checkout's HEAD, index, refs, diff and
+full status (ignored files included) before and after, and flags any change
+while the loop was stopped. Timeout `TRIO_DASH_DIAGNOSE_TIMEOUT` (900 s).
 
 **Answer box** — for NEEDS_HUMAN/BLOCKED loops with no live driver: appends
-a timestamped entry to the live mailbox's `HUMAN.md` and (default) resets
-STATE.md to `status: running`, `phase: idle`, `human_answer: HUMAN.md#<id>`;
-the Lead reads HUMAN.md at the start of its next pass (MAILBOX-SCHEMA.md
-"HUMAN.md"). With held-dispatch records only the answer is written.
+a signed entry (`## <UTC> — answer <id> — iteration <N> — trio-dash <hmac>`,
+the text quoted with `> `) to the live mailbox's `HUMAN.md` and (default)
+resets STATE.md to `status: running`, `phase: idle`,
+`human_answer: HUMAN.md#<id>`; the Lead applies the newest current entry at
+the start of its next pass and the Evaluator counts it as evidence for the
+`verify: human` check it answers (MAILBOX-SCHEMA.md "HUMAN.md", including
+the staleness rule). With held-dispatch records only the answer is written.
 
 **Deploying to the service** (not applied by this change):
 `dashboard/service/point-at-release.sh` checks that the installed release's
 dashboard supports the service (`--discover`, guards, `loop_actions.py`,
 `service/run`) and, with `--apply`, points `TRIO_DASH_CHECKOUT` in
 `~/.services/trio-dash/env` at `~/.local/share/trio-agent-loop/releases/<CURRENT>`
-and installs the release's `run` (backups kept, rollback lines printed);
-then `svc restart trio-dash`. A release older than dash-actions is refused.
+and installs the release's `run` (backups with unique stamps, rollback
+lines printed — including `rm -f run` when there was none); then
+`svc restart trio-dash`. A release older than dash-actions is refused;
+CURRENT must be one hex id inside `releases/`; the value is written
+single-quoted (never via sed or eval).
 
 ## Skills editor
 

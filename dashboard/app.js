@@ -1226,13 +1226,16 @@ function renderActions(data) {
 
   const sel = el("diagnose-harness");
   if (!sel.options.length && data.harnesses) {
-    for (const name of ["cursor", "codex"]) {
+    for (const name of ["codex", "cursor"]) {
       const h = data.harnesses[name];
       if (!h) continue;
       const opt = document.createElement("option");
       opt.value = name;
       opt.textContent = (name === "cursor" ? "Cursor · " : "Codex · ") + h.model +
-        (h.effort ? " (" + h.effort + ")" : "") + (h.available ? "" : " — not installed");
+        (h.effort ? " (" + h.effort + ")" : "") +
+        (name === "cursor" ? " — not sandboxed, see warning" : " — OS read-only sandbox") +
+        (h.available ? "" : " — not installed");
+      if (h.warning) opt.title = h.warning;
       opt.disabled = !h.available;
       sel.appendChild(opt);
     }
@@ -1354,11 +1357,14 @@ async function applyFix(fix, args, btn, note) {
   note.className = "control-note caption control-pending";
   try {
     let { status, data } = await postLoopAction("/api/loop/fix", { fix: fix.id, args });
-    if (status === 409 && data.confirm_required) {
+    // A confirm carries the preview's token; when the loop changed in
+    // between, the server answers with the new plan, shown again here.
+    for (let round = 0; round < 3 && status === 409 && data.confirm_required; round++) {
       const plan = data.plan || {};
       const ok = await confirmCommands({
         title: plan.title || fix.title,
-        lead: "The server re-checked the preconditions just now. Confirming runs exactly these commands" +
+        lead: (data.plan_changed ? "The plan CHANGED since you last reviewed it (the loop state moved). " : "") +
+          "The server re-checked the preconditions just now. Confirming runs exactly these commands" +
           (plan.destructive ? " (they change history or loop state):" : ":"),
         commands: plan.commands_preview, notes: plan.notes,
       });
@@ -1367,7 +1373,8 @@ async function applyFix(fix, args, btn, note) {
         note.className = "control-note caption";
         return;
       }
-      ({ status, data } = await postLoopAction("/api/loop/fix", { fix: fix.id, args, confirm: true }));
+      ({ status, data } = await postLoopAction("/api/loop/fix",
+        { fix: fix.id, args, confirm: true, confirm_token: plan.confirm_token }));
     }
     if (status >= 200 && status < 300 && data.ok) {
       const started = (data.results || []).filter((r) => r.detached);
@@ -1440,12 +1447,27 @@ function renderDiagnosis(d) {
     (fix.rejected ? " — REJECTED by the server (" + fix.rejected + ")" : "") +
     (fix.server_check ? " — server: " + fix.server_check : "");
   panel.appendChild(fixLine);
-  const cmds = (fix.server_commands && fix.server_commands.length) ? fix.server_commands : fix.commands_preview;
-  if (cmds && cmds.length) {
+  // Only commands the server planned itself are shown as commands.
+  const cmds = fix.server_commands || [];
+  if (cmds.length) {
+    panel.appendChild(span("caption", "Server-validated commands:"));
     const pre = document.createElement("pre");
     pre.className = "fix-commands mono";
     pre.textContent = cmds.join("\n");
     panel.appendChild(pre);
+  }
+  const said = fix.agent_commands_preview || [];
+  if (said.length) {
+    const box = document.createElement("details");
+    box.className = "agent-said";
+    const sum = document.createElement("summary");
+    sum.textContent = "Agent said (unverified agent text — never run, not what a fix executes)";
+    box.appendChild(sum);
+    const pre = document.createElement("pre");
+    pre.className = "mono";
+    pre.textContent = said.join("\n");
+    box.appendChild(pre);
+    panel.appendChild(box);
   }
   if (r.needs_human_input) {
     const q = document.createElement("p");
@@ -1463,8 +1485,18 @@ async function startDiagnosis() {
   el("diagnose-btn").disabled = true;
   setNote("diagnose-note", "Starting a read-only diagnosis…", "pending");
   try {
-    const { status, data } = await postLoopAction("/api/loop/diagnose", { harness });
+    let { status, data } = await postLoopAction("/api/loop/diagnose", { harness });
+    if (status === 409 && data.accept_exposure_required) {
+      const ok = await confirmCommands({
+        title: "Cursor is not sandboxed",
+        lead: data.warning || "",
+        commands: [], okText: "Accept and run Cursor",
+      });
+      if (!ok) { setNote("diagnose-note", "Cancelled; use Codex for a sandboxed diagnosis."); return; }
+      ({ status, data } = await postLoopAction("/api/loop/diagnose", { harness, accept_exposure: true }));
+    }
     if (status === 202) setNote("diagnose-note", "Running (" + data.diagnosis.harness + " · " + data.diagnosis.model + ").", "ok");
+    else if (status === 429) setNote("diagnose-note", "Busy: " + (data.error || "too many diagnoses"), "error");
     else setNote("diagnose-note", "Not started: " + (data.error || "HTTP " + status), "error");
   } catch (err) {
     setNote("diagnose-note", "Request failed: " + err.message, "error");
@@ -1480,16 +1512,18 @@ async function submitAnswer(ev) {
   el("answer-restart").hidden = true;
   try {
     let { status, data } = await postLoopAction("/api/loop/answer", { answer, reset });
-    if (status === 409 && data.confirm_required) {
+    for (let round = 0; round < 3 && status === 409 && data.confirm_required; round++) {
       const plan = data.plan || {};
       const ok = await confirmCommands({
         title: "Record this answer",
-        lead: "Appends this entry to HUMAN.md" + (plan.reset ? " and resets STATE.md:" : ":"),
+        lead: (data.plan_changed ? "The loop CHANGED since the preview. " : "") +
+          "Appends this entry to HUMAN.md" + (plan.reset ? " and resets STATE.md:" : ":"),
         commands: [plan.entry || "", ""].concat(plan.commands_preview || []),
         okText: "Write answer",
       });
       if (!ok) { setNote("answer-note", "Cancelled; nothing was written."); return; }
-      ({ status, data } = await postLoopAction("/api/loop/answer", { answer, reset, confirm: true }));
+      ({ status, data } = await postLoopAction("/api/loop/answer",
+        { answer, reset, confirm: true, confirm_token: plan.confirm_token }));
     }
     if (status === 200 && data.ok) {
       el("answer-text").value = "";

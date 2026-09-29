@@ -42,9 +42,16 @@ class RealCliTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(work)], check=True)
             (work / "probe.txt").write_text("hello-from-trio-dash\n", encoding="utf-8")
             last = work.parent / f"{work.name}.last"
-            argv, stdin = la.harness_command(harness, cfg, work, PROMPT, last)
+            state = work.parent / f"{work.name}.state"
+            os.environ["TRIO_DASH_STATE_DIR"] = str(state)
+            try:
+                argv, stdin, env_over = la.harness_command(harness, cfg, work, PROMPT, last,
+                                                           Path.home())
+            finally:
+                os.environ.pop("TRIO_DASH_STATE_DIR", None)
             proc = subprocess.run(argv, cwd=work, input=stdin, capture_output=True, text=True,
-                                  timeout=300, stdin=None if stdin else subprocess.DEVNULL)
+                                  timeout=300, stdin=None if stdin else subprocess.DEVNULL,
+                                  env={**os.environ, **env_over})
             final = ""
             for line in proc.stdout.splitlines():
                 _summary, text = la._event_summary(harness, line)

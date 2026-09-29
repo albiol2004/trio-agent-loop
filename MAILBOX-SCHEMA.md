@@ -1188,18 +1188,34 @@ claude-workflow); a NEEDS_HUMAN or BLOCKED stop is resolved as
 stop → answer → reset → re-run.
 
 - **Writers**: the trio-dash answer box (`POST /api/loop/answer`, only for a
-  loop whose driver is not live and that is stopped at NEEDS_HUMAN/BLOCKED),
-  or a person by hand. Agents never edit it.
+  loop whose driver is not live and that is stopped at NEEDS_HUMAN/BLOCKED).
+  Agents never edit it. The dashboard refuses a HUMAN.md (or STATE.md) that
+  is a symlink and writes with `O_NOFOLLOW`.
 - **Format**: optional `# Human answers` header, then append-only entries,
-  newest last:
+  newest last. Only the header line is server-written structure; the
+  answer text is quoted line by line (`> `), so no answer can forge a
+  header:
 
   ```
-  ## 2026-09-29T13:05:00Z — answer 3f9c01ab
+  ## 2026-09-29T13:05:00Z — answer 3f9c01ab22d4 — iteration 3 — trio-dash 9a0c…(24 hex)
   in-reply-to: STATE.md status needs_human (iteration 3)
   source: trio-dash (<tailnet login or client address>)
 
-  <free text: the human-check result or the decision>
+  > the human-check result or the decision,
+  > one quoted line per answer line
   ```
+
+  `iteration <N>` is the iteration whose NEEDS_HUMAN/BLOCKED stop it
+  answers. The last field is an HMAC-SHA256 (first 24 hex) over the time,
+  id, iteration and answer text, keyed by `~/.local/state/trio-dash/
+  answer-key` (0600, outside every workspace): the dashboard marks an entry
+  whose signature does not verify as UNVERIFIED (hand-written or edited).
+- **Staleness**: an entry answers the stop of iteration N and is current
+  only for iteration N+1 (the Lead pass that follows it and that pass's
+  evaluation). Readers apply only the newest server-written entry whose N is
+  the iteration that just stopped; entries older than that — written before
+  the current iteration's predecessor ended — and any text outside a
+  server-written entry are informational.
 
 - **STATE.md**: the answer box may reset the loop in the same step (shown
   and confirmed first): `status: running`, `phase: idle` (the next run
@@ -1209,7 +1225,12 @@ stop → answer → reset → re-run.
   this way; reconcile it first.
 - **Readers**: the Lead reads HUMAN.md at the start of every pass (canonical
   `trio-lead` input 5; Omnigent `prompts/lead.md` step 1; the claude-workflow
-  plan call) and applies the newest entry. It is a regular mailbox file
+  plan call) and applies the current entry (Staleness, above). The Evaluator
+  (canonical NEEDS_HUMAN rule, Omnigent `prompts/evaluator.md` step 1, the
+  claude-workflow Evaluator call, protocol essentials) treats the current
+  entry as evidence for a `verify: human` criterion whose `## Human check`
+  result it reports, so an answered check does not end NEEDS_HUMAN again.
+  Without HUMAN.md every prompt behaves as before. It is a regular mailbox file
   (committed with the mailbox; not a runtime file). Root-free loops keep it
   in the live mailbox (the Lead worktree copy), like STATE.md.
 
@@ -1219,12 +1240,20 @@ stop → answer → reset → re-run.
   registry `~/.local/share/trio-agent-loop/native-runs/<key>.json` are
   written by the native driver (`native/README.md` "Run registry and
   result"); `.native-result.json` is a runtime file (mailbox `.gitignore`).
+  The dashboard uses both for display and state only: a `launcher` or
+  `helper` path in them (or in `.native-launch.json`) is never executed —
+  fixes run the installed release's `native/launch.sh`. A registry record
+  seeds a workspace only when its `repo` is the mailbox's real git toplevel
+  (never `/`, the home directory or an ancestor of it); records are deduped
+  by the mailbox's realpath (newest `updated_at` wins).
 - The dashboard's own per-loop files live outside every workspace:
   `~/.local/state/trio-dash/loops/<key>/` (`TRIO_DASH_STATE_DIR`) holds
   `actions.jsonl` (append-only log of every fix, answer and diagnosis: who,
   when, commands, outcome, output tail), `diagnosis.json` (latest read-only
   diagnosis) and `runs/*.log` (output of drivers it started); `<key>` is the
-  first 16 hex of sha256(realpath of the root mailbox).
+  first 16 hex of sha256(realpath of the root mailbox). `answer-key` (0600)
+  signs HUMAN.md entry headers; `cursor-isolated/` is the empty HOME/config
+  of opt-in Cursor diagnoses.
 
 ## Session sidecar
 
