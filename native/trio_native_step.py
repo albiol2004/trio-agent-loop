@@ -834,9 +834,26 @@ def _branch_sha(repo: Path, branch: str) -> str | None:
     return sha if result.returncode == 0 and sha else None
 
 
+def _under_worktrees_marker(root: Path, path: str) -> bool:
+    """True when ``path``'s real filesystem location is inside
+    ``<root>/.claude/worktrees/`` (eval-native-v0c C2: compared by
+    ``os.path.realpath``, so a symlinked path cannot claim to be a builder
+    worktree it is not)."""
+    marker = os.path.realpath(str(root / WORKTREES_DIR))
+    real = os.path.realpath(path)
+    return real == marker or real.startswith(marker + os.sep)
+
+
 def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
-                   res: dict) -> str | None:
-    """Why this builder result is refused, or None."""
+                   res: dict, worktree_branches: dict[str, str | None]
+                   ) -> str | None:
+    """Why this builder result is refused, or None.
+
+    ``worktree_branches`` maps each worktree's real path to the branch it is
+    actually checked out on (from ``git worktree list --porcelain``), so a
+    builder cannot report a branch it does not itself own (eval-native-v0c
+    C2): the ``worktree`` it names must really be on the ``branch`` it names.
+    """
     sid = str(res.get("id") or "?")
     base = str(res.get("base") or "").strip()
     if not base or not TL._sha_matches(base, head):
@@ -849,6 +866,15 @@ def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
     tip = _branch_sha(repo, branch) if branch else None
     if tip is None:
         return f"builder {sid}: branch {branch or '(none)'} does not exist"
+    worktree = str(res.get("worktree") or "").strip()
+    if not worktree:
+        return f"builder {sid}: no worktree reported for branch {branch}"
+    on_branch = worktree_branches.get(os.path.realpath(worktree))
+    if on_branch != branch:
+        return (f"builder {sid}: reported worktree {worktree} is not the "
+                f"builder's own worktree for branch {branch} (it is "
+                + (f"checked out on {on_branch}" if on_branch
+                   else "not a known worktree") + ")")
     reported = str(res.get("head") or "").strip()
     if reported and not TL._sha_matches(reported, tip):
         return (f"builder {sid}: reported head {reported[:12]} but branch "
@@ -899,10 +925,13 @@ def op_builders(mailbox: Path, repo: Path | None,
     if not head:
         raise StepError("builders: --head (the dispatch HEAD) is required")
     mailbox_rel = TL._mailbox_rel(root, mailbox)
+    worktree_branches = {os.path.realpath(t["path"]): t.get("branch")
+                         for t in _worktrees(root) if t.get("path")}
     accepted, refused, merge = [], [], []
     for res in results:
         sid = _one_line(res.get("id"), 64) or "?"
-        reason = _check_builder(root, mailbox_rel, head, res)
+        reason = _check_builder(root, mailbox_rel, head, res,
+                                worktree_branches)
         if reason:
             refused.append({"id": sid, "reason": reason})
             continue
@@ -934,21 +963,40 @@ def op_builders(mailbox: Path, repo: Path | None,
 
 
 def _dirty_entries(worktree: str) -> list[tuple[str, str]] | None:
-    """``git status --porcelain`` as [(XY code, path)] (ignored files are
-    not listed: they never block ``git worktree remove``)."""
+    """``git status --porcelain -z`` as [(XY code, path)] (ignored files are
+    not listed: they never block ``git worktree remove``).
+
+    ``-z`` is required, not optional: porcelain v1's non-``-z`` text form
+    quotes a path containing the literal " -> " sequence to disambiguate it
+    from a rename record's own separator, and the old code split on that
+    substring for *every* status code, unconditionally, after stripping only
+    a leading/trailing quote. An untracked file legitimately named e.g.
+    ``notes -> old.pyc`` was then misread as ``old.pyc`` (eval-native-v0c
+    C1). With ``-z`` there is no quoting and no ``" -> "`` text at all: a
+    plain entry is one NUL-terminated ``XY path`` record, and only a rename
+    or copy (``R``/``C`` in either status column) carries a second
+    NUL-terminated field, the *original* path, which this helper discards
+    (only the current path matters to worktree removal and the fold check).
+    """
     result = subprocess.run(
-        ["git", "-C", worktree, "status", "--porcelain",
+        ["git", "-C", worktree, "status", "--porcelain", "-z",
          "--untracked-files=all"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         return None
+    tokens = result.stdout.split("\0")
     entries = []
-    for line in result.stdout.splitlines():
-        entry = line[3:]
-        if " -> " in entry:
-            entry = entry.split(" -> ", 1)[1]
-        entries.append((line[:2], entry.strip().strip('"')))
+    i = 0
+    while i < len(tokens):
+        record = tokens[i]
+        i += 1
+        if not record:
+            continue
+        code, path = record[:2], record[3:]
+        if code[0] in ("R", "C") or code[1] in ("R", "C"):
+            i += 1  # the original path field; not needed here
+        entries.append((code, path))
     return entries
 
 
@@ -983,46 +1031,70 @@ def _remove_worktree(repo: Path, path: str, mailbox_rel: str | None,
     return None
 
 
+def _is_builder_branch(root: Path, trees: dict, branch: str) -> bool:
+    """True when ``branch`` is a builder branch: a ``worktree-*`` name, or
+    checked out in a worktree under ``<root>/.claude/worktrees/`` (checked
+    by real path via ``_under_worktrees_marker``, so a symlinked worktree
+    cannot spoof the marker)."""
+    if branch.startswith("worktree-"):
+        return True
+    tree = trees.get(branch)
+    path = tree.get("path") if tree else None
+    return bool(path) and _under_worktrees_marker(root, path)
+
+
 def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
                      spec: str, trees: dict) -> dict:
     """Drop one unmerged builder branch superseded by a re-dispatch.
 
-    ``spec`` is ``old`` or ``old=new``; with ``=new`` the old branch is
-    dropped only when ``new`` is merged into HEAD (the re-dispatch landed).
-    Only builder branches are dropped: a worktree under
+    ``spec`` must be ``old=new`` (eval-native-v0c C3: the bare ``old`` form
+    is refused — nothing then confirms ``old``'s work was actually
+    superseded by anything, so a live ``worktree-*`` branch with committed,
+    unmerged work named as the bare ``old`` used to be force-deleted
+    unconditionally). ``new`` must itself be a builder branch (a
+    ``worktree-*`` name, or a worktree under ``.claude/worktrees/`` by real
+    path) that is merged into the Lead's HEAD — never ``master`` or the
+    loop's target branch, which would otherwise "count as merged" (it is
+    trivially an ancestor of everything built on it) and launder any branch
+    named as ``old``, including one with commits not reachable from HEAD.
+    ``old`` itself must also be a builder branch: a worktree under
     ``.claude/worktrees/`` (removed under ``_remove_worktree``'s dirt rule),
-    or no worktree and a ``worktree-*`` name. The branch is force-deleted
-    (``git branch -D``): its commits are superseded, not merged.
+    or no worktree and a ``worktree-*`` name. The branch is then
+    force-deleted (``git branch -D``): its commits are superseded by
+    ``new``, not merged themselves.
     """
-    old, _sep, new = (x.strip() for x in spec.partition("="))
+    old, sep, new = (x.strip() for x in spec.partition("="))
     entry: dict = {"branch": old, "superseded_by": new or None}
+    if not sep or not new:
+        return {**entry, "dropped": False,
+                "reason": "drop_unmerged requires 'old=new': the bare "
+                          "'old' form is refused"}
     tip = _branch_sha(root, old)
     if tip is None:
         return {**entry, "dropped": True, "note": "branch already gone"}
-    if new:
-        new_tip = _branch_sha(root, new)
-        if (new_tip is None or head is None
-                or not TL._git_is_ancestor(root, new_tip, head)):
-            return {**entry, "dropped": False,
-                    "reason": f"re-dispatched branch {new} is not merged "
-                              "into HEAD"}
+    if not _is_builder_branch(root, trees, new):
+        return {**entry, "dropped": False,
+                "reason": f"{new} is not a builder branch (no worktree-* "
+                          "name and no worktree under .claude/worktrees/)"}
+    new_tip = _branch_sha(root, new)
+    if (new_tip is None or head is None
+            or not TL._git_is_ancestor(root, new_tip, head)):
+        return {**entry, "dropped": False,
+                "reason": f"re-dispatched branch {new} is not merged "
+                          "into HEAD"}
+    if not _is_builder_branch(root, trees, old):
+        return {**entry, "dropped": False,
+                "reason": "not a builder branch (no worktree-* name)"}
     tree = trees.get(old)
     path = tree.get("path") if tree else None
-    marker = f"{root}/{WORKTREES_DIR}/"
     if path:
         if Path(path).resolve() == root.resolve():
             return {**entry, "dropped": False,
                     "reason": "checked out in the repo"}
-        if not path.startswith(marker):
-            return {**entry, "dropped": False,
-                    "reason": f"worktree {path} is not a builder worktree"}
         why = _remove_worktree(root, path, mailbox_rel)
         if why:
             return {**entry, "dropped": False, "worktree": path,
                     "reason": why}
-    elif not old.startswith("worktree-"):
-        return {**entry, "dropped": False,
-                "reason": "not a builder branch (no worktree-* name)"}
     deleted = TL._git(root, "branch", "-D", old)
     if deleted.returncode != 0:
         return {**entry, "dropped": False, "worktree": path,
@@ -1064,6 +1136,14 @@ def op_cleanup(mailbox: Path, repo: Path | None,
         path = tree.get("path") if tree else None
         if path and Path(path).resolve() == root.resolve():
             kept.append({"branch": branch, "reason": "checked out in the repo"})
+            continue
+        if path and not _under_worktrees_marker(root, path):
+            # eval-native-v0c C2: cleanup never removes a worktree outside
+            # the marker directory, merged or not — only `_drop_superseded`
+            # had this check before.
+            kept.append({"branch": branch, "worktree": path,
+                        "reason": f"worktree {path} is not under "
+                                  f"{root}/{WORKTREES_DIR}/"})
             continue
         if path:
             why = _remove_worktree(root, path, mailbox_rel)

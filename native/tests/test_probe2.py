@@ -188,23 +188,55 @@ def test_cleanup_drops_conflicted_branch_once_redispatch_merged(
     assert not Path(alpha["worktree"]).exists()
 
 
-def test_drop_unmerged_never_touches_non_builder_branches(repo: Path) -> None:
+def test_drop_unmerged_bare_form_is_refused(repo: Path) -> None:
+    """C3: the bare 'old' form (no '=new') is refused outright — nothing
+    then confirms 'old' was actually superseded by anything merged."""
     lead_running(repo)
     git(repo, "branch", "feature")
     out = step(repo, "cleanup", drop_unmerged="feature")
     assert out["dropped"][0]["dropped"] is False
-    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "requires 'old=new'" in out["dropped"][0]["reason"]
     assert "feature" in git(repo, "branch")
     own = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     out = step(repo, "cleanup", drop_unmerged=own)
     assert out["dropped"][0]["dropped"] is False
+    assert "requires 'old=new'" in out["dropped"][0]["reason"]
     assert own in git(repo, "branch")
+
+
+def test_drop_unmerged_never_touches_non_builder_branches(repo: Path) -> None:
+    """C3: 'old=new' still refuses when 'old' itself is not a builder
+    branch, even once 'new' is a real, merged builder branch."""
+    lead_running(repo)
+    git(repo, "branch", "feature")
+    new = builder_branch(repo, "newb")
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", new["branch"])
+    out = step(repo, "cleanup", drop_unmerged=f"feature={new['branch']}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "feature" in git(repo, "branch")
+
+
+def test_drop_unmerged_refuses_target_branch_as_new(repo: Path) -> None:
+    """C3: 'old=master' (or any non-builder branch) must not "count as
+    merged" and launder the drop — 'new' must itself be a builder branch."""
+    lead_running(repo)
+    old = builder_branch(repo, "old")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    out = step(repo, "cleanup", drop_unmerged=f"worktree-old={target}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "worktree-old" in git(repo, "branch")
+    assert Path(old["worktree"]).exists()
 
 
 def test_drop_unmerged_keeps_worktree_with_product_dirt(repo: Path) -> None:
     lead_running(repo)
     old = builder_branch(repo, "old", extra_dirt=True)
-    out = step(repo, "cleanup", drop_unmerged="worktree-old")
+    new = builder_branch(repo, "old2")
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", new["branch"])
+    out = step(repo, "cleanup",
+               drop_unmerged=f"worktree-old={new['branch']}")
     assert out["dropped"][0]["dropped"] is False
     assert "scratch.txt" in out["dropped"][0]["reason"]
     assert Path(old["worktree"], "scratch.txt").exists()
