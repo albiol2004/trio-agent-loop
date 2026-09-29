@@ -32,7 +32,7 @@ Workflow({name: "trio-native",
 ```
 
 Optional args:
-- `run_token`: the lock owner id. It defaults to a slug of the mailbox path. Pass a distinct token only if you deliberately want a second run to be refused while the first is alive.
+- `run_token`: the lock owner id. It defaults to a slug of the mailbox path. A second launch on the same mailbox is refused while the first is alive, whether it uses the same token or a different one (see **Lock**).
 - `models`: `{lead, evaluator, repair, step}`. The defaults are `claude-opus-5-5` for lead and evaluator, and `claude-sonnet-5` for repair and step.
 - `helper`: an absolute path to the helper.
 - `max_agents`, `token_budget`: opt-in caps. See **Caps**.
@@ -87,8 +87,11 @@ claude -p 'Run the saved workflow trio-native with args {"mailbox": "/abs/path/t
 ## Lock
 
 - The mailbox `.lock` uses trio_loop's on-disk protocol. Its owner is `workflow:<run_token>`.
-- The `pid` recorded in the lock is the Claude Code process running the workflow (the nearest `claude` ancestor of the step shell), so `trio_loop.py` and other drivers see a live owner.
-- Every op refreshes a `heartbeat`. A different token takes over only when that pid is dead, or when the heartbeat is older than `TRIO_NATIVE_LOCK_STALE_SECONDS` (default 4 h).
+- The `pid` recorded in the lock is the *holder pid*: the Claude Code process running the workflow, found as the nearest ancestor of the step shell whose `/proc/<pid>/comm` is `claude` (`TRIO_NATIVE_HOLDER_PID` overrides it). So `trio_loop.py` and other drivers see a live owner.
+- Every op re-stamps both `pid` and `heartbeat`. A journal resume in a new Claude process replays `begin` from its cache, so its first live op records the new holder pid.
+- **Same token:** the lock is taken over only when the recorded pid is dead (a crash, or a resume in a new process). While it is alive and is not this run's holder pid, `begin` and every later op are refused, and `end` leaves the lock alone. Two concurrent launches with the default token therefore cannot both drive the mailbox.
+- **Different workflow token:** it takes over when the pid is dead, or when the heartbeat is older than `TRIO_NATIVE_LOCK_STALE_SECONDS` (default 4 h). The heartbeat only moves when an op runs, so a single role pass longer than that can be taken over. The original run then fails closed at its next op ("lock not held").
+- **trio_loop / trioctl** check only the pid. They take over only when the holder pid is dead, never on a stale heartbeat.
 
 ## Probes still needed before a lab run
 

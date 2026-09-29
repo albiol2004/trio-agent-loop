@@ -174,13 +174,107 @@ def test_lock_refuses_other_token_until_holder_dead(repo: Path) -> None:
     refused = step(repo, "next", token="t-other", max_iterations=4)
     assert not refused["ok"] and "lock not held" in refused["error"]
     # holder gone -> takeover
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    env = git_env()
-    env["TRIO_NATIVE_HOLDER_PID"] = str(dead.pid)
-    assert step(repo, "begin", env=env)["ok"]  # re-stamp our pid as dead
+    (mbox(repo) / ".lock" / "pid").write_text(f"{dead_pid()}\n")
     taken = step(repo, "begin", token="t-other")
     assert taken["ok"] and taken["lock_owner"] == "workflow:t-other"
+
+
+def dead_pid() -> int:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+@pytest.fixture
+def live_pid():
+    proc = subprocess.Popen(["sleep", "60"])
+    yield proc.pid
+    proc.kill()
+    proc.wait()
+
+
+def env_pid(pid: int) -> dict[str, str]:
+    env = git_env()
+    env["TRIO_NATIVE_HOLDER_PID"] = str(pid)
+    return env
+
+
+def lock_file(repo: Path, name: str) -> str:
+    return (mbox(repo) / ".lock" / name).read_text().strip()
+
+
+def load_trio_loop():
+    spec = importlib.util.spec_from_file_location(
+        "trio_loop_for_test", NATIVE.parent / "metrics" / "trio_loop.py")
+    tl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tl)
+    return tl
+
+
+def test_same_default_token_two_live_runs_refused(repo: Path,
+                                                   live_pid: int) -> None:
+    """F1: a second live launch with the same token is not an owner."""
+    first = step(repo, "begin")
+    assert first["ok"] and lock_file(repo, "pid") == str(os.getpid())
+    second = step(repo, "begin", env=env_pid(live_pid))
+    assert not second["ok"] and "same run_token" in second["error"]
+    assert lock_file(repo, "pid") == str(os.getpid())  # untouched
+    refused = step(repo, "next", env=env_pid(live_pid), max_iterations=4)
+    assert not refused["ok"] and "another live process" in refused["error"]
+    assert "iteration: 0" in state(repo)  # no bump by the second launch
+    # the second launch's end never releases the first run's lock
+    assert step(repo, "end", env=env_pid(live_pid))["lock"] == "foreign"
+    assert lock_file(repo, "owner") == f"workflow:{TOKEN}"
+    # the first run is unaffected
+    assert step(repo, "next", max_iterations=4)["action"] == "lead"
+
+
+def test_journal_resume_restamps_pid(repo: Path) -> None:
+    """F2: begin replayed from the journal; the first live op re-stamps."""
+    gone = dead_pid()
+    assert step(repo, "begin", env=env_pid(gone))["ok"]
+    assert lock_file(repo, "pid") == str(gone)
+    # new Claude process (this pytest pid) resumes: begin is a cache hit,
+    # `next` is the first op that really runs.
+    n = step(repo, "next", max_iterations=4)
+    assert n["ok"] and n["action"] == "lead"
+    assert lock_file(repo, "pid") == str(os.getpid())
+    tl = load_trio_loop()
+    assert tl._acquire_lock(mbox(repo)) is None  # trio_loop stays out
+    assert lock_file(repo, "owner") == f"workflow:{TOKEN}"
+    # a fresh run with the same token in a new process after a crash
+    (mbox(repo) / ".lock" / "pid").write_text(f"{dead_pid()}\n")
+    again = step(repo, "begin")
+    assert again["ok"] and lock_file(repo, "pid") == str(os.getpid())
+
+
+def test_every_op_refreshes_heartbeat(repo: Path) -> None:
+    """F11: pid + heartbeat are re-stamped by each op, not only begin."""
+    step(repo, "begin")
+    hb = mbox(repo) / ".lock" / "heartbeat"
+    for op, kw in (("next", {"max_iterations": 4}),
+                   ("gate", {"role": "lead", "iteration": 1, "attempt": 1}),
+                   ("gate", {"role": "lead", "iteration": 1, "attempt": 1})):
+        hb.write_text("1000.0\n")
+        (mbox(repo) / ".lock" / "pid").write_text(f"{dead_pid()}\n")
+        assert step(repo, op, **kw)["ok"]
+        assert float(hb.read_text()) > 1000.0
+        assert lock_file(repo, "pid") == str(os.getpid())
+
+
+def test_stale_heartbeat_takeover_fails_closed(repo: Path,
+                                               live_pid: int) -> None:
+    step(repo, "begin", env=env_pid(live_pid))
+    step(repo, "next", env=env_pid(live_pid), max_iterations=4)
+    (mbox(repo) / ".lock" / "heartbeat").write_text(
+        f"{__import__('time').time() - 5 * 3600:.3f}\n")
+    taken = step(repo, "begin", token="t-other")
+    assert taken["ok"] and lock_file(repo, "owner") == "workflow:t-other"
+    old = step(repo, "gate", env=env_pid(live_pid), role="lead",
+               iteration=1, attempt=1)
+    assert not old["ok"] and "lock not held" in old["error"]
+    assert step(repo, "end", env=env_pid(live_pid))["lock"] == "foreign"
+    assert lock_file(repo, "owner") == "workflow:t-other"
 
 
 def test_lock_respects_live_trio_loop_driver(repo: Path) -> None:

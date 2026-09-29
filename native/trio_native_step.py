@@ -29,11 +29,23 @@ phase without bumping; ``pin`` reuses the persisted attempt and sha).
 
 Lock: the helper is a new process per op, so the mailbox ``.lock`` (same
 on-disk protocol as ``trio_loop._acquire_lock``) is owned by the token
-``workflow:<run token>``; its ``pid`` is the long-lived Claude Code process
-running the workflow (nearest ``claude`` ancestor), and a ``heartbeat`` file
-is refreshed by every op. Another driver sees a live pid and stays out; a
-different workflow token takes over only when that pid is dead or the
-heartbeat is older than ``TRIO_NATIVE_LOCK_STALE_SECONDS`` (default 4 h).
+``workflow:<run token>``. Its ``pid`` is the *holder pid* (``_holder_pid``):
+the long-lived Claude Code process running the workflow, i.e. the nearest
+ancestor whose ``/proc/<pid>/comm`` is ``claude`` (``TRIO_NATIVE_HOLDER_PID``
+overrides it; with no ``claude`` ancestor it falls back to the parent pid).
+Every op that needs the lock re-stamps ``pid`` and ``heartbeat``:
+
+* same token, recorded pid dead (a journal resume in a new Claude process,
+  or a fresh run after a crash) -> the op takes the lock over and records
+  its own holder pid, so ``trio_loop``/``trioctl`` (pid-only check) keep
+  seeing a live owner;
+* same token, recorded pid alive and not ours (a second concurrent launch
+  with the default token) -> refused, the lock is left untouched;
+* different token or driver -> refused while the pid is alive, except that
+  a different *workflow* token also takes over when the heartbeat is older
+  than ``TRIO_NATIVE_LOCK_STALE_SECONDS`` (default 4 h). The heartbeat is
+  refreshed only by ops, so a single role pass longer than that can be
+  taken over; the original run then fails closed at its next op.
 """
 from __future__ import annotations
 
@@ -224,6 +236,14 @@ def _stamp_lock(lock: Path, token: str) -> None:
     TL._write_lock_file(lock, "heartbeat", f"{time.time():.3f}\n")
 
 
+def _foreign_live_pid(lock: Path) -> int:
+    """The recorded pid when it is alive and is not this run's holder pid."""
+    pid = TL._lock_pid(lock)
+    if pid > 0 and pid != _holder_pid() and TL._pid_alive(pid):
+        return pid
+    return 0
+
+
 def _acquire(mailbox: Path, token: str) -> None:
     """Take (or re-enter) the mailbox lock for this workflow token."""
     lock = mailbox / ".lock"
@@ -232,7 +252,15 @@ def _acquire(mailbox: Path, token: str) -> None:
             lock.mkdir()
         except FileExistsError:
             owner = _lock_owner(lock)
-            if owner != _owner(token):
+            if owner == _owner(token):
+                live = _foreign_live_pid(lock)
+                if live:
+                    raise StepError(
+                        f"mailbox is locked by {owner} under another live "
+                        f"process (pid {live}): a second launch with the "
+                        f"same run_token is refused"
+                    )
+            else:
                 pid = TL._lock_pid(lock)
                 alive = pid > 0 and TL._pid_alive(pid)
                 age = _heartbeat_age(lock)
@@ -260,7 +288,12 @@ def _acquire(mailbox: Path, token: str) -> None:
 
 
 def _require_lock(mailbox: Path, token: str) -> None:
-    """Every op after ``begin`` must still hold the lock; refresh it."""
+    """Every op after ``begin`` must still hold the lock; re-stamp it.
+
+    The pid is re-stamped as well as the heartbeat: a journal resume in a
+    new Claude process replays ``begin`` from its cache, so the first live
+    op is where the new holder pid gets recorded (eval-native-v0 F2).
+    """
     lock = mailbox / ".lock"
     with TL._MailboxGuard(mailbox):
         owner = _lock_owner(lock)
@@ -269,6 +302,13 @@ def _require_lock(mailbox: Path, token: str) -> None:
                 f"mailbox lock not held by {_owner(token)} "
                 f"(owner: {owner or 'none'}); run begin first"
             )
+        live = _foreign_live_pid(lock)
+        if live:
+            raise StepError(
+                f"mailbox lock {owner} belongs to another live process "
+                f"(pid {live}); this run does not hold it"
+            )
+        TL._write_lock_file(lock, "pid", f"{_holder_pid()}\n")
         TL._write_lock_file(lock, "heartbeat", f"{time.time():.3f}\n")
 
 
@@ -278,7 +318,7 @@ def _release(mailbox: Path, token: str) -> str:
         if not lock.is_dir():
             return "released"
         owner = _lock_owner(lock)
-        if owner != _owner(token):
+        if owner != _owner(token) or _foreign_live_pid(lock):
             return "foreign"
         TL._discard_lock_dir(mailbox, lock)
     return "released"
