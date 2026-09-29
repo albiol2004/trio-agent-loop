@@ -283,7 +283,9 @@ function leadPlanPrompt(n) {
     'PLAN CALL (driver-owned builders). You have no Agent tool in this workflow: the driver spawns one `trio-builder` ' +
     '(Sonnet) per slice you return, each in its own git worktree forked from your checkout\'s HEAD, runs slices with ' +
     'pairwise-disjoint `writes:` concurrently, and then calls you again to integrate. So in this call:',
-    '- Read GOAL.md, STATE.md, the last VERDICT.md and the code; update PLAN.md (with its `slices:` block).',
+    '- Read GOAL.md, STATE.md, the last VERDICT.md, HUMAN.md when it exists (the human\'s timestamped answers, newest ' +
+    'last; the newest entry answers the NEEDS_HUMAN/BLOCKED stop before this run and binds this iteration unless GOAL.md ' +
+    'says otherwise; never edit HUMAN.md) and the code; update PLAN.md (with its `slices:` block).',
     '- Do NOT implement product code and do not commit in this call.',
     '- Do NOT append to LOG.md in this call: the iteration has exactly one `| lead |` LOG line, written at the end of ' +
     'the pass (by the last integrate call or the solo Lead call).',

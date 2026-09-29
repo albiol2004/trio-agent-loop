@@ -26,6 +26,13 @@
 # session is told to print) on stdout; the raw session output is kept under
 # <mailbox>/.native-runs/. Exit 0 when a result was parsed, 3 when not,
 # 2 on usage errors. Default --timeout: 6 h (vps-pool runs about 4 h).
+#
+# Dashboard records (native-dash): the same result (or the error) is also
+# written to <mailbox>/.native-result.json with the session id, the workflow
+# run id (wf_…, found under $CLAUDE_CONFIG_DIR/projects/*/<session>/) and
+# api_equiv_usd, and the run is registered in
+# ${TRIO_NATIVE_RUNS_DIR:-~/.local/share/trio-agent-loop/native-runs}/<key>.json
+# (key = first 16 hex of sha256(realpath mailbox)) so trio-dash finds it.
 set -euo pipefail
 
 CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
@@ -105,6 +112,49 @@ else
 fi
 
 raw="$runs/${session}.$(date -u +%Y%m%dT%H%M%SZ).$mode.json"
+launcher_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+launched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Register the launch before the session starts (never fatal).
+python3 - "$mailbox" "$repo" "$launcher_path" "$session" "$mode" "$args_json" "$launched_at" "$$" "${run_id:-}" <<'PY' || true
+import hashlib, json, os, sys
+from pathlib import Path
+mailbox, repo, launcher, session, mode, args, at, pid, run_id = sys.argv[1:10]
+runs = Path(os.environ.get("TRIO_NATIVE_RUNS_DIR", "").strip()
+            or Path.home() / ".local/share/trio-agent-loop/native-runs").expanduser()
+real = str(Path(mailbox).resolve())
+path = runs / (hashlib.sha256(real.encode()).hexdigest()[:16] + ".json")
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data = data if isinstance(data, dict) else {}
+except (OSError, ValueError):
+    data = {}
+# A launch that another live launcher's lock will refuse must not repoint
+# the record of the run that holds the mailbox.
+other = data.get("launcher_pid")
+if (isinstance(other, int) and other != int(pid)
+        and data.get("state") in ("launching", "running")):
+    try:
+        os.kill(other, 0)
+        sys.exit(0)
+    except (OSError, OverflowError):
+        pass
+data.update({"schema": 1, "driver": "claude-workflow", "mailbox": real,
+             "repo": repo, "launcher": launcher, "session_id": session,
+             "mode": mode, "args": args, "launched_at": at, "state": "launching",
+             "launcher_pid": int(pid), "updated_at": at})
+if run_id:
+    data["run_id"] = run_id
+for key in ("finished_at", "status", "result_path"):
+    data.pop(key, None)
+try:
+    runs.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+except OSError:
+    pass
+PY
 set +e
 (cd "$repo" && timeout "$timeout_s" "$CLAUDE_BIN" -p "$prompt" \
   "${session_flags[@]}" \
@@ -115,11 +165,86 @@ set +e
 rc=$?
 set -e
 
-python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" <<'PY'
-import json, os, re, sys
+python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" \
+  "$mailbox" "$claude_dir" "${run_id:-}" "$launcher_path" "$launched_at" <<'PY'
+import glob, hashlib, json, os, re, sys, time
+from pathlib import Path
 raw, rc, session, mode, record, prev = sys.argv[1:7]
+mailbox, claude_dir, given_run_id, launcher_path, launched_at = sys.argv[7:12]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
+
+
+def find_run_id():
+    """The workflow run id (wf_…) of this session, newest first."""
+    if given_run_id:
+        return given_run_id
+    base = os.path.join(glob.escape(claude_dir), "projects", "*", glob.escape(session))
+    found = []
+    for pattern, rx in (
+            (os.path.join(base, "workflows", "wf_*.json"), r"^(wf_[\w-]+)\.json$"),
+            (os.path.join(base, "subagents", "workflows", "wf_*"), r"^(wf_[\w-]+)$"),
+            (os.path.join(base, "workflows", "scripts", "*-wf_*.js"), r"-(wf_[\w-]+)\.js$")):
+        for path in glob.glob(pattern):
+            m = re.search(rx, os.path.basename(path))
+            if m:
+                try:
+                    found.append((os.path.getmtime(path), m.group(1)))
+                except OSError:
+                    pass
+    return max(found)[1] if found else None
+
+
+def persist(result):
+    """<mailbox>/.native-result.json and the run registry (never fatal)."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        session_rec = json.loads(Path(mailbox, ".session.json").read_text(encoding="utf-8"))
+        session_rec = session_rec if isinstance(session_rec, dict) else {}
+    except (OSError, ValueError):
+        session_rec = {}
+    run_id = find_run_id()
+    lau = result.get("launcher") if isinstance(result.get("launcher"), dict) else {}
+    keep = ("status", "verdict", "code", "reason", "iteration", "held_step",
+            "end_error", "conflicts", "dangling_worktrees", "role_denials",
+            "human_check", "commit_shas", "lock", "run_token", "agents_used",
+            "eval_worktrees_removed")
+    out = {k: result.get(k) for k in keep if k in result}
+    out.update({"schema": 1, "source": "launcher", "driver": "claude-workflow",
+                "mode": mode, "session_id": session, "run_id": run_id,
+                "exit_code": rc, "raw": raw, "launcher": launcher_path,
+                "launched_at": launched_at, "finished_at": now,
+                "session_started_at": session_rec.get("started_at"),
+                "api_equiv_usd": lau.get("api_equiv_usd"),
+                "api_equiv_usd_note": lau.get("api_equiv_usd_note")})
+    try:
+        path = Path(mailbox, ".native-result.json")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    runs = Path(os.environ.get("TRIO_NATIVE_RUNS_DIR", "").strip()
+                or Path.home() / ".local/share/trio-agent-loop/native-runs").expanduser()
+    real = str(Path(mailbox).resolve())
+    reg = runs / (hashlib.sha256(real.encode()).hexdigest()[:16] + ".json")
+    try:
+        data = json.loads(reg.read_text(encoding="utf-8"))
+        data = data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        data = {}
+    data.update({"schema": 1, "driver": "claude-workflow", "mailbox": real,
+                 "state": "finished", "status": out.get("status"),
+                 "session_id": session, "run_id": run_id, "finished_at": now,
+                 "result_path": str(Path(real, ".native-result.json")),
+                 "updated_at": now})
+    try:
+        runs.mkdir(parents=True, exist_ok=True)
+        tmp = reg.with_name(f".{reg.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, reg)
+    except OSError:
+        pass
 try:
     err = open(raw + ".err", encoding="utf-8", errors="replace").read()
 except OSError:
@@ -139,8 +264,9 @@ def fail(reason, head=None):
     if head:
         launcher["result_head"] = head
         reason += "; session reply begins: " + json.dumps(head)
-    print(json.dumps({"status": "error", "reason": reason, "launcher": launcher},
-                     indent=2, sort_keys=True))
+    result = {"status": "error", "reason": reason, "launcher": launcher}
+    persist(result)
+    print(json.dumps(result, indent=2, sort_keys=True))
     sys.exit(3)
 
 
@@ -210,6 +336,8 @@ result.setdefault("launcher", {})
 if not isinstance(result["launcher"], dict):
     result["launcher"] = {}
 result["launcher"].update(launcher)
+if not refused:
+    persist(result)
 print(json.dumps(result, indent=2, sort_keys=True))
 sys.exit(0)
 PY

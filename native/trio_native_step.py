@@ -78,6 +78,15 @@ METRICS_DIR = Path(
 )
 RECORDS = ".native.json"
 SESSION = ".session.json"
+#: Last run's outcome, for the dashboard (native-dash): ``end`` writes a
+#: partial record (``source: "end"``); ``launch.sh`` overwrites it with the
+#: parsed workflow result, session id, run id and cost (``source:
+#: "launcher"``). Schema in native/README.md "Run registry and result".
+RESULT = ".native-result.json"
+#: Per-user registry of native runs, one JSON file per mailbox, so the
+#: dashboard finds runs outside its scan roots (hidden lab dirs included).
+#: ``TRIO_NATIVE_RUNS_DIR`` overrides it (tests always do).
+DEFAULT_RUNS_DIR = Path.home() / ".local" / "share" / "trio-agent-loop" / "native-runs"
 EXCLUDE_LINE = ".claude/worktrees/"
 #: Build/test artefacts that are never product (live probe 2 blocker A):
 #: added to ``info/exclude`` (the common git dir, so every builder and
@@ -99,7 +108,7 @@ DRIVER = "claude-workflow"
 MAILBOX_RUNTIME_IGNORES = (
     ".dispatch/", ".driver.json", ".driver.pid", ".session.json",
     ".sessions/", "driver.log", ".lock", ".repairs", RECORDS,
-    ".native-launch.json", ".native-runs/",
+    ".native-launch.json", ".native-runs/", RESULT,
 )
 _MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock",
                                    ".native-runs"})
@@ -187,6 +196,34 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
                    encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _runs_dir() -> Path:
+    value = os.environ.get("TRIO_NATIVE_RUNS_DIR", "").strip()
+    return Path(value).expanduser() if value else DEFAULT_RUNS_DIR
+
+
+def registry_path(mailbox: Path) -> Path:
+    """``<runs dir>/<sha256(realpath mailbox)[:16]>.json`` (launch.sh uses
+    the same name)."""
+    key = hashlib.sha256(str(Path(mailbox).resolve()).encode()).hexdigest()
+    return _runs_dir() / f"{key[:16]}.json"
+
+
+def _register(mailbox: Path, **fields) -> None:
+    """Merge *fields* into this mailbox's run-registry record; never raises
+    (the registry is a dashboard aid, never a reason to fail a step)."""
+    try:
+        path = registry_path(mailbox)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = _read_json(path)
+        data.update({"schema": 1, "driver": DRIVER,
+                     "mailbox": str(Path(mailbox).resolve()),
+                     "updated_at": _now_iso()})
+        data.update({k: v for k, v in fields.items() if v is not None})
+        _write_json(path, data)
+    except OSError:
+        pass
 
 
 def _records(mailbox: Path) -> dict:
@@ -473,6 +510,10 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     _purge_stale_records(mailbox, snap["iteration"])
     exclude = _ensure_exclude(repo)
     _write_session(mailbox, a.token, snap["phase"], done=False)
+    _register(mailbox, repo=str(repo) if repo else None,
+              helper=str(Path(__file__).resolve()), run_token=a.token,
+              holder_pid=_holder_pid(), state="running",
+              begun_at=_now_iso())
     return {
         "mode": "lockstep",
         "repo": str(repo) if repo else None,
@@ -1286,7 +1327,25 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     # a refused or garbled `begin` (N2), when another run may own both.
     if ours and session.get("session") == a.token and not session.get("done"):
         _write_session(mailbox, a.token, "done", done=True)
-    return {"lock": lock, "dangling_worktrees": _dangling_worktrees(repo),
+    dangling = _dangling_worktrees(repo)
+    if ours:
+        # A partial outcome for runs without launch.sh (an interactive
+        # Workflow call); launch.sh replaces it with the full result.
+        try:
+            _write_json(mailbox / RESULT, {
+                "schema": 1, "source": "end", "driver": DRIVER,
+                "run_token": a.token, "lock": lock,
+                "dangling_worktrees": dangling,
+                "state_status": snap["status"], "phase": snap["phase"],
+                "iteration": snap["iteration"],
+                "session_started_at": session.get("started_at"),
+                "finished_at": _now_iso(),
+            })
+        except OSError:
+            pass
+        _register(mailbox, state="ended", ended_at=_now_iso(), lock=lock,
+                  dangling_worktrees=dangling)
+    return {"lock": lock, "dangling_worktrees": dangling,
             "eval_worktrees_removed": eval_removed,
             "eval_worktrees_kept": eval_kept, **snap}
 
