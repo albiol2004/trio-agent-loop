@@ -125,13 +125,22 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   by itself.
 - Open-loop runs `check_pin`, restore, the tamper count and amendment
   processing on two threads; one controller lock serialises them and a
-  tamper seen by both threads is counted once. A restore swaps the pack in
-  by rename, retries a filesystem error, then stops the loop
-  (`acceptance-restore-failed`) (eval-r19b finding 4).
+  tamper seen by both threads is counted once. A restore builds the pack
+  beside the old one and swaps it in with one atomic
+  `renameat2(RENAME_EXCHANGE)` (two renames where the kernel lacks it), so
+  a concurrent reader never sees a missing or half-copied pack; it retries
+  a filesystem error, then stops the loop (`acceptance-restore-failed`)
+  (eval-r19b finding 4, eval-r19c area 3).
 - `trio-shadow.py --require-commits` derives the pin chain from git objects
   alone (`trio-acceptance.derive_pin_chain`), walking the first-parent
   history from `--acceptance-base`, else the driver state's run head, else
-  the root:
+  the root (the driver judges amendments on the same first-parent line):
+  - a merge commit that changes the pack against its first parent (a land
+    merge-not-rebase, or any merge bringing a pack edit from its other
+    side) is tamper, whatever its subject; an amend commit behind a merge
+    is never an amendment; a HEAD whose first-parent history does not
+    contain the freeze has no valid freeze (resume: NEEDS_HUMAN)
+    (eval-r19c area 1);
   - the freeze is the *first* commit that adds FROZEN; a `git rm` and
     re-add, or a second freeze subject, is tamper and never moves the base;
   - a driver restore must put back the current pin;
@@ -157,6 +166,34 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     driver's `gate breach` LOG line quotes the first acceptance reason.
 - Runs copy the pack without what the pin skips (`node_modules/`, caches,
   `*.pyc`), and driver commits never add those paths.
+- **Per-check isolation (eval-r19c finding 1).** A check's outcome depends
+  only on its own pinned files, the shared pinned files and the product
+  tree:
+  - every run snapshots the pack once (the reported `manifest_sha256` is
+    what ran) and copies the tree once into a master no check runs in;
+  - each check runs in its OWN fresh copy of that master (`cp -a
+    --reflink=auto`, prepared while the previous check runs), with its own
+    read-only pack view: only the files attributed to it plus the shared
+    ones (`pack_attribution`/`check_view`); MANIFEST, AMENDMENTS, AUTHOR
+    and FROZEN are in no view. Under bwrap only its copy and scratch are
+    writable and the view is bind-mounted read-only; with `sandbox: none`
+    the view is chmod read-only and the masters are re-verified (ctime
+    signature) after every check: a change FAILs every later check with
+    reason `isolation`;
+  - Python runs with `PYTHONSAFEPATH=1` and `PYTHONNOUSERSITE=1`, so a
+    script's own directory is not importable; the explicit, pinned helper
+    path is `acceptance/lib/` (on `PYTHONPATH` and `NODE_PATH`, shared by
+    every check). Implicit-load variables of the driver's environment
+    (`PYTHONPATH`, `PYTHONSTARTUP`, `NODE_PATH`, `NODE_OPTIONS`, `BASH_ENV`,
+    `ENV`, `PERL5LIB`, `RUBYLIB`, ...) are not inherited;
+  - driver runs (slice-eval covered checks, integration pre-run, the SHIP
+    gate) read the pinned pack from git at the driver's pin commit and
+    verify its hash, never the working tree a role can edit mid-run
+    (`acceptance-pin-unreadable` fails closed);
+  - measured overhead (20 checks): ~12–25 ms per check on a 550-file tree;
+    on a 5,000-file / 50 MB tree ~50–90 ms per check when checks take
+    ~0.5 s (the next copy is hidden behind the running check) and up to
+    ~250 ms per check for near-instant checks.
 - Isolated builders that touch the mailbox are already retained with
   `mailbox_write` (unchanged).
 
@@ -196,12 +233,24 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
 - **After the verdict, amendments.** Amend commits since the pin are
   validated on git objects (the pinned pack at the driver's pin commit,
   the amended pack at HEAD):
-  - scope: only a check's script, the fakes, `run`, `expect`, `timeout_s`,
-    `binds`, `needs`. Every changed pack file is attributed to the checks
-    whose `run` names it (a file no `run` names is a shared helper and
-    belongs to every check), and every one of those checks must be named
-    and counted. An amended `run` may not point at another check's file or
-    at a shared helper (eval-r19b finding 1);
+  - scope: only a check's files, `run`, `expect`, `timeout_s`, `binds`,
+    `needs`. Every changed pack file is attributed (`pack_attribution`, in
+    the pinned and the amended pack) to every check that can load it: the
+    checks whose `run` names it, whose `run` strings or used files mention
+    it by basename, stem or per-check directory (transitively), and, for a
+    SHARED file, every check. Shared: `fakes/**`, `lib/**`, any directory
+    other than `checks/` and `checks/<ID>/`, interpreter-loaded names
+    (`__init__.py`, `conftest.py`, `sitecustomize.py`, `*.pth`,
+    `package.json`, `tsconfig.json`, `.npmrc`, `pyproject.toml`, shell rc
+    files, `Makefile`, ...), a top-level `checks/` file whose stem shadows
+    a standard-library module (e.g. `checks/subprocess.py`), a `checks/` file no
+    check uses, and anything a shared file mentions. Every owning check
+    must be named and counted, so a shared file is effectively frozen
+    within the budget. An amendment may add a file only under
+    `checks/<ID>/` of an amended ID, and only if no other check would load
+    it. An amended `run` may not point at another check's file or at an
+    unowned top-level `checks/` file (eval-r19b finding 1, eval-r19c
+    finding 1);
   - an AMENDMENTS.md record per id;
   - discrimination: the WHOLE pack re-runs at base with the pinned and the
     amended pack, and every check that FAILed before must still FAIL;
@@ -217,13 +266,28 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
   - With fewer than 4 frozen checks the 25% share allows no amendment. This
     fails safe: an amendment on a small pack forces NEEDS_HUMAN and never
     softens a check (finding 10, kept deliberately).
+  - **Known limit of the amendment budget (eval-r19c finding 2).** A
+    named, counted, in-budget amended check can still be weakened
+    *conditionally on post-base state*: it FAILs at base (so the
+    discrimination re-run is satisfied) yet passes trivially on any tree
+    past the base (for example it probes a feature other than the one its
+    `goal_quote` names). Discrimination-at-base is the only mechanical
+    test; whether an amended check still tests its `goal_quote` is the
+    Evaluator's judgement, bounded by the budget (at most 2 checks and 25%
+    per loop), recorded in AMENDMENTS.md and the pin chain, and visible to
+    the human reviewing the loop. Per-check isolation guarantees the
+    weakening stays confined to the named checks.
 - **Bindings.** `acceptance_bindings:` values come from the Lead's PLAN and
   reach every run as `ACC_BIND_*`. trio-check validates only the names. The
   Evaluator fragment therefore asks the integration Evaluator to review
   each value against the GOAL (finding 11).
 - **Anti-thrash.** A check that FAILs in 2 consecutive integration pre-runs
   with no accepted amendment forces NEEDS_HUMAN.
-- **SHIP gate.** On SHIP the pack is re-run at the evaluated sha.
+- **SHIP gate.** On SHIP the pinned pack (from git) is re-run at the
+  evaluated sha, each check in its own copy of that tree. In a root-free
+  run with the switch on, a land merge that changes product paths is never
+  landed on `full_check:` alone: it re-verifies, so the gate runs on the
+  exact tree that lands.
   - Any FAIL gives `ship_unaccepted (acceptance)`: the SHIP is treated as
     ITERATE and the failures ride to the next Lead pass.
   - Any UNAVAILABLE forces NEEDS_HUMAN (`acceptance-unavailable`).
@@ -238,8 +302,17 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
 
 - A human amends only while the loop is stopped, with
   `trioctl omnigent acceptance amend --human --ids ACC-.. --reason "..."
-  [--adopt <sha>,...]`. The command refuses while a live driver holds the
-  mailbox. It commits the working-tree edits as `acceptance: amend <ids>
+  [--adopt <sha>,...]`. The command refuses (exit 5) while a live driver
+  holds the mailbox and takes the mailbox lock itself for its whole
+  duration, so a driver cannot be starting underneath it (a pid-less
+  `.lock` also refuses) and no driver can start until it is done
+  (eval-r19c area 2). STATE.md is never consulted: a role that writes
+  `status: needs_human` gains nothing. A role that deletes the lock of a
+  running driver can make the command run (same uid: it cannot tell a
+  role from a human), but the running driver keeps its pin in memory: the
+  re-pinned pack is restored as tamper, the SHIP gate runs the driver's
+  pinned pack from git, and the driver state it saves carries no such
+  adoption. It commits the working-tree edits as `acceptance: amend <ids>
   (human): <reason>` and re-pins with a pin commit whose
   `Acceptance-Human-Amend:` trailer names the adopted amend commits, and it
   records the adoption (amend shas, pin commit) in the driver state

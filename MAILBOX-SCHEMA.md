@@ -970,7 +970,9 @@ validates them at base, freezes them, and the PLAN must map every one.
   AUTHOR.md          # GOAL sentence inventory: testable-black-box /
                      # testable-only-live / not-testable, drops + reasons
   checks/acc_NN_<slug>.{py,sh,mjs}
-  fakes/...          # fake CLIs / loopback servers / fixtures
+  checks/ACC-NN/...  # optional per-check files (only that check sees them)
+  fakes/...          # fake CLIs / loopback servers / fixtures (shared)
+  lib/...            # optional shared helpers (PYTHONPATH / NODE_PATH)
   FROZEN             # written by the DRIVER: pin chain
   AMENDMENTS.md      # created empty at freeze; append-only
 ```
@@ -989,12 +991,19 @@ coverage), `guard` (may PASS at base; at most 3; no coverage).
 Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
 PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
 (`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). Each
-check runs in a copy of the tree (no .git/node_modules/caches/mailbox;
-the pack copy likewise omits `node_modules/`, `__pycache__/`,
-`.pytest_cache/` and `*.pyc`, exactly what the pin skips),
-loopback-only under bwrap when available (else `sandbox: none` with a dead
-proxy), env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`/proxies,
-with `ACC_TREE`, `ACC_DIR`, `ACC_WORK`, `ACC_ID`, `ACC_BIND_<NAME>`.
+check runs in its OWN fresh copy of the tree (no .git/node_modules/caches/
+mailbox) with its own read-only view of the pack: its own files (named by
+its `run`, mentioned by them, or under `checks/<its id>/`) plus the shared
+ones (`fakes/`, `lib/`, interpreter-loaded names, unowned helpers); the
+view omits the metadata files and what the pin skips (`node_modules/`,
+`__pycache__/`, `.pytest_cache/`, `*.pyc`). No check can change another
+check's inputs. Loopback-only under bwrap when available (else `sandbox:
+none` with a dead proxy), Python with `PYTHONSAFEPATH` (a script's own
+directory is not importable; shared helpers live in `acceptance/lib/`, on
+`PYTHONPATH`/`NODE_PATH`), env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
+`*_PASSWORD`/proxies and implicit-load variables (`PYTHONPATH`,
+`NODE_OPTIONS`, `BASH_ENV`, ...), with `ACC_TREE`, `ACC_DIR`, `ACC_WORK`,
+`ACC_ID`, `ACC_BIND_<NAME>`.
 
 `FROZEN` lines: `manifest_sha256`, `base`, `frozen_utc`, `author`,
 `dropped: <id> <reason>; ...`, then the pin chain `pin[0]: <sha256>
@@ -1022,17 +1031,25 @@ and still maps the check. Only the integration Evaluator amends, by the
 amendment protocol: `checks/<file>`, `fakes/**` and a check's `run`,
 `expect`, `timeout_s`, `binds`, `needs` may change (`id`, `goal_quote`,
 `kind` are immutable; no check is removed); every changed pack file must
-belong only to amended ids (the checks whose `run` names it; a file no
-`run` names belongs to every check), and an amended `run` may not point at
-another check's file; one `## ACC-NN · iter N ·
+belong only to amended ids (every check that can load it: its `run`
+names it or its files mention it; a shared file -- `fakes/`, `lib/`,
+interpreter-loaded names, module shadows, unowned helpers -- belongs to
+every check); a new file may be added only under `checks/<ID>/` of an
+amended ID and must be used by no other check; an amended `run` may not
+point at another check's file; one `## ACC-NN · iter N ·
 evaluator · <utc>` record per amended id in `AMENDMENTS.md` (`goal_quote:`,
 `defect in check:`, `change:`); commit subject `acceptance: amend ACC-NN
 (evaluator, iter N): <reason>`, touching only `acceptance/`; at most 2
 amendments per loop and 25% of the checks; after the amendment the whole
 pack re-runs at base and every check that FAILed there before must still
-FAIL. A human may change anything while the loop is stopped, only through
+FAIL. Known limit (eval-r19c finding 2): that re-run is the only mechanical
+test, so a named, counted amended check can still be weakened conditionally
+on post-base state (FAIL at base, trivially PASS later); the budget, the
+AMENDMENTS.md record and the pin chain bound and expose it, and per-check
+isolation keeps it confined to the named checks. A human may change anything while the loop is stopped, only through
 `trioctl omnigent acceptance amend --human --ids ACC-NN,... --reason "..."
-[--adopt <sha>,...]` (refused while a live driver holds the mailbox). It
+[--adopt <sha>,...]` (refused while a driver holds or is taking the
+mailbox lock; the command holds the lock itself while it runs). It
 commits the working-tree edits as `acceptance: amend <ids> (human):
 <reason>`, adopts pack commits you already made since the pin only when you
 name them with `--adopt`, re-pins with an `Acceptance-Human-Amend: <shas>`
