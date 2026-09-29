@@ -7,7 +7,8 @@
 #   launch.sh resume --mailbox /abs/repo/loop --run-id wf_… [--session UUID] [--timeout SECONDS]
 #
 # start   records a fresh --session-id and the exact args JSON in
-#         <mailbox>/.native-launch.json, then runs the workflow.
+#         <mailbox>/.native-launch.json, then runs the workflow. A launch
+#         refused by the mailbox lock restores the previous record.
 # resume  (only after a kill or crash mid-run) reopens the SAME session with
 #         --resume and asks for resumeFromRunId with the byte-identical args:
 #         workflow journals live under the launching session. After a
@@ -24,7 +25,7 @@
 # Output: the workflow's result JSON (parsed from the one fenced block the
 # session is told to print) on stdout; the raw session output is kept under
 # <mailbox>/.native-runs/. Exit 0 when a result was parsed, 3 when not,
-# 2 on usage errors.
+# 2 on usage errors. Default --timeout: 6 h (vps-pool runs about 4 h).
 set -euo pipefail
 
 CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
@@ -35,13 +36,13 @@ MODEL="claude-opus-5-5"
 SETTINGS='{"worktree":{"baseRef":"head"}}'
 SUFFIX='Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop.'
 
-usage() { sed -n '2,27p' "$0" >&2; exit 2; }
+usage() { sed -n '2,28p' "$0" >&2; exit 2; }
 
 [ $# -ge 1 ] || usage
 mode="$1"; shift
 case "$mode" in start|resume) ;; *) usage ;; esac
 
-mailbox="" max_iterations="4" helper="" run_token="" run_id="" session="" timeout_s="14400"
+mailbox="" max_iterations="4" helper="" run_token="" run_id="" session="" timeout_s="21600"
 while [ $# -gt 0 ]; do
   case "$1" in
     --mailbox) mailbox="$2"; shift 2 ;;
@@ -74,6 +75,10 @@ if token:
 print(json.dumps(args, separators=(",", ":")))
 PY
 )"
+  # Keep the previous record: a launch refused by the lock restores it, so
+  # a later `resume` never targets the refused session (eval-native-v0b N7).
+  prev_record="$runs/launch-record.$session.prev.json"
+  if [ -f "$record" ]; then cp "$record" "$prev_record"; fi
   python3 - "$record" "$session" "$args_json" <<'PY'
 import json, os, sys
 path, session, args = sys.argv[1:4]
@@ -106,27 +111,69 @@ set +e
 rc=$?
 set -e
 
-python3 - "$raw" "$rc" "$session" <<'PY'
-import json, re, sys
-raw, rc, session = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" <<'PY'
+import json, os, re, sys
+raw, rc, session, mode, record, prev = sys.argv[1:7]
+rc = int(rc)
+launcher = {"session_id": session, "exit_code": rc, "raw": raw}
+
+
+def fail(reason):
+    print(json.dumps({"status": "error", "reason": reason, "launcher": launcher},
+                     indent=2, sort_keys=True))
+    sys.exit(3)
+
+
 try:
-    outer = json.load(open(raw, encoding="utf-8"))
-    text = outer.get("result") or ""
-except (OSError, ValueError):
-    text = open(raw, encoding="utf-8", errors="replace").read()
-blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", text, re.S)
-for block in reversed(blocks):
+    body = open(raw, encoding="utf-8", errors="replace").read()
+except OSError:
+    body = ""
+try:
+    outer = json.loads(body)
+except ValueError:
+    outer = None
+if outer is None:
+    text = body
+elif isinstance(outer, dict):
+    text = outer.get("result")
+    text = text if isinstance(text, str) else ""
+else:
+    fail("session output is JSON but not an object")
+# ```json / ```JSON / ```jsonc / a bare fence; CRLF tolerated.
+blocks = re.findall(r"```(?:jsonc?|json5)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```", text,
+                    re.S | re.I)
+dicts = []
+for block in blocks:
     try:
-        result = json.loads(block)
+        value = json.loads(block)
     except ValueError:
         continue
-    if isinstance(result, dict):
-        result.setdefault("launcher", {})
-        result["launcher"].update(session_id=session, exit_code=rc, raw=raw)
-        print(json.dumps(result, indent=2, sort_keys=True))
-        sys.exit(0)
-print(json.dumps({"status": "error", "reason": "no fenced result JSON in the session output",
-                  "launcher": {"session_id": session, "exit_code": rc, "raw": raw}},
-                 indent=2, sort_keys=True))
-sys.exit(3)
+    if isinstance(value, dict):
+        dicts.append(value)
+# The workflow result carries `status`; a trailing non-result block loses.
+results = [d for d in dicts if "status" in d] or dicts
+if not results:
+    fail("no fenced result JSON in the session output")
+result = results[-1]
+refused = (mode == "start" and result.get("status") == "error"
+           and result.get("lock") in ("foreign", "not_released")
+           and re.match(r"begin\b.*(locked|refused)", str(result.get("reason") or ""), re.S))
+if refused:
+    if prev and os.path.isfile(prev):
+        os.replace(prev, record)
+        launcher["record"] = "restored"
+    else:
+        try:
+            os.remove(record)
+        except OSError:
+            pass
+        launcher["record"] = "removed"
+elif prev and os.path.isfile(prev):
+    os.remove(prev)
+result.setdefault("launcher", {})
+if not isinstance(result["launcher"], dict):
+    result["launcher"] = {}
+result["launcher"].update(launcher)
+print(json.dumps(result, indent=2, sort_keys=True))
+sys.exit(0)
 PY

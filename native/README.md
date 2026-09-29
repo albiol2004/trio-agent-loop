@@ -56,7 +56,9 @@ native/launch.sh start --mailbox /abs/path/to/repo/loop --max-iterations 4 [--he
 It runs `claude -p '<prompt>' --session-id <new uuid> --model claude-opus-5-5 --permission-mode auto --settings '{"worktree":{"baseRef":"head"}}' --output-format json`:
 - `--settings '{"worktree":{"baseRef":"head"}}'` is **required**. Without it, isolated builders fork from `origin/HEAD` (probe P4), and every builder is refused. It is a command-line flag only; no settings file is edited.
 - The prompt ends with "Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop." The launcher parses that fenced block and prints it, adding `launcher: {session_id, exit_code, raw}`.
-- The session id and the exact args JSON are recorded in `<mailbox>/.native-launch.json`; raw outputs go to `<mailbox>/.native-runs/`.
+- The session id and the exact args JSON are recorded in `<mailbox>/.native-launch.json`; raw outputs go to `<mailbox>/.native-runs/`. A `start` refused by the mailbox lock (`begin` locked/refused, `lock: foreign`) restores the previous record, so a later `resume` never targets the refused session.
+- Parsing: the session's JSON must be an object (else exit 3); fences tagged `json`, `JSON`, `jsonc` or bare are accepted (CRLF too); among several fenced objects the last one with a `status` key wins.
+- `--timeout` defaults to 6 h (vps-pool runs about 4 h).
 
 From an interactive session the equivalent call is `Workflow({name: "trio-native", args: {mailbox: "/abs/path/to/repo/loop", max_iterations: 4}})`, provided that session was started with the same `--settings`.
 
