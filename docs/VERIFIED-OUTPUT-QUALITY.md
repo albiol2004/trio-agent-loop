@@ -49,8 +49,10 @@ slice's non-test product files to the base inside the builder's worktree,
 re-runs the brief's `## Targeted check`, and restores the tree from a
 snapshot of every changed path (per-path byte identity + sha256 proof).
 `killed` (a runner's assertion / failed-test report only) / `survived` /
-`n/a` (incl. `absolute cd`) / `error` (not runnable, collection error,
-timeout, `restore:`) land in
+`n/a` (the check would leave the worktree: an absolute or `~` `cd`/`pushd`,
+a relative `cd ../x` that resolves outside, `env -C <dir>`, or a
+backtick/`$(...)` target that can't be resolved statically -- r17-rc L-4)
+/ `error` (not runnable, collection error, timeout, `restore:`) land in
 the builder JSON (`kill_check`), the worktree ledger, the driver's
 `retired slice ... | kill_check: <outcome> (shadow)` LOG line, the
 slice-eval's `BASE-REVERT:` context line, `.driver.json` `quality` and
@@ -76,3 +78,53 @@ the slice's accept-lint findings too. Advisory only; the Evaluator
 adjudicates. Note: a grep over the product file itself is *killed* by the
 base-revert check (the text changes), so W1-style tests are the lint's
 job, W3-style receipt tests the kill check's.
+
+## Lockstep, telemetry and classifier gaps (info, eval-r17rc)
+
+These are non-blocking properties of how r18a's shadow machinery interacts
+with lockstep loops and existing telemetry surfaces; nothing here changes
+behaviour, they are documented so the gaps are expected rather than
+discovered.
+
+- **The lockstep Evaluator gets no `BASE-REVERT:` / `AUTHORED-BY:` /
+  `PRE-GATE:`.** Those three come from the open-loop slice-eval context
+  only (built from a retired `QUEUE.md` entry and the per-slice kill
+  check); a lockstep loop has no `QUEUE.md` and no per-slice dispatch, so
+  there is nothing to attach them to. The base-revert kill check itself
+  only ever runs for an `--isolate-workers` lockstep builder (recorded in
+  the worktree ledger only, never surfaced to the Evaluator); default
+  (non-isolated) lockstep runs no kill check at all. The lockstep
+  Evaluator still gets the full rigor block, `## Independent probe` and
+  `UNAVAILABLE` handling -- it just has no receipt-vs-base evidence handed
+  to it, so it falls back to the canonical prompt's own instruction to run
+  the new tests against the base itself ("your own run of the new tests
+  against the base") rather than trusting a base-revert result it was
+  never given.
+- **A module-top import of a new symbol reports `error`, not `killed`.**
+  `_kill_classify` treats any collection/import failure as `error`
+  (`collection_error: true`) by design (eval-r18a F2): the check never ran
+  at all, so it cannot have been behaviourally killed. The most common
+  test-first shape -- `from calc import new_symbol` at module scope, added
+  by the same slice that adds `new_symbol` -- is exactly a collection
+  failure against the base (the base has no `new_symbol` yet), so its
+  `BASE-REVERT:` line reads `error`, not `killed`, even though the test is
+  perfectly sound. An in-function `calc.new_symbol()` call (attribute
+  access deferred to call time) does classify as `killed`. Either way the
+  Evaluator must still do its own red run; `BASE-REVERT: error` is not
+  proof of a bad test, and `BASE-REVERT: killed` is not a substitute for
+  the Evaluator's own re-execution.
+- **Telemetry surfaces differ in what they show.** The live dashboard
+  reads `.driver.json` for driver/running state only; it does not render
+  `quality` or `lint` (r16b's dashboard scope was never extended for
+  r18a). `trio-shadow` prints per-slice `quality` rows for an open-loop
+  mailbox. Lockstep probe telemetry
+  (`quality["lockstep@<sha12>"].probe`) exists only in the live
+  `.driver.json` under `<Lead worktree>/loop/<x>/`, copied to the root
+  mailbox at land -- there is no dashboard or trio-shadow view of it.
+- **`UNAVAILABLE` accepts are folded into `unverified=`.** The slice
+  section's `evidence:` line has no separate `unavailable=` count; an
+  accept graded `UNAVAILABLE(<reason>)` is counted alongside any other
+  unverified accept under `evidence: ... unverified=<n> ...`, and the
+  reason string itself is what shows up on the section's own
+  `unavailable:` line. Do not expect `unverified=0` to mean "everything
+  was graded" when an `unavailable:` line is present.
