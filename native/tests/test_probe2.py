@@ -247,3 +247,34 @@ def test_end_after_refused_begin_leaves_the_owner_alone(repo: Path) -> None:
     assert (mbox(repo) / ".lock").is_dir()
     assert session.read_text() == before
     assert not _json.loads(before)["done"]
+
+
+# ------------------------------------ N6: commit: lines after the retirement
+def retire_then_append(repo: Path, p: dict, tail: str) -> None:
+    from test_step_ops import write_verdict
+    write_verdict(repo, "VERDICT: SHIP", 1, p)
+    git(repo, "add", "loop")
+    git(repo, "commit", "-q", "-m", "loop: iteration 1 — SHIP")
+    with (mbox(repo) / "VERDICT.md").open("a", encoding="utf-8") as fh:
+        fh.write(tail)
+
+
+def test_fold_takes_commit_lines_appended_after_retirement(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    retire_then_append(repo, p, f"commit: {p['sha']}\n")
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "shipped" and a["retirement_fold"] == "amended", a
+    assert a["commit_shas"] == [p["sha"]]
+    assert git(repo, "status", "--porcelain") == ""
+    assert f"commit: {p['sha']}" in git(repo, "show", "HEAD:loop/VERDICT.md")
+
+
+def test_fold_skips_verdict_edited_beyond_commit_lines(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    retire_then_append(repo, p, f"commit: {p['sha']}\nextra judgement\n")
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "shipped"
+    assert a["retirement_fold"] == ("skipped: other uncommitted paths: "
+                                    "loop/VERDICT.md")

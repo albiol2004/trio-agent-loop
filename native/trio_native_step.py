@@ -1083,6 +1083,32 @@ def _eval_worktrees(repo: Path | None) -> list[str]:
 
 
 # ------------------------------------------------ retirement fold
+_COMMIT_LINE = re.compile(r"^commit:\s*[0-9a-f]{7,40}\s*$")
+
+
+def _commit_lines_appended(root: Path, rel: str) -> bool:
+    """True when the working VERDICT.md is HEAD's copy plus appended
+    ``commit: <sha>`` (or blank) lines only: an Evaluator that appended its
+    ``commit:`` lines after the retirement commit (eval-native-v0b N6)."""
+    shown = TL._git(root, "show", f"HEAD:{rel}")
+    if shown.returncode != 0:
+        return False
+    try:
+        now = (root / rel).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    before = shown.stdout
+    if not now.startswith(before) or now == before:
+        return False
+    extra = now[len(before):]
+    if before and not before.endswith("\n") and not extra.startswith("\n"):
+        return False  # the first appended text continues HEAD's last line
+    lines = extra.splitlines()
+    return (any(_COMMIT_LINE.match(ln.strip()) for ln in lines)
+            and all(not ln.strip() or _COMMIT_LINE.match(ln.strip())
+                    for ln in lines))
+
+
 def _fold_final_state(mailbox: Path, repo: Path | None,
                       iteration: int) -> str:
     """Fold the driver's final STATE (and LOG/.gitignore) into the SHIP
@@ -1091,8 +1117,8 @@ def _fold_final_state(mailbox: Path, repo: Path | None,
     Same guard rails as ``trio_loop._fold_restored_verdict_into_retirement``:
     HEAD is the single-parent ``loop: iteration N — SHIP`` commit touching
     only the mailbox, nothing is staged, HEAD is on no remote branch, and
-    every dirty path is a mailbox sidecar (STATE.md, LOG.md, .gitignore).
-    Returns "amended", "clean" or "skipped: <reason>".
+    every dirty path is a mailbox sidecar (STATE.md, LOG.md, .gitignore,
+    and VERDICT.md when only ``commit:`` lines were appended). Returns "amended", "clean" or "skipped: <reason>".
     """
     root = TL._git_root(repo)
     if root is None:
@@ -1107,6 +1133,9 @@ def _fold_final_state(mailbox: Path, repo: Path | None,
         return "skipped: git status failed"
     if not dirty:
         return "clean"
+    verdict_rel = f"{mailbox_rel}/VERDICT.md"
+    if verdict_rel in dirty and _commit_lines_appended(root, verdict_rel):
+        sidecars.add(verdict_rel)  # eval-native-v0b N6
     others = [p for p in dirty if p not in sidecars]
     if others:
         return "skipped: other uncommitted paths: " + ", ".join(others[:5])
