@@ -67,7 +67,7 @@ const REQUIRED = {
   next: ['action', 'iteration'],
   dispatch: ['head', 'wave'],
   builders: ['accepted', 'refused', 'merge'],
-  cleanup: ['removed', 'kept'],
+  cleanup: ['removed', 'kept', 'dropped'],
   gate: ['pass', 'failures', 'final', 'status'],
   pin: ['sha', 'evaluator_attempt', 'context_block', 'skip_evaluator'],
   apply: ['verdict', 'stop', 'status', 'code', 'commit_shas', 'bound'],
@@ -98,6 +98,29 @@ const PLAN_SCHEMA = {
     notes: { type: 'string' },
   },
   required: ['slices'],
+}
+
+// The integrate call reports what it merged and which merges it aborted;
+// git (cleanup's "not merged into HEAD") stays the authority on conflicts.
+const INTEGRATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    merged: { type: 'array', items: { type: 'string' } },
+    conflicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          branch: { type: 'string' },
+          files: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['id', 'branch', 'files'],
+      },
+    },
+    summary: { type: 'string' },
+  },
+  required: ['merged', 'conflicts', 'summary'],
 }
 
 const BUILDER_SCHEMA = {
@@ -245,6 +268,9 @@ function leadPlanPrompt(n) {
     '- Return every code-changing slice of this iteration through the structured output: `id` (the PLAN.md slice id), ' +
     '`brief` (a complete, self-contained builder assignment: objective, approach, done-criteria and the targeted check ' +
     'command, boundaries), `writes`, `reads`, and `depends` (ids in this list that must be merged before it starts).',
+    '- `writes` decides which slices run concurrently, so it must list EVERY file the slice edits — including shared ' +
+    'files several slices touch: registries, `__init__.py`, config, routing tables, lock files and manifests. Two ' +
+    'slices that both add an entry to the same file must both list it (they then run in sequence, not in parallel).',
     '- Return `slices: []` only when this iteration changes no product code; you will then finish the pass yourself.',
     MAILBOX_WRITES,
     '',
@@ -289,8 +315,9 @@ function integratePrompt(n, k, last, bl, results) {
   lines.push(
     '',
     'Merge procedure: from your own checkout, on your branch, run `git merge --no-ff --no-edit <builder branch>` for ' +
-    'each branch above, in order. If a merge conflicts, run `git merge --abort`, stop merging, and report the builder, ' +
-    'its branch and the conflicting files in REPORT.md and your final message — do not resolve it inside the merge. ' +
+    'each branch above, in order. If a merge conflicts, record the conflicting files (`git diff --name-only ' +
+    '--diff-filter=U`), run `git merge --abort` and go on with the next branch — do not resolve a conflict and do ' +
+    'not re-implement that slice: the driver re-dispatches it to a new builder forked from your new HEAD. ' +
     'Do not remove worktrees or delete branches: the driver does that after this call.',
     'Then review the complete diff of this wave, run the relevant checks, and commit any corrections yourself as ' +
     '`slice(<id>): fix …` (you own the final diff; do not reimplement a slice a builder delivered).',
@@ -298,7 +325,8 @@ function integratePrompt(n, k, last, bl, results) {
   if (last) {
     lines.push(
       '',
-      'Then finish the Lead pass: every code-changing slice has a `slice(<id>):` commit reachable from HEAD; rewrite ' +
+      'If any merge in this call conflicted, stop after your review: do NOT write REPORT.md or your LOG line (the ' +
+      're-dispatched slice\'s integrate call does that). Otherwise finish the Lead pass: every code-changing slice has a `slice(<id>):` commit reachable from HEAD; rewrite ' +
       'REPORT.md for this iteration (with Implementation provenance naming the builders) — the driver fails the gate ' +
       `when REPORT.md was not rewritten; append \`- iter ${n.iteration} | lead | <summary>\` to ${MAILBOX}/LOG.md.`,
       MAILBOX_WRITES,
@@ -306,11 +334,12 @@ function integratePrompt(n, k, last, bl, results) {
   } else {
     lines.push('', 'More waves follow: do not write REPORT.md or your LOG line yet.')
   }
-  lines.push('', 'Final message: 3–5 sentence summary for the driver.')
+  lines.push('', 'Return through the structured output: `merged` (the slice ids you merged), `conflicts` (one ' +
+    '`{id, branch, files}` per aborted merge; [] when none) and `summary` (3–5 sentences for the driver).')
   return lines.join('\n')
 }
 
-function soloLeadPrompt(n, attempt, gate, why) {
+function soloLeadPrompt(n, attempt, gate, why, kept) {
   const lines = header('lead', n).concat([
     '',
     why,
@@ -325,6 +354,11 @@ function soloLeadPrompt(n, attempt, gate, why) {
       lines.push(...gate.failures.map(f => `- ${f}`), ...(gate.detail || []).map(d => `  ${d}`))
     } else {
       lines.push('- (the previous run stopped before reporting; re-check commits, REPORT.md and the LOG line)')
+    }
+    if (kept && kept.length) {
+      lines.push('Builder branches the driver could not clean up (merge them with `git merge --no-ff --no-edit ' +
+        '<branch>` if their slice is not on HEAD yet; the driver runs cleanup on them after this call):',
+      ...kept.map(x => `- \`${x.branch}\`: ${x.reason}`))
     }
     lines.push('Fix exactly this and finish. A second failure stops the loop with status error.')
   }
@@ -437,6 +471,33 @@ function checkSlices(plan) {
   return null
 }
 
+// Conflicts of one wave. git is the authority: a builder branch that the
+// integrate call was asked to merge and that cleanup found "not merged into
+// HEAD" conflicted (the Lead's `conflicts` only contributes the files).
+function waveConflicts(bl, integ, cl) {
+  const unmerged = new Set((cl.kept || []).filter(x => x.reason === 'not merged into HEAD').map(x => x.branch))
+  const reported = integ && Array.isArray(integ.conflicts) ? integ.conflicts : []
+  return bl.merge.filter(m => unmerged.has(m.branch)).map(m => {
+    const r = reported.find(c => c && (c.branch === m.branch || c.id === m.id))
+    return { id: m.id, branch: m.branch, files: r && Array.isArray(r.files) ? r.files.map(String) : [] }
+  })
+}
+
+// A conflicting slice gets one new single-builder wave, forked from the
+// Lead's HEAD after this wave's merges, with the conflict files in `writes`.
+function redispatchSlice(s, c) {
+  const files = c.files.length ? c.files.join(', ') : '(files not reported)'
+  return Object.assign({}, s, {
+    depends: [],
+    writes: Array.from(new Set((s.writes || []).concat(c.files))),
+    supersedes: c.branch,
+    brief: s.brief + '\n\nRE-DISPATCH: an earlier builder for this slice delivered branch `' + c.branch +
+      '`, but merging it conflicted with work merged since, on: ' + files + '. Your worktree forks from the ' +
+      'Lead\'s new HEAD, which contains that merged work. Build the slice on top of it, keeping the merged work ' +
+      'intact in the shared files; you may read the earlier attempt with `git diff HEAD...' + c.branch + '`.',
+  })
+}
+
 function shaMatches(a, b) {
   const x = String(a || '').trim().toLowerCase()
   const y = String(b || '').trim().toLowerCase()
@@ -460,6 +521,9 @@ async function leadPass(n, rec) {
   }
   rec.slices = plan.slices.map(s => s.id)
   rec.waves = waves.map(w => w.map(s => s.id))
+  rec.conflicts = []
+  const redispatched = new Set()
+  const kept = new Map()  // branch -> reason, across this pass's cleanups
   if (!waves.length) {
     const out = await runAgentTwice(`lead it${n.iteration}`, soloLeadPrompt(n, 1, null,
       'The plan has no code-changing slices: finish this Lead pass yourself.'), {
@@ -501,14 +565,43 @@ async function leadPass(n, rec) {
     }
     const integ = await runAgentTwice(`lead integrate it${n.iteration} w${k}`,
       integratePrompt(n, k, k === waves.length, bl, compact.map((c, i) => Object.assign({}, results[i], c))), {
-        agentType: 'trio-lead', model: MODELS.lead, effort: 'high',
+        agentType: 'trio-lead', model: MODELS.lead, effort: 'high', schema: INTEGRATE_SCHEMA,
       })
     if (integ === null) return { status: 'error', reason: 'lead integrate agent failed twice' }
-    const cl = await step('cleanup', { branches: bl.merge.map(m => m.branch).join(',') })
+    // A re-dispatched slice supersedes its conflicted branch: cleanup drops
+    // the old branch once the new one is merged (`old=new`).
+    const drops = wave.filter(s => s.supersedes).map(s => {
+      const m = bl.merge.find(x => x.id === s.id)
+      return m ? `${s.supersedes}=${m.branch}` : null
+    }).filter(Boolean)
+    const cl = await step('cleanup', Object.assign({ branches: bl.merge.map(m => m.branch).join(',') },
+      drops.length ? { drop_unmerged: drops.join(',') } : {}))
     if (!cl.ok) return stepFail('cleanup', cl)
+    trackKept(kept, cl)
+    rec.kept = Array.from(kept, ([branch, reason]) => ({ branch, reason }))
     if (cl.kept.length) log(`cleanup kept: ${cl.kept.map(x => `${x.branch} (${x.reason})`).join('; ')}`)
+    const conflicts = waveConflicts(bl, integ, cl)
+    if (!conflicts.length) continue
+    rec.conflicts.push(...conflicts)
+    const describe = cs => cs.map(c => `${c.id} (${c.branch}) on ${c.files.join(', ') || 'unreported files'}`).join('; ')
+    const again = conflicts.filter(c => redispatched.has(c.id))
+    if (again.length) {
+      return { status: 'conflict', reason: `merge conflict after a re-dispatch: ${describe(again)}`, conflicts }
+    }
+    const byId = new Map(wave.map(s => [s.id, s]))
+    const extra = conflicts.map(c => [redispatchSlice(byId.get(c.id), c)])
+    for (const c of conflicts) redispatched.add(c.id)
+    waves.splice(k, 0, ...extra)
+    rec.waves = waves.map(w => w.map(s => s.id))
+    log(`iteration ${n.iteration} wave ${k}: merge conflict ${describe(conflicts)}; re-dispatching from the new HEAD`)
   }
   return null
+}
+
+function trackKept(kept, cl) {
+  for (const x of cl.removed || []) kept.delete(x.branch)
+  for (const x of cl.dropped || []) if (x.dropped) kept.delete(x.branch)
+  for (const x of cl.kept || []) kept.set(x.branch, x.reason)
 }
 
 // ------------------------------------------------------------------ run
@@ -545,7 +638,7 @@ try {
             failed = await leadPass(n, rec)
           } else {
             const prompt = role === 'lead'
-              ? soloLeadPrompt(n, attempt, g, 'Finish this Lead pass.')
+              ? soloLeadPrompt(n, attempt, g, 'Finish this Lead pass.', rec.kept)
               : repairPrompt(n, attempt, g)
             const out = await runAgentTwice(`${role} it${n.iteration}#${attempt}`, prompt, {
               agentType: `trio-${role}`,
@@ -553,6 +646,16 @@ try {
               effort: 'high',
             })
             if (out === null) failed = { status: 'error', reason: `${role} agent failed twice` }
+            else if (role === 'lead' && rec.kept && rec.kept.length) {
+              // eval-native-v0b N5: the solo Lead may have merged a kept branch.
+              const cl = await step('cleanup', { branches: rec.kept.map(x => x.branch).join(',') })
+              if (!cl.ok) failed = stepFail('cleanup', cl)
+              else {
+                const kept = new Map(rec.kept.map(x => [x.branch, x.reason]))
+                trackKept(kept, cl)
+                rec.kept = Array.from(kept, ([branch, reason]) => ({ branch, reason }))
+              }
+            }
           }
           if (failed) break
           g = await step('gate', { role, iteration: n.iteration, attempt })
@@ -613,6 +716,7 @@ return {
   reason: outcome.reason,
   iteration: end && end.ok ? end.iteration : (iterations.length ? iterations[iterations.length - 1].iteration : null),
   commit_shas: outcome.commit_shas || [],
+  conflicts: outcome.conflicts || [],
   human_check: outcome.human_check || null,
   retirement_fold: outcome.retirement_fold || null,
   // A held (or failed) `end` is surfaced: the loop outcome stands, but the

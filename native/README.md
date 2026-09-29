@@ -36,9 +36,12 @@ Workflow subagents have **no Agent tool** (probe P4), so the driver owns the bui
    - `dispatch` returns the Lead's HEAD;
    - one `trio-builder` (Sonnet) per slice runs with `isolation: 'worktree'`, concurrently within the wave, and reports `worktree`, `branch`, `base`, `head`, `commits`, `targeted_check`, `summary`;
    - the script refuses a builder whose `base` is not that HEAD, and `builders` re-checks on git (the branch must contain the HEAD and must not commit `loop/`) and writes each builder's `- iter N | builder | <id>: …` LOG line — builders never write LOG.md or commit `loop/`;
-   - a `trio-lead` **integrate** call merges each branch (`git merge --no-ff --no-edit`, a conflict is aborted and reported), reviews and corrects; the last wave also rewrites REPORT.md and appends the `| lead |` LOG line;
+   - a `trio-lead` **integrate** call merges each branch (`git merge --no-ff --no-edit`; a conflicting merge is aborted and the next branch merged), reviews and corrects, and returns `{merged, conflicts: [{id, branch, files}], summary}`; the last wave also rewrites REPORT.md and appends the `| lead |` LOG line, unless a merge conflicted;
+   - **conflicts** (probe 2 blocker B): git decides — a builder branch that `cleanup` finds "not merged into HEAD" conflicted (the Lead's `conflicts` only adds the files). Each conflicting slice is re-dispatched **once** as a new single-builder wave forked from the Lead's post-merge HEAD, with the conflict files added to its `writes`; that wave's `cleanup` drops the superseded branch (`--drop-unmerged old=new`: only once `new` is merged, only builder branches, force-deleted, with the same dirt rule for its worktree). A slice that conflicts again stops the run with `status: "conflict"`, the `conflicts` list and a reason naming the slices and files (STATE stays `lead-running`; a fresh run re-plans). Each pass records `conflicts` and `kept` in `iterations[]`;
    - `cleanup` removes the merged worktrees and deletes the branches. It forces the removal only when the only dirt is `loop/` residue or untracked build artefacts; a tracked change or any other untracked file keeps the worktree (ignored files never block a removal).
-4. **Gate** — `_commit_gate` + `_log_gate` as in `trio_loop`, plus: REPORT.md must have been rewritten in this pass. A failure retries once with one solo Lead call; a plan with no slices is also one solo Lead call.
+4. **Gate** — `_commit_gate` + `_log_gate` as in `trio_loop`, plus: REPORT.md must have been rewritten in this pass. A failure retries once with one solo Lead call, which is told the builder branches `cleanup` kept (with the reason); `cleanup` runs on them again after that call (eval-native-v0b N5). A plan with no slices is also one solo Lead call.
+
+The plan call is told that `writes` must list every shared file a slice edits (registries, `__init__.py`, config, lock files), because `writes` alone decides concurrency.
 
 Roles write mailbox files with Bash heredocs: the harness refuses report-file `Write`s from workflow subagents (probe P5). The Evaluator creates any pin worktree under `.claude/worktrees/eval-*`, and `end` removes those.
 
@@ -63,7 +66,7 @@ Optional args:
 - `helper`: an absolute path to the helper.
 - `max_agents`, `token_budget`: opt-in caps. See **Caps**.
 
-The result is `{status, verdict, code, reason, iteration, commit_shas, human_check, retirement_fold, held_step, end_error, iterations[], agents_used, lock, dangling_worktrees, eval_worktrees_removed}`. `iterations[]` records each pass's slices and waves. The launching session:
+The result is `{status, verdict, code, reason, iteration, commit_shas, conflicts, human_check, retirement_fold, held_step, end_error, iterations[], agents_used, lock, dangling_worktrees, eval_worktrees_removed}`. `iterations[]` records each pass's slices and waves. The launching session:
 - surfaces NEEDS_HUMAN (`human_check`) and BLOCKED;
 - announces the SHIP `commit_shas`;
 - queues the one post-SHIP documentation task (CLAUDE.md policy).

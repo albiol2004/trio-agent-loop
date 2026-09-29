@@ -960,15 +960,73 @@ def _remove_worktree(repo: Path, path: str, mailbox_rel: str | None,
     return None
 
 
+def _drop_superseded(root: Path, mailbox_rel: str | None, head: str | None,
+                     spec: str, trees: dict) -> dict:
+    """Drop one unmerged builder branch superseded by a re-dispatch.
+
+    ``spec`` is ``old`` or ``old=new``; with ``=new`` the old branch is
+    dropped only when ``new`` is merged into HEAD (the re-dispatch landed).
+    Only builder branches are dropped: a worktree under
+    ``.claude/worktrees/`` (removed under ``_remove_worktree``'s dirt rule),
+    or no worktree and a ``worktree-*`` name. The branch is force-deleted
+    (``git branch -D``): its commits are superseded, not merged.
+    """
+    old, _sep, new = (x.strip() for x in spec.partition("="))
+    entry: dict = {"branch": old, "superseded_by": new or None}
+    tip = _branch_sha(root, old)
+    if tip is None:
+        return {**entry, "dropped": True, "note": "branch already gone"}
+    if new:
+        new_tip = _branch_sha(root, new)
+        if (new_tip is None or head is None
+                or not TL._git_is_ancestor(root, new_tip, head)):
+            return {**entry, "dropped": False,
+                    "reason": f"re-dispatched branch {new} is not merged "
+                              "into HEAD"}
+    tree = trees.get(old)
+    path = tree.get("path") if tree else None
+    marker = f"{root}/{WORKTREES_DIR}/"
+    if path:
+        if Path(path).resolve() == root.resolve():
+            return {**entry, "dropped": False,
+                    "reason": "checked out in the repo"}
+        if not path.startswith(marker):
+            return {**entry, "dropped": False,
+                    "reason": f"worktree {path} is not a builder worktree"}
+        why = _remove_worktree(root, path, mailbox_rel)
+        if why:
+            return {**entry, "dropped": False, "worktree": path,
+                    "reason": why}
+    elif not old.startswith("worktree-"):
+        return {**entry, "dropped": False,
+                "reason": "not a builder branch (no worktree-* name)"}
+    deleted = TL._git(root, "branch", "-D", old)
+    if deleted.returncode != 0:
+        return {**entry, "dropped": False, "worktree": path,
+                "reason": "git branch -D failed: "
+                          + deleted.stderr.strip()[:200]}
+    return {**entry, "dropped": True, "worktree": path, "tip": tip}
+
+
 def op_cleanup(mailbox: Path, repo: Path | None,
                a: argparse.Namespace) -> dict:
-    """Remove merged builder worktrees and delete their branches."""
+    """Remove merged builder worktrees and delete their branches.
+
+    ``--drop-unmerged old[=new],…`` also drops builder branches superseded
+    by a re-dispatch (see ``_drop_superseded``), reported in ``dropped``.
+    """
     _require_lock(mailbox, a.token)
     root = _need_repo(repo, "cleanup")
     mailbox_rel = TL._mailbox_rel(root, mailbox)
     head = TL._git_head(root)
     wanted = [b.strip() for b in (a.branches or "").split(",") if b.strip()]
+    drops = [d.strip() for d in (a.drop_unmerged or "").split(",")
+             if d.strip()]
     trees = {t.get("branch"): t for t in _worktrees(root)}
+    # Superseded branches first: an `old=new` pair checks that `new` is
+    # merged before the loop below deletes the merged `new` branch.
+    dropped = [_drop_superseded(root, mailbox_rel, head, d, trees)
+               for d in drops]
     removed, kept = [], []
     for branch in wanted:
         tip = _branch_sha(root, branch)
@@ -997,7 +1055,7 @@ def op_cleanup(mailbox: Path, repo: Path | None,
                          + deleted.stderr.strip()[:200]})
             continue
         removed.append({"branch": branch, "worktree": path})
-    return {"removed": removed, "kept": kept}
+    return {"removed": removed, "kept": kept, "dropped": dropped}
 
 
 def _eval_worktrees(repo: Path | None) -> list[str]:
@@ -1126,6 +1184,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="builders: JSON list of builder results")
     parser.add_argument("--branches", default=None,
                         help="cleanup: comma-separated merged builder branches")
+    parser.add_argument("--drop-unmerged", default=None,
+                        help="cleanup: comma-separated old[=new] builder "
+                             "branches superseded by a re-dispatch")
     parser.add_argument("--json", action="store_true",
                         help="accepted for symmetry; output is always JSON")
     return parser

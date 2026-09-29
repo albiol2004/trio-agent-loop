@@ -1,10 +1,12 @@
-"""Live-probe round 2 blockers on real git: build artefacts (A)."""
+"""Live-probe round 2 blockers on real git: build artefacts (A), the
+conflict re-dispatch cleanup (B)."""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
-from test_step_ops import (git, mbox, repo, retire, step,  # noqa: F401
-                           to_lead_done)
+from test_step_ops import (git, git_env, mbox, repo, retire,  # noqa: F401
+                           step, to_lead_done)
 from test_waves import builder_branch, lead_running
 
 ARTEFACTS = ("__pycache__/", "*.py[cod]", ".pytest_cache/")
@@ -129,3 +131,80 @@ def test_ship_still_refuses_untracked_product_file(repo: Path) -> None:
 def test_launcher_disables_bytecode() -> None:
     text = (Path(__file__).resolve().parents[1] / "launch.sh").read_text()
     assert "export PYTHONDONTWRITEBYTECODE=1" in text
+
+
+# ------------------------------------- B: superseded branch after re-dispatch
+def conflicting_wave(repo: Path) -> tuple[dict, dict]:
+    """alpha and beta both append to registry.py (probe 2 P3)."""
+    (repo / "registry.py").write_text("ENTRIES = ['core']\n")
+    git(repo, "add", "registry.py")
+    git(repo, "commit", "-q", "-m", "registry")
+    lead_running(repo)
+    alpha = builder_branch(repo, "alpha", files={
+        "alpha.py": "A = 1\n", "registry.py": "ENTRIES = ['core', 'alpha']\n"})
+    beta = builder_branch(repo, "beta", files={
+        "beta.py": "B = 1\n", "registry.py": "ENTRIES = ['core', 'beta']\n"})
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", alpha["branch"])
+    merge = subprocess_git(repo, "merge", "--no-ff", "--no-edit", beta["branch"])
+    assert merge.returncode != 0  # conflict
+    git(repo, "merge", "--abort")
+    return alpha, beta
+
+
+def subprocess_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, env=git_env())
+
+
+def test_cleanup_drops_conflicted_branch_once_redispatch_merged(
+        repo: Path) -> None:
+    alpha, beta = conflicting_wave(repo)
+    first = step(repo, "cleanup", branches="worktree-alpha,worktree-beta")
+    assert [k["branch"] for k in first["kept"]] == ["worktree-beta"]
+    assert first["kept"][0]["reason"] == "not merged into HEAD"
+    # the re-dispatched builder forks from the post-merge HEAD
+    beta2 = builder_branch(repo, "beta2", files={
+        "beta.py": "B = 1\n",
+        "registry.py": "ENTRIES = ['core', 'alpha', 'beta']\n"})
+    # not merged yet: the old branch is kept
+    early = step(repo, "cleanup",
+                 drop_unmerged="worktree-beta=worktree-beta2")
+    assert early["dropped"][0]["dropped"] is False
+    assert "not merged" in early["dropped"][0]["reason"]
+    assert Path(beta["worktree"]).exists()
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", beta2["branch"])
+    out = step(repo, "cleanup", branches="worktree-beta2",
+               drop_unmerged="worktree-beta=worktree-beta2")
+    assert out["ok"] and out["kept"] == []
+    assert out["dropped"] == [{
+        "branch": "worktree-beta", "superseded_by": "worktree-beta2",
+        "dropped": True, "worktree": beta["worktree"],
+        "tip": beta["head"]}]
+    assert not Path(beta["worktree"]).exists()
+    assert not Path(beta2["worktree"]).exists()
+    assert "worktree-beta" not in git(repo, "branch")
+    assert step(repo, "end")["dangling_worktrees"] == []
+    assert alpha  # merged and removed by the first cleanup
+    assert not Path(alpha["worktree"]).exists()
+
+
+def test_drop_unmerged_never_touches_non_builder_branches(repo: Path) -> None:
+    lead_running(repo)
+    git(repo, "branch", "feature")
+    out = step(repo, "cleanup", drop_unmerged="feature")
+    assert out["dropped"][0]["dropped"] is False
+    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "feature" in git(repo, "branch")
+    own = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    out = step(repo, "cleanup", drop_unmerged=own)
+    assert out["dropped"][0]["dropped"] is False
+    assert own in git(repo, "branch")
+
+
+def test_drop_unmerged_keeps_worktree_with_product_dirt(repo: Path) -> None:
+    lead_running(repo)
+    old = builder_branch(repo, "old", extra_dirt=True)
+    out = step(repo, "cleanup", drop_unmerged="worktree-old")
+    assert out["dropped"][0]["dropped"] is False
+    assert "scratch.txt" in out["dropped"][0]["reason"]
+    assert Path(old["worktree"], "scratch.txt").exists()

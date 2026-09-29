@@ -26,6 +26,11 @@ let lastVerdict = null
 let lastHead = null
 const answers = {}
 const lossyLeft = Object.assign({}, sc.lossy || {})   // op -> times to drop keys
+// Conflicts: sc.conflicts = {<slice id>: [files]} conflicts on the slice's
+// first builder branch; sc.conflict_again = [ids] also on the re-dispatch.
+let integrateIdx = 0
+let lastConflictBranches = []
+const builderRuns = {}
 
 function stepResult(op, nonce, prompt) {
   const flag = name => {
@@ -48,8 +53,19 @@ function stepResult(op, nonce, prompt) {
       return { ...base, accepted, refused, merge: results.filter(r => accepted.includes(r.id) && r.commits.length)
         .map(r => ({ id: r.id, branch: r.branch })) }
     }
-    case 'cleanup': return { ...base, removed: (flag('branches') || '').split(',').filter(Boolean)
-      .map(b => ({ branch: b, worktree: `/repo/.claude/worktrees/${b}` })), kept: [] }
+    case 'cleanup': {
+      const branches = (flag('branches') || '').split(',').filter(Boolean)
+      const keptBranches = branches.filter(b => lastConflictBranches.includes(b) || (sc.kept_branches || []).includes(b))
+      return { ...base,
+        removed: branches.filter(b => !keptBranches.includes(b))
+          .map(b => ({ branch: b, worktree: `/repo/.claude/worktrees/${b}` })),
+        kept: keptBranches.map(b => ({ branch: b, reason: lastConflictBranches.includes(b)
+          ? 'not merged into HEAD' : 'uncommitted changes outside the mailbox: notes.txt' })),
+        dropped: (flag('drop-unmerged') || '').split(',').filter(Boolean).map(d => {
+          const [old, neu] = d.split('=')
+          return { branch: old, superseded_by: neu || null, dropped: true }
+        }) }
+    }
     case 'next': {
       if (lastVerdict && ['SHIP', 'BLOCKED', 'NEEDS_HUMAN'].includes(lastVerdict)) {
         return { ...base, action: 'stop', status: lastVerdict.toLowerCase(), code: 0, iteration }
@@ -109,16 +125,30 @@ async function agent(prompt, opts = {}) {
   }
   const role = opts.agentType.replace('trio-', '')
   if ((sc.die || []).includes(role)) return null
-  if (role === 'lead' && opts.schema) {
-    return { slices: sc.plan || [{ id: 'app', brief: 'build app.py', writes: ['app.py'], reads: [], depends: [] }] }
+  if (role === 'lead' && opts.schema && opts.schema.properties.slices) {
+    return { slices: sc.plan || [{ id: 'app', brief: 'build app.py', writes: ['app.py'], reads: [], depends: [] }],
+      ...(sc.plan_denials ? { denials: sc.plan_denials } : {}) }
+  }
+  if (role === 'lead' && opts.schema && opts.schema.properties.conflicts) {
+    integrateIdx += 1
+    const branches = [...prompt.matchAll(/^- ([A-Za-z0-9._-]+): branch `([^`]+)`/gm)].map(m => ({ id: m[1], branch: m[2] }))
+    const conflicts = branches.filter(b => (sc.conflicts || {})[b.id] &&
+      (!b.branch.includes('-r') || (sc.conflict_again || []).includes(b.id)))
+      .map(b => ({ id: b.id, branch: b.branch, files: sc.conflicts[b.id] }))
+    lastConflictBranches = conflicts.map(c => c.branch)
+    return { merged: branches.filter(b => !lastConflictBranches.includes(b.branch)).map(b => b.id),
+      conflicts: sc.integrate_hides_conflicts ? [] : conflicts,
+      summary: `integrated wave ${integrateIdx}`, ...(sc.integrate_text ? { summary: sc.integrate_text } : {}) }
   }
   if (role === 'builder') {
     const id = prompt.match(/slice `([^`]+)`/)[1]
+    builderRuns[id] = (builderRuns[id] || 0) + 1
+    const branch = builderRuns[id] > 1 ? `worktree-${id}-r${builderRuns[id]}` : `worktree-${id}`
     const base = (sc.bad_base_ids || []).includes(id) ? 'origin-head' : lastHead
-    return { id, worktree: `/repo/.claude/worktrees/${id}`, branch: `worktree-${id}`, base, head: `T-${id}`,
+    return { id, worktree: `/repo/.claude/worktrees/${branch}`, branch, base, head: `T-${id}`,
       commits: [`T-${id}`], summary: `built ${id}` }
   }
-  return `${role} done`
+  return (sc.role_text || {})[role] || `${role} done`
 }
 
 // spent(): 1000 output tokens per agent call so far (deterministic).

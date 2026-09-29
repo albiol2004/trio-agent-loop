@@ -184,7 +184,9 @@ def test_harness_driver_owned_builder_contract() -> None:
     i = integ["prompt"]
     assert "`git merge --no-ff --no-edit <builder branch>`" in i
     assert "from your own checkout, on your branch" in i
-    assert "run `git merge --abort`, stop merging, and report" in i
+    assert "run `git merge --abort` and go on with the next branch" in i
+    assert "the driver re-dispatches it to a new builder" in i
+    assert integ["schemaKeys"] == ["merged", "conflicts", "summary"]
     assert "branch `worktree-app`" in i
     assert "Do not remove worktrees or delete branches: the driver does that" in i
     assert "cat > /work/product/loop/REPORT.md <<'EOF'" in i
@@ -415,3 +417,88 @@ def test_harness_held_end_is_surfaced() -> None:
 def test_harness_released_end_has_no_end_error() -> None:
     r = run({"verdicts": ["SHIP"]})["result"]
     assert r["end_error"] is None and r["held_step"] is None
+
+
+# ------------------------------------------- probe 2 blocker B: conflicts
+TWO = [{"id": "alpha", "brief": "A", "writes": ["alpha.py"]},
+       {"id": "beta", "brief": "B", "writes": ["beta.py"]}]
+
+
+@needs_node
+def test_harness_conflict_redispatches_from_new_head() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "conflicts": {"beta": ["registry.py"]}})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["conflicts"] == []
+    it = r["iterations"][0]
+    assert it["waves"] == [["alpha", "beta"], ["beta"]]
+    assert it["conflicts"] == [{"id": "beta", "branch": "worktree-beta",
+                                "files": ["registry.py"]}]
+    builders = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-builder"]
+    assert len(builders) == 3
+    again = builders[2]
+    assert "The driver requires `base` = H1w2" in again  # the post-merge HEAD
+    assert "RE-DISPATCH" in again and "`worktree-beta`" in again
+    assert "registry.py" in again and "beta.py, registry.py" in again
+    integ = [c["prompt"] for c in out["calls"]
+             if c["agentType"] == "trio-lead"][1:]
+    assert len(integ) == 2
+    assert "If any merge in this call conflicted, stop after your review" in integ[0]
+    assert "(last wave)" in integ[1] and "- beta: branch `worktree-beta-r2`" in integ[1]
+    cleanups = [c["prompt"] for c in out["calls"] if "op=cleanup" in c["prompt"]]
+    assert "--drop-unmerged" not in cleanups[0]
+    assert "--drop-unmerged 'worktree-beta=worktree-beta-r2'" in cleanups[1]
+    assert any("merge conflict beta (worktree-beta) on registry.py" in line
+               for line in out["logs"])
+    assert seq(out).count("gate") == 1
+
+
+@needs_node
+def test_harness_second_conflict_stops_with_conflict_status() -> None:
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "conflicts": {"beta": ["registry.py"]},
+               "conflict_again": ["beta"]})
+    r = out["result"]
+    assert r["status"] == "conflict" and r["lock"] == "released"
+    assert "beta (worktree-beta-r2) on registry.py" in r["reason"]
+    assert r["conflicts"] == [{"id": "beta", "branch": "worktree-beta-r2",
+                               "files": ["registry.py"]}]
+    names = seq(out)
+    assert names[-2:] == ["cleanup", "end"] and "gate" not in names
+    assert names.count("builder") == 3  # at most one re-dispatch per slice
+
+
+@needs_node
+def test_harness_unreported_unmerged_branch_is_a_conflict() -> None:
+    """git decides: a branch cleanup finds unmerged is re-dispatched even
+    when the Lead reported no conflict (files then unknown)."""
+    out = run({"verdicts": ["SHIP"], "plan": TWO,
+               "conflicts": {"beta": ["registry.py"]},
+               "integrate_hides_conflicts": True})
+    assert out["result"]["status"] == "shipped"
+    assert out["result"]["iterations"][0]["waves"] == [["alpha", "beta"], ["beta"]]
+
+
+@needs_node
+def test_harness_plan_prompt_puts_shared_files_in_writes() -> None:
+    out = run({"verdicts": ["SHIP"]})
+    plan = next(c for c in out["calls"] if c["agentType"] == "trio-lead")
+    assert "registries, `__init__.py`, config" in plan["prompt"]
+    assert "must both list it" in plan["prompt"]
+
+
+@needs_node
+def test_harness_gate_retry_names_kept_branch_and_reruns_cleanup() -> None:
+    """eval-native-v0b N5."""
+    out = run({"verdicts": ["SHIP"], "gates": [False, True],
+               "kept_branches": ["worktree-app"]})
+    assert out["result"]["status"] == "shipped"
+    solo = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-lead"][2]
+    assert "RETRY (attempt 2 of 2)" in solo
+    assert "- `worktree-app`: uncommitted changes outside the mailbox" in solo
+    names = seq(out)
+    i = names.index("lead", names.index("gate"))
+    assert names[i:i + 3] == ["lead", "cleanup", "gate"]
+    assert out["result"]["iterations"][0]["kept"] == [
+        {"branch": "worktree-app",
+         "reason": "uncommitted changes outside the mailbox: notes.txt"}]
