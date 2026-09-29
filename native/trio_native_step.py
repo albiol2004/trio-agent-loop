@@ -60,6 +60,7 @@ Every op that needs the lock re-stamps ``pid`` and ``heartbeat``:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -210,18 +211,40 @@ def registry_path(mailbox: Path) -> Path:
     return _runs_dir() / f"{key[:16]}.json"
 
 
-def _register(mailbox: Path, **fields) -> None:
-    """Merge *fields* into this mailbox's run-registry record; never raises
-    (the registry is a dashboard aid, never a reason to fail a step)."""
+def _register(mailbox: Path, *, replace: bool = False,
+              own_token: str | None = None, **fields) -> None:
+    """Write this mailbox's run-registry record; never raises (the registry
+    is a dashboard aid, never a reason to fail a step).
+
+    ``replace=True`` (``begin``, which owns the mailbox lock by the time it
+    calls this) drops any stale record entirely, so an old run's ``status``,
+    ``session_id``, ``run_id`` and ``finished_at`` never survive into the
+    new one. A merge (``end``) instead applies only when the existing
+    record's ``run_token`` is ``own_token`` or unset, so a late ``end``
+    (e.g. after a lock takeover) never clobbers a newer ``begin``'s record.
+    Guarded by an flock on a sidecar lock file next to the registry file, so
+    a concurrent writer of the same record (this helper or ``launch.sh``)
+    never interleaves a read-modify-write.
+    """
     try:
         path = registry_path(mailbox)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = _read_json(path)
-        data.update({"schema": 1, "driver": DRIVER,
-                     "mailbox": str(Path(mailbox).resolve()),
-                     "updated_at": _now_iso()})
-        data.update({k: v for k, v in fields.items() if v is not None})
-        _write_json(path, data)
+        lock_path = path.with_name(path.name + ".lock")
+        with open(lock_path, "a+", encoding="utf-8") as lockf:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+            try:
+                data = {} if replace else _read_json(path)
+                if not replace and own_token is not None:
+                    existing = data.get("run_token")
+                    if existing not in (None, own_token):
+                        return
+                data.update({"schema": 1, "driver": DRIVER,
+                             "mailbox": str(Path(mailbox).resolve()),
+                             "updated_at": _now_iso()})
+                data.update({k: v for k, v in fields.items() if v is not None})
+                _write_json(path, data)
+            finally:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
     except OSError:
         pass
 
@@ -510,7 +533,7 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     _purge_stale_records(mailbox, snap["iteration"])
     exclude = _ensure_exclude(repo)
     _write_session(mailbox, a.token, snap["phase"], done=False)
-    _register(mailbox, repo=str(repo) if repo else None,
+    _register(mailbox, replace=True, repo=str(repo) if repo else None,
               helper=str(Path(__file__).resolve()), run_token=a.token,
               holder_pid=_holder_pid(), state="running",
               begun_at=_now_iso())
@@ -1343,7 +1366,8 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             })
         except OSError:
             pass
-        _register(mailbox, state="ended", ended_at=_now_iso(), lock=lock,
+        _register(mailbox, own_token=a.token, state="ended",
+                  ended_at=_now_iso(), lock=lock,
                   dangling_worktrees=dangling)
     return {"lock": lock, "dangling_worktrees": dangling,
             "eval_worktrees_removed": eval_removed,

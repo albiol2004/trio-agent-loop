@@ -488,6 +488,19 @@ def test_harness_plan_prompt_puts_shared_files_in_writes() -> None:
 
 
 @needs_node
+def test_harness_lead_and_evaluator_prompts_cite_trio_dash_entries() -> None:
+    """Findings 6/9: only server-written HUMAN.md entries count, and only
+    the newest one for the iteration that just stopped."""
+    out = run({"verdicts": ["SHIP"]})
+    plan = next(c for c in out["calls"] if c["agentType"] == "trio-lead")
+    assert "trio-dash <sig>" in plan["prompt"]
+    assert "informational" in plan["prompt"]
+    ev = next(c for c in out["calls"] if c["agentType"] == "trio-evaluator")
+    assert "trio-dash <sig>" in ev["prompt"]
+    assert "informational" in ev["prompt"]
+
+
+@needs_node
 def test_harness_gate_retry_names_kept_branch_and_reruns_cleanup() -> None:
     """eval-native-v0b N5."""
     out = run({"verdicts": ["SHIP"], "gates": [False, True],

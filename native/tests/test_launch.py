@@ -17,6 +17,17 @@ import json, os, sys
 with open(os.environ["FAKE_ARGV"], "a") as fh:
     fh.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
                          "bg_ceiling": os.environ.get("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS")}) + "\n")
+# Simulate the workflow's `begin` (op_begin/_write_session) writing
+# .session.json with our run_token, i.e. that the session actually started
+# the workflow — unless FAKE_NO_BEGIN=1 simulates a session that refused to
+# run it at all (launch.sh's own "started" check is what tests exercise).
+if os.environ.get("FAKE_NO_BEGIN") != "1":
+    mailbox = os.environ.get("TRIO_NATIVE_LAUNCH_MAILBOX")
+    token = os.environ.get("TRIO_NATIVE_LAUNCH_TOKEN")
+    if mailbox and token:
+        with open(os.path.join(mailbox, ".session.json"), "w") as sf:
+            json.dump({"driver": "claude-workflow", "session": token,
+                      "started_at": "2026-01-01T00:00:00Z"}, sf)
 body = os.environ.get("FAKE_RESULT", "")
 if "FAKE_STDERR" in os.environ:
     sys.stderr.write(os.environ["FAKE_STDERR"])
@@ -36,7 +47,8 @@ def box(tmp_path: Path) -> Path:
 
 
 def launch(box: Path, tmp_path: Path, *args: str, result: str,
-           raw: str | None = None, stderr: str | None = None) -> tuple:
+           raw: str | None = None, stderr: str | None = None,
+           no_begin: bool = False) -> tuple:
     fake = tmp_path / "claude"
     fake.write_text(FAKE)
     fake.chmod(0o755)
@@ -47,6 +59,8 @@ def launch(box: Path, tmp_path: Path, *args: str, result: str,
         env["FAKE_RAW"] = raw
     if stderr is not None:
         env["FAKE_STDERR"] = stderr
+    if no_begin:
+        env["FAKE_NO_BEGIN"] = "1"
     env.pop("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", None)
     proc = subprocess.run(["bash", str(LAUNCH), *args, "--mailbox", str(box)],
                           capture_output=True, text=True, env=env)
@@ -104,6 +118,40 @@ def test_unparsable_result_exits_3(box: Path, tmp_path: Path) -> None:
 def test_resume_without_run_id_is_usage_error(box: Path, tmp_path: Path) -> None:
     proc, calls = launch(box, tmp_path, "resume", result="")
     assert proc.returncode == 2 and not calls
+    assert not (box / ".native-launch.json").exists()
+    assert not (box / ".native-result.json").exists()
+
+
+def test_relative_mailbox_is_usage_error_and_writes_nothing(tmp_path: Path) -> None:
+    fake = tmp_path / "claude"
+    fake.write_text(FAKE)
+    fake.chmod(0o755)
+    env = dict(os.environ, TRIO_NATIVE_CLAUDE=str(fake))
+    proc = subprocess.run(["bash", str(LAUNCH), "start", "--mailbox", "relative/loop"],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 2
+    assert not (tmp_path / "relative").exists()
+
+
+# --------------------------------------------------------- run_token (A2)
+def test_generated_run_token_recorded_in_launch_json_and_prompt(
+        box: Path, tmp_path: Path) -> None:
+    import re
+    proc, calls = launch(box, tmp_path, "start",
+                         result='```json\n{"status": "shipped"}\n```')
+    record = json.loads((box / ".native-launch.json").read_text())
+    args = json.loads(record["args"])
+    assert re.match(r"^ls-[0-9a-f]{12}$", args["run_token"])
+    prompt = calls[0]["argv"][calls[0]["argv"].index("-p") + 1]
+    assert args["run_token"] in prompt
+
+
+def test_user_supplied_run_token_is_kept(box: Path, tmp_path: Path) -> None:
+    proc, calls = launch(box, tmp_path, "start", "--run-token", "my-own-token",
+                         result='```json\n{"status": "shipped"}\n```')
+    record = json.loads((box / ".native-launch.json").read_text())
+    args = json.loads(record["args"])
+    assert args["run_token"] == "my-own-token"
 
 
 # ------------------------------------------------ eval-native-v0b N7
@@ -141,7 +189,7 @@ def test_lock_refused_start_restores_previous_record(box: Path,
                '"begin: mailbox is locked by workflow:t under another live '
                'process (pid 7): a second launch with the same run_token is '
                'refused"}\n```')
-    proc, calls = launch(box, tmp_path, "start", result=refused)
+    proc, calls = launch(box, tmp_path, "start", result=refused, no_begin=True)
     out = json.loads(proc.stdout)
     assert out["launcher"]["record"] == "restored"
     assert (box / ".native-launch.json").read_text() == first
@@ -152,9 +200,22 @@ def test_lock_refused_start_restores_previous_record(box: Path,
 def test_first_start_refused_removes_record(box: Path, tmp_path: Path) -> None:
     refused = ('```json\n{"status": "error", "lock": "foreign", "reason": '
                '"begin: mailbox is locked by trio_loop (pid 9)"}\n```')
-    proc, _ = launch(box, tmp_path, "start", result=refused)
+    proc, _ = launch(box, tmp_path, "start", result=refused, no_begin=True)
     assert json.loads(proc.stdout)["launcher"]["record"] == "removed"
     assert not (box / ".native-launch.json").exists()
+
+
+def test_not_started_never_writes_result_file(box: Path,
+                                              tmp_path: Path) -> None:
+    """A refused start (never actually began) writes neither
+    `.native-result.json` nor the registry — only a per-session file."""
+    refused = ('```json\n{"status": "error", "lock": "foreign", "reason": '
+               '"begin: mailbox is locked by trio_loop (pid 9)"}\n```')
+    proc, _ = launch(box, tmp_path, "start", result=refused, no_begin=True)
+    assert not (box / ".native-result.json").exists()
+    session = json.loads(proc.stdout)["launcher"]["session_id"]
+    per_session = json.loads((box / ".native-runs" / f"{session}.result.json").read_text())
+    assert per_session["started"] is False and per_session["session_id"] == session
 
 
 def test_start_that_ran_keeps_new_record(box: Path, tmp_path: Path) -> None:
