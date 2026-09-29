@@ -107,6 +107,17 @@ time.sleep(60)
         self.env_patch.start()
         self.original_home = serve.HOME
         serve.HOME = Path(self.home.name)
+        # dash-actions: Start runs the installed release's drivers.
+        share = Path(self.home.name) / ".local" / "share" / "trio-agent-loop"
+        sha = "e" * 40
+        release_driver = share / "releases" / sha / "metrics" / "trio_loop.py"
+        release_driver.parent.mkdir(parents=True)
+        release_driver.write_text("# fake\n", encoding="utf-8")
+        (share / "CURRENT").write_text(sha + "\n", encoding="utf-8")
+        self.trioctl = Path(self.home.name) / ".local" / "bin" / "trioctl"
+        self.trioctl.parent.mkdir(parents=True)
+        self.trioctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.trioctl.chmod(0o755)
         self.server = serve.DashboardServer(
             ("127.0.0.1", 0),
             workspaces=[self.tmp_workspace],
@@ -223,9 +234,9 @@ time.sleep(60)
                 )
             self.assertEqual(status, 202, payload)
             command = popen.call_args.args[0]
-            # The driver runs from the dashboard checkout, not the workspace.
+            # The installed trioctl runs, never the dashboard checkout's.
             self.assertEqual(command, [
-                "python3", str(serve.REPO_ROOT / "omnigent" / "trioctl"),
+                "python3", str(self.trioctl),
                 "omnigent", "loop",
                 "--mailbox", str(self.mailbox),
                 "--max-iterations", "3",

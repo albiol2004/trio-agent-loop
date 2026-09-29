@@ -141,7 +141,7 @@ Board and service:
 - Request guards (all routes): the Host must be an IP literal, `localhost` or a name in `TRIO_DASH_ALLOWED_HOSTS` (DNS-rebinding defence, 421 otherwise). POST/PUT/DELETE with an `Origin` must be same-origin or listed in `TRIO_DASH_ALLOWED_ORIGINS`; `Sec-Fetch-Site: cross-site` is refused; a request body must be `application/json` (415 otherwise).
 
 Loop control:
-- `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`)
+- `POST /api/loop/start` — start a headless loop: `{"root", "driver", "max_iterations"?}` (driver: `portable` or `omnigent`). Runs the INSTALLED drivers — `~/.local/bin/trioctl` (or `TRIO_DASH_TRIOCTL`) and the installed release's `metrics/trio_loop.py` (`~/.local/share/trio-agent-loop/releases/<CURRENT>`, or `TRIO_DASH_RELEASE_DIR`) — never this checkout's own copies.
 - `POST /api/loop/stop` — stop a running loop: `{"root"}`
 - `GET /api/loop/status?root=<absolute-path>` — read loop status: `{pid, iteration, phase, session_ids, driver}`
 
@@ -179,6 +179,114 @@ Registry and agents:
 - `GET /api/registry/models?root=<repository>` — resolved model rows per agent,
   plus `available`, `by_executor`, and per-source `sources` status
 - `GET /api/registry/health?root=<repository>` — lineage, manifests, dangling files, and generate.py check result
+
+## Unblock actions (dash-actions)
+
+Loops are addressed by `{root, loop}` (the board name of the ROOT mailbox);
+the server resolves the live copy itself (a root-free loop's Lead worktree
+via the `trio-worktrees` ledger) and acts there. Every POST below goes
+through the request guards above.
+
+**Which loops.** Besides `<workspace>/loop*` mailboxes (live copies for
+root-free loops; a Lead worktree is never listed a second time as a linked
+worktree), the board reads the claude-workflow run registry
+(`~/.local/share/trio-agent-loop/native-runs/*.json`, `TRIO_NATIVE_RUNS_DIR`;
+written by `native/launch.sh` and the helper on the `native-dash` line): each
+registered run's repo becomes a workspace and its mailbox a card — any
+mailbox name, hidden directories included (`TRIO_DASH_NATIVE_RUNS=0` turns
+this off). Records are validated (absolute path, existing mailbox) and only
+make runs visible.
+
+**States** (`loop_state` on every card, from files only): `running`,
+`shipped`, `needs_human`, `blocked`, `error`, `needs_retirement`,
+`needs_land`, `held` (Omnigent `.sessions/held-*.json`, or a
+claude-workflow `held_step`), `conflict`, `budget`, `iteration_cap`,
+`interrupted`, `ready` (answered, waiting for its restart), `unknown`. A
+claude-workflow result (`.native-result.json`, or for older runs the raw
+session output in `.native-runs/`) is used only when it belongs to the
+latest run and STATE.md was not changed after it. `driver:
+"claude-workflow"` is a known driver (its `.session.json` "session" is a run
+token, never probed on the broker).
+
+**Inbox kinds** added: `error`, `needs_retirement`, `needs_land`, `held` (one
+per held-dispatch record, with role/session/hold reason), `conflict`,
+`budget`, `iteration_cap`, `dangling_worktrees`. A known outcome replaces the
+generic `interrupted` item; a hold replaces the generic `needs_human`.
+
+Endpoints:
+- `GET /api/loop/actions?root=&loop=` — `{state, driver, live, native,
+  fixes: [{id, title, applicable, destructive, commands_preview | reason}],
+  unblock (table), never_automated, answer: {allowed, reason, stop,
+  reset_allowed}, diagnosis, harnesses, log (last 50 actions)}`.
+- `POST /api/loop/diagnose {root, loop, harness?}` → 202; 409 while one runs
+  for that loop. `GET /api/loop/diagnosis?root=&loop=` polls it.
+- `POST /api/loop/fix {root, loop, fix, args?, confirm?}` — 400 for an id
+  outside the allowlist (logged), 409 `{refused}` when a precondition fails,
+  409 `{confirm_required, plan: {commands_preview, notes}}` for a destructive
+  fix without `confirm: true`; 200/502 with per-step results otherwise.
+- `POST /api/loop/answer {root, loop, answer, reset?=true, confirm?}` — 409
+  preview first (the exact HUMAN.md entry and STATE changes), then writes;
+  the response lists the restart fixes that now apply.
+
+**Fix allowlist** (server-side; a diagnosis only proposes an id). Every fix
+first requires that nothing is live (no driver/lock pid, no live session
+pid, no running broker session, broker liveness known). Destructive ones
+(★) need the confirm click after the exact commands were shown.
+
+| id | when | runs |
+|---|---|---|
+| `rerun` | non-terminal STATE, no holds (Omnigent/portable) | `trioctl omnigent loop --mailbox <root mailbox> --max-iterations N` |
+| `rerun_more_iterations` | stopped at the iteration cap; N > iteration | same, higher N |
+| `reset_and_rerun` ★ | STATE `error` | STATE → running/idle (reason removed), then `rerun` |
+| `native_resume` | claude-workflow run killed mid-run, run id known | `launch.sh resume --mailbox … --run-id wf_…` |
+| `native_start` | claude-workflow held/conflict/budget/cap/interrupted | `launch.sh start --mailbox … --max-iterations N [--helper …]` |
+| `native_reset_and_start` ★ | claude-workflow STATE `error` | STATE reset, then `native_start` |
+| `land` ★ | STATE `needs_land`, no unresolved merge in the Lead worktree | `trioctl omnigent land --mailbox …` |
+| `reconcile_dry_run` | held-dispatch records exist | `trioctl omnigent reconcile --mailbox … --json --dry-run` |
+| `reconcile_apply` ★ | a fresh dry run (run by the server) says `ready` | `… reconcile --json --apply` |
+| `retire_ship` ★ | `needs_retirement`, VERDICT SHIP, product tree clean outside the mailbox | `commit: <HEAD>` in VERDICT.md; `git add <mailbox>`; `git commit -m "loop: iteration N — SHIP"` |
+| `repair_scope` | VERDICT `ITERATE scope=local:…`, `.repairs` 1–2 | the driver with `--max-iterations iteration+1` |
+| `cleanup_worktrees` ★ | dangling builder worktrees that are clean and merged | `git worktree remove <path>`; `git branch -d <branch>` |
+
+Never automated (no id exists): resolving a NEEDS_HUMAN check,
+reconciliation without receipt proof, land-conflict resolution, `abandon`,
+`sessions prune`, `acceptance amend --human`, permission/settings changes.
+Driver starts run detached in their own session; output goes to
+`~/.local/state/trio-dash/loops/<key>/runs/*.log` and their exit code is
+appended to the action log.
+
+**Diagnose** runs a read-only agent — never Claude — with the loop's mailbox
+files, sidecars and driver result, lock/liveness, held records, git state,
+the unblock table and the allowlist, and stores its JSON answer
+(`{diagnosis, state, evidence[], proposed_fix: {id, args, commands_preview,
+destructive}, needs_human_input, question?}`) per loop. Unknown or
+never-automated ids are marked `rejected`; `destructive` is taken from the
+allowlist. Harnesses (`TRIO_DASH_DIAGNOSE_HARNESS`, default `cursor`):
+- Cursor: `cursor-agent -p --mode ask --output-format stream-json --model
+  cursor-grok-4.6-low --workspace <repo> --trust --sandbox enabled` (ask mode
+  is read-only; no `--force`). `TRIO_DASH_CURSOR_AGENT`,
+  `TRIO_DASH_CURSOR_MODEL`.
+- Codex: `codex exec -m gpt-6-luna -c model_reasoning_effort="high" -s
+  read-only -c approval_policy="never" --ephemeral --skip-git-repo-check
+  --ignore-user-config -C <repo> --json -o <file> -` (prompt on stdin).
+  `TRIO_DASH_CODEX`, `TRIO_DASH_CODEX_MODEL`, `TRIO_DASH_CODEX_EFFORT`.
+The server hashes the mailbox files and `git status`/HEAD before and after
+and flags any change while the loop was stopped. Timeout
+`TRIO_DASH_DIAGNOSE_TIMEOUT` (900 s).
+
+**Answer box** — for NEEDS_HUMAN/BLOCKED loops with no live driver: appends
+a timestamped entry to the live mailbox's `HUMAN.md` and (default) resets
+STATE.md to `status: running`, `phase: idle`, `human_answer: HUMAN.md#<id>`;
+the Lead reads HUMAN.md at the start of its next pass (MAILBOX-SCHEMA.md
+"HUMAN.md"). With held-dispatch records only the answer is written.
+
+**Deploying to the service** (not applied by this change):
+`dashboard/service/point-at-release.sh` checks that the installed release's
+dashboard supports the service (`--discover`, guards, `loop_actions.py`,
+`service/run`) and, with `--apply`, points `TRIO_DASH_CHECKOUT` in
+`~/.services/trio-dash/env` at `~/.local/share/trio-agent-loop/releases/<CURRENT>`
+and installs the release's `run` (backups kept, rollback lines printed);
+then `svc restart trio-dash`. A release older than dash-actions is refused.
 
 ## Skills editor
 

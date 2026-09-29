@@ -133,6 +133,41 @@
           <span id="loop-control-note" class="control-note caption" role="status"></span>
         </div>
 
+        <section id="actions-section" class="drawer-section actions-section" aria-labelledby="actions-title" hidden>
+          <h3 id="actions-title" class="section-label">Unblock</h3>
+          <p id="actions-state" class="actions-state"></p>
+          <div class="actions-row">
+            <label class="field" for="diagnose-harness"><span class="sr-only">Diagnosis harness</span>
+              <select id="diagnose-harness" class="select"></select>
+            </label>
+            <button id="diagnose-btn" class="btn btn-secondary" type="button">Diagnose</button>
+            <span id="diagnose-note" class="control-note caption" role="status"></span>
+          </div>
+          <div id="diagnosis-panel" class="diagnosis-panel" hidden></div>
+          <div id="fix-list" class="fix-list" aria-label="Fixes"></div>
+          <details id="fix-unavailable" class="fix-unavailable" hidden>
+            <summary class="caption">Not applicable now</summary>
+            <ul id="fix-unavailable-list" class="fix-unavailable-list"></ul>
+          </details>
+          <form id="answer-box" class="answer-box" hidden>
+            <label class="section-label" for="answer-text">Answer for the Lead (appended to HUMAN.md)</label>
+            <p id="answer-stop" class="caption"></p>
+            <textarea id="answer-text" class="answer-text" rows="5" maxlength="20000"
+                      placeholder="Your decision or the human-check result. The Lead reads HUMAN.md at the start of its next pass."></textarea>
+            <label class="answer-reset caption"><input id="answer-reset" type="checkbox" checked>
+              Reset STATE.md to status running / phase idle so the next run starts a Lead pass</label>
+            <div class="actions-row">
+              <button id="answer-submit" class="btn btn-secondary" type="submit">Review answer…</button>
+              <span id="answer-note" class="control-note caption" role="status"></span>
+            </div>
+            <div id="answer-restart" class="actions-row" hidden></div>
+          </form>
+          <details id="action-log" class="action-log">
+            <summary class="caption">Action log</summary>
+            <ol id="action-log-list" class="action-log-list"></ol>
+          </details>
+        </section>
+
         <section id="drawer-inbox-section" class="drawer-section"
                  aria-label="Why this loop is flagged" hidden>
           <h3 class="section-label">Why this loop is flagged</h3>
@@ -198,6 +233,19 @@
       </div>
     </div>
   </div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog" class="confirm-form">
+      <h2 id="confirm-title" class="confirm-title">Confirm</h2>
+      <p id="confirm-lead" class="confirm-lead"></p>
+      <pre id="confirm-commands" class="confirm-commands mono"></pre>
+      <ul id="confirm-notes" class="confirm-notes caption"></ul>
+      <div class="actions-row confirm-actions">
+        <button id="confirm-cancel" class="btn btn-secondary" value="cancel" type="submit">Cancel</button>
+        <button id="confirm-ok" class="btn btn-destructive" value="ok" type="submit">Run these commands</button>
+      </div>
+    </form>
+  </dialog>
 
   <noscript>This dashboard requires JavaScript.</noscript>
 </div>

@@ -71,8 +71,9 @@ fi
 backoff=2
 while true; do
   started=$SECONDS
-  log "starting serve.py from $CHECKOUT ($(git -C "$CHECKOUT" rev-parse --short HEAD 2>/dev/null || echo '?'))"
-  python3 "$CHECKOUT/dashboard/serve.py" --host 127.0.0.1 --port "$PORT" \
+  log "starting serve.py from $CHECKOUT ($(git -C "$CHECKOUT" rev-parse --short HEAD 2>/dev/null || basename "$CHECKOUT"))"
+  # An installed release directory is verified content: no __pycache__ in it.
+  PYTHONDONTWRITEBYTECODE=1 python3 "$CHECKOUT/dashboard/serve.py" --host 127.0.0.1 --port "$PORT" \
     "${WORKSPACE_ARGS[@]}" &
   child=$!
 

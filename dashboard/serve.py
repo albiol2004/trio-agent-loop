@@ -242,6 +242,9 @@ HEALTH_PATH = DASHBOARD_DIR.parent / "registry" / "health.py"
 BROKER_HTTP_PATH = DASHBOARD_DIR.parent / "omnigent" / "broker_http.py"
 """Omnigent broker client, resolved relative to this file."""
 
+LOOP_ACTIONS_PATH = DASHBOARD_DIR / "loop_actions.py"
+"""Loop states, fix allowlist, answer box and diagnosis (dash-actions)."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -453,6 +456,64 @@ def load_metrics_module():
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
     return module
+
+
+_LOOP_ACTIONS_MODULE = None
+_DIAGNOSES = None
+
+
+def load_loop_actions_module():
+    """Load dashboard/loop_actions.py by path and cache the module."""
+    global _LOOP_ACTIONS_MODULE
+    if _LOOP_ACTIONS_MODULE is not None:
+        return _LOOP_ACTIONS_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_loop_actions", LOOP_ACTIONS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load loop actions module: {LOOP_ACTIONS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _LOOP_ACTIONS_MODULE = module
+    return module
+
+
+def _diagnoses():
+    """The process-wide diagnosis manager (one diagnosis per loop)."""
+    global _DIAGNOSES
+    if _DIAGNOSES is None:
+        _DIAGNOSES = load_loop_actions_module().DiagnosisManager()
+    return _DIAGNOSES
+
+
+NATIVE_REGISTRY_SECONDS = 10.0
+_NATIVE_REGISTRY = {"at": 0.0, "home": None, "value": []}
+_NATIVE_REGISTRY_LOCK = threading.Lock()
+
+
+def _native_registry() -> list[dict]:
+    """Registered claude-workflow runs (native-dash run registry), cached."""
+    now = time.monotonic()
+    with _NATIVE_REGISTRY_LOCK:
+        if (_NATIVE_REGISTRY["home"] == str(HOME)
+                and now - _NATIVE_REGISTRY["at"] <= NATIVE_REGISTRY_SECONDS):
+            return list(_NATIVE_REGISTRY["value"])
+    try:
+        value = load_loop_actions_module().native_registry(HOME)
+    except Exception:  # noqa: BLE001 - the board renders without it
+        traceback.print_exc()
+        value = []
+    with _NATIVE_REGISTRY_LOCK:
+        _NATIVE_REGISTRY.update(at=now, home=str(HOME), value=value)
+    return list(value)
+
+
+def _native_registry_entry(mailbox: Path) -> dict | None:
+    try:
+        target = str(Path(mailbox).resolve())
+    except OSError:
+        return None
+    return next((e for e in _native_registry() if e["mailbox"] == target), None)
 
 
 def load_inbox_state_module():
@@ -788,7 +849,23 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
     """
     live_fn = getattr(metrics, "live_mailbox", None)
     pairs = []
-    for loop_dir in _discover_loops_cached(root):
+    found = list(_discover_loops_cached(root))
+    # native-dash: registered claude-workflow mailboxes below this root that
+    # the loop*/ rule misses (any mailbox name, hidden dirs included).
+    try:
+        root_real = Path(root).resolve()
+        known = {p.resolve() for p in found}
+        for entry in _native_registry():
+            mbox = Path(entry["mailbox"])
+            repo = entry.get("repo")
+            owned = (Path(repo).resolve() == root_real if repo
+                     else _path_is_under(mbox, root_real))
+            if mbox not in known and owned:
+                found.append(mbox)
+                known.add(mbox)
+    except OSError:
+        pass
+    for loop_dir in found:
         live = None
         if live_fn is not None:
             try:
@@ -1183,7 +1260,9 @@ def _broker_session_ids(
         session_ids = driver_state.get("session_ids")
         if isinstance(session_ids, dict):
             values.extend(session_ids.values())
-    if session_state:
+    if session_state and session_state.get("driver") != "claude-workflow":
+        # A claude-workflow sidecar's "session" is its run token, not a
+        # broker session (native-dash).
         values.append(session_state.get("session"))
 
     session_ids = []
@@ -1353,11 +1432,28 @@ def _owns_loop_process(pid: int) -> bool:
     )
 
 
-DRIVER_ENTRYPOINTS = {
-    "portable": REPO_ROOT / "metrics" / "trio_loop.py",
-    "omnigent": REPO_ROOT / "omnigent" / "trioctl",
-}
-"""Loop drivers run from this dashboard's checkout, against any workspace."""
+DRIVER_ENTRYPOINTS: dict | None = None
+"""Test override of ``_driver_entrypoints()`` ({driver: path})."""
+
+
+def _driver_entrypoints() -> dict:
+    """Installed-release loop drivers (dash-actions): the installed trioctl
+    (``TRIO_DASH_TRIOCTL`` or ``~/.local/bin/trioctl``) and the installed
+    release's ``metrics/trio_loop.py`` — never this dashboard checkout's
+    own copies, which may be a stale or unreleased tree."""
+    if DRIVER_ENTRYPOINTS is not None:
+        return DRIVER_ENTRYPOINTS
+    la = load_loop_actions_module()
+    trioctl = la.trioctl_path(HOME)
+    rel = la.release_dir(HOME)
+    return {
+        "portable": (rel / "metrics" / "trio_loop.py") if rel is not None
+        else HOME / ".local" / "share" / "trio-agent-loop" / "releases"
+        / "(no CURRENT release)" / "metrics" / "trio_loop.py",
+        "omnigent": trioctl if trioctl is not None
+        else Path(os.environ.get("TRIO_DASH_TRIOCTL", "").strip()
+                  or HOME / ".local" / "bin" / "trioctl"),
+    }
 
 LAUNCH_GRACE_SECONDS = 1.5
 """A started driver must still be alive this long before Start reports 202."""
@@ -1462,16 +1558,20 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
             is_root_loop = loop_dir.resolve() == (root / "loop").resolve()
         except OSError:
             pass
-    chosen = driver if driver in DRIVER_ENTRYPOINTS else "portable"
+    entrypoints = _driver_entrypoints()
+    chosen = driver if driver in entrypoints else "portable"
     sources = detection["sources"]
-    if not is_root_loop:
+    if driver == "claude-workflow":
+        start = (False, "A claude-workflow (native) loop: start or resume it "
+                        "from the Actions panel (native launch.sh).")
+    elif not is_root_loop:
         start = (False, "Start and stop act on a workspace's loop/ mailbox "
-                        "only; run this one from its session.")
+                        "only; use the Actions panel for this one.")
     elif not (loop_dir / "GOAL.md").is_file():
         start = (False, "GOAL.md is missing.")
-    elif not DRIVER_ENTRYPOINTS[chosen].is_file():
-        start = (False, f"The {chosen} driver is not in this dashboard "
-                        f"checkout ({DRIVER_ENTRYPOINTS[chosen]}).")
+    elif not Path(entrypoints[chosen]).is_file():
+        start = (False, f"The {chosen} driver is not installed "
+                        f"({entrypoints[chosen]}).")
     elif sources:
         start = (False, "Already running (" + ", ".join(sources) + ").")
     elif detection.get("broker") in ("unreachable", "truncated"):
@@ -1480,8 +1580,8 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
                            == "unreachable" else "list was cut short")
                         + "); a broker-only run cannot be ruled out.")
     else:
-        start = (True, f"Starts the {chosen} driver from "
-                       f"{REPO_ROOT} for this mailbox.")
+        start = (True, f"Starts the installed {chosen} driver "
+                       f"({entrypoints[chosen]}) for this mailbox.")
     pid = detection.get("control_pid")
     if not is_root_loop:
         stop = (False, start[1] if not start[0] else "")
@@ -1500,13 +1600,31 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
     }
 
 
+def _loop_state(loop_dir: Path, sources: list[str]) -> dict:
+    """Derived loop state (loop_actions.derive_state), trimmed for a card."""
+    try:
+        derived = load_loop_actions_module().derive_state(
+            loop_dir, sources, home=None, last_action=_last_action(loop_dir))
+    except Exception:  # noqa: BLE001 - the card renders without it
+        traceback.print_exc()
+        return {"state": "unknown", "driver": None, "summary": "", "detail": {}}
+    derived["held"] = [
+        {k: h.get(k) for k in ("session_id", "role", "hold", "iteration")}
+        for h in derived.get("held") or []]
+    return derived
+
+
 def _live_card_fields(loop_dir: Path, root: Path | None) -> dict:
     """Card fields that must be fresh on every poll (never cached)."""
     driver_state = _driver_snapshot(loop_dir)
     detection = _running_detection(loop_dir, root)
     sources = detection["sources"]
     driver = driver_state["driver"] if driver_state else None
+    loop_state = _loop_state(loop_dir, sources)
+    if loop_state.get("driver") == "claude-workflow":
+        driver = "claude-workflow"
     return {
+        "loop_state": loop_state,
         "driver_phase": driver_state["phase"] if driver_state else None,
         "driver": driver,
         "running": bool(sources),
@@ -1992,6 +2110,74 @@ _HUMAN_STATUS_WORDS = {"needs_human", "needs-human", "awaiting_human",
 """STATE.md status words that claim a loop is still working."""
 
 
+_HOLD_REASONS = {
+    "first_prompt_uncertain": "first-prompt delivery uncertain",
+    "role_completion_uncertain": "prompt delivered, role completion uncertain",
+    "abandoned_on_exit": "slice-eval still running when the loop exited",
+    "mirror_crosswired": "first prompt uncertain (cross-wired chat binding)",
+}
+
+
+def _state_inbox_items(derived: dict, add) -> None:
+    """Actionable items for derived loop states (dash-actions)."""
+    state = derived.get("state")
+    detail = derived.get("detail") or {}
+    summary = derived.get("summary") or ""
+    phase = derived.get("phase") or ""
+    native = derived.get("driver") == "claude-workflow"
+    if state == "error":
+        reason = str(detail.get("reason") or summary)
+        add("high", "error", "Loop stopped with an error"
+            + (" (claude-workflow)" if native else ""),
+            reason[:400] + " · Diagnose, then reset STATE and re-run.",
+            f"error:{phase}:{reason[:60]}")
+    elif state == "needs_retirement":
+        add("high", "needs_retirement", "SHIP verified; retirement incomplete",
+            "The SHIP's retirement commit did not complete (exit 6). Retire it "
+            "(/trio-ship) and re-run to finalize.", f"retire:{derived.get('iteration')}")
+    elif state == "needs_land":
+        add("high", "needs_land", "Verified branch could not land"
+            + (f" ({phase})" if phase else ""),
+            "Root-free SHIP is verified on trio/<slug> but not on the target "
+            "(exit 8). A conflict is resolved by a human in the Lead worktree; "
+            "then trioctl omnigent land.", f"land:{phase}")
+    elif state == "held":
+        if native:
+            add("high", "held", f"Held at step {detail.get('held_step') or '?'}",
+                str(detail.get("reason") or "A step's Bash call was denied by the "
+                    "permission system.")[:400]
+                + " · Review the denial; start a fresh run (never a permission change).",
+                f"held:{detail.get('held_step')}:{detail.get('finished_at')}")
+        for hold in derived.get("held") or []:
+            add("high", "held", f"Held dispatch: {hold.get('role') or '?'} session "
+                f"{hold.get('session_id') or '?'}",
+                _HOLD_REASONS.get(hold.get("hold"), str(hold.get("hold") or "held"))
+                + f" (iteration {hold.get('iteration')}). Dry-run trioctl omnigent "
+                "reconcile; apply only when receipt-proven.",
+                f"held:{hold.get('session_id')}")
+    elif state == "conflict":
+        files = sorted({f for c in detail.get("conflicts") or []
+                        for f in (c.get("files") or [])})
+        add("high", "conflict", "Merge conflict after re-dispatch",
+            (", ".join(files[:6]) or summary) + " · A fresh run re-plans.",
+            "conflict:" + ",".join(files[:6]))
+    elif state == "budget":
+        add("medium", "budget", "Agent/token budget exhausted",
+            "The claude-workflow run stopped at max_agents/token_budget; the "
+            "state is resumable with a fresh start.", f"budget:{detail.get('finished_at')}")
+    elif state == "iteration_cap":
+        add("medium", "iteration_cap", "Stopped at the iteration cap",
+            f"{summary}. Re-run with a higher --max-iterations.",
+            f"cap:{derived.get('iteration')}")
+    dangling = detail.get("dangling_worktrees") or []
+    if dangling:
+        add("low", "dangling_worktrees",
+            f"{len(dangling)} dangling builder worktree{'s' if len(dangling) != 1 else ''}",
+            ", ".join(dangling[:3]) + ("…" if len(dangling) > 3 else "")
+            + " · Clean merged ones; a human reviews the rest.",
+            "dangling:" + ",".join(sorted(dangling)))
+
+
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
@@ -2034,11 +2220,16 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
 
     verdict = (card.get("final_verdict") or "").upper()
     status = str(card.get("status") or "").strip().lower()
+    derived = card.get("loop_state") or {}
+    dstate = derived.get("state")
     if (
         status in _RUNNING_STATUS_WORDS
         and not detection["sources"]
         and orphaned is None
         and verdict not in ("SHIP", "NEEDS_HUMAN", "BLOCKED")
+        # A known outcome (native held/conflict/budget/error, iteration
+        # cap, an answered loop waiting for its restart) is its own item.
+        and dstate in (None, "interrupted", "unknown")
     ):
         # Two recorded facts disagree; no idle-time threshold is involved.
         # Without a readable broker, a broker-only loop cannot be ruled out,
@@ -2075,7 +2266,11 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                 f"{reason}, so a broker-only run cannot be ruled out." + when,
                 f"interrupted:{last}")
 
-    if verdict == "NEEDS_HUMAN":
+    _state_inbox_items(derived, add)
+
+    if dstate in ("held", "ready"):
+        pass  # the hold explains STATE's needs_human; an answer was given
+    elif verdict == "NEEDS_HUMAN":
         add("high", "needs_human", "Human verification pending",
             "Agent-verifiable criteria pass; verify: human criteria remain.")
     elif verdict == "BLOCKED":
@@ -2777,6 +2972,37 @@ def _origin_allowed(origin: str, host: str) -> bool:
     if not host or parsed.netloc != host.strip().lower():
         return False
     return _host_allowed(parsed.netloc)
+
+
+def _diagnosis_summary(root_mailbox: Path) -> dict | None:
+    """The loop's latest diagnosis, trimmed for a board card."""
+    try:
+        la = load_loop_actions_module()
+        record = _diagnoses().status(HOME, la.loop_key(root_mailbox))
+    except Exception:  # noqa: BLE001 - the card renders without it
+        return None
+    if not record:
+        return None
+    result = record.get("result") or {}
+    fix = result.get("proposed_fix") or {}
+    return {
+        "status": record.get("status"), "harness": record.get("harness"),
+        "model": record.get("model"), "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"), "events": record.get("events"),
+        "last_event": record.get("last_event"), "error": record.get("error"),
+        "state": result.get("state"), "proposed_fix": fix.get("id"),
+        "proposed_fix_rejected": fix.get("rejected"),
+        "needs_human_input": result.get("needs_human_input"),
+    }
+
+
+_ACTION_LOCKS: dict[str, threading.Lock] = {}
+_ACTION_LOCKS_GUARD = threading.Lock()
+
+
+def _action_lock(key: str) -> threading.Lock:
+    with _ACTION_LOCKS_GUARD:
+        return _ACTION_LOCKS.setdefault(key, threading.Lock())
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -4008,6 +4234,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 driver = _live_driver_summary(metrics, root_dir)
                 if driver is not None:
                     card["live_driver"] = driver
+                card["diagnosis"] = _diagnosis_summary(root_dir)
                 loops.append(card)
             except Exception:
                 traceback.print_exc()
@@ -4245,7 +4472,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not controls["start"]["enabled"]:
             return self._send_json(
                 409, {"error": controls["start"]["reason"]})
-        entrypoint = DRIVER_ENTRYPOINTS[driver]
+        entrypoint = _driver_entrypoints()[driver]
         if driver == "portable":
             command = [
                 "python3", str(entrypoint), "run",
@@ -4367,6 +4594,191 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload["driver"] = driver_state["driver"]
         self._send_json(200, payload)
 
+    # -- /api/loop actions: diagnose, fix, answer (dash-actions) -----------
+
+    def _who(self) -> dict:
+        """Who asked (tailnet identity headers from tailscale serve, else the
+        client address) for the action log."""
+        return {
+            "addr": self.client_address[0] if self.client_address else None,
+            "user": (self.headers.get("Tailscale-User-Login") or "").strip() or None,
+            "name": (self.headers.get("Tailscale-User-Name") or "").strip() or None,
+            "agent": (self.headers.get("User-Agent") or "")[:80] or None,
+        }
+
+    def _find_loop_pair(self, name, root: Path) -> tuple[Path, Path] | None:
+        metrics = self.server.metrics
+        if not isinstance(name, str):
+            return None
+        name = name.strip()
+        if (not name or name.startswith(("/", "\\"))
+                or ".." in name.replace("\\", "/").split("/")):
+            return None
+        return next(
+            ((p, read) for p, read in _live_loop_dirs(metrics, root)
+             if metrics.loop_name(root, p) == name), None)
+
+    def _loop_context(self, root: Path, name):
+        pair = self._find_loop_pair(name, root)
+        if pair is None:
+            return None
+        root_dir, live = pair
+        driver_state = _driver_snapshot(live)
+        return load_loop_actions_module().LoopContext(
+            home=HOME, root=root, name=name, root_mailbox=root_dir,
+            live_mailbox=live, detection=_running_detection(live, root),
+            driver=driver_state["driver"] if driver_state else None,
+            last_action=_last_action(live),
+            registry=_native_registry_entry(live))
+
+    def _post_loop_context(self):
+        """(payload, ctx) of a POST naming {root, loop}; sends the error."""
+        payload = self._read_loop_body()
+        if payload is None:
+            return None, None
+        root = self._resolve_loop_root(payload)
+        if root is None:
+            return None, None
+        ctx = self._loop_context(root, payload.get("loop"))
+        if ctx is None:
+            self._send_json(404, {"error": "unknown loop"})
+            return None, None
+        return payload, ctx
+
+    def _handle_loop_actions(self, query: dict, root: Path) -> None:
+        name = (query.get("loop") or [None])[0]
+        ctx = self._loop_context(root, name)
+        if ctx is None:
+            return self._send_json(404, {"error": "unknown loop"})
+        la = load_loop_actions_module()
+        diagnosis = _diagnoses().status(HOME, ctx.key)
+        proposed = ((diagnosis or {}).get("result") or {}).get("proposed_fix") or {}
+        if proposed.get("id") in la.FIXES and not proposed.get("rejected"):
+            if proposed["id"] == "reconcile_apply":
+                proposed["server_check"] = "re-checked (dry run must be ready) on apply"
+            else:
+                try:
+                    plan = la.plan_fix(ctx, proposed["id"], proposed.get("args") or {})
+                    proposed["server_check"] = "applicable now"
+                    proposed["server_commands"] = plan["commands_preview"]
+                except la.FixRefused as exc:
+                    proposed["server_check"] = f"refused now: {exc}"
+        native = ctx.native or {}
+        self._send_json(200, {
+            "loop": ctx.name, "root": str(ctx.root),
+            "root_mailbox": str(ctx.root_mailbox),
+            "live_mailbox": str(ctx.live_mailbox), "driver": ctx.driver,
+            "live": ctx.live, "state": ctx.derived,
+            "native": {k: native.get(k) for k in (
+                "session_id", "run_id", "session_live", "lock", "result", "args")}
+            if native else None,
+            "fixes": la.available_fixes(ctx), "unblock": la.UNBLOCK_TABLE,
+            "never_automated": la.NEVER_AUTOMATED,
+            "answer": la.answer_context(ctx), "diagnosis": diagnosis,
+            "harnesses": la.harnesses(HOME),
+            "log": la.read_actions(HOME, ctx.key, 50),
+        })
+
+    def _handle_loop_diagnosis(self, query: dict, root: Path) -> None:
+        pair = self._find_loop_pair((query.get("loop") or [None])[0], root)
+        if pair is None:
+            return self._send_json(404, {"error": "unknown loop"})
+        la = load_loop_actions_module()
+        self._send_json(200, {"diagnosis": _diagnoses().status(
+            HOME, la.loop_key(pair[0]))})
+
+    def _handle_loop_diagnose(self) -> None:
+        payload, ctx = self._post_loop_context()
+        if ctx is None:
+            return
+        la = load_loop_actions_module()
+        harness = payload.get("harness") or la.harnesses(HOME)["default"]
+        try:
+            record = _diagnoses().start(ctx, harness, self._who())
+        except la.FixRefused as exc:
+            return self._send_json(409, {"error": str(exc)})
+        self._send_json(202, {"diagnosis": record})
+
+    def _handle_loop_fix(self) -> None:
+        payload, ctx = self._post_loop_context()
+        if ctx is None:
+            return
+        la = load_loop_actions_module()
+        fix_id = payload.get("fix")
+        args = payload.get("args") or {}
+        if not isinstance(fix_id, str) or fix_id not in la.FIXES:
+            la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": str(fix_id)[:80],
+                                          "who": self._who(), "reason": "unknown fix id"})
+            return self._send_json(400, {"error": "unknown fix id",
+                                         "allowlist": sorted(la.FIXES)})
+        if not isinstance(args, dict):
+            return self._send_json(400, {"error": "args must be an object"})
+        lock = _action_lock(ctx.key)
+        if not lock.acquire(blocking=False):
+            return self._send_json(409, {"error": "another action on this loop is in progress"})
+        try:
+            try:
+                plan = la.plan_fix(ctx, fix_id, args)
+            except la.FixRefused as exc:
+                la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": fix_id,
+                                              "who": self._who(), "reason": str(exc)})
+                return self._send_json(409, {"error": str(exc), "refused": True})
+            preview = {k: plan[k] for k in ("id", "title", "destructive", "commands_preview", "notes")}
+            if plan["requires_confirm"] and payload.get("confirm") is not True:
+                return self._send_json(409, {"confirm_required": True, "plan": preview,
+                                             "error": "confirm required: review the commands"})
+            plan["confirmed"] = payload.get("confirm") is True
+            live_mailbox = ctx.live_mailbox
+
+            def on_exit(pid: int, code: int) -> None:
+                _record_action(live_mailbox, outcome="finished" if code == 0 else "exited",
+                               exit_code=code, message=f"{fix_id}: PID {pid} exited (code {code})")
+
+            result = la.execute_plan(ctx, plan, who=self._who(), processes=_LOOP_PROCESSES,
+                                     on_exit=on_exit)
+        finally:
+            lock.release()
+        detached = [r for r in result["results"] if r.get("detached")]
+        _record_action(ctx.live_mailbox, action="fix",
+                       outcome=("failed" if not result["ok"] else
+                                "running" if detached else "finished"),
+                       pid=detached[-1]["pid"] if detached else None,
+                       message=f"{fix_id}: " + ("failed" if not result["ok"] else
+                                                f"started (PID {detached[-1]['pid']})" if detached
+                                                else "done"))
+        self._send_json(200 if result["ok"] else 502, {"plan": preview, **result})
+
+    def _handle_loop_answer(self) -> None:
+        payload, ctx = self._post_loop_context()
+        if ctx is None:
+            return
+        la = load_loop_actions_module()
+        reset = payload.get("reset", True)
+        if not isinstance(reset, bool):
+            return self._send_json(400, {"error": "reset must be a boolean"})
+        lock = _action_lock(ctx.key)
+        if not lock.acquire(blocking=False):
+            return self._send_json(409, {"error": "another action on this loop is in progress"})
+        try:
+            try:
+                plan = la.plan_answer(ctx, payload.get("answer"), reset, self._who())
+            except la.FixRefused as exc:
+                return self._send_json(409, {"error": str(exc), "refused": True})
+            preview = {k: plan[k] for k in ("answer_id", "entry", "commands_preview", "reset", "destructive")}
+            if payload.get("confirm") is not True:
+                return self._send_json(409, {"confirm_required": True, "plan": preview,
+                                             "error": "confirm required: review the changes"})
+            result = la.execute_answer(ctx, plan, self._who())
+        finally:
+            lock.release()
+        fresh = self._loop_context(ctx.root, ctx.name)
+        restart = []
+        if fresh is not None:
+            restart = [f for f in la.available_fixes(fresh)
+                       if f["applicable"] and f["id"] in ("rerun", "native_start")]
+        self._send_json(200 if result["ok"] else 500,
+                        {"plan": preview, **result, "restart": restart})
+
     # -- /api/transcript (SSE) ---------------------------------------------
 
     def _sse_start(self) -> bool:
@@ -4403,7 +4815,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return False
         loop_dir = target.parent.parent
         try:
-            loops = self.server.metrics.discover_loops(root)
+            loops = [p for pair in _live_loop_dirs(self.server.metrics, root)
+                     for p in pair]
         except Exception:
             return False
         for candidate in loops:
@@ -4632,6 +5045,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_loop_detail(query, root))
+        if path in ("/api/loop/actions", "/api/loop/diagnosis"):
+            root = self._request_root(query)
+            if root is None:
+                return
+            if path == "/api/loop/actions":
+                return self._api(lambda: self._handle_loop_actions(query, root))
+            return self._api(lambda: self._handle_loop_diagnosis(query, root))
         if path == "/api/sessions":
             root = self._request_root(query)
             if root is None:
@@ -4689,6 +5109,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(self._handle_loop_start)
         if path == "/api/loop/stop":
             return self._api(self._handle_loop_stop)
+        if path == "/api/loop/diagnose":
+            return self._api(self._handle_loop_diagnose)
+        if path == "/api/loop/fix":
+            return self._api(self._handle_loop_fix)
+        if path == "/api/loop/answer":
+            return self._api(self._handle_loop_answer)
         self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
@@ -5389,7 +5815,13 @@ def _worktree_label(worktree: Path) -> str:
 
 
 def _dashboard_version() -> str:
-    """Short git revision of the served dashboard, or ``"unknown"``."""
+    """Short git revision of the served dashboard, ``release-<sha>`` for an
+    installed release directory (``releases/<sha>/dashboard``, not a git
+    checkout), or ``"unknown"``."""
+    release = DASHBOARD_DIR.parent
+    if (release.parent.name == "releases"
+            and re.fullmatch(r"[0-9a-f]{40}", release.name)):
+        return "release-" + release.name[:7]
     try:
         result = subprocess.run(
             ["git", "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
@@ -5531,6 +5963,22 @@ class DashboardServer(ThreadingHTTPServer):
         for entry, seed in zip(entries, seeds):
             if names.count(entry["name"]) > 1:
                 entry["name"] = f"{seed.parent.name}/{seed.name}"
+        # A root-free loop's live copy (its Lead worktree) is already the
+        # root card's content; never list it a second time as a worktree.
+        live_copies = {
+            os.path.realpath(loop["live_mailbox"])
+            for entry in entries for loop in entry.get("loops") or []
+            if loop.get("live_mailbox")}
+        if live_copies:
+            for entry in worktree_entries:
+                entry["loops"] = [
+                    loop for loop in entry["loops"]
+                    if os.path.realpath(os.path.join(entry["root"], loop["name"]))
+                    not in live_copies]
+                names = {loop["name"] for loop in entry["loops"]}
+                entry["inbox"] = [i for i in entry["inbox"] if i.get("loop") in names]
+            worktree_entries = [e for e in worktree_entries
+                                if e["loops"] or e.get("error")]
         entries.extend(worktree_entries)
         # Processes working inside a workspace without naming any mailbox
         # (e.g. builders started with only --config/--workspace): shown as
@@ -5567,10 +6015,28 @@ class DashboardServer(ThreadingHTTPServer):
             return None
         return round(time.monotonic() - self._overview_at, 1)
 
+    @staticmethod
+    def _with_native_seeds(seeds) -> tuple[Path, ...]:
+        """Seeds plus the repos of registered claude-workflow runs (native
+        run registry), so runs under hidden or unscanned dirs show up.
+        ``TRIO_DASH_NATIVE_RUNS=0`` turns this off."""
+        out = list(seeds)
+        if os.environ.get("TRIO_DASH_NATIVE_RUNS", "1").strip() == "0":
+            return tuple(out)
+        for entry in _native_registry():
+            repo = Path(entry.get("repo") or Path(entry["mailbox"]).parent)
+            try:
+                repo = repo.resolve()
+            except OSError:
+                continue
+            if repo.is_dir() and repo not in out and repo != HOME.resolve():
+                out.append(repo)
+        return tuple(out)
+
     def get_workspace_seeds(self, force: bool = False) -> tuple[Path, ...]:
         """Return fixed seeds plus a TTL-refreshed scan of project directories."""
         if not self.workspace_discovery_enabled:
-            return self._fixed_workspace_seeds
+            return self._with_native_seeds(self._fixed_workspace_seeds)
         now = time.monotonic()
         with self._workspace_lock:
             if (
@@ -5588,7 +6054,7 @@ class DashboardServer(ThreadingHTTPServer):
                 for worktree in linked:
                     if worktree not in seeds and worktree not in worktrees:
                         worktrees.append(worktree)
-            self.workspace_seeds = tuple(seeds)
+            self.workspace_seeds = self._with_native_seeds(seeds)
             self.worktree_seeds = tuple(worktrees)
             self.workspace_scan_at = now
             return self.workspace_seeds
@@ -5600,6 +6066,9 @@ class DashboardServer(ThreadingHTTPServer):
         return self.worktree_seeds
 
 def main(argv: list[str] | None = None) -> int:
+    # Served from an installed release directory: never write __pycache__
+    # next to the verified release files.
+    sys.dont_write_bytecode = True
     parser = argparse.ArgumentParser(
         description="Trio Loop Dashboard — read-only status board and "
                     "transcript viewer for trio loop mailboxes."

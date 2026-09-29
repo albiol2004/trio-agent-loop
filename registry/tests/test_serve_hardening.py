@@ -376,9 +376,26 @@ class PidLivenessTests(unittest.TestCase):
 # --------------------------------------------------------------- controls
 
 
+def _install_fake_release(home: Path) -> dict:
+    """An installed release + trioctl under a temp HOME (dash-actions: Start
+    runs the installed drivers, never the dashboard checkout's)."""
+    share = home / ".local" / "share" / "trio-agent-loop"
+    sha = "f" * 40
+    entry = share / "releases" / sha / "metrics" / "trio_loop.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("# fake release driver\n", encoding="utf-8")
+    (share / "CURRENT").write_text(sha + "\n", encoding="utf-8")
+    trioctl = home / ".local" / "bin" / "trioctl"
+    trioctl.parent.mkdir(parents=True)
+    trioctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    trioctl.chmod(0o755)
+    return {"portable": entry, "omnigent": trioctl}
+
+
 class ControlTests(_Env):
     def setUp(self):
         super().setUp()
+        self.installed = _install_fake_release(self.home)
         self.mailbox = _mailbox(self.root, "loop")
         self.bin = self.home / "bin"
         self.bin.mkdir()
@@ -417,8 +434,7 @@ class ControlTests(_Env):
         with patch.object(serve, "DRIVER_ENTRYPOINTS", missing):
             card = self.card("loop")["controls"]
             self.assertFalse(card["start"]["enabled"])
-            self.assertIn("not in this dashboard checkout",
-                          card["start"]["reason"])
+            self.assertIn("not installed", card["start"]["reason"])
             status, data = self.post("/api/loop/start",
                                      {"root": str(self.root),
                                       "driver": "portable"})

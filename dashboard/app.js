@@ -182,7 +182,26 @@ function latestVerdict(loop) {
  * finished loop is a review note (still listed, just not at the top). */
 const NEEDS_KINDS = new Set([
   "needs_human", "blocked", "interrupted", "orphaned", "queue_fault",
+  "error", "needs_retirement", "needs_land", "held", "conflict", "budget",
+  "iteration_cap",
 ]);
+
+/* Derived loop states (server: loop_actions.derive_state) shown as their
+ * own badge instead of the raw STATE.md word. */
+const LOOP_STATE_BADGES = {
+  error: ["negative", "Error"],
+  needs_retirement: ["warning", "Needs retirement"],
+  needs_land: ["warning", "Needs land"],
+  held: ["warning", "Held"],
+  conflict: ["negative", "Conflict"],
+  budget: ["warning", "Budget spent"],
+  iteration_cap: ["warning", "Iteration cap"],
+  ready: ["neutral", "Ready to restart"],
+};
+
+function derivedStateOf(loop) {
+  return loop && loop.loop_state ? loop.loop_state.state : null;
+}
 const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
 const STORE_KEY = "trio.board.v2";
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -241,9 +260,12 @@ function stateBadge(loop) {
   let text = statusWord(loop);
   const verdict = normVerdict(latestVerdict(loop));
   const status = String(loop.status || "").trim().toLowerCase().replace(/-/g, "_");
+  const derived = derivedStateOf(loop);
   if (loop.running) {
     tone = "live";
     text = "Running";
+  } else if (LOOP_STATE_BADGES[derived]) {
+    [tone, text] = LOOP_STATE_BADGES[derived];
   } else if (HUMAN_STATUS.has(status)) {
     // STATE.md handing the loop to a person outranks an older verdict file.
     tone = "warning";
@@ -269,6 +291,7 @@ function stateBadge(loop) {
   const facts = ["STATE.md: " + statusWord(loop)];
   if (latestVerdict(loop)) facts.push("verdict: " + latestVerdict(loop));
   if (loop.running) facts.push("live via " + (loop.running_sources || []).join(", "));
+  if (loop.loop_state && loop.loop_state.summary) facts.push(derived + ": " + loop.loop_state.summary);
   badge.title = facts.join(" · ");
   return badge;
 }
@@ -363,7 +386,10 @@ async function refreshBoard() {
         openDrawer(target.key);
       }
     }
-    if (state.activeLoop) refreshDetail({ quiet: true });
+    if (state.activeLoop) {
+      refreshDetail({ quiet: true });
+      refreshActions();
+    }
   } catch (err) {
     showBoardError(
       state.loaded
@@ -913,6 +939,13 @@ function cardEl(loop) {
     nameCell.appendChild(span("row-flag", plural(n, "unread item")));
   }
   if (isArchived(loop)) nameCell.appendChild(span("row-flag row-flag-muted", "Archived"));
+  if (loop.driver === "claude-workflow") {
+    const tag = span("row-flag row-flag-muted", "Native (claude-workflow)");
+    tag.title = "Claude-native Trio loop driven by the trio-native Workflow";
+    nameCell.appendChild(tag);
+  }
+  const diag = diagnosisFlag(loop.diagnosis);
+  if (diag) nameCell.appendChild(diag);
   if (loop.worktree && (loop.worktree_reasons || []).length) {
     const tag = span("row-flag row-flag-muted", "Worktree: " + loop.worktree_reasons.join(", "));
     tag.title = "Shown because this linked worktree's copy is " + loop.worktree_reasons.join(", ") +
@@ -957,6 +990,28 @@ function cardEl(loop) {
     openDrawer(loop.key);
   });
   return row;
+}
+
+/* One-line diagnosis status for a card (full result lives in the drawer). */
+function diagnosisFlag(d) {
+  if (!d || !d.status) return null;
+  let text;
+  let cls = "row-flag row-flag-muted";
+  if (d.status === "running") {
+    text = "Diagnosing (" + (d.harness || "?") + ")… " + (d.last_event || "");
+    cls = "row-flag";
+  } else if (d.status === "done") {
+    text = "Diagnosis: " + (d.state || "?") + (d.proposed_fix && d.proposed_fix !== "none"
+      ? " → " + d.proposed_fix + (d.proposed_fix_rejected ? " (rejected)" : "") : "")
+      + (d.needs_human_input ? " · needs your input" : "");
+    if (d.needs_human_input) cls = "row-flag";
+  } else {
+    text = "Diagnosis failed";
+  }
+  const flag = span(cls, oneLine(text, 90));
+  flag.title = (d.harness || "") + " " + (d.model || "") + (d.finished_at ? " · " + d.finished_at : "")
+    + (d.error ? " · " + d.error : "");
+  return flag;
 }
 
 async function setInboxRead(items, read) {
@@ -1080,6 +1135,381 @@ function renderDrawerControls(loop) {
   }
 }
 
+/* ---------------------------- unblock panel ----------------------------
+ * /api/loop/actions: derived state, the server's fix allowlist with each
+ * fix's applicability, the latest read-only diagnosis, the answer box and
+ * the append-only action log. The server re-checks every precondition on
+ * each click; destructive fixes come back as confirm_required with the
+ * exact commands, and only an explicit confirm click runs them. */
+
+let actionsTimer = null;
+const MAXIT_FIXES = new Set(["rerun", "rerun_more_iterations", "reset_and_rerun",
+  "native_start", "native_reset_and_start"]);
+
+function actionsUrl(loop) {
+  return "/api/loop/actions?root=" + encodeURIComponent(loop.root) +
+    "&loop=" + encodeURIComponent(loop.name);
+}
+
+async function refreshActions() {
+  const key = state.activeLoop;
+  const loop = state.byKey.get(key);
+  if (!loop) return;
+  clearTimeout(actionsTimer);
+  try {
+    const res = await fetch(actionsUrl(loop), { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (state.activeLoop !== key) return;
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    state.actions = data;
+    renderActions(data);
+  } catch (err) {
+    if (state.activeLoop !== key) return;
+    el("actions-section").hidden = false;
+    el("actions-state").textContent = "Unblock actions unavailable: " + err.message;
+  }
+  const d = state.actions && state.actions.diagnosis;
+  if (d && d.status === "running" && state.activeLoop === key) {
+    actionsTimer = setTimeout(refreshActions, 2000);
+  }
+}
+
+async function postLoopAction(path, body) {
+  const loop = state.byKey.get(state.activeLoop);
+  if (!loop) return { status: 0, data: { error: "no loop open" } };
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ root: loop.root, loop: loop.name }, body)),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, data };
+}
+
+function confirmCommands({ title, lead, commands, notes, okText }) {
+  const dlg = el("confirm-dialog");
+  el("confirm-title").textContent = title || "Confirm";
+  el("confirm-lead").textContent = lead || "";
+  el("confirm-commands").textContent = (commands || []).join("\n");
+  const list = el("confirm-notes");
+  list.textContent = "";
+  for (const note of notes || []) {
+    const li = document.createElement("li");
+    li.textContent = note;
+    list.appendChild(li);
+  }
+  el("confirm-ok").textContent = okText || "Run these commands";
+  dlg.returnValue = "";
+  return new Promise((resolve) => {
+    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+    dlg.showModal();
+  });
+}
+
+function setNote(id, text, tone) {
+  const note = el(id);
+  note.textContent = text || "";
+  note.className = "control-note caption" + (tone ? " control-" + tone : "");
+}
+
+function renderActions(data) {
+  el("actions-section").hidden = false;
+  const st = data.state || {};
+  const detail = st.detail || {};
+  const parts = [(st.state || "unknown").replace(/_/g, " ")];
+  if (st.summary) parts.push(st.summary);
+  if (data.driver) parts.push("driver " + data.driver);
+  if (detail.run_id) parts.push("run " + detail.run_id);
+  if (detail.session_id) parts.push("session " + String(detail.session_id).slice(0, 8));
+  if (detail.api_equiv_usd != null) parts.push("≈$" + Number(detail.api_equiv_usd).toFixed(2) + " API-equivalent");
+  el("actions-state").textContent = parts.join(" · ");
+
+  const sel = el("diagnose-harness");
+  if (!sel.options.length && data.harnesses) {
+    for (const name of ["cursor", "codex"]) {
+      const h = data.harnesses[name];
+      if (!h) continue;
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = (name === "cursor" ? "Cursor · " : "Codex · ") + h.model +
+        (h.effort ? " (" + h.effort + ")" : "") + (h.available ? "" : " — not installed");
+      opt.disabled = !h.available;
+      sel.appendChild(opt);
+    }
+    sel.value = data.harnesses.default;
+  }
+  const running = data.diagnosis && data.diagnosis.status === "running";
+  el("diagnose-btn").disabled = running;
+  el("diagnose-btn").textContent = running ? "Diagnosing…" : "Diagnose";
+  renderDiagnosis(data.diagnosis);
+
+  const proposed = (((data.diagnosis || {}).result || {}).proposed_fix || {}).id;
+  const list = el("fix-list");
+  list.textContent = "";
+  const unavailable = [];
+  for (const fix of data.fixes || []) {
+    if (!fix.applicable) { unavailable.push(fix); continue; }
+    list.appendChild(fixRow(fix, fix.id === proposed, st));
+  }
+  if (!list.children.length) list.appendChild(span("caption", "No fix applies right now."));
+  const ul = el("fix-unavailable-list");
+  ul.textContent = "";
+  for (const fix of unavailable) {
+    const li = document.createElement("li");
+    li.appendChild(span("mono", fix.id));
+    li.appendChild(document.createTextNode(" — " + (fix.reason || "")));
+    ul.appendChild(li);
+  }
+  el("fix-unavailable").hidden = unavailable.length === 0;
+
+  const answer = data.answer || {};
+  el("answer-box").hidden = !answer.allowed;
+  el("answer-stop").textContent = answer.allowed
+    ? "Stopped at: " + (answer.stop || "?") + (answer.entries && answer.entries.length
+      ? " · earlier answers: " + answer.entries.length : "")
+    : "";
+  const reset = el("answer-reset");
+  reset.disabled = answer.reset_allowed === false;
+  if (reset.disabled) reset.checked = false;
+  reset.parentElement.title = answer.reset_reason || "";
+
+  const log = el("action-log-list");
+  log.textContent = "";
+  for (const entry of (data.log || []).slice(-20).reverse()) {
+    const li = document.createElement("li");
+    const who = entry.who ? (entry.who.user || entry.who.addr || "") : "";
+    const what = [entry.action, entry.fix || entry.harness || entry.answer_id || "",
+      entry.ok === false ? "FAILED" : entry.ok === true ? "ok" : "",
+      entry.exit_code != null ? "exit " + entry.exit_code : "",
+      entry.reason ? "— " + entry.reason : ""].filter(Boolean).join(" ");
+    li.appendChild(span("mono", (entry.at || "").replace("T", " ").replace("Z", "")));
+    li.appendChild(document.createTextNode(" " + what + (who ? " · " + who : "")));
+    log.appendChild(li);
+  }
+}
+
+function fixRow(fix, isProposed, st) {
+  const row = document.createElement("div");
+  row.className = "fix-row" + (isProposed ? " fix-proposed" : "");
+  const head = document.createElement("div");
+  head.className = "fix-head";
+  head.appendChild(span("fix-title", fix.title));
+  head.appendChild(span("fix-id mono caption", fix.id));
+  if (fix.destructive) head.appendChild(span("fix-tag fix-tag-destructive", "needs confirm"));
+  if (isProposed) head.appendChild(span("fix-tag", "proposed by diagnosis"));
+  row.appendChild(head);
+  if ((fix.commands_preview || []).length) {
+    const pre = document.createElement("pre");
+    pre.className = "fix-commands mono";
+    pre.textContent = fix.commands_preview.join("\n");
+    row.appendChild(pre);
+  }
+  for (const note of fix.notes || []) row.appendChild(span("caption fix-note", note));
+  const bar = document.createElement("div");
+  bar.className = "actions-row";
+  let input = null;
+  if (MAXIT_FIXES.has(fix.id)) {
+    const label = document.createElement("label");
+    label.className = "caption fix-arg";
+    label.textContent = "max iterations ";
+    input = document.createElement("input");
+    input.type = "number";
+    input.min = "1";
+    input.max = "200";
+    input.className = "input input-num";
+    const cur = Number(st.iteration || 0);
+    const cap = Number(st.max_iterations || 0);
+    input.value = String(fix.id === "rerun_more_iterations" || st.state === "iteration_cap"
+      ? cur + Math.max(2, Math.min(cap || 4, 10)) : (cap > cur ? cap : cur + (cap || 4)));
+    label.appendChild(input);
+    bar.appendChild(label);
+  }
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn " + (fix.destructive ? "btn-destructive" : "btn-secondary");
+  btn.textContent = fix.destructive ? "Review & apply…" : "Apply";
+  const note = document.createElement("span");
+  note.className = "control-note caption";
+  note.setAttribute("role", "status");
+  btn.addEventListener("click", () => {
+    const args = {};
+    if (input && input.value) args.max_iterations = Number(input.value);
+    applyFix(fix, args, btn, note);
+  });
+  bar.appendChild(btn);
+  bar.appendChild(note);
+  row.appendChild(bar);
+  return row;
+}
+
+async function applyFix(fix, args, btn, note) {
+  btn.disabled = true;
+  note.textContent = "Checking preconditions…";
+  note.className = "control-note caption control-pending";
+  try {
+    let { status, data } = await postLoopAction("/api/loop/fix", { fix: fix.id, args });
+    if (status === 409 && data.confirm_required) {
+      const plan = data.plan || {};
+      const ok = await confirmCommands({
+        title: plan.title || fix.title,
+        lead: "The server re-checked the preconditions just now. Confirming runs exactly these commands" +
+          (plan.destructive ? " (they change history or loop state):" : ":"),
+        commands: plan.commands_preview, notes: plan.notes,
+      });
+      if (!ok) {
+        note.textContent = "Cancelled; nothing ran.";
+        note.className = "control-note caption";
+        return;
+      }
+      ({ status, data } = await postLoopAction("/api/loop/fix", { fix: fix.id, args, confirm: true }));
+    }
+    if (status >= 200 && status < 300 && data.ok) {
+      const started = (data.results || []).filter((r) => r.detached);
+      note.textContent = started.length
+        ? "Started (PID " + started.map((r) => r.pid).join(", ") + "). Output: " + started[0].log
+        : "Done.";
+      note.className = "control-note caption control-ok";
+    } else {
+      const failed = (data.results || []).find((r) => !r.ok);
+      note.textContent = "Not applied: " + (data.error || (failed && (failed.error || failed.output)) || "HTTP " + status);
+      note.className = "control-note caption control-error";
+    }
+  } catch (err) {
+    note.textContent = "Request failed: " + err.message;
+    note.className = "control-note caption control-error";
+  } finally {
+    btn.disabled = false;
+    refreshActions();
+    refreshBoard();
+  }
+}
+
+function renderDiagnosis(d) {
+  const panel = el("diagnosis-panel");
+  panel.textContent = "";
+  if (!d) { panel.hidden = true; return; }
+  panel.hidden = false;
+  const head = document.createElement("div");
+  head.className = "diagnosis-head";
+  head.appendChild(span("fix-title", "Diagnosis"));
+  head.appendChild(span("caption", [d.harness, d.model, d.effort].filter(Boolean).join(" · ") +
+    " · " + (d.status || "") + (d.finished_at ? " · " + relTime(d.finished_at) : d.started_at ? " · started " + relTime(d.started_at) : "")));
+  panel.appendChild(head);
+  if (d.status === "running") {
+    panel.appendChild(span("caption", "Read-only agent working… " + (d.events || 0) + " events · " + (d.last_event || "")));
+    return;
+  }
+  if (d.status === "failed") {
+    panel.appendChild(span("control-note control-error", "Failed: " + (d.error || "unknown error")));
+    if (d.answer_tail) {
+      const pre = document.createElement("pre");
+      pre.className = "fix-commands mono";
+      pre.textContent = d.answer_tail;
+      panel.appendChild(pre);
+    }
+    return;
+  }
+  const r = d.result || {};
+  const text = document.createElement("p");
+  text.className = "diagnosis-text";
+  text.textContent = r.diagnosis || "(no diagnosis text)";
+  panel.appendChild(text);
+  panel.appendChild(span("caption", "State: " + (r.state || "?") + (r.state_note ? " (" + r.state_note + ")" : "")));
+  if ((r.evidence || []).length) {
+    const ul = document.createElement("ul");
+    ul.className = "diagnosis-evidence";
+    for (const e of r.evidence) {
+      const li = document.createElement("li");
+      li.textContent = e;
+      ul.appendChild(li);
+    }
+    panel.appendChild(ul);
+  }
+  const fix = r.proposed_fix || {};
+  const fixLine = document.createElement("p");
+  fixLine.className = "diagnosis-fix";
+  fixLine.textContent = "Proposed fix: " + (fix.id || "none") +
+    (fix.rejected ? " — REJECTED by the server (" + fix.rejected + ")" : "") +
+    (fix.server_check ? " — server: " + fix.server_check : "");
+  panel.appendChild(fixLine);
+  const cmds = (fix.server_commands && fix.server_commands.length) ? fix.server_commands : fix.commands_preview;
+  if (cmds && cmds.length) {
+    const pre = document.createElement("pre");
+    pre.className = "fix-commands mono";
+    pre.textContent = cmds.join("\n");
+    panel.appendChild(pre);
+  }
+  if (r.needs_human_input) {
+    const q = document.createElement("p");
+    q.className = "diagnosis-question";
+    q.textContent = "Needs your input: " + (r.question || "(no question given)");
+    panel.appendChild(q);
+  }
+  if (d.integrity && d.integrity.warning) {
+    panel.appendChild(span("control-note control-error", d.integrity.warning + ": " + d.integrity.changed.join(", ")));
+  }
+}
+
+async function startDiagnosis() {
+  const harness = el("diagnose-harness").value || undefined;
+  el("diagnose-btn").disabled = true;
+  setNote("diagnose-note", "Starting a read-only diagnosis…", "pending");
+  try {
+    const { status, data } = await postLoopAction("/api/loop/diagnose", { harness });
+    if (status === 202) setNote("diagnose-note", "Running (" + data.diagnosis.harness + " · " + data.diagnosis.model + ").", "ok");
+    else setNote("diagnose-note", "Not started: " + (data.error || "HTTP " + status), "error");
+  } catch (err) {
+    setNote("diagnose-note", "Request failed: " + err.message, "error");
+  }
+  refreshActions();
+}
+
+async function submitAnswer(ev) {
+  ev.preventDefault();
+  const answer = el("answer-text").value;
+  const reset = el("answer-reset").checked;
+  setNote("answer-note", "Checking…", "pending");
+  el("answer-restart").hidden = true;
+  try {
+    let { status, data } = await postLoopAction("/api/loop/answer", { answer, reset });
+    if (status === 409 && data.confirm_required) {
+      const plan = data.plan || {};
+      const ok = await confirmCommands({
+        title: "Record this answer",
+        lead: "Appends this entry to HUMAN.md" + (plan.reset ? " and resets STATE.md:" : ":"),
+        commands: [plan.entry || "", ""].concat(plan.commands_preview || []),
+        okText: "Write answer",
+      });
+      if (!ok) { setNote("answer-note", "Cancelled; nothing was written."); return; }
+      ({ status, data } = await postLoopAction("/api/loop/answer", { answer, reset, confirm: true }));
+    }
+    if (status === 200 && data.ok) {
+      el("answer-text").value = "";
+      setNote("answer-note", "Answer " + data.answer_id + " recorded in HUMAN.md" + (reset ? "; STATE reset." : "."), "ok");
+      const wrap = el("answer-restart");
+      wrap.textContent = "";
+      for (const fix of data.restart || []) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-secondary";
+        btn.textContent = "Restart: " + fix.title;
+        const note = document.createElement("span");
+        note.className = "control-note caption";
+        btn.addEventListener("click", () => applyFix(fix, {}, btn, note));
+        wrap.appendChild(btn);
+        wrap.appendChild(note);
+      }
+      wrap.hidden = !(data.restart || []).length;
+    } else {
+      setNote("answer-note", "Not written: " + (data.error || "HTTP " + status), "error");
+    }
+  } catch (err) {
+    setNote("answer-note", "Request failed: " + err.message, "error");
+  }
+  refreshActions();
+  refreshBoard();
+}
+
 function markActiveCard() {
   for (const row of document.querySelectorAll(".loop-row")) {
     row.classList.toggle("active", row.dataset.key === state.activeLoop);
@@ -1148,11 +1578,20 @@ async function openDrawer(key) {
   renderDrawerTabs();
   showDrawerTab();
   renderDrawerInbox();
+  state.actions = null;
+  el("actions-section").hidden = true;
+  el("diagnose-harness").textContent = "";
+  setNote("diagnose-note", "");
+  setNote("answer-note", "");
+  el("answer-restart").hidden = true;
+  refreshActions();
   await refreshDetail({ quiet: false });
 }
 
 function closeDrawer() {
   closeStream();
+  clearTimeout(actionsTimer);
+  state.actions = null;
   state.activeLoop = null;
   state.detail = null;
   state.compare = [];
@@ -2892,9 +3331,12 @@ function init() {
   el("drawer-close").addEventListener("click", closeDrawer);
   el("drawer-scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (ev) => {
+    if (el("confirm-dialog").open) return;  // the dialog handles its own keys
     if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
     trapDrawerFocus(ev);
   });
+  el("diagnose-btn").addEventListener("click", startDiagnosis);
+  el("answer-box").addEventListener("submit", submitAnswer);
   el("inbox-toggle").addEventListener("click", () => {
     state.showReadInbox = !state.showReadInbox;
     renderAll();
