@@ -1731,7 +1731,19 @@ def _kill_check_budget(mailbox: Path | None) -> float:
 # over that looks like shell syntax can be trusted.
 _TARGETED_CHECK_HINT_RE = re.compile(r"Print\s+`TARGETED_CHECK:.*?\)\.", re.DOTALL)
 
-_TARGETED_COMMAND_RUNNER_RE = re.compile(
+# Only the plain-line fallback (no fenced block, no backticked candidate
+# anywhere in the section) still needs a runner/prose heuristic: an
+# unquoted, un-backticked line might be ordinary prose rather than a
+# command, so it is only trusted when it starts with shell syntax a real
+# command almost always has. A fenced block or a backticked span is already
+# explicit, deliberately-marked-up code -- once the hint sentence and
+# placeholder shapes are filtered out (see `_plausible_command`), whatever
+# is left over IS the command, whether or not it happens to start with a
+# runner this list recognizes. A static allowlist can never cover every
+# real-world runner (`mix test ...`, `ctest --test-dir ...`,
+# `php vendor/bin/phpunit ...`, `sbt test`, ...), so it is kept for the
+# plain-line fallback only, where some heuristic is unavoidable.
+_TARGETED_COMMAND_PLAIN_LINE_RUNNER_RE = re.compile(
     r"^(?:\.{1,2}/|~/|/|\()"
     r"|^\.\s"
     r"|^(?:cd|pushd|env|set|export|source|timeout|uv|poetry|docker|bundle|just|"
@@ -1770,29 +1782,38 @@ def _looks_like_prose(text: str) -> bool:
     return not re.search(r"[/=]|--|&&|['\"]", text)
 
 
-def _plausible_targeted_command(text: str) -> str | None:
-    """*text*, if it plausibly is a runnable command; else None."""
+def _plausible_command(text: str) -> str | None:
+    """*text*, if a fenced block or backticked span plausibly is a runnable
+    command; else None.
+
+    Both forms are already explicit, deliberately-marked-up code -- unlike
+    a plain line, neither is rejected just for not starting with a known
+    runner word (that is how a bare `tests/run.sh`, or a real-world runner
+    with no static allowlist entry such as `mix`, `ctest`, `sbt`, or
+    `php vendor/bin/phpunit`, is trusted as the real command). It is still
+    rejected as a hint/placeholder example."""
+    text = text.strip()
+    if not text or "TARGETED_CHECK" in text:
+        return None
+    unquoted = _TARGETED_COMMAND_QUOTED_RE.sub("", text)
+    return None if _TARGETED_COMMAND_PLACEHOLDER_RE.search(unquoted) else text
+
+
+def _plausible_plain_command(text: str) -> str | None:
+    """*text*, if a plain (unquoted, un-backticked) fallback line plausibly
+    is a runnable command; else None.
+
+    This is the only form still gated by a runner allowlist: with no fenced
+    block and no backticked candidate anywhere in the section, an arbitrary
+    line of prose has to be told apart from a real command, and the
+    allowlist is the heuristic used for that."""
     text = text.strip()
     if not text or "TARGETED_CHECK" in text:
         return None
     unquoted = _TARGETED_COMMAND_QUOTED_RE.sub("", text)
     if _TARGETED_COMMAND_PLACEHOLDER_RE.search(unquoted):
         return None
-    return text if _TARGETED_COMMAND_RUNNER_RE.match(text) else None
-
-
-def _plausible_fenced_command(text: str) -> str | None:
-    """*text*, if a fenced block plausibly is a runnable command; else None.
-
-    A fenced block is already explicit, deliberately-placed code -- unlike a
-    plain or backticked line, it is never rejected just for not starting
-    with a known runner word (that is how a bare `tests/run.sh` is a real,
-    fenced command). It is still rejected as a hint/placeholder example."""
-    text = text.strip()
-    if not text or "TARGETED_CHECK" in text:
-        return None
-    unquoted = _TARGETED_COMMAND_QUOTED_RE.sub("", text)
-    return None if _TARGETED_COMMAND_PLACEHOLDER_RE.search(unquoted) else text
+    return text if _TARGETED_COMMAND_PLAIN_LINE_RUNNER_RE.match(text) else None
 
 
 def _brief_targeted_command(brief: str) -> str | None:
@@ -1822,21 +1843,21 @@ def _brief_targeted_command(brief: str) -> str | None:
         # Same hint/placeholder filtering as the other forms (pre-existing
         # gap): a fenced output example or placeholder command is never
         # returned verbatim; fall through to the backtick/plain scan below.
-        command = _plausible_fenced_command("\n".join(fenced))
+        command = _plausible_command("\n".join(fenced))
         if command:
             return command
     for ln in lines:
         for span in re.findall(r"`([^`]+)`", ln):
             if not re.search(r"\s", span):
                 continue  # P-3: a one-word span is never the real command
-            command = _plausible_targeted_command(span)
+            command = _plausible_command(span)
             if command:
                 return command
     for ln in lines:
         text = re.sub(r"^\s*(?:[-*+]\s+|\$\s+)", "", ln).strip()
         if text.lower().startswith("print") or _looks_like_prose(text):
             continue
-        command = _plausible_targeted_command(text)
+        command = _plausible_plain_command(text)
         if command:
             return command
     return None

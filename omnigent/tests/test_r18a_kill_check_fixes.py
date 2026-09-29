@@ -737,6 +737,48 @@ def test_case_table_detailed_rows(brief, expect):
     assert T._brief_targeted_command(brief) == expect
 
 
+# ------------ eval-r17fix P-1 follow-up: backtick/fence need no allowlist --
+
+# The coordinator's 20-command probe (brief = `## Targeted check` + the
+# canonical TARGETED_CHECK hint + one backticked command): with the r18a
+# repair's `_TARGETED_COMMAND_RUNNER_RE` still gating a backticked span, 16
+# of these 20 round-tripped but the last four -- real runners the allowlist
+# simply never listed -- came back `None` instead of the command. A
+# backticked span or fenced block is already explicit, deliberately-marked
+# code once the hint sentence and placeholder shapes are stripped, so it
+# needs no runner allowlist at all; only the plain-line fallback still does.
+_PROBE_COMMANDS = [
+    "npm test -- x",
+    "pnpm vitest run a.test.ts",
+    "uv run pytest",
+    "python -m pytest",
+    "bash scripts/check.sh",
+    "make test",
+    "node --test",
+    "go test ./...",
+    "cargo test",
+    "./gradlew test",
+    "docker compose run --rm app pytest",
+    "FOO=1 pytest",
+    "poetry run pytest -q",
+    "timeout 120 pytest -q",
+    "bundle exec rspec",
+    "just test",
+    "mix test test/foo_test.exs",
+    "ctest --test-dir build",
+    "php vendor/bin/phpunit tests",
+    "sbt test",
+]
+
+
+@pytest.mark.parametrize("command", _PROBE_COMMANDS)
+def test_probe_backticked_command_needs_no_runner_allowlist(command):
+    brief = (
+        f"# Task x\n\n## Targeted check\n\nRun `{command}`.\n\n{_TARGETED_CHECK_HINT}\n"
+    )
+    assert T._brief_targeted_command(brief) == command
+
+
 def test_real_corpus_scan_reports_zero_false_na():
     """r18a repair item 6/acceptance: re-scan the on-disk briefs the
     reviewer used (read-only; paths per VERDICT.md eval-r17fix) and confirm
