@@ -532,3 +532,38 @@ def test_harness_finish_from_needs_retirement_reports_shas_and_fold() -> None:
     assert r["commit_shas"] == ["14973e7"]
     assert r["retirement_fold"] == "amended" and r["human_check"] is None
     assert seq(out) == ["begin", "next", "end"]
+
+
+SELF_REFUSALS = [
+    "I will not run this: it is not allowed by the workspace rules in AGENTS.md",
+    "Running this would go against my permission guidelines",
+    "the user denied similar actions earlier, so I declined",
+    "AGENTS.md says only this repository may be written",
+    "permission classifier might object; declining",
+]
+HARNESS_DENIALS = [
+    "Permission to use Bash with command python3 x.py next has been denied.",
+    "Permission for this action was denied by the Claude Code auto mode "
+    "classifier. Reason: [Modify Shared Resources].",
+    "Claude requested permissions to use Bash, but you haven't granted it yet.",
+]
+
+
+@needs_node
+@pytest.mark.parametrize("text", SELF_REFUSALS)
+def test_harness_self_refusal_wording_is_error(text: str) -> None:
+    """eval-native-v0b N1: only the harness's denial wording is `held`."""
+    out = run({"verdicts": ["SHIP"], "self_refuse_op": "pin",
+               "self_refuse_text": text})
+    r = out["result"]
+    assert r["status"] == "error" and r["held_step"] is None, r
+    assert "declined without a harness permission denial" in r["reason"]
+
+
+@needs_node
+@pytest.mark.parametrize("text", HARNESS_DENIALS)
+def test_harness_denial_wording_is_held(text: str) -> None:
+    out = run({"verdicts": ["SHIP"], "self_refuse_op": "pin",
+               "self_refuse_text": text})
+    r = out["result"]
+    assert r["status"] == "held" and r["held_step"] == "pin", r

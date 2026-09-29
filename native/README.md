@@ -105,7 +105,7 @@ Unattended or headless runs use Claude Code **auto mode** (`--permission-mode au
   - stops with `status: "held"` and `held_step: "<op>"`;
   - still runs `end`, unless `end` itself is denied (then `held_step: "end"`, `end_error`, `lock: "not_released"`);
   - leaves STATE.md at its resumable cursor.
-- **A step agent that declines on its own** (no harness denial text) is `status: "error"`, not `held` (probe P3).
+- **A step agent that declines on its own** (no harness denial text) is `status: "error"`, not `held` (probe P3). The denial is recognised only by the harness's own wording ("Permission to use <Tool> … has been denied", "Permission for this action was denied by the Claude Code auto mode classifier", "… requested permissions to use <Tool>, but you haven't granted it yet"); a step agent's own words such as "not allowed", "permission" or "denied" do not make a hold (eval-native-v0b N1).
 - **Role agents handle their own denials.** A denial inside a role agent (Lead, Evaluator, builders) is handled by that agent. If it leaves the gate unmet, the gate retries the role once and then stops with `error`, so it never loops.
 
 ## Lock

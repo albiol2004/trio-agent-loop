@@ -113,7 +113,7 @@ async function agent(prompt, opts = {}) {
         denial: 'Permission to use Bash has been denied by the auto mode classifier' }
     }
     if (sc.self_refuse_op === m[1]) {
-      return { exit_code: -1, stdout: '', held: true, denial: '' }
+      return { exit_code: -1, stdout: '', held: true, denial: sc.self_refuse_text || '' }
     }
     // the helper is idempotent: a re-run of the same step gets the same answer
     const res = answers[m[2]] || (answers[m[2]] = stepResult(m[1], m[2], prompt))

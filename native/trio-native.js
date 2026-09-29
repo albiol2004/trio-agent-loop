@@ -74,9 +74,13 @@ const REQUIRED = {
   end: ['lock', 'dangling_worktrees'],
 }
 
-// A harness permission denial names the permission system; anything else
-// (a step agent declining on its own judgement) is an error, not a hold.
-const DENIAL_RE = /permission|denied|not allowed|classifier/i
+// A harness permission denial is recognised by the harness's own wording
+// ("Permission to use Bash … has been denied", "Permission for this action
+// was denied by the Claude Code auto mode classifier", "… requested
+// permissions to use X, but you haven't granted it yet"); anything else — a
+// step agent declining in its own words, even ones like "not allowed",
+// "permission" or "denied" — is an error, not a hold (eval-native-v0b N1).
+const DENIAL_RE = /Permission to use \w+[\s\S]*?(?:has been|was) denied|Permission for this action (?:has been|was) denied|denied by the Claude Code auto mode classifier|requested permissions? to use \w+[\s\S]*?haven't granted/i
 
 const PLAN_SCHEMA = {
   type: 'object',
