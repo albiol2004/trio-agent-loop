@@ -43,12 +43,13 @@ LOOP_CORE_API = 2
 
 # The METRICS_API contract this core itself implements (eval-r15 N3). 5 =
 # r15 multi-repo: per-repo pins, retire checks and SHIP retirement; 6 =
-# r16 root-free open-loop: the `land=` hook and `needs_land`. The
+# r16 root-free open-loop: the `land=` hook and `needs_land`; 7 = r19 frozen
+# acceptance (pin check, coverage refusal, SHIP gate, amendments). The
 # sibling trio-metrics.py carries its own METRICS_API; trioctl takes the
 # lower of the two, so a partial refresh (an older core next to a newer
 # trio-metrics.py) is never trusted with a `repos:` mailbox. A core without
 # this constant predates r15.
-METRICS_API = 6
+METRICS_API = 7
 
 def _load_metrics_module():
     path = Path(__file__).resolve().with_name("trio-metrics.py")

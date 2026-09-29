@@ -545,7 +545,7 @@ def test_n3_old_core_next_to_new_metrics_is_refused_for_repos(env, tmp_path):
     layout = E._layout(tmp_path, "B")
     box = layout["box"]
     # r16-rc: the core marker is 6 (root-free), in step with trio-metrics.py.
-    assert core.METRICS_API == 6 and trioctl._core_metrics_api(core) == 6
+    assert core.METRICS_API == 7 and trioctl._core_metrics_api(core) == 7
     # An r15 core (marker 5) next to an API-6 trio-metrics.py: the lower of
     # the two -- multi-repo yes, root-free open-loop no.
     r15_core = type("R15Core", (), {"METRICS_API": 5, "_METRICS": core._METRICS})()

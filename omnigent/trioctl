@@ -7456,8 +7456,8 @@ REQUIRED_LOOP_CORE_API = 2
 
 #: The sibling module trio_loop.py imports by path (``METRICS_API``): this
 #: release's metrics/ set (5 = declared product repos, r15; 6 = root-free
-#: open-loop, r16).
-REQUIRED_METRICS_API = 6
+#: open-loop, r16; 7 = frozen acceptance, r19).
+REQUIRED_METRICS_API = 7
 
 #: Vendored metrics/ sets this trioctl still drives. A repository whose
 #: copy predates r15 (4) runs single-repo mailboxes unchanged; a PLAN.md
@@ -7466,13 +7466,19 @@ REQUIRED_METRICS_API = 6
 #: mailbox outside any git checkout), but every root-free loop -- open-loop
 #: and, since r16b, lockstep -- refuses a target whose committed set is
 #: below ``ROOT_FREE_METRICS_API``.
-COMPATIBLE_METRICS_APIS = (4, 5, 6)
+COMPATIBLE_METRICS_APIS = (4, 5, 6, 7)
 
 #: First METRICS_API whose loop core pins, retires and verifies per repo.
 MULTI_REPO_METRICS_API = 5
 
 #: First METRICS_API whose loop core takes the root-free `land=` hook (r16).
 ROOT_FREE_METRICS_API = 6
+
+#: First METRICS_API whose loop core enforces frozen acceptance (r19): the
+#: `covers:` slice key, the pin check, the coverage refusal and the SHIP
+#: gate. An older core runs every loop with the acceptance switch off
+#: unchanged; with the switch on it is refused (``_old_core_acceptance_refusal``).
+ACCEPTANCE_METRICS_API = 7
 
 
 def _api_marker(path: Path, name: str) -> int:
@@ -7572,7 +7578,8 @@ def _check_loop_core_api(path: Path) -> None:
     if found not in COMPATIBLE_METRICS_APIS:
         raise _refuse_core(
             path, f"sibling {metrics.name} has METRICS_API {found}, this trioctl "
-            f"requires {REQUIRED_METRICS_API} (or {MULTI_REPO_METRICS_API} without "
+            f"requires {REQUIRED_METRICS_API} (or {ROOT_FREE_METRICS_API} without "
+            f"frozen acceptance, {MULTI_REPO_METRICS_API} also without "
             f"root-free open-loop, {min(COMPATIBLE_METRICS_APIS)} also without "
             "PLAN.md repos:) (mixed metrics/ versions)"
         )
