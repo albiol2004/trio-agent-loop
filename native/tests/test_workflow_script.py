@@ -236,3 +236,50 @@ def test_harness_meta_evaluates_and_rejects_bad_args() -> None:
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode != 0 and "absolute mailbox" in proc.stderr
+
+
+# ------------------------------------------- user decisions (2026-09-29)
+def test_no_bypass_permissions_anywhere_in_native() -> None:
+    for path in NATIVE.rglob("*"):
+        if path.is_file() and path.suffix in (".js", ".mjs", ".md", ".py"):
+            if path.name == "test_workflow_script.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            assert "bypassPermissions" not in text, path
+            assert "dangerously-skip-permissions" not in text, path
+
+
+def test_caps_are_opt_in() -> None:
+    assert "A.max_agents : null" in SRC
+    assert "A.token_budget : null" in SRC
+    assert "if (MAX_AGENTS !== null)" in SRC
+
+
+@needs_node
+def test_harness_no_agent_cap_by_default() -> None:
+    out = run({"verdicts": ["ITERATE"] * 5 + ["SHIP"],
+               "args": {"max_iterations": 10}})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["iteration"] == 6
+    assert r["agents_used"] == 2 + 6 * 6 and r["max_agents"] is None
+
+
+@needs_node
+def test_harness_token_budget_opt_in() -> None:
+    out = run({"verdicts": ["ITERATE", "SHIP"],
+               "args": {"token_budget": 5000}})
+    r = out["result"]
+    assert r["status"] == "budget" and "token_budget=5000" in r["reason"]
+    assert seq(out) == ["begin", "next", "lead", "gate", "pin", "end"]
+
+
+@needs_node
+@pytest.mark.parametrize("op", ["gate", "apply", "next"])
+def test_harness_held_step_stops_without_retry(op: str) -> None:
+    out = run({"verdicts": ["SHIP"], "held_op": op})
+    r = out["result"]
+    assert r["status"] == "held" and r["held_step"] == op
+    assert "permission denied" in r["reason"]
+    names = seq(out)
+    assert names.count(op) == 1 and names[-1] == "end"
+    assert names[-2] == op

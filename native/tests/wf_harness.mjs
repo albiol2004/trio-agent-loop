@@ -72,6 +72,10 @@ async function agent(prompt, opts = {}) {
     label: opts.label, isolation: opts.isolation || null, prompt })
   if (opts.agentType === 'trio-step') {
     const m = prompt.match(/op=(\w+), nonce=([^)]+)\)/)
+    if (sc.held_op === m[1]) {
+      return { exit_code: -1, result: { ok: false, held: true, op: m[1], nonce: m[2],
+        error: 'permission denied: auto mode classifier blocked the command' } }
+    }
     const res = stepResult(m[1], m[2], prompt)
     if (wrongNonceLeft > 0) { wrongNonceLeft -= 1; return { exit_code: 0, result: { ...res, nonce: 'stale' } } }
     return { exit_code: 0, result: res }
@@ -81,7 +85,8 @@ async function agent(prompt, opts = {}) {
   return `${role} done`
 }
 
-const budget = { total: null, spent: () => 0, remaining: () => Infinity }
+// spent(): 1000 output tokens per agent call so far (deterministic).
+const budget = { total: null, spent: () => calls.length * 1000, remaining: () => Infinity }
 const phase = t => logs.push(`phase:${t}`)
 const log = m => logs.push(m)
 const parallel = async thunks => Promise.all(thunks.map(t => t().catch(() => null)))

@@ -1,7 +1,7 @@
 export const meta = {
   name: 'trio-native',
   description: 'Claude-native lockstep Trio loop: Lead or Repair, commit gate, pinned Evaluator, verdict; decisions by trio_native_step.py',
-  whenToUse: 'Run a lockstep Trio loop on an initialized mailbox without Omnigent. args: {mailbox, max_iterations, max_agents}',
+  whenToUse: 'Run a lockstep Trio loop on an initialized mailbox without Omnigent. args: {mailbox, max_iterations, [max_agents], [token_budget]}',
   phases: [
     { title: 'Begin', detail: 'lock the mailbox, exclude .claude/worktrees/, read STATE' },
     { title: 'Iterate', detail: 'next, Lead or Repair, commit gate (retry once), pin, Evaluator, apply' },
@@ -21,7 +21,10 @@ if (typeof A.mailbox !== 'string' || !A.mailbox.startsWith('/')) {
 }
 const MAILBOX = A.mailbox.replace(/\/+$/, '')
 const MAX_ITERATIONS = Number.isInteger(A.max_iterations) && A.max_iterations > 0 ? A.max_iterations : 4
-const MAX_AGENTS = Number.isInteger(A.max_agents) && A.max_agents > 0 ? A.max_agents : 14
+// Opt-in caps only (user decision): no agent cap and no usage budget unless
+// passed. max_iterations stays the loop's normal bound.
+const MAX_AGENTS = Number.isInteger(A.max_agents) && A.max_agents > 0 ? A.max_agents : null
+const TOKEN_BUDGET = typeof A.token_budget === 'number' && A.token_budget > 0 ? A.token_budget : null
 const TOKEN = typeof A.run_token === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(A.run_token)
   ? A.run_token
   : 'trio-native-' + MAILBOX.split('/').filter(Boolean).slice(-2).join('-').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 48)
@@ -35,7 +38,7 @@ const MODELS = Object.assign({
 const HELPER = typeof A.helper === 'string' && A.helper.startsWith('/')
   ? shq(A.helper)
   : '"$HOME/.local/share/trio-agent-loop/releases/$(cat "$HOME/.local/share/trio-agent-loop/CURRENT")/native/trio_native_step.py"'
-const RESERVE = 1  // always keep one agent for the `end` step (lock release)
+const RESERVE = 1  // with max_agents: always keep one agent for the `end` step (lock release)
 
 const STEP_SCHEMA = {
   type: 'object',
@@ -47,6 +50,7 @@ const STEP_SCHEMA = {
         ok: { type: 'boolean' },
         op: { type: 'string' },
         nonce: { type: 'string' },
+        held: { type: 'boolean' },
       },
       required: ['ok', 'op', 'nonce'],
     },
@@ -67,17 +71,29 @@ function shq(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'"
 }
 
-function budgetStop(label) {
-  const e = new Error(`max_agents=${MAX_AGENTS} reached before ${label}`)
+function budgetStop(what) {
+  const e = new Error(what)
   e.trioStatus = 'budget'
   return e
 }
 
 function spend(label, reserved) {
-  const limit = reserved ? MAX_AGENTS : MAX_AGENTS - RESERVE
-  if (agentsUsed >= limit) throw budgetStop(label)
-  if (typeof budget !== 'undefined' && budget && budget.total && budget.remaining() <= 0) throw budgetStop(label + ' (token budget)')
+  if (MAX_AGENTS !== null) {
+    const limit = reserved ? MAX_AGENTS : MAX_AGENTS - RESERVE
+    if (agentsUsed >= limit) throw budgetStop(`max_agents=${MAX_AGENTS} reached before ${label}`)
+  }
+  if (TOKEN_BUDGET !== null && !reserved && typeof budget !== 'undefined' && budget.spent() >= TOKEN_BUDGET) {
+    throw budgetStop(`token_budget=${TOKEN_BUDGET} spent before ${label}`)
+  }
   agentsUsed += 1
+}
+
+// A step whose Bash call was denied by the permission system (auto-mode
+// classifier) comes back `held`: the run stops and surfaces it, never loops.
+function stepFail(label, r) {
+  return r.held
+    ? { status: 'held', reason: `${label} held: ${r.error}`, held_step: label }
+    : { status: 'error', reason: `${label}: ${r.error}` }
 }
 
 async function step(op, extra, reserved) {
@@ -106,6 +122,7 @@ async function step(op, extra, reserved) {
     })
     const res = r && r.result
     if (res && res.nonce === nonce && res.op === op) return res
+    if (res && res.held) return Object.assign({}, res, { ok: false, op, nonce })
     // Helper ops are idempotent, so re-running a step is always safe.
     log(`step ${op}: ${res ? `nonce mismatch (${res.nonce})` : 'no result'} on try ${tries}`)
   }
@@ -202,7 +219,7 @@ try {
   phase('Begin')
   const b = await step('begin', {})
   if (!b.ok) {
-    outcome = { status: 'error', reason: `begin: ${b.error}` }
+    outcome = stepFail('begin', b)
   } else {
     began = true
     B = b
@@ -210,7 +227,7 @@ try {
     phase('Iterate')
     while (true) {
       const n = await step('next', { max_iterations: MAX_ITERATIONS })
-      if (!n.ok) { outcome = { status: 'error', reason: `next: ${n.error}` }; break }
+      if (!n.ok) { outcome = stepFail('next', n); break }
       if (n.action === 'stop') {
         outcome = { status: n.status, code: n.code, verdict: n.verdict, reason: 'stop' }
         break
@@ -227,19 +244,19 @@ try {
             model: role === 'lead' ? MODELS.lead : MODELS.repair,
             effort: 'high',
           })
-          if (out === null) { failed = `${role} agent failed twice`; break }
+          if (out === null) { failed = { status: 'error', reason: `${role} agent failed twice` }; break }
           g = await step('gate', { role, iteration: n.iteration, attempt })
-          if (!g.ok) { failed = `gate: ${g.error}`; break }
+          if (!g.ok) { failed = stepFail('gate', g); break }
           rec.gate_attempts = attempt
           if (g.pass || g.final) break
           log(`iteration ${n.iteration}: gate failed (${g.failures.join('; ')}); retrying the ${role} once`)
         }
-        if (failed) { outcome = { status: 'error', reason: failed }; break }
+        if (failed) { outcome = failed; break }
         if (!g) { outcome = { status: 'error', reason: `${role}: no gate attempt left (attempt ${n.attempt})` }; break }
         if (!g.pass) { outcome = { status: 'error', reason: `gate breach after ${role}: ${g.failures.join('; ')}` }; break }
       }
       const p = await step('pin', { iteration: n.iteration })
-      if (!p.ok) { outcome = { status: 'error', reason: `pin: ${p.error}` }; break }
+      if (!p.ok) { outcome = stepFail('pin', p); break }
       rec.evaluated_sha = p.sha
       if (!p.skip_evaluator) {
         const ev = await runAgentTwice(`evaluator it${n.iteration}`, evaluatorPrompt(n, p), {
@@ -250,7 +267,7 @@ try {
         if (ev === null) { outcome = { status: 'error', reason: 'evaluator agent failed twice' }; break }
       }
       const ap = await step('apply', { iteration: n.iteration, attempt: p.evaluator_attempt })
-      if (!ap.ok) { outcome = { status: 'error', reason: `apply: ${ap.error}` }; break }
+      if (!ap.ok) { outcome = stepFail('apply', ap); break }
       Object.assign(rec, { verdict: ap.verdict, scope: ap.scope, bound: ap.bound })
       log(`iteration ${n.iteration}: VERDICT ${ap.verdict}${ap.scope ? ' scope=' + ap.scope : ''} -> ${ap.status}`)
       if (ap.stop) {
@@ -284,11 +301,13 @@ return {
   iteration: end && end.ok ? end.iteration : (iterations.length ? iterations[iterations.length - 1].iteration : null),
   commit_shas: outcome.commit_shas || [],
   human_check: outcome.human_check || null,
+  held_step: outcome.held_step || null,
   iterations,
   agents_used: agentsUsed,
   max_agents: MAX_AGENTS,
+  token_budget: TOKEN_BUDGET,
   run_token: TOKEN,
   mailbox: MAILBOX,
-  lock: end && end.ok ? end.lock : 'held',
+  lock: end && end.ok ? end.lock : 'not_released',
   dangling_worktrees: end && end.ok ? end.dangling_worktrees : [],
 }

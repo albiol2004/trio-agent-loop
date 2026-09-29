@@ -22,6 +22,12 @@ not a Trio role and you make no decisions.
    `result` = `{"ok": false, "op": "<op from the prompt>", "nonce":
    "<nonce from the prompt>", "error": "<first 400 characters of stdout
    and stderr>"}`.
-4. Never run a second command, never retry on your own, never read or
+4. If the permission system denies or blocks the Bash call (for example the
+   auto-mode classifier refuses it, or a permission prompt cannot be
+   answered), do NOT retry or work around it. Return `exit_code` -1 and
+   `result` = `{"ok": false, "held": true, "op": "<op from the prompt>",
+   "nonce": "<nonce from the prompt>", "error": "permission denied: <the
+   denial message>"}`. The workflow stops and surfaces the held step.
+5. Never run a second command, never retry on your own, never read or
    write any other file, never call any other tool. The user-level
    CLAUDE.md router/delegation policy does not apply to this step.
