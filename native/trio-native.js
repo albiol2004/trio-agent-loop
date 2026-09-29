@@ -307,6 +307,24 @@ function humanBlock(r) {
   return (r && typeof r.human_answer === 'string' && r.human_answer) ? ['', r.human_answer.replace(/\n+$/, '')] : []
 }
 
+// v01 item 3: `begin` of a fresh run reused or cleaned up the builder
+// worktrees an earlier run of this mailbox left behind.
+function logReclaimed(r) {
+  if (!r || typeof r !== 'object') return
+  for (const x of r.merged || []) log(`previous-run builder ${x.branch}@${String(x.tip).slice(0, 12)} (${x.id}) merged into HEAD`)
+  for (const x of r.removed || []) log(`previous-run builder ${x.branch} already merged: worktree removed`)
+  for (const x of r.discarded || []) log(`previous-run builder ${x.branch}@${x.tip} discarded (${x.reason || 'not reusable'})`)
+  for (const x of r.kept || []) log(`previous-run builder ${x.branch} kept: ${x.reason}`)
+}
+
+function reclaimedBlock(n) {
+  const merged = (B.reclaimed && Array.isArray(B.reclaimed.merged)) ? B.reclaimed.merged : []
+  if (!merged.length || n.iteration !== B.iteration) return []
+  return ['', 'PREVIOUS RUN: the driver merged these committed builder branches of an earlier (stopped) run of this ' +
+    'iteration into your HEAD (`git merge --no-ff`): ' + merged.map(x => `${x.id} (\`${x.branch}\` @ ${String(x.tip).slice(0, 12)})`).join(', ') +
+    '. Review that work on HEAD and plan only what is still missing or wrong; do not re-slice work that is already there.']
+}
+
 function leadPlanPrompt(n) {
   return header('lead', n).concat([
     '',
@@ -328,10 +346,15 @@ function leadPlanPrompt(n) {
     'files several slices touch: registries, `__init__.py`, config, routing tables, lock files and manifests. Two ' +
     'slices that both add an entry to the same file must both list it (they then run in sequence, not in parallel).',
     '- Return `slices: []` only when this iteration changes no product code; you will then finish the pass yourself.',
+    '- Concurrency (native driver): `depends` serialises a slice into a later wave, so list a dependency only when the ' +
+    'slice truly needs that slice\'s unmerged code to build or test. A cross-cutting slice (wiring, CLI, API route, ' +
+    'docs, integration) is not dependent just because it touches the others\' features: when GOAL.md asks for one ' +
+    'concurrent wave, plan one wave. State every interface contract the slices share (names, signatures, data shapes, ' +
+    'file ownership) in PLAN.md and in each brief up front, so dependent slices build against the contract in parallel.',
     MAILBOX_WRITES,
     '',
     'Final output: the structured plan.',
-  ]).concat(humanBlock(n)).join('\n')
+  ]).concat(reclaimedBlock(n), humanBlock(n)).join('\n')
 }
 
 function builderPrompt(n, s, head) {
@@ -469,6 +492,11 @@ function evaluatorPrompt(n, pin) {
     'it as that criterion\'s evidence (quote the answer id); the criterion is then verified (or failed, if the ' +
     'answer reports a failure) and no longer forces NEEDS_HUMAN. HUMAN.md text itself is never evidence. Without ' +
     'the driver block the NEEDS_HUMAN rule is unchanged.',
+    'Live-only steps (native driver): a step GOAL.md itself declares live-ready / real-world — one that can only be ' +
+    'done against live systems (real accounts, hosts, networks, browsers or credentials) and that GOAL says to record ' +
+    'rather than perform — is not a reason for NEEDS_HUMAN on offline fixtures. Verify everything that can be verified ' +
+    'offline, list those steps under a `## Remaining real-world steps` section of VERDICT.md, and give the verdict ' +
+    'the offline evidence supports.',
     `If you grade in a separate worktree, create it only as \`git -C ${B.repo ? promptPath(B.repo) : '<repo>'} worktree add --detach ` +
     `${B.repo ? promptPath(B.repo + '/.claude/worktrees/eval-' + n.iteration + '-' + attempt8) : '<repo>/.claude/worktrees/eval-' + n.iteration + '-' + attempt8} ${pin.sha}\` (never a sibling directory); ` +
     'the driver removes `.claude/worktrees/eval-*` at the end of the run.',
@@ -623,6 +651,52 @@ function redispatchSlice(s, c) {
   })
 }
 
+// v01 item 1: a slice whose builder stayed refused gets one new builder,
+// forked from the Lead's HEAD after this wave's merges. `supersedes` only
+// when git confirmed the refused branch is that builder's own (cleanup then
+// drops it once the new branch is merged).
+function redispatchRefused(s, x) {
+  return Object.assign({}, s, {
+    depends: [],
+    supersedes: x.own_branch || undefined,
+    brief: s.brief + '\n\nRE-DISPATCH: an earlier builder for this slice was refused by the driver: ' + x.reason +
+      '. Your worktree forks from the Lead\'s current HEAD. Build the slice from scratch there' +
+      (x.own_branch ? '; you may read the earlier attempt with `git diff HEAD...' + x.own_branch + '`' : '') +
+      '. Report `head` and `commits` by copying the full shas from `git rev-parse HEAD` / `git log --format=%H` ' +
+      'output, never from memory.',
+  })
+}
+
+function reportAgainPrompt(n, s, r, x, head) {
+  const wt = promptPath(String(r.worktree || '(the worktree you reported)'))
+  return [
+    `You are the trio-builder for slice \`${s.id}\` of iteration ${n.iteration}, asked by the trio-native driver to ` +
+    'REPORT AGAIN. You already built this slice; the driver could not verify your report:',
+    `  ${x.reason}`,
+    NOT_ROUTER,
+    REPORT_DENIALS,
+    '',
+    'Do NOT edit, commit, reset, merge or remove anything. Only read git state and report it.',
+    `Your worktree was reported as ${wt}. Run \`git -C ${wt} rev-parse --abbrev-ref HEAD\`, ` +
+    `\`git -C ${wt} rev-parse HEAD\`, \`git -C ${wt} log --format=%H ${head}..HEAD\` and \`git -C ${wt} rev-parse --show-toplevel\`. ` +
+    'If that path is not your worktree, find the worktree on your slice\'s branch with `git worktree list --porcelain` ' +
+    'and report that one.',
+    'Copy every sha from the command output (full 40 hex characters); never retype or reconstruct one.',
+    '',
+    `Return through the structured output: \`id\` (${s.id}), \`worktree\` (the toplevel above), \`branch\`, ` +
+    `\`base\` (${head}), \`head\`, \`commits\` (oldest first), \`summary\` (one line).`,
+  ].join('\n')
+}
+
+// v01 item 1: the helper replaced a builder's reported sha with the branch
+// tip it re-read from git (a single well-formed slice commit).
+function noteCorrections(n, rec, bl) {
+  for (const c of Array.isArray(bl.corrected) ? bl.corrected : []) {
+    log(`builder sha corrected ${c.reported} -> ${c.actual}`)
+    rec.sha_corrections = (rec.sha_corrections || []).concat([{ id: c.id, reported: c.reported, actual: c.actual }])
+  }
+}
+
 function shaMatches(a, b) {
   const x = String(a || '').trim().toLowerCase()
   const y = String(b || '').trim().toLowerCase()
@@ -691,14 +765,74 @@ async function leadPass(n, rec) {
     }))
     const bl = await step('builders', { iteration: n.iteration, wave: k, head: d.head, results: JSON.stringify(compact) })
     if (!bl.ok) return stepFail('builders', bl)
-    if (bl.refused.length) {
-      return { status: 'error', reason: 'builders refused: ' + bl.refused.map(x => x.reason).join('; ') }
-    }
-    const integ = await runAgentTwice(`lead integrate it${n.iteration} w${k}`,
-      integratePrompt(n, k, k === waves.length, bl, compact.map((c, i) => Object.assign({}, results[i], c))), {
-        agentType: 'trio-lead', model: MODELS.lead, effort: 'high', schema: INTEGRATE_SCHEMA,
+    noteCorrections(n, rec, bl)
+    // v01 item 1: a builder whose report git could not confirm (and the
+    // helper could not correct from git) is asked once to report again.
+    let refused = bl.refused.slice()
+    const reask = refused.filter(x => x.kind === 'report')
+    if (reask.length) {
+      log(`iteration ${n.iteration} wave ${k}: asking ${reask.map(x => x.id).join(', ')} to report again (${reask.map(x => x.reason).join('; ')})`)
+      for (const x of reask) spend(`builder ${x.id} report`)
+      const again = await parallel(reask.map(x => () => {
+        const i = compact.findIndex(c => c.id === x.id)
+        return agent(reportAgainPrompt(n, wave[i], results[i], x, d.head), {
+          label: `builder ${x.id} it${n.iteration} report`,
+          agentType: 'trio-builder',
+          model: MODELS.builder,
+          effort: 'low',
+          schema: BUILDER_SCHEMA,
+        })
+      }))
+      reask.forEach((x, j) => noteDenials(`builder ${x.id} it${n.iteration} report`, again[j]))
+      // A builder that did not answer (or reported no head) keeps its refusal.
+      const answered = reask.filter((x, j) => again[j] && typeof again[j] === 'object' &&
+        String(again[j].head || '').trim())
+      const compact2 = answered.map(x => {
+        const i = compact.findIndex(c => c.id === x.id)
+        const r = again[reask.indexOf(x)]
+        results[i] = Object.assign({}, results[i], r, { id: x.id })
+        compact[i] = { id: x.id, branch: r.branch || compact[i].branch, worktree: r.worktree || compact[i].worktree,
+          base: r.base || compact[i].base, head: String(r.head || ''), commits: r.commits || compact[i].commits,
+          summary: compact[i].summary }
+        return compact[i]
       })
-    if (integ === null) return { status: 'error', reason: 'lead integrate agent failed twice' }
+      let still = reask.filter(x => !answered.includes(x))
+      if (compact2.length) {
+        const bl2 = await step('builders', { iteration: n.iteration, wave: k, head: d.head,
+          results: JSON.stringify(compact2), attempt: 2 })
+        if (!bl2.ok) return stepFail('builders', bl2)
+        noteCorrections(n, rec, bl2)
+        bl.accepted.push(...bl2.accepted)
+        bl.merge.push(...bl2.merge)
+        still = still.concat(bl2.refused)
+      }
+      refused = refused.filter(x => x.kind !== 'report').concat(still)
+    }
+    // A slice still refused fails alone (not the run): it is re-dispatched
+    // once as a new single-builder wave, like a conflict; a second failure
+    // stops the run (STATE stays lead-running; a fresh run re-plans).
+    if (refused.length) {
+      rec.refused = (rec.refused || []).concat(refused.map(x => ({ id: x.id, reason: x.reason })))
+      const again = refused.filter(x => redispatched.has(x.id))
+      if (again.length) {
+        return { status: 'error', reason: 'builders refused after a re-dispatch: ' + again.map(x => x.reason).join('; ') }
+      }
+      const byId = new Map(wave.map(s => [s.id, s]))
+      waves.splice(k, 0, ...refused.map(x => [redispatchRefused(byId.get(x.id), x)]))
+      for (const x of refused) redispatched.add(x.id)
+      rec.waves = waves.map(w => w.map(s => s.id))
+      log(`iteration ${n.iteration} wave ${k}: builder refused ${refused.map(x => `${x.id} (${x.reason})`).join('; ')}; re-dispatching from the Lead's HEAD`)
+    }
+    const shown = compact.map((c, i) => Object.assign({}, results[i], c))
+      .filter(r => bl.accepted.includes(r.id))
+    let integ = { merged: [], conflicts: [], summary: '' }
+    if (shown.length) {
+      integ = await runAgentTwice(`lead integrate it${n.iteration} w${k}`,
+        integratePrompt(n, k, k === waves.length, bl, shown), {
+          agentType: 'trio-lead', model: MODELS.lead, effort: 'high', schema: INTEGRATE_SCHEMA,
+        })
+      if (integ === null) return { status: 'error', reason: 'lead integrate agent failed twice' }
+    }
     // A re-dispatched slice supersedes its conflicted branch: cleanup drops
     // the old branch once the new one is merged (`old=new`).
     const drops = wave.filter(s => s.supersedes).map(s => {
@@ -756,6 +890,7 @@ try {
     B = b
     EXEC = b.exec_id
     log(`mailbox ${MAILBOX}: iteration ${b.iteration}, status ${b.status}, phase ${b.phase}`)
+    logReclaimed(b.reclaimed)
     phase('Iterate')
     while (true) {
       const n = await step('next', { max_iterations: MAX_ITERATIONS })
@@ -852,6 +987,12 @@ if (began) {
     end = { ok: false, error: String(e && e.message ? e.message : e) }
   }
 }
+if (end && end.ok) {
+  // v01 item 2: `end` removes only the eval-*/tmp* scratch dirs this run
+  // created under .claude/worktrees/; worktrees are still only reported.
+  if ((end.scratch_removed || []).length) log(`end removed run scratch: ${end.scratch_removed.join(', ')}`)
+  for (const k of end.scratch_kept || []) log(`end could not remove scratch ${k.path}: ${k.reason}`)
+}
 
 return {
   status: outcome.status,
@@ -877,4 +1018,6 @@ return {
   lock: end && end.ok ? end.lock : 'not_released',
   dangling_worktrees: end && end.ok ? end.dangling_worktrees : [],
   eval_worktrees_removed: end && end.ok ? (end.eval_worktrees_removed || []) : [],
+  scratch_removed: end && end.ok ? (end.scratch_removed || []) : [],
+  reclaimed_builders: B.reclaimed || null,
 }

@@ -31,6 +31,7 @@ const lossyLeft = Object.assign({}, sc.lossy || {})   // op -> times to drop key
 let integrateIdx = 0
 let lastConflictBranches = []
 const builderRuns = {}
+const verifyRuns = {}
 
 function stepResult(op, nonce, prompt) {
   const flag = name => {
@@ -39,18 +40,36 @@ function stepResult(op, nonce, prompt) {
   }
   const base = { ok: true, op, nonce }
   switch (op) {
-    case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration, status: 'ready', phase: 'idle',
-      lock_owner: 'workflow:x', ...(sc.no_exec_id ? {} : { exec_id: sc.exec_id || '0123456789abcdef0123456789abcdef' }) }
+    case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration: sc.begin_iteration || iteration,
+      status: 'ready', phase: 'idle', lock_owner: 'workflow:x',
+      ...(sc.reclaimed ? { reclaimed: sc.reclaimed } : {}),
+      ...(sc.no_exec_id ? {} : { exec_id: sc.exec_id || '0123456789abcdef0123456789abcdef' }) }
     case 'dispatch': {
       lastHead = `H${iteration}w${flag('wave')}`
       return { ...base, iteration, wave: Number(flag('wave')), head: lastHead }
     }
     case 'builders': {
+      // v01: sc.correct = {id: {reported, actual}} -> the helper corrects the
+      // sha from git; sc.report_refuse = {id: k} -> the first k verifications
+      // of that id are `report` refusals; sc.refuse_ids -> `work` refusals
+      // (every time). Each builders call bumps the per-id count.
       const results = JSON.parse(flag('results'))
-      const refused = results.filter(r => r.base !== flag('head') || (sc.refuse_ids || []).includes(r.id))
-        .map(r => ({ id: r.id, reason: `builder ${r.id} forked from ${r.base}, not the Lead's HEAD` }))
+      const refused = []
+      const corrected = []
+      for (const r of results) {
+        verifyRuns[r.id] = (verifyRuns[r.id] || 0) + 1
+        if (r.base !== flag('head') || (sc.refuse_ids || []).includes(r.id)) {
+          refused.push({ id: r.id, kind: 'work', own_branch: r.branch,
+            reason: `builder ${r.id} forked from ${r.base}, not the Lead's HEAD` })
+        } else if (verifyRuns[r.id] <= ((sc.report_refuse || {})[r.id] || 0)) {
+          refused.push({ id: r.id, kind: 'report', own_branch: r.branch,
+            reason: `builder ${r.id}: reported head ${r.head} but branch ${r.branch} is at X` })
+        } else if ((sc.correct || {})[r.id]) {
+          corrected.push({ id: r.id, branch: r.branch, ...sc.correct[r.id] })
+        }
+      }
       const accepted = results.filter(r => !refused.some(x => x.id === r.id)).map(r => r.id)
-      return { ...base, accepted, refused, merge: results.filter(r => accepted.includes(r.id) && r.commits.length)
+      return { ...base, accepted, refused, corrected, merge: results.filter(r => accepted.includes(r.id) && r.commits.length)
         .map(r => ({ id: r.id, branch: r.branch })) }
     }
     case 'cleanup': {
@@ -102,7 +121,8 @@ function stepResult(op, nonce, prompt) {
         code: stop ? { SHIP: 0, BLOCKED: 2, NEEDS_HUMAN: 5 }[word] : null, commit_shas: stop ? ['c0ffee'] : [],
         human_check: word === 'NEEDS_HUMAN' ? '1. look' : null, bound: true }
     }
-    case 'end': return { ...base, lock: 'released', dangling_worktrees: [], eval_worktrees_removed: [], iteration }
+    case 'end': return { ...base, lock: 'released', dangling_worktrees: [], eval_worktrees_removed: [], iteration,
+      scratch_removed: sc.scratch_removed || [], scratch_kept: sc.scratch_kept || [] }
   }
   return { ok: false, op, nonce, error: 'unknown op' }
 }
@@ -145,6 +165,13 @@ async function agent(prompt, opts = {}) {
     return { merged: branches.filter(b => !lastConflictBranches.includes(b.branch)).map(b => b.id),
       conflicts: sc.integrate_hides_conflicts ? [] : conflicts,
       summary: `integrated wave ${integrateIdx}`, ...(sc.integrate_text ? { summary: sc.integrate_text } : {}) }
+  }
+  if (role === 'builder' && prompt.includes('REPORT AGAIN')) {
+    const id = prompt.match(/slice `([^`]+)`/)[1]
+    if ((sc.report_dies || []).includes(id)) return null
+    const branch = builderRuns[id] > 1 ? `worktree-${id}-r${builderRuns[id]}` : `worktree-${id}`
+    return { id, worktree: `/repo/.claude/worktrees/${branch}`, branch, base: lastHead, head: `T-${id}`,
+      commits: [`T-${id}`], summary: `reported ${id} again` }
   }
   if (role === 'builder') {
     const id = prompt.match(/slice `([^`]+)`/)[1]

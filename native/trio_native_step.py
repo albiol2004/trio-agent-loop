@@ -22,6 +22,14 @@ Beyond ``trio_loop``'s gate, a Lead pass must rewrite REPORT.md; a SHIP
 folds the driver's final STATE into the retirement commit; ``end`` removes
 Evaluator pin worktrees under ``.claude/worktrees/eval-*``.
 
+native-v01 (after N0): ``builders`` corrects a mis-reported builder sha
+from git when the branch holds one well-formed slice commit, and tags every
+refusal ``kind: report|work`` (the script re-asks / re-dispatches); ``end``
+also removes the ``eval-*``/``tmp*`` scratch dirs this run execution
+created under ``.claude/worktrees/``; ``begin`` of a fresh run reuses
+(merges) or cleans up the builder worktrees an earlier run of this mailbox
+left behind.
+
 This file holds no loop semantics. Gates, verdict parsing, the repair
 counter, the evaluator pin/attempt and SHIP retirement are the functions of
 ``metrics/trio_loop.py`` (and through it ``trio-metrics.py``/``trio-shadow.py``)
@@ -636,6 +644,11 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     exclude = _ensure_exclude(repo)
     exec_id = uuid.uuid4().hex
     _write_session(mailbox, a.token, snap["phase"], done=False, exec_id=exec_id)
+    # v01 item 3: this run holds the lock, so every builder worktree an
+    # earlier run of this mailbox left is dead; reuse or clean it up.
+    reclaimed = _reclaim_builders(mailbox, repo)
+    # v01 item 2: after the reclaim, so `end` removes only this run's scratch.
+    _record_scratch_baseline(mailbox, repo, exec_id)
     _register(mailbox, replace=True, repo=str(repo) if repo else None,
               helper=str(Path(__file__).resolve()), run_token=a.token,
               holder_pid=_holder_pid(), state="running",
@@ -646,6 +659,7 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         "lock_owner": _owner(a.token),
         "exec_id": exec_id,
         "exclude_path": exclude,
+        "reclaimed": reclaimed,
         **snap,
     }
 
@@ -1012,53 +1026,93 @@ def _under_worktrees_marker(root: Path, path: str) -> bool:
     return real == marker or real.startswith(marker + os.sep)
 
 
+def _single_slice_commit(repo: Path, head: str, tip: str, sid: str) -> bool:
+    """True when ``head..tip`` is exactly one non-merge commit whose parent
+    is ``head`` and whose subject is ``slice(<sid>): …`` — the one
+    well-formed builder commit a sha correction may accept (v01 item 1)."""
+    listed = TL._git(repo, "rev-list", f"{head}..{tip}").stdout.split()
+    if listed != [tip]:
+        return False
+    info = TL._git(repo, "log", "-1", "--format=%P%n%s", tip)
+    parents, _sep, subject = info.stdout.partition("\n")
+    return (info.returncode == 0 and parents.split() == [head]
+            and subject.strip().startswith(f"slice({sid}):"))
+
+
+def _refusal(reason: str, kind: str, own_branch: str | None = None) -> dict:
+    """A builder refusal: ``kind`` is ``report`` when only the builder's
+    report is in doubt (asking it to report again may resolve it) and
+    ``work`` when git shows the work itself is unusable. ``own_branch`` is
+    set only when git confirmed the reported worktree is on that branch."""
+    return {"reason": reason, "kind": kind, "own_branch": own_branch}
+
+
 def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
                    res: dict, worktree_branches: dict[str, str | None]
-                   ) -> str | None:
-    """Why this builder result is refused, or None.
+                   ) -> tuple[dict | None, dict | None]:
+    """``(refusal, correction)`` for one builder result; both None = ok.
 
     ``worktree_branches`` maps each worktree's real path to the branch it is
     actually checked out on (from ``git worktree list --porcelain``), so a
     builder cannot report a branch it does not itself own (eval-native-v0c
     C2): the ``worktree`` it names must really be on the ``branch`` it names.
+
+    A reported ``head`` that does not match the branch tip (N0 vps-pool r1:
+    ``cc51ac69a9ba`` committed, ``cc51ac6a9bad…`` reported) is re-read from
+    git: when the branch (own worktree, descends from the dispatch HEAD, no
+    ``loop/`` commits) holds exactly one well-formed ``slice(<id>):``
+    commit, the tip is accepted and returned as a ``correction``
+    ``{reported, actual}``; otherwise the refusal is of kind ``report``.
     """
     sid = str(res.get("id") or "?")
     base = str(res.get("base") or "").strip()
     if not base or not TL._sha_matches(base, head):
-        return (f"builder {sid} forked from {base or '(unknown)'}, not the "
-                f"Lead's HEAD {head[:12]}: {BASE_REF_HINT}")
+        return _refusal(f"builder {sid} forked from {base or '(unknown)'}, "
+                        f"not the Lead's HEAD {head[:12]}: {BASE_REF_HINT}",
+                        "work"), None
     commits = res.get("commits") or []
     if not commits:
-        return None  # nothing to merge
+        return None, None  # nothing to merge
     branch = str(res.get("branch") or "").strip()
     tip = _branch_sha(repo, branch) if branch else None
     if tip is None:
-        return f"builder {sid}: branch {branch or '(none)'} does not exist"
+        return _refusal(f"builder {sid}: branch {branch or '(none)'} does "
+                        "not exist", "report"), None
     worktree = str(res.get("worktree") or "").strip()
     if not worktree:
-        return f"builder {sid}: no worktree reported for branch {branch}"
+        return _refusal(f"builder {sid}: no worktree reported for branch "
+                        f"{branch}", "report"), None
     on_branch = worktree_branches.get(os.path.realpath(worktree))
     if on_branch != branch:
-        return (f"builder {sid}: reported worktree {worktree} is not the "
-                f"builder's own worktree for branch {branch} (it is "
-                + (f"checked out on {on_branch}" if on_branch
-                   else "not a known worktree") + ")")
-    reported = str(res.get("head") or "").strip()
-    if reported and not TL._sha_matches(reported, tip):
-        return (f"builder {sid}: reported head {reported[:12]} but branch "
-                f"{branch} is at {tip[:12]}")
+        return _refusal(
+            f"builder {sid}: reported worktree {worktree} is not the "
+            f"builder's own worktree for branch {branch} (it is "
+            + (f"checked out on {on_branch}" if on_branch
+               else "not a known worktree") + ")", "report"), None
     if not TL._git_is_ancestor(repo, head, tip):
-        return (f"builder {sid}: branch {branch} does not contain the "
-                f"Lead's HEAD {head[:12]}: {BASE_REF_HINT}")
+        return _refusal(f"builder {sid}: branch {branch} does not contain "
+                        f"the Lead's HEAD {head[:12]}: {BASE_REF_HINT}",
+                        "work", branch), None
     listed = TL._git(repo, "rev-list", f"{head}..{tip}").stdout.split()
     for sha in listed:
         loop_paths = [p for p in TL._commit_paths(repo, sha)
                       if TL._path_in_mailbox(p, mailbox_rel)]
         if loop_paths:
-            return (f"builder {sid}: commit {sha[:12]} commits mailbox "
-                    f"files ({', '.join(loop_paths[:3])}); builders never "
-                    "commit loop/")
-    return None
+            return _refusal(f"builder {sid}: commit {sha[:12]} commits "
+                            f"mailbox files ({', '.join(loop_paths[:3])}); "
+                            "builders never commit loop/", "work",
+                            branch), None
+    reported = str(res.get("head") or "").strip()
+    if reported and not TL._sha_matches(reported, tip):
+        if _single_slice_commit(repo, head, tip, sid):
+            return None, {"id": sid, "branch": branch, "reported": reported,
+                          "actual": tip}
+        return _refusal(f"builder {sid}: reported head {reported[:12]} but "
+                        f"branch {branch} is at {tip[:12]} ({len(listed)} "
+                        "commit(s) since the dispatch HEAD, not one "
+                        f"well-formed slice({sid}): commit)", "report",
+                        branch), None
+    return None, None
 
 
 def _one_line(text: object, limit: int = 160) -> str:
@@ -1084,6 +1138,11 @@ def op_builders(mailbox: Path, repo: Path | None,
     branches = ",".join(sorted(str(r.get("branch") or r.get("id") or "")
                                for r in results))
     key = f"{a.iteration}:{a.wave}:{branches}"
+    report_round = str(a.attempt or "1").strip()
+    if report_round not in ("", "1"):
+        # A builder asked to report again (v01 item 1) is re-verified under
+        # its own key, never answered from the first report's record.
+        key += f":report{report_round}"
     recorded = _recorded(mailbox, "builders", key)
     if recorded is not None:
         return recorded
@@ -1095,14 +1154,19 @@ def op_builders(mailbox: Path, repo: Path | None,
     mailbox_rel = TL._mailbox_rel(root, mailbox)
     worktree_branches = {os.path.realpath(t["path"]): t.get("branch")
                          for t in _worktrees(root) if t.get("path")}
-    accepted, refused, merge = [], [], []
+    accepted, refused, merge, corrected = [], [], [], []
     for res in results:
         sid = _one_line(res.get("id"), 64) or "?"
-        reason = _check_builder(root, mailbox_rel, head, res,
-                                worktree_branches)
-        if reason:
-            refused.append({"id": sid, "reason": reason})
+        refusal, correction = _check_builder(root, mailbox_rel, head, res,
+                                             worktree_branches)
+        if refusal:
+            refused.append({"id": sid, **refusal})
             continue
+        if correction:
+            # git is the authority: the branch tip replaces the report.
+            res["head"] = correction["actual"]
+            res["commits"] = [correction["actual"]]
+            corrected.append(correction)
         accepted.append(sid)
         if res.get("commits"):
             merge.append({"id": sid, "branch": str(res["branch"]).strip()})
@@ -1124,8 +1188,15 @@ def op_builders(mailbox: Path, repo: Path | None,
                     f"{_one_line(res.get('summary'))}{where}")
             if line not in logged:
                 TL._append_log(mailbox, line)
+    # Every builder that reported commits, accepted or not, so a fresh run
+    # after an error can find its worktree again (v01 item 3).
+    seen = [{"id": _one_line(r.get("id"), 64) or "?",
+             "branch": str(r.get("branch") or "").strip(),
+             "worktree": str(r.get("worktree") or "").strip()}
+            for r in results if r.get("commits") and r.get("branch")]
     result = {"iteration": a.iteration, "wave": a.wave, "head": head,
-              "accepted": accepted, "refused": refused, "merge": merge}
+              "accepted": accepted, "refused": refused, "merge": merge,
+              "corrected": corrected, "builders": seen}
     _record(mailbox, "builders", key, result)
     return result
 
@@ -1436,8 +1507,270 @@ def _dangling_worktrees(repo: Path | None) -> list[str]:
     )
 
 
+# ------------------------------------------ run scratch (v01 item 2)
+#: Scratch a run's roles leave under ``.claude/worktrees/`` that is not a
+#: git worktree: an Evaluator's ``eval-*`` scratch copy and ``tmp*`` dirs of
+#: roles running with ``TMPDIR`` there (N0 subusage r1, vps-pool r2).
+SCRATCH_RE = re.compile(r"^(?:eval-|tmp)[^/]*$")
+SCRATCH_KEY = "scratch_baseline"
+
+
+def _worktrees_dir_entries(repo: Path | None) -> list[str] | None:
+    """Names directly under ``<repo>/.claude/worktrees/`` (None when the
+    directory is missing, a symlink or unreadable)."""
+    if repo is None:
+        return None
+    marker = repo / WORKTREES_DIR
+    try:
+        if not stat.S_ISDIR(os.lstat(marker).st_mode):
+            return None
+        return sorted(os.listdir(marker))
+    except OSError:
+        return None
+
+
+def _record_scratch_baseline(mailbox: Path, repo: Path | None,
+                             exec_id: str) -> None:
+    """``begin``: what already sits under ``.claude/worktrees/``, so ``end``
+    removes only scratch this run execution created."""
+    data = _records(mailbox)
+    data[SCRATCH_KEY] = {"exec_id": exec_id,
+                         "names": _worktrees_dir_entries(repo) or []}
+    _write_json(mailbox / RECORDS, data)
+
+
+def _rmtree_writable(path: Path) -> None:
+    """``shutil.rmtree`` (symlink-safe fd walk) that makes read-only dirs
+    writable first (npm/go caches are often 0555)."""
+    import shutil
+
+    def fix(func, target, _exc):
+        parent = os.path.dirname(target)
+        for p in (parent, target):
+            try:
+                if not os.path.islink(p):
+                    os.chmod(p, stat.S_IRWXU)
+            except OSError:
+                pass
+        func(target)
+
+    shutil.rmtree(str(path), onexc=fix) if sys.version_info >= (3, 12) \
+        else shutil.rmtree(str(path), onerror=fix)
+
+
+def _remove_run_scratch(mailbox: Path, repo: Path | None
+                        ) -> tuple[list[str], list[dict], list[str]]:
+    """``end``: remove the run's non-worktree scratch dirs.
+
+    Only a directory directly under ``<repo>/.claude/worktrees/`` that
+    (a) matches ``eval-*`` or ``tmp*``, (b) was not there at this run
+    execution's ``begin`` (baseline in ``.native.json``, same ``exec_id`` as
+    ``.session.json``), (c) is a real directory, not a symlink, and
+    (d) neither is nor contains a registered git worktree. No baseline for
+    this execution: nothing is removed. Returns ``(removed, kept, left)``:
+    ``left`` = matching dirs that predate this run (reported, never
+    removed)."""
+    if repo is None:
+        return [], [], []
+    base = _records(mailbox).get(SCRATCH_KEY)
+    session = _read_json(mailbox / SESSION)
+    if (not isinstance(base, dict) or not base.get("exec_id")
+            or base.get("exec_id") != session.get("exec_id")):
+        return [], [], []
+    before = set(base.get("names") or [])
+    names = _worktrees_dir_entries(repo) or []
+    marker = os.path.realpath(str(repo / WORKTREES_DIR))
+    registered = [os.path.realpath(t["path"]) for t in _worktrees(repo)
+                  if t.get("path")]
+    removed, kept, left = [], [], []
+    for name in names:
+        if not SCRATCH_RE.match(name):
+            continue
+        path = repo / WORKTREES_DIR / name
+        if name in before:
+            left.append(str(path))
+            continue
+        try:
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                continue  # a symlink or a file: never ours to remove
+        except OSError:
+            continue
+        real = os.path.join(marker, name)
+        if any(r == real or r.startswith(real + os.sep) for r in registered):
+            continue  # a git worktree (eval pin worktrees are removed above)
+        try:
+            _rmtree_writable(path)
+            removed.append(str(path))
+        except OSError as exc:
+            kept.append({"path": str(path), "reason": f"{type(exc).__name__}: {exc}"})
+    return removed, kept, left
+
+
+# ----------------------------- previous run's builders (v01 item 3)
+_RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9_-]{1,64}$")
+
+
+def _previous_builders(mailbox: Path, trees: dict) -> list[dict]:
+    """Builder branches an earlier run of this mailbox left behind:
+
+    * every builder the ``builders`` op saw (accepted or refused; older
+      records only list the accepted ``merge`` branches), with the
+      iteration it belonged to — ``verified: True``;
+    * a worktree on a ``worktree-<run_id>-<n>`` branch, where ``run_id`` is
+      the last launched run of this mailbox (``.native-result.json``): a
+      builder of a killed wave that never reported — ``verified: False``
+      (never merged, only cleaned up).
+    """
+    out: dict[str, dict] = {}
+    for key, rec in _records(mailbox)["builders"].items():
+        if not isinstance(rec, dict):
+            continue
+        iteration = TL._number(str(key).split(":", 1)[0])
+        entries = rec.get("builders")
+        if not isinstance(entries, list):
+            entries = [{"id": m.get("id"), "branch": m.get("branch")}
+                       for m in rec.get("merge") or [] if isinstance(m, dict)]
+        for b in entries:
+            branch = str((b or {}).get("branch") or "").strip()
+            if branch and branch not in out:
+                out[branch] = {"id": str(b.get("id") or "?"), "branch": branch,
+                               "iteration": iteration, "verified": True}
+    run_id = str(_read_json(mailbox / RESULT).get("run_id") or "")
+    if _RUN_ID_RE.match(run_id):
+        pat = re.compile(rf"^worktree-{re.escape(run_id)}-\d+$")
+        for branch in trees:
+            if branch and pat.match(branch) and branch not in out:
+                out[branch] = {"id": "?", "branch": branch, "iteration": None,
+                               "verified": False}
+    return list(out.values())
+
+
+def _drop_builder(root: Path, mailbox_rel: str | None, branch: str,
+                  path: str | None, *, merged: bool) -> str | None:
+    """Remove a builder worktree (``_remove_worktree``'s dirt rule) and its
+    branch (``-d`` when merged, else ``-D``). None, or why it was kept."""
+    if path:
+        why = _remove_worktree(root, path, mailbox_rel)
+        if why:
+            return why
+    deleted = TL._git(root, "branch", "-d" if merged else "-D", branch)
+    if deleted.returncode != 0:
+        return "git branch failed: " + deleted.stderr.strip()[:200]
+    return None
+
+
+def _reclaim_builders(mailbox: Path, repo: Path | None) -> dict:
+    """``begin`` of a fresh run: reuse or clean up the committed builder
+    worktrees an earlier run of this mailbox left (v01 item 3).
+
+    Only branches of this mailbox's own records (or its last run id) that
+    are builder branches with no worktree or a worktree under
+    ``.claude/worktrees/`` (real path) are touched:
+
+    * already merged into HEAD -> worktree removed, branch deleted;
+    * STATE is ``lead-running`` of the branch's iteration (the pass will be
+      re-planned), the builder was verified-reported, its commits descend
+      from HEAD (as it was when ``begin`` started), none commits ``loop/``,
+      and the checkout has no staged or tracked changes outside the
+      mailbox -> ``git merge --no-ff --no-edit`` into HEAD, then removed; a
+      conflicting merge is aborted and the branch discarded;
+    * otherwise -> discarded (worktree removed, branch force-deleted; the
+      tip sha is logged).
+
+    A worktree with product dirt is never removed (kept, and still in
+    ``dangling_worktrees``). Every action gets a ``| loop |`` LOG line.
+    """
+    result: dict = {"merged": [], "removed": [], "discarded": [], "kept": []}
+    if repo is None:
+        return result
+    root = repo
+    trees = {t.get("branch"): t for t in _worktrees(root) if t.get("branch")}
+    candidates = _previous_builders(mailbox, trees)
+    if not candidates:
+        return result
+    mailbox_rel = TL._mailbox_rel(root, mailbox)
+    snap = _snapshot(_state(mailbox))
+    head0 = TL._git_head(root)
+    dirty = _dirty_entries(str(root))
+    staged = TL._diff_paths(root, "--cached", "HEAD")
+    mergeable_tree = (
+        dirty is not None and staged is not None and not staged
+        and not any(code != "??" and not TL._path_in_mailbox(p, mailbox_rel)
+                    for code, p in dirty))
+
+    def note(kind: str, entry: dict, text: str) -> None:
+        result[kind].append(entry)
+        TL._append_log(mailbox, f"- iter {snap['iteration']} | loop | "
+                                f"previous-run builder {text}")
+
+    for c in candidates:
+        branch = c["branch"]
+        tip = _branch_sha(root, branch)
+        if tip is None or head0 is None:
+            continue
+        tree = trees.get(branch)
+        path = tree.get("path") if tree else None
+        entry = {"id": c["id"], "branch": branch, "tip": tip,
+                 "worktree": path}
+        if path and (Path(path).resolve() == root.resolve()
+                     or not _under_worktrees_marker(root, path)):
+            continue  # not a builder worktree of ours: never touched
+        if not _is_builder_branch(root, trees, branch):
+            continue
+        if TL._git_is_ancestor(root, tip, head0):
+            why = _drop_builder(root, mailbox_rel, branch, path, merged=True)
+            if why:
+                result["kept"].append({**entry, "reason": why})
+            else:
+                note("removed", entry, f"{branch}@{tip[:12]}: already merged; "
+                                       "worktree removed")
+            continue
+        listed = TL._git(root, "rev-list", f"{head0}..{tip}").stdout.split()
+        reusable = bool(
+            c["verified"] and snap["phase"] == "lead-running"
+            and c["iteration"] == snap["iteration"]
+            and TL._git_is_ancestor(root, head0, tip) and listed
+            and not any(TL._path_in_mailbox(p, mailbox_rel)
+                        for sha in listed for p in TL._commit_paths(root, sha))
+        )
+        if reusable and not mergeable_tree:
+            # Valid work, but the checkout has staged or tracked changes
+            # outside the mailbox: never merged into (or discarded for) it.
+            result["kept"].append({**entry, "reason": "valid, but the checkout "
+                                   "has uncommitted tracked changes"})
+            continue
+        if reusable:
+            merged = TL._git(root, "merge", "--no-ff", "--no-edit", "-q",
+                             branch)
+            if merged.returncode == 0:
+                why = _drop_builder(root, mailbox_rel, branch, path,
+                                    merged=True)
+                if why:
+                    entry["reason"] = why
+                note("merged", entry, f"{branch}@{tip[:12]} ({c['id']}): "
+                                      "merged into HEAD for re-planning")
+                continue
+            in_merge = TL._git(root, "rev-parse", "-q", "--verify",
+                               "MERGE_HEAD").returncode == 0
+            if not in_merge:
+                result["kept"].append({**entry, "reason": "merge refused: "
+                                       + merged.stderr.strip()[:200]})
+                continue
+            TL._git(root, "merge", "--abort")
+            entry["reason"] = "merge conflicted"
+        why = _drop_builder(root, mailbox_rel, branch, path, merged=False)
+        if why:
+            result["kept"].append({**entry, "reason": why})
+        else:
+            note("discarded", entry,
+                 f"{branch}@{tip[:12]} ({c['id']}): discarded "
+                 f"({entry.get('reason') or 'not reusable'}; tip {tip})")
+    return result
+
+
 def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     eval_removed, eval_kept = [], []
+    scratch_removed, scratch_kept, scratch_left = [], [], []
     lock_dir = mailbox / ".lock"
     ours = (lock_dir.is_dir() and _lock_owner(lock_dir) == _owner(a.token)
             and not _foreign_live_pid(lock_dir))
@@ -1447,6 +1780,8 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             why = _remove_worktree(repo, path, rel, force_any=True)
             (eval_kept if why else eval_removed).append(
                 {"worktree": path, "reason": why} if why else path)
+        scratch_removed, scratch_kept, scratch_left = _remove_run_scratch(
+            mailbox, repo)
     lock = _release(mailbox, a.token)
     snap = _snapshot(_state(mailbox))
     session = _read_json(mailbox / SESSION)
@@ -1475,7 +1810,10 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
                   dangling_worktrees=dangling)
     return {"lock": lock, "dangling_worktrees": dangling,
             "eval_worktrees_removed": eval_removed,
-            "eval_worktrees_kept": eval_kept, **snap}
+            "eval_worktrees_kept": eval_kept,
+            "scratch_removed": scratch_removed,
+            "scratch_kept": scratch_kept,
+            "scratch_left": scratch_left, **snap}
 
 
 HANDLERS = {"begin": op_begin, "next": op_next, "dispatch": op_dispatch,
@@ -1497,7 +1835,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--iteration", type=int, default=0)
     parser.add_argument("--role", choices=("lead", "repair"), default="lead")
     parser.add_argument("--attempt", default="1",
-                        help="gate: role attempt 1|2; apply: evaluator_attempt")
+                        help="gate: role attempt 1|2; apply: evaluator_attempt; "
+                             "builders: report round (2 = a re-report)")
     parser.add_argument("--wave", type=int, default=1,
                         help="dispatch/builders: 1-based builder wave")
     parser.add_argument("--head", default=None,

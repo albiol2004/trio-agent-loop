@@ -54,7 +54,8 @@ def test_no_nondeterministic_builtins() -> None:
 
 def test_every_agent_call_carries_model_and_type() -> None:
     calls = [m.start() for m in re.finditer(r"\bagent\(", SRC)]
-    assert len(calls) == 3  # step(), runAgentTwice() and the builder wave
+    # step(), runAgentTwice(), the builder wave and the builder re-report (v01)
+    assert len(calls) == 4
     step_call = SRC[calls[0]:calls[0] + 400]
     assert "agentType: 'trio-step'" in step_call
     assert "model: MODELS.step" in step_call
@@ -75,6 +76,11 @@ def test_every_agent_call_carries_model_and_type() -> None:
     for key in ("agentType: 'trio-builder'", "model: MODELS.builder",
                 "isolation: 'worktree'", "schema: BUILDER_SCHEMA"):
         assert key in builder_call
+    report_call = SRC[calls[3]:calls[3] + 400]
+    for key in ("agentType: 'trio-builder'", "model: MODELS.builder",
+                "schema: BUILDER_SCHEMA"):
+        assert key in report_call
+    assert "isolation" not in report_call  # read-only: reports git state
 
 
 def test_max_agents_enforced_in_spend() -> None:
@@ -87,6 +93,8 @@ def test_max_agents_enforced_in_spend() -> None:
         assert "spend(" in chunk
     start = SRC.index("const results = await parallel(")
     assert "spend(`builder ${s.id}`)" in SRC[start - 200:start]
+    start = SRC.index("const again = await parallel(")
+    assert "spend(`builder ${x.id} report`)" in SRC[start - 200:start]
 
 
 def test_step_agent_definition() -> None:
@@ -232,10 +240,13 @@ def test_harness_builder_wrong_base_stops_before_integrate() -> None:
 
 @needs_node
 def test_harness_helper_refusal_stops() -> None:
+    """v01: a refused slice fails alone and is re-dispatched once; refused
+    again, the run stops (STATE stays resumable)."""
     out = run({"verdicts": ["SHIP"], "refuse_ids": ["app"]})
     r = out["result"]
-    assert r["status"] == "error" and "builders refused" in r["reason"]
-    assert seq(out)[-2:] == ["builders", "end"]
+    assert r["status"] == "error" and "builders refused after a re-dispatch" in r["reason"]
+    assert seq(out) == ["begin", "next", "lead", "dispatch", "builder", "builders",
+                        "cleanup", "dispatch", "builder", "builders", "end"]
 
 
 @needs_node
@@ -750,3 +761,124 @@ def test_harness_short_gap_denial_still_held_after_bound(text: str) -> None:
                "self_refuse_text": text})
     r = out["result"]
     assert r["status"] == "held" and r["held_step"] == "pin", r
+
+
+# --------------------------------------------------- native-v01 (after N0)
+N0_ACTUAL = "cc51ac69a9ba" + "7" * 28
+N0_REPORTED = "cc51ac6a9bad75395fb753f80fa0e6300f69c80"
+
+
+@needs_node
+def test_v01_builder_sha_corrected_from_git_is_logged_and_run_continues() -> None:
+    """N0 vps-pool r1: the helper re-read the branch tip; no extra agent."""
+    out = run({"verdicts": ["SHIP"],
+               "correct": {"app": {"reported": N0_REPORTED, "actual": N0_ACTUAL}}})
+    r = out["result"]
+    assert r["status"] == "shipped" and seq(out) == ONE_PASS + ["end"]
+    assert f"builder sha corrected {N0_REPORTED} -> {N0_ACTUAL}" in out["logs"]
+    assert r["iterations"][0]["sha_corrections"] == [
+        {"id": "app", "reported": N0_REPORTED, "actual": N0_ACTUAL}]
+
+
+@needs_node
+def test_v01_unverifiable_report_asks_the_builder_once_to_report_again() -> None:
+    out = run({"verdicts": ["SHIP"], "report_refuse": {"app": 1}})
+    r = out["result"]
+    assert r["status"] == "shipped"
+    assert seq(out) == ONE_PASS[:6] + ["builder", "builders"] + ONE_PASS[6:] + ["end"]
+    builders = [c for c in out["calls"] if c["agentType"] == "trio-builder"]
+    assert builders[0]["isolation"] == "worktree" and builders[1]["isolation"] is None
+    again = builders[1]["prompt"]
+    assert "REPORT AGAIN" in again and "Do NOT edit, commit, reset" in again
+    assert "git -C /repo/.claude/worktrees/worktree-app rev-parse HEAD" in again
+    assert "never retype or reconstruct" in again
+    steps = [c["prompt"] for c in out["calls"] if "op=builders" in c["prompt"]]
+    assert "--attempt" not in steps[0] and "--attempt '2'" in steps[1]
+    integ = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-lead"][1]
+    assert "- app: branch `worktree-app`" in integ and "(last wave)" in integ
+
+
+@needs_node
+def test_v01_slice_still_refused_is_redispatched_not_the_whole_run() -> None:
+    plan = [{"id": "alpha", "brief": "A", "writes": ["a.py"]},
+            {"id": "beta", "brief": "B", "writes": ["b.py"]}]
+    out = run({"verdicts": ["SHIP"], "plan": plan, "report_refuse": {"beta": 2}})
+    r = out["result"]
+    assert r["status"] == "shipped"
+    it = r["iterations"][0]
+    assert it["waves"] == [["alpha", "beta"], ["beta"]]
+    assert [x["id"] for x in it["refused"]] == ["beta"]
+    integ = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-lead"][1:]
+    assert len(integ) == 2
+    assert "More waves follow" in integ[0] and "- beta:" not in integ[0]
+    assert "(last wave)" in integ[1] and "- beta: branch `worktree-beta-r2`" in integ[1]
+    redo = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-builder"
+            and "RE-DISPATCH" in c["prompt"]]
+    assert len(redo) == 1 and "The driver requires `base` = H1w2" in redo[0]
+    assert "refused by the driver" in redo[0] and "never from memory" in redo[0]
+    cleanups = [c["prompt"] for c in out["calls"] if "op=cleanup" in c["prompt"]]
+    assert "--drop-unmerged 'worktree-beta=worktree-beta-r2'" in cleanups[1]
+    assert any("builder refused beta" in line for line in out["logs"])
+
+
+@needs_node
+def test_v01_only_slice_refused_skips_integrate_and_redispatches() -> None:
+    out = run({"verdicts": ["SHIP"], "refuse_ids": [], "report_refuse": {"app": 2}})
+    r = out["result"]
+    assert r["status"] == "shipped"
+    assert seq(out)[:13] == ["begin", "next", "lead", "dispatch", "builder", "builders",
+                             "builder", "builders", "cleanup", "dispatch", "builder",
+                             "builders", "lead"]
+
+
+@needs_node
+def test_v01_dead_report_agent_keeps_the_refusal() -> None:
+    out = run({"verdicts": ["SHIP"], "report_refuse": {"app": 1}, "report_dies": ["app"]})
+    names = seq(out)
+    # no second `builders` verification for a builder that did not answer
+    assert names[:9] == ["begin", "next", "lead", "dispatch", "builder", "builders",
+                         "builder", "cleanup", "dispatch"]
+    assert out["result"]["status"] == "shipped"
+
+
+@needs_node
+def test_v01_reclaimed_builders_are_logged_and_told_to_the_lead() -> None:
+    rec = {"merged": [{"id": "pool-core", "branch": "worktree-wf_x-5", "tip": N0_ACTUAL}],
+           "removed": [], "kept": [],
+           "discarded": [{"id": "b3", "branch": "worktree-wf_x-3", "tip": "ab" * 20,
+                          "reason": "merge conflicted"}]}
+    out = run({"verdicts": ["SHIP"], "reclaimed": rec, "begin_iteration": 1})
+    r = out["result"]
+    assert r["status"] == "shipped" and r["reclaimed_builders"] == rec
+    assert any("previous-run builder worktree-wf_x-5@cc51ac69a9ba (pool-core) merged" in line
+               for line in out["logs"])
+    assert any(f"worktree-wf_x-3@{'ab' * 20} discarded (merge conflicted)" in line
+               for line in out["logs"])
+    plan = [c for c in out["calls"] if c["agentType"] == "trio-lead"][0]["prompt"]
+    assert "PREVIOUS RUN: the driver merged" in plan
+    assert "pool-core (`worktree-wf_x-5` @ cc51ac69a9ba)" in plan
+
+
+@needs_node
+def test_v01_end_scratch_is_logged_and_returned() -> None:
+    out = run({"verdicts": ["SHIP"],
+               "scratch_removed": ["/repo/.claude/worktrees/tmpab12"],
+               "scratch_kept": [{"path": "/repo/.claude/worktrees/tmpcd", "reason": "PermissionError"}]})
+    r = out["result"]
+    assert r["scratch_removed"] == ["/repo/.claude/worktrees/tmpab12"]
+    assert "end removed run scratch: /repo/.claude/worktrees/tmpab12" in out["logs"]
+    assert any("could not remove scratch /repo/.claude/worktrees/tmpcd" in line
+               for line in out["logs"])
+
+
+@needs_node
+def test_v01_lead_and_evaluator_prompt_notes() -> None:
+    out = run({"verdicts": ["SHIP"]})
+    plan = [c for c in out["calls"] if c["agentType"] == "trio-lead"][0]["prompt"]
+    assert "list a dependency only when the slice truly needs that slice's unmerged code" in plan
+    assert "when GOAL.md asks for one concurrent wave, plan one wave" in plan
+    assert "State every interface contract" in plan
+    assert "PREVIOUS RUN" not in plan
+    ev = next(c["prompt"] for c in out["calls"] if c["agentType"] == "trio-evaluator")
+    assert "is not a reason for NEEDS_HUMAN on offline fixtures" in ev
+    assert "## Remaining real-world steps" in ev
