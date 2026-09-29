@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import shlex
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,10 +21,12 @@ env = E.env
 git = E.git
 
 
-def _run(env, layout, scenario_cls, monkeypatch, *, iters=2, conc=3):
+def _run(env, layout, scenario_cls, monkeypatch, *, iters=2, conc=3, configure=None):
     _tmp, wt, trioctl, core = env
     root = wt.default_worktree_root(layout["home"])
     scenario = scenario_cls(layout, wt, trioctl, root)
+    if configure is not None:
+        configure(scenario)
     runner = E._runner(trioctl, layout, scenario, root, monkeypatch)
     try:
         code = core.run_loop(
@@ -264,6 +267,12 @@ class RetireTamper(E.Scenario):
 
     repo: str | None = "app-backend"
     sha: str | None = None
+    # eval-r17rc W-1: set by the test to the event that `_append_log` (the
+    # outer loop's poll thread) fires once it has actually logged the
+    # malformed-retired-entry line. `None` (the default) means "don't wait"
+    # -- used by nothing in this module today, kept so the class still
+    # works standalone if ever reused without the wait wired up.
+    malformed_logged: "threading.Event | None" = None
 
     def lead(self, iteration, prompt):
         super().lead(iteration, prompt)
@@ -279,6 +288,18 @@ class RetireTamper(E.Scenario):
         old = f"    repo: app-backend\n    sha: {be}\n"
         assert old in q
         (box / "QUEUE.md").write_text(q.replace(old, f"{repo_line}    sha: {bad_sha}\n"))
+        # eval-r17rc W-1: this instant scripted Lead's next call (iteration
+        # 2) is a real "no change" pass that counts against the driver's
+        # 3-attempt stall budget. The outer poll thread needs at least one
+        # full pass to read the now-tampered QUEUE.md and log the malformed
+        # entry -- with nothing scheduling that pass but the OS, an instant
+        # Lead can burn all 3 attempts and stall the loop before the outer
+        # thread ever gets there, so the LOG.md line this test asserts on
+        # is never written (a real, load-dependent race, not a product
+        # fault: production Lead passes take real wall time). Block on the
+        # event the test wires up instead of guessing a sleep duration.
+        if self.malformed_logged is not None:
+            self.malformed_logged.wait(timeout=10.0)
 
     def slice_eval(self, ctx, workspace, prompt):
         with self.lock:
@@ -304,7 +325,25 @@ def test_n1_n6_bad_retired_entry_is_held_at_retire_parse(
 ):
     layout = E._layout(tmp_path, "B")
     cls = type("Tamper", (RetireTamper,), {"repo": repo, "sha": sha})
-    code, scenario, runner = _run(env, layout, cls, monkeypatch)
+    # eval-r17rc W-1: fire `malformed_logged` the instant the outer loop's
+    # poll thread actually appends the malformed-retired-entry LOG.md line,
+    # so RetireTamper.lead() can wait on that instead of a fixed sleep (see
+    # its docstring for why the race exists).
+    _tmp, _wt, _trioctl, core = env
+    marker = "has a malformed retired entry; not gated as retired"
+    malformed_logged = threading.Event()
+    real_append_log = core._append_log
+
+    def _append_log_and_watch(mailbox, line, *a, **kw):
+        real_append_log(mailbox, line, *a, **kw)
+        if marker in line:
+            malformed_logged.set()
+
+    monkeypatch.setattr(core, "_append_log", _append_log_and_watch)
+    code, scenario, runner = _run(
+        env, layout, cls, monkeypatch,
+        configure=lambda s: setattr(s, "malformed_logged", malformed_logged),
+    )
     assert code != 0
     assert "status: shipped" not in _state(layout)
     log = _log(layout)
