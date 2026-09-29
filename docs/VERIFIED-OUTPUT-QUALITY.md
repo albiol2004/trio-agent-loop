@@ -2,6 +2,14 @@
 
 r18a makes the loop check that behaviour was *verified*, not only that a
 check reported "passed". Design: the lab's `r18/DESIGN.md` (levers L0-L9).
+> **r19 (C1):** the slice-eval part of this pack is trimmed regardless of
+> the acceptance switch: slice sections keep receipt-never-PASS, the
+> tautology list, the kill check, the lints and one `evidence:` line; the
+> per-accept table, attacks (L9), the per-slice probe (L3) and the
+> re-execution duties (L5, L8) are whole-goal only (integration-eval,
+> lockstep) via the generated `integration-rigor.md`. See
+> docs/FROZEN-ACCEPTANCE.md.
+
 This release carries the prompt pack plus the mechanical checks that cost no
 model tokens, all advisory or shadow; nothing here changes a retire or SHIP
 decision, and METRICS_API is unchanged (6).

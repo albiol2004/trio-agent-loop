@@ -1050,6 +1050,41 @@ pack present the r18a WARNs for a missing `goal_acceptance:` /
 goal acceptance). `coverage_refusals(mailbox)` exports the coverage part
 for the drivers.
 
+### Driver behaviour (acceptance on)
+
+- **Author phase.** The driver builds the export (`git archive <base>`,
+  no `.git`, mailbox dirs / archives / sessions / `.trio*` / `.cursor/` /
+  vendored metrics removed, GOAL.md + notes in `.acceptance-input/`) in its
+  state dir, dispatches the author (Cursor: registered
+  `trio-omnigent-acceptance`, Evaluator tier) alongside the first Lead
+  pass, audits the session's tool calls, validates on a fresh export, and
+  commits `acceptance: freeze <n> checks (<model>)` + `Acceptance-Pin:`.
+  STATE.md gains `acceptance_pin: <sha256[:16]> @<commit12>`; `.driver.json`
+  `acceptance {status, pin, pin_commit, ...}`; the pin chain lives in the
+  driver state file outside the repo
+  (`$XDG_STATE_HOME/trio-agent-loop/acceptance/...`,
+  `TRIO_ACCEPTANCE_STATE`).
+- **LOG lines** (`- iter N | loop | ...`): `acceptance: frozen <n>
+  check(s) @<sha12> pin <sha12> (dropped <k>; author <model>)`,
+  `acceptance: author retry: ...`, `acceptance: author session
+  contaminated (...)`, `acceptance tamper restored (<role>)`, `lead pass
+  refused: acceptance coverage`, `gate breach after lead: acceptance ...`,
+  `acceptance: integration pre-run @<sha12>: p/t PASS ... · unavailable=<n>`,
+  `acceptance: amendment of ACC-NN accepted|rejected: ...`, `acceptance:
+  forced NEEDS_HUMAN (acceptance-thrash|acceptance-amendments|
+  acceptance-unavailable): ...`, `acceptance: ship_unaccepted
+  (acceptance): ...`, `acceptance: SHIP gate: p/t PASS @<sha12>`,
+  `acceptance-unavailable-iterate`, `acceptance: unavailable=<n>`.
+- **Driver commits** touching `acceptance/`: the freeze, `acceptance:
+  restore (tamper after <sha12>)`, `acceptance: pin <sha12> (amend ...)`
+  (each with `Acceptance-Pin:`); made under the worktree's `index.lock`.
+- **Commit gate:** `trio-shadow.py --require-commits` rejects any other
+  commit touching the pack in `<FROZEN base>..HEAD` and a freeze that does
+  not precede every `slice(<id>):` commit (a later driver restore excuses
+  the tamper it restored).
+- **Phases:** `needs_human` with `phase: acceptance-thrash`,
+  `acceptance-amendments` or `acceptance-unavailable`.
+
 ## Mailbox placement standard
 
 `loop/` lives in the orchestrator session's cwd — the coordination repo.
@@ -1309,13 +1344,14 @@ the dirty-checkout gate or the untracked-product scan.
 | 0 | `shipped` | SHIP accepted (retirement complete) and, root-free, landed (`phase: landed`); also a root mailbox that is already `shipped` (nothing run, r16b) |
 | 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error of a mailbox outside any git checkout (run in place); a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository (stderr only, nothing created); or a refused flag combination (`--root-bound`, removed in r16b; an open-loop without isolated builders; a detached root without `--target`; `--root-free` outside git) |
-| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
+| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
 | 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict; or the mailbox is owned by a live driver (left byte-identical; a registered driver, or a live pid in the root mailbox's `.lock`, eval-r16rc B1/M1). (r15.x's Lead-pass `writes-overlap` stop was removed in r16b: a mid-run overlap warns) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
 | 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
 | 8 | `needs_land` | root-free (r16): the verified loop branch could not land (`phase: land-blocked`, `land-conflict`, `land-starved`, `land-error`); resume with `trioctl omnigent land --mailbox <x>` |
 | 9 | — | retired in r16b (r15.x `root-occupied`: nothing runs at the root any more) |
+| 10 | unchanged | `trioctl omnigent run builder` only (r19, acceptance on): builder refused before any worktree -- pack not frozen, PLAN.md uncommitted, a frozen check unmapped, or the pack off its pin |
 | 130 | unchanged | interrupted (SIGINT/SIGTERM) |
 
 `reason:` (r15.x) is a driver-owned STATE.md line written with a driver
@@ -1400,6 +1436,26 @@ mailbox directory). They print as `quality: REJECT|WARN ...` lines and
 under `quality` in `--json`.
 
 ## Changelog
+
+- **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
+  default off): the `covers:` slice key and `parse_plan_acceptance`
+  (`lead_integration:` ACC ids, `acceptance_bindings:`) in trio-metrics;
+  `metrics/trio-acceptance.py` (runner, manifest, export, audit, driver
+  commits) joins the vendored set (five files; `metrics refresh` copies
+  it); trio-check `acceptance_findings`/`coverage_refusals` (violations
+  whenever a pack exists); trio-shadow's acceptance guard in
+  `--require-commits`; the loop core's `acceptance=` argument (author
+  phase, pin checks + restore, coverage gate, covered-check and
+  integration pre-runs, amendments, anti-thrash, SHIP gate) -- without it
+  both modes are unchanged. `trioctl` (`REQUIRED_METRICS_API = 7`,
+  `COMPATIBLE_METRICS_APIS = (4, 5, 6, 7)`, `ACCEPTANCE_METRICS_API = 7`)
+  refuses `--acceptance` on an older core and drives it unchanged
+  otherwise; builder exit 10; registry profile
+  `cursor-grok-4.6-medium+glm-5.2-max-v4-acc` with the optional
+  `trio-omnigent-acceptance` anchor. Independently of the switch (C1):
+  slice-eval sections carry one `evidence:` line (no table, attacks or
+  probe; `attacks=n/a` in the LOG line); the whole-goal rigor rides only on
+  integration-eval and lockstep prompts. See docs/FROZEN-ACCEPTANCE.md.
 
 - **r16b** (no METRICS_API bump: no loop-core change): lockstep runs
   root-free (Lead, repair and Evaluator in the Lead worktree; the land is
