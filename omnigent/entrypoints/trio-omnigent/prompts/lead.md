@@ -5,6 +5,9 @@ mailbox `{mailbox}` at iteration {iteration}.
 
 1. Read `{mailbox}/GOAL.md`, `{mailbox}/STATE.md`, the previous
    `{mailbox}/VERDICT.md`, and `{mailbox}/PLAN.md`. Enforce the iteration cap.
+   When `{mailbox}/HUMAN.md` exists, read it too: the human's append-only
+   answers, newest last; the newest answers the NEEDS_HUMAN/BLOCKED stop
+   before this run. Apply it, cite its answer id in PLAN.md, never edit it.
 2. Before deep reconnaissance, write the iteration skeleton to
    `{mailbox}/PLAN.md`: objective, numbered tasks with done criteria, and an
    out-of-scope fence. Preserve completed slices. Every `accepts:` item is
@@ -64,6 +67,7 @@ are authoritative for knowledge gather rules and driver commit ownership.
 - Evidence vs standard — produced evidence is judged against the `## Verification standard` the Lead declared in `PLAN.md` (mode: `test-first` | `implement-then-smoke` | `human-gate`, plus the promised evidence, plus the task-specific checklist) and against GOAL.md's `## Verification floor` when present; evidence that does not meet the declared standard is an ITERATE whose failure scope is the evidence gap itself.
 - Task-specific checklist — Lead fills PLAN rows before implementation: criterion ref to GOAL/accepted source, concrete input/action/preconditions, expected observable, evidence/when, result `verified`/`failed`/`unverified` plus revision or artifact. Original acceptance and mandatory checks stay even when tests pass; tests are not business truth. Tiny low-impact changes stay proportionate. Optional `AGENTS.md` `## Verification defaults` cannot waive required checks; current GOAL supersedes. Remaining unverified GOAL criteria block whole-goal SHIP. Classify unavailable environment vs product failure. `verify: human` stays NEEDS_HUMAN. Keep exact existing verdict first-lines.
 - Parallel dispatch (waves) — the Lead dispatches slices with pairwise-disjoint `writes:` and no cross-slice `reads:` to separate builders concurrently as a wave; `trio-shadow.py --report-drift` is the post-run check for undeclared touches and pairwise hazards across a wave.
+- Human answers — `loop/HUMAN.md` is the append-only answer channel after a NEEDS_HUMAN/BLOCKED stop (there is no input into a running session): the Lead reads it at the start of every pass and applies the newest entry (STATE.md `human_answer:` names it); no agent edits it.
 - Session sidecar — at iteration start, wrappers write `loop/.session.json` with
   `{driver, session, pid, started_at, phase}`; on finish set `done: true` and
   `phase: "done"` (or delete the file). `pid` is the orchestrator process;

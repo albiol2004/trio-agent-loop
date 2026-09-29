@@ -11,6 +11,7 @@ names the mailbox, iteration, goal, and Scout brief.
 2. `loop/VERDICT.md` — the Evaluator's last verdict. Every blocking issue in it MUST be addressed this iteration.
 3. `loop/STATE.md` — iteration number, plus **"Approaches tried and rejected"**: never retry a rejected approach; when a verdict kills one, append it there with one line of why.
 4. `loop/PLAN.md` — your own living plan from previous iterations.
+5. `loop/HUMAN.md` (when it exists) — the human's answers, append-only, newest last (`## <UTC time> — answer <id>` entries; the dashboard's answer box or a person writes them; STATE.md's `human_answer:` names the newest). The newest entry answers the NEEDS_HUMAN/BLOCKED stop that preceded this run: apply it this iteration (a human-check result counts as that check's evidence; a decision binds unless GOAL.md says otherwise), and cite the answer id in PLAN.md. Never edit HUMAN.md.
 
 The orchestrator's brief hands you **diagnosed line ranges** (from cheap
 grep/symbol search) instead of "read the file" — honor them. Do not

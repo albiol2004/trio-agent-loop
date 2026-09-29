@@ -1180,6 +1180,52 @@ Operator guide: `docs/ROOT-FREE-OPEN-LOOP.md`.
   gitignored mailbox protocol file or brief is refused (exit 3) before
   anything, the root lock included, is touched.
 
+## HUMAN.md (human answers)
+
+`loop/HUMAN.md` is the one place a person answers a stopped loop. There is
+no input channel into a running Lead or Evaluator session (Omnigent or
+claude-workflow); a NEEDS_HUMAN or BLOCKED stop is resolved as
+stop → answer → reset → re-run.
+
+- **Writers**: the trio-dash answer box (`POST /api/loop/answer`, only for a
+  loop whose driver is not live and that is stopped at NEEDS_HUMAN/BLOCKED),
+  or a person by hand. Agents never edit it.
+- **Format**: optional `# Human answers` header, then append-only entries,
+  newest last:
+
+  ```
+  ## 2026-09-29T13:05:00Z — answer 3f9c01ab
+  in-reply-to: STATE.md status needs_human (iteration 3)
+  source: trio-dash (<tailnet login or client address>)
+
+  <free text: the human-check result or the decision>
+  ```
+
+- **STATE.md**: the answer box may reset the loop in the same step (shown
+  and confirmed first): `status: running`, `phase: idle` (the next run
+  starts a fresh Lead pass), `reason:` removed, and
+  `human_answer: HUMAN.md#<id> (<UTC time>)` added. Without a reset only
+  HUMAN.md changes. A held dispatch (`.sessions/held-*.json`) is never reset
+  this way; reconcile it first.
+- **Readers**: the Lead reads HUMAN.md at the start of every pass (canonical
+  `trio-lead` input 5; Omnigent `prompts/lead.md` step 1; the claude-workflow
+  plan call) and applies the newest entry. It is a regular mailbox file
+  (committed with the mailbox; not a runtime file). Root-free loops keep it
+  in the live mailbox (the Lead worktree copy), like STATE.md.
+
+## Dashboard records (trio-dash, dash-actions)
+
+- `<mailbox>/.native-result.json` and the per-user claude-workflow run
+  registry `~/.local/share/trio-agent-loop/native-runs/<key>.json` are
+  written by the native driver (`native/README.md` "Run registry and
+  result"); `.native-result.json` is a runtime file (mailbox `.gitignore`).
+- The dashboard's own per-loop files live outside every workspace:
+  `~/.local/state/trio-dash/loops/<key>/` (`TRIO_DASH_STATE_DIR`) holds
+  `actions.jsonl` (append-only log of every fix, answer and diagnosis: who,
+  when, commands, outcome, output tail), `diagnosis.json` (latest read-only
+  diagnosis) and `runs/*.log` (output of drivers it started); `<key>` is the
+  first 16 hex of sha256(realpath of the root mailbox).
+
 ## Session sidecar
 
 `loop/.session.json` is the harness-owned session sidecar (see
