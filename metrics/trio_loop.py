@@ -3575,11 +3575,16 @@ def run_open_loop(
                 _release_lock(lock)
 
 
-def human_answer_block(mailbox: Path, iteration: int, role: str) -> str:
+def human_answer_block(mailbox: Path, iteration: int, role: str,
+                       kind: str | None = None) -> str:
     """The driver-verified human answer block for a Lead / Evaluator prompt,
     or "" (always "" without ``<mailbox>/HUMAN.md``; see
     ``metrics/human_ledger.py``). Ignored entries are reported on stderr;
-    a missing ledger module means no answer is ever passed (fail closed)."""
+    a missing ledger module means no answer is ever passed (fail closed).
+
+    An Evaluator dispatch (lockstep, or an open-loop integration-eval: the
+    Evaluator that rules on the stop) consumes the answer; an open-loop
+    slice-eval (``kind`` "slice-eval") receives it without consuming it."""
     if role not in ("lead", "evaluator"):
         return ""
     try:
@@ -3598,7 +3603,8 @@ def human_answer_block(mailbox: Path, iteration: int, role: str) -> str:
         return ""
     return module.answer_block(
         Path(mailbox), iteration,
-        log=lambda note: print(f"trio_loop: {note}", file=sys.stderr))
+        log=lambda note: print(f"trio_loop: {note}", file=sys.stderr),
+        consume=role == "evaluator" and kind != "slice-eval", role=role)
 
 
 class _PortableRunner:
@@ -3645,7 +3651,8 @@ class _PortableRunner:
                 environment["TRIO_PINNED_SHA"] = sha
         # A driver-verified human answer (only when HUMAN.md exists and its
         # newest ledger answer is current); never HUMAN.md text itself.
-        block = human_answer_block(Path(mailbox), iteration, role)
+        block = human_answer_block(Path(mailbox), iteration, role,
+                                   (context or {}).get("kind"))
         if block:
             environment["TRIO_HUMAN_ANSWER"] = block
         else:

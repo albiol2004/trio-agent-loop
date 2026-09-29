@@ -217,7 +217,7 @@ def read_json(path: Path) -> dict | None:
         return None
     try:
         data = json.loads(raw.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):  # a deeply nested record is not JSON to us
         return None
     return data if isinstance(data, dict) else None
 
@@ -446,84 +446,44 @@ def result_from_raw(mailbox: Path, launch: dict | None) -> dict | None:
     return out
 
 
-UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-RUN_ID_RE = re.compile(r"wf_[A-Za-z0-9_-]{1,64}")
-RUN_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
-NATIVE_ARG_KEYS = ("mailbox", "max_iterations", "max_agents", "token_budget", "helper",
-                   "run_token", "models")
-NATIVE_MODEL_ROLES = ("lead", "evaluator", "builder", "repair", "step")
-NATIVE_MODELS = frozenset({"claude-opus-5-5", "claude-sonnet-5"})
+def _load_native_args():
+    """metrics/native_args.py of this release: the one resume-args and
+    mailbox-path validator, byte-identical to the one native/launch.sh uses
+    (eval3 findings 4, 6, 7)."""
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "metrics" / "native_args.py"
+    spec = importlib.util.spec_from_file_location("trio_dash_native_args", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+native_args = _load_native_args()
+UUID_RE = native_args.UUID_RE
+RUN_ID_RE = native_args.RUN_ID_RE
+RUN_TOKEN_RE = native_args.RUN_TOKEN_RE
+NATIVE_ARG_KEYS = native_args.ARG_KEYS
+NATIVE_MODEL_ROLES = native_args.MODEL_ROLES
+NATIVE_MODELS = frozenset(native_args.MODELS)
 """Models a recorded native run may name (the workflow's defaults); a resume
 of a record naming anything else is refused (never replayed)."""
-NATIVE_CAPS = {"max_iterations": (1, 200), "max_agents": (1, 1000),
-               "token_budget": (1, 10_000_000_000)}
-
-
-class NativeArgsError(ValueError):
-    """A recorded native launch field that fails the strict schema."""
-
-
-def canonical_session_id(value) -> str:
-    """The recorded Claude session id, only as a canonical lowercase UUID
-    (never a flag, never free text)."""
-    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
-        raise NativeArgsError("session_id is not a canonical UUID")
-    try:
-        if str(uuid.UUID(value)) != value:
-            raise NativeArgsError("session_id is not a canonical UUID")
-    except ValueError:
-        raise NativeArgsError("session_id is not a canonical UUID") from None
-    return value
+NATIVE_CAPS = native_args.CAPS
+NativeArgsError = native_args.NativeArgsError
+canonical_session_id = native_args.canonical_session_id
 
 
 def validate_native_args(raw, *, mailbox: Path, helper: Path | None) -> dict:
     """The recorded workflow args as a validated dict (key order kept), or
-    NativeArgsError. Schema (native/trio-native.js ``meta.whenToUse``):
-    ``mailbox`` (required; must BE this mailbox), ``max_iterations``
-    (required int 1..200), optional ``max_agents`` / ``token_budget``
-    (bounded ints), ``run_token`` ([A-Za-z0-9._-]{1,64}), ``helper`` (only
-    the installed release's own helper) and ``models`` ({role: allowlisted
-    model}). Nothing else; never a string that is not a JSON object."""
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            raise NativeArgsError("args is not JSON") from None
-    if not isinstance(raw, dict):
-        raise NativeArgsError("args is not a JSON object")
-    unknown = [k for k in raw if k not in NATIVE_ARG_KEYS]
-    if unknown:
-        raise NativeArgsError("args has unknown keys: " + ", ".join(sorted(map(str, unknown)))[:200])
-    out: dict = {}
-    for key, value in raw.items():
-        if key == "mailbox":
-            if not isinstance(value, str) or not os.path.isabs(value) \
-                    or os.path.realpath(value) != os.path.realpath(str(mailbox)):
-                raise NativeArgsError("args.mailbox is not this mailbox")
-        elif key in NATIVE_CAPS:
-            lo, hi = NATIVE_CAPS[key]
-            if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
-                raise NativeArgsError(f"args.{key} must be an integer {lo}..{hi}")
-        elif key == "run_token":
-            if not isinstance(value, str) or not RUN_TOKEN_RE.fullmatch(value):
-                raise NativeArgsError("args.run_token is not [A-Za-z0-9._-]{1,64}")
-        elif key == "helper":
-            if not isinstance(value, str) or helper is None or not os.path.isabs(value) \
-                    or not _same_file(value, helper):
-                raise NativeArgsError("args.helper is not the installed release's helper")
-        elif key == "models":
-            if not isinstance(value, dict) or any(
-                    r not in NATIVE_MODEL_ROLES or m not in NATIVE_MODELS
-                    for r, m in value.items()):
-                raise NativeArgsError("args.models names a role or model outside the allowlist ("
-                                      + ", ".join(sorted(NATIVE_MODELS)) + ")")
-            value = dict(value)
-        out[key] = value
-    if "mailbox" not in out:
-        raise NativeArgsError("args.mailbox is missing")
-    if "max_iterations" not in out:
-        raise NativeArgsError("args.max_iterations is missing")
-    return out
+    NativeArgsError — never another exception. The schema is
+    ``metrics/native_args.py``'s, which launch.sh applies too, so a preview
+    never offers a resume launch.sh refuses: ``mailbox`` (required; must BE
+    this mailbox, canonical, path rule), ``max_iterations`` (required int
+    1..200), optional ``max_agents`` / ``token_budget`` (bounded ints),
+    ``run_token``, ``helper`` (only the installed release's own helper) and
+    ``models`` ({role: model}, strings from the allowlists). A missing
+    ``run_token`` is reported by :func:`native_resume_args`."""
+    return native_args.validate_args(raw, mailbox=mailbox, helper=helper,
+                                     require_run_token=False)
 
 
 def native_facts(mailbox: Path, home: Path | None = None) -> dict | None:
@@ -1199,17 +1159,17 @@ def _driver_cmd(ctx: LoopContext, max_iterations: int) -> tuple[list[str], Path]
              "--max-iterations", str(max_iterations)], ctx.repo_root)
 
 
-PROMPT_SAFE_PATH = re.compile(r"/[A-Za-z0-9._/+@-]*")
-"""Characters a mailbox path may use before it reaches a driver's prompt
-(launch.sh and trioctl embed it): no spaces, quotes, newlines or shell and
-markdown punctuation, so a repo-controlled directory name cannot carry
-instructions into a role prompt (eval2 finding 6)."""
-
-
 def require_prompt_safe_path(path: Path, what: str = "mailbox") -> None:
-    if not PROMPT_SAFE_PATH.fullmatch(str(path)):
-        raise FixRefused(f"the {what} path {display_name(str(path))} has characters outside "
-                         "[A-Za-z0-9._/+@-]; it would reach a role prompt — rename it to start a driver")
+    """A mailbox path a driver may be started on (eval3 finding 7): any
+    absolute path of printable characters (spaces, non-ASCII letters, ``,``,
+    ``~`` … are fine: it only travels as one argv element, and every driver
+    puts it into a prompt through ``native_args.prompt_path``, quoted unless
+    it is plain ``[A-Za-z0-9._/+@-]``); control characters, newlines, NUL,
+    line separators and format characters are refused."""
+    problem = native_args.path_problem(str(path))
+    if problem:
+        raise FixRefused(f"the {what} path {display_name(str(path))} {problem}; "
+                         "it would reach a role prompt — rename it to start a driver")
 
 
 def display_name(text: str, limit: int = 200) -> str:
@@ -1458,6 +1418,11 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
                                 f"loop: iteration {iteration} — SHIP", "--", rel],
                                Path(repo), detached=False))
         notes.append("then re-run the loop so the driver finalizes needs_retirement → shipped")
+        files = _mailbox_file_set(Path(repo), rel)
+        mailbox_files = {"count": len(files), "digest": hashlib.sha256(
+            json.dumps(files, sort_keys=True).encode()).hexdigest()}
+        notes.append(f"the retirement commit stages the {len(files)} mailbox file(s) as they are "
+                     "now; any change before the confirm needs a new preview")
     elif fix_id == "repair_scope":
         wanted = args.get("scope")
         if verdict != "ITERATE" or not scope or not scope.lower().startswith("local:"):
@@ -1502,12 +1467,43 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
         if note:
             notes.append(note)
     basis = plan_basis(ctx)
+    if fix_id == "retire_ship":
+        # `git add -- <mailbox>` commits whatever is there at confirm: the
+        # token binds that exact file set (eval3 finding 10).
+        basis["mailbox_files"] = mailbox_files
     return {
         "id": fix_id, "title": spec["title"], "destructive": spec["destructive"],
         "requires_confirm": spec["destructive"] or bool(spec.get("confirm")), "steps": steps,
         "commands_preview": [s["display"] for s in steps], "notes": notes,
         "basis": basis, "confirm_token": plan_token(ctx, fix_id, steps, basis),
     }
+
+
+def _mailbox_file_set(repo: Path, rel: str) -> dict:
+    """What ``git add -- <rel>`` would stage: every tracked or untracked,
+    not ignored path under the mailbox with a digest of its content (a
+    symlink: of its target text; never followed)."""
+    try:
+        out = git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                  "--", rel).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {"error": "git ls-files failed"}
+    files = {}
+    for name in sorted({n for n in out.split("\0") if n}):
+        path = Path(repo) / name
+        try:
+            st = os.lstat(path)
+        except OSError:
+            files[name] = "absent"
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            files[name] = "link:" + hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+        elif stat.S_ISREG(st.st_mode):
+            raw = read_bytes_nofollow(path)
+            files[name] = hashlib.sha256(raw or b"").hexdigest()
+        else:
+            files[name] = "other"
+    return files
 
 
 def _file_digest(mailbox: Path, name: str) -> str | None:
@@ -1549,6 +1545,11 @@ def plan_basis(ctx: LoopContext) -> dict:
                                 "sha": _rev(ctx.repo_root, target) if _REF_RE.fullmatch(target)
                                 and ".." not in target else None}
     basis["sidecars"] = {name: _file_digest(ctx.live_mailbox, name) for name in BASIS_SIDECARS}
+    holds = held_records(ctx.live_mailbox)
+    if holds:
+        # reconcile_apply acts on these records (eval3 finding 10).
+        basis["held"] = {h["file"]: _file_digest(ctx.live_mailbox / ".sessions", h["file"])
+                         for h in holds}
     if ctx.registry:
         basis["registry"] = hashlib.sha256(json.dumps(ctx.registry, sort_keys=True,
                                                       default=str).encode()).hexdigest()
@@ -1984,8 +1985,9 @@ def _entry_sig(home: Path, at: str, answer_id: str, iteration, body: str) -> str
 
 
 def quote_body(text: str) -> str:
-    """Every answer line quoted (``> ``): the answer can never forge a header."""
-    return "\n".join(("> " + line) if line else ">" for line in text.split("\n")) + "\n"
+    """Every answer line quoted (``> ``): the answer can never forge a header
+    (the ledger's canonical form: every line separator is a line break)."""
+    return ledger().quote_body(text)
 
 
 def human_entries(home: Path, mailbox: Path) -> list[dict]:
@@ -2001,9 +2003,11 @@ def human_entries(home: Path, mailbox: Path) -> list[dict]:
     text = _safe_read(mailbox, HUMAN_FILE) or ""
     entries = lg.parse_entries(text)
     key_error = None
+    consumed: set = set()
     try:
         key = _answer_key(home)
         records = lg.read_records(state_dir(home))
+        consumed = lg.consumed_macs(state_dir(home))
     except AnswerKeyUnusable as exc:
         key, records, key_error = None, [], str(exc)
     except OSError as exc:
@@ -2012,8 +2016,11 @@ def human_entries(home: Path, mailbox: Path) -> list[dict]:
     out = []
     for e in entries:
         verified = bool(key) and lg.entry_verified(key, e, records, real)
+        used = verified and any(r.get("id") == e["id"] and r.get("mac") in consumed
+                                for r in records)
         out.append({"at": e["at"], "id": e["id"], "iteration": e["iteration"],
-                    "verified": verified, "header": e["header"], "key_error": key_error})
+                    "verified": verified, "consumed": used, "header": e["header"],
+                    "key_error": key_error})
     return out
 
 
@@ -2058,6 +2065,8 @@ def answer_context(ctx: LoopContext) -> dict:
             "path": str(ctx.live_mailbox / HUMAN_FILE),
             "entries": [f"{e['at']} — answer {e['id']} — iteration {e['iteration']}"
                         + ("" if e["verified"] else " (UNVERIFIED: not written by this dashboard)")
+                        + (" (consumed: delivered to the Evaluator that ruled on it)"
+                           if e.get("consumed") else "")
                         for e in entries[-5:]],
             "verdict": verdict, "iteration": to_int(ctx.state.get("iteration"))}
 
@@ -2075,15 +2084,27 @@ def plan_answer(ctx: LoopContext, text: str, reset: bool, who: dict) -> dict:
         raise FixRefused(info["reset_reason"])
     mailbox_file(ctx.live_mailbox, "STATE.md")
     at = _now()
-    body = text.strip().replace("\r\n", "\n").replace("\r", "\n")
+    lg = ledger()
+    # Canonical text (every line separator a "\n"): what is signed is what
+    # the HUMAN.md parser reads back (eval3 finding 5).
+    body = lg.canonical_text(text).strip()
+    if not body:
+        raise FixRefused("the answer is empty")
     answer_id = hashlib.sha256((body + at + uuid.uuid4().hex).encode()).hexdigest()[:12]
     iteration = info["iteration"] if info["iteration"] is not None else "?"
     by = re.sub(r"[\r\n]+", " ", str(who.get("user") or who.get("addr") or "unknown"))[:120]
     key = _answer_key(ctx.home, create=True)
-    lg = ledger()
     sig = lg.entry_sig(key, at, answer_id, iteration, body)
+    # The record binds the exact stop it answers (GOAL, the VERDICT.md on
+    # disk, its last commit, HEAD): a driver passes it on only while that
+    # stop is still the current one, and only once (eval3 finding 1).
+    try:
+        binding = lg.stop_binding(ctx.live_mailbox)
+    except OSError as exc:
+        raise FixRefused(f"the stop cannot be read safely: {exc}") from None
     record = lg.make_record(key, answer_id=answer_id, loop=ctx.key, mailbox=ctx.live_mailbox,
-                            root_mailbox=ctx.root_mailbox, iteration=iteration, at=at, body=body)
+                            root_mailbox=ctx.root_mailbox, iteration=iteration, at=at, body=body,
+                            binding=binding)
     entry = (f"\n## {at} — answer {answer_id} — iteration {iteration} — trio-dash {sig}\n"
              f"in-reply-to: {info['stop']} (iteration {iteration})\n"
              f"source: trio-dash ({by})\n\n{quote_body(body)}")

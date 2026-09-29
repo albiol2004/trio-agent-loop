@@ -245,15 +245,27 @@ Endpoints:
   worktrees (listed by the workspace repository's own `git worktree list`,
   really of that repository, under the workspace or the Trio worktree root
   `$TRIO_WORKTREE_ROOT` / `~/.local/state/trio-agent-loop/worktrees/
-  <repo>-<hash>`; an enclosing repository never counts), or that contains
+  <repo>-<hash>`, computed from the DASHBOARD's environment — a loop
+  started with `--worktree-root` or another `TRIO_WORKTREE_ROOT` (e.g. a
+  sibling `<repo>-worktrees/` layout) needs the same `TRIO_WORKTREE_ROOT`
+  in the trio-dash service env; an enclosing repository never counts), or that contains
   any symlink (directly, or in `.lock/` or `.native-runs/`), gets 403 on every action endpoint and a "refused" board
   card; nothing in it is read (every mailbox, sidecar and registry read is
   `O_NOFOLLOW`, regular files only) or written (writes are `mkstemp` +
   rename, never through a link).
-- Mailbox data never chooses what runs: a mailbox path with characters
-  outside `[A-Za-z0-9._/+@-]` (it would reach a driver prompt) refuses
-  every driver start, and the diagnosis context shows repo-controlled names
-  in a display-safe form.
+- Mailbox data never chooses what runs. A mailbox path may use any
+  printable characters (spaces, non-ASCII letters, `,`, `~` …): it is
+  passed as one argv element and every driver quotes it where it enters a
+  prompt; a path with a control character, newline, NUL, line separator or
+  format character refuses every driver start (MAILBOX-SCHEMA.md "Mailbox
+  path rule"). The diagnosis context shows repo-controlled names in a
+  display-safe form.
+- `native_resume` previews use `metrics/native_args.py`, the validator
+  `launch.sh` itself runs, so a preview never offers a resume launch.sh
+  would refuse (a `..` or non-canonical `args.mailbox`, a non-string or
+  non-allowlisted `models` value …); any bad value is a 409, never a 500.
+- Confirm tokens also bind `reconcile_apply`'s held records and the file
+  set `retire_ship` would commit.
 
 **Fix allowlist** (server-side; a diagnosis only proposes an id). Every fix
 first requires that nothing is live (no driver/lock pid, no live session
@@ -297,8 +309,12 @@ changed, or STATE.md moved on); the reaper watches it until then.
 appended (`answer-key` 0600 + `answers.jsonl` in the state dir; format and
 the same-uid limit: MAILBOX-SCHEMA.md "HUMAN.md"). An entry is verified only
 when its header signature and a ledger record match; the drivers pass only
-a ledger-verified, current answer to the roles as a `## Verified human
-answer (driver)` block. An empty, corrupt, linked or group-readable key is
+a ledger-verified answer to the stop that is still current (the record binds
+GOAL.md, the answered VERDICT.md, its last commit and HEAD) to the roles as a
+`## Verified human answer (driver)` block, and the Evaluator that rules on it
+consumes it (`consumed.jsonl`; shown as "consumed" in the answer box), so an
+answer is never replayed into a later run. Answer text is signed in
+canonical form (every line separator a newline). An empty, corrupt, linked or group-readable key is
 never replaced or used: answers are refused with the reason (never a 500);
 a missing key is generated atomically.
 
@@ -344,7 +360,7 @@ resets STATE.md to `status: running`, `phase: idle`,
 `human_answer: HUMAN.md#<id>`; the Lead applies the newest current entry at
 the start of its next pass and the Evaluator counts it as evidence for the
 `verify: human` check it answers (MAILBOX-SCHEMA.md "HUMAN.md", including
-the staleness rule). With held-dispatch records only the answer is written.
+stop binding and consumption). With held-dispatch records only the answer is written.
 
 **Deploying to the service** (not applied by this change):
 `dashboard/service/point-at-release.sh` checks that the installed release's

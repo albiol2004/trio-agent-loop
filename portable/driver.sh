@@ -63,7 +63,13 @@ build_prompt() {
       "${TRIO_ATTEMPT:-}" "${TRIO_PINNED_SHA:-}"
   fi
   if [[ "$LOOP_DIR" != "loop" ]]; then
-    printf 'MAILBOX OVERRIDE: this run uses `%s/` as the loop mailbox — every `loop/` path in the instructions below resolves to `%s/`.\n\n' "$LOOP_DIR" "$LOOP_DIR"
+    # A path outside [A-Za-z0-9._/+@-] (spaces, non-ASCII, punctuation) is
+    # shown shell-single-quoted: one inert token (eval3 finding 7).
+    local shown
+    shown="$(LC_ALL=C
+      if [[ "$LOOP_DIR" =~ ^[A-Za-z0-9._/+@-]*$ ]]; then printf '%s' "$LOOP_DIR"
+      else printf "'%s'" "${LOOP_DIR//\'/\'\\\'\'}"; fi)"
+    printf 'MAILBOX OVERRIDE: this run uses `%s/` as the loop mailbox — every `loop/` path in the instructions below resolves to `%s/`.\n\n' "$shown" "$shown"
   fi
   cat "$1"
   # Driver-verified human answer (trio_loop.human_answer_block): set only

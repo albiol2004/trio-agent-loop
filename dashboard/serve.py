@@ -945,7 +945,7 @@ def _read_driver_state(loop_dir: Path) -> dict | None:
     """Read the loop driver's private state file when it is valid JSON."""
     try:
         payload = json.loads(_read_mailbox_text(loop_dir / ".driver.json"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -1005,7 +1005,7 @@ def _read_session_sidecar(loop_dir: Path) -> dict | None:
     """Read the optional wrapper-owned session sidecar."""
     try:
         payload = json.loads(_read_mailbox_text(loop_dir / ".session.json"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -2957,7 +2957,7 @@ def _read_json_body(handler) -> dict:
         raise ValueError("invalid request body")
     try:
         payload = json.loads(handler.rfile.read(length).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         raise ValueError("invalid JSON body")
     if not isinstance(payload, dict):
         raise ValueError("JSON body must be an object")
