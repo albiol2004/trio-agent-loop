@@ -7,8 +7,8 @@ files, the shared pinned files and the product tree.
 - F2 (inverted): a file named only by the amended check's `run` that other
   checks' interpreters would load implicitly (a stdlib shadow in checks/)
   is refused: new files only under checks/<ID>/; module shadows, fakes/,
-  lib/ and interpreter-loaded names belong to every check; Python runs with
-  PYTHONSAFEPATH.
+  lib/ and interpreter-loaded names belong to every check; a check's own Python
+  runs with -P (round 4; round 3 used PYTHONSAFEPATH).
 - L1-L3 (liveness, ported from the eval repros): honest amendments, a human
   amendment after a clean stop, and restarts still ship.
 - Attribution/view unit tests, the pinned-pack SHIP gate, merge and
@@ -357,12 +357,23 @@ def test_amendment_shared_files_belong_to_every_check_and_new_files_only_per_che
     probs = TA.amendment_problems(old, new, ["MANIFEST.json", "checks/ACC-08/conftest.py"],
                                   ["ACC-08"], files)
     assert any("other checks would load" in p for p in probs)
-    # A new per-check file another check mentions is not exclusively its own.
-    texts = {"checks/acc_01.py": "import sneaky\n", "checks/ACC-08/sneaky.py": "x = 1\n"}
+    # A new per-check file another check reaches by a path-like mention
+    # (its directory plus its name) is not exclusively its own ...
+    texts = {"checks/acc_01.py": "import sys\nsys.path.insert(0, 'acceptance/checks/ACC-08')\n"
+                                 "import sneaky\n",
+             "checks/ACC-08/sneaky.py": "x = 1\n"}
     new_attr = TA.pack_attribution(new, files + ["checks/ACC-08/sneaky.py"], texts)
     probs = TA.amendment_problems(old, new, ["MANIFEST.json", "checks/ACC-08/sneaky.py"],
                                   ["ACC-08"], files, new_attr=new_attr)
     assert any("other checks would load" in p and "ACC-01" in p for p in probs), probs
+    # ... but a bare token naming it (eval-r19d finding 5) does not: ACC-01
+    # cannot reach checks/ACC-08/ without naming it, and the file is absent
+    # from its view.
+    texts = {"checks/acc_01.py": "import sneaky\n", "checks/ACC-08/sneaky.py": "x = 1\n"}
+    new_attr = TA.pack_attribution(new, files + ["checks/ACC-08/sneaky.py"], texts)
+    assert new_attr["checks/ACC-08/sneaky.py"] == {"ACC-08"}
+    assert TA.amendment_problems(old, new, ["MANIFEST.json", "checks/ACC-08/sneaky.py"],
+                                 ["ACC-08"], files, new_attr=new_attr) == []
 
 
 def test_python_script_dir_is_not_importable_but_lib_is(tmp_path, sandbox):

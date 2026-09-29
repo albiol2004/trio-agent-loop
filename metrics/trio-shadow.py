@@ -145,10 +145,12 @@ def slice_commits(slice_id: str, repo_dir: Path) -> list[str] | None:
 def commit_files(sha: str, repo_dir: Path) -> list[str]:
     """File names touched by one commit (handles root commits; merges resolve
     to their combined diff)."""
-    proc = _git(repo_dir, "show", "--format=", "--name-only", sha)
+    proc = _git(repo_dir, "-c", "core.quotePath=false", "show", "--format=", "--name-only",
+                "-z", sha)
     if proc.returncode != 0:
         return []
-    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    # NUL-separated and unquoted (eval-r19d finding 2).
+    return [p for p in proc.stdout.split("\0") if p.strip()]
 
 
 def _normalize(path: str) -> str:

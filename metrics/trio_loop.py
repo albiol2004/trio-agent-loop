@@ -879,15 +879,13 @@ def _git_is_ancestor(repo: Path, maybe_ancestor: str, rev: str) -> bool:
 def _commit_paths(repo: Path, sha: str) -> list[str]:
     """Paths changed by ``sha``. Empty commits yield an empty list."""
     result = _git(
-        repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
+        repo, "-c", "core.quotePath=false", "diff-tree", "--no-commit-id",
+        "--name-only", "-r", "-z", sha
     )
     if result.returncode != 0:
         return []
-    return [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip()
-    ]
+    # NUL-separated and unquoted (eval-r19d finding 2).
+    return [p for p in result.stdout.split("\0") if p.strip()]
 
 
 def _mailbox_rel(repo: Path, mailbox: Path) -> str | None:
@@ -1068,14 +1066,10 @@ def _verified_verdict_commit_shas(repo: Path, text: str) -> list[str]:
 
 def _diff_paths(repo: Path, *args: str) -> list[str] | None:
     """``git diff --name-only`` paths, or None when git itself fails."""
-    result = _git(repo, "diff", "--name-only", *args)
+    result = _git(repo, "-c", "core.quotePath=false", "diff", "--name-only", "-z", *args)
     if result.returncode != 0:
         return None
-    return [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip()
-    ]
+    return [p for p in result.stdout.split("\0") if p.strip()]
 
 
 def _product_paths_changed(
@@ -2055,6 +2049,11 @@ class AcceptanceController:
         self.acc_rel = f"{self.mailbox_rel}/{self.ta.PACK_DIR}"
         self.state_path = self.ta.state_file(self.repo, self.mailbox)
         self.state = self.ta.load_state(self.state_path)
+        # eval-r19d finding 4: the checks' PATH is resolved from the
+        # driver's own environment at start and kept in memory (the state
+        # file only records it; it is never read back).
+        self.check_path = self.ta.check_path()
+        self.state["check_path"] = self.check_path
         self._thread: threading.Thread | None = None
         self._error: AcceptanceError | None = None
         self._lock = threading.Lock()
@@ -2243,7 +2242,7 @@ class AcceptanceController:
                 fresh = work / "validate"
                 ta.build_export(self.repo, base, fresh, self.mailbox)
                 base_run = ta.run_pack(acc, fresh, exclude={ta.PACK_DIR, ta.INPUT_DIR},
-                                       manifest=manifest)
+                                       manifest=manifest, path=self.check_path)
                 shutil.rmtree(fresh, ignore_errors=True)
                 filtered = ta.freeze_filter(manifest, base_run, goal, notes, acc)
             else:
@@ -2331,7 +2330,8 @@ class AcceptanceController:
             return 3
         fresh = self.state_path.parent / "validate"
         info = ta.build_export(self.repo, base, fresh, self.mailbox)
-        base_run = ta.run_pack(acc, fresh, exclude={ta.PACK_DIR, ta.INPUT_DIR}, manifest=manifest)
+        base_run = ta.run_pack(acc, fresh, exclude={ta.PACK_DIR, ta.INPUT_DIR}, manifest=manifest,
+                               path=self.check_path)
         shutil.rmtree(fresh, ignore_errors=True)
         filtered = ta.freeze_filter(manifest, base_run, goal, notes, acc)
         for cid, why in filtered["dropped"]:
@@ -2393,6 +2393,12 @@ class AcceptanceController:
                 print(f"acceptance amend: {c['sha'][:12]} {c['subject']!r} is not an `acceptance: "
                       "amend` commit; revert it and amend the pack from the working tree",
                       file=sys.stderr)
+            return 3
+        links = ta.pack_symlinks(self.acc_dir) + [
+            f"{link} (committed)" for link in ta.symlinks_at(self.repo, "HEAD", self.acc_rel)]
+        if links:
+            print("acceptance amend: symlinks are not allowed in the pack (replace them with "
+                  f"real files): {', '.join(links[:5])}", file=sys.stderr)
             return 3
         amend_path = self.acc_dir / ta.AMENDMENTS
         with amend_path.open("a", encoding="utf-8") as fh:
@@ -2800,12 +2806,14 @@ class AcceptanceController:
             pass
         if acc is not None:
             return self.ta.run_pack(acc, rev, repo=self.repo, ids=ids,
-                                    exclude=exclude, plan_bindings=plan_bindings)
+                                    exclude=exclude, plan_bindings=plan_bindings,
+                                    path=self.check_path)
         work = Path(tempfile.mkdtemp(prefix="acc-pinned-"))
         try:
             pinned = self._pinned_pack(work)
             return self.ta.run_pack(pinned, rev, repo=self.repo, ids=ids,
-                                    exclude=exclude, plan_bindings=plan_bindings)
+                                    exclude=exclude, plan_bindings=plan_bindings,
+                                    path=self.check_path)
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -2967,12 +2975,14 @@ class AcceptanceController:
             out["rejected"].append(([], f"unreadable amended pack ({exc})"))
             return out
         ids = sorted({i for c in commits for i in c["ids"]})
-        changed = _git(self.repo, "diff", "--name-only", f"{old_rev}..{head}", "--",
-                       self.acc_rel).stdout.split()
+        links = ta.pack_symlinks(new_acc)
+        # eval-r19d findings 2/3: NUL-separated, unquoted path lists.
+        changed = ta.git_paths(self.repo, "diff", "-z", "--name-only", f"{old_rev}..{head}",
+                               "--", self.acc_rel)
         changed = [c[len(self.acc_rel) + 1:] for c in changed if c.startswith(self.acc_rel + "/")]
-        old_files = [f[len(self.acc_rel) + 1:] for f in _git(
-            self.repo, "ls-tree", "-r", "--name-only", old_rev, "--",
-            self.acc_rel + "/").stdout.split()]
+        old_files = [f[len(self.acc_rel) + 1:] for f in ta.git_paths(
+            self.repo, "ls-tree", "-r", "-z", "--name-only", old_rev, "--",
+            self.acc_rel + "/")]
         # eval-r19c finding 1: files are attributed by what each check's
         # interpreter can load (its `run`, mentions, shared locations), in
         # the pinned and the amended pack alike.
@@ -2982,11 +2992,13 @@ class AcceptanceController:
                                          ta.pack_texts(old_acc)),
             new_attr=ta.pack_attribution(new_manifest, ta.pack_files(new_acc),
                                          ta.pack_texts(new_acc)))
+        if links:
+            problems.append("symlinks are not allowed in the pack: " + ", ".join(links[:5]))
         for c in commits:
             problems += [f"{c['sha'][:12]}: {p}" for p in
                          ta._amend_diff_problems(self.repo, c["sha"], self.acc_rel, c["ids"])]
-            outside = [f for f in _git(self.repo, "show", "--format=", "--name-only",
-                                       c["sha"]).stdout.split()
+            outside = [f for f in ta.git_paths(self.repo, "show", "--format=", "--name-only",
+                                               "-z", c["sha"])
                        if not f.startswith(self.acc_rel + "/")]
             if outside:
                 problems.append(f"{c['sha'][:12]} touches files outside {self.acc_rel}/")

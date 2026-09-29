@@ -29,11 +29,16 @@ own process group, under bwrap (`--unshare-all`: loopback only, read-only
 /, tmpfs /tmp, only its own copy writable, its pack view read-only) when
 available, else unsandboxed with a dead http(s) proxy (``sandbox: none``:
 fresh copies only; a hostile check can still write outside its copy).
-Python runs with ``PYTHONSAFEPATH`` (the script directory is not
-importable); ``acceptance/lib/`` is the explicit shared helper path
-(PYTHONPATH/NODE_PATH). The environment is scrubbed of ``*_TOKEN``/
-``*_KEY``/``*_SECRET``/``*_PASSWORD``, proxy variables and implicit-load
-variables (PYTHONPATH, NODE_OPTIONS, BASH_ENV, ...).
+A check whose `run` starts a Python script runs that interpreter with
+``-P`` (the check script's own directory is not importable); the flag is
+not inherited, so the product and any Python the check starts resolve
+imports normally (eval-r19d finding 1). ``acceptance/lib/`` is the
+explicit shared helper path (PYTHONPATH/NODE_PATH). Checks get a
+controlled PATH (system directories plus the directories of the
+interpreters the driver resolved when it started; ``check_path``). The
+environment is scrubbed of ``*_TOKEN``/``*_KEY``/``*_SECRET``/
+``*_PASSWORD``, proxy variables and implicit-load variables (PYTHONPATH,
+NODE_OPTIONS, BASH_ENV, ...).
 
 `run` exits 0 when every check PASSes, 1 on any FAIL, 3 when the only
 non-PASS outcomes are UNAVAILABLE, 2 on a usage/manifest error. `verify`
@@ -137,6 +142,36 @@ def pack_files(acc_dir: Path) -> list[str]:
             if rel == FROZEN:
                 continue
             out.append(rel)
+    return sorted(out)
+
+
+def pack_symlinks(acc_dir: Path) -> list[str]:
+    """Pack paths that are symlinks (files or directories). A pack may hold
+    none (eval-r19d finding 7): the pin hashes a link's text, not what it
+    points at, so a link could retarget a frozen check with no amendment.
+    Refused at validation/freeze, in amendments and in pin commits."""
+    out: list[str] = []
+    acc_dir = Path(acc_dir)
+    if not acc_dir.is_dir():
+        return out
+    for root, dirs, files in os.walk(acc_dir):
+        for name in dirs + files:
+            full = Path(root) / name
+            if full.is_symlink():
+                out.append(full.relative_to(acc_dir).as_posix())
+        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+    return sorted(out)
+
+
+def symlinks_at(repo: Path, rev: str, acc_rel: str) -> list[str]:
+    """``pack_symlinks`` of the pack as committed in *rev* (git objects)."""
+    proc = subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(repo), "ls-tree",
+                           "-r", "-z", rev, "--", acc_rel + "/"], capture_output=True)
+    out = []
+    for raw in proc.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        meta, _tab, path = raw.partition("\t")
+        if meta.split()[:1] == ["120000"]:
+            out.append(path[len(acc_rel) + 1:])
     return sorted(out)
 
 
@@ -362,6 +397,19 @@ def _git(repo: Path, *args: str, check: bool = True, **kw: Any) -> subprocess.Co
     return proc
 
 
+def git_paths(repo: Path, *args: str) -> list[str]:
+    """Paths a git listing command prints, NUL-safe (eval-r19d findings 2,
+    3): run with ``-z`` and ``core.quotePath=false`` and split on NUL, so a
+    non-ASCII or space-containing name is one path, never git-quoted
+    (``"a/r\\303\\251.json"``) or split. *args* must include ``-z``.
+    Empty on a git failure."""
+    proc = subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(repo), *args],
+                          capture_output=True)
+    if proc.returncode != 0:
+        return []
+    return [p for p in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
+
+
 def git_toplevel(path: Path) -> Path | None:
     proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
                           capture_output=True, text=True)
@@ -514,7 +562,7 @@ def _classify(check: dict[str, Any], attempt: dict[str, Any]) -> tuple[str, str 
 
 def run_one(check: dict[str, Any], copy_root: Path, work: Path, env: dict[str, str],
             sandbox: str, readable: list[Path], unmet: list[str],
-            read_only: Iterable[Path] = ()) -> dict[str, Any]:
+            read_only: Iterable[Path] = (), argv: list[str] | None = None) -> dict[str, Any]:
     """Run one check (and its one ERROR re-run) in *copy_root*, which must
     be this check's own copy: only it and *work* are writable, *read_only*
     (its pack view) is mounted read-only under bwrap."""
@@ -530,7 +578,7 @@ def run_one(check: dict[str, Any], copy_root: Path, work: Path, env: dict[str, s
         scratch.mkdir(parents=True, exist_ok=True)
         (scratch / "tmp").mkdir(exist_ok=True)
         run_env = dict(env, ACC_ID=cid, ACC_WORK=str(scratch), TMPDIR=str(scratch / "tmp"))
-        last = _attempt(list(check["run"]), copy_root, run_env, timeout, sandbox,
+        last = _attempt(list(argv or check["run"]), copy_root, run_env, timeout, sandbox,
                         [copy_root, work], readable, list(read_only))
         wall += last["wall_s"]
         outcome, reason = _classify(check, last)
@@ -706,13 +754,125 @@ def _tree_signature(roots: Iterable[Path]) -> list[tuple]:
     return sorted(sig, key=repr)
 
 
-def check_env(env: dict[str, str], tree: Path, pack_view: Path, lib_present: bool) -> dict[str, str]:
-    """The per-check environment: its own tree and pack view, isolated
-    interpreter resolution (eval-r19c finding 1, F2)."""
+#: Directories every check's PATH has (the ones that exist, in this order).
+SYSTEM_PATH_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+                    "/sbin", "/bin")
+#: Interpreters/tools whose directory joins the checks' PATH when the
+#: driver resolves them at start (eval-r19d finding 4). Deliberately no
+#: `pytest` or other user-installed entry points: `python3 -m pytest` finds
+#: a user-site pytest through the interpreter, not through PATH.
+PATH_INTERPRETERS = ("python3", "python", "node", "npm", "npx", "sh", "bash", "dash",
+                     "env", "git", "make", "perl", "ruby", "deno", "bun", "go", "java")
+
+
+def _content_digest(root: Path) -> dict[str, str]:
+    """Content map of a directory (relpath -> file sha256 / symlink target /
+    directory marker), for the ``sandbox: none`` slot check."""
+    out: dict[str, str] = {}
+    root = Path(root)
+    for cur, dirs, files in os.walk(root):
+        rel_dir = os.path.relpath(cur, root)
+        for name in dirs + files:
+            full = os.path.join(cur, name)
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if os.path.islink(full):
+                out[rel] = "L:" + os.readlink(full)
+            elif os.path.isdir(full):
+                out[rel] = "D"
+            else:
+                digest = hashlib.sha256()
+                try:
+                    with open(full, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            digest.update(chunk)
+                    out[rel] = "F:" + digest.hexdigest()
+                except OSError:
+                    out[rel] = "unreadable"
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(cur, d))]
+    return out
+
+
+def check_path(env_path: str | None = None) -> str:
+    """The PATH checks run with: the system directories plus the directory
+    of every ``PATH_INTERPRETERS`` entry resolved on *env_path* (the
+    driver's own PATH when it starts; default: this process's). A
+    user-writable directory early on the driver's PATH (``~/.local/bin``)
+    is therefore not searched by checks unless an interpreter itself was
+    resolved there. The driver resolves this once, at start, and keeps it
+    in memory (it records it in its state file for the record only)."""
+    env_path = os.environ.get("PATH", "") if env_path is None else env_path
+    dirs: list[str] = []
+    for name in PATH_INTERPRETERS:
+        found = shutil.which(name, path=env_path)
+        if found:
+            d = os.path.dirname(os.path.abspath(found))
+            if d not in dirs:
+                dirs.append(d)
+    for d in SYSTEM_PATH_DIRS:
+        if d not in dirs and os.path.isdir(d):
+            dirs.append(d)
+    return os.pathsep.join(dirs)
+
+
+_PY_NAME_RE = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)*)?$")
+#: Python options that take a separate value argument.
+_PY_VALUE_OPTS = frozenset({"-W", "-X", "-Q", "--check-hash-based-pycs"})
+_SAFE_PATH_OK: dict[str, bool] = {}
+
+
+def _supports_safe_path(exe: str) -> bool:
+    if exe not in _SAFE_PATH_OK:
+        try:
+            ok = subprocess.run([exe, "-P", "-c", ""], capture_output=True,
+                                timeout=30).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        _SAFE_PATH_OK[exe] = ok
+    return _SAFE_PATH_OK[exe]
+
+
+def isolated_argv(run: list[str], path: str) -> list[str]:
+    """The argv a check runs: its `run`, with ``-P`` added when it starts a
+    Python interpreter on a script (eval-r19d finding 1). ``-P`` keeps the
+    script's own directory (the check's pack view) off *that* interpreter's
+    ``sys.path`` and is not inherited -- unlike ``PYTHONSAFEPATH``, which
+    leaked into the product. ``-m``/``-c`` invocations are left alone (their
+    ``sys.path[0]`` is the tree copy, not the pack). Interpreters older than
+    3.11 (no ``-P``) rely on the views alone."""
+    argv = [str(a) for a in run]
+    if not argv or not _PY_NAME_RE.match(os.path.basename(argv[0])):
+        return argv
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-" or not arg.startswith("-"):
+            break  # the script
+        if arg.startswith(("-m", "-c")) or arg == "--":
+            return argv
+        if arg in _PY_VALUE_OPTS:
+            i += 1
+        i += 1
+    else:
+        return argv  # no script: an interactive/stdin interpreter
+    exe = shutil.which(argv[0], path=path)
+    if exe is None or not _supports_safe_path(exe):
+        return argv
+    return [argv[0], "-P", *argv[1:]]
+
+
+def check_env(env: dict[str, str], tree: Path, pack_view: Path, lib_present: bool,
+              path: str | None = None) -> dict[str, str]:
+    """The per-check environment: its own tree and pack view, the pinned
+    helper path and the controlled PATH. Nothing here changes how the
+    PRODUCT resolves its imports (eval-r19d finding 1: no PYTHONSAFEPATH /
+    PYTHONNOUSERSITE, which every child Python inherited)."""
     out = {k: v for k, v in env.items() if k not in IMPLICIT_ENV}
     out.update({"ACC_TREE": str(tree), "ACC_DIR": str(pack_view),
-                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1",
-                "PYTHONNOUSERSITE": "1"})
+                "PYTHONDONTWRITEBYTECODE": "1"})
+    out.pop("PYTHONSAFEPATH", None)
+    out.pop("PYTHONNOUSERSITE", None)
+    if path is not None:
+        out["PATH"] = path
     if lib_present:
         lib = str(pack_view / HELPER_DIR)
         out["PYTHONPATH"] = lib
@@ -731,6 +891,7 @@ def run_pack(
     extra_sources: Iterable[Path] = (),
     manifest: dict[str, Any] | None = None,
     allow_setup: bool = True,
+    path: str | None = None,
 ) -> dict[str, Any]:
     """Run the pack in *acc_src* against *tree* (a directory, or a revision
     of *repo* extracted with `git archive`). Never writes into *tree*.
@@ -741,7 +902,11 @@ def run_pack(
     fresh copy of the master with its own read-only pack view
     (``check_view``: its files and the shared ones only). A change to the
     masters while the run is in progress (a check that escaped its copy
-    under ``sandbox: none``) FAILs every later check (``isolation``)."""
+    under ``sandbox: none``) FAILs every later check (``isolation``); so
+    does, under ``sandbox: none``, a prepared copy or view whose content
+    differs from the masters immediately before its check starts (eval-r19d
+    finding 6). *path* is the checks' PATH (``check_path``; the driver passes
+    the one it resolved at start)."""
     acc_src = Path(acc_src)
     if manifest is None:
         load_manifest(acc_src)  # a missing/invalid pack is a ManifestError
@@ -800,6 +965,7 @@ def run_pack(
         attribution = pack_attribution(manifest, pack_files(pack_master),
                                        pack_texts(pack_master))
         env = scrubbed_env()
+        env["PATH"] = check_path() if path is None else path
         if sandbox == "none":
             env.update({"http_proxy": DEAD_PROXY, "https_proxy": DEAD_PROXY,
                         "HTTP_PROXY": DEAD_PROXY, "HTTPS_PROXY": DEAD_PROXY,
@@ -808,6 +974,13 @@ def run_pack(
         for name, value in binding_values(manifest, plan_bindings or {}).items():
             env[f"ACC_BIND_{name}"] = value
         signature = _tree_signature([copy_root, pack_master])
+        expected_slot: dict[str, str] | None = None
+        if sandbox == "none":
+            # What every prepared copy must hold when its check starts: the
+            # master tree plus the pack files of its view (eval-r19d 6).
+            expected_slot = _content_digest(copy_root)
+            expected_slot[PACK_DIR] = "D"
+            pack_digest = {rel: val for rel, val in _content_digest(pack_master).items()}
         breached = False
         budget = float(manifest.get("budget_s", DEFAULT_BUDGET_S) or DEFAULT_BUDGET_S)
         runnable: list[tuple[int, dict[str, Any], list[str]]] = []
@@ -870,18 +1043,31 @@ def run_pack(
                     breached = True
                     result["log"].append("isolation breach: the run's master copy changed "
                                          f"before {check['id']}")
+                if not breached and expected_slot is not None:
+                    want = dict(expected_slot)
+                    for rel in rels:
+                        want[f"{PACK_DIR}/{rel}"] = pack_digest.get(rel, "missing")
+                        parts = rel.split("/")[:-1]
+                        for k in range(1, len(parts) + 1):
+                            want[PACK_DIR + "/" + "/".join(parts[:k])] = "D"
+                    if _content_digest(slot / "tree") != want:
+                        breached = True
+                        result["log"].append("isolation breach: the prepared copy or pack "
+                                             f"view of {check['id']} changed before it ran")
                 if breached:
                     result["results"].append({
                         "id": check["id"], "outcome": "FAIL", "reason": "isolation",
                         "error": True, "excerpt": "", "wall_s": 0.0,
-                        "detail": "the run's master copy changed while the pack ran (a check "
-                                  "escaped its own copy)"})
+                        "detail": "the run's master copy, or this check's prepared copy or "
+                                  "pack view, changed while the pack ran (a check escaped its "
+                                  "own copy)"})
                     pool.submit(_rmtree_force, slot)
                     continue
                 croot, view = slot / "tree", slot / "tree" / PACK_DIR
                 cenv = check_env(env, croot, view,
-                                 any(r.startswith(HELPER_DIR + "/") for r in rels))
-                res = run_one(check, croot, slot / "work", cenv, sandbox, readable, unmet, [view])
+                                 any(r.startswith(HELPER_DIR + "/") for r in rels), env["PATH"])
+                res = run_one(check, croot, slot / "work", cenv, sandbox, readable, unmet, [view],
+                              argv=isolated_argv(check["run"], env["PATH"]))
                 pool.submit(_rmtree_force, slot)
                 result["results"].append(res)
         finally:
@@ -928,6 +1114,11 @@ def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
     "unavailable_at_base": [ids], "retry": bool, "fatal": [pack errors]}``.
     """
     fatal = manifest_errors(manifest, goal_text, notes_text)
+    if acc_root is not None:
+        links = pack_symlinks(Path(acc_root))
+        if links:
+            fatal.append("symlinks are not allowed in the pack (use a real file): "
+                         + ", ".join(links[:5]))
     by_id = {r["id"]: r for r in (base_result or {}).get("results") or []}
     kept: list[dict[str, Any]] = []
     dropped: list[tuple[str, str]] = []
@@ -1381,19 +1572,37 @@ def _tokens(text: str) -> set[str]:
     return toks
 
 
-def _mention_keys(rel: str) -> set[str]:
-    """What names *rel* in another file's text: its basename, its stem, and
-    its per-check directory."""
-    parts = rel.split("/")
-    name = parts[-1]
-    keys = {name}
-    stem = name.split(".", 1)[0]
-    if len(stem) >= 2:
-        keys.add(stem)
+#: Extensions whose stem alone loads the file (`import x`, `require('./x')`).
+IMPORTABLE_SUFFIXES = (".py", ".pyw", ".mjs", ".cjs", ".js", ".ts", ".mts", ".cts",
+                       ".json", ".node")
+
+
+def _mentions(rel: str, toks: set[str], text: str) -> bool:
+    """True when *text* (its tokens *toks*) can name the pack file *rel*.
+
+    Top-level ``checks/`` files: by basename or stem (over-attribution).
+    Per-check files (``checks/<ID>/...``, eval-r19d finding 5): only by a
+    path-like mention -- ``<ID>/<path within it>`` in the text, or the
+    ``<ID>`` token together with the basename (or, for an importable
+    extension, the stem) -- never by a bare common token such as
+    ``check``, ``expected``, ``server`` or ``data``. Another check cannot
+    reach ``checks/<ID>/`` without naming ``<ID>``, and a file not
+    attributed to it is absent from its view. Per-check files named like a
+    standard-library module keep the bare-stem rule (a module shadow)."""
     m = PER_CHECK_RE.match(rel)
-    if m:
-        keys.add(m.group(1))
-    return keys
+    name = rel.rsplit("/", 1)[-1]
+    stem = name.split(".", 1)[0]
+    if not m:
+        return name in toks or (len(stem) >= 2 and stem in toks)
+    if _module_shadow(stem) and (name in toks or stem in toks):
+        return True
+    cid = m.group(1)
+    if f"{cid}/{rel[len(m.group(0)):]}" in text:
+        return True
+    if cid not in toks:
+        return False
+    return name in toks or (name.endswith(IMPORTABLE_SUFFIXES) and len(stem) >= 2
+                            and stem in toks)
 
 
 def pack_attribution(manifest: dict[str, Any], files: Iterable[str],
@@ -1402,7 +1611,8 @@ def pack_attribution(manifest: dict[str, Any], files: Iterable[str],
 
     A check uses the files its `run` names (``run_references``, directories
     cover what they hold), the files its `run` strings or any file it uses
-    mention by basename, stem or per-check directory (transitively), and
+    mention (``_mentions``: top-level checks/ files by basename or stem,
+    per-check files only by a path-like mention; transitively), and
     every shared file. Shared: metadata, `lib/`, `fakes/`, any directory
     other than `checks/` and `checks/<ID>/`, interpreter-loaded names
     (``IMPLICIT_NAMES``), top-level `checks/` files that shadow an importable
@@ -1421,23 +1631,23 @@ def pack_attribution(manifest: dict[str, Any], files: Iterable[str],
         else:
             attr[rel] = {owner} if owner else set()
             cands.append(rel)
-    keys = {rel: _mention_keys(rel) for rel in cands}
-    toks = {rel: _tokens(text) for rel, text in (texts or {}).items()
-            if rel in attr and rel not in META_FILES}
+    raw = {rel: text for rel, text in (texts or {}).items()
+           if rel in attr and rel not in META_FILES}
+    toks = {rel: _tokens(text) for rel, text in raw.items()}
 
-    def mentioned(tokset: set[str]) -> set[str]:
-        return {c for c in cands if keys[c] & tokset}
+    def mentioned(tokset: set[str], text: str = "") -> set[str]:
+        return {c for c in cands if _mentions(c, tokset, text)}
 
     for check in checks:
         cid = check["id"]
         refs = run_references(check)
         uses = {c for c in cands if any(_ref_covers(ref, c) for ref in refs)}
-        uses |= mentioned(_tokens(" ".join(a for a in check.get("run") or []
-                                           if isinstance(a, str))))
+        run_text = " ".join(a for a in check.get("run") or [] if isinstance(a, str))
+        uses |= mentioned(_tokens(run_text), run_text)
         stack = list(uses)
         while stack:
             cur = stack.pop()
-            for nxt in mentioned(toks.get(cur, set())) - uses:
+            for nxt in mentioned(toks.get(cur, set()), raw.get(cur, "")) - uses:
                 uses.add(nxt)
                 stack.append(nxt)
         for c in uses:
@@ -1448,7 +1658,7 @@ def pack_attribution(manifest: dict[str, Any], files: Iterable[str],
         changed = False
         for rel in files:
             if attr[rel] is None and rel not in META_FILES:
-                for c in mentioned(toks.get(rel, set())):
+                for c in mentioned(toks.get(rel, set()), raw.get(rel, "")):
                     if attr[c] is not None:
                         attr[c] = None
                         changed = True
@@ -1659,8 +1869,15 @@ def write_frozen_pack(src_acc: Path, dst_acc: Path, manifest: dict[str, Any]) ->
     dst_acc = Path(dst_acc)
     if dst_acc.exists():
         shutil.rmtree(dst_acc)
-    shutil.copytree(src_acc, dst_acc, ignore=shutil.ignore_patterns(
-        FROZEN, "__pycache__", "*.pyc", ".pytest_cache", "node_modules"))
+    skip = shutil.ignore_patterns(FROZEN, "__pycache__", "*.pyc", ".pytest_cache",
+                                  "node_modules")
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        # Symlinks never enter a frozen pack (eval-r19d finding 7).
+        return set(skip(directory, names)) | {
+            n for n in names if os.path.islink(os.path.join(directory, n))}
+
+    shutil.copytree(src_acc, dst_acc, ignore=ignore)
     (dst_acc / MANIFEST).write_text(dump_manifest(manifest), encoding="utf-8")
     (dst_acc / AMENDMENTS).write_text("", encoding="utf-8")
     return manifest_sha256(dst_acc)
@@ -2020,9 +2237,9 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
             info[parts[0]] = (parts[1], parts[2].strip(), parts[3].strip())
 
     def files_of(sha: str, parent: str | None) -> list[str]:
-        args = ["diff-tree", "-r", "--no-commit-id", "--name-only"]
+        args = ["diff-tree", "-r", "-z", "--no-commit-id", "--name-only"]
         args += [parent, sha] if parent else ["--root", sha]
-        return [f for f in _git(repo, *args, check=False).stdout.splitlines() if f.strip()]
+        return git_paths(repo, *args)
 
     problems: list[str] = out["problems"]
     pending_tamper: list[str] = []
@@ -2075,6 +2292,9 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
             committed = pack_hash_at(repo, sha, acc_rel)
             if not pin or pin != committed:
                 why.append("Acceptance-Pin trailer does not match the committed pack")
+            links = symlinks_at(repo, sha, acc_rel)
+            if links:
+                why.append(f"the frozen pack holds symlinks ({', '.join(links[:3])})")
             text = _show(repo, sha, f"{acc_rel}/{FROZEN}") or ""
             pins0 = re.findall(r"^pin\[0\]:\s*([0-9a-f]{64})", text, re.MULTILINE)
             if not why and (not pins0 or pins0[0] != pin):
@@ -2096,8 +2316,8 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
             out["pins"].append({"sha256": pin, "commit": sha, "note": "freeze", "kind": "freeze"})
             out["driver_commits"].append(sha)
             anchor_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
-            anchor_files = _git(repo, "ls-tree", "-r", "--name-only", sha, "--",
-                                acc_rel + "/", check=False).stdout.split()
+            anchor_files = git_paths(repo, "ls-tree", "-r", "-z", "--name-only", sha, "--",
+                                     acc_rel + "/")
             checks_total = max(1, len(anchor_manifest.get("checks") or []))
             continue
         # ---- after the freeze
@@ -2126,6 +2346,9 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
             if outside:
                 why.append(f"touches files outside acceptance/: {', '.join(outside[:5])}")
             committed = pack_hash_at(repo, sha, acc_rel)
+            links = symlinks_at(repo, sha, acc_rel) if kind == "pin" else []
+            if links:
+                why.append(f"the pinned pack holds symlinks ({', '.join(links[:3])})")
             if not pin or pin != committed:
                 why.append("Acceptance-Pin trailer does not match the committed pack")
             elif kind == "restore":
@@ -2170,9 +2393,9 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
                     new_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
                     # What the amend commits changed (the pin commit itself
                     # only extends FROZEN).
-                    changed = [f[len(acc_rel) + 1:] for f in _git(
-                        repo, "diff", "--name-only", anchor, parent or sha, "--", acc_rel,
-                        check=False).stdout.split()]
+                    changed = [f[len(acc_rel) + 1:] for f in git_paths(
+                        repo, "diff", "-z", "--name-only", anchor, parent or sha, "--",
+                        acc_rel)]
                     old_rel = [f[len(acc_rel) + 1:] for f in anchor_files]
                     try:
                         old_attr = attribution_at(repo, anchor, acc_rel, anchor_manifest or {})
@@ -2215,8 +2438,8 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
                 cur_pin = pin
                 pending_amends.clear()
                 anchor_manifest = json.loads(_show(repo, sha, f"{acc_rel}/{MANIFEST}") or "{}")
-                anchor_files = _git(repo, "ls-tree", "-r", "--name-only", sha, "--",
-                                    acc_rel + "/", check=False).stdout.split()
+                anchor_files = git_paths(repo, "ls-tree", "-r", "-z", "--name-only", sha, "--",
+                                         acc_rel + "/")
                 if out["pins"][-1]["kind"] == "human":
                     checks_total = max(1, len(anchor_manifest.get("checks") or []))
             anchor = sha
