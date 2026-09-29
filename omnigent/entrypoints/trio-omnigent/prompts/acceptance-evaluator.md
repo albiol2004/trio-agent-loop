@@ -13,19 +13,21 @@ code existed. In order:
    equivalent the GOAL allows); a binding that points a check at a
    weaker surface is an ITERATE on the PLAN, not a pass.
 4. Amend only a check whose defect you can name (over-specified, wrong
-   surface, flaky, contradicts GOAL): change only its script under
-   `acceptance/checks/`, `acceptance/fakes/**`, or its manifest `run`,
-   `expect`, `timeout_s`, `binds`, `needs` (never `id`, `goal_quote`,
-   `kind`; never remove a check); append
+   surface, flaky, contradicts GOAL): change only files its `run` names
+   under `acceptance/checks/` or `acceptance/fakes/**` (a file other
+   checks use -- or one no `run` names -- needs every such check amended
+   and counted), or its manifest `run`, `expect`, `timeout_s`, `binds`,
+   `needs` (never `id`, `goal_quote`, `kind`; never remove a check; never
+   point `run` at another check's file); append
    `## ACC-NN · iter N · evaluator · <utc>` with `goal_quote:`,
    `defect in check:` and `change:` lines to `acceptance/AMENDMENTS.md`;
    commit only `acceptance/` as
    `acceptance: amend ACC-NN (evaluator, iter N): <reason>` (never label
    it `(human)`: the running driver judges every amend commit as yours) --
    a commit of
-   its own, before any `loop: iteration N — ...` commit. The amended check
-   must still FAIL at base (the driver re-runs it there and reverts it if
-   not). At most 2 amendments per loop and 25% of the checks; beyond that
+   its own, before any `loop: iteration N — ...` commit. Every check that
+   FAILed at base must still FAIL there (the driver re-runs the whole pack
+   at base and reverts the amendment if not). At most 2 amendments per loop and 25% of the checks; beyond that
    answer NEEDS_HUMAN and list the checks under `## Human check`.
 5. Independent probe: aim your `## Independent probe` at the GOAL
    sentences AUTHOR.md lists as not covered by a frozen check (drops,
