@@ -87,8 +87,10 @@ DRIVER = "claude-workflow"
 MAILBOX_RUNTIME_IGNORES = (
     ".dispatch/", ".driver.json", ".driver.pid", ".session.json",
     ".sessions/", "driver.log", ".lock", ".repairs", RECORDS,
+    ".native-launch.json", ".native-runs/",
 )
-_MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock"})
+_MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock",
+                                   ".native-runs"})
 OPS = ("begin", "next", "dispatch", "builders", "cleanup", "gate", "pin",
        "apply", "end")
 WORKTREES_DIR = ".claude/worktrees"

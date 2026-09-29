@@ -356,7 +356,7 @@ def test_harness_meta_evaluates_and_rejects_bad_args() -> None:
 # ------------------------------------------- user decisions (2026-09-29)
 def test_no_bypass_permissions_anywhere_in_native() -> None:
     for path in NATIVE.rglob("*"):
-        if path.is_file() and path.suffix in (".js", ".mjs", ".md", ".py"):
+        if path.is_file() and path.suffix in (".js", ".mjs", ".md", ".py", ".sh"):
             if path.name == "test_workflow_script.py":
                 continue
             text = path.read_text(encoding="utf-8")
