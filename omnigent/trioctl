@@ -1484,19 +1484,34 @@ def command_acceptance(args: argparse.Namespace) -> int:
             print(f"trioctl: {mailbox} is owned by a live loop driver; stop it first",
                   file=sys.stderr)
             return 5
-        controller = _acceptance_controller(mailbox, _try_config(args))
-        if sub == "freeze":
-            code = controller.freeze_from_export(
-                Path(args.export).expanduser().resolve(),
-                {"model": args.model, "session": args.session, "effort": args.effort,
-                 "path": "manual"})
-            return code
-        if not args.human:
+        if sub == "amend" and not args.human:
             raise TrioctlError("only `--human` amendments are made from the CLI; the "
                                "integration Evaluator amends by commit (MAILBOX-SCHEMA.md)")
-        ids = [i.strip() for i in args.ids.split(",") if i.strip()]
-        adopt = [a.strip() for a in (getattr(args, "adopt", None) or "").split(",") if a.strip()]
-        return controller.human_amend(ids, args.reason, adopt=adopt)
+        controller = _acceptance_controller(mailbox, _try_config(args))
+        # eval-r19c area 2: hold the mailbox lock for the whole command, so
+        # a driver cannot start (or be starting: a pid-less lock) between
+        # the check above and the commits below.
+        core_globals = type(controller).__init__.__globals__
+        acquire = core_globals.get("_acquire_lock")
+        release = core_globals.get("_release_lock")
+        lock = acquire(mailbox) if callable(acquire) else None
+        if callable(acquire) and lock is None:
+            print(f"trioctl: {mailbox} is locked by a loop driver (running or starting); "
+                  "stop it first", file=sys.stderr)
+            return 5
+        try:
+            if sub == "freeze":
+                return controller.freeze_from_export(
+                    Path(args.export).expanduser().resolve(),
+                    {"model": args.model, "session": args.session, "effort": args.effort,
+                     "path": "manual"})
+            ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+            adopt = [a.strip() for a in (getattr(args, "adopt", None) or "").split(",")
+                     if a.strip()]
+            return controller.human_amend(ids, args.reason, adopt=adopt)
+        finally:
+            if callable(release):
+                release(lock)
     raise TrioctlError(f"unknown acceptance command {sub!r}")
 
 
@@ -9116,8 +9131,14 @@ def _root_free_setup(record: dict[str, Any], args: argparse.Namespace) -> str | 
     return None
 
 
-def _root_free_land_hook(rf: dict[str, Any], args: argparse.Namespace) -> Any:
-    """The loop core's `land=` hook of a root-free run."""
+def _root_free_land_hook(rf: dict[str, Any], args: argparse.Namespace,
+                         acceptance: bool = False) -> Any:
+    """The loop core's `land=` hook of a root-free run.
+
+    With frozen acceptance on, a land merge that changes product paths
+    never lands on a `full_check:` alone: it re-verifies with an
+    integration-eval, whose SHIP gate runs the frozen pack (each check in
+    isolation) on exactly the tree that lands (eval-r19c)."""
     wt = worker_worktrees
     home, slug, core = rf["home"], rf["slug"], rf["core"]
 
@@ -9141,6 +9162,8 @@ def _root_free_land_hook(rf: dict[str, Any], args: argparse.Namespace) -> Any:
         pins = {"home": str(state.get("evaluated_sha") or "").strip()}
         pins.update(core._state_repo_pins(state))
         watched, checks = _root_free_plan_facts(Path(mailbox))
+        if acceptance:
+            checks = {}
 
         def pre_land() -> None:
             try:
@@ -9701,7 +9724,8 @@ def _command_loop_run(
         loop_kwargs["acceptance"] = acceptance_cfg
         print(f"trioctl: frozen acceptance ON ({settings['source']}); the author runs "
               "with the first Lead pass", file=sys.stderr)
-    land_hook = _root_free_land_hook(rf, args) if rf is not None else None
+    land_hook = (_root_free_land_hook(rf, args, acceptance=acceptance_cfg is not None)
+                 if rf is not None else None)
     if land_hook is not None and not lockstep:
         # Open-loop: the loop core lands after its integration SHIP. Lockstep
         # (r16b) lands through `_run_lockstep_root_free` (no core change).

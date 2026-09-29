@@ -195,9 +195,10 @@ def test_amendment_scope_attributes_every_changed_file():
     # Another id's script.
     probs = TA.amendment_problems(old, old, ["checks/b.py"], ["ACC-01"], files)
     assert any("checks/b.py is used by ACC-02" in p for p in probs)
-    # A fake that one check's `sh -c` string names.
+    # A fake (fakes/ is a shared location since eval-r19c: every check).
     probs = TA.amendment_problems(old, old, ["fakes/srv/app.py"], ["ACC-01"], files)
-    assert any("fakes/srv/app.py is used by ACC-03" in p for p in probs)
+    assert any("fakes/srv/app.py is shared by every check" in p and "ACC-02, ACC-03" in p
+               for p in probs)
     # A helper no `run` names belongs to every check.
     probs = TA.amendment_problems(old, old, ["checks/helper.py"], ["ACC-01"], files)
     assert any("shared helper" in p and "ACC-02, ACC-03" in p for p in probs)
@@ -210,10 +211,14 @@ def test_amendment_scope_attributes_every_changed_file():
     new = {"checks": [_chk("ACC-01", "helper.py"), old["checks"][1], old["checks"][2]]}
     assert any("shared pack file" in p
                for p in TA.amendment_problems(old, new, ["MANIFEST.json"], ["ACC-01"], files))
-    # A brand-new script for the amended id is its own.
+    # A brand-new script for the amended id is its own -- only under its
+    # per-check directory (eval-r19c); a new top-level checks/ file is not.
+    new = {"checks": [_chk("ACC-01", "ACC-01/a2.py"), old["checks"][1], old["checks"][2]]}
+    assert TA.amendment_problems(old, new, ["MANIFEST.json", "checks/ACC-01/a2.py"],
+                                 ["ACC-01"], files) == []
     new = {"checks": [_chk("ACC-01", "a2.py"), old["checks"][1], old["checks"][2]]}
-    assert TA.amendment_problems(old, new, ["MANIFEST.json", "checks/a2.py"], ["ACC-01"],
-                                 files) == []
+    assert any("new file outside checks/<ID>/" in p for p in TA.amendment_problems(
+        old, new, ["MANIFEST.json", "checks/a2.py"], ["ACC-01"], files))
     # No removals.
     new = {"checks": old["checks"][:2]}
     assert any("removed" in p for p in TA.amendment_problems(old, new, [], ["ACC-03"], files))

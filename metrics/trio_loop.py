@@ -2638,13 +2638,32 @@ class AcceptanceController:
         status = _git(self.repo, "status", "--porcelain", "--", self.acc_rel)
         if status.returncode != 0 or status.stdout.strip():
             return None
-        log = _git(self.repo, "log", "--reverse", "--format=%H%x1f%s", f"{pin_commit}..HEAD",
-                   "--", self.acc_rel)
+        # The first-parent line only, like the git-derived pin chain
+        # (eval-r19c area 1): an amend commit on the other side of a merge
+        # is not this loop's, and a merge that changes the pack is tamper.
+        rows = _git(self.repo, "rev-list", "--first-parent", "--reverse", "--parents",
+                    f"{pin_commit}..HEAD")
+        if rows.returncode != 0:
+            return None
+        chain = [line.split() for line in rows.stdout.splitlines() if line.strip()]
+        if not chain:
+            return []
+        specs = [f"{pin_commit}:{self.acc_rel}"] + [f"{r[0]}:{self.acc_rel}" for r in chain]
+        trees = self.ta._object_ids(self.repo, specs)
+        touching = [(r, i) for i, r in enumerate(chain) if trees[i] != trees[i + 1]]
+        if not touching:
+            return []
+        if any(len(r) > 2 for r, _i in touching):
+            return None
+        shas = [r[0] for r, _i in touching]
+        log = _git(self.repo, "log", "--no-walk=unsorted", "--format=%H%x1f%s", *shas)
         if log.returncode != 0:
             return None
+        subjects = dict(line.split("\x1f", 1) for line in log.stdout.splitlines()
+                        if "\x1f" in line)
         commits = []
-        for line in log.stdout.splitlines():
-            sha, _sep, subject = line.partition("\x1f")
+        for sha in shas:
+            subject = subjects.get(sha, "")
             m = _AMEND_SUBJECT_RE.match(subject)
             if not m:
                 return None
@@ -2766,6 +2785,11 @@ class AcceptanceController:
     # ------------------------------------------------------------ runs
 
     def _run(self, rev: str, ids=None, acc: Path | None = None) -> dict:
+        """Run the pack at *rev* (per-check isolated, ``run_pack``). Without
+        *acc* the pack is the PINNED one read from git at the driver's pin
+        commit and verified against the pin -- never the working tree a role
+        can edit while the run is in progress (eval-r19c finding 1; the SHIP
+        gate). Raises AcceptanceError when the pinned pack cannot be read."""
         exclude = {self.mailbox_rel}
         plan_bindings = {}
         try:
@@ -2774,8 +2798,36 @@ class AcceptanceController:
             plan_bindings = parsed.get("bindings") or {}
         except OSError:
             pass
-        return self.ta.run_pack(acc or self.acc_dir, rev, repo=self.repo, ids=ids,
-                                exclude=exclude, plan_bindings=plan_bindings)
+        if acc is not None:
+            return self.ta.run_pack(acc, rev, repo=self.repo, ids=ids,
+                                    exclude=exclude, plan_bindings=plan_bindings)
+        work = Path(tempfile.mkdtemp(prefix="acc-pinned-"))
+        try:
+            pinned = self._pinned_pack(work)
+            return self.ta.run_pack(pinned, rev, repo=self.repo, ids=ids,
+                                    exclude=exclude, plan_bindings=plan_bindings)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _pinned_pack(self, dest: Path) -> Path:
+        """The pinned pack from git (the driver's pin commit), verified."""
+        pin_commit = str(self.state.get("pin_commit") or "")
+        pin = self.state.get("pin")
+        if not pin_commit or not pin:
+            raise AcceptanceError("acceptance-pin-unreadable",
+                                  "the driver state names no pin commit")
+        try:
+            acc = self._extract(pin_commit, dest)
+        except (OSError, RuntimeError, shutil.Error) as exc:
+            raise AcceptanceError("acceptance-pin-unreadable",
+                                  f"cannot read the pinned pack at {pin_commit[:12]} ({exc})")
+        got = self.ta.manifest_sha256(acc)
+        if got != pin:
+            raise AcceptanceError(
+                "acceptance-pin-unreadable",
+                f"the pack committed at the pin commit {pin_commit[:12]} hashes {got[:12]}, "
+                f"not the pin {str(pin)[:12]}")
+        return acc
 
     def covered_line(self, slice_id: str, sha: str) -> str | None:
         """`ACCEPTANCE (covered): ...` for one slice-eval (None: nothing covered)."""
@@ -2789,7 +2841,10 @@ class AcceptanceController:
         mine = [cid for cid, owners in covers.items() if slice_id in owners]
         if not mine:
             return None
-        result = self._run(sha, ids=mine)
+        try:
+            result = self._run(sha, ids=mine)
+        except AcceptanceError as exc:
+            return f"ACCEPTANCE (covered): not run ({exc.reason}: {exc.detail[:160]})"
         parts = []
         for res in result["results"]:
             owners = covers.get(res["id"], [])
@@ -2918,7 +2973,15 @@ class AcceptanceController:
         old_files = [f[len(self.acc_rel) + 1:] for f in _git(
             self.repo, "ls-tree", "-r", "--name-only", old_rev, "--",
             self.acc_rel + "/").stdout.split()]
-        problems = ta.amendment_problems(old_manifest, new_manifest, changed, ids, old_files)
+        # eval-r19c finding 1: files are attributed by what each check's
+        # interpreter can load (its `run`, mentions, shared locations), in
+        # the pinned and the amended pack alike.
+        problems = ta.amendment_problems(
+            old_manifest, new_manifest, changed, ids, old_files,
+            old_attr=ta.pack_attribution(old_manifest, ta.pack_files(old_acc),
+                                         ta.pack_texts(old_acc)),
+            new_attr=ta.pack_attribution(new_manifest, ta.pack_files(new_acc),
+                                         ta.pack_texts(new_acc)))
         for c in commits:
             problems += [f"{c['sha'][:12]}: {p}" for p in
                          ta._amend_diff_problems(self.repo, c["sha"], self.acc_rel, c["ids"])]
@@ -3075,7 +3138,13 @@ class AcceptanceController:
         if verdict != "SHIP":
             return verdict, scope, None
         sha = evaluated or _git_head(self.repo) or ""
-        result = self._run(sha)
+        try:
+            # Every check in its own copy of the landed tree, with the
+            # pinned pack from git (eval-r19c finding 1).
+            result = self._run(sha)
+        except AcceptanceError as exc:
+            return self._needs_human(state_path, iteration, exc.reason,
+                                     f"SHIP refused: {exc.detail}")
         self.last_run = result
         if result["failed"]:
             bad = [f"{r['id']} {r['outcome']} ({r.get('reason') or ''})".strip()

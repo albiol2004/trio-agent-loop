@@ -20,12 +20,20 @@ Check outcomes (from the check's exit code):
   FAIL (reason `timeout`), anything else -> ERROR, re-run once; still
   ERROR -> FAIL (reason `error`).
 
-Isolation: the tree is copied (no .git, node_modules, caches, no mailbox)
-into a fresh temp dir; each check runs there in its own process group,
-under bwrap (`--unshare-all`: loopback only, read-only /, tmpfs /tmp) when
-available, else unsandboxed with a dead http(s) proxy (``sandbox: none``).
-The environment is scrubbed of ``*_TOKEN``/``*_KEY``/``*_SECRET``/
-``*_PASSWORD`` and proxy variables.
+Isolation: the tree is copied once (no .git, node_modules, caches, no
+mailbox) into a master copy no check runs in; EACH check then runs in its
+own fresh copy of that tree with its own read-only view of the pack (its
+own files plus the shared ones, ``pack_attribution``), so no check can
+change another check's inputs (eval-r19c finding 1). Each check runs in its
+own process group, under bwrap (`--unshare-all`: loopback only, read-only
+/, tmpfs /tmp, only its own copy writable, its pack view read-only) when
+available, else unsandboxed with a dead http(s) proxy (``sandbox: none``:
+fresh copies only; a hostile check can still write outside its copy).
+Python runs with ``PYTHONSAFEPATH`` (the script directory is not
+importable); ``acceptance/lib/`` is the explicit shared helper path
+(PYTHONPATH/NODE_PATH). The environment is scrubbed of ``*_TOKEN``/
+``*_KEY``/``*_SECRET``/``*_PASSWORD``, proxy variables and implicit-load
+variables (PYTHONPATH, NODE_OPTIONS, BASH_ENV, ...).
 
 `run` exits 0 when every check PASSes, 1 on any FAIL, 3 when the only
 non-PASS outcomes are UNAVAILABLE, 2 on a usage/manifest error. `verify`
@@ -34,6 +42,7 @@ exits 0 when the pack hash equals --pin, else 1. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import importlib.util
 import json
@@ -44,6 +53,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -415,13 +425,16 @@ def scrubbed_env(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _sandbox_argv(argv: list[str], cwd: Path, writable: list[Path],
-                  readable: list[Path]) -> list[str]:
+                  readable: list[Path], read_only: Iterable[Path] = ()) -> list[str]:
     cmd = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
            "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]
     for path in readable:
         cmd += ["--ro-bind", str(path), str(path)]
     for path in writable:
         cmd += ["--bind", str(path), str(path)]
+    # Mounted last, over the writable copy: the check's pack view.
+    for path in read_only:
+        cmd += ["--ro-bind", str(path), str(path)]
     cmd += ["--unshare-all", "--die-with-parent", "--chdir", str(cwd), "--", *argv]
     return cmd
 
@@ -445,8 +458,10 @@ def _reason_line(text: str) -> str:
 
 
 def _attempt(argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
-             sandbox: str, writable: list[Path], readable: list[Path]) -> dict[str, Any]:
-    cmd = _sandbox_argv(argv, cwd, writable, readable) if sandbox == "bwrap" else argv
+             sandbox: str, writable: list[Path], readable: list[Path],
+             read_only: Iterable[Path] = ()) -> dict[str, Any]:
+    cmd = _sandbox_argv(argv, cwd, writable, readable, read_only) \
+        if sandbox == "bwrap" else argv
     started = time.monotonic()
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
@@ -498,7 +513,11 @@ def _classify(check: dict[str, Any], attempt: dict[str, Any]) -> tuple[str, str 
 
 
 def run_one(check: dict[str, Any], copy_root: Path, work: Path, env: dict[str, str],
-            sandbox: str, readable: list[Path], unmet: list[str]) -> dict[str, Any]:
+            sandbox: str, readable: list[Path], unmet: list[str],
+            read_only: Iterable[Path] = ()) -> dict[str, Any]:
+    """Run one check (and its one ERROR re-run) in *copy_root*, which must
+    be this check's own copy: only it and *work* are writable, *read_only*
+    (its pack view) is mounted read-only under bwrap."""
     cid = check["id"]
     if unmet:
         return {"id": cid, "outcome": "UNAVAILABLE", "reason": "needs " + ", ".join(unmet),
@@ -512,7 +531,7 @@ def run_one(check: dict[str, Any], copy_root: Path, work: Path, env: dict[str, s
         (scratch / "tmp").mkdir(exist_ok=True)
         run_env = dict(env, ACC_ID=cid, ACC_WORK=str(scratch), TMPDIR=str(scratch / "tmp"))
         last = _attempt(list(check["run"]), copy_root, run_env, timeout, sandbox,
-                        [copy_root, work], readable)
+                        [copy_root, work], readable, list(read_only))
         wall += last["wall_s"]
         outcome, reason = _classify(check, last)
         if outcome != "ERROR":
@@ -597,6 +616,110 @@ def binding_values(manifest: dict[str, Any], plan_bindings: dict[str, str]) -> d
     return out
 
 
+#: Implicit-load variables of the driver's environment a check never
+#: inherits (a path in them could point at a live worktree); the runner
+#: sets its own PYTHONPATH/NODE_PATH (the pinned helper path).
+IMPLICIT_ENV = (
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONINSPECT", "PYTHONEXECUTABLE",
+    "NODE_PATH", "NODE_OPTIONS", "BASH_ENV", "ENV", "PERL5LIB", "PERL5OPT", "RUBYLIB",
+    "RUBYOPT",
+)
+
+
+def _fast_copy(src: Path, dst: Path) -> None:
+    """Copy *src* to the new directory *dst* (symlinks kept): `cp -a
+    --reflink=auto` (copy_file_range / reflink where the filesystem has it),
+    else shutil."""
+    if shutil.which("cp"):
+        proc = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(src), str(dst)],
+                              capture_output=True)
+        if proc.returncode == 0:
+            return
+        _rmtree_force(dst)
+    shutil.copytree(src, dst, symlinks=True)
+
+
+def _rmtree_force(path: Path) -> None:
+    """rmtree that first makes directories writable again (pack views are
+    read-only)."""
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+    if not path.exists():
+        return
+    for root, _dirs, _files in os.walk(path):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _copy_view(pack: Path, dst: Path, rels: Iterable[str]) -> None:
+    """The check's read-only pack view: *rels* of *pack* copied (never
+    hard-linked: a link would share the inode with the master) into *dst*."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for rel in sorted(rels):
+        src = pack / rel
+        out = dst / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_symlink():
+            os.symlink(os.readlink(src), out)
+        elif src.is_file():
+            shutil.copy2(src, out)
+    for root, dirs, files in os.walk(dst, topdown=False):
+        for name in files:
+            full = os.path.join(root, name)
+            if not os.path.islink(full):
+                os.chmod(full, os.stat(full).st_mode & 0o555)
+        os.chmod(root, 0o555)
+
+
+def _tree_signature(roots: Iterable[Path]) -> list[tuple]:
+    """Cheap change detector over the run's master copies: every entry's
+    type, size, inode and ctime (ctime cannot be set by a check)."""
+    sig: list[tuple] = []
+    for root in roots:
+        root = Path(root)
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            try:
+                entries = list(os.scandir(cur))
+            except OSError:
+                sig.append((str(cur), "unreadable"))
+                continue
+            for entry in entries:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                sig.append((entry.path, st.st_mode, st.st_size, st.st_ino, st.st_ctime_ns))
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+            try:
+                st = os.stat(cur, follow_symlinks=False)
+                sig.append((str(cur), st.st_mode, st.st_ino, st.st_ctime_ns))
+            except OSError:
+                sig.append((str(cur), "gone"))
+    return sorted(sig, key=repr)
+
+
+def check_env(env: dict[str, str], tree: Path, pack_view: Path, lib_present: bool) -> dict[str, str]:
+    """The per-check environment: its own tree and pack view, isolated
+    interpreter resolution (eval-r19c finding 1, F2)."""
+    out = {k: v for k, v in env.items() if k not in IMPLICIT_ENV}
+    out.update({"ACC_TREE": str(tree), "ACC_DIR": str(pack_view),
+                "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1",
+                "PYTHONNOUSERSITE": "1"})
+    if lib_present:
+        lib = str(pack_view / HELPER_DIR)
+        out["PYTHONPATH"] = lib
+        out["NODE_PATH"] = lib
+    return out
+
+
 def run_pack(
     acc_src: Path,
     tree: Path | str,
@@ -610,24 +733,39 @@ def run_pack(
     allow_setup: bool = True,
 ) -> dict[str, Any]:
     """Run the pack in *acc_src* against *tree* (a directory, or a revision
-    of *repo* extracted with `git archive`). Never writes into *tree*."""
+    of *repo* extracted with `git archive`). Never writes into *tree*.
+
+    Per-check isolation (eval-r19c finding 1): the pack is snapshotted once
+    (the result's ``manifest_sha256`` is the snapshot's), the tree is copied
+    once into a master no check runs in, and every check runs in its own
+    fresh copy of the master with its own read-only pack view
+    (``check_view``: its files and the shared ones only). A change to the
+    masters while the run is in progress (a check that escaped its copy
+    under ``sandbox: none``) FAILs every later check (``isolation``)."""
     acc_src = Path(acc_src)
-    manifest = manifest if manifest is not None else load_manifest(acc_src)
+    if manifest is None:
+        load_manifest(acc_src)  # a missing/invalid pack is a ManifestError
     wanted = set(ids) if ids else None
     started = time.monotonic()
     sandbox = sandbox_mode()
+    pin = latest_pin(acc_src)
     tmp = Path(tempfile.mkdtemp(prefix="trio-acceptance-"))
     result: dict[str, Any] = {
-        "manifest_sha256": manifest_sha256(acc_src), "pin_ok": None,
-        "tree": str(tree), "tree_head": None, "sandbox": sandbox, "passed": 0,
-        "failed": 0, "unavailable": 0, "total": 0, "wall_s": 0.0, "results": [],
-        "log": [],
+        "manifest_sha256": None, "pin_ok": None,
+        "tree": str(tree), "tree_head": None, "sandbox": sandbox, "isolation": "per-check",
+        "passed": 0, "failed": 0, "unavailable": 0, "total": 0, "wall_s": 0.0,
+        "isolation_s": 0.0, "isolation_wait_s": 0.0, "results": [], "log": [],
     }
-    pin = latest_pin(acc_src)
-    if pin is not None:
-        result["pin_ok"] = pin == result["manifest_sha256"]
     try:
-        copy_root = tmp / "tree"
+        # The run's one view of the pack (a concurrent edit of *acc_src*
+        # cannot reach a check, nor make the hash disagree with what ran).
+        pack_master = tmp / "pack"
+        shutil.copytree(acc_src, pack_master, symlinks=True, ignore=_pack_copy_ignore)
+        result["manifest_sha256"] = manifest_sha256(pack_master)
+        if pin is not None:
+            result["pin_ok"] = pin == result["manifest_sha256"]
+        manifest = manifest if manifest is not None else load_manifest(pack_master)
+        copy_root = tmp / "master"
         sources: list[Path] = []
         tree_path = Path(str(tree))
         if tree_path.is_dir():
@@ -650,56 +788,113 @@ def run_pack(
         sources.extend(Path(p) for p in extra_sources)
         env_extra = os.environ.get(PROVIDES_FROM_ENV, "").strip()
         sources.extend(Path(p) for p in env_extra.split(os.pathsep) if p)
-        pack_dst = copy_root / PACK_DIR
-        if pack_dst.exists() or pack_dst.is_symlink():
+        shadow = copy_root / PACK_DIR
+        if shadow.exists() or shadow.is_symlink():
             result["log"].append("tree has its own top-level acceptance/; shadowed by the pack")
-            if pack_dst.is_dir() and not pack_dst.is_symlink():
-                shutil.rmtree(pack_dst)
+            if shadow.is_dir() and not shadow.is_symlink():
+                shutil.rmtree(shadow)
             else:
-                pack_dst.unlink()
-        # The run sees exactly the hashed pack (eval-r19 finding 8): a
-        # directory the pin skips (node_modules, caches) never reaches it.
-        shutil.copytree(acc_src, pack_dst, symlinks=True, ignore=_pack_copy_ignore)
-        work = tmp / "work"
-        work.mkdir()
+                shadow.unlink()
         provided = resolve_setups(manifest, sources, copy_root, result["log"], allow_setup)
         readable = sorted({p.resolve() for p in provided.values() if p is not None})
+        attribution = pack_attribution(manifest, pack_files(pack_master),
+                                       pack_texts(pack_master))
         env = scrubbed_env()
         if sandbox == "none":
             env.update({"http_proxy": DEAD_PROXY, "https_proxy": DEAD_PROXY,
                         "HTTP_PROXY": DEAD_PROXY, "HTTPS_PROXY": DEAD_PROXY,
                         "no_proxy": "localhost,127.0.0.1,::1",
                         "NO_PROXY": "localhost,127.0.0.1,::1"})
-        env.update({"ACC_TREE": str(copy_root), "ACC_DIR": str(pack_dst),
-                    "PYTHONDONTWRITEBYTECODE": "1"})
         for name, value in binding_values(manifest, plan_bindings or {}).items():
             env[f"ACC_BIND_{name}"] = value
+        signature = _tree_signature([copy_root, pack_master])
+        breached = False
         budget = float(manifest.get("budget_s", DEFAULT_BUDGET_S) or DEFAULT_BUDGET_S)
-        for check in manifest.get("checks") or []:
+        runnable: list[tuple[int, dict[str, Any], list[str]]] = []
+        for n, check in enumerate(manifest.get("checks") or []):
             if not isinstance(check, dict) or not check.get("id"):
                 continue
             if wanted is not None and check["id"] not in wanted:
                 continue
-            if time.monotonic() - started > budget:
-                res = {"id": check["id"], "outcome": "FAIL", "reason": "budget",
-                       "over_budget": True, "excerpt": "", "wall_s": 0.0}
-            else:
-                unmet = []
-                for need in check.get("needs") or []:
-                    if need.startswith("setup:"):
-                        if provided.get(need[6:]) is None:
-                            unmet.append(need)
-                    elif shutil.which(need, path=env.get("PATH")) is None:
+            unmet = []
+            for need in check.get("needs") or []:
+                if need.startswith("setup:"):
+                    if provided.get(need[6:]) is None:
                         unmet.append(need)
-                res = run_one(check, copy_root, work, env, sandbox, readable, unmet)
-            result["results"].append(res)
+                elif shutil.which(need, path=env.get("PATH")) is None:
+                    unmet.append(need)
+            runnable.append((n, check, unmet))
+
+        def prepare(n: int, cid: str) -> tuple[Path, set[str], float]:
+            t0 = time.monotonic()
+            slot = tmp / f"c{n:03d}"
+            slot.mkdir()
+            _fast_copy(copy_root, slot / "tree")
+            rels = check_view(attribution, cid)
+            _copy_view(pack_master, slot / "tree" / PACK_DIR, rels)
+            (slot / "work").mkdir()
+            return slot, rels, time.monotonic() - t0
+
+        # The next check's copy is made while the current one runs; the
+        # masters are re-verified after every check, before the next runs,
+        # so a copy taken from a changed master never runs.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                                     thread_name_prefix="acc-copy")
+        prepared: dict[int, concurrent.futures.Future] = {}
+
+        def schedule(i: int) -> None:
+            for n, check, unmet in runnable[i:]:
+                if not unmet:
+                    if n not in prepared:
+                        prepared[n] = pool.submit(prepare, n, check["id"])
+                    return
+
+        try:
+            schedule(0)
+            for i, (n, check, unmet) in enumerate(runnable):
+                if time.monotonic() - started > budget:
+                    result["results"].append({"id": check["id"], "outcome": "FAIL",
+                                              "reason": "budget", "over_budget": True,
+                                              "excerpt": "", "wall_s": 0.0})
+                    continue
+                if unmet:
+                    result["results"].append(run_one(check, copy_root, tmp, env, sandbox,
+                                                     readable, unmet))
+                    continue
+                t0 = time.monotonic()
+                slot, rels, cost = prepared.pop(n).result()
+                result["isolation_wait_s"] += time.monotonic() - t0
+                result["isolation_s"] += cost
+                schedule(i + 1)
+                if not breached and _tree_signature([copy_root, pack_master]) != signature:
+                    breached = True
+                    result["log"].append("isolation breach: the run's master copy changed "
+                                         f"before {check['id']}")
+                if breached:
+                    result["results"].append({
+                        "id": check["id"], "outcome": "FAIL", "reason": "isolation",
+                        "error": True, "excerpt": "", "wall_s": 0.0,
+                        "detail": "the run's master copy changed while the pack ran (a check "
+                                  "escaped its own copy)"})
+                    pool.submit(_rmtree_force, slot)
+                    continue
+                croot, view = slot / "tree", slot / "tree" / PACK_DIR
+                cenv = check_env(env, croot, view,
+                                 any(r.startswith(HELPER_DIR + "/") for r in rels))
+                res = run_one(check, croot, slot / "work", cenv, sandbox, readable, unmet, [view])
+                pool.submit(_rmtree_force, slot)
+                result["results"].append(res)
+        finally:
+            pool.shutdown(wait=True)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _rmtree_force(tmp)
     for res in result["results"]:
         result["total"] += 1
         key = {"PASS": "passed", "FAIL": "failed", "UNAVAILABLE": "unavailable"}[res["outcome"]]
         result[key] += 1
     result["wall_s"] = round(time.monotonic() - started, 2)
+    result["isolation_s"] = round(result["isolation_s"], 3)
+    result["isolation_wait_s"] = round(result["isolation_wait_s"], 3)
     return result
 
 
@@ -1099,6 +1294,176 @@ def _ref_covers(ref: str, rel: str) -> bool:
     return rel == ref or rel.startswith(ref.rstrip("/") + "/")
 
 
+# ------------------------------------------- per-check attribution (r19c)
+
+#: Pack metadata: in no check's view (eval-r19c finding 1: a check's outcome
+#: depends only on its own pinned files, the shared ones and the tree).
+META_FILES = frozenset({MANIFEST, AMENDMENTS, AUTHOR_NOTES, FROZEN})
+#: The explicit, pinned helper directory: on every check's PYTHONPATH and
+#: NODE_PATH, attributed to every check.
+HELPER_DIR = "lib"
+#: The only place an amendment may add a file: `checks/<its id>/`.
+PER_CHECK_RE = re.compile(r"^checks/(ACC-[0-9]{1,4})/")
+#: Names an interpreter or tool loads without the loading code naming them
+#: (Python packages/pytest/site, Node package resolution, shells, make):
+#: attributed to every check wherever they are.
+IMPLICIT_NAMES = frozenset({
+    "__init__.py", "__main__.py", "conftest.py", "sitecustomize.py", "usercustomize.py",
+    "pytest.ini", "pyproject.toml", "setup.cfg", "setup.py", "tox.ini", ".pythonrc",
+    "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+    "pnpm-lock.yaml", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", "tsconfig.json",
+    "jsconfig.json", "deno.json", "deno.jsonc", "bunfig.toml", ".babelrc",
+    "babel.config.js", "babel.config.json", ".swcrc", "node_modules", ".env",
+    ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zshenv", ".envrc", ".inputrc",
+    "Makefile", "makefile", "GNUmakefile",
+})
+IMPLICIT_SUFFIXES = (".pth",)
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.@+-]+")
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+MAX_SCAN_BYTES = 4 << 20
+
+
+def _module_shadow(stem: str) -> bool:
+    """True when a top-level file with this stem would shadow a standard
+    library module: a check that puts its directory on sys.path would load
+    it through any stdlib import. Deliberately the stdlib only, so the
+    driver and trio-shadow attribute identically whatever is installed or
+    importable from their working directories."""
+    if not stem.isidentifier():
+        return False
+    return stem in getattr(sys, "stdlib_module_names", ()) \
+        or stem in sys.builtin_module_names
+
+
+def file_location(rel: str) -> tuple[str, str | None]:
+    """(kind, owner) of a pack path: ``meta``, ``shared`` (every check:
+    fakes/, lib/, any other directory, interpreter-loaded names, module
+    shadows), ``top`` (a file directly in checks/) or ``percheck``
+    (checks/<ID>/..., owned by ID)."""
+    if rel in META_FILES:
+        return "meta", None
+    parts = rel.split("/")
+    name = parts[-1]
+    if any(p in IMPLICIT_NAMES for p in parts) or name.endswith(IMPLICIT_SUFFIXES):
+        return "shared", None
+    if parts[0] == "checks":
+        if len(parts) == 2:
+            if _module_shadow(name.split(".", 1)[0]):
+                return "shared", None
+            return "top", None
+        m = PER_CHECK_RE.match(rel)
+        if m:
+            return "percheck", m.group(1)
+    return "shared", None
+
+
+def pack_texts(acc_dir: Path) -> dict[str, str]:
+    """Text of every pack file (for mention attribution; bounded)."""
+    out: dict[str, str] = {}
+    acc_dir = Path(acc_dir)
+    for rel in pack_files(acc_dir):
+        path = acc_dir / rel
+        try:
+            if path.is_symlink():
+                out[rel] = os.readlink(path)
+            else:
+                with path.open("rb") as fh:
+                    out[rel] = fh.read(MAX_SCAN_BYTES).decode("utf-8", errors="replace")
+        except OSError:
+            out[rel] = ""
+    return out
+
+
+def _tokens(text: str) -> set[str]:
+    toks = set(_TOKEN_RE.findall(text))
+    toks |= {t.strip(".") for t in toks}
+    toks |= set(_WORD_RE.findall(text))
+    return toks
+
+
+def _mention_keys(rel: str) -> set[str]:
+    """What names *rel* in another file's text: its basename, its stem, and
+    its per-check directory."""
+    parts = rel.split("/")
+    name = parts[-1]
+    keys = {name}
+    stem = name.split(".", 1)[0]
+    if len(stem) >= 2:
+        keys.add(stem)
+    m = PER_CHECK_RE.match(rel)
+    if m:
+        keys.add(m.group(1))
+    return keys
+
+
+def pack_attribution(manifest: dict[str, Any], files: Iterable[str],
+                     texts: dict[str, str] | None = None) -> dict[str, frozenset[str] | None]:
+    """Which checks each pack file belongs to (None: every check).
+
+    A check uses the files its `run` names (``run_references``, directories
+    cover what they hold), the files its `run` strings or any file it uses
+    mention by basename, stem or per-check directory (transitively), and
+    every shared file. Shared: metadata, `lib/`, `fakes/`, any directory
+    other than `checks/` and `checks/<ID>/`, interpreter-loaded names
+    (``IMPLICIT_NAMES``), top-level `checks/` files that shadow an importable
+    module, a `checks/` file no check uses, and any file a shared file
+    mentions. `checks/<ID>/**` always belongs to ID too. Over-attribution
+    only makes amendments stricter and views larger, never a check's
+    inputs smaller than what it names."""
+    files = sorted(set(files))
+    checks = [c for c in manifest.get("checks") or [] if isinstance(c, dict) and c.get("id")]
+    attr: dict[str, set[str] | None] = {}
+    cands: list[str] = []
+    for rel in files:
+        kind, owner = file_location(rel)
+        if kind in ("meta", "shared"):
+            attr[rel] = None
+        else:
+            attr[rel] = {owner} if owner else set()
+            cands.append(rel)
+    keys = {rel: _mention_keys(rel) for rel in cands}
+    toks = {rel: _tokens(text) for rel, text in (texts or {}).items()
+            if rel in attr and rel not in META_FILES}
+
+    def mentioned(tokset: set[str]) -> set[str]:
+        return {c for c in cands if keys[c] & tokset}
+
+    for check in checks:
+        cid = check["id"]
+        refs = run_references(check)
+        uses = {c for c in cands if any(_ref_covers(ref, c) for ref in refs)}
+        uses |= mentioned(_tokens(" ".join(a for a in check.get("run") or []
+                                           if isinstance(a, str))))
+        stack = list(uses)
+        while stack:
+            cur = stack.pop()
+            for nxt in mentioned(toks.get(cur, set())) - uses:
+                uses.add(nxt)
+                stack.append(nxt)
+        for c in uses:
+            if attr[c] is not None:
+                attr[c].add(cid)
+    changed = True
+    while changed:
+        changed = False
+        for rel in files:
+            if attr[rel] is None and rel not in META_FILES:
+                for c in mentioned(toks.get(rel, set())):
+                    if attr[c] is not None:
+                        attr[c] = None
+                        changed = True
+    for c in cands:
+        if attr[c] is not None and not attr[c]:
+            attr[c] = None  # a checks/ file no check uses: a shared helper
+    return {rel: (frozenset(v) if v is not None else None) for rel, v in attr.items()}
+
+
+def check_view(attribution: dict[str, frozenset[str] | None], cid: str) -> set[str]:
+    """The pack files a check's run sees: its own and the shared ones."""
+    return {rel for rel, owners in attribution.items()
+            if rel not in META_FILES and (owners is None or cid in owners)}
+
+
 def file_owners(manifests: Iterable[dict[str, Any]], rel: str) -> set[str]:
     """Ids whose `run` (in any of *manifests*) names *rel* or its directory."""
     owners: set[str] = set()
@@ -1113,21 +1478,33 @@ def file_owners(manifests: Iterable[dict[str, Any]], rel: str) -> set[str]:
 
 def amendment_problems(old: dict[str, Any], new: dict[str, Any],
                        changed_files: Iterable[str], amended: Iterable[str],
-                       old_files: Iterable[str] | None = None) -> list[str]:
+                       old_files: Iterable[str] | None = None, *,
+                       old_attr: dict[str, frozenset[str] | None] | None = None,
+                       new_attr: dict[str, frozenset[str] | None] | None = None) -> list[str]:
     """Mechanical scope rule of one Evaluator amendment (§3.4 rule 1).
 
-    eval-r19b finding 1: every changed pack file is attributed to the checks
-    whose `run` names it (a file no `run` names -- a shared helper any check
-    may import -- belongs to every check), and each of those checks must be
-    one of the amended (named, counted) ids. An amended check's `run` may
-    not be pointed at a file another check's `run` names, nor at an existing
-    pack file no check names (a shared helper)."""
+    eval-r19c finding 1: every changed pack file is attributed with
+    ``pack_attribution`` of the pinned pack (*old_attr*) and of the amended
+    pack (*new_attr*); a shared file (fakes/, lib/, interpreter-loaded
+    names, anything not exclusively owned) belongs to every check, and each
+    owning check must be one of the amended (named, counted) ids -- so a
+    shared file is effectively frozen within the budget. A new file may only
+    be added under `checks/<ID>/` of an amended ID and used by no other
+    check. An amended check's `run` may not be pointed at a file another
+    check uses, nor at an unowned top-level `checks/` file. Without
+    attributions (unit callers) they are derived from `run` alone."""
     probs: list[str] = []
     old_by = {c["id"]: c for c in old.get("checks") or [] if isinstance(c, dict) and "id" in c}
     new_by = {c["id"]: c for c in new.get("checks") or [] if isinstance(c, dict) and "id" in c}
     amended = set(amended)
     all_ids = set(old_by) | set(new_by)
+    changed_files = sorted(set(changed_files))
+    # Without *old_files* nothing is known to be new (unit callers).
     old_set = set(old_files) if old_files is not None else None
+    if old_attr is None:
+        old_attr = pack_attribution(old, old_set if old_set is not None else changed_files)
+    if new_attr is None:
+        new_attr = pack_attribution(new, set(old_attr) | set(changed_files))
     removed = sorted(set(old_by) - set(new_by))
     if removed:
         probs.append(f"check(s) removed: {', '.join(removed)}")
@@ -1152,21 +1529,46 @@ def amendment_problems(old: dict[str, Any], new: dict[str, Any],
         if key == "checks" or old.get(key) == new.get(key):
             continue
         probs.append(f"manifest `{key}` may not be amended")
-    for rel in sorted(set(changed_files)):
+
+    def owners_of(rel: str) -> tuple[set[str], str | None]:
+        """(owning ids, why shared or None)."""
+        out: set[str] = set()
+        why = None
+        for attr in (old_attr, new_attr):
+            if rel not in attr:
+                continue
+            if attr[rel] is None:
+                kind, _o = file_location(rel)
+                why = ("is named by no check's `run` (a shared helper any check may use)"
+                       if kind == "top" else
+                       "is shared by every check (a shared location such as fakes/ or lib/, "
+                       "an interpreter-loaded name, or a file a shared file uses)")
+                return set(all_ids), why
+            out |= set(attr[rel])
+        return out, why
+
+    for rel in changed_files:
         if rel in (MANIFEST, AMENDMENTS):
             continue
         if not rel.startswith(("checks/", "fakes/")):
             probs.append(f"{rel} is outside the amendable pack files")
             continue
-        owners = file_owners((old, new), rel)
-        shared = not owners
-        if shared:
-            owners = set(all_ids)
+        if old_set is not None and rel not in old_set:
+            m = PER_CHECK_RE.match(rel)
+            if not m or m.group(1) not in amended:
+                probs.append(f"{rel} is a new file outside checks/<ID>/ of an amended check "
+                             "(an amendment adds files only under its own checks/<ID>/)")
+                continue
+            owners, why = owners_of(rel)
+            others = sorted(owners - {m.group(1)})
+            if others:
+                probs.append(f"{rel} is a new file that other checks would load "
+                             f"({why or 'used by ' + ', '.join(others[:8])})")
+            continue
+        owners, why = owners_of(rel)
         others = sorted(owners - amended)
         if others:
-            why = ("is named by no check's `run` (a shared helper any check may use)"
-                   if shared else "is used by")
-            probs.append(f"{rel} {why} {', '.join(others[:8])}"
+            probs.append(f"{rel} {why or 'is used by'} {', '.join(others[:8])}"
                          f"{' ...' if len(others) > 8 else ''}, which the amendment does not "
                          "name (every check whose files change must be amended and counted)")
     for cid in sorted(amended):
@@ -1174,12 +1576,15 @@ def amendment_problems(old: dict[str, Any], new: dict[str, Any],
         if before is None or after is None or before.get("run") == after.get("run"):
             continue
         for ref in sorted(run_references(after)):
-            others = sorted(file_owners((old,), ref) - {cid})
+            covered = [f for f in (old_set if old_set is not None else ()) if _ref_covers(ref, f)]
+            others = sorted({o for f in covered if old_attr.get(f) is not None
+                             for o in old_attr[f]} - {cid}
+                            | (file_owners((old,), ref) - {cid}))
             if others:
                 probs.append(f"{cid}: `run` now points at {ref}, which belongs to "
                              f"{', '.join(others[:8])}")
-            elif old_set is not None and any(_ref_covers(ref, f) for f in old_set) \
-                    and not file_owners((old,), ref):
+            elif any(old_attr.get(f, frozenset()) is None and file_location(f)[0] == "top"
+                     for f in covered):
                 probs.append(f"{cid}: `run` now points at {ref}, a shared pack file "
                              "no check's `run` named")
     return probs
@@ -1350,6 +1755,35 @@ def commit_paths(repo: Path, rels: list[str], message: str,
         tmp_real.unlink(missing_ok=True)
 
 
+_RENAME_EXCHANGE = 2
+_EXCHANGE: dict[str, Any] = {}
+
+
+def _exchange(a: Path, b: Path) -> bool:
+    """Atomically swap two paths (Linux renameat2 RENAME_EXCHANGE); False
+    when unsupported (the caller falls back to two renames)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if "fn" not in _EXCHANGE:
+        fn = None
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            fn = libc.renameat2
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_uint]
+            fn.restype = ctypes.c_int
+        except (OSError, AttributeError):
+            fn = None
+        _EXCHANGE["fn"] = fn
+    fn = _EXCHANGE["fn"]
+    if fn is None:
+        return False
+    at_fdcwd = -100
+    rc = fn(at_fdcwd, os.fsencode(str(a)), at_fdcwd, os.fsencode(str(b)), _RENAME_EXCHANGE)
+    return rc == 0
+
+
 def restore_pack_files(repo: Path, rev: str, acc_rel: str, acc_dir: Path) -> None:
     """Replace the working-tree pack with *acc_rel* as committed in *rev*."""
     top = git_toplevel(repo) or Path(repo).resolve()
@@ -1365,16 +1799,21 @@ def restore_pack_files(repo: Path, rev: str, acc_rel: str, acc_dir: Path) -> Non
             raise RuntimeError(f"cannot read {acc_rel} at {rev[:12]}")
         acc_dir = Path(acc_dir)
         # Build the new pack next to the old one and swap by rename, so a
-        # reader never sees a half-copied pack (eval-r19b finding 4).
+        # reader never sees a half-copied pack (eval-r19b finding 4) -- nor
+        # a missing one: where the kernel has it, the swap is one atomic
+        # renameat2(RENAME_EXCHANGE) (eval-r19c area 3).
         acc_dir.parent.mkdir(parents=True, exist_ok=True)
-        tag = f"{os.getpid()}-{time.monotonic_ns()}"
+        tag = f"{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
         fresh = acc_dir.with_name(f".{acc_dir.name}.restore-{tag}")
         old = acc_dir.with_name(f".{acc_dir.name}.old-{tag}")
         shutil.copytree(stage / acc_rel, fresh, symlinks=True)
         try:
-            if acc_dir.exists() or acc_dir.is_symlink():
-                os.replace(acc_dir, old)
-            os.replace(fresh, acc_dir)
+            if acc_dir.is_dir() and not acc_dir.is_symlink() and _exchange(fresh, acc_dir):
+                os.replace(fresh, old)  # *fresh* now holds the previous pack
+            else:
+                if acc_dir.exists() or acc_dir.is_symlink():
+                    os.replace(acc_dir, old)
+                os.replace(fresh, acc_dir)
         finally:
             shutil.rmtree(fresh, ignore_errors=True)
             if old.is_symlink():
@@ -1479,6 +1918,20 @@ def base_fails_lost(repo: Path, acc_rel: str, ref_rev: str, new_rev: str,
                   if r["outcome"] == "FAIL" and after.get(r["id"]) != "FAIL")
 
 
+def attribution_at(repo: Path, rev: str, acc_rel: str,
+                   manifest: dict[str, Any] | None = None) -> dict[str, frozenset[str] | None]:
+    """``pack_attribution`` of the pack as committed in *rev* (git objects)."""
+    work = Path(tempfile.mkdtemp(prefix="trio-acceptance-attr-"))
+    try:
+        acc = work / PACK_DIR
+        restore_pack_files(repo, rev, acc_rel, acc)
+        if manifest is None:
+            manifest = load_manifest(acc)
+        return pack_attribution(manifest, pack_files(acc), pack_texts(acc))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
                      head: str = "HEAD", driver_commits: Iterable[str] | None = None,
                      human_amends: Iterable[str] | None = None,
@@ -1528,11 +1981,13 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
         "tamper_restores": 0, "driver_commits": [], "human_amends": [], "frozen_text": None,
     }
     rng = f"{start}..{head}" if start else head
-    proc = _git(repo, "rev-list", "--first-parent", "--reverse", rng, check=False)
+    proc = _git(repo, "rev-list", "--first-parent", "--reverse", "--parents", rng, check=False)
     if proc.returncode != 0:
         out["problems"].append(f"cannot read the history {rng} ({proc.stderr.strip()[-200:]})")
         return out
-    chain = [c for c in proc.stdout.split() if c]
+    rows = [line.split() for line in proc.stdout.splitlines() if line.strip()]
+    chain = [r[0] for r in rows]
+    merges = {r[0] for r in rows if len(r) > 2}
     out["head_pack"] = pack_hash_at(repo, head, acc_rel) if chain or start else None
     first_parent = start
     if chain and start is None:
@@ -1588,6 +2043,20 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
         outside = [f for f in files if not f.startswith(acc_rel + "/")]
         pack_only = [f for f in files if f.startswith(acc_rel + "/")]
         frozen_adds += int(adds_frozen)
+        if sha in merges:
+            # A driver freeze/pin/restore or an amend is never a merge; a
+            # merge that changes the pack against its first parent (a land
+            # merge-not-rebase bringing a pack edit from the other side)
+            # is tamper (eval-r19c area 1).
+            if freeze is None:
+                problems.append(f"{label}: a merge commit touches {acc_rel}/ before the freeze")
+                if adds_frozen:
+                    break
+            else:
+                pending_tamper.append(f"{label}: a merge commit changes {acc_rel}/ "
+                                      f"({', '.join(pack_only[:3])}) -- only driver freeze/"
+                                      "restore/pin and amend commits may")
+            continue
         if freeze is None:
             if not (adds_frozen or FREEZE_SUBJECT_RE.match(subject)):
                 if start is not None:
@@ -1705,8 +2174,14 @@ def derive_pin_chain(repo: Path, acc_rel: str, start: str | None = None, *,
                         repo, "diff", "--name-only", anchor, parent or sha, "--", acc_rel,
                         check=False).stdout.split()]
                     old_rel = [f[len(acc_rel) + 1:] for f in anchor_files]
+                    try:
+                        old_attr = attribution_at(repo, anchor, acc_rel, anchor_manifest or {})
+                        new_attr = attribution_at(repo, sha, acc_rel, new_manifest)
+                    except (OSError, RuntimeError) as exc:
+                        old_attr = new_attr = None
+                        why.append(f"cannot read the amended pack ({exc})")
                     why += amendment_problems(anchor_manifest or {}, new_manifest, changed, ids,
-                                              old_rel)
+                                              old_rel, old_attr=old_attr, new_attr=new_attr)
                     if amend_used + len(ids) > AMEND_MAX \
                             or amend_used + len(ids) > AMEND_SHARE * checks_total:
                         why.append(f"amendment budget exceeded ({amend_used} used + {len(ids)})")
