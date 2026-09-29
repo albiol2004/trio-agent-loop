@@ -50,6 +50,19 @@ PyYAML dependency. The block parser itself (``find_slices_block`` /
 ``parse_slices`` / ``SliceParseError``) is shared from trio-metrics.py, the
 single source of truth for the format, and loaded here by file location.
 
+Frozen acceptance guard (r19, MAILBOX-SCHEMA.md "Frozen acceptance"):
+when the mailbox has an ``acceptance/`` pack, --require-commits also
+checks every commit in ``<FROZEN base>..HEAD`` (or ``--acceptance-base``)
+that touches ``<mailbox>/acceptance/``: it must be the single driver freeze
+commit (``acceptance: freeze N checks (...)``, ``Acceptance-Pin:`` trailer
+equal to the pack hash in that commit), a driver ``acceptance: restore``/
+``acceptance: pin`` commit (same trailer rule), or a valid amend commit
+(``acceptance: amend ACC-NN (evaluator|human...): ...``, touching only
+``acceptance/``, with an ``## ACC-NN`` AMENDMENTS.md record per id); and the
+freeze commit must precede every ``slice(<id>):`` commit of the range.
+Anything else is an offender and the gate exits 1. Without a pack the
+gate is unchanged.
+
 Cross-mailbox drift report:
 
   python3 metrics/trio-shadow.py --report-drift [--root <repo>] [--json]
@@ -70,8 +83,10 @@ observability only, across mailboxes just like the single-mailbox report).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -165,6 +180,150 @@ def commit_gate_offenders(report: dict) -> list[dict]:
         e for e in report["slices"]
         if code_changing_writes(e["declared_writes"]) and not e["commits"]
     ]
+
+
+# --- r19 frozen acceptance guard ---------------------------------------------
+
+ACCEPTANCE_DIR = "acceptance"
+_ACC_FREEZE_RE = re.compile(r"^acceptance: freeze \d+ checks?\b")
+_ACC_DRIVER_RE = re.compile(r"^acceptance: (?:restore|pin)\b")
+_ACC_AMEND_RE = re.compile(
+    r"^acceptance: amend (ACC-[0-9]{1,4}(?:\s*,\s*ACC-[0-9]{1,4})*) "
+    r"\((evaluator|human)\b[^)]*\): \S"
+)
+_ACC_HASH_SKIP = ("__pycache__", ".pytest_cache", "node_modules")
+
+
+def _mailbox_prefix(loop_dir: Path) -> str | None:
+    """The mailbox's repo-relative path (`git rev-parse --show-prefix`)."""
+    proc = _git(loop_dir, "rev-parse", "--show-prefix")
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip().rstrip("/")
+
+
+def pack_hash_at(repo_dir: Path, sha: str, acc_rel: str) -> str | None:
+    """manifest_sha256 (trio-acceptance.py) of the pack as committed in *sha*."""
+    proc = _git(repo_dir, "ls-tree", "-r", "-z", sha, "--", acc_rel + "/")
+    if proc.returncode != 0:
+        return None
+    entries = []
+    for raw in proc.stdout.split("\0"):
+        if not raw.strip():
+            continue
+        meta, _tab, path = raw.partition("\t")
+        mode, _type, blob = meta.split()
+        rel = path[len(acc_rel) + 1:]
+        parts = rel.split("/")
+        if rel == "FROZEN" or any(p in _ACC_HASH_SKIP for p in parts[:-1]) \
+                or rel.endswith((".pyc", ".pyo")):
+            continue
+        entries.append((rel, mode, blob))
+    digest = hashlib.sha256()
+    for rel, mode, blob in sorted(entries):
+        data = subprocess.run(["git", "cat-file", "blob", blob], cwd=repo_dir,
+                              capture_output=True).stdout
+        if mode == "120000":
+            data = b"symlink:" + data
+        digest.update(rel.encode("utf-8") + b"\0" + data + b"\0")
+    return digest.hexdigest()
+
+
+def _frozen_base(loop_dir: Path) -> str | None:
+    try:
+        text = (loop_dir / ACCEPTANCE_DIR / "FROZEN").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"^base:\s*([0-9a-f]{7,40})\s*$", text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def acceptance_offenders(loop_dir: Path, base: str | None = None) -> list[str]:
+    """r19 §3.3 check 2: commits touching `<mailbox>/acceptance/` that are
+    not the freeze, a driver restore/pin, or a valid amend commit. [] when
+    the mailbox has no pack (and no commit touched one)."""
+    loop_dir = Path(loop_dir).resolve()
+    prefix = _mailbox_prefix(loop_dir)
+    if prefix is None:
+        return []
+    acc_rel = f"{prefix}/{ACCEPTANCE_DIR}" if prefix else ACCEPTANCE_DIR
+    base = base or _frozen_base(loop_dir)
+    has_pack = (loop_dir / ACCEPTANCE_DIR).exists()
+    if base is None:
+        if has_pack:
+            return [f"{acc_rel}/ exists but FROZEN names no `base:` (not a driver freeze)"]
+        return []
+    top = _git(loop_dir, "rev-parse", "--show-toplevel").stdout.strip()
+    repo_dir = Path(top) if top else loop_dir
+    rng = f"{base}..HEAD"
+    proc = _git(repo_dir, "log", "--reverse", "--format=%x1e%H%x1f%s%x1f%(trailers:key=Acceptance-Pin,valueonly,separator=%x2c)",
+                "--name-only", rng, "--", acc_rel)
+    if proc.returncode != 0:
+        return [f"cannot read the acceptance history ({proc.stderr.strip()[-200:]})"]
+    offenders: list[str] = []
+    # Tamper offenders a later driver `acceptance: restore` commit put
+    # right (the driver already counted that breach when it restored).
+    pending_tamper: list[str] = []
+    freeze_sha: str | None = None
+    for block in proc.stdout.split("\x1e"):
+        if not block.strip():
+            continue
+        head, _nl, rest = block.partition("\n")
+        sha, subject, pin = (head.split("\x1f") + ["", ""])[:3]
+        pin = pin.strip()
+        files = [ln for ln in rest.splitlines() if ln.strip()]
+        label = f"{sha[:12]} {subject!r}"
+        outside = [f for f in _git(repo_dir, "show", "--format=", "--name-only", sha).stdout.splitlines()
+                   if f.strip() and not f.startswith(acc_rel + "/")]
+        if _ACC_FREEZE_RE.match(subject) or _ACC_DRIVER_RE.match(subject):
+            kind = "freeze" if _ACC_FREEZE_RE.match(subject) else "driver"
+            if kind == "freeze":
+                if freeze_sha is not None:
+                    offenders.append(f"{label}: a second freeze commit (the pack is frozen once per loop)")
+                    continue
+                freeze_sha = sha
+            elif freeze_sha is None:
+                offenders.append(f"{label}: driver acceptance commit before the freeze")
+            restores = subject.startswith("acceptance: restore")
+            if outside:
+                offenders.append(f"{label}: touches files outside acceptance/: {', '.join(outside[:5])}")
+            if not pin or pin != pack_hash_at(repo_dir, sha, acc_rel):
+                offenders.append(f"{label}: Acceptance-Pin trailer does not match the committed pack")
+            elif kind == "driver" and restores:
+                pending_tamper.clear()
+            continue
+        m = _ACC_AMEND_RE.match(subject)
+        if m:
+            if freeze_sha is None:
+                offenders.append(f"{label}: amend before the freeze")
+            if outside:
+                offenders.append(f"{label}: an amend commit may touch only acceptance/ "
+                                 f"(also: {', '.join(outside[:5])})")
+            ids = [i.strip() for i in m.group(1).split(",")]
+            diff = _git(repo_dir, "show", "--format=", "-U0", sha, "--",
+                        f"{acc_rel}/AMENDMENTS.md").stdout
+            added = set(re.findall(r"^\+##\s+(ACC-[0-9]{1,4})\b", diff, re.MULTILINE))
+            missing = [i for i in ids if i not in added]
+            if missing:
+                offenders.append(f"{label}: no AMENDMENTS.md record for {', '.join(missing)}")
+            removed = re.findall(r"^-(?!--)(.+)$", diff, re.MULTILINE)
+            if removed:
+                offenders.append(f"{label}: AMENDMENTS.md is append-only (lines removed)")
+            continue
+        pending_tamper.append(f"{label}: touches {acc_rel}/ ({', '.join(files[:3])}) -- only the "
+                              "driver freeze/restore and amend commits may")
+    offenders.extend(pending_tamper)
+    if has_pack and freeze_sha is None and not offenders:
+        offenders.append(f"{acc_rel}/ exists but {rng} has no driver freeze commit")
+    if freeze_sha is not None:
+        slices = _git(repo_dir, "log", "--format=%H %s", "--grep=^slice(", rng).stdout.splitlines()
+        for line in slices:
+            ssha, _sp, subject = line.partition(" ")
+            anc = _git(repo_dir, "merge-base", "--is-ancestor", freeze_sha, ssha)
+            if anc.returncode != 0:
+                offenders.append(f"{ssha[:12]} {subject!r}: slice commit is not preceded by the "
+                                 f"acceptance freeze {freeze_sha[:12]}")
+    return offenders
 
 
 def covers(declared: str, actual: str) -> bool:
@@ -653,6 +812,13 @@ def main(argv: list[str] | None = None) -> int:
         "for the per-slice open-loop gate.",
     )
     parser.add_argument(
+        "--acceptance-base",
+        metavar="SHA",
+        default=None,
+        help="r19: start of the range the frozen-acceptance guard of "
+        "--require-commits checks (default: FROZEN's `base:`).",
+    )
+    parser.add_argument(
         "--slice",
         metavar="ID",
         default=None,
@@ -685,7 +851,16 @@ def main(argv: list[str] | None = None) -> int:
         print(render(report, require_commits=args.require_commits))
 
     if args.require_commits:
+        # r19: the frozen-acceptance guard (no pack: nothing to check).
+        loop_dir = Path(report["plan"]).parent
+        acc_offenders = acceptance_offenders(loop_dir, args.acceptance_base)
+        for msg in acc_offenders:
+            print(f"acceptance gate: {msg}")
         offenders = commit_gate_offenders(report)
+        if acc_offenders and not offenders:
+            print(f"acceptance gate: FAIL — {len(acc_offenders)} offender(s); only the "
+                  "driver and amend commits may touch acceptance/")
+            return 1
         if offenders:
             for e in offenders:
                 why = ""
@@ -700,6 +875,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"commit gate: FAIL — {len(offenders)} code-changing slice(s) "
                 "missing slice-prefixed commits; fix before Evaluator dispatch"
             )
+            if acc_offenders:
+                print(f"acceptance gate: FAIL — {len(acc_offenders)} offender(s)")
             return 1
         print("commit gate: PASS — every code-changing slice has a slice(<id>): commit")
     return 0
