@@ -1155,8 +1155,9 @@ def _dangling_worktrees(repo: Path | None) -> list[str]:
 def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     eval_removed, eval_kept = [], []
     lock_dir = mailbox / ".lock"
-    if (repo is not None and _lock_owner(lock_dir) == _owner(a.token)
-            and not _foreign_live_pid(lock_dir)):
+    ours = (lock_dir.is_dir() and _lock_owner(lock_dir) == _owner(a.token)
+            and not _foreign_live_pid(lock_dir))
+    if repo is not None and ours:
         rel = TL._mailbox_rel(repo, mailbox)
         for path in _eval_worktrees(repo):
             why = _remove_worktree(repo, path, rel, force_any=True)
@@ -1165,7 +1166,9 @@ def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     lock = _release(mailbox, a.token)
     snap = _snapshot(_state(mailbox))
     session = _read_json(mailbox / SESSION)
-    if session.get("session") == a.token and not session.get("done"):
+    # Only the lock owner closes the session record: `end` also runs after
+    # a refused or garbled `begin` (N2), when another run may own both.
+    if ours and session.get("session") == a.token and not session.get("done"):
         _write_session(mailbox, a.token, "done", done=True)
     return {"lock": lock, "dangling_worktrees": _dangling_worktrees(repo),
             "eval_worktrees_removed": eval_removed,

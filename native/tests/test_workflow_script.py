@@ -603,3 +603,13 @@ def test_harness_role_denials_are_surfaced() -> None:
             assert "starting with `DENIED:`" in c["prompt"]
     clean = run({"verdicts": ["SHIP"]})["result"]
     assert clean["role_denials"] == []
+
+
+@needs_node
+def test_harness_garbled_begin_still_runs_end() -> None:
+    """eval-native-v0b N2: begin's helper may have taken the lock."""
+    out = run({"verdicts": ["SHIP"], "lossy": {"begin": 2}})
+    r = out["result"]
+    assert r["status"] == "error" and "begin" in r["reason"]
+    assert seq(out) == ["begin", "begin", "end"]
+    assert r["lock"] == "released"

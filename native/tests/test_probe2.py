@@ -229,3 +229,21 @@ def test_next_finishing_needs_retirement_reports_shas_and_fold(
     again = step(repo, "next", max_iterations=4)
     assert again["commit_shas"] == [p["sha"]]
     assert again["retirement_fold"] is None  # nothing finalized this time
+
+
+# --------------------------------------------- N2: end after a failed begin
+def test_end_after_refused_begin_leaves_the_owner_alone(repo: Path) -> None:
+    import json as _json
+    import os
+    assert step(repo, "begin")["ok"]            # run A holds the lock
+    session = mbox(repo) / ".session.json"
+    before = session.read_text()
+    env = git_env()
+    env["TRIO_NATIVE_HOLDER_PID"] = str(os.getppid())  # another live process
+    refused = step(repo, "begin", env=env)
+    assert not refused["ok"] and "refused" in refused["error"]
+    e = step(repo, "end", env=env)
+    assert e["ok"] and e["lock"] == "foreign"
+    assert (mbox(repo) / ".lock").is_dir()
+    assert session.read_text() == before
+    assert not _json.loads(before)["done"]

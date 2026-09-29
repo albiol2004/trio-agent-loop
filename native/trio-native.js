@@ -665,10 +665,13 @@ let began = false
 try {
   phase('Begin')
   const b = await step('begin', {})
+  // eval-native-v0b N2: `end` runs whenever `begin` was attempted — a
+  // garbled begin result may still have taken the lock, and `end` is safe
+  // for a run that does not own it (lock `foreign`, nothing removed).
+  began = true
   if (!b.ok) {
     outcome = stepFail('begin', b)
   } else {
-    began = true
     B = b
     log(`mailbox ${MAILBOX}: iteration ${b.iteration}, status ${b.status}, phase ${b.phase}`)
     phase('Iterate')
