@@ -842,7 +842,8 @@ def _git_common_dir(path: Path) -> Path | None:
 
     try:
         proc = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+            ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+             "-C", str(path), "rev-parse", "--path-format=absolute",
              "--git-common-dir"],
             capture_output=True, text=True,
         )

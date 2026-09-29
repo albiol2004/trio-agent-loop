@@ -231,7 +231,7 @@ Endpoints:
   the confirm must carry that `confirm_token` = hash(loop, fix id, exact
   steps incl. a resume's validated session/run id/args, the live HEAD, the
   root HEAD and the land target's sha for root-free loops, STATE.md /
-  VERDICT.md / HUMAN.md, `.native-launch.json` / `.native-result.json` /
+  VERDICT.md / HUMAN.md / GOAL.md, `.native-launch.json` / `.native-result.json` /
   `.session.json` / `.driver.json` / `.repairs` digests and the registry
   record). The server re-plans under the loop's
   action lock (the loop context is gathered only after the lock is taken)
@@ -240,7 +240,8 @@ Endpoints:
 - `POST /api/loop/answer {root, loop, answer, reset?=true, confirm?,
   confirm_token?}` — 409 preview first (the exact HUMAN.md entry and STATE
   changes, and its token), then writes with the same token rule; the
-  response lists the restart fixes that now apply.
+  response lists the restart fixes that now apply. An answer that is not
+  valid Unicode text (a lone UTF-16 surrogate) is a 400; nothing is written.
 - A mailbox that resolves outside the workspace root and its accepted Lead
   worktrees (listed by the workspace repository's own `git worktree list`,
   really of that repository, under the workspace or the Trio worktree root
@@ -249,10 +250,16 @@ Endpoints:
   started with `--worktree-root` or another `TRIO_WORKTREE_ROOT` (e.g. a
   sibling `<repo>-worktrees/` layout) needs the same `TRIO_WORKTREE_ROOT`
   in the trio-dash service env; an enclosing repository never counts), or that contains
-  any symlink (directly, or in `.lock/` or `.native-runs/`), gets 403 on every action endpoint and a "refused" board
+  any symlink (directly, or in `.lock/` or `.native-runs/`), or that holds
+  a `.git` entry (a nested repository, whose config every git call on the
+  mailbox would read), gets 403 on every action endpoint and a "refused" board
   card; nothing in it is read (every mailbox, sidecar and registry read is
   `O_NOFOLLOW`, regular files only) or written (writes are `mkstemp` +
   rename, never through a link).
+- Every git call the dashboard makes on a workspace or mailbox repository
+  (reads, and the git steps it plans) runs with `-c core.fsmonitor=false
+  -c core.hooksPath=/dev/null -c protocol.file.allow=never`: a repository's
+  configured fsmonitor command or hooks never run from the dashboard.
 - Mailbox data never chooses what runs. A mailbox path may use any
   printable characters (spaces, non-ASCII letters, `,`, `~` …): it is
   passed as one argv element and every driver quotes it where it enters a

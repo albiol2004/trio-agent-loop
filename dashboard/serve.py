@@ -219,6 +219,12 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 """Directory this file lives in; static frontend files are served from here."""
 
 METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
+#: Config overrides for every git call the dashboard makes on a workspace or
+#: mailbox repository: never run a repository-configured fsmonitor command or
+#: hook, never follow a file:// transport (eval4 finding 2; the same tuple as
+#: loop_actions.SAFE_GIT_CONFIG and human_ledger.SAFE_GIT_CONFIG).
+SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                   "-c", "protocol.file.allow=never")
 """Parsing module, resolved relative to this file (NOT cwd)."""
 
 INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
@@ -935,6 +941,19 @@ def _mailbox_symlinks(loop_dir: Path) -> list[str]:
         return ["<unreadable>"]
 
 
+def _mailbox_nested_git(loop_dir: Path) -> bool:
+    """A mailbox holding a ``.git`` entry (loop_actions.mailbox_nested_git):
+    refused like a mailbox with symlinks (eval4 finding 2)."""
+    try:
+        return bool(load_loop_actions_module().mailbox_nested_git(loop_dir))
+    except Exception:  # noqa: BLE001 - treat an unreadable mailbox as refused
+        return True
+
+
+NESTED_GIT_REFUSAL = ("the mailbox contains a .git entry (a nested repository); "
+                      "nothing in it is read")
+
+
 def _io_lines(path: Path):
     """A text stream over a mailbox file read without following a link."""
     import io
@@ -1609,6 +1628,9 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
     elif _mailbox_symlinks(loop_dir):
         start = (False, "The mailbox contains symlinks; nothing in it is read or "
                         "started (eval2 finding 2).")
+    elif _mailbox_nested_git(loop_dir):
+        start = (False, "The mailbox contains a .git entry (a nested repository); "
+                        "nothing in it is read or started.")
     elif not (loop_dir / "GOAL.md").is_file():
         start = (False, "GOAL.md is missing.")
     elif not Path(entrypoints[chosen]).is_file():
@@ -2115,7 +2137,8 @@ def _repo_slice_commits(root: Path) -> list[dict]:
     """`_loop_commits` for one repository."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "log", "--format=%H%x09%h%x09%s", "-n", "200"],
+            ["git", *SAFE_GIT_CONFIG, "-C", str(root), "log", "--format=%H%x09%h%x09%s",
+             "-n", "200"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -3311,7 +3334,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         try:
             status = subprocess.run(
-                ["git", "-C", str(root), "status", "--porcelain"],
+                ["git", *SAFE_GIT_CONFIG, "-C", str(root), "status", "--porcelain"],
                 capture_output=True, text=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -4277,6 +4300,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "segments": [], "refused": "mailbox contains symlinks",
                 })
                 continue
+            if _mailbox_nested_git(loop_dir) or (loop_dir != root_dir
+                                                 and _mailbox_nested_git(root_dir)):
+                name = metrics.loop_name(root, root_dir)
+                loops.append({
+                    "name": name, "path": name, "mission": "", "title": "",
+                    "iteration": None, "max_iterations": None, "status": "unknown",
+                    "final_verdict": None, "last_activity": None, "verdict_mtime": None,
+                    "last_entry_summary": "refused: " + NESTED_GIT_REFUSAL,
+                    "segments": [], "refused": "mailbox contains a .git entry",
+                })
+                continue
             try:
                 card = self._loop_card(loop_dir, metrics, root)
                 if loop_dir != root_dir:
@@ -4418,6 +4452,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(403, {"error": "the mailbox contains symlinks ("
                                          + ", ".join(links[:5]) + "); nothing in it is read",
                                          "refused": True})
+        if _mailbox_nested_git(loop_dir):
+            return self._send_json(403, {"error": NESTED_GIT_REFUSAL, "refused": True})
         card = self._loop_card(loop_dir, self.server.metrics, root)
         card["name"] = card["path"] = name  # r16: a live copy keeps the root name
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
@@ -4874,6 +4910,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         reset = payload.get("reset", True)
         if not isinstance(reset, bool):
             return self._send_json(400, {"error": "reset must be a boolean"})
+        answer = payload.get("answer")
+        if isinstance(answer, str):
+            try:
+                answer.encode("utf-8")
+            except UnicodeEncodeError:
+                # a lone UTF-16 surrogate (eval4 finding 5): a clean 400
+                return self._send_json(400, {"error": "the answer is not valid Unicode text "
+                                                      "(it contains a lone surrogate)"})
         token = payload.get("confirm_token")
         lock = _action_lock(la.loop_key(pair[0]))
         if not lock.acquire(blocking=False):
@@ -5464,7 +5508,7 @@ def _worktree_git_labels(worktree: Path, mailboxes: list[Path]) -> dict:
     if rels:
         try:
             result = subprocess.run(
-                ["git", "--no-optional-locks", "-C", str(worktree), "status",
+                ["git", "--no-optional-locks", *SAFE_GIT_CONFIG, "-C", str(worktree), "status",
                  "--porcelain", "-uall", "--ignored=matching", "--", *rels],
                 capture_output=True, text=True, timeout=10, check=False)
             if result.returncode == 0:
@@ -5540,7 +5584,7 @@ def _git_out(cwd: Path, *args: str) -> str | None:
     """stdout of a read-only git command, or None on any failure."""
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(cwd), *args],
+            ["git", "--no-optional-locks", *SAFE_GIT_CONFIG, "-C", str(cwd), *args],
             capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -5953,7 +5997,7 @@ def _dashboard_version() -> str:
         return "release-" + release.name[:7]
     try:
         result = subprocess.run(
-            ["git", "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
+            ["git", *SAFE_GIT_CONFIG, "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5, check=False)
     except (OSError, subprocess.SubprocessError):
         return "unknown"

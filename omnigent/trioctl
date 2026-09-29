@@ -5650,12 +5650,17 @@ class OmnigentRunner:
         prompt_role = "lead" if role == "repair" else role
         template = self._prompt_path(prompt_role).read_text(encoding="utf-8")
         values = {
-            "{mailbox}": _pp(mailbox.resolve()),
-            "{iteration}": str(iteration),
-            "{repo}": _pp(self.repo),
+            "mailbox": _pp(mailbox.resolve()),
+            "iteration": str(iteration),
+            "repo": _pp(self.repo),
         }
-        for placeholder, value in values.items():
-            template = template.replace(placeholder, value)
+        # Single pass: a substituted value (a path containing `{repo}`) is
+        # never itself re-substituted (eval4 finding 4).
+        template = re.sub(
+            r"\{(mailbox|iteration|repo)\}",
+            lambda m: values[m.group(1)],
+            template,
+        )
         if role != "repair":
             result = template.rstrip() + "\n"
         else:

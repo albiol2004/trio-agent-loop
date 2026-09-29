@@ -612,8 +612,20 @@ def _same_file(a, b) -> bool:
 # Git helpers (read-only unless a fix says otherwise)
 # --------------------------------------------------------------------------
 
+#: Config overrides for every dashboard git call on a mailbox's repository:
+#: never run a repository-configured fsmonitor command or hook, never follow
+#: a file:// transport (eval4 finding 2). Same as human_ledger.SAFE_GIT_CONFIG.
+SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                   "-c", "protocol.file.allow=never")
+
+
+def git_argv(cwd: Path, *args: str) -> list[str]:
+    """``git <safe config> -C <cwd> <args>`` (also for planned fix steps)."""
+    return ["git", *SAFE_GIT_CONFIG, "-C", str(cwd), *args]
+
+
 def git(cwd: Path, *args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "--no-optional-locks", "-C", str(cwd), *args],
+    return subprocess.run(["git", "--no-optional-locks", *SAFE_GIT_CONFIG, "-C", str(cwd), *args],
                           capture_output=True, text=True, timeout=timeout, check=False)
 
 
@@ -1021,6 +1033,19 @@ def mailbox_symlinks(mailbox: Path) -> list[str]:
     return sorted(out)
 
 
+def mailbox_nested_git(mailbox: Path) -> bool:
+    """Whether a mailbox holds a ``.git`` entry (directory, file or link):
+    a nested repository whose config every git call on the mailbox would
+    read. Such a mailbox is refused as a whole (eval4 finding 2)."""
+    try:
+        os.lstat(Path(mailbox) / ".git")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def mailbox_file(mailbox: Path, name: str) -> Path:
     """``<mailbox>/<name>`` for reading or writing, refused (PathEscape) when
     it is a symlink or resolves outside the mailbox."""
@@ -1073,6 +1098,9 @@ class LoopContext:
         if links:
             raise PathEscape("the mailbox contains symlinks (" + ", ".join(
                 display_name(n, 80) for n in links[:8]) + "); nothing in it is read or acted on")
+        if mailbox_nested_git(live_mailbox) or mailbox_nested_git(root_mailbox):
+            raise PathEscape("the mailbox contains a .git entry (a nested repository); "
+                             "nothing in it is read or acted on")
         self.root_mailbox = Path(root_mailbox)
         self.live_mailbox = Path(live_mailbox)
         self.detection = detection or {}
@@ -1413,9 +1441,9 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
             steps.append({"kind": "append", "path": str(mailbox_file(ctx.live_mailbox, "VERDICT.md")),
                           "text": f"commit: {head}\n",
                           "display": f"append 'commit: {head}' to {rel}/VERDICT.md (clean tree: HEAD)"})
-        steps.append(_cmd_step(["git", "-C", str(repo), "add", "--", rel], Path(repo), detached=False))
-        steps.append(_cmd_step(["git", "-C", str(repo), "commit", "-q", "-m",
-                                f"loop: iteration {iteration} — SHIP", "--", rel],
+        steps.append(_cmd_step(git_argv(Path(repo), "add", "--", rel), Path(repo), detached=False))
+        steps.append(_cmd_step(git_argv(Path(repo), "commit", "-q", "-m",
+                                        f"loop: iteration {iteration} — SHIP", "--", rel),
                                Path(repo), detached=False))
         notes.append("then re-run the loop so the driver finalizes needs_retirement → shipped")
         files = _mailbox_file_set(Path(repo), rel)
@@ -1456,10 +1484,10 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
                              + ("; kept: " + "; ".join(f"{c['path']}: {c['reason']}"
                                                         for c in candidates) if candidates else ""))
         for c in ok:
-            steps.append(_cmd_step(["git", "-C", str(ctx.live_repo), "worktree", "remove", c["path"]],
+            steps.append(_cmd_step(git_argv(ctx.live_repo, "worktree", "remove", c["path"]),
                                    ctx.live_repo, detached=False))
             if c["branch"]:
-                steps.append(_cmd_step(["git", "-C", str(ctx.live_repo), "branch", "-d", c["branch"]],
+                steps.append(_cmd_step(git_argv(ctx.live_repo, "branch", "-d", c["branch"]),
                                        ctx.live_repo, detached=False))
         notes += [f"kept {c['path']}: {c['reason']}" for c in candidates if not c["ok"]]
     if native and fix_id.startswith("native_") or (native and fix_id == "repair_scope"):
@@ -1528,7 +1556,7 @@ def plan_basis(ctx: LoopContext) -> dict:
     """The state a plan was made from (eval findings 3 and eval2 6): the live
     checkout's HEAD, the root checkout's HEAD and the land target's sha when
     they differ (root-free loops), the STATE.md / VERDICT.md / HUMAN.md
-    digests, the native sidecars, ``.repairs`` and the run-registry record.
+    digests, the GOAL.md digest, the native sidecars, ``.repairs`` and the run-registry record.
     Computed once per LoopContext (a context is gathered per request)."""
     cached = getattr(ctx, "_plan_basis", None)
     if cached is not None:
@@ -1536,7 +1564,9 @@ def plan_basis(ctx: LoopContext) -> dict:
     head = _rev(ctx.live_repo, "HEAD")
     basis = {"head": head, "state": _file_digest(ctx.live_mailbox, "STATE.md"),
              "verdict": _file_digest(ctx.live_mailbox, "VERDICT.md"),
-             "human": _file_digest(ctx.live_mailbox, "HUMAN.md")}
+             "human": _file_digest(ctx.live_mailbox, "HUMAN.md"),
+             # an answer's stop binding is computed at confirm (eval4 finding 6)
+             "goal": _file_digest(ctx.live_mailbox, "GOAL.md")}
     if Path(ctx.repo_root) != Path(ctx.live_repo):
         basis["root_head"] = _rev(ctx.repo_root, "HEAD")
     target = str(ctx.state.get("target_ref") or "").strip()
@@ -2078,6 +2108,11 @@ def plan_answer(ctx: LoopContext, text: str, reset: bool, who: dict) -> dict:
     _require_not_live(ctx)
     if not isinstance(text, str) or not text.strip():
         raise FixRefused("the answer is empty")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise FixRefused("the answer is not valid Unicode text (it contains a lone "
+                         "surrogate)") from None
     if len(text) > ANSWER_LIMIT:
         raise FixRefused(f"the answer is longer than {ANSWER_LIMIT} characters")
     if reset and not info["reset_allowed"]:
