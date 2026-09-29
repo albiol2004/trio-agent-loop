@@ -1,13 +1,17 @@
 FROZEN ACCEPTANCE (r19; this loop runs with the acceptance switch on) --
 extends your procedure:
-0. Before any builder dispatch, wait for the freeze:
-   `trioctl omnigent acceptance wait --mailbox {mailbox}` (run it with a
-   shell timeout of at least 910 s; call it again if it times out). You
-   may read code and draft PLAN.md meanwhile. Then read
+0. Before any builder dispatch AND before any product commit (no
+   `slice(<id>):` take-over commit, no code commit of your own) wait for
+   the freeze: `trioctl omnigent acceptance wait --mailbox {mailbox}` (run
+   it with a shell timeout of at least 910 s; call it again if it times
+   out). You may read code and draft PLAN.md meanwhile; commit nothing but
+   PLAN.md until `{mailbox}/acceptance/FROZEN` is committed. Then read
    `{mailbox}/acceptance/MANIFEST.json` and `AUTHOR.md`. You may read the
    check scripts; NEVER edit, add or delete anything under
    `{mailbox}/acceptance/` (the driver restores it and counts a gate
-   breach; a second breach stops the loop).
+   breach; a second breach in the loop stops it). Never write a
+   `(human)` amend commit: only a human, through trioctl while the loop is
+   stopped, amends as `(human)`.
 1. Map every `behaviour`/`doc` check id: put it in the `covers:` list of
    the slice(s) that make it pass (`covers: [ACC-03, ACC-09]` inside the
    slice entry) or in `lead_integration:` under `## Verification

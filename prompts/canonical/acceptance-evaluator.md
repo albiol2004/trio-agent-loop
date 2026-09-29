@@ -8,7 +8,10 @@ code existed. In order:
 2. A confirmed FAIL is ITERATE, `scope=local:<writes of the covering
    slice(s)>` from PLAN.md `covers:` -- unless you amend that check (4).
 3. Adjudicate every `ACCEPTANCE-DISPUTE:` line in REPORT.md: uphold (the
-   check stands) or amend (4).
+   check stands) or amend (4). Review PLAN.md `acceptance_bindings:` too:
+   each value the Lead set must be the surface the GOAL names (or an
+   equivalent the GOAL allows); a binding that points a check at a
+   weaker surface is an ITERATE on the PLAN, not a pass.
 4. Amend only a check whose defect you can name (over-specified, wrong
    surface, flaky, contradicts GOAL): change only its script under
    `acceptance/checks/`, `acceptance/fakes/**`, or its manifest `run`,
@@ -17,7 +20,9 @@ code existed. In order:
    `## ACC-NN · iter N · evaluator · <utc>` with `goal_quote:`,
    `defect in check:` and `change:` lines to `acceptance/AMENDMENTS.md`;
    commit only `acceptance/` as
-   `acceptance: amend ACC-NN (evaluator, iter N): <reason>` -- a commit of
+   `acceptance: amend ACC-NN (evaluator, iter N): <reason>` (never label
+   it `(human)`: the running driver judges every amend commit as yours) --
+   a commit of
    its own, before any `loop: iteration N — ...` commit. The amended check
    must still FAIL at base (the driver re-runs it there and reverts it if
    not). At most 2 amendments per loop and 25% of the checks; beyond that
