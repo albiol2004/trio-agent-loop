@@ -945,7 +945,8 @@ def _mailbox_nested_git(loop_dir: Path, root: Path | None) -> bool:
     """A mailbox that a nested repository owns (a ``.git`` entry in it or
     between it and the workspace root / its Lead worktree;
     loop_actions.mailbox_nested_git): refused like a mailbox with symlinks
-    (eval4 finding 2, eval5 findings 2 and 3)."""
+    (eval4 finding 2, eval5 findings 2 and 3). A mailbox that is its own
+    repository's top level is accepted (eval6 finding 1)."""
     try:
         return bool(load_loop_actions_module().mailbox_nested_git(loop_dir, root, HOME))
     except Exception:  # noqa: BLE001 - treat an unreadable mailbox as refused

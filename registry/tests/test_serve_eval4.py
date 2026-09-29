@@ -45,7 +45,10 @@ class NestedGitTests(_AnswerBase):
     def get(self, path: str, **query) -> tuple[int, dict]:
         return D._request("GET", f"{self.base}{path}?{urllib.parse.urlencode(query)}")
 
-    def test_a_nested_git_in_the_mailbox_is_refused_and_its_fsmonitor_never_runs(self):
+    def test_a_mailbox_that_is_its_own_repo_is_read_but_its_fsmonitor_never_runs(self):
+        # eval6 finding 1: a mailbox that is its own repository's top level
+        # is accepted (eval4 refused it); SAFE_GIT_CONFIG still keeps its
+        # config's programs from running.
         box = self.repo_with_stop("loop-fsm")
         hook, marker = self.hook()
         _git(box, "init", "-q", ".")
@@ -53,21 +56,12 @@ class NestedGitTests(_AnswerBase):
         _git(box, "commit", "-q", "--allow-empty", "-m", "x")
         marker.unlink(missing_ok=True)
         self.start_server()
-        status, data = self.get("/api/loop/actions", root=str(self.root), loop="loop-fsm")
-        self.assertEqual(status, 403, data)
-        self.assertTrue(data.get("refused"))
-        self.assertIn(".git entry", data["error"])
+        self.actions("loop-fsm")
         status, data = self.get("/api/loop", root=str(self.root), name="loop-fsm")
-        self.assertEqual(status, 403, data)
-        self.assertTrue(data.get("refused"))
-        card = self.card("loop-fsm")
-        self.assertEqual(card["refused"], "mailbox contains a .git entry")
-        self.assertIn("refused", card["last_entry_summary"])
-        self.assertEqual(self.inbox("loop-fsm"), [])
-        status, data = self.post("/api/loop/answer", {"root": str(self.root), "loop": "loop-fsm",
-                                                      "answer": "x", "reset": True})
-        self.assertEqual(status, 403, data)
-        self.assertFalse((box / "HUMAN.md").exists())
+        self.assertEqual(status, 200, data)
+        self.assertNotIn("refused", self.card("loop-fsm"))
+        self.answer("loop-fsm")
+        self.assertTrue((box / "HUMAN.md").is_file())
         self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     def test_a_git_file_or_link_named_dot_git_is_refused_too(self):

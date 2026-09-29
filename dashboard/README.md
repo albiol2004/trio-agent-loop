@@ -259,7 +259,13 @@ Endpoints:
   (every mailbox, sidecar and registry read is `O_NOFOLLOW`, regular files
   only) or written (writes are `mkstemp` + rename, never through a link).
   A workspace root that is itself the mailbox and its repository's top
-  level is accepted: that `.git` is the workspace's own repository.
+  level is accepted: that `.git` is the workspace's own repository. So is
+  a mailbox that is its own repository's top level (a real `.git`
+  directory directly in it, e.g. a plain `git init` in the mailbox, and
+  `git rev-parse --show-toplevel` from it naming the mailbox): git never
+  checks out a `.git` path, so that repository is the loop's own. A `.git`
+  in a directory between such a mailbox and the workspace root is still
+  refused.
 - Every git call the dashboard makes on a workspace, mailbox or slice
   repository (reads, the git steps it plans, and trio-shadow's slice
   attribution — which trioctl's commit gate shares) runs with one config
@@ -273,8 +279,12 @@ Endpoints:
   A repository-configured program never runs from the dashboard, and a
   tracked bare-repository layout (e.g. a PLAN.md slice `repo:` pointing at
   one) is not a repository to it. The retirement commit is unsigned and
-  skips hooks. (`diff.external=` is not set: git 2.43 would then run an
-  empty command on `git diff`.)
+  skips hooks (the `retire_ship` preview says so). `diff.external=` is not
+  set (git 2.43 would then run an empty command on `git diff`); instead
+  the one textual diff the dashboard runs — the diagnosis snapshot's
+  `git diff HEAD --binary`, hashed to detect changes — passes
+  `--no-ext-diff --no-textconv`, so no configured external diff or
+  textconv program runs. Every other diff is `--name-only`/`--name-status`.
 - Mailbox data never chooses what runs. A mailbox path may use any
   printable characters (spaces, non-ASCII letters, `,`, `~` …): it is
   passed as one argv element and every driver quotes it where it enters a

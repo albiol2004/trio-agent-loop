@@ -1042,6 +1042,27 @@ def _has_git_entry(directory: Path) -> bool:
     return True
 
 
+def mailbox_own_repo(mailbox: Path) -> bool:
+    """Whether *mailbox* is its own repository's top level: a real ``.git``
+    directory (not a link or a gitfile) directly in it, and ``git rev-parse
+    --show-toplevel`` from it (under SAFE_GIT_CONFIG) naming the mailbox's
+    real path. Never raises; anything unreadable is False."""
+    try:
+        box = Path(mailbox).resolve(strict=True)
+        st = os.lstat(box / ".git")
+    except (OSError, RuntimeError):
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    top = git_toplevel(box)
+    if top is None:
+        return False
+    try:
+        return top.resolve(strict=True) == box
+    except (OSError, RuntimeError):
+        return False
+
+
 def mailbox_nested_git(mailbox: Path, root: Path | None = None,
                        home: Path | None = None) -> bool:
     """Whether a nested (foreign) repository would own the mailbox: a ``.git``
@@ -1054,10 +1075,15 @@ def mailbox_nested_git(mailbox: Path, root: Path | None = None,
 
     The anchor's own ``.git`` is the workspace's (or the worktree's) own
     repository: a workspace root that is itself the mailbox and its
-    repository's top level is accepted (eval5 finding 3). Without *root*
-    only the mailbox itself is checked. Never raises."""
+    repository's top level is accepted (eval5 finding 3). So is a mailbox
+    that is its own repository's top level (``mailbox_own_repo``: a plain
+    ``git init`` in the mailbox; eval6 finding 1) — its ``.git`` is that
+    loop's own and cannot come from tracked content. A ``.git`` in any
+    directory between such a mailbox and its anchor is still refused.
+    Without *root* only the mailbox itself is checked. Never raises."""
     if root is None:
-        return _has_git_entry(Path(mailbox))
+        box = Path(mailbox)
+        return _has_git_entry(box) and not mailbox_own_repo(box)
     try:
         root_real = Path(root).resolve(strict=True)
         box = Path(mailbox).resolve(strict=True)
@@ -1068,6 +1094,8 @@ def mailbox_nested_git(mailbox: Path, root: Path | None = None,
         if directory == root_real:
             return False
         if not _has_git_entry(directory):
+            continue
+        if directory == box and mailbox_own_repo(box):
             continue
         if worktrees is None:
             try:
@@ -1478,6 +1506,11 @@ def plan_fix(ctx: LoopContext, fix_id: str, args: dict | None = None) -> dict:
         steps.append(_cmd_step(git_argv(Path(repo), "commit", "-q", "-m",
                                         f"loop: iteration {iteration} — SHIP", "--", rel),
                                Path(repo), detached=False))
+        notes.append("the retirement commit is made unsigned (commit.gpgSign=false, "
+                     "gpg.program=/bin/false) and without repository hooks (core.hooksPath=/dev/null): "
+                     "every dashboard git call runs under SAFE_GIT_CONFIG so no repository-"
+                     "chosen program (signer, hook, fsmonitor) executes from the dashboard; "
+                     "sign or amend it yourself if the remote requires signed commits")
         notes.append("then re-run the loop so the driver finalizes needs_retirement → shipped")
         files = _mailbox_file_set(Path(repo), rel)
         mailbox_files = {"count": len(files), "digest": hashlib.sha256(
@@ -2472,7 +2505,8 @@ def _snapshot_files(ctx: LoopContext) -> dict:
                 pass
         snap["<git status>"] = hashlib.sha256(git(
             repo, "status", "--porcelain=v1", "--untracked-files=all", "--ignored").stdout.encode()).hexdigest()
-        snap["<git diff>"] = hashlib.sha256(git(repo, "diff", "HEAD", "--binary").stdout.encode()).hexdigest()
+        snap["<git diff>"] = hashlib.sha256(git(
+            repo, "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary").stdout.encode()).hexdigest()
         snap["<git refs>"] = hashlib.sha256(git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout.encode()).hexdigest()
     except (OSError, subprocess.TimeoutExpired):
         pass

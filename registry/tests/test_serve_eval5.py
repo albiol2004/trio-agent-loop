@@ -274,10 +274,12 @@ class NestedGitLayoutTests(_AnswerBase):
             la.LoopContext(home=self.home, root=self.root, name="loop-grp/m1", root_mailbox=box,
                            live_mailbox=box, detection={}, driver=None)
 
-    def test_a_mailbox_that_is_its_own_top_level_below_the_root_stays_refused(self):
+    def test_a_mailbox_that_is_its_own_top_level_below_the_root_is_accepted(self):
+        # eval6 finding 1 reverses eval5's "stays refused": the mailbox's own
+        # .git (a plain `git init` in it) is the loop's repository.
         box = _mailbox(self.root, "loop-own", NH_STATE, "VERDICT: NEEDS_HUMAN\n")
         _git(box, "init", "-q", ".")
-        self.assertTrue(la.mailbox_nested_git(box, self.root, self.home))
+        self.assertFalse(la.mailbox_nested_git(box, self.root, self.home))
 
     def test_a_root_that_is_the_mailbox_and_its_repo_top_level_is_accepted(self):
         _git(self.root, "init", "-q", "-b", "main")
