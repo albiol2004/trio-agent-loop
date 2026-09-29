@@ -1671,7 +1671,7 @@ def _loop_state(loop_dir: Path, sources: list[str]) -> dict:
     """Derived loop state (loop_actions.derive_state), trimmed for a card."""
     try:
         derived = load_loop_actions_module().derive_state(
-            loop_dir, sources, home=None, last_action=_last_action(loop_dir))
+            loop_dir, sources, home=HOME, last_action=_last_action(loop_dir))
     except Exception:  # noqa: BLE001 - the card renders without it
         traceback.print_exc()
         return {"state": "unknown", "driver": None, "summary": "", "detail": {}}
@@ -4798,6 +4798,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "session_id", "run_id", "session_live", "lock", "result", "args", "errors")}
             if native else None,
             "native_launcher": str(la.native_launcher(HOME) or "") or None,
+            "native_script": la.native_script_view(ctx.native, ctx.registry, HOME, ctx.live_repo),
             "fixes": la.available_fixes(ctx), "unblock": la.UNBLOCK_TABLE,
             "never_automated": la.NEVER_AUTOMATED,
             "answer": la.answer_context(ctx), "diagnosis": diagnosis,

@@ -497,6 +497,7 @@ def native_facts(mailbox: Path, home: Path | None = None) -> dict | None:
     session = read_json(mailbox / ".session.json")
     launch = read_json(mailbox / ".native-launch.json")
     result = read_json(mailbox / ".native-result.json")
+    result_record = result  # the file as written, even when raw output replaces it below
     is_native = bool(
         (session and session.get("driver") == NATIVE_DRIVER)
         or launch or (result and result.get("driver", NATIVE_DRIVER) == NATIVE_DRIVER))
@@ -533,8 +534,8 @@ def native_facts(mailbox: Path, home: Path | None = None) -> dict | None:
     if home is not None and session_id and not run_id and "run_id" not in errors:
         run_id = find_run_id(home, session_id)
     return {
-        "session": session, "launch": launch, "result": result, "args": args,
-        "errors": errors, "lock": lock, "session_live": session_live,
+        "session": session, "launch": launch, "result": result,
+        "result_record": result_record, "args": args, "errors": errors, "lock": lock, "session_live": session_live,
         "session_id": session_id, "run_id": run_id,
         "running": session_live or bool(lock and lock["alive"]
                                         and str(lock.get("owner") or "").startswith("workflow:")),
@@ -599,6 +600,99 @@ def native_helper(home: Path) -> Path | None:
     """The installed release's ``trio_native_step.py``."""
     native = release_native_dir(home)
     return native / "trio_native_step.py" if native is not None else None
+
+
+WORKFLOW_SCRIPT_FILE = "trio-native.js"
+WORKFLOW_SCRIPT_SCOPES = ("project", "user", "none", "unknown")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_SCRIPT_HASH_LIMIT = 8 * 1024 * 1024
+
+
+def _display_path(value) -> str | None:
+    """A recorded path for display (the UI sets it as textContent): a string
+    without control characters, capped; anything else is None."""
+    if not isinstance(value, str) or not value:
+        return None
+    return re.sub(r"[\x00-\x1f\x7f]", "?", value)[:400]
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        if not path.is_file() or path.stat().st_size > _SCRIPT_HASH_LIMIT:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _script_view(path, scope, is_release, sha256) -> dict:
+    sha = sha256 if isinstance(sha256, str) and _SHA256_RE.fullmatch(sha256) else None
+    return {
+        "path": _display_path(path),
+        "scope": scope if scope in WORKFLOW_SCRIPT_SCOPES else "unknown",
+        "is_release": is_release if isinstance(is_release, bool) else None,
+        "sha256": sha, "sha_short": sha[:12] if sha else None,
+    }
+
+
+def native_script_view(native: dict | None, registry: dict | None, home: Path,
+                       repo: Path | None) -> dict | None:
+    """Display-only view of the trio-native Workflow script (native-v01's
+    ``workflow_script*`` fields), or None for a non-native loop.
+
+    ``recorded``: what the last run's ``.native-result.json`` (else its run
+    registry record) says the session ran; every field is ``None``/
+    ``"unknown"`` for records that predate those fields. ``next``: what a
+    Start/Resume from the dashboard would run now: the installed release's
+    launch.sh starts claude in the loop's repo, which loads ``trio-native.js``
+    by the documented precedence (the repo's ``.claude/workflows/``, then
+    ``$CLAUDE_CONFIG_DIR``/``~/.claude`` ``workflows/``); ``is_release``
+    compares that file with the release's own ``trio-native.js`` (same file
+    or same bytes), as launch.sh does. Nothing here is ever executed."""
+    if not native:
+        return None
+    source, record = None, {}
+    for name, candidate in (("result", native.get("result_record")), ("registry", registry)):
+        if isinstance(candidate, dict) and any(k.startswith("workflow_script") for k in candidate):
+            source, record = name, candidate
+            break
+    recorded = _script_view(record.get("workflow_script"), record.get("workflow_script_scope"),
+                            record.get("workflow_script_is_release"),
+                            record.get("workflow_script_sha256"))
+    recorded["source"] = source
+    raw_candidates = record.get("workflow_script_candidates")
+    recorded["candidates"] = [
+        {"path": _display_path(c.get("path")),
+         "scope": c.get("scope") if c.get("scope") in WORKFLOW_SCRIPT_SCOPES else "unknown",
+         "exists": c.get("exists") if isinstance(c.get("exists"), bool) else None}
+        for c in (raw_candidates if isinstance(raw_candidates, list) else [])[:8]
+        if isinstance(c, dict)]
+
+    release_dir = release_native_dir(home)
+    release = release_dir / WORKFLOW_SCRIPT_FILE if release_dir is not None else None
+    release_sha = _file_sha256(release) if release is not None else None
+    nxt = _script_view(None, "unknown", None, None)
+    try:
+        config = _env_path("CLAUDE_CONFIG_DIR") or Path(home) / ".claude"
+        candidates = ([(Path(repo) / ".claude" / "workflows" / WORKFLOW_SCRIPT_FILE, "project")]
+                      if repo is not None else [])
+        candidates.append((config / "workflows" / WORKFLOW_SCRIPT_FILE, "user"))
+        winner = next(((p, s) for p, s in candidates if p.is_file()), None)
+        if winner is None:
+            nxt = _script_view(None, "none", None, None)
+        else:
+            real = winner[0].resolve()
+            sha = _file_sha256(real)
+            same = release is not None and (_same_file(real, release)
+                                            or (sha is not None and sha == release_sha))
+            nxt = _script_view(str(real), winner[1], same if release is not None else None, sha)
+    except OSError:
+        pass
+    release_view = _script_view(str(release) if release is not None else None,
+                                "unknown", True if release is not None else None, release_sha)
+    del release_view["scope"]
+    nxt["release"] = release_view
+    return {"recorded": recorded, "next": nxt}
 
 
 def _same_file(a, b) -> bool:

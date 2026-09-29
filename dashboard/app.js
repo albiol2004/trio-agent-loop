@@ -1212,8 +1212,52 @@ function setNote(id, text, tone) {
   note.className = "control-note caption" + (tone ? " control-" + tone : "");
 }
 
+/* Workflow script facts of a claude-workflow loop (server view model
+ * native_script: recorded = what the last run ran, next = what Start/Resume
+ * would run now). Pure: one {label, text, warn} row per line; any missing
+ * field reads "unknown". Rendered only through textContent. */
+function nativeScriptRows(view) {
+  if (!view || typeof view !== "object") return [];
+  const known = (v) => (v === null || v === undefined || v === "" ? "unknown" : String(v));
+  const release = (v) => (v === true ? "release ✓" : v === false ? "not the installed release" : "release: unknown");
+  const describe = (s) => {
+    s = s && typeof s === "object" ? s : {};
+    const path = s.scope === "none" ? "none found" : known(s.path);
+    return {
+      text: path + " · scope " + known(s.scope) + " · " + release(s.is_release) +
+        " · sha " + known(s.sha_short),
+      warn: s.is_release === false,
+    };
+  };
+  const rows = [];
+  const rec = describe(view.recorded);
+  rows.push({ label: "Workflow script (last run)", text: rec.text, warn: rec.warn });
+  const next = view.next && typeof view.next === "object" ? view.next : {};
+  const nx = describe(next);
+  rows.push({ label: "Start/Resume would run", text: nx.text, warn: nx.warn });
+  const rel = next.release && typeof next.release === "object" ? next.release : {};
+  rows.push({ label: "Installed release script",
+    text: known(rel.path) + " · sha " + known(rel.sha_short), warn: false });
+  return rows;
+}
+
+function renderNativeScript(view) {
+  const list = el("actions-script");
+  if (!list) return;
+  list.textContent = "";
+  const rows = nativeScriptRows(view);
+  list.hidden = rows.length === 0;
+  for (const row of rows) {
+    const li = document.createElement("li");
+    li.appendChild(span("script-label", row.label + ": "));
+    li.appendChild(span(row.warn ? "mono script-warn" : "mono", (row.warn ? "⚠ " : "") + row.text));
+    list.appendChild(li);
+  }
+}
+
 function renderActions(data) {
   el("actions-section").hidden = false;
+  renderNativeScript(data.driver === "claude-workflow" ? data.native_script : null);
   const st = data.state || {};
   const detail = st.detail || {};
   const parts = [(st.state || "unknown").replace(/_/g, " ")];

@@ -1764,6 +1764,9 @@ tr.is-active td { background: var(--primary-tint); }
 /* ---- unblock panel (dash-actions) ---- */
 .actions-section { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-3); margin: 0 0 var(--sp-4); }
 .actions-state { margin: 0; font-size: var(--fs-label); color: var(--muted); overflow-wrap: anywhere; }
+.actions-script { margin: 4px 0 0; padding: 0; list-style: none; font-size: var(--fs-label); color: var(--muted); overflow-wrap: anywhere; }
+.actions-script li { margin: 2px 0; }
+.actions-script .script-warn { color: var(--warning); font-weight: 600; }
 .actions-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .diagnosis-panel { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); background: var(--surface-2); border-radius: var(--radius-sm); }
 .diagnosis-head { display: flex; gap: var(--sp-2); align-items: baseline; flex-wrap: wrap; }

@@ -2007,5 +2007,198 @@ class Eval2RestoreAfterGraceTests(_Base):
         self.assertNotEqual((box / "STATE.md").read_bytes(), original)
 
 
+# ------------------------------------------------- workflow script display
+
+
+SHA_A = "a" * 64
+
+
+class NativeScriptViewTests(_Base):
+    """names-fix: native-v01's workflow_script* fields reach the drawer's
+    view model (recorded vs what Start/Resume would run), older records read
+    "unknown", and the card shows the same recovered run id as the actions."""
+
+    def running_box(self, name):
+        return _mailbox(self.root, name,
+                        "iteration: 1\nmax_iterations: 4\nstatus: running\nphase: lead-running\n")
+
+    def test_recorded_fields_and_a_stale_project_copy_that_shadows_the_release(self):
+        native = _release_native(self.home)
+        box = self.running_box("loop-script")
+        project = self.root / ".claude" / "workflows" / "trio-native.js"
+        project.parent.mkdir(parents=True)
+        project.write_text("// stale project copy\n")
+        _native(box, {"status": "held", "held_step": "gate",
+                      "workflow_script": str(project), "workflow_script_scope": "project",
+                      "workflow_script_is_release": False, "workflow_script_sha256": SHA_A,
+                      "workflow_script_candidates": [
+                          {"path": str(project), "scope": "project", "exists": True},
+                          {"path": "/u/.claude/workflows/trio-native.js", "scope": "user",
+                           "exists": False}]})
+        self.start_server()
+        view = self.actions("loop-script")["native_script"]
+        rec = view["recorded"]
+        self.assertEqual((rec["path"], rec["scope"], rec["is_release"], rec["sha_short"],
+                          rec["source"]),
+                         (str(project), "project", False, "a" * 12, "result"))
+        self.assertEqual([c["scope"] for c in rec["candidates"]], ["project", "user"])
+        nxt = view["next"]
+        release_sha = hashlib.sha256(b"// release script\n").hexdigest()
+        self.assertEqual((nxt["path"], nxt["scope"], nxt["is_release"]),
+                         (str(project.resolve()), "project", False))
+        self.assertEqual(nxt["release"]["path"], str((native / "trio-native.js").resolve()))
+        self.assertEqual(nxt["release"]["sha256"], release_sha)
+        # The project copy made identical to the release counts as the release.
+        project.write_text("// release script\n")
+        nxt = self.actions("loop-script")["native_script"]["next"]
+        self.assertEqual((nxt["scope"], nxt["is_release"], nxt["sha256"]),
+                         ("project", True, release_sha))
+
+    def test_user_scope_symlink_and_registry_fallback(self):
+        native = _release_native(self.home)
+        user = self.home / ".claude" / "workflows" / "trio-native.js"
+        user.parent.mkdir(parents=True)
+        user.symlink_to(native / "trio-native.js")
+        _git(self.root, "init", "-q")  # registry records count inside a git checkout only
+        box = self.running_box("loop-reg")
+        _native(box, {"status": "held", "held_step": "gate"})  # predates the fields
+        runs = self.home / ".local" / "share" / "trio-agent-loop" / "native-runs"
+        runs.mkdir(parents=True)
+        (runs / "r.json").write_text(json.dumps(
+            {"driver": "claude-workflow", "mailbox": str(box), "workflow_script": str(user),
+             "workflow_script_scope": "user", "workflow_script_is_release": True,
+             "workflow_script_sha256": SHA_A}))
+        self.start_server()
+        view = self.actions("loop-reg")["native_script"]
+        rec = view["recorded"]
+        self.assertEqual((rec["source"], rec["scope"], rec["is_release"], rec["path"]),
+                         ("registry", "user", True, str(user)))
+        nxt = view["next"]
+        self.assertEqual((nxt["scope"], nxt["is_release"]), ("user", True))
+        self.assertEqual(nxt["path"], str((native / "trio-native.js").resolve()))
+
+    def test_registry_record_carries_the_fields_when_the_result_does_not(self):
+        la_view = la.native_script_view(
+            {"result_record": {"status": "shipped"}},
+            {"workflow_script": "/r/.claude/workflows/trio-native.js",
+             "workflow_script_scope": "project", "workflow_script_is_release": True,
+             "workflow_script_sha256": SHA_A}, self.home, None)
+        rec = la_view["recorded"]
+        self.assertEqual((rec["source"], rec["scope"], rec["is_release"], rec["sha_short"]),
+                         ("registry", "project", True, "a" * 12))
+
+    def test_older_records_and_garbage_values_read_unknown_never_error(self):
+        box = self.running_box("loop-old")
+        _native(box, {"status": "held", "held_step": "gate"})
+        self.start_server()
+        view = self.actions("loop-old")["native_script"]
+        rec = view["recorded"]
+        self.assertEqual((rec["path"], rec["scope"], rec["is_release"], rec["sha256"],
+                          rec["sha_short"], rec["source"], rec["candidates"]),
+                         (None, "unknown", None, None, None, None, []))
+        self.assertEqual(view["next"]["scope"], "none")
+        self.assertIsNone(view["next"]["release"]["path"])  # no release installed
+        garbage = la.native_script_view(
+            {"result_record": {"workflow_script": ["x"], "workflow_script_scope": "evil",
+                               "workflow_script_is_release": "yes",
+                               "workflow_script_sha256": "zz",
+                               "workflow_script_candidates": "nope"}}, None, self.home, None)
+        rec = garbage["recorded"]
+        self.assertEqual((rec["path"], rec["scope"], rec["is_release"], rec["sha256"],
+                          rec["candidates"]), (None, "unknown", None, None, []))
+        ctl = la.native_script_view({"result_record": {"workflow_script": "/a\x1b[31m/b"}},
+                                    None, self.home, None)
+        self.assertEqual(ctl["recorded"]["path"], "/a?[31m/b")
+        self.assertIsNone(la.native_script_view(None, None, self.home, None))
+
+    def test_card_uses_the_same_recovered_run_id_as_the_actions(self):
+        box = self.running_box("loop-rawid")
+        _native(box, None)
+        runs = box / ".native-runs"
+        runs.mkdir()
+        (runs / "11111111-2222-3333-4444-555555555555.20260929T100000Z.start.json").write_text(
+            json.dumps({"type": "result", "result":
+                        '```json\n{"status": "shipped", "verdict": "SHIP"}\n```'}))
+        claude = self.home / ".claude" / "projects" / "-r" / "11111111-2222-3333-4444-555555555555"
+        (claude / "subagents" / "workflows" / "wf_rawrun-9").mkdir(parents=True)
+        self.start_server()
+        card = self.card("loop-rawid")
+        actions = self.actions("loop-rawid")
+        self.assertEqual(actions["native"]["run_id"], "wf_rawrun-9")
+        self.assertEqual(card["loop_state"]["detail"]["run_id"], "wf_rawrun-9")
+
+
+def _js_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}(")
+    return source[start:source.index("\n}\n", start) + 3]
+
+
+class NativeScriptDomTests(unittest.TestCase):
+    """The drawer's workflow-script rows rendered by app.js's own functions
+    against a minimal DOM in node: text only (textContent), "unknown" for
+    missing fields, a warning when the script is not the release."""
+
+    FAKE_DOM = r"""
+class Node { constructor(tag) { this.tagName = tag; this.children = []; this.className = "";
+  this.hidden = false; this._text = ""; }
+  appendChild(c) { this.children.push(c); return c; }
+  set textContent(v) { this._text = String(v); this.children = []; }
+  get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
+  set innerHTML(v) { throw new Error("innerHTML used"); } }
+const nodes = { "actions-script": new Node("ul") };
+const document = { createElement: (t) => new Node(t), getElementById: (id) => nodes[id] || null };
+"""
+
+    def render(self, view) -> dict:
+        import shutil as _shutil
+        node = _shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
+        script = self.FAKE_DOM + "\n".join(
+            _js_function(source, n) for n in ("el", "span", "nativeScriptRows", "renderNativeScript"))
+        script += ("\nrenderNativeScript(" + json.dumps(view) + ");\n"
+                   "const ul = nodes['actions-script'];\n"
+                   "console.log(JSON.stringify({hidden: ul.hidden, lines: ul.children.map("
+                   "(li) => ({text: li.textContent, warn: li.children[1].className.includes('script-warn')}))}));\n")
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_recorded_next_and_release_rows(self):
+        hostile = "/w/<img src=x onerror=alert(1)>/trio-native.js"
+        got = self.render({
+            "recorded": {"path": hostile, "scope": "project", "is_release": False,
+                         "sha_short": "7075c6e0e38a"},
+            "next": {"path": "/rel/native/trio-native.js", "scope": "user", "is_release": True,
+                     "sha_short": "0123456789ab",
+                     "release": {"path": "/rel/native/trio-native.js", "sha_short": "0123456789ab"}}})
+        self.assertFalse(got["hidden"])
+        lines = got["lines"]
+        self.assertEqual(lines[0]["text"], "Workflow script (last run): ⚠ " + hostile +
+                         " · scope project · not the installed release · sha 7075c6e0e38a")
+        self.assertTrue(lines[0]["warn"])
+        self.assertEqual(lines[1]["text"], "Start/Resume would run: /rel/native/trio-native.js"
+                         " · scope user · release ✓ · sha 0123456789ab")
+        self.assertFalse(lines[1]["warn"])
+        self.assertEqual(lines[2]["text"], "Installed release script: /rel/native/trio-native.js"
+                         " · sha 0123456789ab")
+
+    def test_missing_fields_render_unknown(self):
+        for view in ({}, {"recorded": None, "next": None}, {"recorded": {"scope": "unknown"},
+                                                            "next": {"scope": "none"}}):
+            with self.subTest(view=view):
+                lines = [l["text"] for l in self.render(view)["lines"]]
+                self.assertEqual(lines[0], "Workflow script (last run): unknown · scope unknown"
+                                 " · release: unknown · sha unknown")
+                self.assertIn(lines[1], (
+                    "Start/Resume would run: unknown · scope unknown · release: unknown · sha unknown",
+                    "Start/Resume would run: none found · scope none · release: unknown · sha unknown"))
+                self.assertEqual(lines[2], "Installed release script: unknown · sha unknown")
+
+    def test_non_native_loops_render_nothing(self):
+        self.assertEqual(self.render(None), {"hidden": True, "lines": []})
+
+
 if __name__ == "__main__":
     unittest.main()
