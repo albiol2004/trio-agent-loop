@@ -177,7 +177,7 @@ def test_harness_driver_owned_builder_contract() -> None:
     builder = next(c for c in out["calls"] if c["agentType"] == "trio-builder")
     b = builder["prompt"]
     assert builder["isolation"] == "worktree"
-    assert "report it as `base`" in b and "The driver requires `base` = H1w1" in b
+    assert "as `base`" in b and "The driver requires `base` = H1w1" in b
     assert "Do NOT write LOG.md" in b and "Never commit `loop/` files" in b
     assert "the driver writes your LOG line from this result" in b
     assert "ASSIGNMENT FROM THE LEAD:\nbuild app.py" in b
@@ -502,3 +502,18 @@ def test_harness_gate_retry_names_kept_branch_and_reruns_cleanup() -> None:
     assert out["result"]["iterations"][0]["kept"] == [
         {"branch": "worktree-app",
          "reason": "uncommitted changes outside the mailbox: notes.txt"}]
+
+
+@needs_node
+def test_harness_builder_discards_untrusted_leftovers() -> None:
+    """Probe 2 finding C: a journal resume re-creates the killed builder's
+    worktree with its uncommitted files; the builder discards them, and
+    only inside its own .claude/worktrees/ path."""
+    out = run({"verdicts": ["SHIP"]})
+    b = next(c["prompt"] for c in out["calls"] if c["agentType"] == "trio-builder")
+    assert "Leftovers are untrusted" in b
+    assert "`git merge-base --is-ancestor H1w1 HEAD`" in b
+    assert "`git reset --hard H1w1 && git clean -fd`" in b
+    assert "is inside `/repo/.claude/worktrees/`" in b
+    assert "Never run these outside that directory" in b
+    assert "git clean -fdx" not in b

@@ -283,9 +283,16 @@ function builderPrompt(n, s, head) {
     `You are the trio-builder for slice \`${s.id}\` of iteration ${n.iteration} of a Trio loop driven by the trio-native workflow.`,
     NOT_ROUTER,
     '',
-    'Your cwd is an isolated git worktree created for you. Before anything else run `git rev-parse HEAD` and report it ' +
-    `as \`base\`. The driver requires \`base\` = ${head} (the Lead's HEAD); if it differs, do no work and return with ` +
-    '`commits: []` and a summary saying so.',
+    'Your cwd is an isolated git worktree created for you. Before anything else:',
+    `1. Run \`pwd\`, \`git rev-parse HEAD\` and \`git status --porcelain\`.`,
+    `2. Leftovers are untrusted. A resumed run re-creates a killed builder's worktree at the same path, with its ` +
+    `uncommitted files and commits. If HEAD is ${head} or a descendant of it (\`git merge-base --is-ancestor ${head} ` +
+    `HEAD\`) and HEAD differs from it or the status is not empty, and \`pwd\` is inside ` +
+    `\`${B.repo ? B.repo + '/' : ''}.claude/worktrees/\`, discard the leftovers with \`git reset --hard ${head} && ` +
+    `git clean -fd\` and start from scratch. Never run these outside that directory, and never reuse leftover work ` +
+    `without redoing it.`,
+    `3. Report \`git rev-parse HEAD\` (now) as \`base\`. The driver requires \`base\` = ${head} (the Lead's HEAD). ` +
+    'If HEAD is not that commit or a descendant of it, do no work and return with `commits: []` and a summary saying so.',
     `The mailbox ${MAILBOX} is read-only for you (read PLAN.md and GOAL.md there if you need them). Do NOT write LOG.md ` +
     'or any `loop/` or mailbox file, in the worktree or at the absolute path: the driver writes your LOG line from ' +
     'this result. Never commit `loop/` files.',
