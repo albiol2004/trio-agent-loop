@@ -311,12 +311,12 @@ set -e
 
 python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" \
   "$mailbox" "$claude_dir" "${run_id:-}" "$launcher_path" "$launched_at" \
-  "$our_token" "$claim_snapshot" "$self_dir" <<'PY'
+  "$our_token" "$claim_snapshot" "$self_dir" "$repo" <<'PY'
 import fcntl, glob, hashlib, json, os, re, stat, sys, tempfile, time
 from pathlib import Path
 raw, rc, session, mode, record, prev = sys.argv[1:7]
 mailbox, claude_dir, given_run_id, launcher_path, launched_at = sys.argv[7:12]
-our_token, claim_snapshot, self_dir = sys.argv[12:15]
+our_token, claim_snapshot, self_dir, repo_dir = sys.argv[12:16]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
 
@@ -362,15 +362,71 @@ def _regular_or_absent(path) -> bool:
 
 # The saved workflow script should be this release's (README "Launcher
 # hardening"): reported, never enforced (a checkout run is legitimate).
+# Report the file Claude Code will actually run for `trio-native`, by its
+# documented precedence for saved workflows (code.claude.com/docs/en/workflows
+# "Save the workflow for reuse"): project workflows load from every
+# `.claude/workflows/` between the working directory and the repository
+# root, the one closest to the working directory winning; a project workflow
+# shadows a personal one ($CLAUDE_CONFIG_DIR/workflows, default
+# ~/.claude/workflows). The session runs with cwd = repo (the git toplevel).
+WORKFLOW_FILE = "trio-native.js"
+
+
+def _sha256(path):
+    data = _read_bytes(path)
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def workflow_script_facts(cwd, top, config_dir, release_dir) -> dict:
+    """{workflow_script, workflow_script_scope (project|user|none),
+    workflow_script_is_release, workflow_script_sha256,
+    workflow_script_candidates: [{path, scope, exists, sha256}]} — the
+    candidates in precedence order; the first existing one is the script."""
+    dirs = []
+    here = os.path.abspath(cwd)
+    stop = os.path.abspath(top) if top else here
+    while True:
+        dirs.append(here)
+        if here == stop or os.path.dirname(here) == here:
+            break
+        here = os.path.dirname(here)
+    if stop not in dirs:  # cwd outside the toplevel: only cwd itself
+        dirs = dirs[:1]
+    candidates = [(os.path.join(d, ".claude", "workflows", WORKFLOW_FILE), "project")
+                  for d in dirs]
+    candidates.append((os.path.join(config_dir, "workflows", WORKFLOW_FILE), "user"))
+    ours = os.path.join(release_dir, WORKFLOW_FILE)
+    ours_real = os.path.realpath(ours)
+    ours_bytes = _read_bytes(ours_real)
+    listed, chosen = [], None
+    for path, scope in candidates:
+        real = os.path.realpath(path)
+        digest = _sha256(real)
+        exists = digest is not None
+        listed.append({"path": path, "real_path": real, "scope": scope,
+                       "exists": exists, "sha256": digest})
+        if exists and chosen is None:
+            chosen = listed[-1]
+    if chosen is None:
+        return {"workflow_script": None, "workflow_script_scope": "none",
+                "workflow_script_is_release": False, "workflow_script_sha256": None,
+                "workflow_script_candidates": listed}
+    real = chosen["real_path"]
+    is_release = real == ours_real or (
+        ours_bytes is not None and _read_bytes(real) == ours_bytes)
+    return {"workflow_script": real, "workflow_script_scope": chosen["scope"],
+            "workflow_script_is_release": bool(is_release),
+            "workflow_script_sha256": chosen["sha256"],
+            "workflow_script_candidates": listed}
+
+
 try:
-    saved = os.path.realpath(os.path.join(claude_dir, "workflows", "trio-native.js"))
-    ours = os.path.join(self_dir, "trio-native.js")
-    launcher["workflow_script"] = saved
-    launcher["workflow_script_is_release"] = (
-        saved == os.path.realpath(ours)
-        or (_read_bytes(saved) is not None and _read_bytes(saved) == _read_bytes(ours)))
+    WORKFLOW_SCRIPT = workflow_script_facts(repo_dir, repo_dir, claude_dir, self_dir)
 except OSError:
-    pass
+    WORKFLOW_SCRIPT = {"workflow_script": None, "workflow_script_scope": "unknown",
+                       "workflow_script_is_release": False, "workflow_script_sha256": None,
+                       "workflow_script_candidates": []}
+launcher.update(WORKFLOW_SCRIPT)
 
 
 def _runs_dir() -> Path:
@@ -517,6 +573,7 @@ def persist(result):
                 "session_started_at": session_rec.get("started_at"),
                 "api_equiv_usd": lau.get("api_equiv_usd"),
                 "api_equiv_usd_note": lau.get("api_equiv_usd_note")})
+    out.update(WORKFLOW_SCRIPT)
     try:
         _write_json_atomic(Path(mailbox, ".native-result.json"), out)
     except OSError:
@@ -526,7 +583,7 @@ def persist(result):
                        "run_token": our_token, "launcher": launcher_path,
                        "finished_at": now,
                        "result_path": str(Path(mailbox).resolve() / ".native-result.json"),
-                       "updated_at": now})
+                       "updated_at": now, **WORKFLOW_SCRIPT})
 
 
 def persist_not_started(result):
