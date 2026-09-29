@@ -229,11 +229,33 @@ def make_record(key: bytes, *, answer_id: str, loop: str, mailbox: Path, root_ma
 
 # --------------------------------------------------------- stop binding
 
-#: Config overrides for every git call on a mailbox's repository: never run
-#: a repository-configured fsmonitor command or hook, never follow file://
-#: transports (eval4 finding 2).
-SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                   "-c", "protocol.file.allow=never")
+#: Config overrides for every git call the drivers and the dashboard make on a
+#: mailbox's (or a slice's) repository. The single source of truth: the
+#: dashboard imports it; metrics/trio-metrics.py (vendored stand-alone) keeps
+#: an identical copy that a test compares; trio-shadow.py uses that copy.
+#: A repository-configured program never runs: no fsmonitor, no hook, no
+#: signature verification (gpg.*; ``log.showSignature`` off), no pager, no
+#: ssh, askpass or credential helper, no file:// transport, and an embedded
+#: bare repository (tracked ``HEAD``/``objects``/``config``) is never
+#: discovered implicitly (eval4 finding 2, eval5 finding 1). ``commit.gpgSign``
+#: is off so the dashboard's retirement commit stays an unsigned commit.
+#: ``diff.external=`` is not set: git 2.43 then tries to run an empty command
+#: on ``git diff``; no caller asks for a textual diff.
+SAFE_GIT_CONFIG = (
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "protocol.file.allow=never",
+    "-c", "safe.bareRepository=explicit",
+    "-c", "log.showSignature=false",
+    "-c", "core.sshCommand=false",
+    "-c", "core.pager=cat",
+    "-c", "gpg.program=/bin/false",
+    "-c", "gpg.ssh.program=/bin/false",
+    "-c", "gpg.x509.program=/bin/false",
+    "-c", "commit.gpgSign=false",
+    "-c", "core.askPass=",
+    "-c", "credential.helper=",
+)
 
 
 def _git(mailbox: Path, *args: str) -> bytes | None:

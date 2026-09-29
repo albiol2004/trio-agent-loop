@@ -612,11 +612,8 @@ def _same_file(a, b) -> bool:
 # Git helpers (read-only unless a fix says otherwise)
 # --------------------------------------------------------------------------
 
-#: Config overrides for every dashboard git call on a mailbox's repository:
-#: never run a repository-configured fsmonitor command or hook, never follow
-#: a file:// transport (eval4 finding 2). Same as human_ledger.SAFE_GIT_CONFIG.
-SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                   "-c", "protocol.file.allow=never")
+# SAFE_GIT_CONFIG (every git argv below) is metrics/human_ledger.py's tuple,
+# bound after ``ledger()`` is defined (eval4 finding 2, eval5 finding 1).
 
 
 def git_argv(cwd: Path, *args: str) -> list[str]:
@@ -1033,16 +1030,51 @@ def mailbox_symlinks(mailbox: Path) -> list[str]:
     return sorted(out)
 
 
-def mailbox_nested_git(mailbox: Path) -> bool:
-    """Whether a mailbox holds a ``.git`` entry (directory, file or link):
-    a nested repository whose config every git call on the mailbox would
-    read. Such a mailbox is refused as a whole (eval4 finding 2)."""
+def _has_git_entry(directory: Path) -> bool:
+    """Whether *directory* holds a ``.git`` entry (directory, file or link);
+    an unreadable one counts as present."""
     try:
-        os.lstat(Path(mailbox) / ".git")
+        os.lstat(Path(directory) / ".git")
     except FileNotFoundError:
         return False
     except OSError:
         return True
+    return True
+
+
+def mailbox_nested_git(mailbox: Path, root: Path | None = None,
+                       home: Path | None = None) -> bool:
+    """Whether a nested (foreign) repository would own the mailbox: a ``.git``
+    entry (directory, file or link) in the mailbox or in any directory above
+    it, up to (excluding) its anchor — the workspace root, or the accepted
+    Lead worktree holding a root-free live copy. git discovery from the
+    mailbox would read that repository's config, so such a mailbox is
+    refused as a whole (eval4 finding 2; eval5 finding 2: ``loop-grp/.git``
+    for ``loop-grp/m1``).
+
+    The anchor's own ``.git`` is the workspace's (or the worktree's) own
+    repository: a workspace root that is itself the mailbox and its
+    repository's top level is accepted (eval5 finding 3). Without *root*
+    only the mailbox itself is checked. Never raises."""
+    if root is None:
+        return _has_git_entry(Path(mailbox))
+    try:
+        root_real = Path(root).resolve(strict=True)
+        box = Path(mailbox).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return True
+    worktrees: set | None = None
+    for directory in (box, *box.parents):
+        if directory == root_real:
+            return False
+        if not _has_git_entry(directory):
+            continue
+        if worktrees is None:
+            try:
+                worktrees = set(_lead_worktree_roots(root_real, home))
+            except Exception:  # noqa: BLE001 - no worktree list: nothing is accepted
+                worktrees = set()
+        return directory not in worktrees
     return True
 
 
@@ -1098,7 +1130,8 @@ class LoopContext:
         if links:
             raise PathEscape("the mailbox contains symlinks (" + ", ".join(
                 display_name(n, 80) for n in links[:8]) + "); nothing in it is read or acted on")
-        if mailbox_nested_git(live_mailbox) or mailbox_nested_git(root_mailbox):
+        if (mailbox_nested_git(live_mailbox, root, home)
+                or mailbox_nested_git(root_mailbox, root, home)):
             raise PathEscape("the mailbox contains a .git entry (a nested repository); "
                              "nothing in it is read or acted on")
         self.root_mailbox = Path(root_mailbox)
@@ -1997,6 +2030,12 @@ def ledger():
             raise FixRefused(f"the answer ledger module is unusable ({LEDGER_PATH}: {exc})") from None
         _LEDGER_MODULE["m"] = module
     return module
+
+
+#: Config overrides for every dashboard git call: the release's single source
+#: of truth, metrics/human_ledger.SAFE_GIT_CONFIG (no fsmonitor, hook, gpg,
+#: pager, ssh, askpass or credential program; no implicit bare repository).
+SAFE_GIT_CONFIG: tuple = tuple(ledger().SAFE_GIT_CONFIG)
 
 
 def _answer_key(home: Path, *, create: bool = False) -> bytes:

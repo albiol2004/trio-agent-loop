@@ -219,12 +219,6 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 """Directory this file lives in; static frontend files are served from here."""
 
 METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
-#: Config overrides for every git call the dashboard makes on a workspace or
-#: mailbox repository: never run a repository-configured fsmonitor command or
-#: hook, never follow a file:// transport (eval4 finding 2; the same tuple as
-#: loop_actions.SAFE_GIT_CONFIG and human_ledger.SAFE_GIT_CONFIG).
-SAFE_GIT_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                   "-c", "protocol.file.allow=never")
 """Parsing module, resolved relative to this file (NOT cwd)."""
 
 INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
@@ -482,6 +476,12 @@ def load_loop_actions_module():
     spec.loader.exec_module(module)
     _LOOP_ACTIONS_MODULE = module
     return module
+
+
+#: Config overrides for every git call the dashboard makes on a workspace or
+#: mailbox repository: metrics/human_ledger.SAFE_GIT_CONFIG through
+#: loop_actions (one source of truth; eval4 finding 2, eval5 finding 1).
+SAFE_GIT_CONFIG: tuple = load_loop_actions_module().SAFE_GIT_CONFIG
 
 
 def _diagnoses():
@@ -941,11 +941,13 @@ def _mailbox_symlinks(loop_dir: Path) -> list[str]:
         return ["<unreadable>"]
 
 
-def _mailbox_nested_git(loop_dir: Path) -> bool:
-    """A mailbox holding a ``.git`` entry (loop_actions.mailbox_nested_git):
-    refused like a mailbox with symlinks (eval4 finding 2)."""
+def _mailbox_nested_git(loop_dir: Path, root: Path | None) -> bool:
+    """A mailbox that a nested repository owns (a ``.git`` entry in it or
+    between it and the workspace root / its Lead worktree;
+    loop_actions.mailbox_nested_git): refused like a mailbox with symlinks
+    (eval4 finding 2, eval5 findings 2 and 3)."""
     try:
-        return bool(load_loop_actions_module().mailbox_nested_git(loop_dir))
+        return bool(load_loop_actions_module().mailbox_nested_git(loop_dir, root, HOME))
     except Exception:  # noqa: BLE001 - treat an unreadable mailbox as refused
         return True
 
@@ -1628,7 +1630,7 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
     elif _mailbox_symlinks(loop_dir):
         start = (False, "The mailbox contains symlinks; nothing in it is read or "
                         "started (eval2 finding 2).")
-    elif _mailbox_nested_git(loop_dir):
+    elif _mailbox_nested_git(loop_dir, root):
         start = (False, "The mailbox contains a .git entry (a nested repository); "
                         "nothing in it is read or started.")
     elif not (loop_dir / "GOAL.md").is_file():
@@ -4300,8 +4302,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "segments": [], "refused": "mailbox contains symlinks",
                 })
                 continue
-            if _mailbox_nested_git(loop_dir) or (loop_dir != root_dir
-                                                 and _mailbox_nested_git(root_dir)):
+            if _mailbox_nested_git(loop_dir, root) or (
+                    loop_dir != root_dir and _mailbox_nested_git(root_dir, root)):
                 name = metrics.loop_name(root, root_dir)
                 loops.append({
                     "name": name, "path": name, "mission": "", "title": "",
@@ -4452,7 +4454,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(403, {"error": "the mailbox contains symlinks ("
                                          + ", ".join(links[:5]) + "); nothing in it is read",
                                          "refused": True})
-        if _mailbox_nested_git(loop_dir):
+        if _mailbox_nested_git(loop_dir, root):
             return self._send_json(403, {"error": NESTED_GIT_REFUSAL, "refused": True})
         card = self._loop_card(loop_dir, self.server.metrics, root)
         card["name"] = card["path"] = name  # r16: a live copy keeps the root name

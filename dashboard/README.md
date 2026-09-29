@@ -250,16 +250,31 @@ Endpoints:
   started with `--worktree-root` or another `TRIO_WORKTREE_ROOT` (e.g. a
   sibling `<repo>-worktrees/` layout) needs the same `TRIO_WORKTREE_ROOT`
   in the trio-dash service env; an enclosing repository never counts), or that contains
-  any symlink (directly, or in `.lock/` or `.native-runs/`), or that holds
-  a `.git` entry (a nested repository, whose config every git call on the
-  mailbox would read), gets 403 on every action endpoint and a "refused" board
-  card; nothing in it is read (every mailbox, sidecar and registry read is
-  `O_NOFOLLOW`, regular files only) or written (writes are `mkstemp` +
-  rename, never through a link).
-- Every git call the dashboard makes on a workspace or mailbox repository
-  (reads, and the git steps it plans) runs with `-c core.fsmonitor=false
-  -c core.hooksPath=/dev/null -c protocol.file.allow=never`: a repository's
-  configured fsmonitor command or hooks never run from the dashboard.
+  any symlink (directly, or in `.lock/` or `.native-runs/`), or that a
+  nested repository owns — a `.git` entry in the mailbox or in any directory
+  between it and the workspace root (or the Lead worktree holding a
+  root-free live copy), e.g. `loop-grp/.git` for `loop-grp/m1`; every git
+  call on the mailbox would read that repository's config — gets 403 on
+  every action endpoint and a "refused" board card; nothing in it is read
+  (every mailbox, sidecar and registry read is `O_NOFOLLOW`, regular files
+  only) or written (writes are `mkstemp` + rename, never through a link).
+  A workspace root that is itself the mailbox and its repository's top
+  level is accepted: that `.git` is the workspace's own repository.
+- Every git call the dashboard makes on a workspace, mailbox or slice
+  repository (reads, the git steps it plans, and trio-shadow's slice
+  attribution — which trioctl's commit gate shares) runs with one config
+  set, `SAFE_GIT_CONFIG` in `metrics/human_ledger.py` (trio-metrics.py keeps
+  a compared stand-alone copy): `core.fsmonitor=false`,
+  `core.hooksPath=/dev/null`, `protocol.file.allow=never`,
+  `safe.bareRepository=explicit`, `log.showSignature=false`,
+  `core.sshCommand=false`, `core.pager=cat`, `gpg.program`,
+  `gpg.ssh.program` and `gpg.x509.program` = `/bin/false`,
+  `commit.gpgSign=false`, and empty `core.askPass` and `credential.helper`.
+  A repository-configured program never runs from the dashboard, and a
+  tracked bare-repository layout (e.g. a PLAN.md slice `repo:` pointing at
+  one) is not a repository to it. The retirement commit is unsigned and
+  skips hooks. (`diff.external=` is not set: git 2.43 would then run an
+  empty command on `git diff`.)
 - Mailbox data never chooses what runs. A mailbox path may use any
   printable characters (spaces, non-ASCII letters, `,`, `~` …): it is
   passed as one argv element and every driver quotes it where it enters a

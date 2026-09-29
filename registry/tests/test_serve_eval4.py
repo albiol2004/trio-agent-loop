@@ -113,27 +113,21 @@ class NestedGitTests(_AnswerBase):
         gits = [s["argv"] for s in plan["steps"] if s.get("argv") and s["argv"][0] == "git"]
         self.assertEqual(len(gits), 2, plan["steps"])
         for argv in gits:
-            self.assertEqual(argv[1:7], list(la.SAFE_GIT_CONFIG))
+            self.assertEqual(argv[1:1 + len(la.SAFE_GIT_CONFIG)], list(la.SAFE_GIT_CONFIG))
         self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
         # control: the same repo's git status without the overrides runs it
         subprocess.run(["git", "-C", str(self.root), "status"], capture_output=True)
         self.assertTrue(marker.exists())
 
     def test_every_git_argv_carries_the_safe_config(self):
-        for module, name in ((la, "loop_actions"), (serve, "serve")):
-            with self.subTest(module=name):
-                self.assertEqual(module.SAFE_GIT_CONFIG,
-                                 ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                                  "-c", "protocol.file.allow=never"))
+        # the source scan over all git-calling files is eval5's
+        # (test_serve_eval5.SafeGitConfigTests); the tuple is human_ledger's.
+        self.assertIs(serve.SAFE_GIT_CONFIG, la.SAFE_GIT_CONFIG)
         self.assertEqual(la.ledger().SAFE_GIT_CONFIG, la.SAFE_GIT_CONFIG)
-        for path in (REPO_ROOT / "dashboard" / "serve.py", REPO_ROOT / "dashboard" / "loop_actions.py",
-                     REPO_ROOT / "metrics" / "human_ledger.py"):
-            text = path.read_text()
-            for line in text.splitlines():
-                if '["git",' in line:
-                    self.assertIn("SAFE_GIT_CONFIG", line, (path.name, line))
-        self.assertEqual(la.git_argv(Path("/r"), "status")[:7], ["git", *la.SAFE_GIT_CONFIG])
-
+        for flag in ("core.fsmonitor=false", "core.hooksPath=/dev/null", "protocol.file.allow=never"):
+            self.assertIn(flag, la.SAFE_GIT_CONFIG)
+        n = len(la.SAFE_GIT_CONFIG)
+        self.assertEqual(la.git_argv(Path("/r"), "status")[:n + 1], ["git", *la.SAFE_GIT_CONFIG])
 
 class PromptSinglePassTests(D._Base):
     """eval4 finding 4: trioctl ``_prompt`` fills its placeholders once."""
