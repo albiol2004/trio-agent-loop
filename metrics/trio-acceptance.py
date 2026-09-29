@@ -37,7 +37,11 @@ that interpreter with ``-P -s`` (neither the script's directory, the tree
 nor user site-packages is importable by it); the flags are not inherited,
 and a `run` that starts the PRODUCT (``python3 app.py``, ``python3 -m
 pkg``) gets neither, so the product and any Python a check starts resolve
-imports normally (eval-r19d finding 1, eval-r19e findings 1, 3, 4). ``acceptance/lib/`` is the
+imports normally (eval-r19d finding 1, eval-r19e findings 1, 3, 4). A
+pytest run on pack tests gets ``-P`` and ``pytest_isolation_args`` (no
+product conftest/ini/plugin applies; eval-r19f finding 1). `expect`
+matching is bounded by min(timeout_s, MATCH_DEADLINE_S), else FAIL
+``pattern-timeout`` (eval-r19f finding 2). ``acceptance/lib/`` is the
 explicit shared helper path (PYTHONPATH/NODE_PATH). Checks get a
 controlled PATH (system directories plus the directories of the
 interpreters the driver resolved when it started; ``check_path``). The
@@ -58,6 +62,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -66,6 +71,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -100,6 +106,10 @@ MATCH_BYTES = 1 << 20
 #: `expect` pattern lists: `stdout` (stdout only), `stderr` (stderr only),
 #: `output` (stdout followed by stderr, for a check that asks for both).
 EXPECT_STREAMS = ("stdout", "stderr", "output")
+#: Wall-clock bound on matching one attempt's `expect` patterns (eval-r19f
+#: finding 2): min(the check's timeout_s, this). Past it the check FAILs
+#: with reason ``pattern-timeout``; the time counts in the check's wall_s.
+MATCH_DEADLINE_S = 10.0
 CHECK_ID_RE = re.compile(r"^ACC-[0-9]{1,4}$")
 BINDING_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SETUP_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -303,7 +313,14 @@ def check_errors(check: Any, manifest: dict[str, Any], goal_text: str | None = N
                             f"{PACK_DIR}/{HELPER_DIR}/ and run `-m <name>`")
         if acc_root is not None:
             for arg in run:
-                if arg.startswith(PACK_DIR + "/") and not (acc_root.parent / arg).exists():
+                if not arg.startswith(PACK_DIR + "/"):
+                    continue
+                # `acceptance/lib/../../app.py` is the product's app.py
+                # (eval-r19f finding 4): only a path that stays in the pack
+                # must exist in it.
+                norm = os.path.normpath(arg.split("::", 1)[0]).replace(os.sep, "/")
+                if (norm == PACK_DIR or norm.startswith(PACK_DIR + "/")) \
+                        and not (acc_root.parent / norm).exists():
                     errs.append(f"run names {arg}, which does not exist")
     expect = check.get("expect", {"exit": 0})
     if not isinstance(expect, dict) or set(expect) - {"exit", *EXPECT_STREAMS}:
@@ -666,6 +683,78 @@ def _expect_text(attempt: dict[str, Any], key: str) -> str:
     return attempt.get(key) or ""
 
 
+def _search_in_process(jobs: list[tuple[str, str]]) -> tuple[int, bool] | None:
+    for n, (pat, text) in enumerate(jobs):
+        if not re.search(pat, text, re.MULTILINE):
+            return n, False
+    return None
+
+
+def _search_all(jobs: list[tuple[str, str]], deadline_s: float) -> tuple[int, bool] | None:
+    """Match every ``(pattern, text)`` (``re.search``, MULTILINE) within
+    *deadline_s* seconds in total (eval-r19f finding 2: a backtracking
+    pattern that does not match a long line is quadratic or worse, and
+    ``re`` cannot be interrupted in-process). None when all match; else
+    ``(index, timed_out)`` of the first that does not match, or that was
+    still running at the deadline. The matching runs in a forked child
+    that is killed at the deadline; without ``os.fork`` it runs in-process,
+    unbounded."""
+    compiled = [(re.compile(pat, re.MULTILINE), text) for pat, text in jobs]
+    if not hasattr(os, "fork"):
+        return _search_in_process(jobs)
+    rfd, wfd = os.pipe()
+    with warnings.catch_warnings():
+        # 3.12+: forking a threaded process is deprecated because the child
+        # may deadlock on a lock another thread held; the child here takes
+        # none (compiled patterns, os.write, os._exit only).
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:  # the child: report each index before trying it, then "ok"
+        try:
+            os.close(rfd)
+            for n, (rx, text) in enumerate(compiled):
+                os.write(wfd, f"{n}\n".encode())
+                if not rx.search(text):
+                    os.write(wfd, b"miss\n")
+                    os._exit(0)
+            os.write(wfd, b"ok\n")
+        finally:
+            os._exit(0)
+    os.close(wfd)
+    data = bytearray()
+    done = False
+    end = time.monotonic() + max(0.0, deadline_s)
+    try:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            ready, _, _ = select.select([rfd], [], [], left)
+            if not ready:
+                break
+            chunk = os.read(rfd, 65536)
+            if not chunk:
+                done = True
+                break
+            data += chunk
+    finally:
+        os.close(rfd)
+        if not done:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        os.waitpid(pid, 0)
+    lines = data.decode().split()
+    if lines and lines[-1] == "ok":
+        return None
+    if lines and lines[-1] == "miss":
+        return int(lines[-2]), False
+    # Still running at the deadline, or the child died without a verdict
+    # (killed, out of memory): the pattern it was on FAILs.
+    return (int(lines[-1]) if lines and lines[-1].isdigit() else 0), True
+
+
 def _classify(check: dict[str, Any], attempt: dict[str, Any]) -> tuple[str, str | None]:
     """(outcome, reason): PASS | FAIL | UNAVAILABLE | ERROR. `expect`
     patterns (``re.search``, MULTILINE) see the full stream they name, not
@@ -677,12 +766,25 @@ def _classify(check: dict[str, Any], attempt: dict[str, Any]) -> tuple[str, str 
         return "ERROR", attempt.get("error") or "runner failure"
     if code == 0:
         expect = check.get("expect") or {}
-        for key in EXPECT_STREAMS:
-            text = _expect_text(attempt, key)
-            for pat in expect.get(key) or []:
-                if not re.search(pat, text, re.MULTILINE):
-                    return "FAIL", f"{key} does not match {pat!r}"
-        return "PASS", None
+        jobs = [(key, pat, _expect_text(attempt, key))
+                for key in EXPECT_STREAMS for pat in expect.get(key) or []]
+        if not jobs:
+            return "PASS", None
+        timeout = check.get("timeout_s", DEFAULT_TIMEOUT_S)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            timeout = DEFAULT_TIMEOUT_S
+        started = time.monotonic()
+        first_miss = _search_all([(pat, text) for _, pat, text in jobs],
+                                 min(float(timeout), MATCH_DEADLINE_S))
+        attempt["match_s"] = round(time.monotonic() - started, 2)
+        if first_miss is None:
+            return "PASS", None
+        index, timed_out = first_miss
+        key, pat, _ = jobs[index]
+        if timed_out:
+            attempt["match_detail"] = f"expect.{key} {pat!r} did not finish matching"
+            return "FAIL", "pattern-timeout"
+        return "FAIL", f"{key} does not match {pat!r}"
     if code == 1:
         return "FAIL", _reason_line(attempt.get("output") or "") or "exit 1"
     if code == EXIT_UNAVAILABLE:
@@ -710,10 +812,11 @@ def run_one(check: dict[str, Any], copy_root: Path, work: Path, env: dict[str, s
         run_env = dict(env, ACC_ID=cid, ACC_WORK=str(scratch), TMPDIR=str(scratch / "tmp"))
         last = _attempt(list(argv or check["run"]), copy_root, run_env, timeout, sandbox,
                         [copy_root, work], readable, list(read_only))
-        wall += last["wall_s"]
         outcome, reason = _classify(check, last)
+        wall += last["wall_s"] + last.get("match_s", 0.0)
         if outcome != "ERROR":
             return {"id": cid, "outcome": outcome, "reason": reason,
+                    **({"detail": last["match_detail"]} if "match_detail" in last else {}),
                     "excerpt": last.get("output", ""), "wall_s": round(wall, 2),
                     **({"rerun": True} if attempt_no == 2 else {})}
     return {"id": cid, "outcome": "FAIL", "reason": "error", "error": True,
@@ -964,25 +1067,22 @@ def _supports_safe_path(exe: str) -> bool:
     return _SAFE_PATH_OK[exe]
 
 
-def python_target(argv: list[str]) -> tuple[str, str | None]:
-    """What a Python command line runs: ``("script", path)``,
-    ``("module", name)``, ``("code", source)`` or ``("none", None)`` (an
-    interactive/stdin interpreter, or ``-h``/``-V``). Parses CPython's
-    option syntax: combined short options (``-um pkg``, ``-Bc code``,
-    ``-mpkg``, ``-uWignore``), value options as a separate word (``-W x``,
-    ``-X y``, ``--check-hash-based-pycs v``) and ``--``."""
+def _python_target_at(argv: list[str]) -> tuple[str, str | None, int]:
+    """``python_target`` plus the index of the first argv word after the
+    target (the target's own arguments start there)."""
     i = 1
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            return ("script", argv[i + 1]) if i + 1 < len(argv) else ("none", None)
+            return ("script", argv[i + 1], i + 2) if i + 1 < len(argv) \
+                else ("none", None, len(argv))
         if arg == "-" or not arg.startswith("-"):
-            return ("none", None) if arg == "-" else ("script", arg)
+            return ("none", None, i + 1) if arg == "-" else ("script", arg, i + 1)
         if arg.startswith("--"):
             name = arg.split("=", 1)[0]
             if name in ("--help", "--version", "--help-env", "--help-xoptions",
                         "--help-all"):
-                return ("none", None)
+                return ("none", None, len(argv))
             if name in _PY_VALUE_LONG and "=" not in arg:
                 i += 1
             i += 1
@@ -992,19 +1092,31 @@ def python_target(argv: list[str]) -> tuple[str, str | None]:
             letter = arg[j]
             rest = arg[j + 1:]
             if letter in "cm":
-                value = rest if rest else (argv[i + 1] if i + 1 < len(argv) else None)
-                if value is None:
-                    return ("none", None)
-                return ("code" if letter == "c" else "module", value)
+                if rest:
+                    return ("code" if letter == "c" else "module", rest, i + 1)
+                if i + 1 >= len(argv):
+                    return ("none", None, len(argv))
+                return ("code" if letter == "c" else "module", argv[i + 1], i + 2)
             if letter in _PY_VALUE_LETTERS:
                 if not rest:
                     i += 1  # the value is the next word
                 break
             if letter in "hV?":
-                return ("none", None)
+                return ("none", None, len(argv))
             j += 1
         i += 1
-    return ("none", None)
+    return ("none", None, len(argv))
+
+
+def python_target(argv: list[str]) -> tuple[str, str | None]:
+    """What a Python command line runs: ``("script", path)``,
+    ``("module", name)``, ``("code", source)`` or ``("none", None)`` (an
+    interactive/stdin interpreter, or ``-h``/``-V``). Parses CPython's
+    option syntax: combined short options (``-um pkg``, ``-Bc code``,
+    ``-mpkg``, ``-uWignore``), value options as a separate word (``-W x``,
+    ``-X y``, ``--check-hash-based-pycs v``) and ``--``."""
+    kind, value, _ = _python_target_at(argv)
+    return kind, value
 
 
 def _inside(path: str, root: str) -> bool:
@@ -1052,6 +1164,54 @@ def runs_pack_code(run: list[str], tree: Path | str | None = None,
     return False
 
 
+_PYTEST_NAMES = frozenset({"pytest", "py.test"})
+
+
+def _names_pack_path(value: str, tree: Path | str | None) -> bool:
+    """True when *value* (a path, optionally with a pytest ``::node`` part)
+    resolves inside ``acceptance/`` (of *tree* when given)."""
+    value = value.split("::", 1)[0]
+    if not value or os.path.isabs(value) and tree is None:
+        return False
+    if tree is None:
+        norm = os.path.normpath(value).replace(os.sep, "/")
+        return norm == PACK_DIR or norm.startswith(PACK_DIR + "/")
+    root = os.path.realpath(str(tree))
+    return _inside(os.path.realpath(os.path.join(root, value)), os.path.join(root, PACK_DIR))
+
+
+def pack_pytest_at(run: list[str], tree: Path | str | None = None) -> int | None:
+    """When *run* runs pytest on pack files (``python3 -m pytest
+    acceptance/...`` or ``pytest acceptance/...``), the argv index where
+    pytest's own arguments start; else None (eval-r19f finding 1). A pytest
+    run on product tests (``python3 -m pytest tests``) is the product's."""
+    argv = [str(a) for a in run]
+    if not argv:
+        return None
+    name = os.path.basename(argv[0])
+    if name in _PYTEST_NAMES:
+        start = 1
+    elif _PY_NAME_RE.match(name):
+        kind, value, start = _python_target_at(argv)
+        if kind != "module" or value != "pytest":
+            return None
+    else:
+        return None
+    if any(not a.startswith("-") and _names_pack_path(a, tree) for a in argv[start:]):
+        return start
+    return None
+
+
+def pytest_isolation_args(view: Path | str) -> list[str]:
+    """What a pack pytest run gets in front of its own arguments: no cache,
+    no ini file (``-c /dev/null``: a product ``pytest.ini``/``pyproject``/
+    ``setup.cfg``/``tox.ini`` never applies), rootdir and conftest cut-off
+    at the pack view (a product-root ``conftest.py`` never loads)."""
+    view = str(view)
+    return ["-p", "no:cacheprovider", f"--confcutdir={view}", "-c", os.devnull,
+            f"--rootdir={view}"]
+
+
 def isolated_argv(run: list[str], path: str, tree: Path | str | None = None,
                   lib_present: bool = False) -> list[str]:
     """The argv a check runs: its `run`, with ``-P -s`` added to the
@@ -1063,8 +1223,25 @@ def isolated_argv(run: list[str], path: str, tree: Path | str | None = None,
     flags, not environment variables: the product and every process the
     check starts resolve imports normally, user site included. Product
     scripts and product/third-party modules get nothing. Interpreters
-    older than 3.11 (no ``-P``) get ``-s`` only and rely on the views."""
+    older than 3.11 (no ``-P``) get ``-s`` only and rely on the views.
+
+    A pytest run on pack files (``pack_pytest_at``; eval-r19f finding 1)
+    gets ``pytest_isolation_args`` in front of pytest's own arguments, so
+    no product ``conftest.py``, ini file or ``pyproject.toml`` decides the
+    outcome; its interpreter (``python3 -m pytest``) also gets ``-P`` so
+    a product ``pytest.py`` or ``*.dist-info`` plugin entry point in the
+    tree root is not importable. It does not get ``-s``: pytest itself may
+    live in user site-packages."""
     argv = [str(a) for a in run]
+    at = pack_pytest_at(argv, tree)
+    if at is not None:
+        view = Path(str(tree)) / PACK_DIR if tree is not None else Path(PACK_DIR)
+        argv = argv[:at] + pytest_isolation_args(view) + argv[at:]
+        if at > 1:  # python3 -m pytest: the interpreter gets -P
+            exe = shutil.which(argv[0], path=path)
+            if exe is not None and _supports_safe_path(exe):
+                argv = [argv[0], "-P", *argv[1:]]
+        return argv
     if not runs_pack_code(argv, tree, lib_present):
         return argv
     exe = shutil.which(argv[0], path=path)
@@ -1321,6 +1498,71 @@ def summary_line(result: dict[str, Any]) -> str:
 # ------------------------------------------------------- freeze validation
 
 
+#: freeze_filter's drop reason for a pack-code import failure at base
+#: (eval-r19f finding 3); such a drop always asks the author to retry.
+PACK_IMPORT_DROP = "broken-at-base: pack code cannot import"
+_TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):$", re.MULTILINE)
+_FRAME_RE = re.compile(r'^  File "([^"]*)", line \d+', re.MULTILINE)
+_IMPORT_EXC_RE = re.compile(r"^((?:ModuleNotFoundError|ImportError)\b.*)$", re.MULTILINE)
+_PYTEST_IMPORT_RE = re.compile(
+    r"^(?:FAILED|ERROR) \S+ - ((?:ModuleNotFoundError|ImportError)\b.*)$"
+    r"|^E\s+((?:ModuleNotFoundError|ImportError)\b.*)$", re.MULTILINE)
+
+
+def _pack_frame(path: str, code_run: bool) -> bool:
+    if path == "<string>":
+        return code_run
+    if path.startswith("<frozen "):
+        return False
+    norm = path.replace(os.sep, "/")
+    if not os.path.isabs(path):
+        norm = os.path.normpath(norm).replace(os.sep, "/")
+        return norm.startswith(PACK_DIR + "/")
+    # run_pack's layout: every check runs in <slot>/tree with its pack view
+    # at <slot>/tree/acceptance (the tree's own acceptance/ is replaced).
+    return f"/tree/{PACK_DIR}/" in norm
+
+
+def pack_import_error(check: dict[str, Any], res: dict[str, Any],
+                      acc_root: Path | None = None) -> str | None:
+    """The import error that made a pack-code check FAIL at base, or None
+    (eval-r19f finding 3). Pack code runs as ``python3 -P -s``, so an
+    import of a product module, a sibling file or a user-site library
+    fails at base AND forever: such a check is broken, not discriminating.
+
+    Only the check's OWN interpreter counts: the output's last traceback
+    must start in pack code (a pack script, or ``<string>`` for ``-c``) and
+    end in ModuleNotFoundError/ImportError; a product traceback a check
+    echoes starts in the product and does not count. A pytest run on pack
+    files counts when its short summary (or an ``E`` line) names the error."""
+    run = check.get("run") if isinstance(check, dict) else None
+    if not isinstance(run, list) or not run:
+        return None
+    text = (res.get("excerpt") or "") + "\n" + (res.get("reason") or "")
+    if pack_pytest_at(run) is not None:
+        m = _PYTEST_IMPORT_RE.search(text)
+        return (m.group(1) or m.group(2)).strip()[:200] if m else None
+    lib_present = False
+    if acc_root is not None and _PY_NAME_RE.match(os.path.basename(str(run[0]))):
+        kind, value = python_target([str(a) for a in run])
+        if kind == "module" and value:
+            lib = Path(acc_root) / HELPER_DIR
+            top = value.split(".", 1)[0]
+            lib_present = (lib / f"{top}.py").is_file() or (lib / top).is_dir()
+    if not runs_pack_code(run) and not lib_present:
+        return None
+    code_run = python_target([str(a) for a in run])[0] == "code"
+    starts = [m.start() for m in _TRACEBACK_RE.finditer(text)]
+    if not starts:
+        return None
+    block = text[starts[-1]:]
+    exc = _IMPORT_EXC_RE.search(block)
+    frames = [f for f in _FRAME_RE.findall(block) if not f.startswith("<frozen ")]
+    if exc is None or not frames or not _pack_frame(frames[0], code_run):
+        return None
+    return exc.group(1).strip()[:200]
+
+
 def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
                   goal_text: str | None, notes_text: str | None = None,
                   acc_root: Path | None = None) -> dict[str, Any]:
@@ -1366,6 +1608,16 @@ def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
             if res.get("error"):
                 dropped.append((cid, "broken-at-base"))
                 continue
+            if res["outcome"] == "FAIL":
+                missing = (pack_import_error(check, res, acc_root) or "").replace(";", ",")
+                if missing:
+                    dropped.append((cid, f"{PACK_IMPORT_DROP} ({missing}): pack code runs "
+                                    "as `python3 -P -s` and must not import product "
+                                    "modules, its own directory or user site-packages. "
+                                    "Use the standard library and "
+                                    f"{PACK_DIR}/{HELPER_DIR}/, and run the product as "
+                                    "its users do, as a child process"))
+                    continue
             if res["outcome"] == "PASS" and check["kind"] in COVERED_KINDS:
                 dropped.append((cid, "passes-at-base"))
                 continue
@@ -1384,7 +1636,8 @@ def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
     new = dict(manifest)
     new["checks"] = kept
     total = len(checks) or 1
-    retry = bool(fatal) or (len(dropped) / total > RETRY_DROP_FRACTION) or len(kept) < MIN_CHECKS
+    retry = bool(fatal) or (len(dropped) / total > RETRY_DROP_FRACTION) or len(kept) < MIN_CHECKS \
+        or any(reason.startswith(PACK_IMPORT_DROP) for _, reason in dropped)
     return {"manifest": new, "dropped": dropped, "unavailable_at_base": unavailable,
             "retry": retry, "fatal": fatal}
 
