@@ -57,14 +57,23 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   `.sessions/`, `.trio*`, `.cursor/` and the vendored Trio metrics files are
   removed. `.acceptance-input/` holds only GOAL.md and the optional
   `ACCEPTANCE-NOTES.md`. The repository path is never named in its prompt.
-- The driver audits the session's tool calls. It flags any absolute path
-  outside the export and `$TMPDIR` (system prefixes such as `/usr/` are
-  allowed), and any mention of `PLAN.md`, `VERDICT.md`, `/hidden/` or
-  `speed/hard`. A contaminated session is discarded and re-run once with a
+- The driver audits the session's tool calls for evidence that the author
+  **read** the loop's plan or code. Only tool-call arguments count, never a
+  tool's output and never chat text. A session is flagged when an argument
+  names any of:
+  - a path inside the loop repository (its checkout, git dir or mailbox);
+  - a mailbox file (`PLAN.md`, `VERDICT.md`, `QUEUE.md`, `STATE.md`,
+    `LOG.md`, `REPORT.md`) that is not a file of the export itself;
+  - a lab hidden-pack path (`/hidden/`, `speed/hard`).
+
+  Route literals such as `/api/openrouter/stats`, `$TMPDIR`, toolchain
+  paths (`~/.nvm/...`) and system paths never contaminate (eval-r19
+  finding 2). A contaminated session is discarded and re-run once with a
   stern prefix. A second contaminated session stops the loop
   (`acceptance-contaminated`). When the broker history has no row
-  recognisable as a tool call, the audit is limited to the export plus a
-  scan of the authored files, and records `limited: true`.
+  recognisable as a tool call, the audit is limited: it checks only
+  whether the authored files spell the loop repository's path, and records
+  `limited: true`.
 - Validation runs on a **fresh** export, so files the author created in its
   own workspace never make a check pass. A `behaviour`/`doc` check that
   PASSes at base, ERRORs, misquotes the GOAL, breaks the schema or exceeds
@@ -94,16 +103,38 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
 
   A mismatch that no valid amend commit explains is restored with
   `acceptance: restore (tamper after <sha12>)` and logged
-  `acceptance tamper restored (<role>)`. It counts as a gate breach: the
-  role is re-run once, and a second breach sets `status: error`.
-- `trio-shadow.py --require-commits` also rejects every commit in
-  `<FROZEN base>..HEAD` that touches the pack, unless it is:
+  `acceptance tamper restored (<role>)`. It counts as a gate breach, and
+  the role is re-run once. The driver state counts restored tampers
+  loop-wide (`tamper_events`). The second one, in the same pass or any
+  later pass, stops the loop with `status: error` (reason
+  `acceptance-tamper-repeated`).
+- The driver state also records every pack commit the driver made
+  (`freeze_commit`, `driver_commits`) and every authenticated human
+  amendment (`human_amends`). A commit subject or trailer proves nothing
+  by itself.
+- `trio-shadow.py --require-commits` also rejects every commit that
+  touches the pack, unless it is one of:
   - the single freeze commit;
-  - a driver restore/pin commit whose trailer matches the committed pack;
+  - a driver restore or pin commit;
   - a valid amend commit.
 
-  It also rejects a freeze commit that does not precede every
-  `slice(<id>):` commit.
+  The range starts at `--acceptance-base`, else the driver state's run
+  head, else the parent of the commit that added FROZEN. It never starts
+  from the working tree.
+  - With the driver state visible, driver commits must be in its record,
+    and `(human)` amends must be authenticated ones.
+  - Without the driver state, a pin commit may only extend FROZEN after
+    amend commits, and a restore must put back a pack that was already
+    pinned.
+  - Only a genuine restore excuses the earlier tamper.
+  - A `slice(<id>):` commit behind the freeze (a Lead take-over made while
+    the author was still working) is tolerated with an `acceptance note:`.
+    The author worked from the base export and never saw it, and the Lead
+    prompt forbids product commits before FROZEN. A slice on a line
+    without the freeze fails with "acceptance/freeze ordering". The
+    driver's `gate breach` LOG line quotes the first acceptance reason.
+- Runs copy the pack without what the pin skips (`node_modules/`, caches,
+  `*.pyc`), and driver commits never add those paths.
 - Isolated builders that touch the mailbox are already retained with
   `mailbox_write` (unchanged).
 
@@ -149,6 +180,17 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
     (amend ACC-..)`).
   - An invalid one is reverted.
   - Going over the budget forces NEEDS_HUMAN.
+  - Every amend commit in a running loop is judged as the Evaluator's,
+    including one labelled `(human)`. The driver logs
+    ``unauthenticated `(human)` label``, and the scope, record, budget, must-FAIL-at-base
+    and no-removal rules all apply (eval-r19 finding 1).
+  - With fewer than 4 frozen checks the 25% share allows no amendment. This
+    fails safe: an amendment on a small pack forces NEEDS_HUMAN and never
+    softens a check (finding 10, kept deliberately).
+- **Bindings.** `acceptance_bindings:` values come from the Lead's PLAN and
+  reach every run as `ACC_BIND_*`. trio-check validates only the names. The
+  Evaluator fragment therefore asks the integration Evaluator to review
+  each value against the GOAL (finding 11).
 - **Anti-thrash.** A check that FAILs in 2 consecutive integration pre-runs
   with no accepted amendment forces NEEDS_HUMAN.
 - **SHIP gate.** On SHIP the pack is re-run at the evaluated sha.
@@ -157,6 +199,37 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
   - Any UNAVAILABLE forces NEEDS_HUMAN (`acceptance-unavailable`).
   - An ITERATE whose pre-run had only UNAVAILABLE non-passes is logged
     `acceptance-unavailable-iterate`.
+  - A refused SHIP is logged `acceptance: SHIP refused by the acceptance
+    gate (verdict becomes ...)`. The driver commits it as `loop: iteration
+    N — acceptance gate refused SHIP (<verdict>)`, next to any SHIP
+    retirement commit the Evaluator already made (finding 13).
+
+## Human amendments and resume
+
+- A human amends only while the loop is stopped, with
+  `trioctl omnigent acceptance amend --human --ids ACC-.. --reason "..."`.
+  The command refuses while a live driver holds the mailbox. It commits the
+  working-tree edits, or edits already committed since the pin, re-pins,
+  and records the amend commit in the driver state. That record, not the
+  `(human)` subject, is what authenticates a human amendment.
+- A hand-made `acceptance: amend <ids> (human): <reason>` commit is adopted
+  on resume only when all of these hold:
+  - the driver recorded a clean stop (`stopped_head`) with the pack intact;
+  - every pack commit since that stop is such a `(human)` amend;
+  - each of those commits has its AMENDMENTS.md records and touches only
+    `acceptance/`.
+
+  Otherwise it is logged `not adopted (...)` and restored.
+- Resume compares the frozen MANIFEST's `goal_sha256` with the current
+  GOAL.md. On a mismatch (a reused mailbox with a new GOAL) the loop stops
+  with `status: needs_human`, `phase: acceptance-goal-changed` (finding
+  12).
+- `trioctl omnigent acceptance wait` also returns when git shows the
+  committed freeze with a clean FROZEN. The Lead's shell need not see the
+  driver's state file (finding 6).
+- `python3 metrics/trio_loop.py run --runner omnigent --acceptance` (or
+  `TRIO_ACCEPTANCE=1`) passes the switch into the runner, so the Lead and
+  Evaluator get the acceptance prompt blocks (finding 7).
 
 ## C1: slice-evals back to fast (independent of the switch)
 
