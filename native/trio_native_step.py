@@ -7,10 +7,20 @@ call of this helper, run by a Bash-only ``trio-step`` agent:
 
     trio_native_step.py <op> --mailbox <abs> --token <run> --nonce <n> [...]
 
-Ops (v0, lockstep): ``begin``, ``next``, ``gate``, ``pin``, ``apply``,
-``end``. Each prints exactly one JSON object on stdout and exits 0 (usage
-errors exit 2). Every result echoes ``--nonce`` so the script can detect a
-step agent that answered for the wrong command.
+Ops (v0, lockstep): ``begin``, ``next``, ``dispatch``, ``builders``,
+``cleanup``, ``gate``, ``pin``, ``apply``, ``end``. Each prints exactly one
+JSON object on stdout and exits 0 (usage errors exit 2). Every result echoes
+``--nonce`` so the script can detect a step agent that answered for the
+wrong command.
+
+Builder waves are driver-owned (workflow subagents have no Agent tool):
+``dispatch`` returns the Lead's HEAD before a wave; ``builders`` verifies
+each isolated builder's branch (forked from that HEAD, no ``loop/``
+commits) and writes the builders' LOG lines; ``cleanup`` removes merged
+builder worktrees (``--force`` only for ``loop/`` residue) and branches.
+Beyond ``trio_loop``'s gate, a Lead pass must rewrite REPORT.md; a SHIP
+folds the driver's final STATE into the retirement commit; ``end`` removes
+Evaluator pin worktrees under ``.claude/worktrees/eval-*``.
 
 This file holds no loop semantics. Gates, verdict parsing, the repair
 counter, the evaluator pin/attempt and SHIP retirement are the functions of
@@ -50,6 +60,7 @@ Every op that needs the lock re-stamps ``pid`` and ``heartbeat``:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -78,7 +89,15 @@ MAILBOX_RUNTIME_IGNORES = (
     ".sessions/", "driver.log", ".lock", ".repairs", RECORDS,
 )
 _MAILBOX_RUNTIME_DIRS = frozenset({".dispatch", ".sessions", ".lock"})
-OPS = ("begin", "next", "gate", "pin", "apply", "end")
+OPS = ("begin", "next", "dispatch", "builders", "cleanup", "gate", "pin",
+       "apply", "end")
+WORKTREES_DIR = ".claude/worktrees"
+EVAL_WORKTREE_PREFIX = "eval-"
+BASE_REF_HINT = (
+    "launch Claude Code with --settings '{\"worktree\":{\"baseRef\":\"head\"}}' "
+    "so isolated builders fork from the Lead's HEAD"
+)
+RECORD_KINDS = ("gate", "apply", "report", "builders")
 
 
 def _load_loop():
@@ -158,7 +177,7 @@ def _write_json(path: Path, data: dict) -> None:
 
 def _records(mailbox: Path) -> dict:
     data = _read_json(mailbox / RECORDS)
-    for key in ("gate", "apply"):
+    for key in RECORD_KINDS:
         data.setdefault(key, {})
     return data
 
@@ -175,11 +194,19 @@ def _recorded(mailbox: Path, kind: str, key: str) -> dict | None:
     return dict(value) if isinstance(value, dict) else None
 
 
+def _report_digest(mailbox: Path) -> str:
+    """sha256 of REPORT.md ("" when missing): the gate's rewrite check."""
+    try:
+        return hashlib.sha256((mailbox / "REPORT.md").read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 def _purge_stale_records(mailbox: Path, iteration: int) -> None:
     """A mailbox re-initialized to an earlier iteration drops old records."""
     data = _records(mailbox)
     changed = False
-    for kind in ("gate", "apply"):
+    for kind in RECORD_KINDS:
         for key in list(data[kind]):
             if TL._number(key.split(":", 1)[0]) > iteration:
                 del data[kind][key]
@@ -437,6 +464,8 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             code = TL._finalize_ship(
                 mailbox, state_path, iteration, repo, context="resume"
             )
+            if code == 0:
+                _fold_final_state(mailbox, repo, iteration)
         after = _snapshot(_state(mailbox))
         return {"action": "stop", "code": code, "verdict": verdict, **after}
     phase = state["phase"].strip().lower()
@@ -462,6 +491,10 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         "evaluated_sha": "",
         "evaluated_repos": "",
     })
+    if role == "lead":
+        data = _records(mailbox)
+        data["report"][str(iteration)] = _report_digest(mailbox)
+        _write_json(mailbox / RECORDS, data)
     _write_session(mailbox, a.token, f"{role}-running", done=False)
     return {"action": role, "iteration": iteration, "attempt": 1,
             "scope": scope if role == "repair" else None}
@@ -503,6 +536,23 @@ def _advisory_check(mailbox: Path) -> dict:
             "v1_violations": summary.get("v1_violations")}
 
 
+def _report_gate(mailbox: Path, iteration: int) -> tuple[bool, str]:
+    """A Lead pass must rewrite REPORT.md (probe blocker 6).
+
+    The digest is recorded by ``next`` when it starts the pass; a pass
+    started by another driver has no record and is not checked.
+    """
+    before = _records(mailbox)["report"].get(str(iteration))
+    if before is None:
+        return True, "REPORT gate skipped (no digest recorded)"
+    if _report_digest(mailbox) in ("", before):
+        return False, (
+            f"REPORT.md was not rewritten in iteration {iteration} "
+            "(write it with a Bash heredoc)"
+        )
+    return True, "REPORT gate passed"
+
+
 def op_gate(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     """The post-role gate of ``trio_loop._run_role`` for one attempt."""
     _require_lock(mailbox, a.token)
@@ -518,10 +568,12 @@ def op_gate(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             f"gate {key}: STATE is iteration {snap['iteration']} phase "
             f"{snap['phase']}, not {role}-running"
         )
-    checks = (
+    checks = [
         TL._commit_gate(mailbox, repo),
         TL._log_gate(mailbox, iteration, role),
-    )
+    ]
+    if role == "lead":
+        checks.append(_report_gate(mailbox, iteration))
     failures = [note for ok, note in checks if not ok]
     result: dict = {
         "role": role, "iteration": iteration, "attempt": attempt,
@@ -654,8 +706,11 @@ def op_apply(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
             mailbox, state_path, mailbox / ".repairs", a.iteration,
             verdict, scope, repo=repo,
         )
+    fold = (_fold_final_state(mailbox, repo, a.iteration)
+            if verdict == "SHIP" and code == 0 else None)
     after = _snapshot(_state(mailbox))
     result = {
+        "retirement_fold": fold,
         "verdict": verdict,
         "scope": scope,
         "bound": bound,
@@ -673,6 +728,293 @@ def op_apply(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     return result
 
 
+# ------------------------------------------------------ builder waves
+def _lead_running(mailbox: Path, iteration: int, op: str) -> None:
+    snap = _snapshot(_state(mailbox))
+    if snap["iteration"] != iteration or snap["phase"] != "lead-running":
+        raise StepError(
+            f"{op}: STATE is iteration {snap['iteration']} phase "
+            f"{snap['phase']}, not lead-running of iteration {iteration}"
+        )
+
+
+def _need_repo(repo: Path | None, op: str) -> Path:
+    if repo is None:
+        raise StepError(f"{op}: no git repository for this mailbox")
+    return repo
+
+
+def op_dispatch(mailbox: Path, repo: Path | None,
+                a: argparse.Namespace) -> dict:
+    """The Lead's HEAD before a builder wave: every builder must fork here."""
+    _require_lock(mailbox, a.token)
+    _lead_running(mailbox, a.iteration, "dispatch")
+    root = _need_repo(repo, "dispatch")
+    head = TL._git_head(root)
+    if head is None:
+        raise StepError("dispatch: repository has no HEAD commit")
+    return {"iteration": a.iteration, "wave": a.wave, "head": head}
+
+
+def _worktrees(repo: Path) -> list[dict]:
+    """``git worktree list --porcelain`` as [{path, head, branch}]."""
+    out = TL._git(repo, "worktree", "list", "--porcelain").stdout
+    items, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur:
+                items.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch refs/heads/"):
+            cur["branch"] = line[len("branch refs/heads/"):]
+    return items
+
+
+def _branch_sha(repo: Path, branch: str) -> str | None:
+    result = TL._git(repo, "rev-parse", "--verify", "-q",
+                     f"refs/heads/{branch}^{{commit}}")
+    sha = result.stdout.strip()
+    return sha if result.returncode == 0 and sha else None
+
+
+def _check_builder(repo: Path, mailbox_rel: str | None, head: str,
+                   res: dict) -> str | None:
+    """Why this builder result is refused, or None."""
+    sid = str(res.get("id") or "?")
+    base = str(res.get("base") or "").strip()
+    if not base or not TL._sha_matches(base, head):
+        return (f"builder {sid} forked from {base or '(unknown)'}, not the "
+                f"Lead's HEAD {head[:12]}: {BASE_REF_HINT}")
+    commits = res.get("commits") or []
+    if not commits:
+        return None  # nothing to merge
+    branch = str(res.get("branch") or "").strip()
+    tip = _branch_sha(repo, branch) if branch else None
+    if tip is None:
+        return f"builder {sid}: branch {branch or '(none)'} does not exist"
+    reported = str(res.get("head") or "").strip()
+    if reported and not TL._sha_matches(reported, tip):
+        return (f"builder {sid}: reported head {reported[:12]} but branch "
+                f"{branch} is at {tip[:12]}")
+    if not TL._git_is_ancestor(repo, head, tip):
+        return (f"builder {sid}: branch {branch} does not contain the "
+                f"Lead's HEAD {head[:12]}: {BASE_REF_HINT}")
+    listed = TL._git(repo, "rev-list", f"{head}..{tip}").stdout.split()
+    for sha in listed:
+        loop_paths = [p for p in TL._commit_paths(repo, sha)
+                      if TL._path_in_mailbox(p, mailbox_rel)]
+        if loop_paths:
+            return (f"builder {sid}: commit {sha[:12]} commits mailbox "
+                    f"files ({', '.join(loop_paths[:3])}); builders never "
+                    "commit loop/")
+    return None
+
+
+def _one_line(text: object, limit: int = 160) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
+def op_builders(mailbox: Path, repo: Path | None,
+                a: argparse.Namespace) -> dict:
+    """Verify one wave's builder results and write their LOG lines.
+
+    Builders never write LOG.md (their worktree copy is lost): the driver
+    appends ``- iter N | builder | <id>: <summary>`` for each accepted one.
+    Idempotent per (iteration, wave, branches).
+    """
+    _require_lock(mailbox, a.token)
+    try:
+        results = json.loads(a.results or "[]")
+    except ValueError as exc:
+        raise StepError(f"builders: --results is not JSON: {exc}") from exc
+    if not isinstance(results, list) or not all(
+            isinstance(r, dict) for r in results):
+        raise StepError("builders: --results must be a JSON list of objects")
+    branches = ",".join(sorted(str(r.get("branch") or r.get("id") or "")
+                               for r in results))
+    key = f"{a.iteration}:{a.wave}:{branches}"
+    recorded = _recorded(mailbox, "builders", key)
+    if recorded is not None:
+        return recorded
+    _lead_running(mailbox, a.iteration, "builders")
+    root = _need_repo(repo, "builders")
+    head = str(a.head or "").strip()
+    if not head:
+        raise StepError("builders: --head (the dispatch HEAD) is required")
+    mailbox_rel = TL._mailbox_rel(root, mailbox)
+    accepted, refused, merge = [], [], []
+    for res in results:
+        sid = _one_line(res.get("id"), 64) or "?"
+        reason = _check_builder(root, mailbox_rel, head, res)
+        if reason:
+            refused.append({"id": sid, "reason": reason})
+            continue
+        accepted.append(sid)
+        if res.get("commits"):
+            merge.append({"id": sid, "branch": str(res["branch"]).strip()})
+    for res in results:
+        sid = _one_line(res.get("id"), 64) or "?"
+        if sid in accepted:
+            tip = str(res.get("head") or "")[:7]
+            where = (f" ({res.get('branch')}@{tip})" if res.get("commits")
+                     else " (no commits)")
+            TL._append_log(
+                mailbox,
+                f"- iter {a.iteration} | builder | {sid}: "
+                f"{_one_line(res.get('summary'))}{where}",
+            )
+    result = {"iteration": a.iteration, "wave": a.wave, "head": head,
+              "accepted": accepted, "refused": refused, "merge": merge}
+    _record(mailbox, "builders", key, result)
+    return result
+
+
+def _dirty_paths(worktree: str) -> list[str] | None:
+    result = subprocess.run(
+        ["git", "-C", worktree, "status", "--porcelain",
+         "--untracked-files=all"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    paths = []
+    for line in result.stdout.splitlines():
+        entry = line[3:]
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.strip().strip('"'))
+    return paths
+
+
+def _remove_worktree(repo: Path, path: str, mailbox_rel: str | None,
+                     force_any: bool = False) -> str | None:
+    """Remove a worktree; None on success, else why it was kept.
+
+    ``--force`` only when every uncommitted path is mailbox residue (or,
+    for an Evaluator pin worktree, always: it never holds product edits).
+    """
+    dirty = _dirty_paths(path)
+    if dirty is None:
+        return "git status failed in the worktree"
+    outside = [p for p in dirty if not TL._path_in_mailbox(p, mailbox_rel)]
+    if outside and not force_any:
+        return ("uncommitted changes outside the mailbox: "
+                + ", ".join(outside[:5]))
+    cmd = ["worktree", "remove"] + (["--force"] if dirty else []) + [path]
+    result = TL._git(repo, *cmd)
+    if result.returncode != 0:
+        return f"git worktree remove failed: {result.stderr.strip()[:200]}"
+    return None
+
+
+def op_cleanup(mailbox: Path, repo: Path | None,
+               a: argparse.Namespace) -> dict:
+    """Remove merged builder worktrees and delete their branches."""
+    _require_lock(mailbox, a.token)
+    root = _need_repo(repo, "cleanup")
+    mailbox_rel = TL._mailbox_rel(root, mailbox)
+    head = TL._git_head(root)
+    wanted = [b.strip() for b in (a.branches or "").split(",") if b.strip()]
+    trees = {t.get("branch"): t for t in _worktrees(root)}
+    removed, kept = [], []
+    for branch in wanted:
+        tip = _branch_sha(root, branch)
+        if tip is None:
+            removed.append({"branch": branch, "worktree": None,
+                            "note": "branch already gone"})
+            continue
+        if head is None or not TL._git_is_ancestor(root, tip, head):
+            kept.append({"branch": branch, "reason": "not merged into HEAD"})
+            continue
+        tree = trees.get(branch)
+        path = tree.get("path") if tree else None
+        if path and Path(path).resolve() == root.resolve():
+            kept.append({"branch": branch, "reason": "checked out in the repo"})
+            continue
+        if path:
+            why = _remove_worktree(root, path, mailbox_rel)
+            if why:
+                kept.append({"branch": branch, "worktree": path,
+                             "reason": why})
+                continue
+        deleted = TL._git(root, "branch", "-d", branch)
+        if deleted.returncode != 0:
+            kept.append({"branch": branch, "worktree": None,
+                         "reason": "git branch -d failed: "
+                         + deleted.stderr.strip()[:200]})
+            continue
+        removed.append({"branch": branch, "worktree": path})
+    return {"removed": removed, "kept": kept}
+
+
+def _eval_worktrees(repo: Path | None) -> list[str]:
+    if repo is None:
+        return []
+    marker = f"{repo}/{WORKTREES_DIR}/{EVAL_WORKTREE_PREFIX}"
+    return sorted(t["path"] for t in _worktrees(repo)
+                  if t.get("path", "").startswith(marker))
+
+
+# ------------------------------------------------ retirement fold
+def _fold_final_state(mailbox: Path, repo: Path | None,
+                      iteration: int) -> str:
+    """Fold the driver's final STATE (and LOG/.gitignore) into the SHIP
+    retirement commit, so the tree is clean after SHIP.
+
+    Same guard rails as ``trio_loop._fold_restored_verdict_into_retirement``:
+    HEAD is the single-parent ``loop: iteration N — SHIP`` commit touching
+    only the mailbox, nothing is staged, HEAD is on no remote branch, and
+    every dirty path is a mailbox sidecar (STATE.md, LOG.md, .gitignore).
+    Returns "amended", "clean" or "skipped: <reason>".
+    """
+    root = TL._git_root(repo)
+    if root is None:
+        return "skipped: no repository"
+    mailbox_rel = TL._mailbox_rel(root, mailbox)
+    if not mailbox_rel:
+        return "skipped: mailbox is not inside the repository"
+    sidecars = {f"{mailbox_rel}/{n}" for n in ("STATE.md", "LOG.md",
+                                                ".gitignore")}
+    dirty = _dirty_paths(str(root))
+    if dirty is None:
+        return "skipped: git status failed"
+    if not dirty:
+        return "clean"
+    others = [p for p in dirty if p not in sidecars]
+    if others:
+        return "skipped: other uncommitted paths: " + ", ".join(others[:5])
+    head = TL._git_head(root)
+    if head is None:
+        return "skipped: no HEAD"
+    info = TL._git(root, "log", "-1", "--format=%P%n%B", head)
+    parents, _sep, message = info.stdout.partition("\n")
+    if info.returncode != 0 or len(parents.split()) != 1:
+        return "skipped: HEAD is a merge or root commit"
+    if f"loop: iteration {iteration} — SHIP" not in message:
+        return "skipped: HEAD is not the retirement commit"
+    paths = TL._commit_paths(root, head)
+    if not paths or any(not TL._path_in_mailbox(p, mailbox_rel)
+                        for p in paths):
+        return "skipped: HEAD touches paths outside the mailbox"
+    if TL._git(root, "branch", "-r", "--contains", head).stdout.strip():
+        return "skipped: HEAD is already on a remote branch"
+    staged = TL._diff_paths(root, "--cached", "HEAD")
+    if staged is None or staged:
+        return "skipped: index has staged changes"
+    if TL._git(root, "add", "--", *sorted(dirty)).returncode != 0:
+        return "skipped: git add failed"
+    amend = TL._git(root, "commit", "--amend", "--no-edit", "--no-verify",
+                    "-q")
+    if amend.returncode != 0:
+        TL._git(root, "reset", "-q", "--", *sorted(dirty))
+        return "skipped: git commit --amend failed"
+    return "amended"
+
+
 def _dangling_worktrees(repo: Path | None) -> list[str]:
     if repo is None:
         return []
@@ -688,16 +1030,27 @@ def _dangling_worktrees(repo: Path | None) -> list[str]:
 
 
 def op_end(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
+    eval_removed, eval_kept = [], []
+    lock_dir = mailbox / ".lock"
+    if (repo is not None and _lock_owner(lock_dir) == _owner(a.token)
+            and not _foreign_live_pid(lock_dir)):
+        rel = TL._mailbox_rel(repo, mailbox)
+        for path in _eval_worktrees(repo):
+            why = _remove_worktree(repo, path, rel, force_any=True)
+            (eval_kept if why else eval_removed).append(
+                {"worktree": path, "reason": why} if why else path)
     lock = _release(mailbox, a.token)
     snap = _snapshot(_state(mailbox))
     session = _read_json(mailbox / SESSION)
     if session.get("session") == a.token and not session.get("done"):
         _write_session(mailbox, a.token, "done", done=True)
     return {"lock": lock, "dangling_worktrees": _dangling_worktrees(repo),
-            **snap}
+            "eval_worktrees_removed": eval_removed,
+            "eval_worktrees_kept": eval_kept, **snap}
 
 
-HANDLERS = {"begin": op_begin, "next": op_next, "gate": op_gate,
+HANDLERS = {"begin": op_begin, "next": op_next, "dispatch": op_dispatch,
+            "builders": op_builders, "cleanup": op_cleanup, "gate": op_gate,
             "pin": op_pin, "apply": op_apply, "end": op_end}
 
 
@@ -716,6 +1069,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--role", choices=("lead", "repair"), default="lead")
     parser.add_argument("--attempt", default="1",
                         help="gate: role attempt 1|2; apply: evaluator_attempt")
+    parser.add_argument("--wave", type=int, default=1,
+                        help="dispatch/builders: 1-based builder wave")
+    parser.add_argument("--head", default=None,
+                        help="builders: the dispatch HEAD sha")
+    parser.add_argument("--results", default=None,
+                        help="builders: JSON list of builder results")
+    parser.add_argument("--branches", default=None,
+                        help="cleanup: comma-separated merged builder branches")
     parser.add_argument("--json", action="store_true",
                         help="accepted for symmetry; output is always JSON")
     return parser

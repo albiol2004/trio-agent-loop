@@ -93,7 +93,8 @@ def same(a: dict, b: dict) -> bool:
 
 
 def lead_pass(repo: Path, iteration: int, *, role: str = "lead",
-              commit: bool = True, log: bool = True, body: str = "") -> None:
+              commit: bool = True, log: bool = True, body: str = "",
+              report: bool = True) -> None:
     if commit:
         (repo / "app.py").write_text(f"print({iteration}){body}\n",
                                      encoding="utf-8")
@@ -102,6 +103,9 @@ def lead_pass(repo: Path, iteration: int, *, role: str = "lead",
     if log:
         with (mbox(repo) / "LOG.md").open("a", encoding="utf-8") as fh:
             fh.write(f"- iter {iteration} | {role} | done\n")
+    if role == "lead" and report:
+        (mbox(repo) / "REPORT.md").write_text(
+            f"# Report — iteration {iteration}{body}\n", encoding="utf-8")
 
 
 def write_verdict(repo: Path, first: str, iteration: int, pin: dict,
