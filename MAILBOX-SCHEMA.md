@@ -981,7 +981,7 @@ validates them at base, freezes them, and the PLAN must map every one.
 `base`, `author {role, model, effort, session, path}`, `budget_s` (<= 300),
 `setup: [{id, cmd, provides, network: allowed}]`, `bindings: {NAME:
 {default, goal_quote}}` and `checks: [{id: ACC-NN, goal_ref, goal_quote,
-kind, surface, run: [argv], expect: {exit: 0, stdout?: [regex]},
+kind, surface, run: [argv], expect: {exit: 0, stdout?|stderr?|output?: [regex]},
 timeout_s (<= 120), needs: [tool | setup:<id>], binds: [NAME], network:
 loopback}]`. `goal_quote` is a verbatim substring of GOAL.md (or
 `ACCEPTANCE-NOTES.md`). `kind`: `behaviour` (must FAIL at base, needs
@@ -990,7 +990,9 @@ coverage), `guard` (may PASS at base; at most 3; no coverage).
 
 Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
 PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
-(`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). Each
+(`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). `expect`
+regexes match the full stream (first 1 MiB): `stdout`, `stderr`, or
+`output` (stdout then stderr); the 2 KB excerpt is evidence only. Each
 check runs in its OWN fresh copy of the tree (no .git/node_modules/caches/
 mailbox) with its own read-only view of the pack: its own files (named by
 its `run`, mentioned by them, or under `checks/<its id>/`) plus the shared
@@ -998,10 +1000,13 @@ ones (`fakes/`, `lib/`, interpreter-loaded names, unowned helpers); the
 view omits the metadata files and what the pin skips (`node_modules/`,
 `__pycache__/`, `.pytest_cache/`, `*.pyc`). No check can change another
 check's inputs. Loopback-only under bwrap when available (else `sandbox:
-none` with a dead proxy), the check's own Python run with `-P` when its
-`run` starts a Python script (the script's directory is not importable by
-it; the flag is not inherited, so the product, `python3 -m pkg` and
-`python3 -m pytest` resolve imports normally; shared helpers live in
+none` with a dead proxy), the check's own Python run with `-P -s` when
+the code it runs comes from the pack (a script under `acceptance/`, `-c`,
+`-m` of an `acceptance/lib/` module; neither the script's directory, the
+tree nor user site is importable by it; `-m acceptance...` is invalid). A
+`run` that starts the product (`python3 app.py`, `python3 -m pkg`,
+`python3 -m pytest`) gets no flag, and flags are not inherited, so the
+product resolves imports normally; shared helpers live in
 `acceptance/lib/`, on `PYTHONPATH`/`NODE_PATH`), a controlled `PATH` (system
 directories plus the interpreter directories the driver resolved at
 start), no symlinks in the pack, env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/

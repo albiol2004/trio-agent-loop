@@ -165,7 +165,14 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     without the freeze fails with "acceptance/freeze ordering". The
     driver's `gate breach` LOG line quotes the first acceptance reason.
 - Runs copy the pack without what the pin skips (`node_modules/`, caches,
-  `*.pyc`), and driver commits never add those paths.
+  `*.pyc`), and driver commits never add those paths. The symlink rule
+  below skips the same directories (eval-r19e finding 6): an author's or
+  Evaluator's local `npm i` in `acceptance/` (`node_modules/.bin/*`) is
+  neither a pack error nor a reason for `amend --human` to refuse.
+- A directory tree with entries the driver cannot read (a mode-000 file)
+  is copied without them; each is logged as `tree copy: skipped
+  unreadable <path>: <error>` in the run's log. An unreadable tree root
+  is a run error (`cannot copy tree`), never a crash (eval-r19e finding 7).
 - **No symlinks in the pack (eval-r19d finding 7).** Validation reports a
   symlink as a pack error (the author gets one retry), the frozen pack
   never contains one (`write_frozen_pack` skips them), and amendments,
@@ -206,19 +213,39 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     `isolation`. This is detection, not enforcement: a process that
     escapes a check under `sandbox: none` can still race a check after its
     copy was verified; only bwrap enforces isolation;
-  - the check's OWN Python runs with `-P` when its `run` starts a Python
-    interpreter on a script (`python3 [opts] acceptance/checks/x.py`), so
-    the script's directory (its pack view) is not importable by it
-    (eval-r19c F2). `-P` is a flag, not an environment variable: the
-    PRODUCT and every Python the check starts (`python3 app.py` importing
-    a sibling module, `python3 -m pkg`, `python3 -m pytest`, a standalone
-    `python3 tests/test_x.py`) resolve imports normally, including
-    user-site (`~/.local`) packages (eval-r19d finding 1; round 3 exported
-    `PYTHONSAFEPATH`/`PYTHONNOUSERSITE`, which every child inherited, so
-    correct products could never pass). `-m`/`-c` runs are left as they
-    are (their `sys.path[0]` is the tree copy, not the pack); a nested
-    `sh -c "python3 acceptance/checks/x.py"` gets no `-P` and sees only
-    its own view. Interpreters older than 3.11 rely on the views alone.
+  - the check's OWN Python runs with `-P -s` when the code it executes
+    comes from the PACK (eval-r19c F2; eval-r19e findings 1, 3, 4, 5):
+    - a script that resolves (symlinks followed, as CPython does for
+      `sys.path[0]`) inside the check's `acceptance/` view:
+      `python3 [opts] acceptance/checks/x.py`;
+    - `python3 -c <code>` (the code is the manifest's): the tree root
+      (cwd) is not on its `sys.path`, so a product-root `json.py` cannot
+      answer for the judge;
+    - `python3 -m <name>` whose top-level module is in `acceptance/lib/`
+      (found through `PYTHONPATH` and preferred over a same-named product
+      module). `-m acceptance...` is a validation error: run a pack
+      script by its path.
+
+    `-P` keeps the script directory / tree off that interpreter's
+    `sys.path`; `-s` keeps user site-packages (a `.pth` or
+    `usercustomize.py` planted in `~/.local` after the driver started) out
+    of it, so pack code gets the standard library plus `acceptance/lib/`
+    only. A `run` that starts the PRODUCT gets neither flag and runs
+    exactly as its users run it: `python3 app.py` importing a sibling
+    module, `python3 template/build/test_x.py`, `python3 -m pkg` (cwd
+    import), `python3 -m pytest` (user site). Both are flags, not
+    environment variables, so the product and every process a check
+    starts resolve imports normally, user site included (eval-r19d
+    finding 1; round 3 exported `PYTHONSAFEPATH`/`PYTHONNOUSERSITE`, which
+    every child inherited). The option parser follows CPython: combined
+    short options (`-um pkg`, `-Bc code`, `-mpkg`, `-Wignore`), value
+    options as separate words (`-W x`, `-X y`, `--check-hash-based-pycs
+    v`) and `--`. A nested interpreter (`sh -c "python3 acceptance/..."`,
+    `/usr/bin/env python3 ...`) gets no flags and sees only its own view.
+    Interpreters older than 3.11 get `-s` only and rely on the views.
+    Residual: product code (and every child) still loads user site, so a
+    same-uid process that plants a `.pth` there can still affect product
+    runs; under `sandbox: none` a hostile check can plant one itself.
     The explicit, pinned helper path is `acceptance/lib/` (on `PYTHONPATH`
     and `NODE_PATH`, shared by every check). Implicit-load variables of
     the driver's environment (`PYTHONPATH`, `PYTHONSTARTUP`, `NODE_PATH`,
@@ -249,6 +276,26 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
     ~250 ms per check for near-instant checks.
 - Isolated builders that touch the mailbox are already retained with
   `mailbox_write` (unchanged).
+
+## Check outcomes and `expect`
+
+A check exits 0 on PASS, 1 on FAIL, 77 on UNAVAILABLE; a timeout is a
+FAIL, anything else is an ERROR re-run once. On exit 0 every `expect`
+pattern must match too (eval-r19e finding 2):
+
+- `expect.stdout`: regexes matched (`re.search`, `re.MULTILINE`) against
+  the check's full stdout;
+- `expect.stderr`: the same against its full stderr;
+- `expect.output`: the same against stdout followed by stderr, for a check
+  that deliberately asks for both.
+
+stdout and stderr are captured separately; each stream's first 1 MiB
+(`MATCH_BYTES`) is matched, the rest is drained and discarded. The
+`excerpt` in results and the one-line FAIL reason come from the last 2 KB
+(`EXCERPT_BYTES`) of both streams in arrival order and are evidence only;
+patterns never see just that tail. (Before round 5 patterns saw the last
+2 KB of merged stdout+stderr, so a `--help` obligation early in a long help
+text never passed.)
 
 ## Coverage
 
