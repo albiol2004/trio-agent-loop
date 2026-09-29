@@ -1,4 +1,7 @@
-"""The generated repair prompts satisfy the drivers' repair LOG gate (F5)."""
+"""The generated repair prompts satisfy the drivers' repair LOG gate (F5).
+
+Guards the shared repair prompt and LOG-gate prose of every harness (moved
+out of native/ per eval-native-v0b: it is not native-specific)."""
 from __future__ import annotations
 
 import importlib.util
