@@ -526,7 +526,11 @@ trioctl omnigent acceptance validate --export .                                 
 - Repositories must vendor the METRICS_API 7 set, now five files including
   `trio-acceptance.py`, with `trioctl omnigent metrics refresh --commit`
   before `--acceptance` runs there. An older set still runs with the switch
-  off.
+  off. With the switch on, `trioctl omnigent loop` checks the set committed
+  on the target (or a re-attached loop branch) before creating any Lead
+  worktree, branch or registry record, and refuses (exit 3) below
+  METRICS_API 7, naming `trioctl omnigent metrics refresh --mailbox <mb>
+  --commit` (r20); the check on the loaded core remains a second guard.
 
 ## Claude-native seams (N1–N4, later task)
 

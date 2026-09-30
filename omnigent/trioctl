@@ -8773,6 +8773,40 @@ def _root_free_wanted(args: argparse.Namespace, mailbox: Path) -> tuple[bool, in
     return True, None
 
 
+def _loop_acceptance_settings(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """``(profile, r19 switch settings)`` of a `loop` invocation."""
+    try:
+        profile = load_config(config_path(None))
+    except TrioctlError:
+        profile = None
+    return profile, acceptance_settings(profile, getattr(args, "acceptance", None))
+
+
+def _acceptance_target_refusal(
+    args: argparse.Namespace, home: Path, branch: str, mailbox: Path, api: int | None,
+) -> str | None:
+    """r20: with frozen acceptance ON, the metrics/ set committed on *branch*
+    (the target, or a re-attached loop branch) must honour
+    ``ACCEPTANCE_METRICS_API``: the roles run that committed trio-check /
+    trio-shadow, which have no acceptance gate below it -- whatever core this
+    driver itself loads (an installed adapter loads the release's). Checked
+    before any Lead worktree, branch or registry record exists. None = ok or
+    switch off (switch-off runs are unchanged)."""
+    if not _loop_acceptance_settings(args)[1]["enabled"]:
+        return None
+    if api is not None and api >= ACCEPTANCE_METRICS_API:
+        return None
+    found = "no committed metrics/ set" if api is None else f"METRICS_API {api}"
+    return (
+        f"trioctl: acceptance: frozen acceptance needs METRICS_API "
+        f"{ACCEPTANCE_METRICS_API} committed on {branch} ({found}): run "
+        f"`trioctl omnigent metrics refresh --mailbox {_pp(mailbox)} --commit` with "
+        f"{branch} checked out, or run with --no-acceptance. Nothing was created."
+    )
+
+
 def _target_metrics_api(home: Path, target: str) -> int | None:
     """METRICS_API the metrics/ set committed at the tip of *target* honours
     (None = no trio-metrics.py or trio_loop.py there).
@@ -9041,6 +9075,20 @@ def _root_free_begin(
                 f"`{METRICS_REFRESH_COMMAND}`). Nothing was changed.",
                 file=sys.stderr,
             )
+            return 3
+        refusal = _acceptance_target_refusal(args, home, target, mailbox, api)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 3
+    elif not land_only:
+        # A re-attached Lead worktree runs the metrics/ committed on its loop
+        # branch: the same acceptance floor applies (nothing is created).
+        branch = str(record.get("branch") or "")
+        refusal = branch and _acceptance_target_refusal(
+            args, home, branch, mailbox, _target_metrics_api(home, branch)
+        )
+        if refusal:
+            print(refusal, file=sys.stderr)
             return 3
     worktree_root = (
         Path(args.worktree_root).expanduser().resolve()
@@ -9774,12 +9822,10 @@ def _command_loop_run(
     lockstep = _loop_is_lockstep(mailbox)
     # r19 frozen acceptance (default off): switch, old-core and tier guards.
     acceptance_cfg: dict[str, Any] | None = None
-    try:
-        profile = load_config(config_path(None))
-    except TrioctlError:
-        profile = None
-    settings = acceptance_settings(profile, getattr(args, "acceptance", None))
+    profile, settings = _loop_acceptance_settings(args)
     if settings["enabled"]:
+        # Second guard (the committed set was checked before anything was
+        # created, `_acceptance_target_refusal`): the core this driver loaded.
         problems: list[str] = []
         if (_core_metrics_api(loop_core) < ACCEPTANCE_METRICS_API
                 or not hasattr(loop_core, "AcceptanceController")):

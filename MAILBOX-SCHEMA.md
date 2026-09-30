@@ -1654,7 +1654,7 @@ the dirty-checkout gate or the untracked-product scan.
 | 0 | `shipped` | SHIP accepted (retirement complete) and, root-free, landed (`phase: landed`); also a root mailbox that is already `shipped` (nothing run, r16b) |
 | 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error of a mailbox outside any git checkout (run in place); a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository (stderr only, nothing created); or a refused flag combination (`--root-bound`, removed in r16b; an open-loop without isolated builders; a detached root without `--target`; `--root-free` outside git) |
-| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
+| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch; r20: acceptance on with a target (or re-attached loop branch) whose committed metrics/ is below METRICS_API 7, refused before any Lead worktree, branch or registry record exists, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
 | 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict; or the mailbox is owned by a live driver (left byte-identical; a registered driver, or a live pid in the root mailbox's `.lock`, eval-r16rc B1/M1). (r15.x's Lead-pass `writes-overlap` stop was removed in r16b: a mid-run overlap warns) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
@@ -1772,6 +1772,13 @@ under `quality` in `--json`.
     git, fresh-run reclaim of builder worktrees, and the saved workflow
     script reported as the one Claude Code actually runs. The frozen
     acceptance seams (docs/FROZEN-ACCEPTANCE.md, N1-N4) are not in v0.1.
+  - *acceptance pre-create check* (trioctl): with the switch on, `loop`
+    requires the target's COMMITTED metrics/ set (or a re-attached loop
+    branch's) at METRICS_API >= 7 before anything is created (exit 3,
+    naming `trioctl omnigent metrics refresh --mailbox <mb> --commit`):
+    the roles run that committed trio-check/trio-shadow even when the
+    driver loads the release's own core (installed adapter). The
+    loaded-core check stays as a second guard; switch off is unchanged.
 
 - **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
   default off): the `covers:` slice key and `parse_plan_acceptance`
