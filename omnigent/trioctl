@@ -8786,6 +8786,7 @@ def _loop_acceptance_settings(
 
 def _acceptance_target_refusal(
     args: argparse.Namespace, home: Path, branch: str, mailbox: Path, api: int | None,
+    reattach: dict | None = None,
 ) -> str | None:
     """r20: with frozen acceptance ON, the metrics/ set committed on *branch*
     (the target, or a re-attached loop branch) must honour
@@ -8793,12 +8794,33 @@ def _acceptance_target_refusal(
     trio-shadow, which have no acceptance gate below it -- whatever core this
     driver itself loads (an installed adapter loads the release's). Checked
     before any Lead worktree, branch or registry record exists. None = ok or
-    switch off (switch-off runs are unchanged)."""
+    switch off (switch-off runs are unchanged).
+
+    *reattach* is the root-free record of a re-attached loop (*branch* is its
+    `trio/<slug>` branch, checked out in the Lead worktree): refreshing the
+    target cannot reach that branch, so the advice names the ways out that do
+    (r20 review F2)."""
     if not _loop_acceptance_settings(args)[1]["enabled"]:
         return None
     if api is not None and api >= ACCEPTANCE_METRICS_API:
         return None
     found = "no committed metrics/ set" if api is None else f"METRICS_API {api}"
+    if reattach is not None:
+        lead = str(reattach.get("path") or "<Lead worktree>")
+        target = str(reattach.get("target_ref") or "<target>")
+        return (
+            f"trioctl: acceptance: frozen acceptance needs METRICS_API "
+            f"{ACCEPTANCE_METRICS_API} committed on this loop's branch {branch} ({found}), "
+            f"which its Lead worktree {lead} runs; refreshing {target} does not reach "
+            f"{branch}. Either (1) refresh inside the Lead worktree, on {branch}: "
+            f"`trioctl omnigent metrics refresh --repo {_pp(lead)} --commit`, then run again; "
+            f"or (2) resume with --no-acceptance (the loop continues with the switch off, "
+            f"as it started); or (3) `cd {_pp(home)} && trioctl omnigent abandon --mailbox "
+            f"{_pp(mailbox)}` (it keeps {branch}: take what you need from it, then "
+            f"`git branch -D {branch}`), refresh the target with {target} checked out "
+            f"(`trioctl omnigent metrics refresh --mailbox {_pp(mailbox)} --commit`) and "
+            f"start the loop again. Nothing was created."
+        )
     return (
         f"trioctl: acceptance: frozen acceptance needs METRICS_API "
         f"{ACCEPTANCE_METRICS_API} committed on {branch} ({found}): run "
@@ -9085,7 +9107,7 @@ def _root_free_begin(
         # branch: the same acceptance floor applies (nothing is created).
         branch = str(record.get("branch") or "")
         refusal = branch and _acceptance_target_refusal(
-            args, home, branch, mailbox, _target_metrics_api(home, branch)
+            args, home, branch, mailbox, _target_metrics_api(home, branch), reattach=record
         )
         if refusal:
             print(refusal, file=sys.stderr)

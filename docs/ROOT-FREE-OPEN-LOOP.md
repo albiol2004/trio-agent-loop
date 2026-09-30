@@ -196,7 +196,7 @@ SHIP-not-landed; `trioctl omnigent land` resumes it.
 |---|---|
 | 0 | shipped — verified **and** landed (also: an already-shipped root mailbox, nothing run) |
 | 2 | blocked; refused flag combination (`--root-bound`; open-loop without isolation; detached root without `--target`); start-time `writes:` overlap |
-| 3 | error (incl. `worktree-setup`, `driver-exception`, METRICS_API refusal, gitignored mailbox) |
+| 3 | error (incl. `worktree-setup`, `driver-exception`, METRICS_API refusal, gitignored mailbox; r20: frozen acceptance ON over a committed set below METRICS_API 7, refused before anything is created, STATE.md untouched — see §10) |
 | 4 | iteration cap |
 | 5 | needs_human / mailbox owned by a live driver: a registered driver, or a live pid in the ROOT mailbox's `.lock` (a native core or pre-r16 driver never registers; eval-r16rc B1) — refused before anything is created, root mailbox byte-identical. A stale `.lock` (dead pid, or pid-less for 60 s) is removed as the loop core does and the start proceeds |
 | 6 | needs_retirement |
@@ -307,6 +307,22 @@ r15 guard.
   pin is `sha256:<12 hex>` of the four files and goes into the commit
   message as is. Bundles should write `<release>/metrics/PIN` (12-char
   release sha) so the commit names the release.
+- **Frozen acceptance (r19/r20) and API-6 repositories.** With the
+  acceptance switch ON a root-free loop needs METRICS_API 7 committed on
+  its target (a new loop) or on its `trio/<slug>` branch (a re-attached
+  loop); below that it is refused with exit 3 before any Lead worktree,
+  branch or registry record exists. The switch is ON when `--acceptance`
+  is passed, when `TRIO_ACCEPTANCE=1`, **or when the profile
+  (`~/.config/trio-agent-loop/omnigent.toml`) has `[acceptance] enabled =
+  true`** — so that profile line alone refuses every honest r16/r17 loop
+  over an API-6 set, including a trio-dash resume (which passes no flag),
+  until the repository is refreshed (`trioctl omnigent metrics refresh
+  --mailbox <mb> --commit` with the target checked out). A re-attached
+  loop cannot be fixed by a target refresh: refresh inside its Lead
+  worktree (`trioctl omnigent metrics refresh --repo <Lead worktree>
+  --commit`), resume with `--no-acceptance`, or `abandon` it (then `git
+  branch -D trio/<slug>`), refresh the target and start again. The switch
+  is OFF by default; with it off API-6 loops run unchanged.
 - One-shots (`trioctl omnigent run <role>`) keep their `--workspace`
   semantics (physical cwd = `--workspace`); since no Trio session runs at
   a root any more they take no root turn and never wait. A lockstep Lead's

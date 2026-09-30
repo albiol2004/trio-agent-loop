@@ -1654,7 +1654,7 @@ the dirty-checkout gate or the untracked-product scan.
 | 0 | `shipped` | SHIP accepted (retirement complete) and, root-free, landed (`phase: landed`); also a root mailbox that is already `shipped` (nothing run, r16b) |
 | 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error of a mailbox outside any git checkout (run in place); a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository (stderr only, nothing created); or a refused flag combination (`--root-bound`, removed in r16b; an open-loop without isolated builders; a detached root without `--target`; `--root-free` outside git) |
-| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch; r20: acceptance on with a target (or re-attached loop branch) whose committed metrics/ is below METRICS_API 7, refused before any Lead worktree, branch or registry record exists, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
+| 3 | `error`; unchanged for the r20 pre-create refusal | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1). r20 pre-create refusal (stderr only; STATE.md, LOG.md and the root untouched, nothing created): acceptance on -- by flag, `TRIO_ACCEPTANCE=1` or the profile's `[acceptance] enabled = true`, which also decides a dashboard resume -- with a target (or re-attached loop branch) whose committed metrics/ is below METRICS_API 7; for a re-attached loop the message names the exits that reach its `trio/<slug>` branch (`metrics refresh --repo <Lead worktree> --commit`, `--no-acceptance`, or `abandon` + `git branch -D` + target refresh + restart) |
 | 4 | unchanged | `--max-iterations` reached |
 | 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict; or the mailbox is owned by a live driver (left byte-identical; a registered driver, or a live pid in the root mailbox's `.lock`, eval-r16rc B1/M1). (r15.x's Lead-pass `writes-overlap` stop was removed in r16b: a mid-run overlap warns) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
@@ -1779,6 +1779,14 @@ under `quality` in `--json`.
     the roles run that committed trio-check/trio-shadow even when the
     driver loads the release's own core (installed adapter). The
     loaded-core check stays as a second guard; switch off is unchanged.
+    Review fix (F2/F3): a re-attached loop's refusal no longer advises a
+    target refresh (it cannot reach `trio/<slug>`); it names `metrics
+    refresh --repo <Lead worktree> --commit`, `--no-acceptance`, or
+    `abandon` then `git branch -D trio/<slug>`, a target refresh and a
+    restart. The switch counts from the profile too: `[acceptance]
+    enabled = true` alone refuses every API-6 root-free loop, dashboard
+    resumes included (they pass no flag), until its repository (or loop
+    branch) is refreshed.
 
 - **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
   default off): the `covers:` slice key and `parse_plan_acceptance`

@@ -100,7 +100,8 @@ def test_reattach_to_an_api6_loop_branch_is_refused_with_the_switch_on(world, tm
     capsys.readouterr()
     assert world.run_loop(spec, "--acceptance") == 3
     err = capsys.readouterr().err
-    assert f"committed on {rec['branch']} (METRICS_API 6)" in err and "Nothing was created" in err
+    assert (f"committed on this loop's branch {rec['branch']} (METRICS_API 6)" in err
+            and "Nothing was created" in err)
     assert git(home, "worktree", "list") == before
 
 
@@ -131,3 +132,101 @@ def test_real_cli_subprocess_refuses_before_create(tmp_path):
     assert f"metrics refresh --mailbox {box} --commit" in proc.stderr
     assert git(home, "branch", "--list", "trio/*") == ""
     assert len(git(home, "worktree", "list").splitlines()) == 1
+
+
+# ---------------------------------------------------------------- r20 review F2
+def _progressed_reattach(world, tmp_path, monkeypatch):
+    """An API-6 loop started with the switch OFF that made progress on its
+    `trio/<slug>` branch (so a moved target never re-seeds it), then stopped."""
+    t = world.trioctl
+    home = _api6_home(tmp_path)
+    spec = world.add_loop(home, "loop/a", [{"id": "a-one", "write": "src/a.py"}])
+    monkeypatch.setattr(t, "_command_loop_run", lambda *a, **kw: 9)
+    assert world.run_loop(spec) == 9  # switch off: Lead worktree created, loop "stopped"
+    rec = world.rf.load_record(world.wt, home, spec["slug"])
+    assert world.rf.active(rec)
+    lead = Path(rec["path"])
+    (lead / "src" / "a.py").write_text("progress = 1\n")
+    git(lead, "add", "src/a.py")
+    git(lead, "commit", "-qm", "a-one: progress on the loop branch")
+    return t, home, spec, rec, lead
+
+
+def _refresh(t, *argv):
+    return t.command_metrics_refresh(t.parser().parse_args(["omnigent", "metrics", "refresh", *argv]))
+
+
+def _branch_api(t, home, branch):
+    return t._target_metrics_api(home, branch)
+
+
+def test_reattach_advice_names_the_working_exits(world, tmp_path, monkeypatch, capsys):
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    branch = rec["branch"]
+    capsys.readouterr()
+    assert world.run_loop(spec, "--acceptance") == 3
+    err = capsys.readouterr().err
+    assert (f"frozen acceptance needs METRICS_API 7 committed on this loop's branch {branch} "
+            f"(METRICS_API 6), which its Lead worktree {lead} runs; refreshing main does not "
+            f"reach {branch}.") in err
+    assert f"`trioctl omnigent metrics refresh --repo {lead} --commit`" in err
+    assert "resume with --no-acceptance" in err
+    assert (f"`cd {home} && trioctl omnigent abandon --mailbox {spec['root_box']}` "
+            f"(it keeps {branch}: take what you need from it, then `git branch -D {branch}`), "
+            f"refresh the target with main checked out (`trioctl omnigent metrics refresh "
+            f"--mailbox {spec['root_box']} --commit`) and start the loop again.") in err
+    assert "Nothing was created" in err
+    # The r20-rc advice ("refresh --mailbox ... with trio/<slug> checked out") is gone ...
+    assert f"with {branch} checked out" not in err
+    # ... and following it never helped: the target moves, the loop branch does not.
+    monkeypatch.chdir(home)
+    assert _refresh(t, "--mailbox", str(spec["root_box"]), "--commit") == 0
+    assert _branch_api(t, home, "main") == 7 and _branch_api(t, home, branch) == 6
+    capsys.readouterr()
+    assert world.run_loop(spec, "--acceptance") == 3
+    assert f"committed on this loop's branch {branch} (METRICS_API 6)" in capsys.readouterr().err
+
+
+def test_reattach_exit_1_refresh_inside_the_lead_worktree(world, tmp_path, monkeypatch, capsys):
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    before = git(home, "worktree", "list", "--porcelain")
+    before = [l for l in before.splitlines() if not l.startswith("HEAD ")]
+    assert _refresh(t, "--repo", str(lead), "--commit") == 0
+    assert "chore: vendor trio loop core" in git(lead, "log", "-1", "--format=%s")
+    assert _branch_api(t, home, rec["branch"]) == 7
+    assert _branch_api(t, home, "main") == 6  # the target is untouched
+    assert world.run_loop(spec, "--acceptance") == 9  # past the pre-check: re-attached
+    after = git(home, "worktree", "list", "--porcelain")
+    assert [l for l in after.splitlines() if not l.startswith("HEAD ")] == before
+
+
+def test_reattach_exit_2_no_acceptance_overrides_env_and_profile(world, tmp_path, monkeypatch):
+    """A dashboard resume passes no flag: the env (or profile) decides; the
+    advised --no-acceptance resumes the loop switch-off."""
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    monkeypatch.setenv("TRIO_ACCEPTANCE", "1")
+    assert world.run_loop(spec) == 3
+    assert world.run_loop(spec, "--no-acceptance") == 9
+
+
+def test_reattach_exit_3_abandon_refresh_target_restart(world, tmp_path, monkeypatch, capsys):
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    branch = rec["branch"]
+    progress = git(home, "rev-parse", branch).strip()
+    monkeypatch.chdir(home)
+    assert t.command_abandon(t.parser().parse_args(
+        ["omnigent", "abandon", "--mailbox", str(spec["root_box"])])) == 0
+    assert not lead.exists()
+    # the branch is kept, and the loop's progress on it with it
+    assert subprocess.run(["git", "-C", str(home), "merge-base", "--is-ancestor", progress, branch],
+                          env={**os.environ, **GIT_ENV}).returncode == 0
+    assert _refresh(t, "--mailbox", str(spec["root_box"]), "--commit") == 0
+    assert _branch_api(t, home, "main") == 7
+    capsys.readouterr()
+    assert world.run_loop(spec, "--acceptance") == 3  # the kept branch blocks a restart ...
+    assert f"git branch -D {branch}" in capsys.readouterr().err
+    git(home, "branch", "-D", branch)                  # ... as the advice says
+    capsys.readouterr()
+    assert world.run_loop(spec, "--acceptance") == 9, capsys.readouterr().err
+    new = world.rf.load_record(world.wt, home, spec["slug"])
+    assert world.rf.active(new) and _branch_api(t, home, new["branch"]) == 7

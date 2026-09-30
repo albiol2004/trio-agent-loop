@@ -31,7 +31,14 @@ verdict: amendments -> anti-thrash -> SHIP gate (pack re-run at the evaluated sh
 | CLI | `trioctl omnigent loop --acceptance` / `--no-acceptance`; `trioctl omnigent doctor --acceptance` |
 | loop core | `run_loop(..., acceptance={"enabled": True, "wait_s": 900})`; `trio_loop.py run --acceptance` |
 
-The CLI flag wins, then the env, then the profile. With the switch off
+The CLI flag wins, then the env, then the profile. **The profile alone is
+enough to turn it on for every loop of this user**, including a trio-dash
+resume (the dashboard passes no `--acceptance` flag, so the profile or
+`TRIO_ACCEPTANCE` decides). With it on, every root-free loop (open-loop and
+lockstep, r16/r17) whose repository still has an API-6 metrics/ set
+committed is refused (exit 3, nothing created) until that set is refreshed;
+see "Install impact". Leave `[acceptance]` out of the profile (the default)
+and those loops run unchanged. With the switch off
 nothing changes: prompts, LOG.md, STATE.md, `.driver.json` and commits are
 identical to r17-rc (a test compares the loop core with `9342a57`). The one
 exception is the C1 slice-eval trim, which applies whatever the switch says
@@ -531,6 +538,21 @@ trioctl omnigent acceptance validate --export .                                 
   worktree, branch or registry record, and refuses (exit 3) below
   METRICS_API 7, naming `trioctl omnigent metrics refresh --mailbox <mb>
   --commit` (r20); the check on the loaded core remains a second guard.
+  STATE.md and LOG.md are not touched by this refusal.
+- The switch may come from the profile: `[acceptance] enabled = true` in
+  `~/.config/trio-agent-loop/omnigent.toml` refuses **every** honest
+  API-6 root-free loop (r16 open-loop, r16b/r17 lockstep), dashboard
+  resumes included, until its repository is refreshed. Turn it on in the
+  profile only after refreshing the repositories you run loops in, or use
+  `--acceptance` / `TRIO_ACCEPTANCE=1` per run.
+- A loop already running on its `trio/<slug>` branch (started with the
+  switch off) runs the metrics/ set committed on **that branch**; a target
+  refresh does not reach it. Its refusal names the three ways out: refresh
+  inside the Lead worktree (`trioctl omnigent metrics refresh --repo <Lead
+  worktree> --commit`, a commit on `trio/<slug>`), resume with
+  `--no-acceptance` (as it started), or `trioctl omnigent abandon --mailbox
+  <mb>` (keeps the branch: take what you need, then `git branch -D
+  trio/<slug>`), refresh the target and start again.
 
 ## Claude-native seams (N1–N4, later task)
 
