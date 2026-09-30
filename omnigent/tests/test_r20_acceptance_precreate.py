@@ -283,9 +283,11 @@ def test_profile_on_no_acceptance_runs_builders(world, tmp_path, monkeypatch, ca
 
 def test_flag_absent_env_on_keeps_acceptance_active(world, tmp_path, monkeypatch, capsys):
     """(d) Without the flag the env decides, as before: the re-attach is
-    refused, and a fresh API-7 loop starts with the switch ON (the World's
-    fixture repository vendors no trio-acceptance.py, so the driver stops at
-    the acceptance stage before any builder; nothing is recorded as off)."""
+    refused, and a fresh API-7 loop starts with the switch ON and stops at the
+    acceptance stage before any builder (the repository's core: no vendored
+    trio-acceptance.py -> AcceptanceError; the installed adapter's release
+    core: the author dispatch fails on the World's empty profile); nothing is
+    recorded as off."""
     t = world.trioctl
     real_run = t._command_loop_run
     t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
@@ -305,7 +307,8 @@ def test_flag_absent_env_on_keeps_acceptance_active(world, tmp_path, monkeypatch
     assert rc != 0
     assert "frozen acceptance ON (env)" in err and "frozen acceptance OFF" not in err
     lead7 = Path(world.rf.load_record(world.wt, fresh, spec7["slug"])["path"])
-    assert "AcceptanceError" in (lead7 / "loop" / "b" / "LOG.md").read_text()
+    log = (lead7 / "loop" / "b" / "LOG.md").read_text()
+    assert "AcceptanceError" in log or "acceptance: error" in log, log
     assert (fresh / "src" / "b.py").exists() is False
     assert all(on and (rec or {}).get("enabled") is True for _mb, on, rec in seen), seen
 
