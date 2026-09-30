@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SERVE_PATH = REPO_ROOT / "dashboard" / "serve.py"
@@ -50,6 +52,11 @@ class NestedMailboxBoardTests(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory()
         self.home = tempfile.TemporaryDirectory()
+        # This class exercises the HOME-relative inbox-state default under the
+        # patched serve.HOME (a temp dir), so drop conftest's per-test override.
+        self.inbox_env = patch.dict(os.environ, {"TRIO_DASH_INBOX_STATE": ""})
+        self.inbox_env.start()
+        self.addCleanup(self.inbox_env.stop)
         root = Path(self.workspace.name)
         (root / "loop").mkdir()
         (root / "loop" / "LOG.md").write_text("# LOG\n", encoding="utf-8")
