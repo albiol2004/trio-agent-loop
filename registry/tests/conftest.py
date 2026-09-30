@@ -8,6 +8,7 @@ DashboardServer test without a patched HOME wrote
 file, on every full-suite run and every verify.sh item-65 run)."""
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
@@ -67,11 +68,16 @@ def inbox_keys_owned_by_tests(before: dict, after: dict, roots: list[str]) -> li
 
 
 def _test_temp_roots(tmp_path_factory) -> list[str]:
-    roots = {tempfile.gettempdir(), "/tmp"}
+    """This session's temp roots only: TMPDIR/tempfile's dir, the pytest
+    basetemp and pytest's default `/tmp/pytest-of-<user>/` -- never bare
+    `/tmp` (r20 review round 2: a live-service write for any /tmp workspace,
+    e.g. a claude scratchpad, must warn, not fail the session)."""
+    roots = {tempfile.gettempdir(), f"/tmp/pytest-of-{getpass.getuser()}"}
     try:
         roots.add(str(tmp_path_factory.getbasetemp()))
     except Exception:  # pragma: no cover - basetemp always resolvable in a session
         pass
+    roots.discard("/tmp")
     out = set()
     for r in roots:
         out.add(r)
@@ -86,7 +92,7 @@ def _live_inbox_state_guard(tmp_path_factory):
     Skipped (a no-op) when the live file does not exist. The live trio-dash
     service may legitimately rewrite the file during a long run, so a changed
     sha fails only when a changed/added key is a test temp root (TMPDIR,
-    /tmp or the pytest basetemp) — the exact signature of the F1 leak; any
+    the pytest basetemp or /tmp/pytest-of-<user>) — the exact signature of the F1 leak; any
     other change is reported as a warning."""
     before_sha = _sha(LIVE_INBOX_STATE)
     if before_sha is None:

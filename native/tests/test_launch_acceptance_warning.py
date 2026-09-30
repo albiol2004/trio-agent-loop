@@ -90,3 +90,31 @@ def test_launcher_never_edits_helper_or_workflow_script() -> None:
     assert TAG in (native / "launch.sh").read_text()
     for name in ("trio_native_step.py", "trio-native.js"):
         assert TAG not in (native / name).read_text()
+
+
+# r20 review round 2 (eval2 finding 9): the profile trioctl reads, parsed as trioctl parses it.
+def test_trioctl_config_override_is_honoured(box: Path, tmp_path: Path, monkeypatch) -> None:
+    _profile(tmp_path, "[acceptance]\nenabled = false\n")   # the XDG profile says off ...
+    other = tmp_path / "elsewhere.toml"
+    other.write_text("[acceptance]\nenabled = true\n")
+    monkeypatch.setenv("TRIOCTL_CONFIG", str(other))        # ... TRIOCTL_CONFIG wins (trioctl:config_path)
+    proc, _ = launch(box, tmp_path, "start", result=BODY)
+    assert proc.returncode == 0, proc.stderr
+    assert f"profile: [acceptance] enabled = true ({other})" in proc.stderr
+    assert _result(box)["acceptance"] == TAG
+
+
+@pytest.mark.parametrize("value,want", [("1", "enabled = 1"), ('"false"', "enabled = 'false'")])
+def test_profile_values_trioctl_treats_as_on_warn(box: Path, tmp_path: Path, value, want) -> None:
+    _profile(tmp_path, f"[acceptance]\nenabled = {value}\n")  # bool(1) / bool("false") in trioctl
+    proc, _ = launch(box, tmp_path, "start", result=BODY)
+    assert proc.returncode == 0, proc.stderr
+    assert want in proc.stderr and _result(box)["acceptance"] == TAG
+
+
+@pytest.mark.parametrize("value", ["0", '""'])
+def test_profile_values_trioctl_treats_as_off_stay_silent(box: Path, tmp_path: Path, value) -> None:
+    _profile(tmp_path, f"[acceptance]\nenabled = {value}\n")
+    proc, _ = launch(box, tmp_path, "start", result=BODY)
+    assert proc.returncode == 0 and "WARNING" not in proc.stderr
+    assert "acceptance" not in _result(box)

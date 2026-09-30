@@ -294,15 +294,24 @@ env = os.environ.get("TRIO_ACCEPTANCE", "").strip().lower()
 if env in ("1", "true", "on", "yes"):
     why.append("TRIO_ACCEPTANCE=" + os.environ["TRIO_ACCEPTANCE"].strip())
 elif env not in ("0", "false", "off", "no"):
-    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    profile = base / "trio-agent-loop" / "omnigent.toml"
+    # the profile trioctl reads (`config_path`: TRIOCTL_CONFIG, else XDG), parsed
+    # the way trioctl's `acceptance_settings` does (`bool(enabled)`: 1 and a
+    # non-empty string such as "false" are ON)
+    override = os.environ.get("TRIOCTL_CONFIG")
+    if override:
+        profile = Path(override).expanduser()
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        profile = base / "trio-agent-loop" / "omnigent.toml"
     try:
         import tomllib
         table = tomllib.loads(profile.read_text(encoding="utf-8")).get("acceptance")
     except (OSError, ValueError, ImportError):
         table = None
-    if isinstance(table, dict) and table.get("enabled") is True:
-        why.append(f"profile: [acceptance] enabled = true ({profile})")
+    if isinstance(table, dict) and bool(table.get("enabled", False)):
+        value = table.get("enabled")
+        shown = repr(value) if isinstance(value, str) else json.dumps(value)
+        why.append(f"profile: [acceptance] enabled = {shown} ({profile})")
 print(json.dumps(why) if why else "")
 PY
 )" || acceptance_why=""

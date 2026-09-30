@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import socket
@@ -197,11 +198,18 @@ def free_port() -> int:
     return port
 
 
-def start_server(root: Path, port: int, log_path: Path) -> subprocess.Popen:
+def start_server(root: Path, port: int, log_path: Path, live_dir: Path) -> subprocess.Popen:
+    """serve.py on *root*; its per-user live paths (the inbox read-state the
+    running trio-dash owns, its state dir, the native run registry) point into
+    *live_dir*, never the real HOME (r20 review round 2, finding 5)."""
     log_file = open(log_path, "w", encoding="utf-8")
+    env = {**os.environ,
+           "TRIO_DASH_INBOX_STATE": str(live_dir / "inbox-state.json"),
+           "TRIO_DASH_STATE_DIR": str(live_dir / "trio-dash-state"),
+           "TRIO_NATIVE_RUNS_DIR": str(live_dir / "native-runs")}
     proc = subprocess.Popen(
         [sys.executable, str(SERVE_PATH), "--root", str(root), "--port", str(port)],
-        stdout=log_file, stderr=subprocess.STDOUT,
+        stdout=log_file, stderr=subprocess.STDOUT, env=env,
     )
     proc._dom_smoke_log_file = log_file  # keep a ref so it isn't gc'd early
     return proc
@@ -413,9 +421,10 @@ def main(argv: list[str] | None = None) -> int:
     port = free_port()
     server_log = Path(tempfile.mkstemp(prefix="dom-smoke-serve-", suffix=".log")[1])
     user_data_dir_ctx = tempfile.TemporaryDirectory(prefix="dom-smoke-chromium-")
+    live_dir_ctx = tempfile.TemporaryDirectory(prefix="dom-smoke-live-paths-")
     proc = None
     try:
-        proc = start_server(root, port, server_log)
+        proc = start_server(root, port, server_log, Path(live_dir_ctx.name))
         base_url = f"http://127.0.0.1:{port}"
         wait_for_server(base_url)
 
@@ -447,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         if proc is not None:
             stop_server(proc)
         user_data_dir_ctx.cleanup()
+        live_dir_ctx.cleanup()
         try:
             server_log.unlink()
         except OSError:

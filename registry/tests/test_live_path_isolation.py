@@ -116,6 +116,21 @@ class GuardAttributionTests(unittest.TestCase):
         self.assertEqual(guard.inbox_keys_owned_by_tests(before, after, ["/lab/tmp/"]),
                          ["/lab/tmp/tmpabc"])
 
+    def test_temp_roots_are_this_sessions_only_never_bare_tmp(self):
+        """r20 review round 2 (finding 4): a live-service write for any /tmp
+        workspace (a claude scratchpad, dom-smoke) must not fail the session."""
+        class Factory:
+            @staticmethod
+            def getbasetemp():
+                return Path("/lab/bt/pytest-1")
+        roots = guard._test_temp_roots(Factory())
+        self.assertNotIn("/tmp", roots)
+        self.assertIn("/lab/bt/pytest-1", roots)
+        self.assertTrue(any(r.startswith("/tmp/pytest-of-") for r in roots), roots)
+        self.assertIn(tempfile.gettempdir(), roots + ["/tmp"])
+        self.assertEqual(guard.inbox_keys_owned_by_tests(
+            {}, {"/tmp/claude-1000/x/scratchpad/ws": {"read": []}}, roots), [])
+
     def test_live_path_is_the_real_home_file(self):
         self.assertEqual(guard.LIVE_INBOX_STATE,
                          REAL_HOME / ".local" / "share" / "trio-agent-loop" / "inbox-state.json")
