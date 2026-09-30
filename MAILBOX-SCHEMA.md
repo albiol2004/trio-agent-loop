@@ -1747,6 +1747,32 @@ under `quality` in `--json`.
 
 ## Changelog
 
+- **r20** (merge of r19-acceptance, dash-actions and native-v01 onto
+  r17-rc-fixes; no METRICS_API bump beyond r19's 7):
+  - *dash-actions HUMAN.md answer flow*: trio-dash's answer box appends a
+    signed entry to `loop/HUMAN.md` and a ledger record outside the repo
+    ("HUMAN.md (human answers)", "Dashboard records"); before each Lead /
+    Evaluator dispatch the driver (trioctl `_human_answer_block`, the loop
+    core's `human_answer_block`, the native helper) verifies the newest
+    answer with the release's `metrics/human_ledger.py` and appends it as
+    the last prompt block `## Verified human answer (driver)` only when it
+    answers the current stop (with acceptance on: rigor -> acceptance ->
+    human answer); without HUMAN.md every prompt is unchanged. The ruling
+    Evaluator consumes it; a slice-eval, repair or acceptance author never
+    gets it. One `SAFE_GIT_CONFIG` tuple (human_ledger, copied into
+    trio-metrics) on every dashboard, ledger, trio-metrics and trio-shadow
+    `_git` call; `install.sh --omnigent` ships `human_ledger.py` next to
+    trioctl, `--dashboard` ships `human_ledger.py` + `native_args.py`.
+  - *native v0.1* (claude-workflow driver, lockstep only, acceptance
+    off): `.native-result.json` and the per-user run registry
+    (`native-runs/<key>.json`) for trio-dash, driver-verified HUMAN.md
+    answers in the native plan/evaluator calls, the shared
+    `metrics/native_args.py` resume/path validator, an ownership ledger
+    for every driver merge/removal/delete, builder shas corrected from
+    git, fresh-run reclaim of builder worktrees, and the saved workflow
+    script reported as the one Claude Code actually runs. The frozen
+    acceptance seams (docs/FROZEN-ACCEPTANCE.md, N1-N4) are not in v0.1.
+
 - **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
   default off): the `covers:` slice key and `parse_plan_acceptance`
   (`lead_integration:` ACC ids, `acceptance_bindings:`) in trio-metrics;
