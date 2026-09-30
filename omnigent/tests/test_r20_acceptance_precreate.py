@@ -200,13 +200,129 @@ def test_reattach_exit_1_refresh_inside_the_lead_worktree(world, tmp_path, monke
     assert [l for l in after.splitlines() if not l.startswith("HEAD ")] == before
 
 
-def test_reattach_exit_2_no_acceptance_overrides_env_and_profile(world, tmp_path, monkeypatch):
-    """A dashboard resume passes no flag: the env (or profile) decides; the
-    advised --no-acceptance resumes the loop switch-off."""
+# -- r20 review round 2 (eval2 finding 1): exit (2) must hold for the WHOLE run.
+# The loop driver passed the pre-check with --no-acceptance, but every builder
+# dispatch resolved the switch again from env/profile and was refused
+# ("acceptance not frozen yet", exit 3). Unmocked: the real `_command_loop_run`,
+# real git, the World's builders. `_acceptance_active` is only OBSERVED.
+def _observe_switch(t, monkeypatch, seen: list):
+    real = t._acceptance_active
+
+    def spy(mailbox, config):
+        on = real(mailbox, config)
+        seen.append((Path(mailbox), on, t._driver_acceptance(Path(mailbox))))
+        return on
+    monkeypatch.setattr(t, "_acceptance_active", spy)
+
+
+def _assert_off_for_the_whole_run(seen, home):
+    assert seen, "no builder dispatch consulted the switch"
+    assert all(not on for _mb, on, _rec in seen), seen
+    assert all(rec == {"enabled": False, "source": "--no-acceptance"} for _mb, _on, rec in seen), seen
+    assert (home / "src" / "a.py").is_file()  # the builder ran and the loop landed
+
+
+def test_reattach_exit_2_env_on_no_acceptance_runs_builders(world, tmp_path, monkeypatch, capsys):
+    """(a) A dashboard resume passes no flag: TRIO_ACCEPTANCE=1 refuses the
+    re-attach (unchanged); `--no-acceptance` resumes it switch-off to the end."""
+    t = world.trioctl
+    real_run = t._command_loop_run
     t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    monkeypatch.setattr(t, "_command_loop_run", real_run)
     monkeypatch.setenv("TRIO_ACCEPTANCE", "1")
+    capsys.readouterr()
     assert world.run_loop(spec) == 3
-    assert world.run_loop(spec, "--no-acceptance") == 9
+    assert "resume with --no-acceptance" in capsys.readouterr().err
+    seen: list = []
+    _observe_switch(t, monkeypatch, seen)
+    rc = world.run_loop(spec, "--no-acceptance")
+    err = capsys.readouterr().err
+    assert rc == 0, err[-3000:]
+    assert "acceptance refused builder" not in err
+    assert "frozen acceptance OFF (--no-acceptance over env ON)" in err
+    _assert_off_for_the_whole_run(seen, home)
+
+
+def test_fresh_api7_loop_env_on_no_acceptance_runs_builders(world, tmp_path, monkeypatch, capsys):
+    """(b) A fresh loop on an API-7 target, TRIO_ACCEPTANCE=1, --no-acceptance."""
+    t = world.trioctl
+    home = tmp_path / "home"
+    init_repo(home, "main", {"README.md": "home\n", "src/__init__.py": ""})
+    spec = world.add_loop(home, "loop/a", [{"id": "a-one", "write": "src/a.py"}])
+    monkeypatch.setenv("TRIO_ACCEPTANCE", "1")
+    seen: list = []
+    _observe_switch(t, monkeypatch, seen)
+    capsys.readouterr()
+    rc = world.run_loop(spec, "--no-acceptance")
+    err = capsys.readouterr().err
+    assert rc == 0, err[-3000:]
+    assert "acceptance refused builder" not in err
+    _assert_off_for_the_whole_run(seen, home)
+
+
+def test_profile_on_no_acceptance_runs_builders(world, tmp_path, monkeypatch, capsys):
+    """(c) The profile's `[acceptance] enabled = true` alone refuses the
+    re-attach; `--no-acceptance` resumes it switch-off to the end."""
+    t = world.trioctl
+    real_run = t._command_loop_run
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    monkeypatch.setattr(t, "_command_loop_run", real_run)
+    monkeypatch.setattr(t, "load_config", lambda path: {"acceptance": {"enabled": True}})
+    capsys.readouterr()
+    assert world.run_loop(spec) == 3
+    assert "resume with --no-acceptance" in capsys.readouterr().err
+    seen: list = []
+    _observe_switch(t, monkeypatch, seen)
+    rc = world.run_loop(spec, "--no-acceptance")
+    err = capsys.readouterr().err
+    assert rc == 0, err[-3000:]
+    assert "acceptance refused builder" not in err
+    assert "frozen acceptance OFF (--no-acceptance over config ON)" in err
+    _assert_off_for_the_whole_run(seen, home)
+
+
+def test_flag_absent_env_on_keeps_acceptance_active(world, tmp_path, monkeypatch, capsys):
+    """(d) Without the flag the env decides, as before: the re-attach is
+    refused, and a fresh API-7 loop starts with the switch ON (the World's
+    fixture repository vendors no trio-acceptance.py, so the driver stops at
+    the acceptance stage before any builder; nothing is recorded as off)."""
+    t = world.trioctl
+    real_run = t._command_loop_run
+    t, home, spec, rec, lead = _progressed_reattach(world, tmp_path, monkeypatch)
+    monkeypatch.setattr(t, "_command_loop_run", real_run)
+    monkeypatch.setenv("TRIO_ACCEPTANCE", "1")
+    capsys.readouterr()
+    assert world.run_loop(spec) == 3
+    assert f"committed on this loop's branch {rec['branch']} (METRICS_API 6)" in capsys.readouterr().err
+    fresh = tmp_path / "fresh"
+    init_repo(fresh, "main", {"README.md": "fresh\n", "src/__init__.py": ""})
+    spec7 = world.add_loop(fresh, "loop/b", [{"id": "b-one", "write": "src/b.py"}])
+    seen: list = []
+    _observe_switch(t, monkeypatch, seen)
+    capsys.readouterr()
+    rc = world.run_loop(spec7)
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "frozen acceptance ON (env)" in err and "frozen acceptance OFF" not in err
+    lead7 = Path(world.rf.load_record(world.wt, fresh, spec7["slug"])["path"])
+    assert "AcceptanceError" in (lead7 / "loop" / "b" / "LOG.md").read_text()
+    assert (fresh / "src" / "b.py").exists() is False
+    assert all(on and (rec or {}).get("enabled") is True for _mb, on, rec in seen), seen
+
+
+def test_no_acceptance_without_env_or_profile_records_nothing(world, tmp_path, monkeypatch, capsys):
+    """Switch-off identity: `--no-acceptance` with env/profile off writes no
+    `acceptance` key to `.driver.json` (verify item 89 compares the bytes)."""
+    t = world.trioctl
+    home = tmp_path / "home"
+    init_repo(home, "main", {"README.md": "home\n", "src/__init__.py": ""})
+    spec = world.add_loop(home, "loop/a", [{"id": "a-one", "write": "src/a.py"}])
+    seen: list = []
+    _observe_switch(t, monkeypatch, seen)
+    capsys.readouterr()
+    assert world.run_loop(spec, "--no-acceptance") == 0
+    assert "frozen acceptance OFF" not in capsys.readouterr().err
+    assert seen and all(rec is None for _mb, _on, rec in seen), seen
 
 
 def test_reattach_exit_3_abandon_refresh_target_restart(world, tmp_path, monkeypatch, capsys):

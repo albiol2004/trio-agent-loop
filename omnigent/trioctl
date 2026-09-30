@@ -34,6 +34,14 @@ ROLES = ("lead", "evaluator", "builder", "scout", "docs")
 ACCEPTANCE_ROLE = "acceptance"
 OPTIONAL_ROLES = (ACCEPTANCE_ROLE,)
 ACCEPTANCE_ENV = "TRIO_ACCEPTANCE"
+#: `.driver.json` `acceptance.source` when `--no-acceptance` overrides an
+#: env/profile ON switch (r20 review F2 exit (2)).
+ACCEPTANCE_OFF_BY_FLAG = "--no-acceptance"
+#: r20: every git argv of this CLI carries `--no-replace-objects` and its git
+#: helpers pass this env: a role's `git replace` ref (a complete tree behind
+#: the evaluated sha) never reaches the acceptance pre-run, the commit gate or
+#: the target/loop-branch reads; the real commit is what push/clone carry.
+GIT_NO_REPLACE_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
 #: `trioctl omnigent run builder` refused by the frozen-acceptance guard.
 ACCEPTANCE_REFUSED_EXIT = 10
 DEFAULT_ACCEPTANCE_WAIT_S = 900.0
@@ -1296,10 +1304,12 @@ def _driver_acceptance(mailbox: Path) -> dict[str, Any] | None:
 
 
 def _acceptance_active(mailbox: Path, config: dict[str, Any] | None) -> bool:
-    """Builder dispatch guard switch: the loop driver's record wins; without
-    a driver record, the profile/env switch decides."""
+    """Builder dispatch guard switch: the loop driver's record wins -- an
+    explicit ``{"enabled": false, "source": "--no-acceptance"}`` (the CLI
+    flag over an env/profile ON switch, r20) as much as ``enabled: true``;
+    without a driver record, the profile/env switch decides."""
     record = _driver_acceptance(mailbox)
-    if record is not None:
+    if record is not None and "enabled" in record:
         return bool(record.get("enabled"))
     return bool(acceptance_settings(config)["enabled"])
 
@@ -1319,7 +1329,7 @@ def _acceptance_refusals(mailbox: Path, slice_id: str | None) -> list[str]:
     repo = ta.git_toplevel(mailbox) or mailbox
     problems: list[str] = []
     plan = mailbox / "PLAN.md"
-    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", str(plan)],
+    status = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "status", "--porcelain", "--", str(plan)],
                             capture_output=True, text=True)
     if status.returncode != 0 or status.stdout.strip():
         problems.append("PLAN.md has uncommitted changes; commit the PLAN (with its "
@@ -1542,13 +1552,13 @@ def _committed_freeze(ta: Any, repo: Path | None, mailbox: Path) -> tuple[str, s
         rel = (acc / "FROZEN").resolve().relative_to(repo).as_posix()
     except ValueError:
         return None
-    log = subprocess.run(["git", "-C", str(repo), "log", "--format=%H%x1f%s", "--", rel],
+    log = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "log", "--format=%H%x1f%s", "--", rel],
                          capture_output=True, text=True)
     freezes = [line.split("\x1f", 1)[0] for line in log.stdout.splitlines()
                if line.partition("\x1f")[2].startswith("acceptance: freeze ")]
     if log.returncode != 0 or not freezes:
         return None
-    dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", rel],
+    dirty = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "status", "--porcelain", "--", rel],
                            capture_output=True, text=True)
     if dirty.returncode != 0 or dirty.stdout.strip():
         return None
@@ -2365,7 +2375,7 @@ def _no_targeted_command_reason(brief: str) -> str:
 
 def _kill_ls_files(path: Path) -> list[str]:
     out = subprocess.run(
-        ["git", "-C", str(path), "ls-files", "-z", "--cached", "--others",
+        ["git", "--no-replace-objects", "-C", str(path), "ls-files", "-z", "--cached", "--others",
          "--exclude-standard"],
         capture_output=True, check=True,
     ).stdout.decode("utf-8", "surrogateescape")
@@ -2429,7 +2439,7 @@ def _kill_write(path: Path, rel: str, state: tuple[str, bytes] | None) -> None:
 def _kill_base_state(path: Path, base: str, rel: str) -> tuple[str, bytes] | None:
     """(kind+mode, content) of *rel* at *base*; None when *base* lacks it."""
     listed = subprocess.run(
-        ["git", "-C", str(path), "ls-tree", "-z", base, "--", rel],
+        ["git", "--no-replace-objects", "-C", str(path), "ls-tree", "-z", base, "--", rel],
         capture_output=True, check=True,
     ).stdout.decode("utf-8", "surrogateescape").strip("\0")
     if not listed:
@@ -2439,7 +2449,7 @@ def _kill_base_state(path: Path, base: str, rel: str) -> tuple[str, bytes] | Non
     if kind != "blob":
         return None
     data = subprocess.run(
-        ["git", "-C", str(path), "cat-file", "blob", sha],
+        ["git", "--no-replace-objects", "-C", str(path), "cat-file", "blob", sha],
         capture_output=True, check=True,
     ).stdout
     if mode == "120000":
@@ -2449,11 +2459,11 @@ def _kill_base_state(path: Path, base: str, rel: str) -> tuple[str, bytes] | Non
 
 def _kill_changed_paths(path: Path, base: str) -> list[str]:
     tracked = subprocess.run(
-        ["git", "-C", str(path), "diff", "--no-renames", "--name-only", "-z", base],
+        ["git", "--no-replace-objects", "-C", str(path), "diff", "--no-renames", "--name-only", "-z", base],
         capture_output=True, check=True,
     ).stdout.decode("utf-8", "surrogateescape")
     untracked = subprocess.run(
-        ["git", "-C", str(path), "ls-files", "-z", "--others", "--exclude-standard"],
+        ["git", "--no-replace-objects", "-C", str(path), "ls-files", "-z", "--others", "--exclude-standard"],
         capture_output=True, check=True,
     ).stdout.decode("utf-8", "surrogateescape")
     return sorted({p for p in (tracked + "\0" + untracked).split("\0") if p})
@@ -3037,11 +3047,11 @@ def _ship_acceptance_once(mailbox: Path, repo: Path, core: Any) -> dict[str, Any
         return {"pending": f"retirement not verified: {problem[1]}"}
     verdict = mailbox / "VERDICT.md"
     tracked = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", str(verdict)],
+        ["git", "--no-replace-objects", "-C", str(repo), "ls-files", "--error-unmatch", "--", str(verdict)],
         capture_output=True, text=True,
     )
     dirty = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--", str(verdict)],
+        ["git", "--no-replace-objects", "-C", str(repo), "status", "--porcelain", "--", str(verdict)],
         capture_output=True, text=True,
     )
     if tracked.returncode != 0:
@@ -3834,8 +3844,8 @@ def _sent_prompt_shas(prov: dict[str, Any]) -> list[str] | None:
 def _git_read(repo: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), "--no-optional-locks", *args],
-            capture_output=True, text=True,
+            ["git", "--no-replace-objects", "-C", str(repo), "--no-optional-locks", *args],
+            capture_output=True, text=True, env={**os.environ, **GIT_NO_REPLACE_ENV},
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -5443,7 +5453,7 @@ def _repo_identity(path: Path | str) -> str:
     real = os.path.realpath(str(path))
     try:
         proc = subprocess.run(
-            ["git", "-C", real, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ["git", "--no-replace-objects", "-C", real, "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -5985,6 +5995,14 @@ class OmnigentRunner:
         self._acceptance = acceptance if acceptance and acceptance.get("enabled") else None
         if self._acceptance is not None:
             self.driver_meta["acceptance"] = {"enabled": True}
+        elif acceptance and acceptance.get("source") == ACCEPTANCE_OFF_BY_FLAG:
+            # r20 review F2 exit (2): `--no-acceptance` over an env/profile ON
+            # switch. Every builder dispatch of this loop (`run builder
+            # --mailbox`, isolated or not) reads the driver's record before
+            # env/profile (`_acceptance_active`), so the CLI's OFF holds for
+            # the whole run, re-attach included. Only recorded in that case:
+            # a switch-off run without env/profile ON stays byte-identical.
+            self.driver_meta["acceptance"] = {"enabled": False, "source": ACCEPTANCE_OFF_BY_FLAG}
 
     def _load_config(self) -> dict[str, Any]:
         """Load the user profile only when the first role is dispatched."""
@@ -7345,8 +7363,9 @@ class OmnigentRunner:
 
             def git(*argv: str) -> str:
                 return subprocess.run(
-                    ["git", "-C", str(repo), "--no-optional-locks", *argv],
+                    ["git", "--no-replace-objects", "-C", str(repo), "--no-optional-locks", *argv],
                     capture_output=True, text=True, errors="replace", timeout=60,
+                    env={**os.environ, **GIT_NO_REPLACE_ENV},
                 ).stdout
 
             changed: list[str] = []
@@ -8841,7 +8860,7 @@ def _target_metrics_api(home: Path, target: str) -> int | None:
     blobs: dict[str, bytes] = {}
     for name in ("trio-metrics.py", "trio_loop.py"):
         proc = subprocess.run(
-            ["git", "-C", str(home), "cat-file", "blob", f"refs/heads/{target}:metrics/{name}"],
+            ["git", "--no-replace-objects", "-C", str(home), "cat-file", "blob", f"refs/heads/{target}:metrics/{name}"],
             capture_output=True,
         )
         if proc.returncode != 0:
@@ -9391,13 +9410,13 @@ def _release_metrics_source() -> tuple[Path, str] | None:
         pin = (directory / "PIN").read_text(encoding="utf-8").strip()
     if not pin:
         proc = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "--short=12", "HEAD"],
+            ["git", "--no-replace-objects", "-C", str(directory), "rev-parse", "--short=12", "HEAD"],
             capture_output=True, text=True,
         )
         if proc.returncode == 0 and proc.stdout.strip():
             pin = proc.stdout.strip()
             dirty = subprocess.run(
-                ["git", "-C", str(directory), "status", "--porcelain", "--", "."],
+                ["git", "--no-replace-objects", "-C", str(directory), "status", "--porcelain", "--", "."],
                 capture_output=True, text=True,
             )
             if dirty.returncode == 0 and dirty.stdout.strip():
@@ -9493,7 +9512,7 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
     problems: list[str] = []
     for repo in targets:
         proc = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all",
+            ["git", "--no-replace-objects", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all",
              "--", "metrics"],
             capture_output=True, text=True,
         )
@@ -9506,7 +9525,7 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
             )
         if getattr(args, "commit", False):
             head = subprocess.run(
-                ["git", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"],
+                ["git", "--no-replace-objects", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"],
                 capture_output=True, text=True,
             )
             if head.returncode != 0:
@@ -9546,10 +9565,10 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
             print("  not committed (pass --commit to commit these files)")
             continue
         add = subprocess.run(
-            ["git", "-C", str(repo), "add", "--", *changed], capture_output=True, text=True,
+            ["git", "--no-replace-objects", "-C", str(repo), "add", "--", *changed], capture_output=True, text=True,
         )
         commit = add if add.returncode != 0 else subprocess.run(
-            ["git", "-C", str(repo), "commit", "-q", "-m",
+            ["git", "--no-replace-objects", "-C", str(repo), "commit", "-q", "-m",
              f"chore: vendor trio loop core ({pin})", "--", *changed],
             capture_output=True, text=True,
         )
@@ -9558,11 +9577,11 @@ def command_metrics_refresh(args: argparse.Namespace) -> int:
                   f"{(commit.stderr or commit.stdout).strip()}", file=sys.stderr)
             return 3
         sha = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
+            ["git", "--no-replace-objects", "-C", str(repo), "rev-parse", "--short=12", "HEAD"],
             capture_output=True, text=True,
         ).stdout.strip()
         branch = subprocess.run(
-            ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+            ["git", "--no-replace-objects", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
             capture_output=True, text=True,
         ).stdout.strip()
         print(f"  committed {sha} on {branch}: chore: vendor trio loop core ({pin})")
@@ -9844,6 +9863,7 @@ def _command_loop_run(
     lockstep = _loop_is_lockstep(mailbox)
     # r19 frozen acceptance (default off): switch, old-core and tier guards.
     acceptance_cfg: dict[str, Any] | None = None
+    acceptance_off_record: dict[str, Any] | None = None
     profile, settings = _loop_acceptance_settings(args)
     if settings["enabled"]:
         # Second guard (the committed set was checked before anything was
@@ -9866,6 +9886,16 @@ def _command_loop_run(
         loop_kwargs["acceptance"] = acceptance_cfg
         print(f"trioctl: frozen acceptance ON ({settings['source']}); the author runs "
               "with the first Lead pass", file=sys.stderr)
+    elif (getattr(args, "acceptance", None) is False
+          and acceptance_settings(profile)["enabled"]):
+        # r20 review F2 exit (2): the flag says OFF while env/profile say ON.
+        # The driver records the OFF in `.driver.json` (OmnigentRunner) so
+        # builders resolve it from the record, not from their own env/profile;
+        # the loop core gets nothing (switch-off runs are unchanged).
+        acceptance_off_record = {"enabled": False, "source": ACCEPTANCE_OFF_BY_FLAG}
+        print("trioctl: frozen acceptance OFF (--no-acceptance over "
+              f"{acceptance_settings(profile)['source']} ON); recorded in .driver.json "
+              "for this loop's builders", file=sys.stderr)
     land_hook = (_root_free_land_hook(rf, args, acceptance=acceptance_cfg is not None)
                  if rf is not None else None)
     if land_hook is not None and not lockstep:
@@ -9899,6 +9929,8 @@ def _command_loop_run(
         runner_kwargs["root_free"] = rf["info"]
     if acceptance_cfg is not None:
         runner_kwargs["acceptance"] = acceptance_cfg
+    elif acceptance_off_record is not None:
+        runner_kwargs["acceptance"] = acceptance_off_record
     runner = OmnigentRunner(
         repo=repo,
         base_url=getattr(args, "base_url", None),
