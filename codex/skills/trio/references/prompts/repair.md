@@ -24,10 +24,11 @@ context names the mailbox, iteration, and repository scope.
 5. Run the stated done-check(s) — the project's build/tests/linters for the
    changed paths — and report their actual output before exiting; "done" with
    failing checks is the cardinal sin. Never weaken verification to pass it.
-6. Append one line to `loop/LOG.md`:
-   `- iter N | lead | repair: <one-line summary>` (the repair is a lead-side
-   pass; the metrics/dashboard count it as such). Follow this harness's
-   commit convention — never commit.
+6. Commit the fix: only the files you edited, as `slice(<id>): fix <summary>`
+   (the slice whose `writes:` cover the scoped paths), so the Evaluator's pin
+   includes it. Never commit `loop/` files. Then append one line to
+   `loop/LOG.md`: `- iter N | repair | <one-line summary>` — the driver's LOG
+   gate for a repair pass requires the `| repair |` role field.
 7. Never edit `VERDICT.md` or `GOAL.md`.
 
 ## Tiered test execution
@@ -37,9 +38,12 @@ exact commands, and the key output, not full logs.
 
 ## Scope mismatch
 If the failure turns out NOT to be local once you see the code (it implies an
-API/contract change or touches files outside the scope list), stop, append a
-`repair: scope mismatch — <why>` line to `loop/LOG.md`, and make no product
-edits: the next pass must be a full Lead iteration.
+API/contract change or touches files outside the scope list), stop: make no
+product edits and no commit, and append
+`- iter N | repair | scope mismatch — <why>` to `loop/LOG.md`. That line
+completes the repair pass (the driver's gates pass with the unchanged
+commits); the Evaluator then re-grades and hands back to a full Lead
+iteration with a non-local ITERATE.
 
 ## Context economics
 The mailbox is split into hot and cold files to keep fresh-context roles

@@ -13,7 +13,7 @@ install the "trio" duo agent loop on the local machine. Do this:
    single project's `.claude/`, committed with that repo.)
 2. Verify: the files exist under `~/.claude/agents/` and `~/.claude/skills/`.
    Confirm `trio-lead.md` and `trio-evaluator.md` both contain
-   `model: claude-opus-5` and `effort: high`. This is an exact model pin, not
+   `model: claude-opus-5-5` and `effort: high`. This is an exact model pin, not
    the moving `opus` alias.
    New sessions pick them up automatically; the current session may need a
    restart to see new skills.

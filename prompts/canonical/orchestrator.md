@@ -47,8 +47,9 @@ boundaries visible in the messages and in `loop/LOG.md`:
    before the report, writes only `loop/VERDICT.md` (and its log entry), and
    never repairs product code. Before spawning it, verify `loop/LOG.md`
    contains the Lead's `- iter N | lead | ...` entry for this iteration
-   (the LOG.md gate); if the append is missing, have the Lead append it
-   first. Then run the **commit gate** (active interlock) before dispatching
+   (the LOG.md gate; after a scoped repair pass, the Repair's
+   `- iter N | repair | ...` entry); if the append is missing, have the
+   Lead (or Repair) append it first. Then run the **commit gate** (active interlock) before dispatching
    the Evaluator: `trio-shadow.py --mailbox <loop-dir> --require-commits`
    (the script lives in the template repo's `metrics/`; it may be on PATH or
    referenced by absolute path from the installing repo). Exit 1 lists

@@ -1,0 +1,351 @@
+"""Live-probe round 2 blockers on real git: build artefacts (A), the
+conflict re-dispatch cleanup (B), the needs_retirement finish (D)."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from test_step_ops import (git, git_env, mbox, repo, retire,  # noqa: F401
+                           step, to_lead_done)
+from test_waves import builder_branch, lead_running, owned_wave
+
+ARTEFACTS = ("__pycache__/", "*.py[cod]", ".pytest_cache/")
+
+
+def pytest_droppings(root: Path, name: str) -> None:
+    """What `python3 -m pytest` leaves behind in a checkout (probe 2)."""
+    for rel in (f"__pycache__/{name}.cpython-312.pyc",
+                "tests/__pycache__/__init__.cpython-312.pyc",
+                f"tests/__pycache__/test_{name}.cpython-312-pytest-9.1.1.pyc",
+                ".pytest_cache/v/cache/nodeids", "stray.pyc"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("junk\n")
+
+
+def exclude_lines(repo: Path) -> list[str]:
+    path = Path(git(repo, "rev-parse", "--path-format=absolute",
+                    "--git-path", "info/exclude"))
+    return path.read_text().splitlines()
+
+
+# ---------------------------------------------------------- A: begin
+def test_begin_excludes_build_artefacts_once(repo: Path) -> None:
+    assert step(repo, "begin")["ok"]
+    assert step(repo, "begin")["ok"]
+    lines = exclude_lines(repo)
+    for entry in (".claude/worktrees/", *ARTEFACTS):
+        assert lines.count(entry) == 1, (entry, lines)
+    assert "node_modules/" not in lines
+    pytest_droppings(repo, "app")
+    status = git(repo, "status", "--porcelain", "--untracked-files=all")
+    assert status == "?? loop/.gitignore", status  # begin's runtime ignores
+
+
+def test_exclude_covers_linked_worktrees(repo: Path) -> None:
+    step(repo, "begin")
+    wt = repo / ".claude" / "worktrees" / "b1"
+    git(repo, "worktree", "add", "-q", "-b", "worktree-b1", str(wt), "HEAD")
+    pytest_droppings(wt, "b1")
+    assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+# -------------------------------------------------- A: cleanup (9/9 kept)
+def test_cleanup_removes_merged_worktrees_with_pytest_droppings(
+        repo: Path) -> None:
+    """Probe 2 P1: every merged builder worktree was kept for .pyc dirt."""
+    lead_running(repo)
+    w = owned_wave(repo, {"b1": {}, "b2": {}})
+    b1, b2 = w["b1"], w["b2"]
+    for b in (b1, b2):
+        pytest_droppings(Path(b["worktree"]), b["id"])
+        git(repo, "merge", "--no-ff", "--no-edit", "-q", b["branch"])
+    out = step(repo, "cleanup", branches=f"{b1['branch']},{b2['branch']}")
+    assert out["ok"] and out["kept"] == [], out
+    assert {r["branch"] for r in out["removed"]} == {b1["branch"],
+                                                     b2["branch"]}
+    assert not Path(b1["worktree"]).exists()
+    assert not Path(b2["worktree"]).exists()
+    assert "worktree-" not in git(repo, "branch")
+    assert step(repo, "end")["dangling_worktrees"] == []
+
+
+def test_cleanup_forces_unexcluded_artefacts_but_never_product(
+        repo: Path) -> None:
+    """Without the exclude lines (a repo whose info/exclude was reset), an
+    untracked artefact is still force-removable; a tracked change or any
+    other untracked file keeps the worktree."""
+    lead_running(repo)
+    path = Path(git(repo, "rev-parse", "--path-format=absolute",
+                    "--git-path", "info/exclude"))
+    path.write_text(".claude/worktrees/\n")
+    w = owned_wave(repo, {"b1": {}, "b2": {}, "b3": {}})
+    b1, b2, b3 = w["b1"], w["b2"], w["b3"]
+    pytest_droppings(Path(b1["worktree"]), "b1")
+    pytest_droppings(Path(b2["worktree"]), "b2")
+    (Path(b2["worktree"]) / "notes.txt").write_text("wip\n")  # unignored
+    pytest_droppings(Path(b3["worktree"]), "b3")
+    tracked = Path(b3["worktree"]) / f"{Path(b3['worktree']).name}.py"
+    tracked.write_text("x = 2\n")                             # tracked edit
+    for b in (b1, b2, b3):
+        git(repo, "merge", "--no-ff", "--no-edit", "-q", b["branch"])
+    out = step(repo, "cleanup",
+               branches=",".join(b["branch"] for b in (b1, b2, b3)))
+    kept = {k["branch"]: k["reason"] for k in out["kept"]}
+    assert [r["branch"] for r in out["removed"]] == [b1["branch"]]
+    assert "notes.txt" in kept[b2["branch"]]
+    assert "__pycache__" not in kept[b2["branch"]]
+    assert tracked.name in kept[b3["branch"]]
+    assert Path(b2["worktree"], "notes.txt").exists()
+    assert tracked.read_text() == "x = 2\n"
+
+
+# ------------------------------------------ A: SHIP retirement (p2, p4)
+def test_ship_with_root_pytest_droppings_is_shipped_and_clean(
+        repo: Path) -> None:
+    """Probe 2 P2/P4: a role ran pytest in the root checkout, and the SHIP
+    stopped at needs_retirement ("untracked product paths")."""
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    pytest_droppings(repo, "app")
+    git(repo, "add", "loop")
+    retire(repo, 1, p)
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "shipped" and a["code"] == 0, a
+    assert a["retirement_fold"] == "amended"
+    assert git(repo, "status", "--porcelain") == ""
+    assert (repo / "__pycache__" / "app.cpython-312.pyc").exists()
+
+
+def test_ship_still_refuses_untracked_product_file(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    (repo / "helper.py").write_text("x = 1\n")  # real, untracked product
+    git(repo, "add", "loop")
+    retire(repo, 1, p)
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "needs_retirement" and a["code"] == 6
+    assert "helper.py" in (mbox(repo) / "LOG.md").read_text()
+
+
+def test_launcher_disables_bytecode() -> None:
+    text = (Path(__file__).resolve().parents[1] / "launch.sh").read_text()
+    assert "export PYTHONDONTWRITEBYTECODE=1" in text
+
+
+# ------------------------------------- B: superseded branch after re-dispatch
+def conflicting_wave(repo: Path) -> tuple[dict, dict]:
+    """alpha and beta both append to registry.py (probe 2 P3)."""
+    (repo / "registry.py").write_text("ENTRIES = ['core']\n")
+    git(repo, "add", "registry.py")
+    git(repo, "commit", "-q", "-m", "registry")
+    lead_running(repo)
+    w = owned_wave(repo, {
+        "alpha": {"files": {"alpha.py": "A = 1\n",
+                            "registry.py": "ENTRIES = ['core', 'alpha']\n"}},
+        "beta": {"files": {"beta.py": "B = 1\n",
+                           "registry.py": "ENTRIES = ['core', 'beta']\n"}}})
+    alpha, beta = w["alpha"], w["beta"]
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", alpha["branch"])
+    merge = subprocess_git(repo, "merge", "--no-ff", "--no-edit", beta["branch"])
+    assert merge.returncode != 0  # conflict
+    git(repo, "merge", "--abort")
+    return alpha, beta
+
+
+def subprocess_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, env=git_env())
+
+
+def test_cleanup_drops_conflicted_branch_once_redispatch_merged(
+        repo: Path) -> None:
+    alpha, beta = conflicting_wave(repo)
+    first = step(repo, "cleanup", branches=f"{alpha['branch']},{beta['branch']}")
+    assert [k["branch"] for k in first["kept"]] == [beta["branch"]]
+    assert first["kept"][0]["reason"] == "not merged into HEAD"
+    # the re-dispatched builder forks from the post-merge HEAD
+    beta2 = owned_wave(repo, {"beta": {"files": {
+        "beta.py": "B = 1\n",
+        "registry.py": "ENTRIES = ['core', 'alpha', 'beta']\n"}}},
+        wave=2, first=9)["beta"]
+    spec = f"{beta['branch']}={beta2['branch']}"
+    # not merged yet: the old branch is kept
+    early = step(repo, "cleanup", drop_unmerged=spec)
+    assert early["dropped"][0]["dropped"] is False
+    assert "not merged" in early["dropped"][0]["reason"]
+    assert Path(beta["worktree"]).exists()
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", beta2["branch"])
+    out = step(repo, "cleanup", branches=beta2["branch"], drop_unmerged=spec)
+    assert out["ok"] and out["kept"] == []
+    assert out["dropped"] == [{
+        "branch": beta["branch"], "superseded_by": beta2["branch"],
+        "dropped": True, "worktree": beta["worktree"],
+        "tip": beta["head"]}]
+    assert not Path(beta["worktree"]).exists()
+    assert not Path(beta2["worktree"]).exists()
+    assert "worktree-" not in git(repo, "branch")
+    assert step(repo, "end")["dangling_worktrees"] == []
+    assert alpha  # merged and removed by the first cleanup
+    assert not Path(alpha["worktree"]).exists()
+
+
+def test_drop_unmerged_bare_form_is_refused(repo: Path) -> None:
+    """C3: the bare 'old' form (no '=new') is refused outright — nothing
+    then confirms 'old' was actually superseded by anything merged."""
+    lead_running(repo)
+    git(repo, "branch", "feature")
+    out = step(repo, "cleanup", drop_unmerged="feature")
+    assert out["dropped"][0]["dropped"] is False
+    assert "requires 'old=new'" in out["dropped"][0]["reason"]
+    assert "feature" in git(repo, "branch")
+    own = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    out = step(repo, "cleanup", drop_unmerged=own)
+    assert out["dropped"][0]["dropped"] is False
+    assert "requires 'old=new'" in out["dropped"][0]["reason"]
+    assert own in git(repo, "branch")
+
+
+def test_drop_unmerged_never_touches_non_builder_branches(repo: Path) -> None:
+    """C3: 'old=new' still refuses when 'old' itself is not a builder
+    branch, even once 'new' is a real, merged builder branch."""
+    lead_running(repo)
+    git(repo, "branch", "feature")
+    new = builder_branch(repo, "newb")
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", new["branch"])
+    out = step(repo, "cleanup", drop_unmerged=f"feature={new['branch']}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "feature" in git(repo, "branch")
+
+
+def test_drop_unmerged_refuses_target_branch_as_new(repo: Path) -> None:
+    """C3: 'old=master' (or any non-builder branch) must not "count as
+    merged" and launder the drop — 'new' must itself be a builder branch."""
+    lead_running(repo)
+    old = builder_branch(repo, "old")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    out = step(repo, "cleanup", drop_unmerged=f"worktree-old={target}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "not a builder branch" in out["dropped"][0]["reason"]
+    assert "worktree-old" in git(repo, "branch")
+    assert Path(old["worktree"]).exists()
+
+
+def test_drop_unmerged_keeps_worktree_with_product_dirt(repo: Path) -> None:
+    lead_running(repo)
+    old = owned_wave(repo, {"old": {"extra_dirt": True}})["old"]
+    new = owned_wave(repo, {"old": {}}, wave=2, first=6)["old"]
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", new["branch"])
+    out = step(repo, "cleanup",
+               drop_unmerged=f"{old['branch']}={new['branch']}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "scratch.txt" in out["dropped"][0]["reason"]
+    assert Path(old["worktree"], "scratch.txt").exists()
+
+
+def test_drop_unmerged_never_drops_a_branch_this_run_does_not_own(
+        repo: Path) -> None:
+    """v01 fix (eval-v01 finding 4): a superseded 'old' that no `builders`
+    call proved to be this run's (another run's live builder a builder
+    report named) is never dropped, even once 'new' is owned and merged."""
+    lead_running(repo)
+    other = builder_branch(repo, "wf_OTHER-2")
+    new = owned_wave(repo, {"s": {}})["s"]
+    git(repo, "merge", "--no-ff", "--no-edit", "-q", new["branch"])
+    out = step(repo, "cleanup", branches=new["branch"],
+               drop_unmerged=f"{other['branch']}={new['branch']}")
+    assert out["dropped"][0]["dropped"] is False
+    assert "no ownership-ledger entry" in out["dropped"][0]["reason"]
+    assert Path(other["worktree"]).exists()
+    assert other["branch"] in git(repo, "branch")
+
+
+# --------------------------------------- D: finish from needs_retirement
+def test_next_finishing_needs_retirement_reports_shas_and_fold(
+        repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    git(repo, "add", "loop")
+    (repo / "helper.py").write_text("x = 1\n")  # blocks retirement
+    retire(repo, 1, p)
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "needs_retirement"
+    (repo / "helper.py").unlink()  # the operator removes it, then starts
+    n = step(repo, "next", max_iterations=4)
+    assert n["action"] == "stop" and n["status"] == "shipped", n
+    assert n["code"] == 0 and n["commit_shas"] == [p["sha"]]
+    assert n["retirement_fold"] == "amended" and n["human_check"] is None
+    assert git(repo, "status", "--porcelain") == ""
+    again = step(repo, "next", max_iterations=4)
+    assert again["commit_shas"] == [p["sha"]]
+    assert again["retirement_fold"] is None  # nothing finalized this time
+
+
+# --------------------------------------------- N2: end after a failed begin
+def test_end_after_refused_begin_leaves_the_owner_alone(repo: Path) -> None:
+    import json as _json
+    import os
+    assert step(repo, "begin")["ok"]            # run A holds the lock
+    session = mbox(repo) / ".session.json"
+    before = session.read_text()
+    env = git_env()
+    env["TRIO_NATIVE_HOLDER_PID"] = str(os.getppid())  # another live process
+    refused = step(repo, "begin", env=env)
+    assert not refused["ok"] and "refused" in refused["error"]
+    e = step(repo, "end", env=env)
+    assert e["ok"] and e["lock"] == "foreign"
+    assert (mbox(repo) / ".lock").is_dir()
+    assert session.read_text() == before
+    assert not _json.loads(before)["done"]
+
+
+# ------------------------------------ N6: commit: lines after the retirement
+def retire_then_append(repo: Path, p: dict, tail: str) -> None:
+    from test_step_ops import write_verdict
+    write_verdict(repo, "VERDICT: SHIP", 1, p)
+    git(repo, "add", "loop")
+    git(repo, "commit", "-q", "-m", "loop: iteration 1 — SHIP")
+    with (mbox(repo) / "VERDICT.md").open("a", encoding="utf-8") as fh:
+        fh.write(tail)
+
+
+def test_fold_takes_commit_lines_appended_after_retirement(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    retire_then_append(repo, p, f"commit: {p['sha']}\n")
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "shipped" and a["retirement_fold"] == "amended", a
+    assert a["commit_shas"] == [p["sha"]]
+    assert git(repo, "status", "--porcelain") == ""
+    assert f"commit: {p['sha']}" in git(repo, "show", "HEAD:loop/VERDICT.md")
+
+
+def test_fold_skips_verdict_edited_beyond_commit_lines(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    retire_then_append(repo, p, f"commit: {p['sha']}\nextra judgement\n")
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["status"] == "shipped"
+    assert a["retirement_fold"] == ("skipped: other uncommitted paths: "
+                                    "loop/VERDICT.md")
+
+
+# --------------------------------- N9: builders crash before its record
+def test_builders_replay_without_record_logs_once(repo: Path) -> None:
+    import json as _json
+    lead_running(repo)
+    head = step(repo, "dispatch", iteration=1)["head"]
+    b1 = builder_branch(repo, "b1")
+    results = _json.dumps([b1])
+    assert step(repo, "builders", iteration=1, wave=1, head=head,
+                results=results)["accepted"] == ["b1"]
+    records = mbox(repo) / ".native.json"
+    data = _json.loads(records.read_text())
+    data["builders"] = {}          # the crash hit before _record
+    records.write_text(_json.dumps(data))
+    again = step(repo, "builders", iteration=1, wave=1, head=head,
+                 results=results)
+    assert again["accepted"] == ["b1"]
+    log = (mbox(repo) / "LOG.md").read_text()
+    assert log.count("| builder | b1:") == 1
