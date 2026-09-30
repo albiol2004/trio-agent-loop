@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# trio-dash service entrypoint for the workspace `svc` manager.
+#
+# Runs dashboard/serve.py in the foreground-supervised style svc expects
+# (svc starts `run` under setsid and stops the whole process group). This
+# wrapper adds what svc does not have: restart on crash with backoff, and a
+# /healthz watchdog that restarts a server that stops answering.
+#
+# Configuration comes from the service dir's `env` file (see env.example).
+set -u
+
+CHECKOUT="${TRIO_DASH_CHECKOUT:?set TRIO_DASH_CHECKOUT to a trio-agent-loop checkout}"
+PORT="${TRIO_DASH_PORT:-9470}"
+HEALTH_EVERY="${TRIO_DASH_HEALTH_EVERY:-20}"   # seconds between probes
+HEALTH_FAILS="${TRIO_DASH_HEALTH_FAILS:-3}"    # consecutive failures before restart
+read -r -a WORKSPACE_ARGS <<< "${TRIO_DASH_WORKSPACE_ARGS:-}"
+
+log() { printf '%s trio-dash: %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# Accept the tailnet URL this wrapper publishes (Host and Origin checks in
+# serve.py refuse every other name besides localhost and IP literals).
+identity=/etc/agent-platform/identity
+ws_host="${WORKSPACE_HOSTNAME:-$(sed -n 's/^WORKSPACE_HOSTNAME=//p' "$identity" 2>/dev/null | head -1)}"
+ts_domain="${TAILNET_DOMAIN:-$(sed -n 's/^TAILNET_DOMAIN=//p' "$identity" 2>/dev/null | head -1)}"
+# Accept both the inherited/identity name and the name tailscale itself
+# reports (they have drifted apart before: see the ws-1 serve mappings).
+id_host="$(sed -n 's/^WORKSPACE_HOSTNAME=//p' "$identity" 2>/dev/null | head -1)"
+ts_self="$(timeout 5 tailscale status --json 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)"
+for name in "$ws_host" "$id_host" "$ts_self"; do
+  [ -n "$name" ] || continue
+  case "$name" in
+    *.*) fqdn="$name" ;;
+    *) fqdn="$name${ts_domain:+.$ts_domain}" ;;
+  esac
+  case ",$TRIO_DASH_ALLOWED_HOSTS," in *",$fqdn,"*) continue ;; esac
+  export TRIO_DASH_ALLOWED_HOSTS="${TRIO_DASH_ALLOWED_HOSTS:+$TRIO_DASH_ALLOWED_HOSTS,}$fqdn"
+  export TRIO_DASH_ALLOWED_ORIGINS="${TRIO_DASH_ALLOWED_ORIGINS:+$TRIO_DASH_ALLOWED_ORIGINS,}https://$fqdn:$PORT"
+done
+
+child=""
+# TERM, resume (a stopped process cannot act on TERM), then KILL after 5 s.
+end_child() {
+  [ -n "$child" ] || return 0
+  kill -TERM "$child" 2>/dev/null
+  kill -CONT "$child" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$child" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -KILL "$child" 2>/dev/null
+  wait "$child" 2>/dev/null
+}
+stop() {
+  log "stopping (signal)"
+  end_child
+  exit 0
+}
+trap stop TERM INT
+
+# Tailnet-only HTTPS on a dedicated port, like OpenDesign's :8443 listener;
+# the root (/) and /auth mappings of the workspace are left untouched.
+if [ "${TRIO_DASH_TAILSCALE:-1}" = 1 ]; then
+  if timeout 10 sudo -n tailscale serve --bg --https="$PORT" "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
+    log "tailscale serve https:$PORT -> 127.0.0.1:$PORT"
+  else
+    log "tailscale serve mapping failed; dashboard stays loopback-only"
+  fi
+fi
+
+backoff=2
+while true; do
+  started=$SECONDS
+  log "starting serve.py from $CHECKOUT ($(git -C "$CHECKOUT" rev-parse --short HEAD 2>/dev/null || basename "$CHECKOUT"))"
+  # An installed release directory is verified content: no __pycache__ in it.
+  PYTHONDONTWRITEBYTECODE=1 python3 "$CHECKOUT/dashboard/serve.py" --host 127.0.0.1 --port "$PORT" \
+    "${WORKSPACE_ARGS[@]}" &
+  child=$!
+
+  fails=0
+  while kill -0 "$child" 2>/dev/null; do
+    sleep "$HEALTH_EVERY" &
+    wait $! 2>/dev/null
+    kill -0 "$child" 2>/dev/null || break
+    if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+      fails=0
+    else
+      fails=$((fails + 1))
+      log "health probe failed ($fails/$HEALTH_FAILS)"
+      if [ "$fails" -ge "$HEALTH_FAILS" ]; then
+        log "unhealthy; restarting"
+        end_child
+        break
+      fi
+    fi
+  done
+  wait "$child" 2>/dev/null
+  code=$?
+  child=""
+  # A server that ran for a while earns a fresh backoff.
+  if [ $((SECONDS - started)) -gt 300 ]; then backoff=2; fi
+  log "serve.py exited (code $code); restarting in ${backoff}s"
+  sleep "$backoff"
+  backoff=$(( backoff * 2 > 60 ? 60 : backoff * 2 ))
+done

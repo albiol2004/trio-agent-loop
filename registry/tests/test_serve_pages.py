@@ -9,6 +9,7 @@ Run: python3 -m unittest discover -s registry/tests -t . (from repo root)
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 import threading
@@ -135,6 +136,40 @@ class HealthPageTests(DashboardPagesTestCase):
         status, content_type, _body = self._get("/health.js")
         self.assertEqual(status, 200)
         self.assertIn("text/javascript", content_type)
+
+
+class SharedShellTests(DashboardPagesTestCase):
+    """Every page wears the loop board's app bar and stylesheet only."""
+
+    PAGES = {
+        "/": "Loops", "/skills.html": "Skills", "/agents.html": "Agents",
+        "/topology.html": "Topology", "/models.html": "Models",
+        "/health.html": "Health",
+    }
+
+    def test_every_page_uses_the_shared_app_bar(self):
+        for path, current in self.PAGES.items():
+            with self.subTest(page=path):
+                status, _content_type, body = self._get(path)
+                self.assertEqual(status, 200)
+                self.assertIn('<header class="appbar">', body)
+                self.assertIn('class="skip-link" href="#main"', body)
+                self.assertIn('id="main"', body)
+                self.assertRegex(
+                    body, r'<a href="%s" aria-current="page"[^>]*>%s</a>'
+                    % (re.escape(path), current))
+                self.assertEqual(body.count('aria-current="page"'), 1)
+                for other in self.PAGES:
+                    self.assertIn(f'href="{other}"', body)
+
+    def test_pages_carry_no_inline_styles(self):
+        for path in self.PAGES:
+            with self.subTest(page=path):
+                _status, _content_type, body = self._get(path)
+                self.assertNotIn("<style", body)
+                self.assertNotIn(' style="', body)
+                self.assertIn('<link rel="stylesheet" href="/app.css">', body)
+                self.assertNotIn("topbar ", body.replace("topbar-meta", ""))
 
 
 class StaticRoutesTableTests(unittest.TestCase):
@@ -284,10 +319,10 @@ class SkillsJsWidgetTests(unittest.TestCase):
                 self.assertIn(marker, source)
         self.assertNotIn("innerHTML", source)
         self.assertNotIn("<script", source)
-        html = (REPO_ROOT / "dashboard" / "skills.html").read_text(
-            encoding="utf-8")
-        self.assertIn(".field-offlist", html)
-        self.assertIn(".field-error", html)
+        # The field states live in the shared stylesheet with every page.
+        css = (REPO_ROOT / "dashboard" / "app.css").read_text(encoding="utf-8")
+        self.assertIn(".field-offlist", css)
+        self.assertIn(".field-error", css)
 
     def test_skills_managed_source_controls_exist(self):
         html = (REPO_ROOT / "dashboard" / "skills.html").read_text(

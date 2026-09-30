@@ -55,7 +55,9 @@ Sessions:
     The loop's absolute path is mapped to an omp session slug ("-" +
     path-relative-to-$HOME with "/" -> "-"); if that slug directory does
     not exist, the project root's slug is used as a fallback (sessions
-    are keyed by the cwd of the omp run).
+    are keyed by the cwd of the omp run). Omnigent session exports in the
+    loop's own ``.sessions/`` directory are listed as parents too, with
+    "source": "mailbox", "agent" and "status" from their header line.
 
 Transcript tail (SSE):
     GET /api/transcript?path=<absolute-path>&offset=<bytes>
@@ -64,7 +66,8 @@ Transcript tail (SSE):
         event: init   data: {"offset": <int>, "size": <int>}
         event: line   data: {"offset": <byte-offset-after-line>, "record": <obj>}
         event: error  data: {"error": "<message>"}   (then the stream closes)
-    Path is validated to resolve under ~/.omp/agent/sessions/. Incomplete
+    Path is validated to resolve under ~/.omp/agent/sessions/ or to be a
+    ``.sessions/*.jsonl`` export inside a loop mailbox of `root`. Incomplete
     final lines are buffered until more bytes arrive. The stream polls the
     file every ~500 ms and emits a ":heartbeat" comment every ~15 s.
 
@@ -186,7 +189,9 @@ Canonical agents (registry/agents.py's api:AgentsAPI; repo files, no ?root=):
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
+import ipaddress
 import importlib.util
 import json
 import os
@@ -199,6 +204,8 @@ import threading
 import traceback
 import urllib.parse
 import urllib.request
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -235,6 +242,9 @@ HEALTH_PATH = DASHBOARD_DIR.parent / "registry" / "health.py"
 BROKER_HTTP_PATH = DASHBOARD_DIR.parent / "omnigent" / "broker_http.py"
 """Omnigent broker client, resolved relative to this file."""
 
+LOOP_ACTIONS_PATH = DASHBOARD_DIR / "loop_actions.py"
+"""Loop states, fix allowlist, answer box and diagnosis (dash-actions)."""
+
 REPO_ROOT = DASHBOARD_DIR.parent.resolve()
 """Repository root containing canonical harness sources."""
 
@@ -254,6 +264,15 @@ REGISTRY_CACHE_SECONDS = 5.0
 WORKSPACE_SCAN_SECONDS = 60.0
 """Maximum age of the automatically discovered workspace list."""
 
+OVERVIEW_CACHE_SECONDS = 15.0
+"""Age after which a poll triggers one background rebuild of the overview.
+
+Polls in between are answered from the last build; git-backed parts are
+reused across builds while their inputs are unchanged (``_heavy``)."""
+
+OVERVIEW_WORKERS = 4
+"""Workspaces scanned in parallel when building the overview."""
+
 _REGISTRY_MODULE = None
 _AGENTS_MODULE = None
 _TOPOLOGY_MODULE = None
@@ -265,6 +284,11 @@ _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
 SESSIONS_ROOT = HOME / ".omp" / "agent" / "sessions"
+
+MAILBOX_SESSIONS_DIR = ".sessions"
+"""Per-mailbox directory where the Omnigent drivers (trioctl) export each
+role session as ``<epoch>-<slug>-<id>.jsonl``: line 1 is the session
+header, then ``message`` / ``resource_event`` / ``compaction`` records."""
 
 # Keep handles for children started by this server so stop can reap a child
 # after sending SIGTERM without ever signalling its process group.
@@ -432,6 +456,70 @@ def load_metrics_module():
             raise RuntimeError(f"metrics module missing required function: {fn}")
     _METRICS_MODULE = module
     return module
+
+
+_LOOP_ACTIONS_MODULE = None
+_DIAGNOSES = None
+
+
+def load_loop_actions_module():
+    """Load dashboard/loop_actions.py by path and cache the module."""
+    global _LOOP_ACTIONS_MODULE
+    if _LOOP_ACTIONS_MODULE is not None:
+        return _LOOP_ACTIONS_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_loop_actions", LOOP_ACTIONS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load loop actions module: {LOOP_ACTIONS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _LOOP_ACTIONS_MODULE = module
+    return module
+
+
+#: Config overrides for every git call the dashboard makes on a workspace or
+#: mailbox repository: metrics/human_ledger.SAFE_GIT_CONFIG through
+#: loop_actions (one source of truth; eval4 finding 2, eval5 finding 1).
+SAFE_GIT_CONFIG: tuple = load_loop_actions_module().SAFE_GIT_CONFIG
+
+
+def _diagnoses():
+    """The process-wide diagnosis manager (one diagnosis per loop)."""
+    global _DIAGNOSES
+    if _DIAGNOSES is None:
+        _DIAGNOSES = load_loop_actions_module().DiagnosisManager()
+    return _DIAGNOSES
+
+
+NATIVE_REGISTRY_SECONDS = 10.0
+_NATIVE_REGISTRY = {"at": 0.0, "home": None, "value": []}
+_NATIVE_REGISTRY_LOCK = threading.Lock()
+
+
+def _native_registry() -> list[dict]:
+    """Registered claude-workflow runs (native-dash run registry), cached."""
+    now = time.monotonic()
+    with _NATIVE_REGISTRY_LOCK:
+        if (_NATIVE_REGISTRY["home"] == str(HOME)
+                and now - _NATIVE_REGISTRY["at"] <= NATIVE_REGISTRY_SECONDS):
+            return list(_NATIVE_REGISTRY["value"])
+    try:
+        value = load_loop_actions_module().native_registry(HOME)
+    except Exception:  # noqa: BLE001 - the board renders without it
+        traceback.print_exc()
+        value = []
+    with _NATIVE_REGISTRY_LOCK:
+        _NATIVE_REGISTRY.update(at=now, home=str(HOME), value=value)
+    return list(value)
+
+
+def _native_registry_entry(mailbox: Path) -> dict | None:
+    try:
+        target = str(Path(mailbox).resolve())
+    except OSError:
+        return None
+    return next((e for e in _native_registry() if e["mailbox"] == target), None)
 
 
 def load_inbox_state_module():
@@ -685,7 +773,67 @@ def _pid_is_live(pid: int) -> bool:
         os.kill(pid, 0)
     except (OSError, OverflowError, ValueError):
         return False
-    return True
+    # A zombie still answers kill(0) until its parent reaps it; it is dead.
+    return _proc_state(pid) not in ("Z", "X")
+
+
+def _proc_stat_fields(pid: int) -> list[str] | None:
+    """Fields of /proc/<pid>/stat after the ``(comm)`` field, or None."""
+    try:
+        raw = (Path(PROC_ROOT) / str(pid) / "stat").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    _, sep, rest = raw.rpartition(")")
+    return rest.split() if sep else None
+
+
+def _proc_state(pid: int) -> str | None:
+    fields = _proc_stat_fields(pid)
+    return fields[0] if fields else None
+
+
+_BOOT_TIME = None
+
+
+def _pid_start_epoch(pid: int) -> float | None:
+    """Wall-clock start time of a real process, or None when unknown."""
+    global _BOOT_TIME
+    fields = _proc_stat_fields(pid)
+    if not fields or len(fields) < 20:
+        return None
+    try:
+        if _BOOT_TIME is None:
+            for line in Path("/proc/stat").read_text().splitlines():
+                if line.startswith("btime "):
+                    _BOOT_TIME = float(line.split()[1])
+        ticks = os.sysconf("SC_CLK_TCK")
+        return _BOOT_TIME + int(fields[19]) / ticks
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _pid_owns_record(pid: int, record: Path) -> bool:
+    """Whether a live ``pid`` can be the process that wrote ``record``.
+
+    Sidecars and lock files are written by their process, so a process that
+    started after the file's last write is a recycled PID, not the owner.
+    Unknown start times (fake /proc, permissions) are not treated as reuse.
+    """
+    if not _using_real_proc():
+        return True
+    started = _pid_start_epoch(pid)
+    if started is None:
+        return True
+    try:
+        written = record.stat().st_mtime
+    except OSError:
+        return True
+    return started <= written + 2.0
+
+
+def _record_pid_live(pid: int, record: Path) -> bool:
+    return _pid_is_live(pid) and _pid_owns_record(pid, record)
 
 
 def _process_cmdline(pid: int) -> str:
@@ -707,7 +855,34 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
     """
     live_fn = getattr(metrics, "live_mailbox", None)
     pairs = []
-    for loop_dir in metrics.discover_loops(root):
+    found = list(_discover_loops_cached(root))
+    # native-dash: registered claude-workflow mailboxes below this root that
+    # the loop*/ rule misses (any mailbox name, hidden dirs included).
+    try:
+        root_real = Path(root).resolve()
+        known = {p.resolve() for p in found}
+        for entry in _native_registry():
+            mbox = Path(entry["mailbox"])
+            repo = entry.get("repo")
+            owned = (Path(repo).resolve() == root_real if repo
+                     else _path_is_under(mbox, root_real))
+            if mbox not in known and owned:
+                found.append(mbox)
+                known.add(mbox)
+    except OSError:
+        pass
+    try:
+        root_real = Path(root).resolve()
+    except OSError:
+        root_real = Path(root)
+    for loop_dir in found:
+        # A mailbox dir that is a symlink out of the workspace is not one of
+        # its loops (eval finding 4): never listed, never acted on.
+        try:
+            if not _path_is_under(Path(loop_dir).resolve(), root_real):
+                continue
+        except OSError:
+            continue
         live = None
         if live_fn is not None:
             try:
@@ -738,13 +913,61 @@ def _live_driver_summary(metrics, root_dir: Path) -> dict | None:
     return {key: entry.get(key) for key in keys}
 
 
+def _read_mailbox_text(path: Path) -> str:
+    """A mailbox file's text, opened without following a symlink; OSError
+    when it is absent, a symlink or not a regular file (eval2 finding 2:
+    a link planted in a repo never makes the board read a file outside it)."""
+    import stat as _stat
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
+def _mailbox_symlinks(loop_dir: Path) -> list[str]:
+    """Symlinked entries of a mailbox (loop_actions.mailbox_symlinks)."""
+    try:
+        return load_loop_actions_module().mailbox_symlinks(loop_dir)
+    except Exception:  # noqa: BLE001 - treat an unreadable mailbox as linked
+        return ["<unreadable>"]
+
+
+def _mailbox_nested_git(loop_dir: Path, root: Path | None) -> bool:
+    """A mailbox that a nested repository owns (a ``.git`` entry in it or
+    between it and the workspace root / its Lead worktree;
+    loop_actions.mailbox_nested_git): refused like a mailbox with symlinks
+    (eval4 finding 2, eval5 findings 2 and 3). A mailbox that is its own
+    repository's top level is accepted (eval6 finding 1)."""
+    try:
+        return bool(load_loop_actions_module().mailbox_nested_git(loop_dir, root, HOME))
+    except Exception:  # noqa: BLE001 - treat an unreadable mailbox as refused
+        return True
+
+
+NESTED_GIT_REFUSAL = ("the mailbox contains a .git entry (a nested repository); "
+                      "nothing in it is read")
+
+
+def _io_lines(path: Path):
+    """A text stream over a mailbox file read without following a link."""
+    import io
+    return io.StringIO(_read_mailbox_text(path))
+
+
 def _read_driver_state(loop_dir: Path) -> dict | None:
     """Read the loop driver's private state file when it is valid JSON."""
     try:
-        payload = json.loads(
-            (loop_dir / ".driver.json").read_text(
-                encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(_read_mailbox_text(loop_dir / ".driver.json"))
+    except (OSError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -784,7 +1007,7 @@ def _driver_snapshot(loop_dir: Path) -> dict | None:
         "phase": phase,
         "session_ids": sessions,
         "driver": driver,
-        "live": _pid_is_live(pid),
+        "live": _record_pid_live(pid, loop_dir / ".driver.json"),
     }
 
 
@@ -792,48 +1015,301 @@ def _live_lock_pid(mailbox: Path) -> int | None:
     """Return a live lock owner PID, ignoring malformed or stale locks."""
     lock = mailbox / ".lock"
     try:
-        if not lock.exists():
+        if lock.is_symlink() or not lock.exists():
             return None
-        pid = int((lock / "pid").read_text(encoding="utf-8").strip())
+        pid = int(_read_mailbox_text(lock / "pid").strip())
     except (OSError, ValueError):
         return None
-    return pid if _pid_is_live(pid) else None
+    return pid if _record_pid_live(pid, lock / "pid") else None
 
 
 def _read_session_sidecar(loop_dir: Path) -> dict | None:
     """Read the optional wrapper-owned session sidecar."""
     try:
-        payload = json.loads(
-            (loop_dir / ".session.json").read_text(
-                encoding="utf-8", errors="replace"
-            )
-        )
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(_read_mailbox_text(loop_dir / ".session.json"))
+    except (OSError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
 
-def _proc_matches_mailbox(loop_dir: Path) -> bool:
-    """Return whether a live process command line names this mailbox."""
-    try:
-        mailbox_text = str(loop_dir.resolve())
-        entries = list(Path(PROC_ROOT).iterdir())
-    except (OSError, RuntimeError):
+_PROC_SNAPSHOT = threading.local()
+"""Per-thread state shared while one board or overview is being built."""
+
+
+class _proc_snapshot:
+    """Scope in which every mailbox check reuses one read of the process
+    table and one broker session listing.
+
+    A board checks every mailbox against every live process; without the
+    scope that is one full ``/proc`` walk per mailbox (twice, once for the
+    card and once for the inbox).
+    """
+
+    def __init__(self, processes: list[tuple] | None = None,
+                 broker: dict | None = None):
+        self._given = processes
+        self._broker = broker
+
+    def __enter__(self):
+        self._outer = getattr(_PROC_SNAPSHOT, "processes", None)
+        if self._outer is None:
+            _PROC_SNAPSHOT.processes = (
+                self._given if self._given is not None
+                else _live_processes())
+            _PROC_SNAPSHOT.paths = _candidate_paths_for(
+                _PROC_SNAPSHOT.processes)
+            _PROC_SNAPSHOT.broker = (
+                self._broker if self._broker is not None
+                else _broker_listing())
+            _PROC_SNAPSHOT.ambiguous = {}
+            _PROC_SNAPSHOT.memo = {}
+        return self
+
+    def __exit__(self, *exc):
+        if self._outer is None:
+            _PROC_SNAPSHOT.processes = None
+            _PROC_SNAPSHOT.paths = None
+            _PROC_SNAPSHOT.broker = None
+            _PROC_SNAPSHOT.ambiguous = None
+            _PROC_SNAPSHOT.memo = None
         return False
 
+
+def _process_args(pid: int) -> list[str]:
+    try:
+        raw = (Path(PROC_ROOT) / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [
+        part.decode("utf-8", errors="replace")
+        for part in raw.split(b"\0") if part
+    ]
+
+
+def _live_processes() -> list[tuple[int, list[str], str | None]] | None:
+    """Live processes as ``(pid, argv, cwd)`` (excluding this server)."""
+    try:
+        entries = list(Path(PROC_ROOT).iterdir())
+    except (OSError, RuntimeError):
+        return None
     current_pid = os.getpid()
+    processes = []
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        try:
-            pid = int(entry.name)
-        except ValueError:
-            continue
+        pid = int(entry.name)
         if pid == current_pid or not _pid_is_live(pid):
             continue
-        if mailbox_text in _process_cmdline(pid):
+        args = _process_args(pid)
+        if not args:
+            continue
+        try:
+            cwd = os.readlink(Path(PROC_ROOT) / str(pid) / "cwd")
+        except OSError:
+            cwd = None
+        processes.append((pid, args, cwd))
+    return processes
+
+
+_NON_MAILBOX_OPTIONS = {"--config", "-c"}
+
+
+def _arg_paths(args: list[str], cwd: str | None):
+    """Normalized filesystem paths named by argv elements.
+
+    Each element counts as a whole (``--opt=value`` contributes ``value``);
+    nothing is matched inside a larger string such as a shell ``-c`` script.
+    A relative element resolves against the process cwd only when it looks
+    like a path (contains a separator) or is an option's value
+    (``--mailbox loop``); a bare word such as the ``loop`` subcommand of
+    ``trioctl omnigent loop`` is never a path.
+    """
+    previous = ""
+    for arg in args[1:]:
+        value = arg
+        option = previous if previous.startswith("-") and "=" not in previous else ""
+        if arg.startswith("-") and "=" in arg:
+            option, value = arg.split("=", 1)
+        is_option_value = bool(option)
+        previous = arg
+        # A shared role config (`--config <mailbox>/omnigent.toml`) says
+        # which settings a run uses, not which loop it works on.
+        if option in _NON_MAILBOX_OPTIONS:
+            continue
+        if not value or "\n" in value or value.startswith("-"):
+            continue
+        if os.path.isabs(value):
+            yield os.path.normpath(value)
+        elif cwd and (os.sep in value or is_option_value):
+            yield os.path.normpath(os.path.join(cwd, value))
+
+
+def _path_names_mailbox(path: str, mailbox: str) -> bool:
+    """``path`` is the mailbox or a file inside it, not inside a child
+    mailbox nested below it (those belong to the child)."""
+    if path == mailbox:
+        return True
+    if not path.startswith(mailbox + os.sep):
+        return False
+    first = path[len(mailbox) + 1:].split(os.sep, 1)[0]
+    try:
+        return not load_metrics_module().is_mailbox(Path(mailbox) / first)
+    except Exception:
+        return True
+
+
+def _mailbox_candidate_paths(processes) -> list[str]:
+    """Sorted argv paths that could name a mailbox (a ``loop*`` component).
+
+    Every discovered mailbox lives under a top-level ``loop*`` directory, so
+    other paths can never match; filtering once per snapshot keeps each
+    mailbox check to a binary search.
+    """
+    paths = set()
+    for _, args, cwd in processes or ():
+        for path in _arg_paths(args, cwd):
+            if any(part.startswith("loop") for part in path.split(os.sep)):
+                paths.add(path)
+    return sorted(paths)
+
+
+_CANDIDATE_PATHS_MEMO: list = [None, None]
+_CANDIDATE_PATHS_LOCK = threading.Lock()
+
+
+def _candidate_paths_for(processes) -> list[str]:
+    """``_mailbox_candidate_paths`` once per process snapshot, however many
+    workspace and worktree scopes of one overview build share it."""
+    with _CANDIDATE_PATHS_LOCK:
+        if processes is not None and _CANDIDATE_PATHS_MEMO[0] is processes:
+            return _CANDIDATE_PATHS_MEMO[1]
+    paths = _mailbox_candidate_paths(processes)
+    with _CANDIDATE_PATHS_LOCK:
+        _CANDIDATE_PATHS_MEMO[0] = processes
+        _CANDIDATE_PATHS_MEMO[1] = paths
+    return paths
+
+
+def _proc_matches_mailbox(loop_dir: Path) -> bool:
+    """Return whether a live process names this mailbox in its argv."""
+    try:
+        mailbox_text = str(loop_dir.resolve())
+    except (OSError, RuntimeError):
+        return False
+    paths = getattr(_PROC_SNAPSHOT, "paths", None)
+    if paths is None:
+        paths = _mailbox_candidate_paths(_live_processes())
+    start = bisect.bisect_left(paths, mailbox_text)
+    for path in paths[start:]:
+        if not path.startswith(mailbox_text):
+            break
+        if _path_names_mailbox(path, mailbox_text):
             return True
     return False
+
+
+BROKER_LIST_PAGES = 20
+"""Upper bound on ``GET /v1/sessions`` pages read per listing (100 each)."""
+
+BROKER_LIST_SECONDS = 5.0
+"""How long one broker listing is reused across boards and workspaces."""
+
+_BROKER_LISTING = {"at": 0.0, "value": None}
+_BROKER_LISTING_LOCK = threading.Lock()
+
+
+def _broker_listing() -> dict:
+    """Running broker sessions, with an explicit ``status``.
+
+    ``status`` is ``disabled`` (no broker URL), ``unreachable`` (any page
+    failed: liveness from the broker is unknown, not "not running") or
+    ``ok``. Only sessions whose status is ``running`` are kept.
+    """
+    base_url = str(BROKER_BASE_URL).strip()
+    if not base_url:
+        return {"status": "disabled", "running": []}
+    with _BROKER_LISTING_LOCK:
+        cached = _BROKER_LISTING["value"]
+        if (
+            cached is not None
+            and cached.get("url") == base_url
+            and time.monotonic() - _BROKER_LISTING["at"] <= BROKER_LIST_SECONDS
+        ):
+            return cached
+        running = []
+        status = "ok"
+        after = None
+        complete = False
+        for _ in range(BROKER_LIST_PAGES):
+            query = {"limit": "100"}
+            if after:
+                query["after"] = after
+            url = (base_url.rstrip("/") + "/v1/sessions?"
+                   + urllib.parse.urlencode(query))
+            try:
+                with urllib.request.urlopen(url, timeout=2.0) as response:
+                    page = json.loads(
+                        response.read().decode("utf-8", errors="replace"))
+            except (OSError, ValueError):
+                status = "unreachable"
+                break
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list):
+                status = "unreachable"
+                break
+            for item in data:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("status", "")).lower() == "running"
+                ):
+                    running.append({
+                        "id": str(item.get("id") or ""),
+                        "title": str(item.get("title") or ""),
+                        "workspace": str(item.get("workspace") or ""),
+                    })
+            after = page.get("last_id")
+            if not page.get("has_more") or not after:
+                complete = True
+                break
+        if status == "ok" and not complete:
+            status = "truncated"
+        value = {"status": status, "running": running, "url": base_url}
+        _BROKER_LISTING["value"] = value
+        _BROKER_LISTING["at"] = time.monotonic()
+        return value
+
+
+def _broker_sessions_for_mailbox(loop_dir: Path, root: Path | None,
+                                 listing: dict) -> list[dict]:
+    """Running broker sessions that belong to exactly this mailbox.
+
+    trioctl titles sessions ``trioctl <mailbox-dir-name> <role>:...`` and
+    records the workspace. Both must match, and the mailbox dir name must be
+    unique within the workspace; a title alone never attributes a session.
+    """
+    if root is None or not listing.get("running"):
+        return []
+    ambiguous = (getattr(_PROC_SNAPSHOT, "ambiguous", None) or {}).get(
+        str(root), set())
+    if loop_dir.name in ambiguous:
+        return []
+    prefix = f"trioctl {loop_dir.name} "
+    try:
+        root_text = str(root.resolve())
+    except OSError:
+        return []
+    matches = []
+    for session in listing["running"]:
+        workspace = session.get("workspace")
+        if not workspace or not session["title"].startswith(prefix):
+            continue
+        try:
+            same = str(Path(workspace).resolve()) == root_text
+        except OSError:
+            same = False
+        if same:
+            matches.append(session)
+    return matches
 
 
 def _broker_session_ids(
@@ -845,7 +1321,9 @@ def _broker_session_ids(
         session_ids = driver_state.get("session_ids")
         if isinstance(session_ids, dict):
             values.extend(session_ids.values())
-    if session_state:
+    if session_state and session_state.get("driver") != "claude-workflow":
+        # A claude-workflow sidecar's "session" is its run token, not a
+        # broker session (native-dash).
         values.append(session_state.get("session"))
 
     session_ids = []
@@ -858,11 +1336,19 @@ def _broker_session_ids(
     return session_ids
 
 
-def _broker_has_running_session(session_ids: list[str]) -> bool:
-    """Probe configured broker sessions, treating failures as unknown."""
+def _broker_has_running_session(session_ids: list[str],
+                                listing: dict | None = None) -> bool:
+    """Probe configured broker sessions, treating failures as unknown.
+
+    A complete listing (``status: ok``) already names every running
+    session, so it answers without one request per id.
+    """
     base_url = str(BROKER_BASE_URL).strip()
-    if not base_url:
+    if not base_url or not session_ids:
         return False
+    if listing is not None and listing.get("status") == "ok":
+        running = {s.get("id") for s in listing.get("running", [])}
+        return any(sid in running for sid in session_ids)
 
     for session_id in session_ids:
         url = (
@@ -910,15 +1396,39 @@ def _open_loop_substate(loop_dir: Path) -> str | None:
     return None
 
 
-def _running_detection(loop_dir: Path) -> dict:
-    """Return concrete running evidence and any stale session sidecar."""
+def _snapshot_memo(key: tuple, compute):
+    """Reuse ``compute()`` within one snapshot (one board/overview build)."""
+    memo = getattr(_PROC_SNAPSHOT, "memo", None)
+    if memo is None:
+        return compute()
+    if key not in memo:
+        memo[key] = compute()
+    return memo[key]
+
+
+def _running_detection(loop_dir: Path, root: Path | None = None) -> dict:
+    """Running evidence for a mailbox; computed once per build (the card
+    and the inbox both ask)."""
+    return copy.deepcopy(_snapshot_memo(
+        ("detect", str(loop_dir), str(root)),
+        lambda: _detect_running(loop_dir, root)))
+
+
+def _detect_running(loop_dir: Path, root: Path | None = None) -> dict:
+    """Return concrete running evidence and any stale session sidecar.
+
+    ``broker`` reports whether broker liveness was known for this check:
+    ``ok`` (listing read), ``disabled`` (no broker URL) or ``unreachable`` /
+    ``truncated``; only ``ok`` lets callers treat "no broker session" as a
+    fact.
+    """
     driver_state = _driver_snapshot(loop_dir)
     session_state = _read_session_sidecar(loop_dir)
     sources = []
 
-    driver_running = bool(driver_state and driver_state["live"])
-    driver_running = driver_running or _live_lock_pid(loop_dir) is not None
-    if driver_running:
+    lock_pid = _live_lock_pid(loop_dir)
+    driver_live = bool(driver_state and driver_state["live"])
+    if driver_live or lock_pid is not None:
         sources.append("driver")
 
     if _proc_matches_mailbox(loop_dir):
@@ -936,7 +1446,10 @@ def _running_detection(loop_dir: Path) -> dict:
             if not isinstance(raw_pid, bool)
             else None
         )
-        if not done and pid is not None and _pid_is_live(pid):
+        if (
+            not done and pid is not None
+            and _record_pid_live(pid, loop_dir / ".session.json")
+        ):
             session_running = True
         elif not done:
             orphaned_session = {
@@ -946,14 +1459,27 @@ def _running_detection(loop_dir: Path) -> dict:
     if session_running:
         sources.append("session")
 
+    listing = getattr(_PROC_SNAPSHOT, "broker", None)
+    if listing is None:
+        listing = _broker_listing()
     session_ids = _broker_session_ids(driver_state, session_state)
-    if _broker_has_running_session(session_ids):
+    matched = _broker_sessions_for_mailbox(loop_dir, root, listing)
+    if matched or _broker_has_running_session(session_ids, listing):
         sources.append("broker")
+
+    control_pid = None
+    if driver_live:
+        control_pid = driver_state["pid"]
+    elif lock_pid is not None:
+        control_pid = lock_pid
 
     return {
         "sources": sources,
         "orphaned_session": orphaned_session,
         "substate": _open_loop_substate(loop_dir),
+        "broker": listing.get("status", "disabled"),
+        "broker_sessions": [m["title"] for m in matched],
+        "control_pid": control_pid,
     }
 
 
@@ -965,6 +1491,217 @@ def _owns_loop_process(pid: int) -> bool:
         or "portable/driver.sh" in cmdline
         or ("trioctl" in cmdline and "loop" in cmdline)
     )
+
+
+DRIVER_ENTRYPOINTS: dict | None = None
+"""Test override of ``_driver_entrypoints()`` ({driver: path})."""
+
+
+def _driver_entrypoints() -> dict:
+    """Installed-release loop drivers (dash-actions): the installed trioctl
+    (``TRIO_DASH_TRIOCTL`` or ``~/.local/bin/trioctl``) and the installed
+    release's ``metrics/trio_loop.py`` — never this dashboard checkout's
+    own copies, which may be a stale or unreleased tree."""
+    if DRIVER_ENTRYPOINTS is not None:
+        return DRIVER_ENTRYPOINTS
+    la = load_loop_actions_module()
+    trioctl = la.trioctl_path(HOME)
+    rel = la.release_dir(HOME)
+    return {
+        "portable": (rel / "metrics" / "trio_loop.py") if rel is not None
+        else HOME / ".local" / "share" / "trio-agent-loop" / "releases"
+        / "(no CURRENT release)" / "metrics" / "trio_loop.py",
+        "omnigent": trioctl if trioctl is not None
+        else Path(os.environ.get("TRIO_DASH_TRIOCTL", "").strip()
+                  or HOME / ".local" / "bin" / "trioctl"),
+    }
+
+LAUNCH_GRACE_SECONDS = 1.5
+"""A started driver must still be alive this long before Start reports 202."""
+
+LAUNCH_LOG_KEEP = 20
+
+_LOOP_ACTIONS: dict[str, dict] = {}
+"""Last Start/Stop per mailbox path, kept for the life of the server."""
+_LOOP_ACTIONS_LOCK = threading.Lock()
+
+
+def _record_action(mailbox: Path, **fields) -> dict:
+    with _LOOP_ACTIONS_LOCK:
+        record = dict(_LOOP_ACTIONS.get(str(mailbox), {}))
+        if "action" in fields:
+            record = {}
+        record.update(fields)
+        record["updated_at"] = _utc_iso(datetime.now(timezone.utc))
+        _LOOP_ACTIONS[str(mailbox)] = record
+        return dict(record)
+
+
+def _last_action(mailbox: Path) -> dict | None:
+    with _LOOP_ACTIONS_LOCK:
+        record = _LOOP_ACTIONS.get(str(mailbox))
+        return dict(record) if record else None
+
+
+def _launch_log_path(mailbox: Path) -> Path:
+    """Per-launch driver output, outside every workspace."""
+    directory = HOME / ".local" / "state" / "trio-dash" / "launch"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        logs = sorted(directory.glob("*.log"), key=lambda p: p.stat().st_mtime)
+        for old in logs[:-LAUNCH_LOG_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", mailbox.parent.name)[:60]
+    return directory / f"{stamp}-{slug}.log"
+
+
+def _log_tail(path: Path, limit: int = 2000) -> str:
+    try:
+        return path.read_bytes()[-limit:].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _seed_driver_state(mailbox: Path, pid: int, driver: str) -> None:
+    """Point .driver.json at a started driver, keeping its resume cursor.
+
+    A driver that already wrote its own sidecar is left alone; otherwise the
+    existing iteration and session ids survive and only pid/driver/phase
+    change.
+    """
+    path = mailbox / ".driver.json"
+    current = _read_driver_state(mailbox) or {}
+    if _to_int(current.get("pid")) == pid:
+        return
+    state = dict(current)
+    state.update({"pid": pid, "driver": driver, "phase": "starting"})
+    state.setdefault("iteration", 0)
+    state.setdefault("session_ids", {})
+    try:
+        # mkstemp + rename, refusing a linked target (never a fixed temp name).
+        load_loop_actions_module()._write_atomic_nofollow(
+            path, (json.dumps(state) + "\n").encode("utf-8"))
+    except OSError:
+        traceback.print_exc()
+
+
+def _reap_loop_process(mailbox: Path, process) -> None:
+    """Wait for a started driver so it never lingers as a zombie."""
+    try:
+        code = process.wait()
+    except Exception:
+        return
+    with _LOOP_PROCESSES_LOCK:
+        _LOOP_PROCESSES.pop(process.pid, None)
+    record = _last_action(mailbox) or {}
+    if record.get("pid") == process.pid:
+        outcome = "stopped" if record.get("action") == "stop" or code in (
+            -signal.SIGTERM, 143) else ("finished" if code == 0 else "exited")
+        _record_action(mailbox, outcome=outcome, exit_code=code,
+                       message=f"Driver PID {process.pid} {outcome} "
+                               f"(code {code})")
+
+
+def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
+                   driver: str | None) -> dict:
+    """What Start/Stop can do for this mailbox, with the reason if not.
+
+    The control API acts on ``<workspace>/loop`` only. Start needs GOAL.md,
+    the driver entrypoint in this checkout, and no live evidence of a run;
+    Stop needs a live driver or lock PID with a known loop command line.
+    """
+    is_root_loop = False
+    if root is not None:
+        try:
+            is_root_loop = loop_dir.resolve() == (root / "loop").resolve()
+        except OSError:
+            pass
+    entrypoints = _driver_entrypoints()
+    chosen = driver if driver in entrypoints else "portable"
+    sources = detection["sources"]
+    if driver == "claude-workflow":
+        start = (False, "A claude-workflow (native) loop: start or resume it "
+                        "from the Actions panel (native launch.sh).")
+    elif not is_root_loop:
+        start = (False, "Start and stop act on a workspace's loop/ mailbox "
+                        "only; use the Actions panel for this one.")
+    elif _mailbox_symlinks(loop_dir):
+        start = (False, "The mailbox contains symlinks; nothing in it is read or "
+                        "started (eval2 finding 2).")
+    elif _mailbox_nested_git(loop_dir, root):
+        start = (False, "The mailbox contains a .git entry (a nested repository); "
+                        "nothing in it is read or started.")
+    elif not (loop_dir / "GOAL.md").is_file():
+        start = (False, "GOAL.md is missing.")
+    elif not Path(entrypoints[chosen]).is_file():
+        start = (False, f"The {chosen} driver is not installed "
+                        f"({entrypoints[chosen]}).")
+    elif sources:
+        start = (False, "Already running (" + ", ".join(sources) + ").")
+    elif detection.get("broker") in ("unreachable", "truncated"):
+        start = (False, "Broker liveness is unknown (the broker "
+                        + ("did not answer" if detection.get("broker")
+                           == "unreachable" else "list was cut short")
+                        + "); a broker-only run cannot be ruled out.")
+    else:
+        start = (True, f"Starts the installed {chosen} driver "
+                       f"({entrypoints[chosen]}) for this mailbox.")
+    pid = detection.get("control_pid")
+    if not is_root_loop:
+        stop = (False, start[1] if not start[0] else "")
+    elif pid is None:
+        stop = (False, "No driver or lock process is live"
+                + (f"; live via {', '.join(sources)} only." if sources
+                   else "."))
+    elif not _owns_loop_process(pid):
+        stop = (False, f"PID {pid} is not a loop driver command.")
+    else:
+        stop = (True, f"Sends SIGTERM to driver PID {pid}.")
+    return {
+        "driver": chosen,
+        "start": {"enabled": start[0], "reason": start[1]},
+        "stop": {"enabled": stop[0], "reason": stop[1]},
+    }
+
+
+def _loop_state(loop_dir: Path, sources: list[str]) -> dict:
+    """Derived loop state (loop_actions.derive_state), trimmed for a card."""
+    try:
+        derived = load_loop_actions_module().derive_state(
+            loop_dir, sources, home=HOME, last_action=_last_action(loop_dir))
+    except Exception:  # noqa: BLE001 - the card renders without it
+        traceback.print_exc()
+        return {"state": "unknown", "driver": None, "summary": "", "detail": {}}
+    derived["held"] = [
+        {k: h.get(k) for k in ("session_id", "role", "hold", "iteration")}
+        for h in derived.get("held") or []]
+    return derived
+
+
+def _live_card_fields(loop_dir: Path, root: Path | None) -> dict:
+    """Card fields that must be fresh on every poll (never cached)."""
+    driver_state = _driver_snapshot(loop_dir)
+    detection = _running_detection(loop_dir, root)
+    sources = detection["sources"]
+    driver = driver_state["driver"] if driver_state else None
+    loop_state = _loop_state(loop_dir, sources)
+    if loop_state.get("driver") == "claude-workflow":
+        driver = "claude-workflow"
+    return {
+        "loop_state": loop_state,
+        "driver_phase": driver_state["phase"] if driver_state else None,
+        "driver": driver,
+        "running": bool(sources),
+        "running_sources": sources,
+        "running_substate": detection["substate"],
+        "broker": detection["broker"],
+        "broker_sessions": detection["broker_sessions"],
+        "controls": _loop_controls(loop_dir, root, detection, driver),
+        "last_action": _last_action(loop_dir),
+    }
 
 
 def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
@@ -980,7 +1717,7 @@ def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
         return ""
     heading = None
     try:
-        with goal_path.open("r", encoding="utf-8", errors="replace") as fh:
+        with _io_lines(goal_path) as fh:
             for raw in fh:
                 line = raw.strip()
                 if not line:
@@ -1007,6 +1744,38 @@ def _mission_from_goal(goal_path: Path, limit: int = 120) -> str:
     if len(text) > limit:
         text = text[: limit - 1] + "\u2026"
     return text
+
+
+_GENERIC_GOAL_HEADINGS = {"goal", "mission", "objective", "task", "brief"}
+
+
+def _goal_title(goal_path: Path, limit: int = 120) -> str:
+    """Return GOAL.md's first heading as a short human title, or ``""``.
+
+    ``# Mission: fix X`` becomes ``fix X`` (first letter capitalised); a bare
+    generic heading such as ``# Goal`` yields ``""`` so callers fall back to
+    the mailbox name instead of showing a meaningless word.
+    """
+    try:
+        with _io_lines(goal_path) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line.startswith("#"):
+                    continue
+                text = line.lstrip("#").strip()
+                text = re.sub(
+                    r"^(mission|goal|objective)\s*(?::|—|–|-)\s*", "", text,
+                    flags=re.IGNORECASE)
+                if text.casefold() in _GENERIC_GOAL_HEADINGS:
+                    return ""
+                if text:
+                    text = text[0].upper() + text[1:]
+                if len(text) > limit:
+                    text = text[: limit - 1] + "\u2026"
+                return text
+    except OSError:
+        return ""
+    return ""
 
 
 def _last_activity(loop_dir: Path, entries: list[dict]) -> str | None:
@@ -1077,7 +1846,7 @@ def _loop_slices(loop_dir: Path) -> list[dict] | None:
     """
     plan_path = loop_dir / "PLAN.md"
     try:
-        text = plan_path.read_text(encoding="utf-8", errors="replace")
+        text = _read_mailbox_text(plan_path)
     except OSError:
         return None
     return load_metrics_module().parse_slices_block(text)
@@ -1110,8 +1879,7 @@ def _loop_slices_derived(loop_dir: Path, mode: str, commits: list[dict]) -> list
         metrics = load_metrics_module()
         queue = metrics.read_queue(loop_dir)
         try:
-            verdict_text = (loop_dir / "VERDICT.md").read_text(
-                encoding="utf-8", errors="replace")
+            verdict_text = _read_mailbox_text(loop_dir / "VERDICT.md")
         except OSError:
             verdict_text = ""
         commit_subjects = [f"slice({c['slice']}): {c['subject']}" for c in commits]
@@ -1173,6 +1941,93 @@ def _open_loop_iteration_lifecycle(iterations: list[dict], slices: list[dict]) -
     return out
 
 
+HEAVY_CACHE_SECONDS = 600.0
+"""Upper bound on reusing a git-backed derivation whose inputs look unchanged."""
+
+HEAVY_CACHE_MAX = 4096
+_HEAVY_CACHE: dict[tuple, tuple] = {}
+_HEAVY_CACHE_LOCK = threading.Lock()
+
+
+def _dir_fingerprint(path: Path) -> tuple:
+    """(name, mtime_ns, size) of a directory's direct files, sorted."""
+    try:
+        with os.scandir(path) as entries:
+            return tuple(sorted(
+                (entry.name, entry.stat().st_mtime_ns, entry.stat().st_size)
+                for entry in entries if entry.is_file()
+            ))
+    except OSError:
+        return ()
+
+
+def _git_fingerprint(root: Path) -> tuple:
+    """Stat of the files a commit, checkout or ref update always touches."""
+    try:
+        probe = root.resolve()
+    except OSError:
+        return ()
+    for candidate in (probe, *probe.parents):
+        dot_git = candidate / ".git"
+        if dot_git.is_dir():
+            gitdir = dot_git
+            break
+        if dot_git.is_file():
+            try:
+                text = dot_git.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ()
+            if not text.startswith("gitdir:"):
+                return ()
+            gitdir = (candidate / text[len("gitdir:"):].strip()).resolve()
+            break
+    else:
+        return ()
+    out = []
+    for rel in ("HEAD", "logs/HEAD", "packed-refs", "commondir"):
+        try:
+            st = (gitdir / rel).stat()
+            out.append((rel, st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((rel, None, None))
+    return tuple(out)
+
+
+def _jittered(seconds: float, key: str) -> float:
+    """``seconds`` stretched by up to 50% by a stable hash of ``key``, so
+    caches filled in one build do not all expire in the same later build."""
+    spread = (zlib.crc32(key.encode("utf-8")) % 1000) / 1000.0
+    return seconds * (1.0 + 0.5 * spread)
+
+
+def _heavy(kind: str, loop_dir: Path, root: Path | None, compute):
+    """Reuse ``compute()`` while the mailbox files and git state are unchanged.
+
+    Keyed by mailbox + workspace; invalidated by any mailbox file write or a
+    commit/checkout in the workspace repo, and in any case after
+    ``HEAVY_CACHE_SECONDS``. Returns a deep copy so callers may mutate.
+    """
+    key = (kind, str(loop_dir), str(root))
+    fingerprint = (
+        _snapshot_memo(("dirfp", str(loop_dir)),
+                       lambda: _dir_fingerprint(loop_dir)),
+        _snapshot_memo(("gitfp", str(root)), lambda: _git_fingerprint(root))
+        if root is not None else ())
+    now = time.monotonic()
+    with _HEAVY_CACHE_LOCK:
+        hit = _HEAVY_CACHE.get(key)
+        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
+                HEAVY_CACHE_SECONDS, str(loop_dir)):
+            return copy.deepcopy(hit[2])
+    value = compute()
+    with _HEAVY_CACHE_LOCK:
+        if len(_HEAVY_CACHE) >= HEAVY_CACHE_MAX:
+            oldest = min(_HEAVY_CACHE, key=lambda k: _HEAVY_CACHE[k][1])
+            _HEAVY_CACHE.pop(oldest, None)
+        _HEAVY_CACHE[key] = (fingerprint, now, value)
+    return copy.deepcopy(value)
+
+
 def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     """Shadow drift for a loop's slices, or None when not applicable.
 
@@ -1184,9 +2039,14 @@ def _loop_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     Any failure (no PLAN.md, no slices block, a missing/non-git repo, or a
     shadow-script load error) yields None, never a 500.
     """
+    return _heavy("slice_activity", loop_dir, root,
+                  lambda: _compute_slice_activity(loop_dir, root))
+
+
+def _compute_slice_activity(loop_dir: Path, root: Path) -> dict | None:
     try:
         shadow = load_shadow_module()
-        text = (loop_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
+        text = _read_mailbox_text(loop_dir / "PLAN.md")
         slices = shadow.parse_slices(shadow.find_slices_block(text))
     except Exception:
         return None
@@ -1212,19 +2072,24 @@ def _loop_iterations(loop_dir: Path, root: Path) -> tuple[list[dict], list[dict]
     iteration_path_sets / iteration_overlaps); this helper only loads the
     mailbox inputs. Any failure yields ([], []), never a 500.
     """
+    iterations, overlaps = _heavy(
+        "iterations", loop_dir, root,
+        lambda: _compute_loop_iterations(loop_dir, root))
+    return iterations, overlaps
+
+
+def _compute_loop_iterations(loop_dir: Path, root: Path) -> tuple[list[dict], list[dict]]:
     try:
         metrics = load_metrics_module()
         state = metrics.parse_state(loop_dir / "STATE.md")
         timeline = metrics.parse_timeline(loop_dir / "LOG.md")
         slices = _loop_slices(loop_dir) or []
         try:
-            verdict_text = (loop_dir / "VERDICT.md").read_text(
-                encoding="utf-8", errors="replace")
+            verdict_text = _read_mailbox_text(loop_dir / "VERDICT.md")
         except OSError:
             verdict_text = ""
         try:
-            report_text = (loop_dir / "REPORT.md").read_text(
-                encoding="utf-8", errors="replace")
+            report_text = _read_mailbox_text(loop_dir / "REPORT.md")
         except OSError:
             report_text = ""
         activity = _loop_slice_activity(loop_dir, root)
@@ -1245,6 +2110,11 @@ _SLICE_COMMIT_RE = re.compile(r"^slice\(([^)]+)\):\s*(.*)$")
 
 
 def _loop_commits(loop_dir: Path, root: Path) -> list[dict]:
+    return _heavy("commits", loop_dir, root,
+                  lambda: _compute_loop_commits(loop_dir, root))
+
+
+def _compute_loop_commits(loop_dir: Path, root: Path) -> list[dict]:
     """Git metadata for a loop: slice-attributed commits newest first.
 
     Reads ``git log`` of the coordination repo (the mailbox's parent root)
@@ -1270,7 +2140,8 @@ def _repo_slice_commits(root: Path) -> list[dict]:
     """`_loop_commits` for one repository."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "log", "--format=%H%x09%h%x09%s", "-n", "200"],
+            ["git", *SAFE_GIT_CONFIG, "-C", str(root), "log", "--format=%H%x09%h%x09%s",
+             "-n", "200"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1295,11 +2166,88 @@ def _repo_slice_commits(root: Path) -> list[dict]:
     return commits
 
 
+_RUNNING_STATUS_WORDS = {"running", "in_progress", "in-progress", "active",
+                         "iterating"}
+
+_HUMAN_STATUS_WORDS = {"needs_human", "needs-human", "awaiting_human",
+                       "awaiting-human", "awaiting_user", "awaiting-user"}
+"""STATE.md status words that hand the loop to a person."""
+"""STATE.md status words that claim a loop is still working."""
+
+
+_HOLD_REASONS = {
+    "first_prompt_uncertain": "first-prompt delivery uncertain",
+    "role_completion_uncertain": "prompt delivered, role completion uncertain",
+    "abandoned_on_exit": "slice-eval still running when the loop exited",
+    "mirror_crosswired": "first prompt uncertain (cross-wired chat binding)",
+}
+
+
+def _state_inbox_items(derived: dict, add) -> None:
+    """Actionable items for derived loop states (dash-actions)."""
+    state = derived.get("state")
+    detail = derived.get("detail") or {}
+    summary = derived.get("summary") or ""
+    phase = derived.get("phase") or ""
+    native = derived.get("driver") == "claude-workflow"
+    if state == "error":
+        reason = str(detail.get("reason") or summary)
+        add("high", "error", "Loop stopped with an error"
+            + (" (claude-workflow)" if native else ""),
+            reason[:400] + " · Diagnose, then reset STATE and re-run.",
+            f"error:{phase}:{reason[:60]}")
+    elif state == "needs_retirement":
+        add("high", "needs_retirement", "SHIP verified; retirement incomplete",
+            "The SHIP's retirement commit did not complete (exit 6). Retire it "
+            "(/trio-ship) and re-run to finalize.", f"retire:{derived.get('iteration')}")
+    elif state == "needs_land":
+        add("high", "needs_land", "Verified branch could not land"
+            + (f" ({phase})" if phase else ""),
+            "Root-free SHIP is verified on trio/<slug> but not on the target "
+            "(exit 8). A conflict is resolved by a human in the Lead worktree; "
+            "then trioctl omnigent land.", f"land:{phase}")
+    elif state == "held":
+        if native:
+            add("high", "held", f"Held at step {detail.get('held_step') or '?'}",
+                str(detail.get("reason") or "A step's Bash call was denied by the "
+                    "permission system.")[:400]
+                + " · Review the denial; start a fresh run (never a permission change).",
+                f"held:{detail.get('held_step')}:{detail.get('finished_at')}")
+        for hold in derived.get("held") or []:
+            add("high", "held", f"Held dispatch: {hold.get('role') or '?'} session "
+                f"{hold.get('session_id') or '?'}",
+                _HOLD_REASONS.get(hold.get("hold"), str(hold.get("hold") or "held"))
+                + f" (iteration {hold.get('iteration')}). Dry-run trioctl omnigent "
+                "reconcile; apply only when receipt-proven.",
+                f"held:{hold.get('session_id')}")
+    elif state == "conflict":
+        files = sorted({f for c in detail.get("conflicts") or []
+                        for f in (c.get("files") or [])})
+        add("high", "conflict", "Merge conflict after re-dispatch",
+            (", ".join(files[:6]) or summary) + " · A fresh run re-plans.",
+            "conflict:" + ",".join(files[:6]))
+    elif state == "budget":
+        add("medium", "budget", "Agent/token budget exhausted",
+            "The claude-workflow run stopped at max_agents/token_budget; the "
+            "state is resumable with a fresh start.", f"budget:{detail.get('finished_at')}")
+    elif state == "iteration_cap":
+        add("medium", "iteration_cap", "Stopped at the iteration cap",
+            f"{summary}. Re-run with a higher --max-iterations.",
+            f"cap:{derived.get('iteration')}")
+    dangling = detail.get("dangling_worktrees") or []
+    if dangling:
+        add("low", "dangling_worktrees",
+            f"{len(dangling)} dangling builder worktree{'s' if len(dangling) != 1 else ''}",
+            ", ".join(dangling[:3]) + ("…" if len(dangling) > 3 else "")
+            + " · Clean merged ones; a human reviews the rest.",
+            "dangling:" + ",".join(sorted(dangling)))
+
+
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
-    Kinds: needs_human / blocked (high), orphaned / drift / overlap /
-    queue_fault / slice_overlap (medium), and repair (low). For open-loop
+    Kinds: needs_human / blocked (high), orphaned / interrupted / drift /
+    overlap / queue_fault / slice_overlap (medium), and repair (low). For open-loop
     mailboxes (QUEUE.md present) the iteration-overlap item is suppressed
     and replaced by queue_fault (one per open fault) and slice_overlap
     (write-set intersection between simultaneously-building slices);
@@ -1320,7 +2268,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
             item["_inbox_anchor"] = anchor
         items.append(item)
 
-    detection = _running_detection(loop_dir)
+    detection = _running_detection(loop_dir, root)
     orphaned = detection["orphaned_session"]
     if orphaned is not None and not detection["sources"]:
         pid = orphaned.get("pid")
@@ -1336,17 +2284,79 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         )
 
     verdict = (card.get("final_verdict") or "").upper()
-    if verdict == "NEEDS_HUMAN":
+    status = str(card.get("status") or "").strip().lower()
+    derived = card.get("loop_state") or {}
+    dstate = derived.get("state")
+    if (
+        status in _RUNNING_STATUS_WORDS
+        and not detection["sources"]
+        and orphaned is None
+        and verdict not in ("SHIP", "NEEDS_HUMAN", "BLOCKED")
+        # A known outcome (native held/conflict/budget/error, iteration
+        # cap, an answered loop waiting for its restart) is its own item.
+        and dstate in (None, "interrupted", "unknown", "ready")
+    ):
+        # Two recorded facts disagree; no idle-time threshold is involved.
+        # Without a readable broker, a broker-only loop cannot be ruled out,
+        # so the item is a low-severity note instead of a call to act.
+        last = card.get("last_activity") or ""
+        when = (f" Last mailbox write {last[:16].replace('T', ' ')} UTC."
+                if last else "")
+        broker = detection.get("broker")
+        working = _workspace_worker_count(root)
+        if working:
+            add("low", "interrupted",
+                f"STATE.md says {status}; no worker names this mailbox",
+                f"{working} loop worker{'s' if working != 1 else ''} "
+                "(Trio driver, role runner or headless harness) "
+                f"{'are' if working != 1 else 'is'} running in this "
+                "workspace without naming a mailbox, so this loop may still "
+                "be progressing." + when,
+                f"interrupted:{last}")
+        elif broker == "ok":
+            add("medium", "interrupted",
+                f"STATE.md says {status}; nothing is live",
+                "No driver, lock, process, session sidecar or broker "
+                "session is live." + when,
+                f"interrupted:{last}")
+        else:
+            reason = {
+                "disabled": "broker liveness is not configured",
+                "unreachable": "the broker did not answer",
+                "truncated": "the broker session list was too long to read",
+            }.get(broker, "broker liveness is unknown")
+            add("low", "interrupted",
+                f"STATE.md says {status}; no local process",
+                "No driver, lock, process or session sidecar is live; "
+                f"{reason}, so a broker-only run cannot be ruled out." + when,
+                f"interrupted:{last}")
+
+    _state_inbox_items(derived, add)
+
+    if dstate in ("held", "answered"):
+        pass  # the hold explains STATE's needs_human; an answer was given
+    elif verdict == "NEEDS_HUMAN":
         add("high", "needs_human", "Human verification pending",
             "Agent-verifiable criteria pass; verify: human criteria remain.")
     elif verdict == "BLOCKED":
         add("high", "blocked", "Loop blocked",
             card.get("last_entry_summary") or "")
+    elif status in _HUMAN_STATUS_WORDS:
+        # A Lead that stops for a decision records it in STATE.md; the
+        # verdict file may still say "none" or the previous ITERATE.
+        add("high", "needs_human", "STATE.md asks for a human",
+            f"STATE.md status is {status}"
+            + (f"; verdict file says {verdict}." if verdict else ".")
+            + (f" Last log entry: {card.get('last_entry_summary')}."
+               if card.get("last_entry_summary") else ""),
+            f"state:{status}")
+    elif status == "blocked":
+        add("high", "blocked", "STATE.md says blocked",
+            card.get("last_entry_summary") or "", "state:blocked")
 
     plan = loop_dir / "PLAN.md"
     try:
-        has_slices = "slices:" in plan.read_text(
-            encoding="utf-8", errors="replace")
+        has_slices = "slices:" in _read_mailbox_text(plan)
     except OSError:
         has_slices = False
     if has_slices:
@@ -1440,7 +2450,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
             traceback.print_exc()
 
     try:
-        repairs = int((loop_dir / ".repairs").read_text().strip())
+        repairs = int(_read_mailbox_text(loop_dir / ".repairs").strip())
     except (OSError, ValueError):
         repairs = 0
     if repairs >= 1:
@@ -1574,6 +2584,92 @@ def _parse_session_file(path: Path) -> dict:
         "path": str(path.resolve()),
         "size": path.stat().st_size,
     }
+
+def _mailbox_session_files(loop_dir: Path) -> list[Path]:
+    """``.jsonl`` files directly inside ``<loop>/.sessions/``.
+
+    A ``.sessions`` directory that is itself a symlink (or resolves anywhere
+    but ``<resolved loop>/.sessions``) lists nothing, and file symlinks that
+    resolve outside it are skipped, so the session list shows exactly what
+    the transcript endpoint will tail and never another directory's paths
+    or sizes.
+    """
+    directory = Path(loop_dir) / MAILBOX_SESSIONS_DIR
+    try:
+        if directory.is_symlink():
+            return []
+        real_dir = directory.resolve()
+        if real_dir != Path(loop_dir).resolve() / MAILBOX_SESSIONS_DIR:
+            return []
+        entries = list(directory.iterdir())
+    except (OSError, RuntimeError):
+        return []
+    files = []
+    for entry in entries:
+        if entry.name.startswith(".") or entry.suffix != ".jsonl":
+            continue
+        try:
+            if entry.is_file() and entry.resolve().parent == real_dir:
+                files.append(entry)
+        except (OSError, RuntimeError):
+            continue
+    return files
+
+
+def _epoch_iso(value) -> str | None:
+    """ISO-8601 UTC for an epoch-seconds value, or None."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace(
+            "+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
+    """Describe one exported Omnigent session from its header line.
+
+    The label drops the driver's ``trioctl <loop> `` title prefix so the
+    list reads ``evaluator:iteration 1``. A missing or malformed header
+    falls back to the file name, its leading epoch, then the mtime, so the
+    file is never hidden.
+    """
+    stem = path.name[: -len(".jsonl")]
+    header: dict = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            first = json.loads(fh.readline() or "null")
+        if isinstance(first, dict) and "type" not in first:
+            header = first
+    except (OSError, ValueError):
+        header = {}
+    stat = path.stat()
+    title = str(header.get("title") or "").strip()
+    # trioctl titles name the loop by its full name or, for nested
+    # ``loop/<name>`` mailboxes, by the last segment only.
+    short_name = loop_name.rsplit("/", 1)[-1]
+    for prefix in (f"trioctl {loop_name} ", f"trioctl {short_name} ", "trioctl "):
+        if title.startswith(prefix):
+            title = title[len(prefix):]
+            break
+    stem_epoch = re.match(r"^(\d{9,11})-", stem)
+    timestamp = (_epoch_iso(header.get("created_at"))
+                 or (_epoch_iso(stem_epoch.group(1)) if stem_epoch else None)
+                 or _epoch_iso(stat.st_mtime))
+    return {
+        "id": str(header.get("id") or stem),
+        "label": title or stem,
+        "timestamp": timestamp,
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "source": "mailbox",
+        "agent": str(header.get("agent_name") or "") or None,
+        "status": str(header.get("status") or "") or None,
+    }
+
 
 def _resolve_registry_path(value) -> Path:
     """Resolve an API path, raising ``ValueError`` for malformed values."""
@@ -1887,7 +2983,7 @@ def _read_json_body(handler) -> dict:
         raise ValueError("invalid request body")
     try:
         payload = json.loads(handler.rfile.read(length).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         raise ValueError("invalid JSON body")
     if not isinstance(payload, dict):
         raise ValueError("JSON body must be an object")
@@ -1899,11 +2995,149 @@ def _read_json_body(handler) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _env_list(name: str) -> set[str]:
+    return {
+        value.strip().lower().rstrip("/")
+        for value in os.environ.get(name, "").split(",") if value.strip()
+    }
+
+
+def _allowed_origins() -> set[str]:
+    return _env_list("TRIO_DASH_ALLOWED_ORIGINS")
+
+
+def _split_host(host: str) -> str:
+    """Hostname part of a Host header (``[::1]:80`` -> ``::1``)."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:host.find("]")] if "]" in host else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def _host_allowed(host: str) -> bool:
+    name = _split_host(host).rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+        return True  # an IP literal cannot be a rebinding attacker's name
+    except ValueError:
+        pass
+    return name == "localhost" or name in _env_list("TRIO_DASH_ALLOWED_HOSTS")
+
+
+def _origin_allowed(origin: str, host: str) -> bool:
+    value = origin.strip().lower().rstrip("/")
+    if value in _allowed_origins():
+        return True
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    if not host or parsed.netloc != host.strip().lower():
+        return False
+    return _host_allowed(parsed.netloc)
+
+
+def _diagnosis_summary(root_mailbox: Path) -> dict | None:
+    """The loop's latest diagnosis, trimmed for a board card."""
+    try:
+        la = load_loop_actions_module()
+        record = _diagnoses().status(HOME, la.loop_key(root_mailbox))
+    except Exception:  # noqa: BLE001 - the card renders without it
+        return None
+    if not record:
+        return None
+    result = record.get("result") or {}
+    fix = result.get("proposed_fix") or {}
+    return {
+        "status": record.get("status"), "harness": record.get("harness"),
+        "model": record.get("model"), "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"), "events": record.get("events"),
+        "last_event": record.get("last_event"), "error": record.get("error"),
+        "state": result.get("state"), "proposed_fix": fix.get("id"),
+        "proposed_fix_rejected": fix.get("rejected"),
+        "needs_human_input": result.get("needs_human_input"),
+    }
+
+
+_ACTION_LOCKS: dict[str, threading.Lock] = {}
+_ACTION_LOCKS_GUARD = threading.Lock()
+
+
+def _action_lock(key: str) -> threading.Lock:
+    with _ACTION_LOCKS_GUARD:
+        return _ACTION_LOCKS.setdefault(key, threading.Lock())
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler for the dashboard API and static files."""
 
     server_version = "TrioLoopDashboard/1.0"
     protocol_version = "HTTP/1.1"
+
+    # -- request guards ----------------------------------------------------
+
+    def _request_allowed(self, mutating: bool) -> bool:
+        """Reject DNS-rebinding hosts and cross-origin writes.
+
+        Every request needs a Host that is an IP literal, ``localhost`` or a
+        name in ``TRIO_DASH_ALLOWED_HOSTS``. A mutating request with an
+        ``Origin`` must come from the same origin as its Host or from
+        ``TRIO_DASH_ALLOWED_ORIGINS``; browsers' cross-site fetches are
+        refused; and any request body must be ``application/json`` so a
+        cross-origin "simple" form/text POST cannot reach a handler.
+        """
+        host = (self.headers.get("Host") or "").strip()
+        if host and not _host_allowed(host):
+            self._reject(421, "host not allowed")
+            return False
+        if not mutating:
+            return True
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and not _origin_allowed(origin, host):
+            self._reject(403, "cross-origin request refused")
+            return False
+        fetch_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if fetch_site == "cross-site" and not (
+                origin and origin.lower() in _allowed_origins()):
+            self._reject(403, "cross-site request refused")
+            return False
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if length != 0:
+            media = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+            if media.strip().lower() != "application/json":
+                self._reject(415, "request body must be application/json")
+                return False
+        return True
+
+    def _reject(self, code: int, message: str) -> None:
+        # Refused requests may leave an unread body; close the connection
+        # and say so, or a proxy that pools connections (tailscale serve)
+        # sends the next request into a dead socket.
+        self.close_connection = True
+        body = json.dumps({"error": message}).encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def log_message(self, format: str, *args) -> None:
+        """Log errors and writes; skip successful reads (polls, probes)."""
+        try:
+            status = int(str(args[1])) if len(args) > 1 else 0
+        except ValueError:
+            status = 0
+        if self.command == "GET" and 200 <= status < 400:
+            return
+        super().log_message(format, *args)
 
     # -- helpers -----------------------------------------------------------
 
@@ -1950,7 +3184,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             candidate = candidate.resolve()
         except (OSError, RuntimeError, ValueError):
             raise PermissionError("invalid workspace root")
-        seeds = self.server.get_workspace_seeds()
+        seeds = (self.server.get_workspace_seeds()
+                 + self.server.get_worktree_seeds())
         if not any(_path_is_under(candidate, seed) for seed in seeds):
             pruebas = HOME / "pruebas"
             if (
@@ -2102,7 +3337,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         try:
             status = subprocess.run(
-                ["git", "-C", str(root), "status", "--porcelain"],
+                ["git", *SAFE_GIT_CONFIG, "-C", str(root), "status", "--porcelain"],
                 capture_output=True, text=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -3001,38 +4236,84 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # -- /api/board --------------------------------------------------------
 
     def _loop_card(self, loop_dir: Path, metrics, root: Path | None = None) -> dict:
-        analysis = metrics.analyze_loop(loop_dir, root)
-        entries = metrics.parse_log(loop_dir / "LOG.md")
-        driver_state = _driver_snapshot(loop_dir)
-        detection = _running_detection(loop_dir)
-        sources = detection["sources"]
-        return {
-            "name": analysis["name"],
-            "path": analysis["name"],
-            "mission": _mission_from_goal(loop_dir / "GOAL.md"),
-            "iteration": _to_int(analysis["state_iteration"]),
-            "max_iterations": _to_int(analysis["state_max_iterations"]),
-            "status": analysis["state_status"] or "unknown",
-            "final_verdict": analysis["final_verdict"],
-            "last_activity": _last_activity(loop_dir, entries),
-            "verdict_mtime": _verdict_mtime(loop_dir),
-            "last_entry_summary": _last_entry_summary(entries),
-            "segments": analysis["segments"],
-            "driver_phase": (
-                driver_state["phase"] if driver_state else None
-            ),
-            "driver": driver_state["driver"] if driver_state else None,
-            "running": bool(sources),
-            "running_sources": sources,
-            "running_substate": detection["substate"],
-        }
+        def static() -> dict:
+            analysis = metrics.analyze_loop(loop_dir, root)
+            entries = metrics.parse_log(loop_dir / "LOG.md")
+            return {
+                "name": analysis["name"],
+                "path": analysis["name"],
+                "mission": _mission_from_goal(loop_dir / "GOAL.md"),
+                "title": _goal_title(loop_dir / "GOAL.md"),
+                "iteration": _to_int(analysis["state_iteration"]),
+                "max_iterations": _to_int(analysis["state_max_iterations"]),
+                "status": analysis["state_status"] or "unknown",
+                "final_verdict": analysis["final_verdict"],
+                "last_activity": _last_activity(loop_dir, entries),
+                "verdict_mtime": _verdict_mtime(loop_dir),
+                "last_entry_summary": _last_entry_summary(entries),
+                "segments": analysis["segments"],
+            }
+
+        card = _heavy("card", loop_dir, root, static)
+        card.update(_live_card_fields(loop_dir, root))
+        return card
 
     def _handle_board(self, root: Path) -> None:
+        self._send_json(200, self._board_payload(root))
+
+    def _board_payload(
+        self, root: Path, processes: list | None = None,
+        broker: dict | None = None, only: dict | None = None,
+    ) -> dict:
+        with _proc_snapshot(processes, broker):
+            if only is None:
+                return self._build_board(root)
+            return self._build_board(root, only)
+
+    def _build_board(self, root: Path, only: dict | None = None) -> dict:
+        """Cards and inbox for a workspace; ``only`` limits a linked
+        worktree to its selected mailboxes ({path: reasons})."""
         metrics = self.server.metrics
         pairs = _live_loop_dirs(metrics, root)
+        # Broker titles carry only the mailbox dir name; a name used twice in
+        # one workspace cannot be attributed to either mailbox.
+        seen: dict[str, int] = {}
+        for root_dir, _read in pairs:
+            seen[root_dir.name] = seen.get(root_dir.name, 0) + 1
+        ambiguous = getattr(_PROC_SNAPSHOT, "ambiguous", None)
+        if ambiguous is not None:
+            ambiguous[str(root)] = {n for n, c in seen.items() if c > 1}
+        if only is not None:
+            pairs = [(r, d) for r, d in pairs if str(r) in only]
+        root_dirs = [root_dir for root_dir, _read in pairs]
         loop_dirs = [read for _root_dir, read in pairs]
         loops = []
         for root_dir, loop_dir in pairs:
+            links = _mailbox_symlinks(loop_dir) + (
+                [] if loop_dir == root_dir else _mailbox_symlinks(root_dir))
+            if links:
+                # eval2 finding 2: a mailbox with symlinks is never read.
+                name = metrics.loop_name(root, root_dir)
+                loops.append({
+                    "name": name, "path": name, "mission": "", "title": "",
+                    "iteration": None, "max_iterations": None, "status": "unknown",
+                    "final_verdict": None, "last_activity": None, "verdict_mtime": None,
+                    "last_entry_summary": "refused: the mailbox contains symlinks ("
+                    + ", ".join(links[:5]) + "); nothing in it is read",
+                    "segments": [], "refused": "mailbox contains symlinks",
+                })
+                continue
+            if _mailbox_nested_git(loop_dir, root) or (
+                    loop_dir != root_dir and _mailbox_nested_git(root_dir, root)):
+                name = metrics.loop_name(root, root_dir)
+                loops.append({
+                    "name": name, "path": name, "mission": "", "title": "",
+                    "iteration": None, "max_iterations": None, "status": "unknown",
+                    "final_verdict": None, "last_activity": None, "verdict_mtime": None,
+                    "last_entry_summary": "refused: " + NESTED_GIT_REFUSAL,
+                    "segments": [], "refused": "mailbox contains a .git entry",
+                })
+                continue
             try:
                 card = self._loop_card(loop_dir, metrics, root)
                 if loop_dir != root_dir:
@@ -3042,16 +4323,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 driver = _live_driver_summary(metrics, root_dir)
                 if driver is not None:
                     card["live_driver"] = driver
+                card["diagnosis"] = _diagnosis_summary(root_dir)
                 loops.append(card)
             except Exception:
                 traceback.print_exc()
                 # Keep the board alive even if one loop's mailbox is broken.
-                detection = _running_detection(loop_dir)
-                sources = detection["sources"]
-                loops.append({
-                    "name": metrics.loop_name(root, loop_dir),
-                    "path": metrics.loop_name(root, loop_dir),
+                card = {
+                    "name": metrics.loop_name(root, root_dir),
+                    "path": metrics.loop_name(root, root_dir),
                     "mission": "",
+                    "title": "",
                     "iteration": None,
                     "max_iterations": None,
                     "status": "unknown",
@@ -3060,31 +4341,67 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "verdict_mtime": _verdict_mtime(loop_dir),
                     "last_entry_summary": "unreadable mailbox",
                     "segments": [],
-                    "driver_phase": None,
-                    "driver": None,
-                    "running": bool(sources),
-                    "running_sources": sources,
-                    "running_substate": detection["substate"],
-                })
+                }
+                card.update(_live_card_fields(loop_dir, root))
+                loops.append(card)
+        if only is not None:
+            for root_dir, card in zip(root_dirs, loops):
+                card["worktree_reasons"] = only.get(str(root_dir), [])
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):
+            if card.get("refused"):
+                continue
             try:
                 inbox.extend(_inbox_items(loop_dir, card, root))
             except Exception:
                 traceback.print_exc()
         order = {"high": 0, "medium": 1, "low": 2}
         inbox.sort(key=lambda i: (order[i["severity"]], i["loop"]))
-        self._send_json(200, {
+        return {
             "loops": loops,
             "inbox": inbox,
+            "broker": (getattr(_PROC_SNAPSHOT, "broker", None)
+                       or {}).get("status", "disabled"),
             "updated_at": _utc_iso(datetime.now(timezone.utc)),
+        }
+
+    # -- /api/overview -----------------------------------------------------
+
+    def _handle_overview(self) -> None:
+        self._send_json(200, self.server.overview(self._board_payload))
+
+    # -- /healthz ----------------------------------------------------------
+
+    def _handle_healthz(self) -> None:
+        server = self.server
+        self._send_json(200, {
+            "ok": True,
+            "uptime_seconds": round(time.monotonic() - server.started_at, 1),
+            "version": server.version,
+            "workspaces": len(server.get_workspace_seeds()),
+            "overview_age_seconds": server.overview_age(),
+            "broker": (server._overview or {}).get("broker"),
         })
 
     # -- /api/sessions -----------------------------------------------------
 
     def _session_list(self, loop_dir: Path, root: Path) -> list[dict]:
-        """Parents first (newest first), then subagents, for one loop."""
+        """Parents first (newest first), then subagents, for one loop.
+
+        Parents are omp sessions keyed by cwd plus the Omnigent session
+        exports in the mailbox's own ``.sessions/`` directory.
+        """
         sessions = []
+        loop_name = self.server.metrics.loop_name(root, loop_dir)
+        for path in _mailbox_session_files(loop_dir):
+            try:
+                session = _parse_mailbox_session_file(path, loop_name)
+            except OSError:
+                continue
+            session["kind"] = "parent"
+            session["parent_id"] = None
+            session["parent_path"] = None
+            sessions.append(session)
         for desc in _session_files_for_loop(loop_dir, root):
             try:
                 session = _parse_session_file(desc["path"])
@@ -3133,6 +4450,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         loop_dir = self._find_loop_dir(name, root)
         if loop_dir is None:
             return self._send_json(400, {"error": f"unknown loop: {name}"})
+        links = _mailbox_symlinks(loop_dir)
+        if links:
+            return self._send_json(403, {"error": "the mailbox contains symlinks ("
+                                         + ", ".join(links[:5]) + "); nothing in it is read",
+                                         "refused": True})
+        if _mailbox_nested_git(loop_dir, root):
+            return self._send_json(403, {"error": NESTED_GIT_REFUSAL, "refused": True})
         card = self._loop_card(loop_dir, self.server.metrics, root)
         card["name"] = card["path"] = name  # r16: a live copy keeps the root name
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
@@ -3184,7 +4508,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return None
 
     def _resolve_loop_root(self, payload: dict) -> Path | None:
-        """Resolve a loop-control root through the existing seed allowlist."""
+        """Resolve a loop-control root through the existing seed allowlist.
+
+        Controls never fall back to the default workspace: ``root`` is
+        required.
+        """
+        if not isinstance(payload.get("root"), str) or not payload["root"].strip():
+            self._send_json(400, {"error": "root is required"})
+            return None
         try:
             return self._resolve_root({"root": [payload.get("root")]})
         except PermissionError as exc:
@@ -3234,48 +4565,75 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if lock_pid is not None:
             return self._send_json(
                 409, {"error": f"loop is already running (pid {lock_pid})"})
+        detection = _running_detection(mailbox, root)
+        controls = _loop_controls(mailbox, root, detection, driver)
+        if not controls["start"]["enabled"]:
+            return self._send_json(
+                409, {"error": controls["start"]["reason"]})
+        entrypoint = _driver_entrypoints()[driver]
         if driver == "portable":
             command = [
-                "python3", "metrics/trio_loop.py", "run",
+                "python3", str(entrypoint), "run",
                 "--mailbox", str(mailbox),
                 "--max-iterations", str(max_iterations),
                 "--runner", "portable",
             ]
         else:
             command = [
-                "python3", "omnigent/trioctl", "omnigent", "loop",
+                "python3", str(entrypoint), "omnigent", "loop",
                 "--mailbox", str(mailbox),
                 "--max-iterations", str(max_iterations),
             ]
+        log_path = _launch_log_path(mailbox)
+        try:
+            log = open(log_path, "ab")
+        except OSError:
+            log = None
         try:
             process = subprocess.Popen(
                 command,
                 cwd=root,
                 start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                stdout=log if log is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log is not None
+                else subprocess.DEVNULL,
             )
-        except OSError:
+        except OSError as exc:
+            _record_action(mailbox, action="start", outcome="failed",
+                           message=f"could not start {driver} driver: {exc}")
             return self._send_json(500, {"error": "could not start loop"})
+        finally:
+            if log is not None:
+                log.close()
+        # Answer only once the driver has survived its startup: a driver
+        # that exits at once must not leave a sidecar that looks running.
+        try:
+            code = process.wait(timeout=LAUNCH_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            code = None
+        if code is not None:
+            tail = _log_tail(log_path)
+            message = f"{driver} driver exited during startup (code {code})"
+            _record_action(mailbox, action="start", outcome="failed",
+                           pid=process.pid, exit_code=code, message=message,
+                           log=str(log_path))
+            return self._send_json(502, {
+                "error": message, "log": str(log_path), "log_tail": tail})
         with _LOOP_PROCESSES_LOCK:
             _LOOP_PROCESSES[process.pid] = process
-        # Seed driver state before the child overwrites it so status
-        # is not 404 in the window between spawn and first loop tick.
-        (mailbox / ".driver.json").write_text(
-            json.dumps({
-                "pid": process.pid,
-                "iteration": 0,
-                "phase": "starting",
-                "session_ids": {},
-                "driver": driver,
-            })
-            + "\n",
-            encoding="utf-8",
-        )
+        _seed_driver_state(mailbox, process.pid, driver)
+        _record_action(mailbox, action="start", outcome="running",
+                       pid=process.pid, driver=driver, log=str(log_path),
+                       message=f"{driver} driver started (PID {process.pid})")
+        threading.Thread(
+            target=_reap_loop_process, args=(mailbox, process),
+            daemon=True).start()
         self._send_json(202, {
             "pid": process.pid,
             "driver": driver,
             "mailbox": str(mailbox),
+            "log": str(log_path),
         })
 
     def _handle_loop_stop(self) -> None:
@@ -3302,6 +4660,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "loop process is stale"})
         except PermissionError:
             return self._send_json(403, {"error": "cannot stop loop process"})
+        _record_action(mailbox, action="stop", outcome="stopping", pid=pid,
+                       message=f"SIGTERM sent to driver PID {pid}")
         with _LOOP_PROCESSES_LOCK:
             process = _LOOP_PROCESSES.pop(pid, None)
         if process is not None:
@@ -3309,6 +4669,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 process.wait(timeout=1)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        if not _pid_is_live(pid):
+            _record_action(mailbox, outcome="stopped",
+                           message=f"Driver PID {pid} stopped")
         self._send_json(200, {"stopped": True, "pid": pid})
 
     def _handle_loop_status(self, root: Path) -> None:
@@ -3328,6 +4691,272 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if driver_state["driver"] is not None:
             payload["driver"] = driver_state["driver"]
         self._send_json(200, payload)
+
+    # -- /api/loop actions: diagnose, fix, answer (dash-actions) -----------
+
+    def _who(self) -> dict:
+        """Who asked (tailnet identity headers from tailscale serve, else the
+        client address) for the action log."""
+        return {
+            "addr": self.client_address[0] if self.client_address else None,
+            "user": (self.headers.get("Tailscale-User-Login") or "").strip() or None,
+            "name": (self.headers.get("Tailscale-User-Name") or "").strip() or None,
+            "agent": (self.headers.get("User-Agent") or "")[:80] or None,
+        }
+
+    def _find_loop_pair(self, name, root: Path) -> tuple[Path, Path] | None:
+        metrics = self.server.metrics
+        if not isinstance(name, str):
+            return None
+        name = name.strip()
+        if (not name or name.startswith(("/", "\\"))
+                or ".." in name.replace("\\", "/").split("/")):
+            return None
+        return next(
+            ((p, read) for p, read in _live_loop_dirs(metrics, root)
+             if metrics.loop_name(root, p) == name), None)
+
+    def _loop_context(self, root: Path, name, pair=None):
+        """LoopContext of a loop, or None (unknown). Raises the module's
+        PathEscape for a mailbox that resolves outside the workspace."""
+        pair = pair or self._find_loop_pair(name, root)
+        if pair is None:
+            return None
+        root_dir, live = pair
+        driver_state = _driver_snapshot(live)
+        return load_loop_actions_module().LoopContext(
+            home=HOME, root=root, name=name, root_mailbox=root_dir,
+            live_mailbox=live, detection=_running_detection(live, root),
+            driver=driver_state["driver"] if driver_state else None,
+            last_action=_last_action(live),
+            registry=_native_registry_entry(live))
+
+    def _post_loop_target(self):
+        """(payload, root, name, pair) of a POST naming {root, loop}; sends
+        the error and returns None when it does not resolve. The context
+        itself is built later, under the loop's action lock."""
+        payload = self._read_loop_body()
+        if payload is None:
+            return None
+        root = self._resolve_loop_root(payload)
+        if root is None:
+            return None
+        name = payload.get("loop")
+        pair = self._find_loop_pair(name, root)
+        if pair is None:
+            self._send_json(404, {"error": "unknown loop"})
+            return None
+        return payload, root, name, pair
+
+    def _locked_context(self, root: Path, name, pair):
+        """Build the LoopContext (after the caller took the action lock), or
+        send 403 for a mailbox outside the workspace and return None."""
+        la = load_loop_actions_module()
+        try:
+            ctx = self._loop_context(root, name, pair)
+        except la.PathEscape as exc:
+            self._send_json(403, {"error": str(exc), "refused": True})
+            return None
+        if ctx is None:
+            self._send_json(404, {"error": "unknown loop"})
+        return ctx
+
+    def _handle_loop_actions(self, query: dict, root: Path) -> None:
+        name = (query.get("loop") or [None])[0]
+        la = load_loop_actions_module()
+        try:
+            ctx = self._loop_context(root, name)
+        except la.PathEscape as exc:
+            return self._send_json(403, {"error": str(exc), "refused": True})
+        if ctx is None:
+            return self._send_json(404, {"error": "unknown loop"})
+        diagnosis = _diagnoses().status(HOME, ctx.key)
+        proposed = ((diagnosis or {}).get("result") or {}).get("proposed_fix") or {}
+        if proposed:
+            # Agent-authored text is never shown as a command: only what the
+            # server itself plans (server_commands) is; the agent's own
+            # preview is kept apart, labelled, for the record (finding 10).
+            proposed["agent_commands_preview"] = proposed.pop("commands_preview", []) or []
+            proposed["server_commands"] = []
+        if proposed.get("id") in la.FIXES and not proposed.get("rejected"):
+            if proposed["id"] == "reconcile_apply":
+                proposed["server_check"] = "re-checked (dry run must be ready) on apply"
+            else:
+                try:
+                    plan = la.plan_fix(ctx, proposed["id"], proposed.get("args") or {})
+                    proposed["server_check"] = "applicable now"
+                    proposed["server_commands"] = plan["commands_preview"]
+                except la.FixRefused as exc:
+                    proposed["server_check"] = f"refused now: {exc}"
+        native = ctx.native or {}
+        self._send_json(200, {
+            "loop": ctx.name, "root": str(ctx.root),
+            "root_mailbox": str(ctx.root_mailbox),
+            "live_mailbox": str(ctx.live_mailbox), "driver": ctx.driver,
+            "live": ctx.live, "state": ctx.derived,
+            "native": {k: native.get(k) for k in (
+                "session_id", "run_id", "session_live", "lock", "result", "args", "errors")}
+            if native else None,
+            "native_launcher": str(la.native_launcher(HOME) or "") or None,
+            "native_script": la.native_script_view(ctx.native, ctx.registry, HOME, ctx.live_repo),
+            "fixes": la.available_fixes(ctx), "unblock": la.UNBLOCK_TABLE,
+            "never_automated": la.NEVER_AUTOMATED,
+            "answer": la.answer_context(ctx), "diagnosis": diagnosis,
+            "harnesses": la.harnesses(HOME),
+            "log": la.read_actions(HOME, ctx.key, 50),
+        })
+
+    def _handle_loop_diagnosis(self, query: dict, root: Path) -> None:
+        pair = self._find_loop_pair((query.get("loop") or [None])[0], root)
+        if pair is None:
+            return self._send_json(404, {"error": "unknown loop"})
+        la = load_loop_actions_module()
+        self._send_json(200, {"diagnosis": _diagnoses().status(
+            HOME, la.loop_key(pair[0]))})
+
+    def _handle_loop_diagnose(self) -> None:
+        target = self._post_loop_target()
+        if target is None:
+            return
+        payload, root, name, pair = target
+        ctx = self._locked_context(root, name, pair)
+        if ctx is None:
+            return
+        la = load_loop_actions_module()
+        harness = payload.get("harness") or la.harnesses(HOME)["default"]
+        accept = payload.get("accept_exposure") is True
+        try:
+            record = _diagnoses().start(ctx, harness, self._who(), accept_exposure=accept)
+        except la.DiagnosisBusy as exc:
+            return self._send_json(429, {"error": str(exc)})
+        except la.CursorExposure as exc:
+            return self._send_json(409, {"error": "Cursor needs accept_exposure: true",
+                                         "accept_exposure_required": True,
+                                         "warning": str(exc)})
+        except la.FixRefused as exc:
+            return self._send_json(409, {"error": str(exc)})
+        self._send_json(202, {"diagnosis": record})
+
+    def _handle_loop_fix(self) -> None:
+        target = self._post_loop_target()
+        if target is None:
+            return
+        payload, root, name, pair = target
+        la = load_loop_actions_module()
+        key = la.loop_key(pair[0])
+        fix_id = payload.get("fix")
+        args = payload.get("args") or {}
+        if not isinstance(fix_id, str) or fix_id not in la.FIXES:
+            la.log_action(HOME, key, {"action": "fix-refused", "fix": str(fix_id)[:80],
+                                      "who": self._who(), "reason": "unknown fix id"})
+            return self._send_json(400, {"error": "unknown fix id",
+                                         "allowlist": sorted(la.FIXES)})
+        if not isinstance(args, dict):
+            return self._send_json(400, {"error": "args must be an object"})
+        token = payload.get("confirm_token")
+        lock = _action_lock(key)
+        if not lock.acquire(blocking=False):
+            return self._send_json(409, {"error": "another action on this loop is in progress"})
+        try:
+            # The context is gathered only now, under the lock (finding 3).
+            ctx = self._locked_context(root, name, pair)
+            if ctx is None:
+                return
+            try:
+                plan = la.plan_fix(ctx, fix_id, args)
+            except la.FixRefused as exc:
+                la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": fix_id,
+                                              "who": self._who(), "reason": str(exc)})
+                return self._send_json(409, {"error": str(exc), "refused": True})
+            preview = {k: plan[k] for k in ("id", "title", "destructive", "commands_preview",
+                                            "notes", "confirm_token", "basis")}
+            if plan["requires_confirm"]:
+                if payload.get("confirm") is not True or not isinstance(token, str):
+                    return self._send_json(409, {"confirm_required": True, "plan": preview,
+                                                 "error": "confirm required: review the commands "
+                                                          "and confirm with their confirm_token"})
+                if token != plan["confirm_token"]:
+                    la.log_action(HOME, ctx.key, {"action": "fix-refused", "fix": fix_id,
+                                                  "who": self._who(),
+                                                  "reason": "confirm token does not match the "
+                                                            "current plan (state changed)"})
+                    return self._send_json(409, {
+                        "confirm_required": True, "plan_changed": True, "plan": preview,
+                        "error": "the plan changed since the preview (commands or loop state); "
+                                 "review the new commands"})
+            plan["confirmed"] = payload.get("confirm") is True
+            live_mailbox = ctx.live_mailbox
+
+            def on_exit(pid: int, code: int) -> None:
+                _record_action(live_mailbox, outcome="finished" if code == 0 else "exited",
+                               exit_code=code, message=f"{fix_id}: PID {pid} exited (code {code})")
+
+            result = la.execute_plan(ctx, plan, who=self._who(), processes=_LOOP_PROCESSES,
+                                     on_exit=on_exit)
+        finally:
+            lock.release()
+        detached = [r for r in result["results"] if r.get("detached")]
+        _record_action(ctx.live_mailbox, action="fix",
+                       outcome=("failed" if not result["ok"] else
+                                "running" if detached else "finished"),
+                       pid=detached[-1]["pid"] if detached else None,
+                       message=f"{fix_id}: " + ("failed" if not result["ok"] else
+                                                f"started (PID {detached[-1]['pid']})" if detached
+                                                else "done"))
+        self._send_json(200 if result["ok"] else 502, {"plan": preview, **result})
+
+    def _handle_loop_answer(self) -> None:
+        target = self._post_loop_target()
+        if target is None:
+            return
+        payload, root, name, pair = target
+        la = load_loop_actions_module()
+        reset = payload.get("reset", True)
+        if not isinstance(reset, bool):
+            return self._send_json(400, {"error": "reset must be a boolean"})
+        answer = payload.get("answer")
+        if isinstance(answer, str):
+            try:
+                answer.encode("utf-8")
+            except UnicodeEncodeError:
+                # a lone UTF-16 surrogate (eval4 finding 5): a clean 400
+                return self._send_json(400, {"error": "the answer is not valid Unicode text "
+                                                      "(it contains a lone surrogate)"})
+        token = payload.get("confirm_token")
+        lock = _action_lock(la.loop_key(pair[0]))
+        if not lock.acquire(blocking=False):
+            return self._send_json(409, {"error": "another action on this loop is in progress"})
+        try:
+            ctx = self._locked_context(root, name, pair)
+            if ctx is None:
+                return
+            try:
+                plan = la.plan_answer(ctx, payload.get("answer"), reset, self._who())
+            except la.FixRefused as exc:
+                return self._send_json(409, {"error": str(exc), "refused": True})
+            preview = {k: plan[k] for k in ("answer_id", "entry", "commands_preview", "reset",
+                                            "destructive", "confirm_token", "basis")}
+            if payload.get("confirm") is not True or not isinstance(token, str):
+                return self._send_json(409, {"confirm_required": True, "plan": preview,
+                                             "error": "confirm required: review the changes "
+                                                      "and confirm with their confirm_token"})
+            if token != plan["confirm_token"]:
+                return self._send_json(409, {
+                    "confirm_required": True, "plan_changed": True, "plan": preview,
+                    "error": "the loop changed since the preview; review the new changes"})
+            result = la.execute_answer(ctx, plan, self._who())
+        finally:
+            lock.release()
+        try:
+            fresh = self._loop_context(ctx.root, ctx.name)
+        except la.PathEscape:
+            fresh = None
+        restart = []
+        if fresh is not None:
+            restart = [f for f in la.available_fixes(fresh)
+                       if f["applicable"] and f["id"] in ("rerun", "native_start")]
+        self._send_json(200 if result["ok"] else 500,
+                        {"plan": preview, **result, "restart": restart})
 
     # -- /api/transcript (SSE) ---------------------------------------------
 
@@ -3359,9 +4988,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
 
-    def _validate_transcript_params(self, query: dict) -> tuple[int, Path]:
+    def _is_mailbox_session(self, target: Path, root: Path) -> bool:
+        """True when `target` sits in ``.sessions/`` of one of root's loops."""
+        if target.suffix != ".jsonl" or target.parent.name != MAILBOX_SESSIONS_DIR:
+            return False
+        loop_dir = target.parent.parent
+        try:
+            loops = [p for pair in _live_loop_dirs(self.server.metrics, root)
+                     for p in pair]
+        except Exception:
+            return False
+        for candidate in loops:
+            try:
+                if Path(candidate).resolve() == loop_dir:
+                    return target in {
+                        p.resolve() for p in _mailbox_session_files(candidate)}
+            except OSError:
+                continue
+        return False
+
+    def _validate_transcript_params(self, query: dict,
+                                    root: Path | None = None) -> tuple[int, Path]:
         """Validate `path`/`offset` for the transcript endpoint.
 
+        The path must resolve under the omp sessions root or be a session
+        export inside a loop mailbox of the request's workspace root.
         Raises ValueError with a client-safe message when invalid.
         """
         offset = 0
@@ -3383,7 +5034,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             target.relative_to(SESSIONS_ROOT.resolve())
         except ValueError:
-            raise ValueError("invalid session path")
+            if root is None or not self._is_mailbox_session(target, root):
+                raise ValueError("invalid session path")
         if not target.is_file():
             raise ValueError("session file not found")
         return offset, target
@@ -3453,9 +5105,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     next_heartbeat = now + HEARTBEAT_SECONDS
                 time.sleep(POLL_SECONDS)
 
-    def _handle_transcript(self, query: dict) -> None:
+    def _handle_transcript(self, query: dict, root: Path | None = None) -> None:
         try:
-            offset, target = self._validate_transcript_params(query)
+            offset, target = self._validate_transcript_params(query, root)
         except ValueError as exc:
             return self._sse_error({"error": str(exc)})
         except Exception:
@@ -3477,14 +5129,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # -- dispatch ----------------------------------------------------------
 
     def do_GET(self) -> None:
+        if not self._request_allowed(mutating=False):
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
         if path in STATIC_ROUTES:
             name, ctype = STATIC_ROUTES[path]
             return self._serve_static(name, ctype)
+        if path == "/healthz":
+            return self._api(self._handle_healthz)
         if path == "/api/workspaces":
             return self._api(self._handle_workspaces)
+        if path == "/api/overview":
+            return self._api(self._handle_overview)
         if path == "/api/registry":
             root = self._request_root(query)
             if root is None:
@@ -3566,20 +5224,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if root is None:
                 return
             return self._api(lambda: self._handle_loop_detail(query, root))
+        if path in ("/api/loop/actions", "/api/loop/diagnosis"):
+            root = self._request_root(query)
+            if root is None:
+                return
+            if path == "/api/loop/actions":
+                return self._api(lambda: self._handle_loop_actions(query, root))
+            return self._api(lambda: self._handle_loop_diagnosis(query, root))
         if path == "/api/sessions":
             root = self._request_root(query)
             if root is None:
                 return
             return self._api(lambda: self._handle_sessions(query, root))
         if path == "/api/transcript":
-            if self._request_root(query) is None:
+            root = self._request_root(query)
+            if root is None:
                 return
-            return self._handle_transcript(query)
+            return self._handle_transcript(query, root)
         if path.startswith("/api/"):
             return self._send_json(404, {"error": "not found"})
         return self._send_text(404, "not found")
 
     def do_PUT(self) -> None:
+        if not self._request_allowed(mutating=True):
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/registry/file":
             query = parse_qs(parsed.query)
@@ -3592,6 +5260,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if not self._request_allowed(mutating=True):
+            return
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
@@ -3618,9 +5288,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(self._handle_loop_start)
         if path == "/api/loop/stop":
             return self._api(self._handle_loop_stop)
+        if path == "/api/loop/diagnose":
+            return self._api(self._handle_loop_diagnose)
+        if path == "/api/loop/fix":
+            return self._api(self._handle_loop_fix)
+        if path == "/api/loop/answer":
+            return self._api(self._handle_loop_answer)
         self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
+        if not self._request_allowed(mutating=True):
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/registry/file":
             query = parse_qs(parsed.query)
@@ -3632,6 +5310,702 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             return self._api(lambda: self._handle_agent_delete(query))
         self._send_json(404, {"error": "not found"})
+
+
+def _workspace_scan_roots() -> list[Path]:
+    """Directories below which workspaces are auto-discovered.
+
+    ``TRIO_DASH_SCAN_ROOTS`` (``os.pathsep``-separated) replaces the default
+    list, so a long-running service can cover e.g. ``~/personal``; see
+    ``_discover_workspaces`` for the bounded walk.
+    """
+    configured = os.environ.get("TRIO_DASH_SCAN_ROOTS", "").strip()
+    if configured:
+        return [
+            Path(value).expanduser()
+            for value in configured.split(os.pathsep) if value.strip()
+        ]
+    return [
+        HOME / "pruebas",
+        HOME / "Projects",
+        HOME / "projects",
+        HOME / "dev",
+        HOME / "src",
+        HOME / "code",
+        HOME / "repos",
+        HOME / "work",
+    ]
+
+
+SCAN_SKIP_NAMES = {
+    "node_modules", "venv", "__pycache__", "site-packages", "dist", "build",
+    "target", "vendor", "coverage", "tmp", "cache",
+}
+"""Directory names never descended into while discovering workspaces."""
+
+SCAN_DIR_BUDGET = 4000
+"""Most directories listed per scan root per discovery pass."""
+
+
+def _scan_depth() -> int:
+    try:
+        return max(1, min(6, int(os.environ.get("TRIO_DASH_SCAN_DEPTH", "3"))))
+    except ValueError:
+        return 3
+
+
+def _has_loop_mailbox(path: Path) -> bool:
+    try:
+        with os.scandir(path) as entries:
+            return any(
+                entry.name.startswith("loop") and entry.is_dir()
+                for entry in entries
+            )
+    except OSError:
+        return False
+
+
+def _discover_workspaces(scan_root: Path) -> list[Path]:
+    """Workspaces (not linked worktrees) below one scan root."""
+    return _scan_root_walk(scan_root)[0]
+
+
+def _discover_worktrees(scan_root: Path) -> list[Path]:
+    """Linked git worktrees below one scan root (same bounded walk)."""
+    return _scan_root_walk(scan_root)[1]
+
+
+_SCAN_WALK_CACHE: dict[str, tuple[float, tuple]] = {}
+
+
+def _scan_root_walk(scan_root: Path) -> tuple[list[Path], list[Path]]:
+    """Workspaces and linked worktrees below one scan root, bounded.
+
+    Direct children are always workspaces (the registry pages use them).
+    Deeper directories, down to ``TRIO_DASH_SCAN_DEPTH`` levels, count only
+    when they hold a ``loop*`` directory. A linked git worktree (``.git`` is
+    a file) is returned separately and never entered: its mailboxes are
+    mostly committed copies of the main checkout's, and
+    ``_worktree_mailboxes`` picks the ones that matter. Dot-dirs,
+    dependency/build dirs and loop mailboxes themselves are never entered,
+    the walk lists at most ``SCAN_DIR_BUDGET`` directories, and HOME or
+    ``/`` are refused as scan roots so secrets and caches are never walked.
+    """
+    try:
+        root = scan_root.expanduser().resolve()
+    except OSError:
+        return [], []
+    if root in (HOME.resolve(), Path("/")) or not root.is_dir():
+        if root in (HOME.resolve(), Path("/")):
+            print(f"note: refusing to scan {root} for workspaces; list its "
+                  "project directories in TRIO_DASH_SCAN_ROOTS instead",
+                  file=sys.stderr)
+        return [], []
+    found: list[Path] = []
+    worktrees: list[Path] = []
+    depth_limit = _scan_depth()
+    budget = SCAN_DIR_BUDGET
+    frontier = [(root, 0)]
+    while frontier and budget > 0:
+        directory, depth = frontier.pop(0)
+        budget -= 1
+        try:
+            children = sorted(
+                entry.path for entry in os.scandir(directory)
+                if entry.is_dir(follow_symlinks=False)
+                and not entry.name.startswith(".")
+                and not entry.name.startswith("loop")
+                and entry.name not in SCAN_SKIP_NAMES
+            )
+        except OSError:
+            continue
+        for child_text in children:
+            child = Path(child_text)
+            if (child / ".git").is_file():
+                if _has_loop_mailbox(child):
+                    worktrees.append(child)
+                continue
+            if depth == 0 or _has_loop_mailbox(child):
+                found.append(child)
+            if depth + 1 < depth_limit:
+                frontier.append((child, depth + 1))
+    return found, worktrees
+
+
+# -- linked worktrees -------------------------------------------------------
+
+WORKTREE_GIT_SECONDS = 90.0
+"""Longest reuse (jittered up to +50%) of a worktree's ``git status``
+labels while its index and HEAD reflog are unchanged; an ordinary edit of a
+tracked mailbox file shows up within this bound."""
+
+WORKTREE_REFS_SECONDS = 300.0
+"""Longest reuse of a worktree's ancestry evidence with unchanged refs."""
+
+_WORKTREE_GIT_CACHE: dict[str, tuple] = {}
+_WORKTREE_GIT_LOCK = threading.Lock()
+
+
+def _worktree_gitdir(worktree: Path) -> Path | None:
+    try:
+        text = (worktree / ".git").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    value = text[len("gitdir:"):].strip()
+    gitdir = Path(value) if os.path.isabs(value) else worktree / value
+    try:
+        return gitdir.resolve()
+    except OSError:
+        return None
+
+
+def _worktree_main(worktree: Path) -> Path | None:
+    """The main checkout a linked worktree belongs to, if it has one."""
+    gitdir = _worktree_gitdir(worktree)
+    if gitdir is None:
+        return None
+    try:
+        common = (gitdir / (gitdir / "commondir").read_text(
+            encoding="utf-8").strip()).resolve()
+    except OSError:
+        return None
+    if common.name != ".git":
+        return None  # bare repository: no main checkout to compare with
+    return common.parent
+
+
+_RUNTIME_FILES = {".driver.json", ".session.json", ".lock", ".repairs",
+                  ".driver.json.dashboard-tmp"}
+"""Runtime files a running loop writes that are not mailbox content."""
+
+
+def _worktree_git_labels(worktree: Path, mailboxes: list[Path]) -> dict:
+    """``git status`` of a worktree's mailboxes: ``untracked``/``modified``,
+    plus ``runtime`` for untracked or ignored sidecars/locks.
+
+    One ``git status --porcelain -uall --ignored=matching -- <mailboxes>``
+    per worktree (``--no-optional-locks``: never rewrites the index), reused
+    while the worktree's index and HEAD reflog are unchanged and for at most
+    a jittered ``WORKTREE_GIT_SECONDS`` (edits that touch neither show up
+    within that bound; liveness is checked every build).
+    """
+    gitdir = _worktree_gitdir(worktree)
+    stamps = []
+    for rel in ("index", "logs/HEAD"):
+        try:
+            stamps.append((gitdir / rel).stat().st_mtime_ns if gitdir else None)
+        except OSError:
+            stamps.append(None)
+    fingerprint = (tuple(stamps), tuple(str(m) for m in mailboxes))
+    key = str(worktree)
+    now = time.monotonic()
+    with _WORKTREE_GIT_LOCK:
+        hit = _WORKTREE_GIT_CACHE.get(key)
+        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
+                WORKTREE_GIT_SECONDS, key):
+            return dict(hit[2])
+    rels = [str(m.relative_to(worktree)) for m in mailboxes]
+    labels: dict[str, set] = {str(m): set() for m in mailboxes}
+    lines: list[str] = []
+    if rels:
+        try:
+            result = subprocess.run(
+                ["git", "--no-optional-locks", *SAFE_GIT_CONFIG, "-C", str(worktree), "status",
+                 "--porcelain", "-uall", "--ignored=matching", "--", *rels],
+                capture_output=True, text=True, timeout=10, check=False)
+            if result.returncode == 0:
+                lines = result.stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            lines = []
+    # Deepest mailbox first, so a child's file never labels its container.
+    ordered = sorted(mailboxes, key=lambda m: len(m.parts), reverse=True)
+    for line in lines:
+        code, path = line[:2], line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        target = worktree / path.rstrip("/")
+        runtime = bool(
+            {part for part in target.parts[-2:]} & _RUNTIME_FILES)
+        if code == "!!" and not runtime:
+            continue  # other ignored files are not loop activity
+        for mailbox in ordered:
+            if target == mailbox or mailbox in target.parents:
+                if runtime and code in ("??", "!!"):
+                    # Git never creates untracked/ignored runtime files:
+                    # a loop ran in this worktree.
+                    labels[str(mailbox)].add("runtime")
+                else:
+                    labels[str(mailbox)].add(
+                        "untracked" if code == "??" else "modified")
+                break
+    value = {k: sorted(v) for k, v in labels.items()}
+    with _WORKTREE_GIT_LOCK:
+        _WORKTREE_GIT_CACHE[key] = (fingerprint, now, value)
+    return dict(value)
+
+
+DISCOVER_CACHE_SECONDS = 60.0
+_DISCOVER_CACHE: dict[str, tuple] = {}
+_DISCOVER_LOCK = threading.Lock()
+
+
+def _loop_dirs_fingerprint(root: Path) -> tuple:
+    """mtimes of the root and its ``loop*`` dirs: they change when a mailbox
+    directory is created or removed at either level."""
+    stamps = []
+    try:
+        stamps.append(root.stat().st_mtime_ns)
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name.startswith("loop") and entry.is_dir():
+                    stamps.append((entry.name, entry.stat().st_mtime_ns))
+    except OSError:
+        pass
+    return tuple(sorted(stamps, key=str))
+
+
+def _discover_loops_cached(root: Path) -> list[Path]:
+    """``discover_loops(root)``, reused while the loop dirs are unchanged
+    (and for at most a jittered ``DISCOVER_CACHE_SECONDS``, which covers a
+    directory that becomes a mailbox by gaining its first GOAL.md)."""
+    key = str(root)
+    fingerprint = _loop_dirs_fingerprint(root)
+    now = time.monotonic()
+    with _DISCOVER_LOCK:
+        hit = _DISCOVER_CACHE.get(key)
+        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
+                DISCOVER_CACHE_SECONDS, key):
+            return list(hit[2])
+    loops = list(load_metrics_module().discover_loops(root))
+    with _DISCOVER_LOCK:
+        _DISCOVER_CACHE[key] = (fingerprint, now, loops)
+    return list(loops)
+
+
+def _git_out(cwd: Path, *args: str) -> str | None:
+    """stdout of a read-only git command, or None on any failure."""
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", *SAFE_GIT_CONFIG, "-C", str(cwd), *args],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _common_gitdir(worktree: Path) -> Path | None:
+    gitdir = _worktree_gitdir(worktree)
+    if gitdir is None:
+        return None
+    try:
+        return (gitdir / (gitdir / "commondir").read_text(
+            encoding="utf-8").strip()).resolve()
+    except OSError:
+        return None
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+
+
+def _resolve_ref(common: Path, gitdir: Path, ref: str, depth: int = 0) -> str | None:
+    """Resolve ``HEAD`` or ``refs/...`` by reading ref files and
+    packed-refs; None when that needs git itself (then callers ask git)."""
+    if depth > 4:
+        return None
+    if ref == "HEAD":
+        try:
+            text = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if _SHA_RE.match(text):
+            return text
+        if not text.startswith("ref:"):
+            return None
+        return _resolve_ref(common, gitdir, text[4:].strip(), depth + 1)
+    for base in (gitdir, common):
+        try:
+            text = (base / ref).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if _SHA_RE.match(text):
+            return text
+        if text.startswith("ref:"):
+            return _resolve_ref(common, gitdir, text[4:].strip(), depth + 1)
+    try:
+        with open(common / "packed-refs", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref and _SHA_RE.match(parts[0]):
+                    return parts[0]
+    except OSError:
+        pass
+    return None
+
+
+def _worktree_heads(worktree: Path) -> tuple[str | None, str | None, str]:
+    """(worktree HEAD, base tip, base description) as commit ids.
+
+    The base tip is the main checkout's HEAD; for a worktree of a bare
+    repository (no main checkout) it is ``main``/``master``/``origin/HEAD``.
+    Ref files are read directly; git is asked only when that fails.
+    """
+    gitdir = _worktree_gitdir(worktree)
+    common = _common_gitdir(worktree)
+    head = tip = None
+    description = "no main checkout or main/master branch"
+    if gitdir is not None and common is not None:
+        head = _resolve_ref(common, gitdir, "HEAD")
+        main = _worktree_main(worktree)
+        if main is not None:
+            tip = _resolve_ref(common, common, "HEAD")
+            try:
+                branch = (common / "HEAD").read_text(encoding="utf-8").strip()
+            except OSError:
+                branch = ""
+            branch = branch[len("ref: refs/heads/"):] if branch.startswith(
+                "ref: refs/heads/") else "detached"
+            description = f"{main.name} HEAD ({branch})"
+            if tip is None:
+                tip = (_git_out(main, "rev-parse", "--verify", "-q", "HEAD")
+                       or "").strip() or None
+        else:
+            for ref in ("refs/heads/main", "refs/heads/master",
+                        "refs/remotes/origin/HEAD"):
+                tip = _resolve_ref(common, common, ref) or (
+                    _git_out(worktree, "rev-parse", "--verify", "-q", ref)
+                    or "").strip() or None
+                if tip:
+                    description = ref
+                    break
+    if head is None:
+        head = (_git_out(worktree, "rev-parse", "--verify", "-q", "HEAD")
+                or "").strip() or None
+    return head, tip, description
+
+
+def _deepest_mailbox(target: Path, ordered: list[Path]) -> Path | None:
+    for mailbox in ordered:
+        if target == mailbox or mailbox in target.parents:
+            return mailbox
+    return None
+
+
+_WORKTREE_REFS_CACHE: dict[str, tuple] = {}
+_WORKTREE_REFS_LOCK = threading.Lock()
+
+
+def _worktree_ancestry(worktree: Path, mailboxes: list[Path]) -> dict:
+    """Ancestry evidence for a worktree's mailboxes, from git objects only
+    (never file mtimes, so merges, rebases, resets, stashes and touched
+    files cannot move it).
+
+    With ``mb = merge-base(HEAD, base tip)``: a mailbox's own files are
+    those added, modified or deleted between ``mb`` and HEAD; they still
+    belong to the branch when the base tip does not already have the same
+    content at that path. ``changed`` maps such mailboxes to
+    ``changed``/``deleted``; ``new`` lists those among them absent from
+    the ``mb`` tree. Cached on (HEAD, tip) commit ids, so a commit
+    elsewhere in the repository does not recompute every worktree.
+    """
+    head, tip, description = _worktree_heads(worktree)
+    fingerprint = (head, tip, tuple(str(m) for m in mailboxes))
+    key = str(worktree)
+    now = time.monotonic()
+    with _WORKTREE_REFS_LOCK:
+        hit = _WORKTREE_REFS_CACHE.get(key)
+        if hit and hit[0] == fingerprint and now - hit[1] <= _jittered(
+                WORKTREE_REFS_SECONDS, key):
+            return copy.deepcopy(hit[2])
+    rels = [str(m.relative_to(worktree)) for m in mailboxes]
+    ordered = sorted(mailboxes, key=lambda m: len(m.parts), reverse=True)
+    merge_base = None
+    if tip and head:
+        merge_base = (_git_out(worktree, "merge-base", head, tip)
+                      or "").strip() or None
+        if merge_base is None:
+            description += "; no common history"
+    result = {"base": description, "merge_base": merge_base,
+              "changed": {}, "new": []}
+    if merge_base and rels and merge_base != head:
+        own = _git_out(worktree, "diff", "--name-status", "--no-renames",
+                       merge_base, head, "--", *rels)
+        own_files: dict[str, str] = {}
+        for line in (own or "").splitlines():
+            status, _, path = line.partition("\t")
+            if path:
+                own_files[path] = "deleted" if status.startswith("D") else "changed"
+        if own_files:
+            touched = sorted({
+                str(m.relative_to(worktree)) for m in
+                (_deepest_mailbox(worktree / f, ordered) for f in own_files)
+                if m is not None})
+            differs = set((_git_out(worktree, "diff", "--name-only", tip,
+                                    head, "--", *touched) or "").splitlines())
+            for path, kind in own_files.items():
+                if path not in differs:
+                    continue  # the base tip already has this exact content
+                mailbox = _deepest_mailbox(worktree / path, ordered)
+                if mailbox is not None:
+                    kinds = result["changed"].setdefault(str(mailbox), [])
+                    if kind not in kinds:
+                        kinds.append(kind)
+            if result["changed"]:
+                present = _git_out(
+                    worktree, "ls-tree", "-d", "--name-only", merge_base,
+                    "--", *[str(Path(k).relative_to(worktree))
+                            for k in result["changed"]])
+                at_base = {str(worktree / line)
+                           for line in (present or "").splitlines()}
+                result["new"] = [k for k in result["changed"]
+                                 if k not in at_base]
+    with _WORKTREE_REFS_LOCK:
+        _WORKTREE_REFS_CACHE[key] = (fingerprint, now, copy.deepcopy(result))
+    return result
+
+
+_ACTIONABLE_STATUS = (_RUNNING_STATUS_WORDS | _HUMAN_STATUS_WORDS
+                      | {"blocked"})
+
+
+def _mailbox_actionable(mailbox: Path) -> bool:
+    """STATE.md or VERDICT.md says the loop is running or needs a person."""
+    try:
+        state = _read_mailbox_text(mailbox / "STATE.md")
+        m = re.search(r"(?im)^status:\s*([\w-]+)", state)
+        if m and m.group(1).strip().lower() in _ACTIONABLE_STATUS:
+            return True
+    except OSError:
+        pass
+    try:
+        head = _read_mailbox_text(mailbox / "VERDICT.md")[:200].upper()
+        return "NEEDS_HUMAN" in head or "BLOCKED" in head
+    except OSError:
+        return False
+
+
+def _worktree_static_selection(worktree: Path) -> tuple[list[Path], dict]:
+    """(all mailboxes, {path: reasons}) from git evidence.
+
+    Reasons: ``new on branch`` (absent from the merge-base tree, with
+    content the base tip does not have), ``committed on branch`` /
+    ``deleted on branch`` (own changes since the merge-base the base tip
+    does not already have), ``modified`` / ``untracked`` (git status), ``runtime
+    files present`` (untracked or ignored sidecars/locks, counted when the
+    mailbox has other evidence or STATE/VERDICT says running or needs a
+    person; a finished loop's leftovers are not pending work). Without a merge-base (no main checkout or
+    branch, unrelated histories) nothing can be called inherited, so
+    mailboxes whose STATE/VERDICT is running or needs a person are shown
+    with ``no common base (…)`` instead of being hidden.
+    """
+    try:
+        mailboxes = _discover_loops_cached(worktree)
+    except OSError:
+        mailboxes = []
+    ancestry = _worktree_ancestry(worktree, mailboxes)
+    labels = _worktree_git_labels(worktree, mailboxes)
+    new = set(ancestry["new"])
+    reasons: dict[str, list[str]] = {}
+    for mailbox in mailboxes:
+        key = str(mailbox)
+        found = []
+        if key in new:
+            found.append("new on branch")
+        else:
+            for kind in sorted(ancestry["changed"].get(key, [])):
+                found.append("deleted on branch" if kind == "deleted"
+                             else "committed on branch")
+        tags = labels.get(key) or []
+        found.extend(t for t in tags if t != "runtime")
+        # Leftover sidecars prove a loop ran here, not that it is pending:
+        # they count for loops that still say running / need a person.
+        if "runtime" in tags and (found or _mailbox_actionable(mailbox)):
+            found.append("runtime files present")
+        if ancestry["merge_base"] is None and _mailbox_actionable(mailbox):
+            found.append(f"no common base ({ancestry['base']})")
+        if found:
+            reasons[key] = found
+    return mailboxes, reasons
+
+
+def _worktree_live_candidates(worktree: Path, mailboxes: list[Path],
+                              listing: dict) -> list[Path]:
+    """Mailboxes some live argv path or broker session points at.
+
+    Uses the snapshot's sorted argv path index (one binary search per
+    worktree) and the broker listing; no per-mailbox file access.
+    """
+    base = str(worktree)
+    paths = getattr(_PROC_SNAPSHOT, "paths", None)
+    named = []
+    if paths:
+        start = bisect.bisect_left(paths, base + os.sep)
+        for path in paths[start:]:
+            if not path.startswith(base + os.sep):
+                break
+            named.append(path)
+    sessions = [
+        s for s in listing.get("running", [])
+        if s.get("workspace") and s.get("title", "").startswith("trioctl ")
+    ]
+    out = []
+    for mailbox in mailboxes:
+        text = str(mailbox)
+        if any(p == text or p.startswith(text + os.sep) for p in named):
+            out.append(mailbox)
+            continue
+        prefix = f"trioctl {mailbox.name} "
+        if any(s["title"].startswith(prefix) for s in sessions):
+            out.append(mailbox)
+    return out
+
+
+def _worktree_mailboxes(worktree: Path, listing: dict) -> dict[str, list[str]]:
+    """Mailboxes of a linked worktree worth showing, with the reasons.
+
+    A committed copy the worktree only inherited is left out. A mailbox is
+    shown when any of these holds:
+
+    * ``new on branch`` / ``committed on branch`` / ``deleted on branch``
+      — git ancestry: absent from ``merge-base(HEAD, base tip)``, or files
+      changed since it that the base tip does not already have;
+    * ``untracked`` / ``modified`` — ``git status`` reports uncommitted
+      files in it;
+    * ``runtime files present`` — untracked or ignored sidecars/locks
+      exist, which git never creates, so a loop ran here; shown alone only
+      while STATE/VERDICT says running or needs a person; tracked sidecars
+      (some repos commit them) do not count;
+    * ``no common base (…)`` — no merge-base could be found, and STATE or
+      VERDICT says running / needs a person;
+    * ``live`` — a live argv path, a broker session whose workspace is this
+      worktree, or a live sidecar; checked on every build.
+    """
+    mailboxes, reasons = _worktree_static_selection(worktree)
+    for mailbox in _worktree_live_candidates(worktree, mailboxes, listing):
+        if _running_detection(mailbox, worktree)["sources"]:
+            reasons.setdefault(str(mailbox), []).append("live")
+    # A mailbox already shown for its files also gets its sidecar checked.
+    for key in list(reasons):
+        if "live" in reasons[key]:
+            continue
+        mailbox = Path(key)
+        if any((mailbox / n).exists()
+               for n in (".driver.json", ".session.json", ".lock")):
+            if _running_detection(mailbox, worktree)["sources"]:
+                reasons[key].append("live")
+    return reasons
+
+
+_INTERPRETERS = {"python", "python3", "node", "bun", "deno", "uv", "uvx",
+                 "bash", "sh", "env"}
+
+
+def _command_words(args: list[str]) -> list[str]:
+    """argv with interpreter prefixes (``python3 -I x``, ``env``, ``node``)
+    stripped, program names reduced to their basename."""
+    words = list(args)
+    while words:
+        name = os.path.basename(words[0])
+        base = re.sub(r"[\d.]+$", "", name)  # python3.12 -> python
+        if base in _INTERPRETERS or name in _INTERPRETERS:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
+            continue
+        break
+    if words:
+        words[0] = os.path.basename(words[0])
+    return words
+
+
+def _is_loop_worker(args: list[str]) -> bool:
+    """A process positively shaped like loop work.
+
+    Trio drivers and role runners (``trioctl … run|loop``, ``trio_loop.py``,
+    ``portable/driver.sh``) and headless harness runs (``claude -p/--print``,
+    ``codex exec``, ``cursor-agent -p/--print``, ``opencode run``,
+    ``omp -p``). Interactive sessions, MCP servers and anything unknown are
+    not workers, so they never mask a stopped loop.
+    """
+    words = _command_words(args)
+    if not words:
+        return False
+    if any(w.endswith("portable/driver.sh") for w in args[:3]):
+        return True
+    program, rest = words[0], words[1:]
+    if "mcp" in program.lower() or any(
+            w in ("mcp", "mcp-server", "serve-mcp") for w in rest[:2]):
+        return False
+    if program in ("trio_loop.py",):
+        return True
+    if program == "trioctl":
+        return any(w in ("run", "loop") for w in rest[:3])
+    if program == "claude":
+        return "-p" in rest or "--print" in rest
+    if program == "codex":
+        return "exec" in rest  # options such as -c k=v may precede it
+    if program in ("cursor-agent", "agent"):
+        return "-p" in rest or "--print" in rest
+    if program == "opencode":
+        return "run" in rest
+    if program == "omp":
+        return "-p" in rest or "--print" in rest
+    return False
+
+
+def _workspace_worker_count(root: Path, processes=None) -> int:
+    """Live loop-worker processes (``_is_loop_worker``) whose cwd is inside
+    ``root``."""
+    if processes is None:
+        processes = getattr(_PROC_SNAPSHOT, "processes", None)
+        if processes is None:
+            processes = _live_processes() or []
+
+    def compute() -> int:
+        try:
+            base = str(root.resolve())
+        except OSError:
+            return 0
+        return sum(
+            1 for _, args, cwd in processes or ()
+            if cwd and (cwd == base or cwd.startswith(base + os.sep))
+            and _is_loop_worker(args)
+        )
+
+    return _snapshot_memo(("workers", str(root)), compute)
+
+
+def _unattributed_processes(root: Path, loops: list[dict],
+                            processes) -> int:
+    """Loop-worker processes whose cwd is inside ``root`` while no loop of
+    that workspace is running (so none of them was attributed)."""
+    if any(loop.get("running") for loop in loops):
+        return 0
+    return _workspace_worker_count(root, processes)
+
+
+def _worktree_label(worktree: Path) -> str:
+    main = _worktree_main(worktree)
+    base = main.name if main is not None else worktree.parent.name
+    return f"{base} (worktree {worktree.name})"
+
+
+def _dashboard_version() -> str:
+    """Short git revision of the served dashboard, ``release-<sha>`` for an
+    installed release directory (``releases/<sha>/dashboard``, not a git
+    checkout), or ``"unknown"``."""
+    release = DASHBOARD_DIR.parent
+    if (release.parent.name == "releases"
+            and re.fullmatch(r"[0-9a-f]{40}", release.name)):
+        return "release-" + release.name[:7]
+    try:
+        result = subprocess.run(
+            ["git", *SAFE_GIT_CONFIG, "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -3660,19 +6034,186 @@ class DashboardServer(ThreadingHTTPServer):
         self._workspace_lock = threading.Lock()
         self.workspace_scan_at = 0.0
         self.workspace_seeds = self._fixed_workspace_seeds
+        self.worktree_seeds: tuple[Path, ...] = ()
         self.default_root = (
             Path(root).resolve() if root is not None
             else self._fixed_workspace_seeds[0]
         )
         self.root = self.default_root
         self.metrics = load_metrics_module()
+        self._overview_lock = threading.Lock()
+        self._overview_state_lock = threading.Lock()
+        self._overview_building = False
+        self._overview = None
+        self._overview_at = 0.0
+        self.started_at = time.monotonic()
+        self._version = None
         self.get_workspace_seeds(force=True)
         super().__init__(address, DashboardHandler)
+
+    def overview(self, board_payload) -> dict:
+        """Return every workspace's board without making viewers wait.
+
+        The first request builds synchronously. After that a poll gets the
+        last build immediately and, when it is older than
+        ``OVERVIEW_CACHE_SECONDS``, starts one background rebuild; concurrent
+        polls never scan the same mailboxes twice. A workspace that fails
+        keeps its slot with an ``error`` so the rest still show.
+        """
+        with self._overview_state_lock:
+            cached = self._overview
+            fresh = (
+                cached is not None
+                and time.monotonic() - self._overview_at
+                <= OVERVIEW_CACHE_SECONDS
+            )
+            if cached is not None and not fresh and not self._overview_building:
+                self._overview_building = True
+                threading.Thread(
+                    target=self._rebuild_overview, args=(board_payload,),
+                    daemon=True).start()
+        if cached is not None:
+            return cached
+        with self._overview_lock:
+            if self._overview is not None:
+                return self._overview
+            return self._build_overview(board_payload)
+
+    def _rebuild_overview(self, board_payload) -> None:
+        try:
+            with self._overview_lock:
+                self._build_overview(board_payload)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._overview_state_lock:
+                self._overview_building = False
+
+    def _build_overview(self, board_payload) -> dict:
+        """Scan every workspace now; callers hold ``_overview_lock``."""
+        now = time.monotonic()
+        seeds = self.get_workspace_seeds()
+        processes = _live_processes()
+        broker = _broker_listing()
+
+        def build(seed: Path) -> dict:
+            started = time.monotonic()
+            entry = {"root": str(seed), "name": seed.name}
+            try:
+                board = board_payload(seed, processes, broker)
+                entry["loops"] = board["loops"]
+                entry["inbox"] = board["inbox"]
+            except Exception as exc:
+                traceback.print_exc()
+                entry["loops"] = []
+                entry["inbox"] = []
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            return entry
+
+        def build_worktree(worktree: Path) -> dict | None:
+            started = time.monotonic()
+            with _proc_snapshot(processes, broker):
+                only = _worktree_mailboxes(worktree, broker)
+            if not only:
+                return None
+            entry = {"root": str(worktree), "name": _worktree_label(worktree),
+                     "worktree": True}
+            try:
+                board = board_payload(worktree, processes, broker, only)
+                entry["loops"] = board["loops"]
+                entry["inbox"] = board["inbox"]
+            except Exception as exc:
+                traceback.print_exc()
+                entry["loops"] = []
+                entry["inbox"] = []
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+            return entry
+
+        worktrees = self.get_worktree_seeds()
+        with ThreadPoolExecutor(max_workers=OVERVIEW_WORKERS) as pool:
+            entries = list(pool.map(build, seeds))
+            worktree_entries = [
+                e for e in pool.map(build_worktree, worktrees) if e]
+        names = [entry["name"] for entry in entries]
+        for entry, seed in zip(entries, seeds):
+            if names.count(entry["name"]) > 1:
+                entry["name"] = f"{seed.parent.name}/{seed.name}"
+        # A root-free loop's live copy (its Lead worktree) is already the
+        # root card's content; never list it a second time as a worktree.
+        live_copies = {
+            os.path.realpath(loop["live_mailbox"])
+            for entry in entries for loop in entry.get("loops") or []
+            if loop.get("live_mailbox")}
+        if live_copies:
+            for entry in worktree_entries:
+                entry["loops"] = [
+                    loop for loop in entry["loops"]
+                    if os.path.realpath(os.path.join(entry["root"], loop["name"]))
+                    not in live_copies]
+                names = {loop["name"] for loop in entry["loops"]}
+                entry["inbox"] = [i for i in entry["inbox"] if i.get("loop") in names]
+            worktree_entries = [e for e in worktree_entries
+                                if e["loops"] or e.get("error")]
+        entries.extend(worktree_entries)
+        # Processes working inside a workspace without naming any mailbox
+        # (e.g. builders started with only --config/--workspace): shown as
+        # evidence, never attributed to a loop.
+        for entry in worktree_entries:
+            entry["unattributed_processes"] = _unattributed_processes(
+                Path(entry["root"]), entry["loops"], processes)
+        self._overview = {
+            "workspaces": [
+                entry for entry in entries
+                if entry["loops"] or entry.get("error")
+            ],
+            "scanned": len(seeds),
+            "worktrees_scanned": len(worktrees),
+            "scan_roots": [str(r) for r in _workspace_scan_roots()]
+            if self.workspace_discovery_enabled else [],
+            "broker": broker.get("status", "disabled"),
+            "updated_at": _utc_iso(datetime.now(timezone.utc)),
+            "elapsed_ms": int((time.monotonic() - now) * 1000),
+        }
+        self._overview_at = time.monotonic()
+        return self._overview
+
+    @property
+    def version(self) -> str:
+        """Served git revision, resolved on first use (not at startup)."""
+        if self._version is None:
+            self._version = _dashboard_version()
+        return self._version
+
+    def overview_age(self) -> float | None:
+        """Seconds since the last overview build, or None before the first."""
+        if self._overview is None:
+            return None
+        return round(time.monotonic() - self._overview_at, 1)
+
+    @staticmethod
+    def _with_native_seeds(seeds) -> tuple[Path, ...]:
+        """Seeds plus the repos of registered claude-workflow runs (native
+        run registry), so runs under hidden or unscanned dirs show up.
+        ``TRIO_DASH_NATIVE_RUNS=0`` turns this off."""
+        out = list(seeds)
+        if os.environ.get("TRIO_DASH_NATIVE_RUNS", "1").strip() == "0":
+            return tuple(out)
+        for entry in _native_registry():
+            repo = Path(entry.get("repo") or Path(entry["mailbox"]).parent)
+            try:
+                repo = repo.resolve()
+            except OSError:
+                continue
+            if repo.is_dir() and repo not in out and repo != HOME.resolve():
+                out.append(repo)
+        return tuple(out)
 
     def get_workspace_seeds(self, force: bool = False) -> tuple[Path, ...]:
         """Return fixed seeds plus a TTL-refreshed scan of project directories."""
         if not self.workspace_discovery_enabled:
-            return self._fixed_workspace_seeds
+            return self._with_native_seeds(self._fixed_workspace_seeds)
         now = time.monotonic()
         with self._workspace_lock:
             if (
@@ -3681,32 +6222,30 @@ class DashboardServer(ThreadingHTTPServer):
             ):
                 return self.workspace_seeds
             seeds = list(self._fixed_workspace_seeds)
-            scan_roots = [
-                HOME / "pruebas",
-                HOME / "Projects",
-                HOME / "projects",
-                HOME / "dev",
-                HOME / "src",
-                HOME / "code",
-                HOME / "repos",
-                HOME / "work",
-            ]
-            for scan_root in scan_roots:
-                try:
-                    discovered = sorted(
-                        path.resolve() for path in scan_root.iterdir()
-                        if path.is_dir() and not path.name.startswith(".")
-                    )
-                except OSError:
-                    continue
-                for seed in discovered:
+            worktrees: list[Path] = []
+            for scan_root in _workspace_scan_roots():
+                found, linked = _scan_root_walk(scan_root)
+                for seed in found:
                     if seed not in seeds:
                         seeds.append(seed)
-            self.workspace_seeds = tuple(seeds)
+                for worktree in linked:
+                    if worktree not in seeds and worktree not in worktrees:
+                        worktrees.append(worktree)
+            self.workspace_seeds = self._with_native_seeds(seeds)
+            self.worktree_seeds = tuple(worktrees)
             self.workspace_scan_at = now
             return self.workspace_seeds
 
+    def get_worktree_seeds(self) -> tuple[Path, ...]:
+        """Linked worktrees found by the last discovery pass (not listed as
+        workspaces; the overview shows only their relevant mailboxes)."""
+        self.get_workspace_seeds()
+        return self.worktree_seeds
+
 def main(argv: list[str] | None = None) -> int:
+    # Served from an installed release directory: never write __pycache__
+    # next to the verified release files.
+    sys.dont_write_bytecode = True
     parser = argparse.ArgumentParser(
         description="Trio Loop Dashboard — read-only status board and "
                     "transcript viewer for trio loop mailboxes."
@@ -3718,13 +6257,23 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace", action="append", dest="workspace_paths", metavar="PATH",
         help="workspace root (repeatable; default: cwd and ~/pruebas/* dirs)",
     )
+    parser.add_argument(
+        "--discover", action="store_true",
+        help="also auto-discover workspaces below TRIO_DASH_SCAN_ROOTS "
+             "when --workspace is given",
+    )
     # Keep the old spelling for scripts that have not migrated yet.
     parser.add_argument("--root", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    registered = [
+        value for value in
+        os.environ.get("TRIO_DASH_WORKSPACES", "").split(os.pathsep)
+        if value.strip()
+    ]
     if args.workspace_paths is not None:
-        raw_workspaces = args.workspace_paths
-        auto_discover = False
+        raw_workspaces = args.workspace_paths + registered
+        auto_discover = args.discover
     elif args.root is not None:
         raw_workspaces = [args.root]
         auto_discover = False
@@ -3790,6 +6339,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Trio Loop Dashboard listening on http://{bind_host}:{port} (root: {root})", flush=True)
+
+    def prewarm() -> None:
+        # Build the overview once so the first viewer after a restart does
+        # not wait for a cold scan of every workspace.
+        time.sleep(0.5)
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/overview", timeout=120).read()
+        except (OSError, ValueError):
+            pass
+
+    if bind_host in ("127.0.0.1", "0.0.0.0", "", "localhost"):
+        threading.Thread(target=prewarm, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

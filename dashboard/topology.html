@@ -4,136 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Harness Topology · Trio Loops</title>
+<meta name="description" content="How entrypoints, agents and models are wired in each harness.">
+<title>Harness topology · Trio loops</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230B1214'/%3E%3Crect%20x='3' y='6' width='4' height='4' rx='1' fill='%233FBF8F'/%3E%3Crect%20x='9' y='6' width='4' height='4' rx='1' fill='%23E8A33D'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script src="/nav.js" defer></script>
 <script src="/topology.js" defer></script>
-<style>
-  .topology-topbar { position: sticky; top: 0; z-index: 10; }
-  .topology-topbar a { color: var(--blue); text-decoration: none; }
-  .topology-topbar a:hover {
-    color: var(--text); text-decoration: underline; text-underline-offset: 3px;
-  }
-  .topology-topbar .page-state { color: var(--faint); }
-  .topology-topbar .page-state.is-error { color: var(--red); }
-  .topology-shell { min-height: 100vh; display: flex; flex-direction: column; }
-  .topology-layout {
-    width: 100%; max-width: 1680px; margin: 0 auto; padding: 18px 22px 42px;
-    display: flex; flex-direction: column; gap: 16px; flex: 1; min-height: 0;
-  }
-  .topology-toolbar, .topology-pane, .topology-compare {
-    background: var(--surface); border: 1px solid var(--border);
-  }
-  .topology-toolbar {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 14px;
-    padding: 12px 16px;
-  }
-  .topology-field, .topology-toggle {
-    display: inline-flex; align-items: center; gap: 8px;
-    color: var(--muted); font: 11px var(--mono); text-transform: uppercase;
-    letter-spacing: .06em;
-  }
-  .topology-field select {
-    min-width: 150px; padding: 5px 8px; border: 1px solid var(--border);
-    border-radius: 3px; color: var(--text); background: var(--bg);
-    font: 12px var(--mono);
-    text-transform: none; letter-spacing: 0;
-  }
-  .topology-toggle { cursor: pointer; }
-  .topology-toggle input { accent-color: var(--amber); }
-  .topology-summary { margin-left: auto; color: var(--faint); font: 11px var(--mono); }
-  .topology-pane { min-width: 0; }
-  .topology-pane-heading, .topology-compare-heading {
-    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
-    padding: 16px; border-bottom: 1px solid var(--border);
-  }
-  .topology-pane-heading h2, .topology-compare-heading h2 {
-    margin: 0; font-size: 13px; letter-spacing: .12em; text-transform: uppercase;
-  }
-  .topology-count { color: var(--faint); font: 11px var(--mono); }
-  .topology-svg-wrap { overflow-x: auto; padding: 0 16px 16px; }
-  #topology-svg {
-    display: block; width: 100%; min-width: 820px; height: 480px; background: var(--bg);
-  }
-  .topology-edge { fill: none; stroke-width: 1.6; opacity: .86; }
-  .topology-edge.edge-invokes { stroke: var(--blue); }
-  .topology-edge.edge-spawns { stroke: var(--green); }
-  .topology-edge.edge-dispatches_to { stroke: var(--amber); }
-  .topology-edge.edge-reads_doc {
-    stroke: var(--muted); stroke-dasharray: 4 4;
-  }
-  .topology-edge.edge-subagent { stroke: var(--blue); }
-  .topology-edge.edge-skill { stroke: var(--green); }
-  .topology-edge.edge-command { stroke: var(--amber); }
-  .topology-marker.marker-blue { fill: var(--blue); }
-  .topology-marker.marker-green { fill: var(--green); }
-  .topology-marker.marker-amber { fill: var(--amber); }
-  .topology-marker.marker-muted { fill: var(--muted); }
-  .topology-layer-label {
-    fill: var(--faint); font: 10px var(--mono); letter-spacing: .12em;
-    text-transform: uppercase;
-  }
-  .topology-node rect { fill: var(--surface-2); stroke: var(--border-strong); }
-  .topology-node.kind-entrypoint rect { stroke: var(--blue); }
-  .topology-node.kind-agent rect { stroke: var(--green); }
-  .topology-node.kind-model rect { stroke: var(--amber); }
-  .topology-node.kind-warning rect { stroke: var(--red); }
-  .topology-node.is-external rect { stroke-dasharray: 4 3; opacity: .75; }
-  .topology-node.origin-installed rect {
-    stroke-dasharray: 2 3; opacity: .82;
-  }
-  .topology-node.is-clickable { cursor: pointer; }
-  .topology-node.is-clickable:hover rect,
-  .topology-node.is-clickable:focus rect {
-    fill: var(--surface-3); stroke-width: 2;
-  }
-  .topology-node-label {
-    fill: var(--text); font: 12px var(--mono); font-weight: 650;
-  }
-  .topology-node-meta { fill: var(--muted); font: 9px var(--mono); }
-  .topology-legend {
-    display: flex; flex-wrap: wrap; gap: 12px 18px; padding: 10px 16px 14px;
-    border-top: 1px solid var(--border); color: var(--muted); font: 11px var(--mono);
-  }
-  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
-  .legend-swatch { width: 18px; height: 2px; display: inline-block; }
-  .legend-invokes { background: var(--blue); }
-  .legend-spawns { background: var(--green); }
-  .legend-dispatches { background: var(--amber); }
-  .legend-reads { background: var(--muted); }
-  .topology-compare[hidden] { display: none; }
-  .topology-compare-note {
-    margin: 0; padding: 12px 16px 0; color: var(--muted); font-size: 12px;
-  }
-  #compare-list {
-    margin: 0; padding: 10px 34px 18px; color: var(--text);
-    font: 12px/1.5 var(--mono);
-  }
-  #compare-list li + li { margin-top: 5px; }
-  .compare-edge-type { color: var(--amber); }
-  @media (max-width: 720px) {
-    .topology-layout { padding: 12px 10px 28px; }
-    .topology-summary { width: 100%; margin-left: 0; }
-  }
-</style>
 </head>
 <body>
 <div id="app" class="topology-shell">
-  <header class="topbar topology-topbar">
-    <div class="brand">
-      <h1><a href="/">Trio Loops</a> · Harness Topology</h1>
-      <p class="brand-sub">trace entrypoints, agents, models, and wiring</p>
-    </div>
-    <div id="topbar-meta" class="topbar-meta">
-      <a href="/skills.html" aria-label="Open skills registry">Skills</a>
-      <a href="/agents.html" aria-label="Open agent install matrix">Agents</a>
-      <a href="/models.html" aria-label="Open model registry">Models</a>
-      <a href="/health.html" aria-label="Open registry health">Health</a>
-      <span id="page-state" class="page-state">loading topology…</span>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="appbar">
+    <a class="brand" href="/" aria-label="Trio loops home">
+      <span class="brand-mark" aria-hidden="true"></span>Trio loops
+    </a>
+    <nav class="primary-nav" aria-label="Sections">
+      <a href="/">Loops</a>
+      <a href="/skills.html">Skills</a>
+      <a href="/agents.html" aria-label="Agents: install matrix">Agents</a>
+      <a href="/topology.html" aria-current="page" aria-label="Topology: harness wiring">Topology</a>
+      <a href="/models.html" aria-label="Models: model registry">Models</a>
+      <a href="/health.html" aria-label="Health: registry health">Health</a>
+    </nav>
+    <div id="topbar-meta" class="topbar-meta appbar-tools">
+      <span id="page-state" class="page-state" role="status" aria-live="polite">loading topology…</span>
     </div>
   </header>
 
-  <main class="topology-layout" aria-label="Harness topology workspace">
+  <main id="main" class="page registry-page" aria-label="Harness topology workspace">
+    <section class="summary">
+      <h1 class="verdict">Harness topology</h1>
+      <p class="verdict-sub">How entrypoints, agents and models are wired in each harness.</p>
+    </section>
+  <div class="topology-layout">
     <section class="topology-toolbar" aria-label="Topology controls">
       <label class="topology-field" for="workflow-select">
         <span>Workflow</span>
@@ -155,7 +58,7 @@
       </label>
       <label class="topology-toggle" for="home-toggle">
         <input id="home-toggle" type="checkbox">
-        <span>include installed</span>
+        <span>Include installed</span>
       </label>
       <span id="topology-summary" class="topology-summary">waiting for workspace…</span>
     </section>
@@ -204,6 +107,7 @@
       </p>
       <ul id="compare-list"></ul>
     </section>
+  </div>
   </main>
 
   <noscript>This dashboard requires JavaScript.</noscript>

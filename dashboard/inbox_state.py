@@ -28,7 +28,13 @@ _STATE_ITERATION_RE = re.compile(
 
 
 def state_path(home: Path | str) -> Path:
-    """Return the configured state file path without consulting real HOME."""
+    """Return the configured state file path without consulting real HOME.
+
+    ``TRIO_DASH_INBOX_STATE`` overrides it, so a second (dev) dashboard can
+    run next to the service without sharing its read state."""
+    override = os.environ.get("TRIO_DASH_INBOX_STATE", "").strip()
+    if override:
+        return Path(override).expanduser()
     return Path(home) / ".local" / "share" / "trio-agent-loop" / "inbox-state.json"
 
 

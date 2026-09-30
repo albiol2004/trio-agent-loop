@@ -1125,6 +1125,23 @@ def command_run(args: argparse.Namespace) -> int:
 
 ISOLATED_RETAINED_EXIT = 3
 
+_PLAIN_PROMPT_PATH = re.compile(r"[A-Za-z0-9._/+@-]*")
+
+
+def _pp(value: Any) -> str:
+    """A path (or path-like name) as it may appear in a role prompt (eval3
+    finding 7; ``metrics/native_args.py`` ``prompt_path``): unchanged when
+    it only uses ``[A-Za-z0-9._/+@-]`` (every prompt stays byte-identical),
+    otherwise POSIX-shell single-quoted, so a directory name with spaces or
+    punctuation is one inert token in the prompt's backticks and in any
+    command the prompt spells out. A character that is not printable never
+    reaches a prompt (shown as ``?``; drivers refuse such paths anyway)."""
+    text = str(value)
+    if _PLAIN_PROMPT_PATH.fullmatch(text):
+        return text
+    text = "".join(ch if ch.isprintable() else "?" for ch in text)
+    return shlex.quote(text)
+
 _ISOLATED_BUILDER_NOTE = (
     "ISOLATED WORKTREE: your workspace is the task-owned git worktree "
     "`{path}` (branch `{branch}`, based on aggregate `{base}`). Work only "
@@ -1892,8 +1909,8 @@ def _command_run_isolated(
         file=sys.stderr,
     )
     note = _ISOLATED_BUILDER_NOTE.format(
-        path=path, branch=record["branch"], base=record["base"][:12],
-        repo=repo, slice=slice_id, mailbox=mailbox,
+        path=_pp(path), branch=record["branch"], base=record["base"][:12],
+        repo=_pp(repo), slice=slice_id, mailbox=_pp(mailbox),
     )
     if acceptance_on:
         brief = _acceptance_brief(mailbox, slice_id, path)
@@ -1901,7 +1918,7 @@ def _command_run_isolated(
             note += "\n" + brief
     if declared is not None:
         note += _ISOLATED_BUILDER_REPO_NOTE.format(
-            name=repo_name, repo=repo,
+            name=repo_name, repo=_pp(repo),
             branch=record["aggregate_ref"][len("refs/heads/"):],
         )
 
@@ -5045,7 +5062,7 @@ def _multi_repo_listing(
         ("home", home, None),
         *[(n, d["path"], d.get("base")) for n, d in repos.items()],
     ]:
-        line = f"  - `{name}`: `{path}`"
+        line = f"  - `{name}`: `{_pp(path)}`"
         if base:
             line += f" (base `{base}`)"
         if pins is not None:
@@ -5807,6 +5824,50 @@ def _crosswired_sibling(
     return None
 
 
+def _human_ledger_paths() -> list[Path]:
+    """Where this release's human_ledger.py lives, in lookup order (as for
+    trio-check.py): next to trioctl (install.sh copies it into
+    ``$TRIOCTL_BIN_DIR``), then the release checkout's ``metrics/``."""
+    here = Path(__file__).resolve().parent
+    return [here / "human_ledger.py", here.parent / "metrics" / "human_ledger.py"]
+
+
+def _human_answer_block(
+    mailbox: Path, iteration: int, role: str, kind: str | None = None
+) -> str:
+    """The driver-verified human answer for a Lead / Evaluator prompt, or "".
+
+    Verified with THIS release's ``human_ledger.py`` (never the repository's
+    vendored loop core; :func:`_human_ledger_paths`): the newest trio-dash
+    ledger answer for the mailbox, only when it answers the stop that is
+    still current and its HUMAN.md entry is intact. The Evaluator that rules
+    on it (lockstep, or an open-loop integration-eval) consumes it; a
+    slice-eval does not. Nothing is read without ``HUMAN.md``; ignored
+    entries are reported on stderr; no ledger module means no answer."""
+    if role not in ("lead", "evaluator"):
+        return ""
+    try:
+        os.lstat(Path(mailbox) / "HUMAN.md")
+    except OSError:
+        return ""
+    path = next((p for p in _human_ledger_paths() if p.is_file()), None)
+    try:
+        if path is None:
+            raise ImportError(" or ".join(str(p) for p in _human_ledger_paths()))
+        spec = importlib.util.spec_from_file_location("trioctl_human_ledger", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        print(f"trioctl: HUMAN.md ignored: no answer ledger module ({exc})", file=sys.stderr)
+        return ""
+    return module.answer_block(
+        Path(mailbox), iteration,
+        log=lambda note: print(f"trioctl: {note}", file=sys.stderr),
+        consume=role == "evaluator" and kind != "slice-eval", role=role)
+
+
 class OmnigentRunner:
     """Run Trio judgment roles through fresh broker sessions."""
 
@@ -6093,7 +6154,7 @@ class OmnigentRunner:
                 slice=context.get("slice") or "<slice>",
                 sha=context.get("sha") or "<sha>",
                 name=name,
-                path=repos[name]["path"],
+                path=_pp(repos[name]["path"]),
             )
         if kind == "integration-eval":
             pins = dict(context.get("pins") or {})
@@ -6103,7 +6164,7 @@ class OmnigentRunner:
                 pins=_multi_repo_listing(repos, home, pins),
                 evaluated=", ".join(f"{n}@{pins.get(n) or '<sha>'}" for n in order),
                 iteration=context.get("iteration") or "N",
-                mailbox_name=mailbox.name if mailbox is not None else "<mailbox>",
+                mailbox_name=_pp(mailbox.name) if mailbox is not None else "<mailbox>",
             )
         return ""
 
@@ -6118,12 +6179,17 @@ class OmnigentRunner:
         prompt_role = "lead" if role == "repair" else role
         template = self._prompt_path(prompt_role).read_text(encoding="utf-8")
         values = {
-            "{mailbox}": str(mailbox.resolve()),
-            "{iteration}": str(iteration),
-            "{repo}": str(self.repo),
+            "mailbox": _pp(mailbox.resolve()),
+            "iteration": str(iteration),
+            "repo": _pp(self.repo),
         }
-        for placeholder, value in values.items():
-            template = template.replace(placeholder, value)
+        # Single pass: a substituted value (a path containing `{repo}`) is
+        # never itself re-substituted (eval4 finding 4).
+        template = re.sub(
+            r"\{(mailbox|iteration|repo)\}",
+            lambda m: values[m.group(1)],
+            template,
+        )
         if role != "repair":
             result = template.rstrip() + "\n"
         else:
@@ -6143,7 +6209,7 @@ class OmnigentRunner:
             result = (
                 template.rstrip()
                 + "\n\n## Scoped repair\n"
-                + f"Read `{verdict_path}` and fix only its listed scope.\n"
+                + f"Read `{_pp(verdict_path)}` and fix only its listed scope.\n"
                 + f"Scope note: {scope_note}\n"
                 + f"Append `- iter {iteration} | repair | <one-line summary>` "
                 "to LOG.md for this repair.\n"
@@ -6220,6 +6286,14 @@ class OmnigentRunner:
             result = result.rstrip("\n") + "\n\n" + self._integration_rigor()
         if self.__dict__.get("_acceptance") is not None:
             result = self._acceptance_prompt(role, mailbox, context, result)
+        # A driver-verified human answer (only when HUMAN.md exists and the
+        # newest trio-dash ledger answer for this mailbox is current);
+        # the roles never act on HUMAN.md text itself.
+        block = _human_answer_block(
+            mailbox, iteration, role, (context or {}).get("kind")
+        )
+        if block:
+            result = result.rstrip("\n") + "\n\n" + block
         return result
 
     # --- r19 frozen acceptance (rendered only while the switch is on) ------
@@ -6330,12 +6404,12 @@ class OmnigentRunner:
         if rf is None:
             return ""
         values = {
-            "lead": rf.get("lead") or str(self.repo),
+            "lead": _pp(rf.get("lead") or self.repo),
             "branch": rf.get("branch") or "trio/<mailbox>",
             "target": rf.get("target") or "<target>",
             "base": str(rf.get("target_base") or "")[:12] or "<sha>",
-            "home": rf.get("home") or "<root>",
-            "mailbox": str(mailbox),
+            "home": _pp(rf["home"]) if rf.get("home") else "<root>",
+            "mailbox": _pp(mailbox),
         }
         template = (
             _ROOT_FREE_LOCKSTEP_EVALUATOR_NOTE if role == "evaluator"
@@ -6388,12 +6462,12 @@ class OmnigentRunner:
         """The ROOT-FREE addendum of a root-free OPEN-LOOP CONTEXT (r16)."""
         rf = self._root_free or {}
         values = {
-            "lead": rf.get("lead") or str(self.repo),
+            "lead": _pp(rf.get("lead") or self.repo),
             "branch": rf.get("branch") or "trio/<mailbox>",
             "target": rf.get("target") or "<target>",
             "base": str(rf.get("target_base") or "")[:12] or "<sha>",
-            "home": rf.get("home") or "<root>",
-            "mailbox": str(mailbox),
+            "home": _pp(rf["home"]) if rf.get("home") else "<root>",
+            "mailbox": _pp(mailbox),
             "iteration": context.get("iteration") or "N",
         }
         kind = context.get("kind")
@@ -6401,7 +6475,7 @@ class OmnigentRunner:
             text = _ROOT_FREE_LEAD_NOTE.format(**values)
             if repos:
                 text += "".join(
-                    f"  - `{name}`: aggregate `{d['path']}` on `{values['branch']}`"
+                    f"  - `{name}`: aggregate `{_pp(d['path'])}` on `{values['branch']}`"
                     + (f" (lands onto `{d['target']}`)" if d.get("target") else "")
                     + "\n"
                     for name, d in _root_free_repo_rows(rf, repos).items()
@@ -7607,17 +7681,17 @@ class OmnigentRunner:
         if eval_wt.get("integration") and rf is not None:
             declared = "".join(
                 f" The declared repo `{d['repo_name']}` is checked out at its pin "
-                f"`{d['base']}` in `{d['path']}`."
+                f"`{d['base']}` in `{_pp(d['path'])}`."
                 for d in eval_wt.get("declared_evals") or []
             )
             return (
                 "ISOLATED EVALUATOR WORKSPACE: this session's workspace is the "
-                f"task-owned detached worktree `{eval_wt['path']}` at the "
+                f"task-owned detached worktree `{_pp(eval_wt['path'])}` at the "
                 f"integration pin `{eval_wt['base']}`.{declared} Grade inside it and "
                 "do NOT run `git worktree add`/`remove`; never commit in it and "
                 "leave it clean. Write VERDICT.md/QUEUE.md only under the absolute "
-                f"mailbox `{mailbox}`, and make the SHIP retirement commit(s) in "
-                f"the loop's Lead worktree `{rf['lead']}` with `git -C` (see the "
+                f"mailbox `{_pp(mailbox)}`, and make the SHIP retirement commit(s) in "
+                f"the loop's Lead worktree `{_pp(rf['lead'])}` with `git -C` (see the "
                 "ROOT-FREE lines of the OPEN-LOOP CONTEXT).\n\n"
             )
         of_repo = (
@@ -7626,11 +7700,11 @@ class OmnigentRunner:
         )
         return (
             "ISOLATED EVALUATOR WORKSPACE: this session's workspace is "
-            f"the task-owned detached worktree `{eval_wt['path']}`{of_repo} at "
+            f"the task-owned detached worktree `{_pp(eval_wt['path'])}`{of_repo} at "
             f"`{eval_wt['base']}`. For step 2 grade inside it and do NOT "
             "run `git worktree add`/`remove`. Leave it clean. Write "
             f"VERDICT.md/QUEUE.md only under the absolute mailbox "
-            f"`{mailbox}`.\n\n"
+            f"`{_pp(mailbox)}`.\n\n"
         )
 
     # ---------------------------------------------------- r16 root-free

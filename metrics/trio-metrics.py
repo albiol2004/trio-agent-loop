@@ -872,12 +872,32 @@ def loop_slug(mailbox_rel: str) -> str:
     return (_LOOP_SLUG_RE.sub("-", text).strip("-") or "loop")[:120]
 
 
+#: A stand-alone copy of metrics/human_ledger.py's SAFE_GIT_CONFIG (this file
+#: is vendored without it); a test asserts the two are equal. trio-shadow.py
+#: runs its git calls with this tuple too.
+SAFE_GIT_CONFIG = (
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "protocol.file.allow=never",
+    "-c", "safe.bareRepository=explicit",
+    "-c", "log.showSignature=false",
+    "-c", "core.sshCommand=false",
+    "-c", "core.pager=cat",
+    "-c", "gpg.program=/bin/false",
+    "-c", "gpg.ssh.program=/bin/false",
+    "-c", "gpg.x509.program=/bin/false",
+    "-c", "commit.gpgSign=false",
+    "-c", "core.askPass=",
+    "-c", "credential.helper=",
+)
+
+
 def _git_common_dir(path: Path) -> Path | None:
     import subprocess
 
     try:
         proc = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--path-format=absolute",
+            ["git", *SAFE_GIT_CONFIG, "-C", str(path), "rev-parse", "--path-format=absolute",
              "--git-common-dir"],
             capture_output=True, text=True,
         )

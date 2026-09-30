@@ -238,6 +238,9 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     # r19 frozen acceptance runner (trio-check's coverage check and trioctl's
     # `omnigent acceptance` commands load it as a sibling).
     cp "$ROOT/metrics/trio-acceptance.py" "$TRIOCTL_BIN_DIR/trio-acceptance.py"
+    # trio-dash's answer ledger: trioctl verifies HUMAN.md answers with its
+    # own release's copy (sibling first), never a repository's.
+    cp "$ROOT/metrics/human_ledger.py" "$TRIOCTL_BIN_DIR/human_ledger.py"
     # The release's loop-core set for `trioctl omnigent metrics refresh`
     # (vendored into repositories' metrics/; never loaded from here).
     mkdir -p "$TRIOCTL_BIN_DIR/trio-release-metrics"
@@ -465,10 +468,13 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     # Shipped code: overwrite our own files on reinstall (not user config).
     # Every page/module the server serves or imports by sibling path:
     # dashboard/*.{html,js,css,py}, registry/*.py + models.json +
-    # canonical-agents/, metrics/trio-metrics.py.
+    # canonical-agents/, metrics/trio-metrics.py, and the modules
+    # loop_actions.py loads from ../metrics (the answer ledger and the
+    # native resume-args / mailbox-path validator).
     cp -v "$ROOT"/dashboard/*.html "$ROOT"/dashboard/*.js "$ROOT"/dashboard/*.css \
           "$ROOT"/dashboard/*.py "$ROOT/dashboard/README.md" "$DASH_SHARE/"
-    cp -v "$ROOT/metrics/trio-metrics.py" "$(dirname "$DASH_SHARE")/metrics/"
+    cp -v "$ROOT/metrics/trio-metrics.py" "$ROOT/metrics/human_ledger.py" \
+          "$ROOT/metrics/native_args.py" "$(dirname "$DASH_SHARE")/metrics/"
     cp -v "$ROOT"/registry/*.py "$ROOT/registry/models.json" \
           "$(dirname "$DASH_SHARE")/registry/"
     mkdir -p "$(dirname "$DASH_SHARE")/registry/canonical-agents"

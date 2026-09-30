@@ -4,66 +4,177 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
+<meta name="description" content="Which trio loops need you, what is running, and the evidence behind each verdict.">
 <title>Trio Loops</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230B1214'/%3E%3Crect%20x='3' y='6' width='4' height='4' rx='1' fill='%233FBF8F'/%3E%3Crect%20x='9' y='6' width='4' height='4' rx='1' fill='%23E8A33D'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
-<script src="/nav.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
 <div id="app">
-
-  <header class="topbar">
-    <div class="brand">
-      <h1>Trio Loops</h1>
-      <p class="brand-sub">mission control for agent loops</p>
-    </div>
-    <div class="topbar-meta">
-      <a href="/skills.html" style="color: var(--blue); text-decoration: none;" aria-label="Open skills registry">Skills</a>
-      <a href="/agents.html" style="color: var(--blue); text-decoration: none;" aria-label="Open agent install matrix">Agents</a>
-      <a href="/topology.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open harness topology">Topology</a>
-      <a href="/models.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open model registry">Models</a>
-      <a href="/health.html" style="color: var(--blue); text-decoration: none;"
-         aria-label="Open registry health">Health</a>
-      <span id="agg-loops" class="agg">&mdash; loops</span>
-      <span id="agg-active" class="agg">&mdash; active</span>
-      <span id="updated-at" class="updated-at">updated &mdash;</span>
-      <span id="board-status" class="board-status status-idle"><span id="board-status-text">connecting&hellip;</span></span>
+  <a class="skip-link" href="#main">Skip to loops</a>
+  <header class="appbar">
+    <a class="brand" href="/" aria-label="Trio loops home">
+      <span class="brand-mark" aria-hidden="true"></span>Trio loops
+    </a>
+    <nav class="primary-nav" aria-label="Sections">
+      <a href="/" aria-current="page">Loops</a>
+      <a href="/skills.html">Skills</a>
+      <a href="/agents.html" aria-label="Agents: install matrix">Agents</a>
+      <a href="/topology.html" aria-label="Topology: harness wiring">Topology</a>
+      <a href="/models.html" aria-label="Models: model registry">Models</a>
+      <a href="/health.html" aria-label="Health: registry health">Health</a>
+    </nav>
+    <div id="live" class="live live-connecting" role="status" aria-live="polite">
+      <span class="live-dot" aria-hidden="true"></span>
+      <span id="live-text">Connecting</span>
     </div>
   </header>
 
-  <nav id="tabs" class="tabs" aria-label="Filter loops"></nav>
-
-  <main class="board" aria-label="Loop board">
-    <div id="board-error" class="board-error" hidden></div>
-    <section id="inbox" class="inbox" hidden aria-label="Attention inbox">
-      <header class="inbox-header">
-        <h2 class="inbox-title">Needs attention <span id="inbox-count" class="inbox-count"></span></h2>
-        <button id="inbox-toggle" class="inbox-toggle" type="button"
-                aria-expanded="false" hidden>show read (0)</button>
-      </header>
-      <div id="inbox-list" class="inbox-list"></div>
+  <main id="main" class="page" aria-label="Loop board">
+    <section class="summary" aria-labelledby="verdict">
+      <h1 id="verdict" class="verdict" aria-live="polite">Loading loops</h1>
+      <p id="verdict-sub" class="verdict-sub"></p>
+      <div id="board-error" class="banner banner-error" role="alert" hidden>
+        <span id="board-error-text"></span>
+        <button id="board-retry" class="btn btn-secondary" type="button">Retry now</button>
+      </div>
+      <div id="board-partial" class="banner banner-warning" hidden></div>
+      <div id="broker-note" class="banner banner-warning" role="note" hidden></div>
+      <div id="kpis" class="kpis" aria-label="Loop totals">
+        <div class="kpi skeleton"></div><div class="kpi skeleton"></div>
+        <div class="kpi skeleton"></div><div class="kpi skeleton"></div>
+      </div>
     </section>
-    <div id="card-grid" class="card-grid"></div>
+
+    <section id="needs" class="panel" aria-labelledby="needs-title">
+      <header class="panel-head">
+        <h2 id="needs-title" class="panel-title">Needs you <span id="needs-count" class="count"></span></h2>
+        <button id="inbox-toggle" class="btn btn-ghost" type="button" aria-expanded="false" hidden>Show read (0)</button>
+      </header>
+      <div id="needs-list" class="attn-list">
+        <div class="row-skeleton skeleton"></div>
+      </div>
+    </section>
+
+    <section id="running" class="panel" aria-labelledby="running-title">
+      <header class="panel-head">
+        <h2 id="running-title" class="panel-title">Running now <span id="running-count" class="count"></span></h2>
+      </header>
+      <div id="running-list" class="run-grid">
+        <div class="row-skeleton skeleton"></div>
+      </div>
+    </section>
+
+    <section id="loops" class="panel" aria-labelledby="loops-title">
+      <header class="panel-head panel-head-filters">
+        <h2 id="loops-title" class="panel-title">All loops</h2>
+        <div class="filters" role="search" aria-label="Filter loops">
+          <label class="field field-search">
+            <span class="sr-only">Search loops</span>
+            <input id="loop-search" class="input" type="search" placeholder="Search loops" autocomplete="off">
+          </label>
+          <label class="field">
+            <span class="sr-only">Workspace</span>
+            <select id="workspace-filter" class="select"><option value="">All workspaces</option></select>
+          </label>
+          <div id="tabs" class="segmented" role="group" aria-label="Show loops"></div>
+        </div>
+      </header>
+      <div class="table-scroll">
+        <table class="loop-table">
+          <caption class="sr-only">Every loop mailbox across workspaces</caption>
+          <thead>
+            <tr>
+              <th scope="col" aria-sort="none"><button class="th-sort" type="button" data-sort="loop">Loop</button></th>
+              <th scope="col" class="col-ws" aria-sort="none"><button class="th-sort" type="button" data-sort="workspace">Workspace</button></th>
+              <th scope="col">State</th>
+              <th scope="col" class="num col-iter">Iteration</th>
+              <th scope="col" class="col-hist">Verdicts</th>
+              <th scope="col" class="num" aria-sort="descending"><button class="th-sort" type="button" data-sort="activity">Last activity</button></th>
+            </tr>
+          </thead>
+          <tbody id="loop-rows">
+            <tr class="row-loading"><td colspan="6"><div class="row-skeleton skeleton"></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <details id="notes" class="panel panel-notes" hidden>
+      <summary class="panel-head">
+        <span class="panel-title">Review notes <span id="notes-count" class="count"></span></span>
+        <span id="notes-sub" class="caption"></span>
+      </summary>
+      <div id="notes-list" class="attn-list"></div>
+    </details>
   </main>
 
   <div id="drawer-scrim" class="drawer-scrim" hidden></div>
-  <div id="drawer" class="drawer modal" hidden role="dialog" aria-modal="true" aria-label="Loop detail">
-    <header class="drawer-header">
+  <div id="drawer" class="drawer modal" hidden role="dialog" aria-modal="true" aria-labelledby="drawer-name">
+    <div class="drawer-header">
       <div class="drawer-heading">
         <span id="drawer-badge" class="status-tags">&mdash;</span>
         <h2 id="drawer-name" class="drawer-name">&mdash;</h2>
+        <p id="drawer-where" class="drawer-where mono"></p>
       </div>
       <button id="drawer-close" class="icon-btn" type="button" title="Close detail (Esc)" aria-label="Close detail">&times;</button>
-    </header>
+    </div>
 
     <nav id="drawer-tabs" class="drawer-tabs" aria-label="Loop detail views"></nav>
 
     <div class="drawer-body">
       <div id="view-overview" class="drawer-view">
         <p id="drawer-mission" class="drawer-mission"></p>
+
+        <div id="drawer-controls" class="drawer-controls" hidden>
+          <button id="loop-start" class="btn btn-secondary" type="button">Start loop</button>
+          <button id="loop-stop" class="btn btn-destructive" type="button">Stop loop</button>
+          <span id="loop-control-note" class="control-note caption" role="status"></span>
+        </div>
+
+        <section id="actions-section" class="drawer-section actions-section" aria-labelledby="actions-title" hidden>
+          <h3 id="actions-title" class="section-label">Unblock</h3>
+          <p id="actions-state" class="actions-state"></p>
+          <ul id="actions-script" class="actions-script" aria-label="Workflow script" hidden></ul>
+          <div class="actions-row">
+            <label class="field" for="diagnose-harness"><span class="sr-only">Diagnosis harness</span>
+              <select id="diagnose-harness" class="select"></select>
+            </label>
+            <button id="diagnose-btn" class="btn btn-secondary" type="button">Diagnose</button>
+            <span id="diagnose-note" class="control-note caption" role="status"></span>
+          </div>
+          <div id="diagnosis-panel" class="diagnosis-panel" hidden></div>
+          <div id="fix-list" class="fix-list" aria-label="Fixes"></div>
+          <p id="fix-result" class="control-note caption" role="status"></p>
+          <details id="fix-unavailable" class="fix-unavailable" hidden>
+            <summary class="caption">Not applicable now</summary>
+            <ul id="fix-unavailable-list" class="fix-unavailable-list"></ul>
+          </details>
+          <form id="answer-box" class="answer-box" hidden>
+            <label class="section-label" for="answer-text">Answer for the Lead (appended to HUMAN.md)</label>
+            <p id="answer-stop" class="caption"></p>
+            <textarea id="answer-text" class="answer-text" rows="5" maxlength="20000"
+                      placeholder="Your decision or the human-check result. The Lead reads HUMAN.md at the start of its next pass."></textarea>
+            <label class="answer-reset caption"><input id="answer-reset" type="checkbox" checked>
+              Reset STATE.md to status running / phase idle so the next run starts a Lead pass</label>
+            <div class="actions-row">
+              <button id="answer-submit" class="btn btn-secondary" type="submit">Review answer…</button>
+              <span id="answer-note" class="control-note caption" role="status"></span>
+            </div>
+            <div id="answer-restart" class="actions-row" hidden></div>
+          </form>
+          <details id="action-log" class="action-log">
+            <summary class="caption">Action log</summary>
+            <ol id="action-log-list" class="action-log-list"></ol>
+          </details>
+        </section>
+
+        <section id="drawer-inbox-section" class="drawer-section"
+                 aria-label="Why this loop is flagged" hidden>
+          <h3 class="section-label">Why this loop is flagged</h3>
+          <div id="drawer-inbox-list" class="attn-list"></div>
+        </section>
 
         <dl class="facts" aria-label="Loop facts">
           <div class="fact"><dt>Iteration</dt><dd id="fact-iter" class="mono">&mdash;</dd></div>
@@ -87,11 +198,6 @@
           <div id="slice-list" class="slice-list"></div>
         </section>
 
-        <section id="drawer-inbox-section" class="drawer-section"
-                 aria-label="Attention inbox" hidden>
-          <h3 class="section-label">Attention inbox</h3>
-          <div id="drawer-inbox-list" class="inbox-list"></div>
-        </section>
 
         <section class="drawer-section" aria-label="Activity timeline">
           <h3 class="section-label">Activity</h3>
@@ -111,6 +217,10 @@
               <h3 class="section-label">Sessions</h3>
               <span id="pane-status" class="stream-status status-idle"><span id="pane-status-text">idle</span></span>
             </div>
+            <details id="sessions-note" class="sessions-note" hidden>
+              <summary>Active sessions are not listed yet: sessions appear when archived, usually after a role finishes.</summary>
+              <p>trioctl exports a role's session here when it archives that session, usually soon after the role finishes and otherwise at the end of the run. An open session shows lines added to its file; it is not a live view of a running agent.</p>
+            </details>
             <div id="session-list" class="session-list"></div>
           </aside>
           <div class="chat-main">
@@ -124,7 +234,20 @@
         </div>
       </div>
     </div>
-  </aside>
+  </div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog" class="confirm-form">
+      <h2 id="confirm-title" class="confirm-title">Confirm</h2>
+      <p id="confirm-lead" class="confirm-lead"></p>
+      <pre id="confirm-commands" class="confirm-commands mono"></pre>
+      <ul id="confirm-notes" class="confirm-notes caption"></ul>
+      <div class="actions-row confirm-actions">
+        <button id="confirm-cancel" class="btn btn-secondary" value="cancel" type="submit">Cancel</button>
+        <button id="confirm-ok" class="btn btn-destructive" value="ok" type="submit">Run these commands</button>
+      </div>
+    </form>
+  </dialog>
 
   <noscript>This dashboard requires JavaScript.</noscript>
 </div>

@@ -107,6 +107,17 @@ time.sleep(60)
         self.env_patch.start()
         self.original_home = serve.HOME
         serve.HOME = Path(self.home.name)
+        # dash-actions: Start runs the installed release's drivers.
+        share = Path(self.home.name) / ".local" / "share" / "trio-agent-loop"
+        sha = "e" * 40
+        release_driver = share / "releases" / sha / "metrics" / "trio_loop.py"
+        release_driver.parent.mkdir(parents=True)
+        release_driver.write_text("# fake\n", encoding="utf-8")
+        (share / "CURRENT").write_text(sha + "\n", encoding="utf-8")
+        self.trioctl = Path(self.home.name) / ".local" / "bin" / "trioctl"
+        self.trioctl.parent.mkdir(parents=True)
+        self.trioctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.trioctl.chmod(0o755)
         self.server = serve.DashboardServer(
             ("127.0.0.1", 0),
             workspaces=[self.tmp_workspace],
@@ -206,6 +217,9 @@ time.sleep(60)
     def test_start_omnigent_builds_the_native_loop_command(self):
         process = Mock()
         process.pid = 987654321
+        # Alive through the startup grace, then exits for the reaper.
+        process.wait.side_effect = [
+            serve.subprocess.TimeoutExpired("trioctl", 1), 0]
         try:
             with patch.object(
                 serve.subprocess, "Popen", return_value=process
@@ -220,17 +234,26 @@ time.sleep(60)
                 )
             self.assertEqual(status, 202, payload)
             command = popen.call_args.args[0]
+            # The installed trioctl runs, never the dashboard checkout's.
             self.assertEqual(command, [
-                "python3", "omnigent/trioctl", "omnigent", "loop",
+                "python3", str(self.trioctl),
+                "omnigent", "loop",
                 "--mailbox", str(self.mailbox),
                 "--max-iterations", "3",
             ])
             self.assertEqual(popen.call_args.kwargs["cwd"], self.tmp_workspace)
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertIs(
-                popen.call_args.kwargs["stdout"], serve.subprocess.DEVNULL)
+                popen.call_args.kwargs["stdin"], serve.subprocess.DEVNULL)
             self.assertIs(
-                popen.call_args.kwargs["stderr"], serve.subprocess.DEVNULL)
+                popen.call_args.kwargs["stderr"], serve.subprocess.STDOUT)
+            log = Path(payload["log"])
+            self.assertTrue(log.is_relative_to(
+                Path(self.home.name) / ".local" / "state" / "trio-dash"))
+            state = json.loads(
+                (self.mailbox / ".driver.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["pid"], process.pid)
+            self.assertEqual(state["phase"], "starting")
         finally:
             with serve._LOOP_PROCESSES_LOCK:
                 serve._LOOP_PROCESSES.pop(process.pid, None)

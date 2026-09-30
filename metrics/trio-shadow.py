@@ -121,9 +121,17 @@ find_slices_block = _METRICS.find_slices_block
 parse_slices = _METRICS.parse_slices
 
 
+#: trio-metrics.py's copy of human_ledger.SAFE_GIT_CONFIG: a slice's ``repo:``
+#: comes from PLAN.md (mailbox content), so a repository-configured program
+#: (gpg.program via log.showSignature, fsmonitor, hooks, ...) never runs and an
+#: embedded bare repository layout is never discovered (eval5 finding 1).
+SAFE_GIT_CONFIG = _METRICS.SAFE_GIT_CONFIG
+
+
 def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], cwd=repo_dir, capture_output=True, text=True
+        ["git", *SAFE_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
     )
 
 
