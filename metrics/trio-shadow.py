@@ -88,6 +88,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -128,10 +129,17 @@ parse_slices = _METRICS.parse_slices
 SAFE_GIT_CONFIG = _METRICS.SAFE_GIT_CONFIG
 
 
+#: r20: the gate's git reads ignore `refs/replace/*` (`git replace` could
+#: point the evaluated sha at a complete tree while the real commit, what
+#: push/clone carry, stays incomplete): `--no-replace-objects` on every git
+#: argv of this module, plus the env switch for git's own child processes.
+GIT_NO_REPLACE_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *SAFE_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, text=True,
-        stdin=subprocess.DEVNULL,
+        ["git", "--no-replace-objects", *SAFE_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, env={**os.environ, **GIT_NO_REPLACE_ENV},
     )
 
 

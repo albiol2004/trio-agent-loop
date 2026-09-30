@@ -193,7 +193,7 @@ def pack_symlinks(acc_dir: Path) -> list[str]:
 
 def symlinks_at(repo: Path, rev: str, acc_rel: str) -> list[str]:
     """``pack_symlinks`` of the pack as committed in *rev* (git objects)."""
-    proc = subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(repo), "ls-tree",
+    proc = subprocess.run(["git", "--no-replace-objects", "-c", "core.quotePath=false", "-C", str(repo), "ls-tree",
                            "-r", "-z", rev, "--", acc_rel + "/"], capture_output=True)
     out = []
     for raw in proc.stdout.decode("utf-8", "surrogateescape").split("\0"):
@@ -456,8 +456,24 @@ def copy_tree(src: Path, dst: Path, exclude: Iterable[str] = ()) -> list[str]:
     return []
 
 
+#: r20: every git subprocess of the acceptance gate ignores `refs/replace/*`
+#: (`git replace`): a role could point a replace ref at a commit whose tree
+#: is complete, so that every read of the evaluated sha (archive, ls-tree,
+#: cat-file, rev-list, log, rev-parse) sees the replacement while the real
+#: commit -- what push/clone carry -- stays incomplete. Every git argv in
+#: this module carries `--no-replace-objects`; helpers that spawn git also
+#: pass this env (the same switch for git's own child processes).
+GIT_NO_REPLACE_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """A subprocess env for git: the caller's, plus ``GIT_NO_REPLACE_OBJECTS=1``."""
+    return {**os.environ, **GIT_NO_REPLACE_ENV, **(extra or {})}
+
+
 def _git(repo: Path, *args: str, check: bool = True, **kw: Any) -> subprocess.CompletedProcess:
-    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, **kw)
+    kw.setdefault("env", git_env())
+    proc = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), *args], capture_output=True, text=True, **kw)
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()[-300:]}")
     return proc
@@ -469,7 +485,7 @@ def git_paths(repo: Path, *args: str) -> list[str]:
     non-ASCII or space-containing name is one path, never git-quoted
     (``"a/r\\303\\251.json"``) or split. *args* must include ``-z``.
     Empty on a git failure."""
-    proc = subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(repo), *args],
+    proc = subprocess.run(["git", "--no-replace-objects", "-c", "core.quotePath=false", "-C", str(repo), *args],
                           capture_output=True)
     if proc.returncode != 0:
         return []
@@ -477,7 +493,7 @@ def git_paths(repo: Path, *args: str) -> list[str]:
 
 
 def git_toplevel(path: Path) -> Path | None:
-    proc = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+    proc = subprocess.run(["git", "--no-replace-objects", "-C", str(path), "rev-parse", "--show-toplevel"],
                           capture_output=True, text=True)
     return Path(proc.stdout.strip()).resolve() if proc.returncode == 0 else None
 
@@ -486,7 +502,7 @@ def archive_tree(repo: Path, rev: str, dest: Path) -> str:
     """`git archive <rev> | tar -x` into *dest*; returns the full sha."""
     sha = _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}").stdout.strip()
     dest.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.Popen(["git", "-C", str(repo), "archive", "--format=tar", sha],
+    archive = subprocess.Popen(["git", "--no-replace-objects", "-C", str(repo), "archive", "--format=tar", sha],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     tar = subprocess.run(["tar", "-x", "-C", str(dest)], stdin=archive.stdout,
                          capture_output=True)
@@ -2411,7 +2427,7 @@ def commit_paths(repo: Path, rels: list[str], message: str,
             lock.unlink(missing_ok=True)
             return None
         args = ["commit-tree", tree, "-F", "-"] + (["-p", old] if old else [])
-        new = subprocess.run(["git", "-C", str(top), *args], input=message,
+        new = subprocess.run(["git", "--no-replace-objects", "-C", str(top), *args], input=message,
                              capture_output=True, text=True)
         if new.returncode != 0:
             raise RuntimeError(f"git commit-tree: {new.stderr.strip()[-300:]}")
@@ -2475,7 +2491,7 @@ def restore_pack_files(repo: Path, rev: str, acc_rel: str, acc_dir: Path) -> Non
     top = git_toplevel(repo) or Path(repo).resolve()
     stage = Path(tempfile.mkdtemp(prefix="trio-acceptance-restore-"))
     try:
-        archive = subprocess.Popen(["git", "-C", str(top), "archive", "--format=tar", rev,
+        archive = subprocess.Popen(["git", "--no-replace-objects", "-C", str(top), "archive", "--format=tar", rev,
                                     "--", acc_rel], stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
         tar = subprocess.run(["tar", "-x", "-C", str(stage)], stdin=archive.stdout,
@@ -2529,7 +2545,7 @@ def pack_hash_at(repo: Path, rev: str, acc_rel: str) -> str | None:
         entries.append((rel, mode, blob))
     digest = hashlib.sha256()
     for rel, mode, blob in sorted(entries):
-        data = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
+        data = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "cat-file", "blob", blob],
                               capture_output=True).stdout
         if mode == "120000":
             data = b"symlink:" + data
@@ -2561,7 +2577,7 @@ def _object_ids(repo: Path, specs: list[str]) -> list[str | None]:
     """`git cat-file --batch-check` for many `<rev>:<path>` specs at once."""
     if not specs:
         return []
-    proc = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch-check"],
+    proc = subprocess.run(["git", "--no-replace-objects", "-C", str(repo), "cat-file", "--batch-check"],
                           input="\n".join(specs) + "\n", capture_output=True, text=True)
     out: list[str | None] = []
     for line in proc.stdout.splitlines():

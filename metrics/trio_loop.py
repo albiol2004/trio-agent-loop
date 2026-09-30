@@ -835,16 +835,32 @@ def _git_root(repo: Path | None) -> Path | None:
     return None
 
 
+#: r20: every git subprocess of the loop driver ignores `refs/replace/*`
+#: (`git replace`): a role could point a replace ref at a commit whose tree
+#: is complete, so that every read of the evaluated sha (archive, ls-tree,
+#: cat-file, rev-list, log, rev-parse) sees the replacement while the real
+#: commit -- what push/clone carry -- stays incomplete. Every git argv in
+#: this module carries `--no-replace-objects`; helpers that spawn git also
+#: pass this env (the same switch for git's own child processes).
+GIT_NO_REPLACE_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """A subprocess env for git: the caller's, plus ``GIT_NO_REPLACE_OBJECTS=1``."""
+    return {**os.environ, **GIT_NO_REPLACE_ENV, **(extra or {})}
+
+
 def _git(
     repo: Path, *args: str
 ) -> subprocess.CompletedProcess[str]:
     """Run git in ``repo``; never raise on a missing binary or bad rev."""
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            ["git", "--no-replace-objects", "-C", str(repo), *args],
             capture_output=True,
             text=True,
             check=False,
+            env=git_env(),
         )
     except OSError:
         return subprocess.CompletedProcess(
@@ -1016,7 +1032,7 @@ def _fold_restored_verdict_into_retirement(
         )
     try:
         committed = subprocess.run(
-            ["git", "-C", str(git_root), "show", f"HEAD:{verdict_rel}"],
+            ["git", "--no-replace-objects", "-C", str(git_root), "show", f"HEAD:{verdict_rel}"],
             capture_output=True,
             check=False,
         )
@@ -1481,6 +1497,7 @@ def _retirement_snapshot(mailbox: Path, repo: Path | None) -> tuple:
             result = subprocess.run(
                 [
                     "git",
+                    "--no-replace-objects",
                     "--no-optional-locks",
                     "-C",
                     str(git_root),
@@ -2515,7 +2532,7 @@ class AcceptanceController:
                     "edited, or the driver stopped between a commit and its state write)")
         anchor = chain["anchor"]
         frozen_blob = subprocess.run(
-            ["git", "-C", str(self.repo), "cat-file", "blob", f"{anchor}:{self.acc_rel}/{ta.FROZEN}"],
+            ["git", "--no-replace-objects", "-C", str(self.repo), "cat-file", "blob", f"{anchor}:{self.acc_rel}/{ta.FROZEN}"],
             capture_output=True).stdout
         manifest = json.loads(_git(self.repo, "show", f"{anchor}:{self.acc_rel}/{ta.MANIFEST}").stdout
                               or "{}")
@@ -3837,7 +3854,7 @@ def _git_head_sha(repo_dir: Path) -> str | None:
     `_lead_pass_snapshot`."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "--no-replace-objects", "rev-parse", "HEAD"],
             cwd=repo_dir,
             capture_output=True,
             text=True,
@@ -3854,7 +3871,7 @@ def _git_slice_commit_shas(repo_dir: Path) -> frozenset[str]:
     `_git_head_sha`."""
     try:
         result = subprocess.run(
-            ["git", "log", "--format=%H", "--grep=^slice("],
+            ["git", "--no-replace-objects", "log", "--format=%H", "--grep=^slice("],
             cwd=repo_dir,
             capture_output=True,
             text=True,
