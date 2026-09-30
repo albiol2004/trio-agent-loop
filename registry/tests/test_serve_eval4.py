@@ -150,7 +150,12 @@ class PromptSinglePassTests(D._Base):
                 for placeholder, value in (("{mailbox}", trioctl._pp(box.resolve())),
                                            ("{iteration}", "3"), ("{repo}", trioctl._pp(self.root))):
                     template = template.replace(placeholder, value)
-                self.assertEqual(runner._prompt(role, 3, box, {}), template.rstrip() + "\n")
+                expected = template.rstrip() + "\n"
+                if role == "evaluator":
+                    # r19 C1: a lockstep Evaluator prompt also carries the
+                    # whole-goal rigor block, appended after the fill.
+                    expected = expected.rstrip("\n") + "\n\n" + runner._integration_rigor()
+                self.assertEqual(runner._prompt(role, 3, box, {}), expected)
 
 
 class AnswerInputTests(_AnswerBase):
