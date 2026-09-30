@@ -1786,7 +1786,18 @@ under `quality` in `--json`.
     restart. The switch counts from the profile too: `[acceptance]
     enabled = true` alone refuses every API-6 root-free loop, dashboard
     resumes included (they pass no flag), until its repository (or loop
-    branch) is refreshed.
+    branch) is refreshed. Round 2: `--no-acceptance` over an env/profile
+    ON switch holds for the whole run -- the driver writes `acceptance:
+    {"enabled": false, "source": "--no-acceptance"}` to `.driver.json`
+    (start and re-attach), which every builder dispatch reads before its
+    own env/profile; nothing is recorded when env/profile are off.
+  - *git replace refs* (trio-acceptance, trio_loop, trio-shadow, trioctl):
+    every git read runs with `--no-replace-objects` (+
+    `GIT_NO_REPLACE_OBJECTS=1` in the helpers' env), so a role's
+    `refs/replace/<sha>` pointing at a complete tree never reaches the
+    acceptance pre-run, `pack_hash_at`, the pin chain, the commit gate or
+    the pre-create target read; the real commit (what push/clone carry) is
+    what is evaluated.
 
 - **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
   default off): the `covers:` slice key and `parse_plan_acceptance`

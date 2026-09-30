@@ -320,7 +320,8 @@ r15 guard.
   --mailbox <mb> --commit` with the target checked out). A re-attached
   loop cannot be fixed by a target refresh: refresh inside its Lead
   worktree (`trioctl omnigent metrics refresh --repo <Lead worktree>
-  --commit`), resume with `--no-acceptance`, or `abandon` it (then `git
+  --commit`), resume with `--no-acceptance` (recorded in `.driver.json`, so
+  its builders stay switch-off whatever the env/profile say), or `abandon` it (then `git
   branch -D trio/<slug>`), refresh the target and start again. The switch
   is OFF by default; with it off API-6 loops run unchanged.
 - One-shots (`trioctl omnigent run <role>`) keep their `--workspace`

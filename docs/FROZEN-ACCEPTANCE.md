@@ -31,7 +31,15 @@ verdict: amendments -> anti-thrash -> SHIP gate (pack re-run at the evaluated sh
 | CLI | `trioctl omnigent loop --acceptance` / `--no-acceptance`; `trioctl omnigent doctor --acceptance` |
 | loop core | `run_loop(..., acceptance={"enabled": True, "wait_s": 900})`; `trio_loop.py run --acceptance` |
 
-The CLI flag wins, then the env, then the profile. **The profile alone is
+The CLI flag wins, then the env, then the profile -- for the whole run:
+`--no-acceptance` over `TRIO_ACCEPTANCE=1` or a profile `enabled = true`
+makes the driver record `acceptance: {"enabled": false, "source":
+"--no-acceptance"}` in `.driver.json` (fresh start and re-attach alike), and
+every builder dispatch (`trioctl omnigent run builder --mailbox …`, isolated
+or not) reads that record before its own env/profile, so no builder is
+refused with "acceptance not frozen yet" (r20 review round 2). Without an
+env/profile ON switch nothing is recorded (switch-off runs stay
+byte-identical). **The profile alone is
 enough to turn it on for every loop of this user**, including a trio-dash
 resume (the dashboard passes no `--acceptance` flag, so the profile or
 `TRIO_ACCEPTANCE` decides). With it on, every root-free loop (open-loop and
@@ -550,7 +558,8 @@ trioctl omnigent acceptance validate --export .                                 
   refresh does not reach it. Its refusal names the three ways out: refresh
   inside the Lead worktree (`trioctl omnigent metrics refresh --repo <Lead
   worktree> --commit`, a commit on `trio/<slug>`), resume with
-  `--no-acceptance` (as it started), or `trioctl omnigent abandon --mailbox
+  `--no-acceptance` (as it started; the flag holds for the whole run even
+  when the env or the profile says on, see "Switch"), or `trioctl omnigent abandon --mailbox
   <mb>` (keeps the branch: take what you need, then `git branch -D
   trio/<slug>`), refresh the target and start again.
 
