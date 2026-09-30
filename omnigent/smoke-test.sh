@@ -147,8 +147,8 @@ PY
 }
 
 protocol_contract() {
-  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v3' "$ROOT/omnigent/trioctl"
-  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v3' \
+  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v4-acc' "$ROOT/omnigent/trioctl"
+  assert grep -Fq 'cursor-grok-4.6-medium+glm-5.2-max-v4-acc' \
     "$ROOT/omnigent/entrypoints/trio-omnigent/SKILL.md"
   assert grep -Fq 'Before any deep reconnaissance' \
     "$ROOT/omnigent/trio-omnigent-roles/lead/config.yaml"

@@ -170,22 +170,29 @@ The agent should:
 5. Discover Omnigent's deferred `sys_session_create`, `sys_session_close`, and
    `sys_agent_list` tools.
 6. Back up a registry whose `_profile` is not
-   `cursor-grok-4.6-medium+glm-5.2-max-v3`, then register only the two judgment
-   roles by creating an idle child from:
+   `cursor-grok-4.6-medium+glm-5.2-max-v4-acc`. Then register all three
+   registered roles under the new profile by creating an idle child from each
+   of:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
-7. Write `_profile: cursor-grok-4.6-medium+glm-5.2-max-v3` plus the exact returned
+   - `omnigent/trio-omnigent-roles/acceptance` (the r19 acceptance author)
+
+   Register the acceptance role even while `[acceptance] enabled` is off. A
+   switch-on run (`--acceptance`, `TRIO_ACCEPTANCE=1`, or the profile)
+   otherwise fails doctor with "missing: trio-omnigent-acceptance".
+7. Write `_profile: cursor-grok-4.6-medium+glm-5.2-max-v4-acc` plus the exact returned
    `agent_id` and `bootstrap_conversation_id` values to
    `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`, keyed by
-   `trio-omnigent-{lead,evaluator}`. Leave the idle bootstrap
+   `trio-omnigent-{lead,evaluator,acceptance}`. Leave the idle bootstrap
    sessions in place as registration anchors; `sys_session_close` currently
    rejects config-path-created sessions as `session_not_a_sub_agent`.
-8. Verify both exact names and IDs are present in the registry. Remove legacy
-   Builder/Scout entries; they are no longer registration anchors.
+8. Verify all three exact names and IDs are present in the registry. Remove
+   legacy Builder/Scout entries; they are no longer registration anchors.
 9. Verify Lead and Evaluator use `cursor-native`, `yolo: true`, and
    `spawn: true`, then run a short
     `trioctl omnigent run scout` smoke test and confirm its text is captured.
-10. Run `trioctl omnigent doctor`; all checks must pass.
+10. Run `trioctl omnigent doctor` and `trioctl omnigent doctor --acceptance`;
+    all checks must pass.
 11. Tell you to start a new underlying Claude/Codex session so its skill catalog
    includes the installed entrypoint.
 
@@ -216,8 +223,8 @@ fall back to native Trio.
 
 `OMNIGENT_HOME=/custom/path ./install.sh --omnigent` selects another Omnigent
 home. Re-running the installer updates only the Trio-owned role sources and
-entrypoint skills. Re-register the Lead/Evaluator roles after changing their
-configs.
+entrypoint skills. Re-register the Lead, Evaluator and acceptance roles after
+changing their configs.
 
 Use a different mailbox such as `loop-auth` for a concurrent mission. Never
 point two live runs at one mailbox.

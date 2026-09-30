@@ -485,14 +485,15 @@ def _load_trioctl():
 
 
 def test_metrics_api_is_6_and_matches_trioctl() -> None:
-    assert TM.METRICS_API == 6
+    assert TM.METRICS_API == 7
     trioctl = _load_trioctl()
     assert trioctl.REQUIRED_METRICS_API == TM.METRICS_API
-    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 6
+    assert trioctl._api_marker(METRICS_PATH, "METRICS_API") == 7
     # r15: a pre-multi-repo vendored set (4) is still driven, single-repo;
     # r16: a pre-root-free set (4, 5) runs lockstep / --root-bound only.
-    assert trioctl.COMPATIBLE_METRICS_APIS == (4, 5, 6)
+    assert trioctl.COMPATIBLE_METRICS_APIS == (4, 5, 6, 7)
     assert trioctl.ROOT_FREE_METRICS_API == 6
+    assert trioctl.ACCEPTANCE_METRICS_API == 7
 
 
 def test_too_old_vendored_metrics_is_refused_with_clear_message(
@@ -504,11 +505,11 @@ def test_too_old_vendored_metrics_is_refused_with_clear_message(
     core_src = Path(__file__).parents[1] / "trio_loop.py"
     (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
     (metrics_dir / "trio-metrics.py").write_text(
-        METRICS_PATH.read_text().replace("METRICS_API = 6\n", "METRICS_API = 2\n")
+        METRICS_PATH.read_text().replace("METRICS_API = 7\n", "METRICS_API = 2\n")
     )
     with pytest.raises(
         trioctl.TrioctlError,
-        match=r"METRICS_API 2, this trioctl requires 6 \(or 5 without root-free open-loop, 4 also without PLAN.md repos:\) \(mixed metrics/ versions\)",
+        match=r"METRICS_API 2, this trioctl requires 7 \(or 6 without frozen acceptance, 5 also without root-free open-loop, 4 also without PLAN.md repos:\) \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
 
@@ -521,11 +522,11 @@ def test_same_api3_vendored_metrics_is_refused(tmp_path: Path) -> None:
     core_src = Path(__file__).parents[1] / "trio_loop.py"
     (metrics_dir / "trio_loop.py").write_text(core_src.read_text())
     (metrics_dir / "trio-metrics.py").write_text(
-        METRICS_PATH.read_text().replace("METRICS_API = 6\n", "METRICS_API = 3\n")
+        METRICS_PATH.read_text().replace("METRICS_API = 7\n", "METRICS_API = 3\n")
     )
     with pytest.raises(
         trioctl.TrioctlError,
-        match=r"METRICS_API 3, this trioctl requires 6 \(or 5 without root-free open-loop, 4 also without PLAN.md repos:\) \(mixed metrics/ versions\)",
+        match=r"METRICS_API 3, this trioctl requires 7 \(or 6 without frozen acceptance, 5 also without root-free open-loop, 4 also without PLAN.md repos:\) \(mixed metrics/ versions\)",
     ):
         trioctl._check_loop_core_api(metrics_dir / "trio_loop.py")
 

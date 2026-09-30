@@ -28,7 +28,7 @@ coordinator.
 2. Read `${OMNIGENT_HOME:-~/.omnigent}/agents/trio-omnigent-roles/registry.json`.
    It maps the two exact judgment-role names to persisted `agent_id` values.
    Its `_profile` must be exactly
-   `cursor-grok-4.6-medium+glm-5.2-max-v3`. A missing or different marker means
+   `cursor-grok-4.6-medium+glm-5.2-max-v4-acc`. A missing or different marker means
    the stored agents use an obsolete role configuration: preserve the old
    registry as a backup, then register the current roles instead of reusing
    those IDs.
@@ -37,6 +37,11 @@ coordinator.
    them by calling `sys_session_create(config_path=...)` once for each:
    - `omnigent/trio-omnigent-roles/lead`
    - `omnigent/trio-omnigent-roles/evaluator`
+   - `omnigent/trio-omnigent-roles/acceptance` (r19 acceptance author,
+     registry key `trio-omnigent-acceptance`; its model is templated from
+     the evaluator's, so it runs on the same tier; needed only while
+     `[acceptance] enabled`, but register it with the others so switching
+     it on needs no second registration)
    Create them idle and write each returned `agent_id` and
    `bootstrap_conversation_id` to the registry JSON, keyed by the exact role
    name, and write the exact `_profile` marker above. These idle sessions are
@@ -45,7 +50,9 @@ coordinator.
    `sys_session_close` on them. They MUST keep titles WITHOUT the
    `trioctl <mailbox.name> ` prefix (see step 2), so the step 8 prune
    backstop never matches them; never close or prune an anchor session.
-4. Require both exact names in the registry. Never choose by partial name.
+4. Require both exact names in the registry (and
+   `trio-omnigent-acceptance` when the acceptance switch is on; the doctor
+   checks it only then). Never choose by partial name.
    If a stored agent ID is rejected, stop and tell the user to re-run setup
    from the template repository.
 5. If roles remain missing outside the template repository, stop with setup
@@ -58,7 +65,10 @@ coordinator.
    `trioctl omnigent resolve lead --json`,
    `trioctl omnigent resolve evaluator --json`,
    `trioctl omnigent resolve builder --json`, and
-   `trioctl omnigent resolve scout --json`. Use the returned `model` and
+   `trioctl omnigent resolve scout --json` (with acceptance on, also
+   `trioctl omnigent resolve acceptance --json`: it must equal the
+   evaluator's model and effort; `trioctl omnigent doctor --acceptance`
+   FAILs otherwise). Use the returned `model` and
    `model` and `model_effort` values exactly. Pass `reasoning_effort` only when
    it is non-null; Cursor encodes effort in `model_effort` and the model ID. Never use
    `--allow-fallback` during a loop: unavailable or unentitled models must fail
@@ -277,7 +287,7 @@ verdict.
 - Open-loop extension (optional, gated on `loop/QUEUE.md` existing; absent → unchanged lockstep behavior above) — `QUEUE.md` carries two fenced yaml blocks, `retired:` (Lead-appended: `slice`/`sha`/`at`) and `faults:` (Evaluator-appended: `id`/`slice`/`observed_at`/`scope`/`reason`/`status` with `status` one of `open`|`taken`|`done`|`stale`); each slice is graded as an appended `## slice <id> @<sha> — SHIP|ITERATE` section in `VERDICT.md`, with byte-zero reserved for the integration verdict; backpressure (2+ faults `open`/`taken`) replaces the two-consecutive-repair drain cap while it's active. The automated driver, `python3 metrics/trio_loop.py run --mailbox <dir> --max-iterations N`, auto-selects open-loop when `QUEUE.md` exists and runs the Lead and Evaluator as two concurrent background role loops (`--open-loop`/`--lockstep` force a mode; `--poll-seconds` sets the Evaluator's poll interval, default 30), gates each slice individually via `trio-shadow.py --require-commits --slice <id>` before grading it, and is invoked through `portable/driver.sh` by exporting `TRIO_MODE` and `POLL_SECONDS`.
 - Original-goal planning — preserve GOAL.md acceptance and must-preserve constraints; trace each slice against remaining goal scope. If `knowledge.yaml` or `.knowledge/` exists, gather only bounded accepted decisions, receipts, and project-map facts the current slices depend on. Missing knowledge is not a blocker and must not be invented. Proposals are never accepted authority. Stale knowledge blocks only work that declared that dependency. Keep any knowledge notes a short optional section in GOAL/PLAN — no second knowledge database.
 - Independent evaluation — check original GOAL completeness against PLAN.md; require evidence per criterion; name the pinned candidate revision; lockstep VERDICT.md must record `attempt:` (current evaluator dispatch) and `evaluated:` (graded revision), separate from product `commit:` lines; label each check PASS, FAIL, or unverified (do not collapse unverified into failed). Remaining unverified GOAL criteria block whole-goal SHIP. Classify unavailable environment vs product failure. Implementer-authored tests are not the sole oracle. A slice passing does not close the whole GOAL. Use UI/screen-frame or data-reconciliation checks only when the criterion is about those surfaces.
-- Verification rigor — run every check yourself and prefer executing code over reading it; no SHIP (slice section or whole-goal) unless the verdict lists what you actively tried to break; `profile: data` work (or a diff touching SQL, pipelines, notebooks or dataframes) is graded on reconciliation against the source and your own re-run, never on unit tests alone.
+- Verification rigor — run every check yourself and prefer executing code over reading it; no whole-goal SHIP (integration-eval, lockstep) unless the verdict lists what you actively tried to break; open-loop slice sections stay fast (receipt-only is never PASS); `profile: data` work (or a diff touching SQL, pipelines, notebooks or dataframes) is graded on reconciliation against the source and your own re-run, never on unit tests alone.
 - Commit ownership (driver) — `trio-shadow.py --require-commits` is the product `slice(<id>):` gate before Evaluator. Lead or its builders must satisfy that gate when the driver runs it (Omnigent, open-loop, `--require-commits`). Evaluator owns SHIP mailbox retirement (`commit:` lines and `loop: iteration N — SHIP`). A wait timeout or runner exit 0 is not product SHIP. Missing retirement is recoverable finalization, not shipped.
 <!-- trio-protocol:end -->
 

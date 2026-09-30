@@ -737,46 +737,51 @@ section body **MUST NOT** contain any line beginning with `VERDICT:` —
 that token stays reserved for the integration verdict so existing verdict
 parsers are unaffected.
 
-### Evidence kinds and the per-accept table (r18a)
+### Evidence kinds and the slice summary line (r18a, trimmed in r19)
 
-Each per-slice section grades every `accepts:` item PASS, FAIL or
-`unverified` and names the evidence kind behind the grade:
+Each per-slice section grades the slice's `accepts:` items PASS, FAIL or
+`unverified` and names the evidence kind behind a grade:
 `re-run` (the Evaluator re-executed the behaviour at the pin), `probe`
 (its own check against the public surface), `implementer-test` (a
 builder/Lead test it ran — PASS only when not tautological and, for a
 `value`/`property` accept, shown to fail without the change) or `receipt`
 (a file someone else wrote — never PASS on its own). An accept that needs
 an environment the Evaluator cannot reach is graded `unverified` with
-`UNAVAILABLE(<reason>)` in its evidence column and listed on an
-`unavailable:` line: at slice level that gap alone is not an ITERATE (SHIP
-on the other accepts); the integration evaluation attempts every such
-accept itself or returns NEEDS_HUMAN listing them under `## Human check`
-(eval-r18a). When a slice changes a shared module the slice-eval also runs
-the existing suites that exercise it, and the integration evaluation runs
-the repo's full check. The section carries
+`UNAVAILABLE(<reason>)` and listed on an `unavailable:` line: at slice
+level that gap alone is not an ITERATE (SHIP on the other accepts); the
+integration evaluation attempts every such accept itself or returns
+NEEDS_HUMAN listing them under `## Human check` (eval-r18a). When a slice
+changes a shared module the slice-eval also runs the existing suites that
+exercise it, and the integration evaluation runs the repo's full check.
+
+**r19 C1 (slice-evals back to fast, independent of the acceptance
+switch):** a slice section names its failing or unverified accepts with
+their evidence kind and command, and ends with ONE summary line:
 
 ```markdown
-| # | accept | PASS / FAIL / unverified | evidence | command | key output |
-attacks:
-- <input, boundary, removal or injected fault> -> <what happened>
-- <second attack> -> <what happened>
-evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n> unverified=<n>
+evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
 
-A slice SHIP lists at least two attacks. Tests on the canonical
-evaluator's tautology list (string presence on files the slice or Lead
-wrote, one- or two-character `in` checks, `or`-chains satisfied by a
-header, asserting the literal the code writes, `--verify-only`/pass-flag
-readers, presence-only checks, a typecheck over `files: []`, tests that
-read the mailbox, `results/` or `evidence/`) are rejected by name.
+The per-accept table, the `attacks:` list, the independent probe and the
+re-execution duties (implement-then-smoke, `AUTHORED-BY: lead` receipt
+families, data-work re-run) are whole-goal duties: the lockstep verdict
+and the open-loop integration verdict carry them (the Omnigent driver
+appends the generated `integration-rigor.md` to those prompts only).
+Tests on the canonical evaluator's tautology list (string presence on
+files the slice or Lead wrote, one- or two-character `in` checks,
+`or`-chains satisfied by a header, asserting the literal the code writes,
+`--verify-only`/pass-flag readers, presence-only checks, a typecheck over
+`files: []`, tests that read the mailbox, `results/` or `evidence/`) are
+still rejected by name in slice sections.
 
 The Omnigent driver parses each slice section after the slice-eval returns
-(the `evidence:` line, else the table's evidence cells; the `attacks:`
+(the `evidence:` line, else a table's evidence cells; any `attacks:`
 items) and logs `- iter N | loop | slice <id> @<sha12> SHIP|ITERATE
 evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n>
-unverified=<n> attacks=<n> (shadow)` (`evidence: missing` when neither is
-present), records it under `quality` in `.driver.json`, and trio-shadow
-prints it. Telemetry only; nothing is gated in r18a.
+unverified=<n> attacks=<n|n/a> (shadow)` (`evidence: missing` when neither
+is present; `attacks=n/a` when the section lists none, the r19 norm),
+records it under `quality` in `.driver.json`, and trio-shadow prints it.
+Telemetry only.
 
 **Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
 builder, trioctl runs a deterministic AST/regex lint (no model call) over
@@ -946,6 +951,258 @@ new text names the dispatched slice or sha. Lockstep freshness is the
 dispatched `attempt:` (and pin on `commit:` when a git repo is visible),
 not an iteration-only leftover SHIP. Passing lockstep CLI tests does not
 mean open-loop artifact matching is qualified.
+
+## Frozen acceptance (r19, optional)
+
+Behind the switch `[acceptance] enabled` (trioctl.toml; CLI
+`--acceptance/--no-acceptance`; env `TRIO_ACCEPTANCE=0|1`; default
+**off**). A mailbox without `acceptance/` is checked and driven exactly as
+before. With the switch on, an independent **acceptance author** (a
+separate role on the Lead/Evaluator model tier, never the Lead) turns
+GOAL.md into black-box checks before any builder runs; the driver
+validates them at base, freezes them, and the PLAN must map every one.
+
+### `acceptance/` layout
+
+```
+<mailbox>/acceptance/
+  MANIFEST.json      # acceptance_version: 1 (JSON)
+  AUTHOR.md          # GOAL sentence inventory: testable-black-box /
+                     # testable-only-live / not-testable, drops + reasons
+  checks/acc_NN_<slug>.{py,sh,mjs}
+  checks/ACC-NN/...  # optional per-check files (only that check sees them)
+  fakes/...          # fake CLIs / loopback servers / fixtures (shared)
+  lib/...            # optional shared helpers (PYTHONPATH / NODE_PATH)
+  FROZEN             # written by the DRIVER: pin chain
+  AMENDMENTS.md      # created empty at freeze; append-only
+```
+
+`MANIFEST.json`: `acceptance_version: 1`, `goal_sha256`, `notes_sha256`,
+`base`, `author {role, model, effort, session, path}`, `budget_s` (<= 300),
+`setup: [{id, cmd, provides, network: allowed}]`, `bindings: {NAME:
+{default, goal_quote}}` and `checks: [{id: ACC-NN, goal_ref, goal_quote,
+kind, surface, run: [argv], expect: {exit: 0, stdout?|stderr?|output?: [regex]},
+timeout_s (<= 120), needs: [tool | setup:<id>], binds: [NAME], network:
+loopback}]`. `goal_quote` is a verbatim substring of GOAL.md (or
+`ACCEPTANCE-NOTES.md`). `kind`: `behaviour` (must FAIL at base, needs
+coverage), `doc` (help text/README obligation; must FAIL at base, needs
+coverage), `guard` (may PASS at base; at most 3; no coverage).
+
+Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
+PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
+(`timeout`), anything else ERROR -> re-run once -> FAIL (`error`). `expect`
+regexes match the full stream (first 1 MiB): `stdout`, `stderr`, or
+`output` (stdout then stderr), within min(`timeout_s`, 10 s) (else FAIL
+`pattern-timeout`); the 2 KB excerpt is evidence only. Each
+check runs in its OWN fresh copy of the tree (no .git/node_modules/caches/
+mailbox) with its own read-only view of the pack: its own files (named by
+its `run`, mentioned by them, or under `checks/<its id>/`) plus the shared
+ones (`fakes/`, `lib/`, interpreter-loaded names, unowned helpers); the
+view omits the metadata files and what the pin skips (`node_modules/`,
+`__pycache__/`, `.pytest_cache/`, `*.pyc`). No check can change another
+check's inputs. Loopback-only under bwrap when available (else `sandbox:
+none` with a dead proxy), the check's own Python run with `-P -s` when
+the code it runs comes from the pack (a script under `acceptance/`, `-c`,
+`-m` of an `acceptance/lib/` module; neither the script's directory, the
+tree nor user site is importable by it; `-m acceptance...` is invalid). A
+`run` that starts the product (`python3 app.py`, `python3 -m pkg`,
+`python3 -m pytest tests`) gets no flag, and flags are not inherited, so
+the product resolves imports normally; pytest on pack tests
+(`python3 -m pytest acceptance/...`) gets `-P` and `-p no:cacheprovider
+--confcutdir=<view> -c /dev/null --rootdir=<view>`, so no product
+conftest/ini/plugin applies; shared helpers live in
+`acceptance/lib/`, on `PYTHONPATH`/`NODE_PATH`), a controlled `PATH` (system
+directories plus the interpreter directories the driver resolved at
+start), no symlinks in the pack, env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
+`*_PASSWORD`/proxies and implicit-load variables (`PYTHONPATH`,
+`NODE_OPTIONS`, `BASH_ENV`, ...), with `ACC_TREE`, `ACC_DIR`, `ACC_WORK`,
+`ACC_ID`, `ACC_BIND_<NAME>`.
+
+`FROZEN` lines: `manifest_sha256`, `base`, `frozen_utc`, `author`,
+`dropped: <id> <reason>; ...`, then the pin chain `pin[0]: <sha256>
+freeze`, `pin[k]: <sha256> amend ACC-NN` / `restore`. `manifest_sha256` is
+the sha256 over the sorted `(relpath NUL bytes NUL)` of every pack file
+except `FROZEN` (`__pycache__`/`*.pyc` ignored).
+
+### PLAN.md mapping (METRICS_API 7)
+
+- Slice key **`covers: [ACC-NN, ...]`** (optional; flow or block list of
+  acceptance ids).
+- Plain lines under `## Verification standard`: **`lead_integration:`**
+  keeps its meaning (whole-goal deliverables) and its `ACC-NN` items are
+  the checks the Lead satisfies itself; **`acceptance_bindings: {NAME:
+  value}`** overrides a manifest binding's default (only declared names).
+- Every `behaviour`/`doc` id must appear in some slice's `covers:` or in
+  `lead_integration:`. The frozen checks are the GOAL's floor: PLAN may be
+  stricter, never looser.
+
+### Who may change `acceptance/`
+
+The Lead, builders, repair and slice-evals never do. The Lead files
+`ACCEPTANCE-DISPUTE: ACC-NN — <why; quote the GOAL>` lines in REPORT.md
+and still maps the check. Only the integration Evaluator amends, by the
+amendment protocol: `checks/<file>`, `fakes/**` and a check's `run`,
+`expect`, `timeout_s`, `binds`, `needs` may change (`id`, `goal_quote`,
+`kind` are immutable; no check is removed); every changed pack file must
+belong only to amended ids (every check that can load it: its `run`
+names it or its files mention it; a shared file -- `fakes/`, `lib/`,
+interpreter-loaded names, module shadows, unowned helpers -- belongs to
+every check); a new file may be added only under `checks/<ID>/` of an
+amended ID and must be used by no other check; an amended `run` may not
+point at another check's file; one `## ACC-NN · iter N ·
+evaluator · <utc>` record per amended id in `AMENDMENTS.md` (`goal_quote:`,
+`defect in check:`, `change:`); commit subject `acceptance: amend ACC-NN
+(evaluator, iter N): <reason>`, touching only `acceptance/`; at most 2
+amendments per loop and 25% of the checks; after the amendment the whole
+pack re-runs at base and every check that FAILed there before must still
+FAIL. Known limit (eval-r19c finding 2): that re-run is the only mechanical
+test, so a named, counted amended check can still be weakened conditionally
+on post-base state (FAIL at base, trivially PASS later); the budget, the
+AMENDMENTS.md record and the pin chain bound and expose it, and per-check
+isolation keeps it confined to the named checks. A human may change anything while the loop is stopped, only through
+`trioctl omnigent acceptance amend --human --ids ACC-NN,... --reason "..."
+[--adopt <sha>,...]` (refused while a driver holds or is taking the
+mailbox lock; the command holds the lock itself while it runs). It
+commits the working-tree edits as `acceptance: amend <ids> (human):
+<reason>`, adopts pack commits you already made since the pin only when you
+name them with `--adopt`, re-pins with an `Acceptance-Human-Amend: <shas>`
+trailer, and records the adoption in the driver state outside the repo.
+
+Resume never adopts: a hand-made `(human)` amend commit is restored as
+tamper and logged (``not adopted: resume never adopts``). Resume checks the
+driver state against the pin chain derived from git (a mismatch, or a lost
+state git cannot re-derive unambiguously, stops with NEEDS_HUMAN). A
+`(human)` amend commit that appears while the loop runs is a role's: the
+driver logs ``unauthenticated `(human)` label`` and judges it as an
+Evaluator amendment under every rule above (scope, record, budget,
+must-FAIL-at-base, no removal).
+
+### UNAVAILABLE
+
+A check that exits 77 or has an unmet `needs` is UNAVAILABLE. It never
+justifies ITERATE; with every other check passing the verdict must be
+NEEDS_HUMAN, listing the UNAVAILABLE checks and exact commands under
+`## Human check`.
+
+### `trio-check.py` findings
+
+Whenever `<mailbox>/acceptance/MANIFEST.json` exists these are
+**violations** (exit 1, not advisory): an invalid manifest or check;
+a `goal_quote` that is not verbatim in GOAL.md; the pack hash differing
+from FROZEN's last pin with no amend commit explaining it; an unmapped
+`behaviour`/`doc` id; an unknown id in `covers:`/`lead_integration:`; an
+`acceptance_bindings:` key the manifest does not declare. WARN: more than
+40% of the ids mapped only to `lead_integration:`; a `cli`/`http`/
+`function` check covered only by slices whose `writes:` are docs. With a
+pack present the r18a WARNs for a missing `goal_acceptance:` /
+`goal_probe:` are not emitted (the frozen pack replaces the Lead-authored
+goal acceptance). `coverage_refusals(mailbox)` exports the coverage part
+for the drivers.
+
+### Driver behaviour (acceptance on)
+
+- **Author phase.** The driver builds the export (`git archive <base>`,
+  no `.git`, mailbox dirs / archives / sessions / `.trio*` / `.cursor/` /
+  vendored metrics removed, GOAL.md + notes in `.acceptance-input/`) in its
+  state dir, dispatches the author (Cursor: registered
+  `trio-omnigent-acceptance`, Evaluator tier) alongside the first Lead
+  pass, audits the session's tool calls, validates on a fresh export, and
+  commits `acceptance: freeze <n> checks (<model>)` + `Acceptance-Pin:`.
+  STATE.md gains `acceptance_pin: <sha256[:16]> @<commit12>`; `.driver.json`
+  `acceptance {status, pin, pin_commit, ...}`; the pin chain lives in the
+  driver state file outside the repo
+  (`$XDG_STATE_HOME/trio-agent-loop/acceptance/...`,
+  `TRIO_ACCEPTANCE_STATE`).
+- **LOG lines** (`- iter N | loop | ...`): `acceptance: frozen <n>
+  check(s) @<sha12> pin <sha12> (dropped <k>; author <model>)`,
+  `acceptance: author retry: ...`, `acceptance: author session
+  contaminated (...)`, `acceptance tamper restored (<role>)`, `lead pass
+  refused: acceptance coverage`, `gate breach after lead: acceptance ...`,
+  `acceptance: integration pre-run @<sha12>: p/t PASS ... · unavailable=<n>`,
+  `acceptance: amendment of ACC-NN accepted|rejected: ...`, `acceptance:
+  forced NEEDS_HUMAN (acceptance-thrash|acceptance-amendments|
+  acceptance-unavailable): ...`, `acceptance: ship_unaccepted
+  (acceptance): ...`, `acceptance: SHIP gate: p/t PASS @<sha12>`,
+  `acceptance-unavailable-iterate`, `acceptance: unavailable=<n>`,
+  `acceptance: SHIP refused by the acceptance gate (verdict becomes
+  ITERATE|NEEDS_HUMAN)`, `acceptance stopped the loop
+  (acceptance-tamper-repeated|acceptance-goal-changed|
+  acceptance-restore-failed): ...`, `acceptance: human amendment of
+  ACC-NN re-pinned <sha12> (adopted <sha12>...)`, `acceptance: pin
+  re-derived from git history <sha12> @<sha12> (driver state was
+  missing)`, `acceptance: pack commits after the last driver pin <sha12>
+  are not adopted and are restored as tamper ...`, `acceptance: forced
+  NEEDS_HUMAN (acceptance-state-mismatch|acceptance-state-lost): ...`.
+- **Author audit.** Contamination is evidence of a *read* of the loop:
+  a tool-call argument, never a tool's output or chat text, that names a
+  path inside the loop repository (its checkout, git dir or mailbox;
+  relative paths resolve against the command line's tracked `cd`, and
+  `$HOME`, `~`, `$PWD` are expanded); an ancestor of it given to a
+  reading or searching command or as a bare tool path (`/` only for
+  recursive searchers); `cd` into it or an ancestor; `$OLDPWD`;
+  `/proc/<pid>/cwd|root`; or a lab hidden-pack path (`/hidden/`,
+  `speed/hard`). A mailbox file name (`PLAN.md`, `REPORT.md`, ...) counts
+  only inside the loop repository. Route literals (`/api/...`), `$TMPDIR`,
+  toolchain and system paths never contaminate. The audit is best-effort.
+  Without tool-call rows the limited audit flags only an authored pack
+  that spells the loop repository's path.
+- **Tamper escalation.** Every restored tamper counts in the driver state
+  (`tamper_events`, published in `.driver.json`). The second restored
+  tamper of the loop, in the same pass or a later one, stops it:
+  `status: error`, reason `acceptance-tamper-repeated`, exit 3. This is
+  §3.3's "a second breach sets status: error", counted loop-wide.
+- **SHIP refusal record.** When the acceptance gate turns an Evaluator
+  SHIP into ITERATE or NEEDS_HUMAN, the Evaluator may already have made its
+  `loop: iteration N — SHIP` retirement commit. The driver therefore
+  commits the LOG line as `loop: iteration N — acceptance gate refused
+  SHIP (<new verdict>)`. The subject never matches the `loop: iteration N
+  — SHIP` retirement needle.
+- **Resume.** The driver state is reconciled with the pin chain derived
+  from git; a mismatch forces `phase: acceptance-state-mismatch`, a lost
+  state that git cannot re-derive unambiguously
+  `phase: acceptance-state-lost` (both `status: needs_human`, exit 5).
+  Resume never adopts an amendment. A frozen pack whose MANIFEST
+  `goal_sha256` (read from git) no longer matches GOAL.md (a reused mailbox
+  with a new GOAL) is never used to judge it: `status: needs_human`,
+  `phase: acceptance-goal-changed`, exit 5. At every stop the driver calls
+  the runner's `sweep_role_processes()` when it has one.
+- **Driver commits** touching `acceptance/`: the freeze, `acceptance:
+  restore (tamper after <sha12>)`, `acceptance: pin <sha12> (amend ...)`
+  (each with `Acceptance-Pin:`; a human adoption's pin also carries
+  `Acceptance-Human-Amend: <amend shas>`); made under the worktree's
+  `index.lock`.
+- **Commit gate:** `trio-shadow.py --require-commits` rejects any other
+  commit touching the pack. It never trusts the working tree or a commit
+  subject.
+  - The pin chain is derived from git objects on the first-parent history
+    from `--acceptance-base`, else the driver state's run head, else the
+    root. The freeze is the first commit that adds `FROZEN` (a re-add is
+    tamper). A pin must extend `FROZEN` only and pin a legitimate
+    amendment (the Evaluator rules, discrimination re-run at the frozen
+    base, or an `Acceptance-Human-Amend:` adoption); a restore must put
+    back the current pin; HEAD's committed pack must be the last
+    legitimate pin.
+  - With the driver state visible (same `TRIO_ACCEPTANCE_STATE` /
+    `XDG_STATE_HOME`) it only adds strictness: freeze, pin and restore
+    commits must be the ones the driver recorded, a `(human)` amend must
+    be one it adopted, and its pin must be the chain's.
+  - Mailbox reuse without the driver state needs `--acceptance-base`.
+  - Only a genuine restore excuses the earlier tamper it restored.
+  - A `slice(<id>):` commit behind the freeze (a Lead take-over made while
+    the author was still working) is tolerated with an `acceptance note:`
+    line, because the author worked from the base export. A slice on a
+    line that does not contain the freeze fails ("acceptance/freeze
+    ordering").
+  - The driver's `gate breach` LOG line quotes the first `acceptance gate:`
+    reason.
+- **Phases:** `needs_human` with `phase: acceptance-thrash`,
+  `acceptance-amendments`, `acceptance-unavailable`,
+  `acceptance-goal-changed`, `acceptance-state-mismatch` or
+  `acceptance-state-lost`.
+- **`trioctl omnigent acceptance wait`** returns as soon as the driver
+  state says frozen, or when git shows the committed freeze of this
+  mailbox's pack with a clean `FROZEN`. The Lead's shell need not carry
+  the driver's state env.
 
 ## Mailbox placement standard
 
@@ -1206,13 +1463,14 @@ the dirty-checkout gate or the untracked-product scan.
 | 0 | `shipped` | SHIP accepted (retirement complete) and, root-free, landed (`phase: landed`); also a root mailbox that is already `shipped` (nothing run, r16b) |
 | 1 | unchanged, or `error` (`phase: driver-exception`) | trioctl error of a mailbox outside any git checkout (run in place); a dispatch exception is recorded in STATE/LOG/sidecars first (r15.x) |
 | 2 | `blocked` / unchanged | BLOCKED verdict; or start refused: `writes:` overlap a live loop of the same repository (stderr only, nothing created); or a refused flag combination (`--root-bound`, removed in r16b; an open-loop without isolated builders; a detached root without `--target`; `--root-free` outside git) |
-| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
+| 3 | `error` | loop error (stalled Lead, gate error, repo-scope refusal, unparseable verdict, old loop core, gitignored mailbox; r19: acceptance on with a loop core below METRICS_API 7 or a tier mismatch, a contaminated/failed/timed-out author, a second acceptance gate breach); root-free: setup failure (`phase: worktree-setup`) or any driver exception (`phase: driver-exception`, recorded by the same stop mechanism as exit 1) |
 | 4 | unchanged | `--max-iterations` reached |
 | 5 | `needs_human` / unchanged | NEEDS_HUMAN verdict; or the mailbox is owned by a live driver (left byte-identical; a registered driver, or a live pid in the root mailbox's `.lock`, eval-r16rc B1/M1). (r15.x's Lead-pass `writes-overlap` stop was removed in r16b: a mid-run overlap warns) |
 | 6 | `needs_retirement` | SHIP verdict whose retirement cannot complete |
 | 7 | `needs_human` | held dispatch (`.sessions/held-*.json`); resume after reconcile |
 | 8 | `needs_land` | root-free (r16): the verified loop branch could not land (`phase: land-blocked`, `land-conflict`, `land-starved`, `land-error`); resume with `trioctl omnigent land --mailbox <x>` |
 | 9 | — | retired in r16b (r15.x `root-occupied`: nothing runs at the root any more) |
+| 10 | unchanged | `trioctl omnigent run builder` only (r19, acceptance on): builder refused before any worktree -- pack not frozen, PLAN.md uncommitted, a frozen check unmapped, or the pack off its pin |
 | 130 | unchanged | interrupted (SIGINT/SIGTERM) |
 
 `reason:` (r15.x) is a driver-owned STATE.md line written with a driver
@@ -1297,6 +1555,26 @@ mailbox directory). They print as `quality: REJECT|WARN ...` lines and
 under `quality` in `--json`.
 
 ## Changelog
+
+- **METRICS_API 7** (r19 frozen acceptance, behind `[acceptance] enabled`,
+  default off): the `covers:` slice key and `parse_plan_acceptance`
+  (`lead_integration:` ACC ids, `acceptance_bindings:`) in trio-metrics;
+  `metrics/trio-acceptance.py` (runner, manifest, export, audit, driver
+  commits) joins the vendored set (five files; `metrics refresh` copies
+  it); trio-check `acceptance_findings`/`coverage_refusals` (violations
+  whenever a pack exists); trio-shadow's acceptance guard in
+  `--require-commits`; the loop core's `acceptance=` argument (author
+  phase, pin checks + restore, coverage gate, covered-check and
+  integration pre-runs, amendments, anti-thrash, SHIP gate) -- without it
+  both modes are unchanged. `trioctl` (`REQUIRED_METRICS_API = 7`,
+  `COMPATIBLE_METRICS_APIS = (4, 5, 6, 7)`, `ACCEPTANCE_METRICS_API = 7`)
+  refuses `--acceptance` on an older core and drives it unchanged
+  otherwise; builder exit 10; registry profile
+  `cursor-grok-4.6-medium+glm-5.2-max-v4-acc` with the optional
+  `trio-omnigent-acceptance` anchor. Independently of the switch (C1):
+  slice-eval sections carry one `evidence:` line (no table, attacks or
+  probe; `attacks=n/a` in the LOG line); the whole-goal rigor rides only on
+  integration-eval and lockstep prompts. See docs/FROZEN-ACCEPTANCE.md.
 
 - **r16b** (no METRICS_API bump: no loop-core change): lockstep runs
   root-free (Lead, repair and Evaluator in the Lead worktree; the land is

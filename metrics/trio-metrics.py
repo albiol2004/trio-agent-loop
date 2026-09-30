@@ -28,9 +28,12 @@ from pathlib import Path
 # `repo:` key of `retired:` entries; 6 = root-free open-loop (r16):
 # `loop_slug`, `live_mailbox`, the per-run declared-repo aggregate map
 # (`apply_aggregates`, honoured by `read_repos`/`declared_repos_for`) and the
-# loop core's `land=` hook (`needs_land`, exit 8). A copy without this
-# constant predates it.
-METRICS_API = 6
+# loop core's `land=` hook (`needs_land`, exit 8); 7 = frozen acceptance
+# (r19): the optional slice key `covers:`, `parse_plan_acceptance` (PLAN.md
+# `lead_integration:` ACC ids and `acceptance_bindings:`), and the loop
+# core's acceptance gates (pin check, coverage refusal, SHIP gate). A copy
+# without this constant predates it.
+METRICS_API = 7
 
 A_LEAD_RE = re.compile(
     r"^\s*-\s*(?:\w+\s+)?(?:iter|iteration)\s+(\d+)\s*\|\s*lead\s*\|",
@@ -102,6 +105,7 @@ FLOW_LIST_RE = re.compile(r"^\[(.*)\]$")
 ITEM_RE = re.compile(r"^\s*- (.+)$")
 SLICE_KEYS = (
     "id", "repo", "writes", "reads", "gate", "status", "iteration", "accepts",
+    "covers",
 )
 STATUS_VALUES = ("planned", "in_progress", "complete")
 
@@ -523,6 +527,16 @@ def parse_slices(lines: list[str]) -> list[dict]:
                     raise SliceParseError(f"line {i}: `repo:` needs a path value")
                 cur["repo"] = value
                 list_key = None
+            elif key == "covers":
+                # r19: the frozen acceptance check ids this slice satisfies.
+                # Only present when declared, so a PLAN without `covers:`
+                # parses to exactly the pre-r19 dicts.
+                if value:
+                    cur["covers"] = _parse_covers(_parse_flow_list(value, i), i)
+                    list_key = None
+                else:
+                    cur["covers"] = []
+                    list_key = key
             elif key in ("writes", "reads", "accepts"):
                 if value:
                     cur[key] = _parse_flow_list(value, i)
@@ -563,7 +577,10 @@ def parse_slices(lines: list[str]) -> list[dict]:
                     f"line {i}: expected a `- item` list entry under "
                     f"`{list_key}:`, got {stripped!r}"
                 )
-            cur[list_key].append(_unquote(m.group(1).strip()))
+            item = _unquote(m.group(1).strip())
+            if list_key == "covers":
+                item = _parse_covers([item], i)[0]
+            cur[list_key].append(item)
             continue
 
         raise SliceParseError(
@@ -578,6 +595,24 @@ def parse_slices(lines: list[str]) -> list[dict]:
             "(expected `slices:` followed by `- id:` entries)"
         )
     return slices
+
+
+#: A frozen acceptance check id (r19): `ACC-` then 1-4 digits.
+ACC_ID_RE = re.compile(r"^ACC-[0-9]{1,4}$")
+
+
+def _parse_covers(items: list[str], line: int) -> list[str]:
+    """`covers:` items must be acceptance check ids (`ACC-NN`)."""
+    out: list[str] = []
+    for item in items:
+        value = item.strip()
+        if not ACC_ID_RE.match(value):
+            raise SliceParseError(
+                f"line {line}: `covers:` item {value!r} is not an acceptance "
+                "check id like ACC-03"
+            )
+        out.append(value)
+    return out
 
 
 def parse_slices_block(plan_text: str) -> list[dict] | None:
@@ -1028,6 +1063,140 @@ def parse_repo_pins(values) -> list[tuple[str, str]]:
             if m:
                 pins.append((m.group(1) or HOME_REPO, m.group(2).lower()))
     return pins
+
+
+# --- Frozen acceptance (r19) -------------------------------------------------
+# MAILBOX-SCHEMA.md "Frozen acceptance (r19)". Plain lines under PLAN.md's
+# `## Verification standard` (never keys in the `slices:` block):
+#   lead_integration: [evidence/smoke.md, ACC-12]   # ACC ids the Lead satisfies
+#   acceptance_bindings: {STATS_ROUTE: /api/openrouter/stats}
+# `lead_integration:` keeps its pre-r19 meaning (whole-goal deliverables);
+# its `ACC-NN` items are the acceptance checks the Lead maps to itself.
+
+LEAD_INTEGRATION_KEY_RE = re.compile(r"^lead_integration\s*:\s*(.*)$")
+ACCEPTANCE_BINDINGS_KEY_RE = re.compile(r"^acceptance_bindings\s*:\s*(.*)$")
+BINDING_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _strip_comment(value: str) -> str:
+    """Drop a trailing ` # comment` outside quotes."""
+    quote: str | None = None
+    for pos, ch in enumerate(value):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (pos == 0 or value[pos - 1].isspace()):
+            return value[:pos].rstrip()
+    return value.strip()
+
+
+def _plain_key_blocks(plan_text: str, key_re: re.Pattern) -> list[tuple[int, str, list[str]]]:
+    """(line, inline value, indented follow lines) of every column-0 *key_re*
+    line outside code fences."""
+    lines = plan_text.splitlines()
+    out: list[tuple[int, str, list[str]]] = []
+    in_fence = False
+    for index, raw in enumerate(lines):
+        if raw.strip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = key_re.match(raw)
+        if not m:
+            continue
+        follow: list[str] = []
+        for nxt in lines[index + 1:]:
+            if not nxt.strip() or not nxt[:1].isspace():
+                break
+            follow.append(nxt.strip())
+        out.append((index + 1, _strip_comment(m.group(1)), follow))
+    return out
+
+
+def _plain_list_items(value: str, follow: list[str], line: int, what: str) -> list[str]:
+    if value.startswith("["):
+        if not value.endswith("]"):
+            raise SliceParseError(f"line {line}: {what}: flow list `[ ... ]` is not closed")
+        return [_unquote(p.strip()) for p in _split_flow_items(value[1:-1], line, what)]
+    if value:
+        return [_unquote(p.strip()) for p in re.split(r"[,\s]+", value) if p.strip()]
+    items = []
+    for ln in follow:
+        m = ITEM_RE.match(ln)
+        if m:
+            items.append(_unquote(_strip_comment(m.group(1)).strip()))
+    return items
+
+
+def parse_plan_acceptance(plan_text: str) -> dict:
+    """PLAN.md's acceptance mapping outside the slices block (r19).
+
+    Returns ``{"lead_integration": [ACC ids], "bindings": {NAME: value},
+    "errors": [...]}``. Items of `lead_integration:` that are not ACC ids
+    are deliverables (pre-r19 meaning) and are ignored here. Never raises.
+    """
+    lead: list[str] = []
+    bindings: dict[str, str] = {}
+    errors: list[str] = []
+    for line, value, follow in _plain_key_blocks(plan_text, LEAD_INTEGRATION_KEY_RE):
+        try:
+            items = _plain_list_items(value, follow, line, "lead_integration")
+        except SliceParseError as exc:
+            errors.append(f"PLAN.md {exc}")
+            continue
+        for item in items:
+            if ACC_ID_RE.match(item) and item not in lead:
+                lead.append(item)
+            elif re.match(r"^acc-\d", item, re.IGNORECASE) and not ACC_ID_RE.match(item):
+                errors.append(f"PLAN.md line {line}: lead_integration item {item!r} "
+                              "looks like a malformed acceptance id (expected ACC-NN)")
+    for line, value, follow in _plain_key_blocks(plan_text, ACCEPTANCE_BINDINGS_KEY_RE):
+        pairs: list[str]
+        if value.startswith("{"):
+            if not value.endswith("}"):
+                errors.append(f"PLAN.md line {line}: acceptance_bindings: flow mapping "
+                              "`{ ... }` is not closed")
+                continue
+            try:
+                pairs = _split_flow_items(value[1:-1], line, "acceptance_bindings")
+            except SliceParseError as exc:
+                errors.append(f"PLAN.md {exc}")
+                continue
+        elif value:
+            errors.append(f"PLAN.md line {line}: acceptance_bindings: expected a "
+                          "`{NAME: value}` mapping or indented `NAME: value` lines")
+            continue
+        else:
+            pairs = list(follow)
+        for pair in pairs:
+            name, sep, raw_val = pair.partition(":")
+            name = name.strip()
+            val = _unquote(_strip_comment(raw_val).strip())
+            if not sep or not BINDING_NAME_RE.match(name) or not val:
+                errors.append(f"PLAN.md line {line}: acceptance_bindings item "
+                              f"{pair.strip()!r} is not `NAME: value`")
+                continue
+            if name in bindings and bindings[name] != val:
+                errors.append(f"PLAN.md line {line}: acceptance_bindings: duplicate "
+                              f"binding {name!r}")
+                continue
+            bindings[name] = val
+    return {"lead_integration": lead, "bindings": bindings, "errors": errors}
+
+
+def plan_covers(slices: list[dict] | None) -> dict[str, list[str]]:
+    """``{ACC id: [slice ids covering it]}`` from parsed slices (r19)."""
+    out: dict[str, list[str]] = {}
+    for sl in slices or []:
+        for acc in sl.get("covers") or []:
+            out.setdefault(acc, [])
+            if sl["id"] not in out[acc]:
+                out[acc].append(sl["id"])
+    return out
 
 
 def _full_check_section(plan_text: str) -> list[str]:

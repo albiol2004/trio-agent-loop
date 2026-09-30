@@ -62,7 +62,9 @@ def test_refresh_copies_the_set_and_shows_a_diff_summary_without_committing(worl
     assert sorted(git(repo, "diff", "--name-only").splitlines()) == sorted([
         "metrics/trio-metrics.py", "metrics/trio_loop.py",
     ])
-    assert git(repo, "status", "--porcelain", "--untracked-files=all").count("??") == 0
+    # r19: the set gained trio-acceptance.py, new to a pre-r19 repo.
+    assert "metrics/trio-acceptance.py: added" in out or "trio-acceptance.py" in out
+    assert git(repo, "status", "--porcelain", "--untracked-files=all").count("??") == 1
 
 
 def test_refresh_commit_commits_only_the_metrics_files_on_the_current_branch(world, tmp_path):
@@ -72,10 +74,10 @@ def test_refresh_commit_commits_only_the_metrics_files_on_the_current_branch(wor
     code, out, err = _refresh(world, "--repo", str(repo), "--commit")
     assert code == 0, err
     subject = git(repo, "log", "-1", "--format=%s")
-    assert subject.startswith("chore: vendor trio loop core (") and "METRICS_API 6)" in subject
+    assert subject.startswith("chore: vendor trio loop core (") and "METRICS_API 7)" in subject
     assert git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feat/x"
     assert sorted(git(repo, "show", "--name-only", "--format=", "HEAD").splitlines()) == sorted([
-        "metrics/trio-metrics.py", "metrics/trio_loop.py",
+        "metrics/trio-acceptance.py", "metrics/trio-metrics.py", "metrics/trio_loop.py",
     ])
     assert git(repo, "diff", "--cached", "--name-only") == "README.md"  # user's staging kept
     assert "committed " in out and "on feat/x" in out
@@ -169,11 +171,11 @@ def test_refresh_from_a_bundle_without_pin_uses_the_sha256_pin(world, tmp_path, 
     monkeypatch.setattr(world.trioctl, "__file__", str(bundle / "omnigent" / "trioctl"))
     directory, pin = world.trioctl._release_metrics_source()
     assert directory == bundle / "metrics"
-    assert re.fullmatch(r"sha256:[0-9a-f]{12}, METRICS_API 6", pin), pin
+    assert re.fullmatch(r"sha256:[0-9a-f]{12}, METRICS_API 7", pin), pin
     repo = _old_repo(tmp_path / "repo")
     code, out, err = _refresh(world, "--repo", str(repo), "--commit")
     assert code == 0, err
     assert "no PIN file" in out
     assert git(repo, "log", "-1", "--format=%s") == f"chore: vendor trio loop core ({pin})"
     (bundle / "metrics" / "PIN").write_text("0123456789ab\n")
-    assert world.trioctl._release_metrics_source()[1] == "0123456789ab, METRICS_API 6"
+    assert world.trioctl._release_metrics_source()[1] == "0123456789ab, METRICS_API 7"

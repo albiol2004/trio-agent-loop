@@ -10,6 +10,18 @@ version = 1
 # Lead worktree (default: the repo's .cursor/worktrees.json setup-worktree).
 # worktree_setup = ["npm ci"]
 
+# r19 frozen acceptance (default off; CLI --acceptance/--no-acceptance and
+# env TRIO_ACCEPTANCE=0|1 override). When on, an independent acceptance
+# author (registered agent trio-omnigent-acceptance) writes black-box checks
+# from GOAL.md before any builder runs; the driver freezes them and the PLAN
+# must map every one. The author runs on the Lead/Evaluator tier: without a
+# [roles.acceptance] table it inherits [roles.evaluator] (a differing table
+# is a doctor FAIL). wait_s bounds the Lead's `trioctl omnigent acceptance
+# wait` and the driver's wait for the freeze.
+# [acceptance]
+# enabled = false
+# wait_s = 900
+
 # Cursor exposes account-entitled model IDs through `cursor-agent models`.
 # Effort is encoded in Cursor's model ID, so no separate reasoning override is
 # sent to Omnigent for these roles.

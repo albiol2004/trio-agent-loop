@@ -467,7 +467,10 @@ def test_prompt_open_loop_slice_eval_includes_slice_and_sha(
         "sha": "abc1234",
         "kind": "slice-eval",
     }
+    # r19 C1: a context-free (lockstep) evaluator prompt ends with the
+    # whole-goal rigor, which a slice-eval never carries.
     base_prompt = runner._prompt("evaluator", 5, mailbox)
+    base_prompt = base_prompt[: base_prompt.index("\n\n## Whole-goal verification rigor\n")] + "\n"
 
     prompt = runner._prompt("evaluator", 5, mailbox, context)
 

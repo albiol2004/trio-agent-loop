@@ -219,7 +219,7 @@ class OmnigentYamlDocument(unittest.TestCase):
             "*/config.yaml")))
 
     def test_role_configs_round_trip_byte_identically(self):
-        self.assertEqual(len(self.ROLE_CONFIGS), 5)
+        self.assertEqual(len(self.ROLE_CONFIGS), 6)  # r19: + acceptance
         for path in self.ROLE_CONFIGS:
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")

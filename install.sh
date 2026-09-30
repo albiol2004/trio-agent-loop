@@ -197,10 +197,19 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     fi
     OMNIGENT_ROLES_DEST="${OMNIGENT_HOME:-$HOME/.omnigent}/agents/trio-omnigent-roles"
     mkdir -p "$OMNIGENT_ROLES_DEST"
-    for role in lead evaluator builder scout docs; do
+    for role in lead evaluator builder scout docs acceptance; do
       rm -rf "$OMNIGENT_ROLES_DEST/$role"
       cp -r "$ROOT/omnigent/trio-omnigent-roles/$role" "$OMNIGENT_ROLES_DEST/"
     done
+    # r19: the acceptance author runs on the Evaluator's tier by construction:
+    # its executor model is templated from the installed evaluator config,
+    # never hand-written.
+    EVAL_MODEL="$(sed -n 's/^  model: //p' "$OMNIGENT_ROLES_DEST/evaluator/config.yaml" | head -n 1)"
+    if [ -n "$EVAL_MODEL" ]; then
+      sed "s/^  model: .*/  model: $EVAL_MODEL/" "$OMNIGENT_ROLES_DEST/acceptance/config.yaml" \
+        > "$OMNIGENT_ROLES_DEST/acceptance/config.yaml.tmp" \
+        && mv "$OMNIGENT_ROLES_DEST/acceptance/config.yaml.tmp" "$OMNIGENT_ROLES_DEST/acceptance/config.yaml"
+    fi
     CLAUDE_OMNIGENT_SKILL="$HOME/.claude/skills/trio-omnigent"
     CODEX_OMNIGENT_SKILL="$HOME/.agents/skills/trio-omnigent"
     TRIOCTL_BIN_DIR="${TRIOCTL_BIN_DIR:-$HOME/.local/bin}"
@@ -226,10 +235,13 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     # (sibling first), never a repository's vendored metrics/.
     cp "$ROOT/metrics/trio-check.py" "$TRIOCTL_BIN_DIR/trio-check.py"
     cp "$ROOT/metrics/trio-metrics.py" "$TRIOCTL_BIN_DIR/trio-metrics.py"
+    # r19 frozen acceptance runner (trio-check's coverage check and trioctl's
+    # `omnigent acceptance` commands load it as a sibling).
+    cp "$ROOT/metrics/trio-acceptance.py" "$TRIOCTL_BIN_DIR/trio-acceptance.py"
     # The release's loop-core set for `trioctl omnigent metrics refresh`
     # (vendored into repositories' metrics/; never loaded from here).
     mkdir -p "$TRIOCTL_BIN_DIR/trio-release-metrics"
-    for f in trio_loop.py trio-metrics.py trio-shadow.py trio-check.py; do
+    for f in trio_loop.py trio-metrics.py trio-shadow.py trio-check.py trio-acceptance.py; do
       cp "$ROOT/metrics/$f" "$TRIOCTL_BIN_DIR/trio-release-metrics/$f"
     done
     git -C "$ROOT" rev-parse --short=12 HEAD > "$TRIOCTL_BIN_DIR/trio-release-metrics/PIN" 2>/dev/null \
@@ -246,7 +258,9 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
       *) echo "Add $TRIOCTL_BIN_DIR to PATH before starting Claude, Codex, or Omnigent." ;;
     esac
     echo "Lead/Evaluator now use Cursor Grok 4.6 Medium; old Claude registration IDs must not be reused."
-    echo "When migrating, run 'trioctl omnigent configure --force', then register only Lead and Evaluator."
+    echo "When migrating, run 'trioctl omnigent configure --force', then register only Lead and Evaluator"
+    echo "(plus the acceptance author, trio-omnigent-acceptance, for r19 frozen acceptance); the"
+    echo "registry profile marker changed, so every anchor must be re-registered."
     exit 0 ;;
   --kimi)
     KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"

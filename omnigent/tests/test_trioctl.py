@@ -326,7 +326,7 @@ def test_cursor_lead_resolves_grok_medium():
 def test_registry_profile_tracks_stored_role_prompt_revision():
     trioctl = load_trioctl()
 
-    assert trioctl.REGISTRY_PROFILE == "cursor-grok-4.6-medium+glm-5.2-max-v3"
+    assert trioctl.REGISTRY_PROFILE == "cursor-grok-4.6-medium+glm-5.2-max-v4-acc"
 
 
 def test_codex_family_chooses_newest_available_model():
