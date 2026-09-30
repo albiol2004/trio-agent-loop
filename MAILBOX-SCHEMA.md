@@ -1758,8 +1758,8 @@ under `quality` in `--json`.
     the last prompt block `## Verified human answer (driver)` only when it
     answers the current stop (with acceptance on: rigor -> acceptance ->
     human answer); without HUMAN.md every prompt is unchanged. The ruling
-    Evaluator consumes it; a slice-eval, repair or acceptance author never
-    gets it. One `SAFE_GIT_CONFIG` tuple (human_ledger, copied into
+    Evaluator consumes it; a slice-eval receives it without consuming it;
+    repair and the acceptance author never get it. One `SAFE_GIT_CONFIG` tuple (human_ledger, copied into
     trio-metrics) on every dashboard, ledger, trio-metrics and trio-shadow
     `_git` call; `install.sh --omnigent` ships `human_ledger.py` next to
     trioctl, `--dashboard` ships `human_ledger.py` + `native_args.py`.
