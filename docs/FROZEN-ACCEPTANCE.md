@@ -556,6 +556,15 @@ trioctl omnigent acceptance validate --export .                                 
 
 ## Claude-native seams (N1–N4, later task)
 
+Native v0.1 does not implement them. Until it does, `native/launch.sh`
+(start and resume) prints a loud stderr warning and records
+`"acceptance": "unsupported-in-native-v01"` (plus `acceptance_detected`) in
+`<mailbox>/.native-result.json` whenever the mailbox has `acceptance/FROZEN`
+or the switch resolves ON (`TRIO_ACCEPTANCE`, else the profile's
+`[acceptance] enabled`); the run is otherwise unchanged, so it has no frozen
+SHIP gate, pre-runs or amendments (trio-shadow's pack guard still blocks
+tampering). Use `trioctl omnigent loop --acceptance` for a gated run.
+
 - `MODELS.acceptance = MODELS.evaluator`, with a tier-equality refusal at
   `begin`.
 - A `trio-acceptance` agent generated from `prompts/canonical/acceptance.md`

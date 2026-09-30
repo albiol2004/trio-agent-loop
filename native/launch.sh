@@ -43,6 +43,13 @@
 # run that never started writes neither file; its outcome instead goes to
 # <mailbox>/.native-runs/<session>.result.json. See README.md "Run registry
 # and result".
+#
+# Frozen acceptance (r19) is not implemented by native v0.1. When the mailbox
+# has acceptance/FROZEN, or TRIO_ACCEPTANCE / the profile's `[acceptance]
+# enabled` turns the switch on, the launcher prints a loud stderr warning and
+# records `"acceptance": "unsupported-in-native-v01"` (with
+# `acceptance_detected`) in .native-result.json and the printed result; the
+# run is otherwise unchanged (r20 review F6).
 set -euo pipefail
 
 CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
@@ -271,6 +278,47 @@ PY
 )" || exit 2
 { read -r session; read -r our_token; read -r args_json; read -r prev_record; read -r claim_snapshot; } <<<"$prep"
 
+# Frozen acceptance (r19) is NOT implemented by native v0.1: no frozen SHIP
+# gate, pre-runs or amendments (trio-shadow's pack guard still blocks pack
+# tampering). When this mailbox has a frozen pack, or the switch resolves ON
+# (TRIO_ACCEPTANCE, else the profile's `[acceptance] enabled`, as trioctl
+# resolves it), warn loudly and record `acceptance: unsupported-in-native-v01`
+# in the result (r20 review F6). The run itself is unchanged.
+acceptance_why="$(python3 - "$mailbox" <<'PY'
+import json, os, sys
+from pathlib import Path
+why = []
+if Path(sys.argv[1], "acceptance", "FROZEN").is_file():
+    why.append("frozen pack: acceptance/FROZEN")
+env = os.environ.get("TRIO_ACCEPTANCE", "").strip().lower()
+if env in ("1", "true", "on", "yes"):
+    why.append("TRIO_ACCEPTANCE=" + os.environ["TRIO_ACCEPTANCE"].strip())
+elif env not in ("0", "false", "off", "no"):
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    profile = base / "trio-agent-loop" / "omnigent.toml"
+    try:
+        import tomllib
+        table = tomllib.loads(profile.read_text(encoding="utf-8")).get("acceptance")
+    except (OSError, ValueError, ImportError):
+        table = None
+    if isinstance(table, dict) and table.get("enabled") is True:
+        why.append(f"profile: [acceptance] enabled = true ({profile})")
+print(json.dumps(why) if why else "")
+PY
+)" || acceptance_why=""
+if [ -n "$acceptance_why" ]; then
+  {
+    echo "launch.sh: WARNING: ================================================================"
+    echo "launch.sh: WARNING: frozen acceptance is NOT supported by the native v0.1 driver."
+    echo "launch.sh: WARNING: detected: $acceptance_why"
+    echo "launch.sh: WARNING: this run has NO frozen SHIP gate, pre-runs or amendments (the"
+    echo "launch.sh: WARNING: trio-shadow pack guard still blocks tampering). For an acceptance-"
+    echo "launch.sh: WARNING: gated run use \`trioctl omnigent loop --acceptance\`. Recorded as"
+    echo "launch.sh: WARNING: acceptance: unsupported-in-native-v01 in .native-result.json."
+    echo "launch.sh: WARNING: ================================================================"
+  } >&2
+fi
+
 if [ "$mode" = start ]; then
   prompt="Run the saved workflow trio-native with args ${args_json}. ${SUFFIX}"
   session_flags=(--session-id "$session")
@@ -311,14 +359,18 @@ set -e
 
 python3 - "$raw" "$rc" "$session" "$mode" "$record" "${prev_record:-}" \
   "$mailbox" "$claude_dir" "${run_id:-}" "$launcher_path" "$launched_at" \
-  "$our_token" "$claim_snapshot" "$self_dir" "$repo" <<'PY'
+  "$our_token" "$claim_snapshot" "$self_dir" "$repo" "$acceptance_why" <<'PY'
 import fcntl, glob, hashlib, json, os, re, stat, sys, tempfile, time
 from pathlib import Path
 raw, rc, session, mode, record, prev = sys.argv[1:7]
 mailbox, claude_dir, given_run_id, launcher_path, launched_at = sys.argv[7:12]
-our_token, claim_snapshot, self_dir, repo_dir = sys.argv[12:16]
+our_token, claim_snapshot, self_dir, repo_dir, acceptance_why = sys.argv[12:17]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
+# r20 F6: frozen acceptance detected but not implemented in native v0.1.
+ACCEPTANCE = ({"acceptance": "unsupported-in-native-v01",
+               "acceptance_detected": json.loads(acceptance_why)} if acceptance_why else {})
+launcher.update(ACCEPTANCE)
 
 
 def _read_bytes(path) -> bytes | None:
@@ -574,6 +626,7 @@ def persist(result):
                 "api_equiv_usd": lau.get("api_equiv_usd"),
                 "api_equiv_usd_note": lau.get("api_equiv_usd_note")})
     out.update(WORKFLOW_SCRIPT)
+    out.update(ACCEPTANCE)
     try:
         _write_json_atomic(Path(mailbox, ".native-result.json"), out)
     except OSError:
