@@ -17,8 +17,8 @@ repair slices launched concurrently on candidate `trioctl`
 
 | slice | duration | invocation |
 |---|---|---|
-| join-mode (Join Normal/Advanced via frozen `AscensiaMode`) | 57s (`56908889870` ns) | `f5d3b45e-998f-4324-ac85-2f7791388906` |
-| publication persistence (`ascensia.publication.request`) | 108s (`107735852377` ns) | `bd720ad2-19cf-44df-a668-ef5c7368e42d` |
+| join-mode (Join Normal/Advanced via a frozen mode enum) | 57s (`56908889870` ns) | `f5d3b45e-998f-4324-ac85-2f7791388906` |
+| publication persistence (publication request record) | 108s (`107735852377` ns) | `bd720ad2-19cf-44df-a668-ef5c7368e42d` |
 
 Overlap: `56908466000` ns (**56.908466 s**). Same `clock_domain`.
 Both `outcome`/`returncode` success. **~109 s** is the

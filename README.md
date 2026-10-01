@@ -75,7 +75,7 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ```bash
 ./install.sh --global            # ~/.claude — every project on this machine
 ./install.sh ~/src/myproject     # or per-project, committed to the repo
-./install.sh --omnigent          # Cursor Grok/Luna roles through Omnigent
+./install.sh --omnigent          # Cursor Grok/GLM 5.2 roles through Omnigent
 ./install.sh --kimi              # Kimi Code skills + sequential role runner
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
@@ -167,7 +167,7 @@ actor-critic literature (Reflexion, self-preference-bias papers):
   merging the Evaluator away is the one empirically bad move.
 
 ## Tuning
-- **Fable alternative**: change `model: claude-opus-5-5` → `model: fable` in
+- **Fable alternative**: change `model: opus` → `model: fable` in
   `trio-lead.md` and/or `trio-evaluator.md` — both roles are judgment-heavy;
   keep workers on Sonnet. Do NOT downgrade the Evaluator below the Lead's
   tier: a weak critic measurably hurts (91.4%→82.8% in one study).
@@ -242,12 +242,12 @@ channel the other native bundles don't expose. `omp -p "/trio auto"` runs the
 loop headless for CI.
 
 Omnigent adds two registered Cursor Grok 4.6 Medium agents for Lead/Evaluator.
-Their Scout/Builder delegation runs as ephemeral headless Cursor GPT-5.6 Luna
+Their Scout/Builder delegation runs as ephemeral headless Cursor GLM 5.2
 Max agents through the additive `trioctl` utility. `trioctl` resolves the
 user-editable runtime profile from Cursor's authenticated live model catalog,
 so model availability is checked before a loop starts. The already-open
 Claude/Codex UI session schedules Grok iterations; Lead and Evaluator decide
-and launch their own Luna delegation. There is no extra
+and launch their own GLM 5.2 delegation. There is no extra
 coordinator model and no persistent Cursor session competing for a workspace
 chat. See
 [SETUP-BY-OMNIGENT.md](SETUP-BY-OMNIGENT.md). The installer adds a
@@ -288,8 +288,8 @@ bridge/                              # cross-harness trio-bridge suggestion skil
   skills/trio-bridge/SKILL.md        # /trio-bridge — scan for background work
   commands/trio-bridge.md            # Omp native command source
   README.md                          # proposal card contract
-omnigent/trio-omnigent-roles/        # registered Grok agents + Luna role references
-  {lead,evaluator,builder,scout}/config.yaml
+omnigent/trio-omnigent-roles/        # registered Grok agents + GLM 5.2 role references
+  {lead,evaluator,builder,scout,docs,acceptance}/config.yaml
 omnigent/entrypoints/trio-omnigent/  # current-session orchestration skill
 omnigent/trioctl                     # resolver, doctor, headless Cursor runner
 omnigent/trioctl.example.toml        # preserved user-profile default

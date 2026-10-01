@@ -790,7 +790,6 @@ def test_real_corpus_scan_reports_zero_false_na():
     roots = [
         Path("/home/coder/workflow-lab/.runtime/parallel-worktree-isolation/speed/hard"),
         Path("/home/coder/workflow-lab/.runtime/parallel-worktree-isolation/eval-r18a"),
-        Path("/home/coder/ekona/syngenta"),
     ]
     if not any(root.is_dir() for root in roots):
         pytest.skip("read-only lab corpus not present in this environment")

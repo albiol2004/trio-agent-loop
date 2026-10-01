@@ -219,7 +219,7 @@ openrouter/D retained all 8 accepted/finished worktrees solely for
 ### Tracked project `.cursor` config (r14 W-2)
 
 A repository may COMMIT `.cursor/mcp.json` / `.cursor/hooks.json` carrying
-another Omnigent session's binding (live: syngenta_p_l tracked an `omnigent`
+another Omnigent session's binding (live: a client repo tracked an `omnigent`
 server on `/home/alex/...` and a usage stop hook; every builder/eval worktree
 was retained as `unsafe_cursor_config` and the slice-eval bind killed the
 driver). `create()` now neutralises such TRACKED files in the new worktree

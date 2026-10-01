@@ -149,7 +149,7 @@ def test_brief_cd_inside_repo_and_outside_section_is_fine(tmp_path):
 
 
 def test_legacy_repo_path_into_nested_clone_refused(tmp_path):
-    """Live layout (syngenta 2026-09-28): `repo: app-backend` names a
+    """Live layout (client repo 2026-09-28): `repo: app-backend` names a
     gitignored clone inside the mailbox dir; writes are relative to it."""
     slices = (
         "  - id: backend-bridge-basis\n    repo: app-backend\n"
