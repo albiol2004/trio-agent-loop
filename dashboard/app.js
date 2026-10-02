@@ -2910,7 +2910,7 @@ function renderGraphView() {
 /* --------------------------- sessions --------------------- */
 
 function sessionSignature(sessions) {
-  return sessions.map((s) => s.path + ":" + s.size).join("|");
+  return sessions.map((s) => (s.path ?? "") + ":" + (s.size ?? "") + ":" + (s.status ?? "")).join("|");
 }
 
 /* Transcripts tab with nothing selected: open the newest session so the
@@ -2929,8 +2929,9 @@ function openDefaultSession() {
     );
     return;
   }
-  const first = state.sessions.find((s) => s.kind !== "subagent") || state.sessions[0];
-  openSession(first.path);
+  const openable = state.sessions.filter((s) => s.path && s.status !== "deleted");
+  const first = openable.find((s) => s.kind !== "subagent") || openable[0];
+  if (first) openSession(first.path);
 }
 
 function renderSessionList() {
@@ -2951,7 +2952,7 @@ function renderSessionList() {
     return;
   }
 
-  const byPath = new Map(state.sessions.map((s) => [s.path, s]));
+  const byPath = new Map(state.sessions.filter((s) => s.path).map((s) => [s.path, s]));
   const childrenOf = new Map();
   const roots = [];
   for (const s of state.sessions) {
@@ -2993,10 +2994,18 @@ function renderSessionList() {
 }
 
 function sessionItem(s, depth = 0, subCount = 0) {
+  if (s.status === "deleted") {
+    /* The transcript file is gone (retention): a plain row, never a stream. */
+    const gone = document.createElement("div");
+    gone.className = "session-item session-deleted";
+    const text = String(s.label || s.id || "session");
+    gone.textContent = /deleted by retention/.test(text) ? text : text + " (deleted by retention)";
+    return gone;
+  }
   const item = document.createElement("button");
   item.type = "button";
   item.className = "session-item";
-  if (state.activePath === s.path) item.classList.add("active");
+  if (s.path && state.activePath === s.path) item.classList.add("active");
 
   const isSub = s.kind === "subagent";
   if (isSub) {

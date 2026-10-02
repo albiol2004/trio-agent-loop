@@ -227,6 +227,9 @@ INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
 LOOP_IDS_PATH = DASHBOARD_DIR / "loop_ids.py"
 """Canonical loop identity module, resolved relative to this file."""
 
+TRANSCRIPT_INDEX_PATH = DASHBOARD_DIR / "transcript_index.py"
+"""Session-id transcript index module, resolved relative to this file."""
+
 REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
 """Skill registry scanner, resolved relative to this file."""
 
@@ -284,6 +287,7 @@ _HEALTH_MODULE = None
 _BROKER_HTTP_MODULE = None
 _INBOX_STATE_MODULE = None
 _LOOP_IDS_MODULE = None
+_TRANSCRIPT_INDEX_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -592,6 +596,27 @@ def load_loop_ids_module():
         if not hasattr(module, fn):
             raise RuntimeError(f"loop ids module missing required function: {fn}")
     _LOOP_IDS_MODULE = module
+    return module
+
+
+def load_transcript_index_module():
+    """Load dashboard/transcript_index.py by path and cache the module."""
+    global _TRANSCRIPT_INDEX_MODULE
+    if _TRANSCRIPT_INDEX_MODULE is not None:
+        return _TRANSCRIPT_INDEX_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_transcript_index", TRANSCRIPT_INDEX_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"cannot load transcript index module: {TRANSCRIPT_INDEX_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for name in ("TranscriptIndex", "config_roots", "mailbox_session_refs"):
+        if not hasattr(module, name):
+            raise RuntimeError(
+                f"transcript index module missing required name: {name}")
+    _TRANSCRIPT_INDEX_MODULE = module
     return module
 
 
@@ -1301,6 +1326,9 @@ _BROKER_LISTING_LOCK = threading.Lock()
 def _broker_listing() -> dict:
     """Running broker sessions, with an explicit ``status``.
 
+    ``sessions`` lists every non-archived session read (id, title, workspace,
+    external_session_id, labels) for the transcript index.
+
     ``status`` is ``disabled`` (no broker URL), ``unreachable`` (any page
     failed: liveness from the broker is unknown, not "not running") or
     ``ok``. Only sessions whose status is ``running`` are kept.
@@ -1317,6 +1345,7 @@ def _broker_listing() -> dict:
         ):
             return cached
         running = []
+        sessions = []
         status = "ok"
         after = None
         complete = False
@@ -1338,6 +1367,15 @@ def _broker_listing() -> dict:
                 status = "unreachable"
                 break
             for item in data:
+                if isinstance(item, dict) and not item.get("archived"):
+                    labels = item.get("labels")
+                    sessions.append({
+                        "id": str(item.get("id") or ""),
+                        "title": str(item.get("title") or ""),
+                        "workspace": str(item.get("workspace") or ""),
+                        "external_session_id": item.get("external_session_id"),
+                        "labels": labels if isinstance(labels, dict) else {},
+                    })
                 if (
                     isinstance(item, dict)
                     and str(item.get("status", "")).lower() == "running"
@@ -1353,7 +1391,8 @@ def _broker_listing() -> dict:
                 break
         if status == "ok" and not complete:
             status = "truncated"
-        value = {"status": status, "running": running, "url": base_url}
+        value = {"status": status, "running": running, "sessions": sessions,
+                 "url": base_url}
         _BROKER_LISTING["value"] = value
         _BROKER_LISTING["at"] = time.monotonic()
         return value
@@ -2642,19 +2681,14 @@ def _session_files_for_loop(loop_dir: Path, root: Path) -> list[dict]:
         subagent transcripts are never hidden from the UI.
 
     The slug is derived from the loop's absolute path per the API contract.
-    Sessions are keyed by the omp run's cwd, so when the loop-specific slug
-    directory does not exist we fall back to the project root's slug (the
-    cwd under which this loop lives).
+    Only the loop's own slug directory is read: the project root's slug holds
+    every session started anywhere in the project, so it is never attached
+    to one loop (a loop's other sessions come from the session-id index).
     """
     candidates: list[Path] = []
-    seen = set()
-    for base in (loop_dir, root):
-        slug = _session_slug(base)
-        if slug:
-            d = SESSIONS_ROOT / slug
-            if d not in seen:
-                seen.add(d)
-                candidates.append(d)
+    slug = _session_slug(loop_dir)
+    if slug:
+        candidates.append(SESSIONS_ROOT / slug)
     for directory in candidates:
         try:
             top_level = [
@@ -4538,11 +4572,83 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # -- /api/sessions -----------------------------------------------------
 
+    def _loop_mailboxes(self, loop_dir: Path, root: Path) -> list[Path]:
+        """The loop's root mailbox first, then its live copy (r16 root-free
+        loops keep the live mailbox in their Lead worktree)."""
+        try:
+            target = Path(loop_dir).resolve()
+            for mailbox, read in _live_loop_dirs(self.server.metrics, root):
+                if target in (Path(mailbox).resolve(), Path(read).resolve()):
+                    out = [Path(mailbox)]
+                    if Path(read).resolve() != Path(mailbox).resolve():
+                        out.append(Path(read))
+                    return out
+        except (OSError, RuntimeError):
+            pass
+        return [Path(loop_dir)]
+
+    def _indexed_sessions(self, loop_dir: Path, root: Path) -> list[dict]:
+        """Transcript-index rows (Claude/Codex/Cursor by session id) for the
+        loop's mailbox(es): native-launch/sidecar/runs ids, the native-run
+        registry and broker sessions that name this mailbox."""
+        index = self.server.transcript_index()
+        mailboxes = self._loop_mailboxes(loop_dir, root)
+        reals = set()
+        for mailbox in mailboxes:
+            try:
+                reals.add(str(mailbox.resolve()))
+            except OSError:
+                reals.add(str(mailbox))
+        native_runs = []
+        for entry in _native_registry():
+            if str(entry.get("mailbox") or "") in reals:
+                native_runs.append(entry)
+        try:
+            listing = _broker_listing()
+        except Exception:  # noqa: BLE001 - the broker is optional
+            listing = {}
+        rows: list[dict] = []
+        seen: set[tuple] = set()
+        for mailbox in mailboxes:
+            try:
+                real_mailbox = str(mailbox.resolve())
+                root_real = str(Path(root).resolve())
+            except OSError:
+                continue
+            prefix = f"trioctl {mailbox.name} "
+            broker = []
+            for sess in listing.get("sessions") or []:
+                workspace = sess.get("workspace")
+                if not workspace:
+                    continue
+                try:
+                    workspace_real = str(Path(workspace).resolve())
+                except OSError:
+                    continue
+                # A session started in the mailbox is the loop's. One started
+                # at the repo root is attributed only through trioctl's
+                # ``trioctl <mailbox-dir> <role>`` title, as for liveness.
+                if workspace_real == real_mailbox or (
+                        workspace_real == root_real
+                        and str(sess.get("title") or "").startswith(prefix)):
+                    broker.append(sess)
+            for row in index.sessions_for_mailbox(
+                    mailbox, native_runs=native_runs, broker_sessions=broker):
+                key = (row.get("harness"), row.get("kind"),
+                       row.get("path") or row.get("id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+        return rows
+
     def _session_list(self, loop_dir: Path, root: Path) -> list[dict]:
         """Parents first (newest first), then subagents, for one loop.
 
-        Parents are omp sessions keyed by cwd plus the Omnigent session
-        exports in the mailbox's own ``.sessions/`` directory.
+        Parents are the Omnigent session exports in the mailbox's own
+        ``.sessions/`` directory, the sessions the transcript index finds by
+        id (Claude with its subagents, Codex, Cursor) and omp sessions keyed
+        by the loop's own cwd slug.
         """
         sessions = []
         loop_name = self.server.metrics.loop_name(root, loop_dir)
@@ -4555,6 +4661,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             session["parent_id"] = None
             session["parent_path"] = None
             sessions.append(session)
+        try:
+            sessions.extend(self._indexed_sessions(loop_dir, root))
+        except Exception:  # noqa: BLE001 - exports and omp sessions still list
+            traceback.print_exc()
         for desc in _session_files_for_loop(loop_dir, root):
             try:
                 session = _parse_session_file(desc["path"])
@@ -4566,8 +4676,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             sessions.append(session)
         parents = [s for s in sessions if s["kind"] == "parent"]
         subagents = [s for s in sessions if s["kind"] != "parent"]
-        parents.sort(key=lambda s: (s["timestamp"], s["label"]), reverse=True)
-        subagents.sort(key=lambda s: (s["timestamp"], s["label"]), reverse=True)
+        parents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)
+        subagents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)
         return parents + subagents
 
     def _find_loop_dir(self, name: str, root: Path) -> Path | None:
@@ -5162,12 +5272,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 continue
         return False
 
+    def _is_streamable_session(self, target: Path, root: Path | None) -> bool:
+        """A session export of one of root's loops, or a file the transcript
+        index has returned. On an index miss the loops' session lists are
+        built once and the check repeats (the index is empty after a server
+        restart until a list is requested)."""
+        if root is None:
+            return False
+        if self._is_mailbox_session(target, root):
+            return True
+        index = self.server.transcript_index()
+        if index.is_indexed(target):
+            return True
+        if not target.is_file():
+            return False
+        try:
+            for mailbox, read in _live_loop_dirs(self.server.metrics, root):
+                try:
+                    self._session_list(read, root)
+                except Exception:  # noqa: BLE001 - one bad loop never blocks
+                    traceback.print_exc()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        return index.is_indexed(target)
+
     def _validate_transcript_params(self, query: dict,
                                     root: Path | None = None) -> tuple[int, Path]:
         """Validate `path`/`offset` for the transcript endpoint.
 
-        The path must resolve under the omp sessions root or be a session
-        export inside a loop mailbox of the request's workspace root.
+        The path must resolve under the omp sessions root, be a session
+        export inside a loop mailbox of the request's workspace root, or be
+        a transcript file the session-id index returned for one of its loops.
         Raises ValueError with a client-safe message when invalid.
         """
         offset = 0
@@ -5189,7 +5324,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             target.relative_to(SESSIONS_ROOT.resolve())
         except ValueError:
-            if root is None or not self._is_mailbox_session(target, root):
+            if not self._is_streamable_session(target, root):
                 raise ValueError("invalid session path")
         if not target.is_file():
             raise ValueError("session file not found")
@@ -6252,6 +6387,8 @@ class DashboardServer(ThreadingHTTPServer):
         )
         self.root = self.default_root
         self.metrics = load_metrics_module()
+        self._transcript_index = None
+        self._transcript_index_lock = threading.Lock()
         self._overview_lock = threading.Lock()
         self._overview_state_lock = threading.Lock()
         self._overview_building = False
@@ -6261,6 +6398,16 @@ class DashboardServer(ThreadingHTTPServer):
         self._version = None
         self.get_workspace_seeds(force=True)
         super().__init__(address, DashboardHandler)
+
+    def transcript_index(self):
+        """The long-lived session-id transcript index, created lazily from
+        the current ``HOME`` (tests re-point it)."""
+        with self._transcript_index_lock:
+            index = self._transcript_index
+            if index is None or Path(index.home) != Path(HOME):
+                index = load_transcript_index_module().TranscriptIndex(HOME)
+                self._transcript_index = index
+            return index
 
     def overview(self, board_payload) -> dict:
         """Return every workspace's board without making viewers wait.
