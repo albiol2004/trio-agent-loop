@@ -70,15 +70,21 @@ def test_every_agent_call_carries_model_and_type() -> None:
     assert "effort: 'low'" in step_call
     # role agents: runAgentTwice gets agentType + model at every call site
     sites = [m.start() for m in re.finditer(r"await runAgentTwice\(", SRC)]
-    assert len(sites) == 5  # plan, solo lead, integrate, lead/repair retry, evaluator
+    # plan, solo lead, integrate, lead/repair retry, evaluator; r19 (only
+    # with args.acceptance): the acceptance author and the coverage re-plan
+    assert len(sites) == 7
     for start in sites:
         site = SRC[start:SRC.index("})", start)]
         assert "agentType:" in site and "model:" in site, site
-    assert "lead: 'claude-opus-5-5'" in SRC
-    assert "evaluator: 'claude-opus-5-5'" in SRC
-    assert "repair: 'claude-sonnet-5'" in SRC
-    assert "step: 'claude-sonnet-5'" in SRC
-    assert "builder: 'claude-sonnet-5'" in SRC
+    author = [SRC[st:SRC.index("})", st)] for st in sites
+              if "agentType: 'trio-acceptance'" in SRC[st:SRC.index("})", st)]]
+    assert len(author) == 1
+    assert "model: MODELS.acceptance" in author[0] and "isolation" not in author[0]
+    assert "lead: 'opus'" in SRC
+    assert "evaluator: 'opus'" in SRC
+    assert "repair: 'sonnet'" in SRC
+    assert "step: 'sonnet'" in SRC
+    assert "builder: 'sonnet'" in SRC
     builder_call = SRC[calls[2]:calls[2] + 400]
     for key in ("agentType: 'trio-builder'", "model: MODELS.builder",
                 "isolation: 'worktree'", "schema: BUILDER_SCHEMA"):
@@ -147,7 +153,7 @@ def seq(out: dict) -> list[str]:
     names = []
     for c in out["calls"]:
         if c["agentType"] == "trio-step":
-            names.append(re.search(r"op=(\w+)", c["prompt"]).group(1))
+            names.append(re.search(r"op=([\w-]+)", c["prompt"]).group(1))
         else:
             names.append(c["agentType"].replace("trio-", ""))
     return names
@@ -162,14 +168,14 @@ def test_harness_ship() -> None:
     assert seq(out) == ONE_PASS + ["end"]
     assert r["agents_used"] == 13
     roles = {c["agentType"]: c for c in out["calls"]}
-    assert roles["trio-lead"]["model"] == "claude-opus-5-5"
-    assert roles["trio-evaluator"]["model"] == "claude-opus-5-5"
-    assert roles["trio-step"]["model"] == "claude-sonnet-5"
+    assert roles["trio-lead"]["model"] == "opus"
+    assert roles["trio-evaluator"]["model"] == "opus"
+    assert roles["trio-step"]["model"] == "sonnet"
     assert all(c["schema"] for c in out["calls"] if c["agentType"] == "trio-step")
     lead = roles["trio-lead"]["prompt"]
     assert "does NOT apply inside this role" in lead
     assert roles["trio-builder"]["isolation"] == "worktree"
-    assert roles["trio-builder"]["model"] == "claude-sonnet-5"
+    assert roles["trio-builder"]["model"] == "sonnet"
     ev = roles["trio-evaluator"]["prompt"]
     assert ev.startswith("LOCKSTEP CONTEXT: attempt=att1 sha=sha1")
     assert "attempt: att1" in ev and "evaluated: sha1" in ev
@@ -303,7 +309,7 @@ def test_harness_scoped_iterate_runs_repair_on_sonnet() -> None:
                "args": {"max_agents": 20}})
     assert seq(out)[12:15] == ["next", "repair", "gate"]
     repair = next(c for c in out["calls"] if c["agentType"] == "trio-repair")
-    assert repair["model"] == "claude-sonnet-5"
+    assert repair["model"] == "sonnet"
     assert "| repair |" in repair["prompt"]
     assert "scope=local:app.py" in repair["prompt"]
 

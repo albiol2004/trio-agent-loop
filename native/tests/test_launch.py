@@ -85,7 +85,7 @@ def test_start_flags_prompt_and_parse(box: Path, tmp_path: Path) -> None:
     assert '"max_iterations":3' in prompt and f'"mailbox":"{box}"' in prompt
     for flag, value in (("--permission-mode", "auto"),
                         ("--settings", '{"worktree":{"baseRef":"head"}}'),
-                        ("--model", "claude-opus-5-5"),
+                        ("--model", "opus"),
                         ("--output-format", "json")):
         assert argv[argv.index(flag) + 1] == value
     session = argv[argv.index("--session-id") + 1]

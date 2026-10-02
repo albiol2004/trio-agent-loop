@@ -33,12 +33,100 @@ let lastConflictBranches = []
 const builderRuns = {}
 const verifyRuns = {}
 
+// r19 frozen acceptance (only when the script passes --acceptance):
+// sc.acc = {tier_refuse, begin_stop, begin_frozen, freeze: [actions],
+// coverage: [bool per call], stop_on_refusal_2, errors: [..] (next),
+// refuse_ship: [verdict indexes], pending: {op: n}, run_stop}
+const ACC = sc.acc || {}
+let accFrozen = !!ACC.begin_frozen
+let freezeIdx = 0
+let coverageIdx = 0
+const pendingLeft = Object.assign({}, ACC.pending || {})
+const accDigest = () => accFrozen
+  ? { status: 'frozen', pin: 'PIN0123456789', pin_commit: 'PC0123456789', freeze_commit: 'PC0123456789',
+      tamper_events: 0, amendments: 0, checks: 6, path: '/usr/bin:/bin', tool: '/rel/metrics/trio-acceptance.py' }
+  : { status: 'authoring', pin: null, pin_commit: null, tamper_events: 0, amendments: 0, checks: null,
+      path: '/usr/bin:/bin', tool: '/rel/metrics/trio-acceptance.py' }
+
+function accStepResult(op, base, flag) {
+  switch (op) {
+    case 'acceptance-export':
+      if (accFrozen) return { ...base, frozen: true, acceptance: accDigest() }
+      return { ...base, frozen: false, export: '/state/loop-x/export', base: 'BASESHA000000', marker: 'EXEC-1',
+        notes: false, removed: 3, tool: '/rel/metrics/trio-acceptance.py', acceptance: accDigest() }
+    case 'acceptance-freeze': {
+      const action = (ACC.freeze || ['frozen'])[freezeIdx++] || 'frozen'
+      if (action === 'stop') return { ...base, action: 'stop', acceptance: { stop: { status: 'error', code: 3,
+        reason: 'acceptance-contaminated', detail: 'the re-run author session was contaminated too' } } }
+      if (action === 'frozen') accFrozen = true
+      return { ...base, action, checks: 6, dropped: action === 'retry' ? [['ACC-02', 'passes-at-base']] : [],
+        fatal: [], prefix: action === 'reauthor' ? 'YOUR PREVIOUS ATTEMPT WAS DISCARDED' : undefined,
+        hits: action === 'reauthor' ? ['reads inside the loop repository: /repo/loop/PLAN.md'] : undefined,
+        audit: { limited: true }, acceptance: accDigest() }
+    }
+    case 'coverage': {
+      const ok = (ACC.coverage || [true])[coverageIdx++] ?? true
+      const attempt = Number(flag('attempt'))
+      if (!ok && attempt >= 2) return { ...base, covered_ok: false, refusals: ['unmapped acceptance check(s): ACC-02'],
+        briefs: {}, acceptance: { stop: { status: 'error', code: 3, reason: 'acceptance-coverage',
+          detail: 'the re-planned Lead pass was refused again' } } }
+      return { ...base, covered_ok: ok, refusals: ok ? [] : ['structured plan: unmapped acceptance check(s): ACC-02'],
+        briefs: ok ? { app: '## Acceptance (frozen; do not edit)\n- ACC-01 (behaviour): "prints hello"\n' } : {},
+        acceptance: accDigest() }
+    }
+    case 'acceptance-run':
+      if (ACC.run_stop) return { ...base, text: '', passed: 0, failed: 0, unavailable: 0, total: 0,
+        acceptance: { stop: { status: 'needs_human', code: 5, reason: 'acceptance-pin-unreadable', detail: 'x' } } }
+      return { ...base, text: `FROZEN ACCEPTANCE @${flag('sha')}: 5/6 PASS (manifest PIN012345678; sandbox none)`,
+        passed: 5, failed: 1, unavailable: 0, total: 6, amendments_left: 1, acceptance: accDigest() }
+  }
+  return null
+}
+
 function stepResult(op, nonce, prompt) {
   const flag = name => {
     const m = prompt.match(new RegExp(`--${name} '([^']*)'`))
     return m ? m[1] : null
   }
   const base = { ok: true, op, nonce }
+  const accOn = flag('acceptance') === '1'
+  if (accOn && pendingLeft[op] > 0) {
+    pendingLeft[op] -= 1
+    return { ...base, pending: true, job: `${op}-job` }
+  }
+  if (accOn) {
+    const r = accStepResult(op, base, flag)
+    if (r) return r
+  }
+  const out = baseStepResult(op, base, flag)
+  if (!accOn || !out.ok) return out
+  switch (op) {
+    case 'begin':
+      if (ACC.begin_stop) return { ...out, acceptance: { stop: { status: 'needs_human', code: 5,
+        reason: 'acceptance-goal-changed', detail: 'GOAL.md no longer matches' } } }
+      return { ...out, acceptance: accDigest() }
+    case 'next':
+      if (out.action === 'lead' || out.action === 'repair') {
+        return { ...out, acceptance: { ...accDigest(), ...(ACC.errors && out.iteration === 2 ? { errors: ACC.errors } : {}) } }
+      }
+      return out
+    case 'gate': return { ...out, acceptance: accDigest() }
+    case 'apply': {
+      if ((ACC.refuse_ship || []).includes(verdictIdx - 1)) {
+        lastVerdict = 'ITERATE'
+        return { ...out, verdict: 'ITERATE', scope: null, stop: false, status: 'running', code: null, commit_shas: [],
+          acceptance: { ...accDigest(), verdict_in: 'SHIP', verdict_out: 'ITERATE', ship_refused: true,
+            ship_gate: { passed: 5, failed: 1, unavailable: 0, total: 6 } } }
+      }
+      return { ...out, acceptance: { ...accDigest(), verdict_in: out.verdict, verdict_out: out.verdict,
+        ship_refused: false, ship_gate: out.verdict === 'SHIP' ? { passed: 6, failed: 0, unavailable: 0, total: 6 } : null } }
+    }
+    case 'end': return { ...out, acceptance: { enabled: true, status: 'frozen', pin: 'PIN0123456789', checks: 6 } }
+  }
+  return out
+}
+
+function baseStepResult(op, base, flag) {
   switch (op) {
     case 'begin': return { ...base, mode: 'lockstep', repo: '/repo', iteration: sc.begin_iteration || iteration,
       status: 'ready', phase: 'idle', lock_owner: 'workflow:x',
@@ -132,15 +220,15 @@ function stepResult(op, nonce, prompt) {
       scratch_removed: sc.scratch_removed || [], scratch_kept: sc.scratch_kept || [],
       scratch_left: sc.scratch_left || [], eval_worktrees_left: sc.eval_worktrees_left || [] }
   }
-  return { ok: false, op, nonce, error: 'unknown op' }
+  return { ok: false, op, nonce: base.nonce, error: 'unknown op' }
 }
 
 async function agent(prompt, opts = {}) {
   calls.push({ agentType: opts.agentType, model: opts.model, effort: opts.effort, schema: !!opts.schema,
     label: opts.label, isolation: opts.isolation || null, schemaKeys: opts.schema ? Object.keys(opts.schema.properties) : null,
-    prompt })
+    schemaJson: opts.schema ? JSON.stringify(opts.schema) : null, prompt })
   if (opts.agentType === 'trio-step') {
-    const m = prompt.match(/op=(\w+), nonce=([^)]+)\)/)
+    const m = prompt.match(/op=([\w-]+), nonce=([^)]+)\)/)
     if (sc.held_op === m[1]) {
       return { exit_code: -1, stdout: '', held: true,
         denial: 'Permission to use Bash has been denied by the auto mode classifier' }
@@ -160,8 +248,14 @@ async function agent(prompt, opts = {}) {
   const role = opts.agentType.replace('trio-', '')
   if ((sc.die || []).includes(role)) return null
   if (role === 'lead' && opts.schema && opts.schema.properties.slices) {
-    return { slices: sc.plan || [{ id: 'app', brief: 'build app.py', writes: ['app.py'], reads: [], depends: [] }],
+    return { slices: sc.plan || [{ id: 'app', brief: 'build app.py', writes: ['app.py'], reads: [], depends: [],
+      ...(opts.schema.properties.lead_integration ? { covers: ['ACC-01'] } : {}) }],
+      ...(opts.schema.properties.lead_integration ? { lead_integration: ['ACC-02'], acceptance_bindings: {} } : {}),
       ...(sc.plan_denials ? { denials: sc.plan_denials } : {}) }
+  }
+  if (role === 'acceptance') {
+    if ((sc.die || []).includes('acceptance')) return null
+    return { checks: 6, summary: 'wrote 6 checks' }
   }
   if (role === 'lead' && opts.schema && opts.schema.properties.conflicts) {
     integrateIdx += 1

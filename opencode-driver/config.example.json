@@ -1,0 +1,37 @@
+{
+  "opencode_bin": "opencode",
+  "models": {
+    "lead": "opencode-go/deepseek-v4.1-flash",
+    "evaluator": "opencode-go/deepseek-v4.1-flash",
+    "acceptance": "opencode-go/deepseek-v4.1-flash",
+    "builder": "opencode-go/glm-5.3-flash",
+    "scout": "opencode-go/glm-5.3-flash",
+    "repair": "opencode-go/glm-5.3-flash"
+  },
+  "variants": {
+    "lead": null,
+    "evaluator": null,
+    "builder": null,
+    "scout": null,
+    "repair": null,
+    "acceptance": null
+  },
+  "provider": {
+    "id": "opencode-go",
+    "key_file": "~/Documents/OpenCodeKey.txt",
+    "key_env": "OPENCODE_API_KEY"
+  },
+  "timeouts": {
+    "turn_seconds": 3600,
+    "idle_seconds": 600,
+    "evaluator_turn_seconds": 5400
+  },
+  "retries": {
+    "max_attempts": 3,
+    "backoff_seconds": [10, 30, 90],
+    "idle_retry_unlimited": false
+  },
+  "max_iterations": 4,
+  "root_free": true,
+  "container_mode": false
+}

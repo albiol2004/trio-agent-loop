@@ -1535,11 +1535,39 @@ def command_acceptance(args: argparse.Namespace) -> int:
             ids = [i.strip() for i in args.ids.split(",") if i.strip()]
             adopt = [a.strip() for a in (getattr(args, "adopt", None) or "").split(",")
                      if a.strip()]
+            native = _native_step_for(mailbox, controller)
+            if native is not None:
+                return native.cli_human_amend(mailbox, controller, ids, args.reason, adopt)
             return controller.human_amend(ids, args.reason, adopt=adopt)
         finally:
             if callable(release):
                 release(lock)
     raise TrioctlError(f"unknown acceptance command {sub!r}")
+
+
+def _native_step_for(mailbox: Path, controller: Any) -> Any:
+    """eval-r19n2: a mailbox the Claude-native helper keeps a sealed
+    acceptance record for (``<git-common-dir>/trio-native/<key>/
+    acc-sealed.json``, key as in native/trio_native_step.py) is amended
+    through that helper, so the adoption lands in the sealed record, the
+    native loop's only source of truth across runs. None otherwise."""
+    common = subprocess.run(["git", "--no-replace-objects", "-C", str(controller.repo), "rev-parse",
+                             "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True).stdout.strip()
+    key = hashlib.sha256(str(Path(mailbox).resolve()).encode()).hexdigest()[:16]
+    if not common or not os.path.lexists(Path(common) / "trio-native" / key / "acc-sealed.json"):
+        return None
+    step = Path(os.environ.get("TRIO_NATIVE_STEP") or
+                Path(__file__).resolve().parent.parent / "native" / "trio_native_step.py")
+    if not step.is_file():
+        raise TrioctlError(f"{mailbox} is kept by the Claude-native helper (a sealed acceptance "
+                           f"record), but {step} is missing: run trioctl from the release "
+                           "checkout or set TRIO_NATIVE_STEP")
+    loader = importlib.machinery.SourceFileLoader("trio_native_step_cli", str(step))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    loader.exec_module(module)
+    return module
 
 
 def _committed_freeze(ta: Any, repo: Path | None, mailbox: Path) -> tuple[str, str] | None:

@@ -2509,7 +2509,11 @@ class AcceptanceController:
                 raise AcceptanceNeedsHuman(
                     reason, f"the driver state's run head {start[:12]} is not an ancestor of HEAD")
             start = None
-        chain = ta.derive_pin_chain(self.repo, self.acc_rel, start, verify=True)
+        # The native helper sets ``chain_record`` from its sealed record
+        # (eval-r19n2): only commits it made or recorded pin; unset (the
+        # Cursor driver, the CLI), the chain is derived structurally.
+        chain = ta.derive_pin_chain(self.repo, self.acc_rel, start, verify=True,
+                                    **(getattr(self, "chain_record", None) or {}))
         if chain["freeze_commit"] is None:
             raise AcceptanceNeedsHuman(
                 reason, f"git history has no valid driver freeze of {self.acc_rel}/"

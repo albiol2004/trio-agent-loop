@@ -1266,6 +1266,15 @@ function renderActions(data) {
   if (detail.run_id) parts.push("run " + detail.run_id);
   if (detail.session_id) parts.push("session " + String(detail.session_id).slice(0, 8));
   if (detail.api_equiv_usd != null) parts.push("≈$" + Number(detail.api_equiv_usd).toFixed(2) + " API-equivalent");
+  if (detail.acceptance) {
+    const a = detail.acceptance;
+    parts.push("frozen acceptance " + (a.checks || 0) + " checks" + (a.pin ? " pin " + a.pin : "") +
+      (a.ship_gate ? ", SHIP gate " + a.ship_gate : "") +
+      (a.coverage_refusals ? ", " + a.coverage_refusals + " coverage refusal(s)" : "") +
+      (a.ship_refused ? ", " + a.ship_refused + " SHIP refused" : "") +
+      (a.tamper_events ? ", " + a.tamper_events + " tamper restore(s)" : "") +
+      (a.audit_limited ? ", author audit limited" : ""));
+  }
   el("actions-state").textContent = parts.join(" · ");
 
   const sel = el("diagnose-harness");

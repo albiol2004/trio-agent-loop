@@ -522,6 +522,36 @@ def _native_registry_entry(mailbox: Path) -> dict | None:
     return next((e for e in _native_registry() if e["mailbox"] == target), None)
 
 
+OPENCODE_REGISTRY_SECONDS = NATIVE_REGISTRY_SECONDS
+_OPENCODE_REGISTRY = {"at": 0.0, "home": None, "value": []}
+_OPENCODE_REGISTRY_LOCK = threading.Lock()
+
+
+def _opencode_registry() -> list[dict]:
+    """Registered trio-opencode runs (opencode-dash run registry), cached."""
+    now = time.monotonic()
+    with _OPENCODE_REGISTRY_LOCK:
+        if (_OPENCODE_REGISTRY["home"] == str(HOME)
+                and now - _OPENCODE_REGISTRY["at"] <= OPENCODE_REGISTRY_SECONDS):
+            return list(_OPENCODE_REGISTRY["value"])
+    try:
+        value = load_loop_actions_module().opencode_registry(HOME)
+    except Exception:  # noqa: BLE001 - the board renders without it
+        traceback.print_exc()
+        value = []
+    with _OPENCODE_REGISTRY_LOCK:
+        _OPENCODE_REGISTRY.update(at=now, home=str(HOME), value=value)
+    return list(value)
+
+
+def _opencode_registry_entry(mailbox: Path) -> dict | None:
+    try:
+        target = str(Path(mailbox).resolve())
+    except OSError:
+        return None
+    return next((e for e in _opencode_registry() if e["mailbox"] == target), None)
+
+
 def load_inbox_state_module():
     """Load dashboard/inbox_state.py by path and cache the module."""
     global _INBOX_STATE_MODULE
@@ -856,6 +886,7 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
     live_fn = getattr(metrics, "live_mailbox", None)
     pairs = []
     found = list(_discover_loops_cached(root))
+    opencode_live: dict[Path, Path] = {}
     # native-dash: registered claude-workflow mailboxes below this root that
     # the loop*/ rule misses (any mailbox name, hidden dirs included).
     try:
@@ -869,6 +900,23 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
             if mbox not in known and owned:
                 found.append(mbox)
                 known.add(mbox)
+        # opencode-dash: registered trio-opencode mailboxes, same rule; when
+        # the record names a valid live_mailbox (its Lead worktree copy,
+        # already strictly validated by opencode_registry), the board reads
+        # that copy under the root mailbox's name, as the root-free case does.
+        for entry in _opencode_registry():
+            mbox = Path(entry["mailbox"])
+            repo = entry.get("repo")
+            owned = (Path(repo).resolve() == root_real if repo
+                     else _path_is_under(mbox, root_real))
+            if not owned:
+                continue
+            if mbox not in known:
+                found.append(mbox)
+                known.add(mbox)
+            live_mailbox = entry.get("live_mailbox")
+            if live_mailbox:
+                opencode_live[mbox.resolve()] = Path(live_mailbox)
     except OSError:
         pass
     try:
@@ -879,12 +927,13 @@ def _live_loop_dirs(metrics, root: Path) -> list[tuple[Path, Path]]:
         # A mailbox dir that is a symlink out of the workspace is not one of
         # its loops (eval finding 4): never listed, never acted on.
         try:
-            if not _path_is_under(Path(loop_dir).resolve(), root_real):
+            loop_real = Path(loop_dir).resolve()
+            if not _path_is_under(loop_real, root_real):
                 continue
         except OSError:
             continue
-        live = None
-        if live_fn is not None:
+        live = opencode_live.get(loop_real)
+        if live is None and live_fn is not None:
             try:
                 live = live_fn(loop_dir)
             except Exception:  # noqa: BLE001 - the root copy still renders
@@ -996,7 +1045,7 @@ def _driver_snapshot(loop_dir: Path) -> dict | None:
     if not isinstance(sessions, dict):
         sessions = {}
     driver = state.get("driver")
-    if driver not in ("portable", "omnigent"):
+    if driver not in ("portable", "omnigent", "opencode"):
         driver = _driver_from_cmdline(pid)
     phase = state.get("phase")
     if phase is not None:
@@ -1030,6 +1079,13 @@ def _read_session_sidecar(loop_dir: Path) -> dict | None:
     except (OSError, ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _is_opencode_loop(loop_dir: Path) -> bool:
+    """Whether this mailbox's session sidecar names the trio-opencode driver
+    (persists across restarts, unlike the live ``.driver.json``)."""
+    session = _read_session_sidecar(loop_dir)
+    return bool(session and session.get("driver") == "opencode")
 
 
 _PROC_SNAPSHOT = threading.local()
@@ -1321,9 +1377,9 @@ def _broker_session_ids(
         session_ids = driver_state.get("session_ids")
         if isinstance(session_ids, dict):
             values.extend(session_ids.values())
-    if session_state and session_state.get("driver") != "claude-workflow":
-        # A claude-workflow sidecar's "session" is its run token, not a
-        # broker session (native-dash).
+    if session_state and session_state.get("driver") not in ("claude-workflow", "opencode"):
+        # A claude-workflow or trio-opencode sidecar's "session" is a run
+        # token, not a broker session (native-dash / opencode-dash).
         values.append(session_state.get("session"))
 
     session_ids = []
@@ -1625,6 +1681,9 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
     if driver == "claude-workflow":
         start = (False, "A claude-workflow (native) loop: start or resume it "
                         "from the Actions panel (native launch.sh).")
+    elif driver == "opencode":
+        start = (False, "A trio-opencode loop: start or resume it with "
+                        "opencode-driver/trio-opencode (start|resume).")
     elif not is_root_loop:
         start = (False, "Start and stop act on a workspace's loop/ mailbox "
                         "only; use the Actions panel for this one.")
@@ -2183,8 +2242,13 @@ _HOLD_REASONS = {
 }
 
 
-def _state_inbox_items(derived: dict, add) -> None:
-    """Actionable items for derived loop states (dash-actions)."""
+def _state_inbox_items(derived: dict, add, *, opencode: bool = False,
+                       mailbox: str | None = None) -> None:
+    """Actionable items for derived loop states (dash-actions).
+
+    ``opencode`` names a trio-opencode loop (its mailbox ``.session.json``
+    driver; see ``_is_opencode_loop``) — a fact derive_state itself does not
+    carry, unlike the native ``derived["driver"] == "claude-workflow"``."""
     state = derived.get("state")
     detail = derived.get("detail") or {}
     summary = derived.get("summary") or ""
@@ -2192,8 +2256,8 @@ def _state_inbox_items(derived: dict, add) -> None:
     native = derived.get("driver") == "claude-workflow"
     if state == "error":
         reason = str(detail.get("reason") or summary)
-        add("high", "error", "Loop stopped with an error"
-            + (" (claude-workflow)" if native else ""),
+        suffix = " (claude-workflow)" if native else (" (opencode)" if opencode else "")
+        add("high", "error", "Loop stopped with an error" + suffix,
             reason[:400] + " · Diagnose, then reset STATE and re-run.",
             f"error:{phase}:{reason[:60]}")
     elif state == "needs_retirement":
@@ -2201,11 +2265,13 @@ def _state_inbox_items(derived: dict, add) -> None:
             "The SHIP's retirement commit did not complete (exit 6). Retire it "
             "(/trio-ship) and re-run to finalize.", f"retire:{derived.get('iteration')}")
     elif state == "needs_land":
+        land_next = (f"then `opencode-driver/trio-opencode land --mailbox {mailbox}`."
+                     if opencode else "then trioctl omnigent land.")
         add("high", "needs_land", "Verified branch could not land"
             + (f" ({phase})" if phase else ""),
             "Root-free SHIP is verified on trio/<slug> but not on the target "
             "(exit 8). A conflict is resolved by a human in the Lead worktree; "
-            "then trioctl omnigent land.", f"land:{phase}")
+            + land_next, f"land:{phase}")
     elif state == "held":
         if native:
             add("high", "held", f"Held at step {detail.get('held_step') or '?'}",
@@ -2331,7 +2397,8 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                 f"{reason}, so a broker-only run cannot be ruled out." + when,
                 f"interrupted:{last}")
 
-    _state_inbox_items(derived, add)
+    _state_inbox_items(derived, add, opencode=_is_opencode_loop(loop_dir),
+                       mailbox=str(loop_dir))
 
     if dstate in ("held", "answered"):
         pass  # the hold explains STATE's needs_human; an answer was given
@@ -6194,13 +6261,14 @@ class DashboardServer(ThreadingHTTPServer):
 
     @staticmethod
     def _with_native_seeds(seeds) -> tuple[Path, ...]:
-        """Seeds plus the repos of registered claude-workflow runs (native
-        run registry), so runs under hidden or unscanned dirs show up.
-        ``TRIO_DASH_NATIVE_RUNS=0`` turns this off."""
+        """Seeds plus the repos of registered claude-workflow and
+        trio-opencode runs (native / opencode run registries), so runs under
+        hidden or unscanned dirs show up. ``TRIO_DASH_NATIVE_RUNS=0`` turns
+        both off."""
         out = list(seeds)
         if os.environ.get("TRIO_DASH_NATIVE_RUNS", "1").strip() == "0":
             return tuple(out)
-        for entry in _native_registry():
+        for entry in (*_native_registry(), *_opencode_registry()):
             repo = Path(entry.get("repo") or Path(entry["mailbox"]).parent)
             try:
                 repo = repo.resolve()

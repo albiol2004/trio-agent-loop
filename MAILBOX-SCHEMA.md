@@ -1067,6 +1067,12 @@ commits the working-tree edits as `acceptance: amend <ids> (human):
 <reason>`, adopts pack commits you already made since the pin only when you
 name them with `--adopt`, re-pins with an `Acceptance-Human-Amend: <shas>`
 trailer, and records the adoption in the driver state outside the repo.
+On a Claude-native mailbox (the helper keeps a sealed record in
+`<git-common-dir>/trio-native/`) the command runs through the helper: it
+also refuses while that record holds no stop and its holder is alive, it
+amends from the sealed state, and the adoption is written into the sealed
+record, the only source the next native `begin` trusts
+(`native/README.md`).
 
 Resume never adopts: a hand-made `(human)` amend commit is restored as
 tamper and logged (``not adopted: resume never adopts``). Resume checks the

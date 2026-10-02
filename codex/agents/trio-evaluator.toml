@@ -128,6 +128,40 @@ Every open-loop slice section ends with one summary line the driver logs
 evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
 
+## Goal-derived pass/fail
+- Derive every pass/fail criterion from GOAL.md's text and the semantics
+  of the input data and fields — never from what the produced output
+  happens to do. Never redefine, narrow or reinterpret a criterion, and
+  never write a probe with your own definition of "valid", "feasible" or
+  "correct", so that the produced code passes: when GOAL.md (or the
+  inputs' own field semantics) and the implementation disagree, the
+  implementation is wrong.
+- Every field, column, flag or feature present in the inputs (data
+  files, schemas, payloads, fixtures, config) that the produced code
+  ignores is a missing feature — FAIL the criterion it bears on — unless
+  GOAL.md explicitly says to ignore it. Calling an input a "decoy",
+  "distractor", "irrelevant" or "unused" requires a verbatim GOAL.md
+  citation in the verdict; without one it is a blocking issue.
+
+## Closing unverified claims
+- Anything your verdict lists as unverified, unconfirmed, untested or
+  not checked (a criterion, an attack class, a behaviour, an environment
+  you did not exercise) blocks SHIP. Either build the missing oracle and
+  run it now — execute the real thing: run the program or start the
+  service and drive it, render the page in a headless browser, and
+  install the test tooling you need inside the sandbox or your scratch
+  directory when the environment allows (a project-local `pip`/`npm`
+  install of a test runner or headless browser) — or write ITERATE with
+  that gap as the failure scope. Only a genuine `UNAVAILABLE(<reason>)`
+  environment gap (credentials, live third-party systems, hardware —
+  never a tool you could install) follows the `UNAVAILABLE` rules above
+  instead (in an open-loop slice section: the `unavailable:` line).
+- Static inspection of output (grep, string matching, reading source or
+  generated files) is never sufficient evidence for a behavioural claim
+  (filtering or sanitising, rendering, numerical results, protocol or
+  runtime behaviour): such a claim stays `unverified` until you execute
+  it.
+
 ## Whole-goal rigor
 (whole-goal verdicts: integration-eval, lockstep) — open-loop slice
 sections skip this section.

@@ -3,7 +3,7 @@
 # launches the saved `trio-native` workflow and returns its result JSON.
 #
 #   launch.sh start  --mailbox /abs/repo/loop [--max-iterations N] [--helper /abs/trio_native_step.py]
-#                    [--run-token T] [--timeout SECONDS]
+#                    [--run-token T] [--timeout SECONDS] [--acceptance]
 #   launch.sh resume --mailbox /abs/repo/loop --run-id wf_… [--session UUID] [--timeout SECONDS]
 #
 # start   records a fresh --session-id and the exact args JSON (including
@@ -23,7 +23,7 @@
 # Flags: --permission-mode auto (auto mode; no permission-skipping flag is
 # used or needed), --settings '{"worktree":{"baseRef":"head"}}' (isolated
 # builders fork from the Lead's HEAD, not origin/HEAD; command-line only,
-# no settings file is edited), --model claude-opus-5-5, --output-format json.
+# no settings file is edited), --model opus, --output-format json.
 # Run from the product repo (the cwd is the checkout builders fork from);
 # the default cwd is the git toplevel of the mailbox.
 #
@@ -44,12 +44,18 @@
 # <mailbox>/.native-runs/<session>.result.json. See README.md "Run registry
 # and result".
 #
-# Frozen acceptance (r19) is not implemented by native v0.1. When the mailbox
-# has acceptance/FROZEN, or TRIO_ACCEPTANCE / the profile's `[acceptance]
-# enabled` turns the switch on, the launcher prints a loud stderr warning and
-# records `"acceptance": "unsupported-in-native-v01"` (with
-# `acceptance_detected`) in .native-result.json and the printed result; the
-# run is otherwise unchanged (r20 review F6).
+# Frozen acceptance (r19, see "Frozen acceptance" in README.md) IS
+# implemented by the native driver via `start --acceptance` (args.acceptance
+# runs the full protocol). `resume` cannot carry it (metrics/native_args.py's
+# resume schema does not know the `acceptance` key yet; such a record is
+# refused -- start again). So when this run did NOT opt in via
+# `start --acceptance` but the mailbox/environment nonetheless signals
+# acceptance (acceptance/FROZEN present, or TRIO_ACCEPTANCE / the profile's
+# `[acceptance] enabled` is on), that signal will be silently ignored for
+# THIS execution: the launcher prints a loud stderr warning and records
+# `"acceptance": "unsupported-in-native-v01"` (with `acceptance_detected`) in
+# .native-result.json and the printed result. A `start --acceptance` run
+# never gets this warning (it IS the supported path).
 set -euo pipefail
 
 CLAUDE_BIN="${TRIO_NATIVE_CLAUDE:-claude}"
@@ -60,7 +66,7 @@ export PYTHONDONTWRITEBYTECODE=1
 # Workflow is one, 600 s after the launching turn ends unless this is 0
 # (probe 3 blocker E). Environment only: no settings file is involved.
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
-MODEL="claude-opus-5-5"
+MODEL="opus"
 SETTINGS='{"worktree":{"baseRef":"head"}}'
 SUFFIX='Launch only; do not edit files, settings or permissions; output the result JSON verbatim in one fenced block and stop.'
 
@@ -70,7 +76,7 @@ usage() { sed -n '2,31p' "$0" >&2; exit 2; }
 mode="$1"; shift
 case "$mode" in start|resume) ;; *) usage ;; esac
 
-mailbox="" max_iterations="4" helper="" run_token="" run_id="" session="" timeout_s="21600"
+mailbox="" max_iterations="4" helper="" run_token="" run_id="" session="" timeout_s="21600" acceptance=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mailbox) mailbox="$2"; shift 2 ;;
@@ -80,9 +86,13 @@ while [ $# -gt 0 ]; do
     --run-id) run_id="$2"; shift 2 ;;
     --session) session="$2"; shift 2 ;;
     --timeout) timeout_s="$2"; shift 2 ;;
+    --acceptance) acceptance="1"; shift ;;
     *) echo "launch.sh: unknown argument $1" >&2; usage ;;
   esac
 done
+if [ "$mode" = resume ] && [ -n "$acceptance" ]; then
+  echo "launch.sh: --acceptance is a start flag (resume replays the recorded args)" >&2; exit 2
+fi
 case "$mailbox" in /*) ;; *) echo "launch.sh: --mailbox must be an absolute path" >&2; exit 2 ;; esac
 [ -d "$mailbox" ] || { echo "launch.sh: $mailbox is not a directory" >&2; exit 2; }
 [[ "$timeout_s" =~ ^[0-9]{1,6}$ ]] || { echo "launch.sh: --timeout must be whole seconds" >&2; exit 2; }
@@ -101,7 +111,7 @@ runs="$mailbox/.native-runs"
 # session outside the canonical-UUID form, or free prompt text. Prints
 # session, token, args JSON, previous-record copy and the pre-launch claim
 # snapshot, one per line; exit 2 (nothing written) on any refusal.
-prep="$(python3 - "$mode" "$mailbox" "$max_iterations" "$helper" "$run_token" "$run_id" \
+prep="$(TRIO_NATIVE_LAUNCH_ACCEPTANCE="$acceptance" python3 - "$mode" "$mailbox" "$max_iterations" "$helper" "$run_token" "$run_id" \
   "$session" "$own_helper" <<'PY'
 import hashlib, importlib.util, json, os, re, stat, sys, tempfile, uuid
 mode, mailbox, max_it, helper, token, run_id, session, own_helper = sys.argv[1:9]
@@ -213,6 +223,11 @@ if mode == "start":
         token = "ls-" + session.replace("-", "")[:12]
     args = {"mailbox": mailbox, "max_iterations": int(max_it), "helper": own_helper_real,
             "run_token": token}
+    if os.environ.get("TRIO_NATIVE_LAUNCH_ACCEPTANCE") == "1":
+        # r19 frozen acceptance (args.acceptance). A resume replays recorded
+        # args through metrics/native_args.py, which does not know the key
+        # yet: such a record is refused there (start again instead).
+        args["acceptance"] = True
     args_json = json.dumps(args, separators=(",", ":"))
     # Keep the previous record (a start that never began the workflow
     # restores it); copied without following links, to a fresh name.
@@ -278,12 +293,18 @@ PY
 )" || exit 2
 { read -r session; read -r our_token; read -r args_json; read -r prev_record; read -r claim_snapshot; } <<<"$prep"
 
-# Frozen acceptance (r19) is NOT implemented by native v0.1: no frozen SHIP
-# gate, pre-runs or amendments (trio-shadow's pack guard still blocks pack
-# tampering). When this mailbox has a frozen pack, or the switch resolves ON
-# (TRIO_ACCEPTANCE, else the profile's `[acceptance] enabled`, as trioctl
-# resolves it), warn loudly and record `acceptance: unsupported-in-native-v01`
-# in the result (r20 review F6). The run itself is unchanged.
+# `start --acceptance` IS the supported path (args.acceptance runs the full
+# r19 protocol, same trust model as the Cursor path; see README.md "Frozen
+# acceptance"). Only when THIS run did not opt in that way, but the mailbox
+# or environment signals acceptance anyway (a frozen pack already present,
+# or the switch resolves ON via TRIO_ACCEPTANCE / the profile's `[acceptance]
+# enabled`, as trioctl resolves it), warn loudly: that signal has no effect
+# on this execution (no frozen SHIP gate, pre-runs or amendments -- trio-
+# shadow's pack guard still blocks pack tampering) and is recorded as
+# `acceptance: unsupported-in-native-v01` in the result (r20 review F6,
+# narrowed once native gained real `--acceptance` support).
+acceptance_why=""
+if [ -z "$acceptance" ]; then
 acceptance_why="$(python3 - "$mailbox" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -318,15 +339,17 @@ PY
 if [ -n "$acceptance_why" ]; then
   {
     echo "launch.sh: WARNING: ================================================================"
-    echo "launch.sh: WARNING: frozen acceptance is NOT supported by the native v0.1 driver."
+    echo "launch.sh: WARNING: frozen acceptance is signalled but this run did not opt in."
     echo "launch.sh: WARNING: detected: $acceptance_why"
     echo "launch.sh: WARNING: this run has NO frozen SHIP gate, pre-runs or amendments (the"
-    echo "launch.sh: WARNING: trio-shadow pack guard still blocks tampering). For an acceptance-"
-    echo "launch.sh: WARNING: gated run use \`trioctl omnigent loop --acceptance\`. Recorded as"
+    echo "launch.sh: WARNING: trio-shadow pack guard still blocks tampering). Use \`launch.sh"
+    echo "launch.sh: WARNING: start --acceptance\` (native) or \`trioctl omnigent loop --acceptance\`"
+    echo "launch.sh: WARNING: (Cursor) for an acceptance-gated run. Recorded as"
     echo "launch.sh: WARNING: acceptance: unsupported-in-native-v01 in .native-result.json."
     echo "launch.sh: WARNING: ================================================================"
   } >&2
 fi
+fi  # [ -z "$acceptance" ]
 
 if [ "$mode" = start ]; then
   prompt="Run the saved workflow trio-native with args ${args_json}. ${SUFFIX}"
@@ -376,7 +399,8 @@ mailbox, claude_dir, given_run_id, launcher_path, launched_at = sys.argv[7:12]
 our_token, claim_snapshot, self_dir, repo_dir, acceptance_why = sys.argv[12:17]
 rc = int(rc)
 launcher = {"session_id": session, "exit_code": rc, "raw": raw}
-# r20 F6: frozen acceptance detected but not implemented in native v0.1.
+# r20 F6: frozen acceptance detected but this run did not opt in via
+# `start --acceptance` (acceptance_why is only ever computed in that case).
 ACCEPTANCE = ({"acceptance": "unsupported-in-native-v01",
                "acceptance_detected": json.loads(acceptance_why)} if acceptance_why else {})
 launcher.update(ACCEPTANCE)
@@ -624,7 +648,7 @@ def persist(result):
     keep = ("status", "verdict", "code", "reason", "iteration", "held_step",
             "end_error", "conflicts", "dangling_worktrees", "role_denials",
             "human_check", "commit_shas", "lock", "agents_used",
-            "eval_worktrees_removed")
+            "eval_worktrees_removed", "acceptance")
     out = {k: result.get(k) for k in keep if k in result}
     out.update({"schema": 1, "source": "launcher", "driver": "claude-workflow",
                 "mode": mode, "session_id": session, "run_id": run_id,
@@ -645,7 +669,9 @@ def persist(result):
                        "run_token": our_token, "launcher": launcher_path,
                        "finished_at": now,
                        "result_path": str(Path(mailbox).resolve() / ".native-result.json"),
-                       "updated_at": now, **WORKFLOW_SCRIPT})
+                       "updated_at": now, **WORKFLOW_SCRIPT,
+                       **({"acceptance": out["acceptance"]}
+                          if isinstance(out.get("acceptance"), dict) else {})})
 
 
 def persist_not_started(result):

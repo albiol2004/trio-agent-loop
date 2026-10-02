@@ -180,6 +180,23 @@ def test_launch_refuses_exactly_what_the_shared_validator_refuses(box: Path, tmp
     assert proc.returncode == 0 and len(calls) == 1, proc.stderr
 
 
+def test_launch_resume_with_alias_models_passes_the_alias_to_claude(box: Path, tmp_path: Path) -> None:
+    """r21 native model aliases, end to end: a resume record naming the new opus/sonnet aliases
+    (not the old exact pins) validates, resumes, and the exact alias string — not a translated
+    exact model id — is what reaches `claude --model` (fake). Covers eval r21-eval-1 NB-A4/A6."""
+    na = native_args()
+    good = {"mailbox": str(box), "max_iterations": 3, "run_token": "tok1",
+            "models": {"lead": "opus", "evaluator": "opus", "builder": "sonnet",
+                       "repair": "sonnet", "step": "sonnet"}}
+    assert na.validate_args(json.dumps(good), mailbox=box, helper=HELPER.resolve()) == good
+    write_record(box, SESSION, good)
+    proc, calls = run(box, tmp_path, "resume", "--run-id", "wf_alias")
+    assert proc.returncode == 0 and len(calls) == 1, proc.stderr
+    argv = calls[0]["argv"]
+    assert "--model" in argv, argv
+    assert argv[argv.index("--model") + 1] == "opus", argv
+
+
 def test_launch_loads_this_releases_validator(tmp_path: Path, box: Path) -> None:
     text = (NATIVE / "launch.sh").read_text()
     assert '"metrics", "native_args.py"' in text

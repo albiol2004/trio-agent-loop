@@ -1,7 +1,11 @@
-"""r20 review F6: native v0.1 does not implement frozen acceptance. launch.sh
-warns loudly and records `acceptance: unsupported-in-native-v01` in
-.native-result.json when the mailbox has a frozen pack or the switch
-resolves ON (TRIO_ACCEPTANCE, else the profile); otherwise nothing changes."""
+"""r20 review F6 (narrowed once native gained real `--acceptance` support,
+see native/README.md "Frozen acceptance"): `start --acceptance` IS the
+supported acceptance path and never warns. Only a run that did NOT opt in
+that way, but the mailbox or environment signals acceptance anyway (a
+frozen pack present, or the switch resolves ON via TRIO_ACCEPTANCE / the
+profile), gets a loud launch.sh warning and
+`acceptance: unsupported-in-native-v01` recorded in .native-result.json;
+otherwise nothing changes."""
 from __future__ import annotations
 
 import json
@@ -57,8 +61,9 @@ def test_acceptance_detected_warns_and_records(box: Path, tmp_path: Path, monkey
     proc, calls = launch(box, tmp_path, "start", result=BODY)
     assert proc.returncode == 0, proc.stderr
     assert len(calls) == 1  # the run itself proceeds unchanged
-    assert "frozen acceptance is NOT supported by the native v0.1 driver" in proc.stderr
+    assert "frozen acceptance is signalled but this run did not opt in" in proc.stderr
     assert want in proc.stderr and "trioctl omnigent loop --acceptance" in proc.stderr
+    assert "start --acceptance" in proc.stderr
     rec = _result(box)
     assert rec["acceptance"] == TAG and rec["status"] == "shipped"
     assert any(want in d for d in rec["acceptance_detected"])
@@ -80,8 +85,23 @@ def test_frozen_pack_warns_on_resume_too(box: Path, tmp_path: Path) -> None:
     (box / "acceptance" / "FROZEN").write_text("pin: x\n")
     proc, _ = launch(box, tmp_path, "resume", "--run-id", "wf_abc", result=BODY)
     assert proc.returncode == 0, proc.stderr
-    assert "NOT supported by the native v0.1 driver" in proc.stderr
+    assert "frozen acceptance is signalled but this run did not opt in" in proc.stderr
     assert _result(box)["acceptance"] == TAG
+
+
+def test_acceptance_flag_opts_in_and_suppresses_the_warning(box: Path, tmp_path: Path) -> None:
+    """`start --acceptance` is the supported path (README "Frozen
+    acceptance"): even with a frozen pack already present (which alone would
+    warn per test_acceptance_detected_warns_and_records), opting in via the
+    flag must not print the unsupported warning or record the tag."""
+    (box / "acceptance").mkdir()
+    (box / "acceptance" / "FROZEN").write_text("pin: x\n")
+    proc, calls = launch(box, tmp_path, "start", "--acceptance", result=BODY)
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 1
+    assert "WARNING" not in proc.stderr
+    assert "acceptance" not in json.loads(proc.stdout)["launcher"]
+    assert _result(box).get("acceptance") != TAG
 
 
 def test_launcher_never_edits_helper_or_workflow_script() -> None:

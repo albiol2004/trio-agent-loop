@@ -1838,7 +1838,8 @@ def _ancestor_of(path: str, roots: Iterable[str]) -> bool:
 
 def audit_transcript(entries: Iterable[Any], export: Path,
                      forbidden: Iterable[Path] = (),
-                     allowed: Iterable[Path] = ()) -> dict[str, Any]:
+                     allowed: Iterable[Path] = (),
+                     cwd: Path | None = None) -> dict[str, Any]:
     """Mechanical isolation audit of an author session's tool calls (§2.2).
 
     Best-effort (DESIGN §10): only evidence that the author *read* the
@@ -1858,8 +1859,14 @@ def audit_transcript(entries: Iterable[Any], export: Path,
     A mailbox file name (PLAN.md, REPORT.md, LOG.md, ...) counts only when
     it resolves inside a forbidden root (eval-r19b finding 5/E10: a product
     that writes REPORT.md to a scratch dir is not the loop's mailbox). URL
-    and route literals, $TMPDIR and toolchain paths never contaminate."""
+    and route literals, $TMPDIR and toolchain paths never contaminate.
+
+    *cwd* is where a tool call starts when it names no directory: the
+    export by default. The Claude-native author's tools start in the
+    session's cwd (the loop repository), so the native driver passes it and
+    a relative path without a `cd` resolves there."""
     export_root = _norm(Path(export).resolve())[0]
+    start_cwd = _norm(Path(cwd).resolve())[0] if cwd is not None else export_root
     export_roots = _norm(Path(export).resolve())
     export_roots += [r for p in allowed for r in _norm(Path(p))]
     bad_roots = sorted({r for p in forbidden for r in _norm(Path(p))})
@@ -1877,7 +1884,7 @@ def audit_transcript(entries: Iterable[Any], export: Path,
     for entry in entries:
         for text in _audit_inputs(entry):
             bare = len(text.split()) == 1  # a tool's own path argument
-            cwd: str | None = export_root
+            cwd: str | None = start_cwd
             prev: str | None = None
             for segment in _AUDIT_SEGMENT_RE.split(text):
                 words = segment.strip().lstrip("({").split()

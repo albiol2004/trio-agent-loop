@@ -563,32 +563,58 @@ trioctl omnigent acceptance validate --export .                                 
   <mb>` (keeps the branch: take what you need, then `git branch -D
   trio/<slug>`), refresh the target and start again.
 
-## Claude-native seams (N1–N4, later task)
+## Claude-native (N1–N4, `r19-native`)
 
-Native v0.1 does not implement them. Until it does, `native/launch.sh`
-(start and resume) prints a loud stderr warning and records
-`"acceptance": "unsupported-in-native-v01"` (plus `acceptance_detected`) in
-`<mailbox>/.native-result.json` whenever the mailbox has `acceptance/FROZEN`
-or the switch resolves ON (`TRIO_ACCEPTANCE`, else the profile's
-`[acceptance] enabled`); the run is otherwise unchanged, so it has no frozen
-SHIP gate, pre-runs or amendments (trio-shadow's pack guard still blocks
-tampering). Use `trioctl omnigent loop --acceptance` for a gated run.
+Built behind the workflow's `args.acceptance` (default off; switch-off
+journals and helper answers identical to `6842907`). `native/README.md`
+"Frozen acceptance" has the operational detail.
 
-- `MODELS.acceptance = MODELS.evaluator`, with a tier-equality refusal at
-  `begin`.
-- A `trio-acceptance` agent generated from `prompts/canonical/acceptance.md`
-  via a `.claude` overlay target.
-- Helper ops in `trio_native_step.py` reuse this build's functions:
+- `MODELS.acceptance = MODELS.evaluator`; `begin` refuses an author or Lead
+  off that tier before it takes the lock.
+- The `trio-acceptance` agent is generated from `prompts/canonical/acceptance.md`
+  (`.claude/agents/trio-acceptance.md`, model from the `.claude` evaluator
+  header). The native Lead/Evaluator additions are
+  `prompts/canonical/acceptance-native-{lead,evaluator}.md`, embedded into
+  `native/trio-native.js` by `generate.py` (`--check` covers them).
+- Helper ops reuse this build's functions:
   - `acceptance-export` -> `trio-acceptance.build_export`;
-  - `acceptance-freeze` -> `AcceptanceController.freeze_from_export` plus
-    `audit_transcript`;
-  - `coverage` -> `trio-check.coverage_refusals`;
-  - `acceptance-run` -> `run_pack`;
-  - the `op_gate` pin check -> `AcceptanceController.check_pin`;
-  - the `op_apply` SHIP gate and amendments ->
-    `AcceptanceController.review_verdict`.
-- `PLAN_SCHEMA` gains `covers`, `lead_integration` and
-  `acceptance_bindings`.
-- The Lead/Evaluator fragments `prompts/canonical/acceptance-lead.md` and
-  `acceptance-evaluator.md` are the native `leadPlanPrompt`/`evaluatorPrompt`
-  additions.
+  - `acceptance-freeze` -> `run_pack` + `freeze_filter` on a fresh export,
+    `audit_transcript` (new `cwd=` argument: the native author's tools
+    start in the repository) or the limited audit, then
+    `AcceptanceController._freeze`;
+  - `coverage` -> `trio-check.coverage_refusals` on the structured plan
+    (rendered as PLAN text) and on PLAN.md;
+  - `acceptance-run` -> `AcceptanceController.integration_context`;
+  - pin checks in `next`/`coverage`/`dispatch` -> `check_pin`, `gate` ->
+    `lead_gate`;
+  - `apply` -> `AcceptanceController.review_verdict`.
+- The script holds the pin digest between helper processes (the running
+  Cursor driver's in-memory state) from `begin` on (`status: authoring`
+  until the helper's own freeze). eval-r19n: nothing role-writable relaxes
+  a check. The helper's state is a record sealed with a per-execution HMAC
+  key (a random secret `begin` writes into the git common dir, plus the
+  exec id from the script's nonce); gate/apply records and job results are
+  HMAC-verified; the checks' PATH is re-derived from the interpreters sealed
+  at `begin`; the sealed record, the state file and `derive_pin_chain` must
+  agree with the digest at every op (`acceptance-state-mismatch`), and a
+  record that does not verify stops the loop (`acceptance-record-forged`).
+  eval-r19n2: the sealed record is the only source of truth across
+  executions too. Every acceptance stop and `end` write it over the state
+  file and record the stop in it; `begin` authenticates the previous
+  record with the secret it was sealed under before rotating, overwrites a
+  disagreeing state file from it (logged), and derives the pin chain with
+  the record's own `driver_commits`/`human_amends`, so a pin or human
+  adoption it does not hold is restored by a driver commit and stops the
+  loop NEEDS_HUMAN `acceptance-tamper`, never adopted. `trioctl omnigent
+  acceptance amend --human [--adopt]` on such a mailbox runs through the
+  helper (`cli_human_amend`): only while the record says the loop stopped
+  (or its holder is dead), from the sealed state, and the adoption is
+  written into the sealed record. The record carries a sequence number the
+  script holds, so an older authentic record is refused; every git process
+  of the helper runs with `GIT_NO_REPLACE_OBJECTS=1`.
+  Same-uid limit: a process that writes the git common dir (not only one
+  that reads the secret: it can replace the secret, or remove the sealed
+  record so the next `begin` is a first run) can forge records, as it can
+  write the Cursor driver's state file; an author can plant a decoy
+  transcript that turns the limited audit into a clean one.
+- Long ops run as detached helper jobs and are polled (`pending`).

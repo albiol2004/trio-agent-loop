@@ -76,6 +76,11 @@ def native_runs_dir(home: Path) -> Path:
             or home / ".local" / "share" / "trio-agent-loop" / "native-runs")
 
 
+def opencode_runs_dir(home: Path) -> Path:
+    return (_env_path("TRIO_OPENCODE_RUNS_DIR")
+            or home / ".local" / "share" / "trio-agent-loop" / "opencode-runs")
+
+
 def _executable(path: Path | None) -> Path | None:
     if path is None:
         return None
@@ -334,6 +339,7 @@ def held_records(mailbox: Path) -> list[dict]:
 # --------------------------------------------------------------------------
 
 NATIVE_DRIVER = "claude-workflow"
+OPENCODE_DRIVER = "opencode"
 _MAILBOX_MARKERS = ("GOAL.md", "STATE.md", "LOG.md", "PLAN.md", "VERDICT.md")
 
 
@@ -344,40 +350,109 @@ def is_mailbox(path: Path) -> bool:
         return False
 
 
+def _resolve_registry_entry(record: dict, path: Path, home: Path) -> dict | None:
+    """A raw run-registry record turned into a display entry: an absolute,
+    existing mailbox and a valid ``repo`` (``registry_repo``); None when
+    either check fails. Shared by ``native_registry`` and
+    ``opencode_registry`` — the driver match and any driver-specific
+    validation (e.g. ``live_mailbox``) are the caller's."""
+    mailbox = record.get("mailbox")
+    if not isinstance(mailbox, str) or not os.path.isabs(mailbox):
+        return None
+    try:
+        mbox = Path(mailbox).resolve()
+    except OSError:
+        return None
+    if not is_mailbox(mbox):
+        return None
+    repo_path = registry_repo(home, mbox, record.get("repo"))
+    if repo_path is None:
+        return None
+    return {**record, "mailbox": str(mbox), "repo": str(repo_path),
+            "registry_file": str(path)}
+
+
+def _newest_per_mailbox(entries: list[dict]) -> list[dict]:
+    """One entry per real mailbox: the most recently updated wins."""
+    by_mailbox: dict[str, dict] = {}
+    for entry in entries:
+        mbox = entry["mailbox"]
+        prev = by_mailbox.get(mbox)
+        if prev is None or str(entry.get("updated_at") or "") >= str(prev.get("updated_at") or ""):
+            by_mailbox[mbox] = entry
+    return [by_mailbox[k] for k in sorted(by_mailbox)]
+
+
 def native_registry(home: Path) -> list[dict]:
     """Valid native run records: an absolute, existing mailbox each.
 
     The registry is written by native/launch.sh and the helper's begin/end
     (native-dash); it only makes runs *visible*. Nothing is executed from a
     record without re-validating it (see ``native_launcher``)."""
-    by_mailbox: dict[str, dict] = {}
     try:
         files = sorted(native_runs_dir(home).glob("*.json"))
     except OSError:
         return []
+    entries = []
     for path in files:
         record = read_json(path)
         if not record or record.get("driver", NATIVE_DRIVER) != NATIVE_DRIVER:
             continue
-        mailbox = record.get("mailbox")
-        if not isinstance(mailbox, str) or not os.path.isabs(mailbox):
+        entry = _resolve_registry_entry(record, path, home)
+        if entry is not None:
+            entries.append(entry)
+    return _newest_per_mailbox(entries)
+
+
+def _valid_live_mailbox(live_mailbox, repo: str) -> str | None:
+    """*live_mailbox* kept only when it is an absolute path that resolves to
+    an existing mailbox directory, is not itself a symlink, and sits inside
+    a git worktree whose ``--git-common-dir`` equals the root repo's
+    (``repo``, a resolved git toplevel). Anything else — relative, missing,
+    a symlink, or in an unrelated repository — becomes None (opencode-dash's
+    strict validation of a driver-reported path)."""
+    if not isinstance(live_mailbox, str) or not live_mailbox or not os.path.isabs(live_mailbox):
+        return None
+    if os.path.islink(live_mailbox):
+        return None
+    path = Path(live_mailbox)
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not is_mailbox(real):
+        return None
+    root_common = _common_dir(Path(repo))
+    if root_common is None:
+        return None
+    live_common = _common_dir(real)
+    if live_common is None or live_common != root_common:
+        return None
+    return str(real)
+
+
+def opencode_registry(home: Path) -> list[dict]:
+    """Valid trio-opencode run records: an absolute, existing mailbox each,
+    ``driver`` exactly ``"opencode"`` (unlike ``native_registry`` a missing
+    ``driver`` field is never treated as one of ours), tagged
+    ``harness: "opencode"``, with ``live_mailbox`` dropped to None unless it
+    strictly validates (``_valid_live_mailbox``)."""
+    try:
+        files = sorted(opencode_runs_dir(home).glob("*.json"))
+    except OSError:
+        return []
+    entries = []
+    for path in files:
+        record = read_json(path)
+        if not record or record.get("driver") != OPENCODE_DRIVER:
             continue
-        try:
-            mbox = Path(mailbox).resolve()
-        except OSError:
+        entry = _resolve_registry_entry(record, path, home)
+        if entry is None:
             continue
-        if not is_mailbox(mbox):
-            continue
-        repo_path = registry_repo(home, mbox, record.get("repo"))
-        if repo_path is None:
-            continue
-        entry = {**record, "mailbox": str(mbox), "repo": str(repo_path),
-                 "registry_file": str(path)}
-        # One record per real mailbox: the most recently updated wins.
-        prev = by_mailbox.get(str(mbox))
-        if prev is None or str(entry.get("updated_at") or "") >= str(prev.get("updated_at") or ""):
-            by_mailbox[str(mbox)] = entry
-    return [by_mailbox[k] for k in sorted(by_mailbox)]
+        entry["live_mailbox"] = _valid_live_mailbox(entry.get("live_mailbox"), entry["repo"])
+        entry["harness"] = OPENCODE_DRIVER
+        entries.append(entry)
+    return _newest_per_mailbox(entries)
 
 
 def registry_repo(home: Path, mailbox: Path, claimed) -> Path | None:
@@ -446,6 +521,36 @@ def result_from_raw(mailbox: Path, launch: dict | None) -> dict | None:
     return out
 
 
+def native_acceptance_detail(native: dict | None) -> dict | None:
+    """r19 frozen acceptance of a native run, for the drawer: a compact,
+    display-only view of the result record's additive ``acceptance`` key
+    (None when the run had the switch off)."""
+    acc = ((native or {}).get("result") or {}).get("acceptance")
+    if not isinstance(acc, dict):
+        return None
+
+    def num(value) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    gate = acc.get("ship_gate") if isinstance(acc.get("ship_gate"), dict) else None
+    refused = acc.get("ship_refused")
+    return {
+        "status": str(acc.get("status") or "")[:40] or None,
+        "pin": str(acc.get("pin") or "")[:12] or None,
+        "checks": num(acc.get("checks")),
+        "ship_gate": (f"{num(gate.get('passed'))}/{num(gate.get('total'))} PASS" if gate else None),
+        "coverage_refusals": len(acc.get("coverage_refusals") or [])
+        if isinstance(acc.get("coverage_refusals"), list) else num((acc.get("refusals") or {}).get("coverage")
+                                                                    if isinstance(acc.get("refusals"), dict) else 0),
+        "ship_refused": len(refused) if isinstance(refused, list) else num(refused),
+        "tamper_events": num(acc.get("tamper_events")),
+        "amendments": num(acc.get("amendments")),
+        # eval-r19n finding 6: the author audit fell back to the limited
+        # audit (no author transcript found); None when not recorded.
+        "audit_limited": (bool(acc["audit"].get("limited"))
+                          if isinstance(acc.get("audit"), dict) else None),
+    }
+
+
 def _load_native_args():
     """metrics/native_args.py of this release: the one resume-args and
     mailbox-path validator, byte-identical to the one native/launch.sh uses
@@ -464,9 +569,12 @@ RUN_ID_RE = native_args.RUN_ID_RE
 RUN_TOKEN_RE = native_args.RUN_TOKEN_RE
 NATIVE_ARG_KEYS = native_args.ARG_KEYS
 NATIVE_MODEL_ROLES = native_args.MODEL_ROLES
-NATIVE_MODELS = frozenset(native_args.MODELS)
-"""Models a recorded native run may name (the workflow's defaults); a resume
-of a record naming anything else is refused (never replayed)."""
+NATIVE_MODELS = frozenset(native_args.ALLOWED_MODELS)
+"""Models a recorded native run may name (the workflow's aliases plus the legacy exact pins a
+pre-alias record may still carry); a resume of a record naming anything else is refused (never
+replayed). ALLOWED_MODELS, not MODELS: this must accept everything launch.sh's own
+native_args.validate_args accepts, or a future caller would refuse an r20-era resume record that
+launch.sh itself still resumes."""
 NATIVE_CAPS = native_args.CAPS
 NativeArgsError = native_args.NativeArgsError
 canonical_session_id = native_args.canonical_session_id
@@ -888,6 +996,9 @@ def derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None
             "session_id": native.get("session_id"), "run_id": native.get("run_id"),
             "api_equiv_usd": (native.get("result") or {}).get("api_equiv_usd"),
         })
+        acceptance = native_acceptance_detail(native)
+        if acceptance is not None:
+            out["detail"]["acceptance"] = acceptance
 
     if running_sources:
         out.update(state="running", summary="live via " + ", ".join(running_sources))

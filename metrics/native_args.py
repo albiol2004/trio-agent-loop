@@ -23,8 +23,10 @@ Resume schema (:func:`validate_args`): a JSON object with only ``mailbox``
 components, no trailing slash, allowed by the path rule), ``max_iterations``
 (required, int 1..200), ``max_agents`` (int 1..1000), ``token_budget`` (int
 1..1e10), ``run_token`` (``[A-Za-z0-9._-]{1,64}``), ``helper`` (this
-release's helper only) and ``models`` (``{role: model}``, both strings from
-the allowlists). Anything else — including any unexpected type or an input
+release's helper only) and ``models`` (``{role: model}``, role from
+``MODEL_ROLES``, model a string in ``MODELS`` (the ``opus``/``sonnet``
+aliases) or, for resuming a pre-alias record, ``LEGACY_MODELS`` (the old
+exact pins)). Anything else — including any unexpected type or an input
 that makes a parser fail — is a :class:`NativeArgsError`, never another
 exception.
 """
@@ -43,7 +45,14 @@ RUN_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 ARG_KEYS = ("mailbox", "max_iterations", "max_agents", "token_budget", "helper", "run_token",
             "models")
 MODEL_ROLES = ("lead", "evaluator", "builder", "repair", "step")
-MODELS = ("claude-opus-5-5", "claude-sonnet-5")
+MODELS = ("opus", "sonnet")
+# r20 recorded exact pins. Kept valid for `models` ONLY so a
+# `.native-launch.json` resume record written before this switch (r20 and
+# earlier) still resumes; every default and every new launch (trio-native.js,
+# launch.sh, agents/trio-step.md) uses the MODELS aliases above exclusively,
+# never these.
+LEGACY_MODELS = ("claude-opus-5-5", "claude-sonnet-5")
+ALLOWED_MODELS = MODELS + LEGACY_MODELS
 CAPS = {"max_iterations": (1, 200), "max_agents": (1, 1000), "token_budget": (1, 10_000_000_000)}
 CONSERVATIVE_PATH = re.compile(r"/[A-Za-z0-9._/+@-]*")
 MAX_PATH = 4096
@@ -155,9 +164,9 @@ def _validate(raw, mailbox, helper, require_run_token: bool) -> dict:
         elif key == "models":
             if not isinstance(value, dict) or not all(
                     isinstance(r, str) and r in MODEL_ROLES
-                    and isinstance(m, str) and m in MODELS for r, m in value.items()):
+                    and isinstance(m, str) and m in ALLOWED_MODELS for r, m in value.items()):
                 raise NativeArgsError("args.models names a role or model outside the allowlist "
-                                      "(" + ", ".join(MODELS) + ")")
+                                      "(" + ", ".join(ALLOWED_MODELS) + ")")
             value = dict(value)
         out[key] = value
     if "mailbox" not in out:

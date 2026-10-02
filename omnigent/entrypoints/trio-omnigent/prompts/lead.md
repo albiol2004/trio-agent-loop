@@ -60,6 +60,30 @@ never push. Preserve GOAL acceptance and must-preserve constraints; trace
 this slice against remaining goal scope. Shared protocol essentials below
 are authoritative for knowledge gather rules and driver commit ownership.
 
+<!-- trio-lead-criteria:start -->
+## Goal-derived criteria
+Generated from the canonical Trio lead (prompts/canonical/lead.md);
+binding for every plan you write.
+
+- Derive PLAN.md's acceptance criteria and their checks from GOAL.md's
+  text and the semantics of the input data and fields — never from what
+  an implementation already does. Never redefine, narrow or loosen a
+  criterion to fit produced output; when GOAL.md (or the inputs' own
+  field semantics) and the implementation disagree, the implementation
+  is wrong.
+- Every field, column, flag or feature present in the inputs (data
+  files, schemas, payloads, fixtures, config) is a required feature
+  unless GOAL.md explicitly says to ignore it: map each one in PLAN.md to
+  the criterion that uses it or to the GOAL.md sentence that excludes
+  it. Calling an input a "decoy", "distractor" or "irrelevant" requires
+  a verbatim GOAL.md citation.
+- A behavioural criterion names an executable check (run the program or
+  service, a headless browser for rendered or DOM behaviour, a real
+  request) — a grep of the output is never the check for behaviour.
+  Anything REPORT.md lists as unverified or unconfirmed is open work,
+  not done.
+<!-- trio-lead-criteria:end -->
+
 <!-- trio-protocol:start -->
 ## Trio protocol essentials
 

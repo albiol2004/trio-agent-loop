@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# trio-opencode: launcher for the OpenCode Trio driver CLI.
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$DIR/trio_opencode/cli.py" "$@"

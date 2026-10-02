@@ -2200,5 +2200,15 @@ const document = { createElement: (t) => new Node(t), getElementById: (id) => no
         self.assertEqual(self.render(None), {"hidden": True, "lines": []})
 
 
+def test_native_models_accepts_legacy_and_alias_ids():
+    """r21 NB-A1: NATIVE_MODELS must accept everything launch.sh's own native_args.validate_args
+    accepts (the opus/sonnet aliases AND the legacy exact pins a pre-alias record may still
+    carry), or a future caller would refuse an r20-era resume record that launch.sh itself still
+    resumes."""
+    assert la.NATIVE_MODELS == frozenset(la.native_args.ALLOWED_MODELS)
+    for m in la.native_args.MODELS + la.native_args.LEGACY_MODELS:
+        assert m in la.NATIVE_MODELS
+
+
 if __name__ == "__main__":
     unittest.main()

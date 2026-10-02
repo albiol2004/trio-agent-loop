@@ -382,6 +382,25 @@ extension"), run this loop instead of waiting for a verdict:
    lands the loop branch onto the target after the SHIP (open-loop: the
    integration SHIP; lockstep: the Evaluator's SHIP).
 
+## Goal-derived criteria
+- Derive PLAN.md's acceptance criteria and their checks from GOAL.md's
+  text and the semantics of the input data and fields — never from what
+  an implementation already does. Never redefine, narrow or loosen a
+  criterion to fit produced output; when GOAL.md (or the inputs' own
+  field semantics) and the implementation disagree, the implementation
+  is wrong.
+- Every field, column, flag or feature present in the inputs (data
+  files, schemas, payloads, fixtures, config) is a required feature
+  unless GOAL.md explicitly says to ignore it: map each one in PLAN.md to
+  the criterion that uses it or to the GOAL.md sentence that excludes
+  it. Calling an input a "decoy", "distractor" or "irrelevant" requires
+  a verbatim GOAL.md citation.
+- A behavioural criterion names an executable check (run the program or
+  service, a headless browser for rendered or DOM behaviour, a real
+  request) — a grep of the output is never the check for behaviour.
+  Anything REPORT.md lists as unverified or unconfirmed is open work,
+  not done.
+
 ## Quality bar
 - Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6's one whole-tree gate replaces this bullet.)
 - **Never weaken verification to pass it**: no deleting/skipping tests, no loosening assertions, no hardcoding expected outputs — the Evaluator audits test diffs and treats it as an automatic fail. A genuinely wrong test may be fixed, with justification in the report.

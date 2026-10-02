@@ -1,7 +1,7 @@
 ---
 name: trio-step
 description: Deterministic step runner for the trio-native Workflow. Runs exactly one trio_native_step.py command given in the prompt and returns its stdout verbatim as a string. Never edits files, never reasons about the loop.
-model: claude-sonnet-5
+model: sonnet
 effort: low
 tools: Bash
 ---
