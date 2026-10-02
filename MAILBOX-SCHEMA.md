@@ -1653,6 +1653,57 @@ lines are never rewritten. The `.gitignore` may itself stay untracked
 until the next mailbox commit: files inside the active mailbox never block
 the dirty-checkout gate or the untracked-product scan.
 
+## Session heartbeat (.heartbeat.json)
+
+`<mailbox>/.heartbeat.json` is an optional, gitignored runtime file (like
+`.session.json`; conformance tooling ignores it) that a session writes so the
+dashboard can tell an **in-session** Trio loop (an orchestrator running inside
+a Claude/Codex/Kimi/ZCode session, no driver, no `.lock`) from an interrupted
+one. Without it such a loop reads as interrupted. The dashboard counts
+"running" only from owned evidence (driver sidecars and locks with live pids,
+the native-runs registry, broker sessions whose workspace is the mailbox or
+repo, and this heartbeat); a process that merely names the mailbox in its argv
+is shown as a `running_hints: ["proc"]` hint and is never "running".
+
+```json
+{"schema": 1, "writer": "trio-skill", "session_id": "<id or empty>",
+ "pid": null, "phase": "lead", "iteration": 3,
+ "updated_at": "2026-10-02T12:00:00Z", "ttl_s": 7200, "done": false}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | int | Always `1`; any other value is not live. |
+| `writer` | string | Who wrote it (`trio-skill` for the /trio orchestrators). |
+| `session_id` | string | The writing session's id, or `""` when unknown. |
+| `pid` | int or null | A process that must be alive for the heartbeat to count; `null` when the session has no stable pid (the usual in-session case). |
+| `phase` | string | `lead`, `evaluator` or `repair` (any short word). |
+| `iteration` | int or null | The iteration being run. |
+| `updated_at` | string | ISO-8601 UTC with a trailing `Z`, written at every refresh. |
+| `ttl_s` | int | Seconds the heartbeat stays live after `updated_at`. |
+| `done` | bool | `true` once a stop condition was applied. |
+
+**Liveness.** The heartbeat is live iff `schema` is `1`, `done` is not `true`,
+`updated_at` parses, `-120 <= age <= ttl` (age is now minus `updated_at`; up
+to 120 s of clock skew into the future is tolerated, more is not live), and
+`pid` is null/absent or a live process. `ttl` is `ttl_s` (default 900 when
+missing or not positive) clamped to 60..14400 seconds. A symlinked
+`.heartbeat.json` is never followed and is not live; the file is read with a
+64 KB bound, and a missing, non-JSON or non-object file is treated as absent.
+
+**Who writes it.** The in-session /trio orchestrators write it right before
+each synchronous role spawn (`ttl_s` 7200, `phase` `lead`, `evaluator` or
+`repair`), refresh it after the role returns, and write `done: true` when a
+stop condition is applied (SHIP, BLOCKED, NEEDS_HUMAN, iteration cap, error).
+Drivers may write it too. Add `.heartbeat.json` to `<mailbox>/.gitignore`
+when it is missing.
+
+Portable write command (atomic: temp file, then rename):
+
+```sh
+printf '{"schema":1,"writer":"trio-skill","session_id":"%s","pid":null,"phase":"%s","iteration":%s,"updated_at":"%s","ttl_s":%s,"done":%s}\n' "${CLAUDE_SESSION_ID:-}" lead 3 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 7200 false > <mailbox>/.heartbeat.json.tmp && mv <mailbox>/.heartbeat.json.tmp <mailbox>/.heartbeat.json
+```
+
 ## Driver exit codes (`trioctl omnigent loop`)
 
 | Exit | STATE.md `status` | Meaning |

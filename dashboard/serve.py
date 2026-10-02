@@ -30,7 +30,7 @@ Board:
         name, path, mission, iteration, max_iterations, status,
         final_verdict, last_activity, verdict_mtime, last_entry_summary,
         segments, driver_phase, driver, running, running_sources,
-        running_substate
+        running_hints, heartbeat, running_substate
     Each inbox item includes: loop, kind, severity, headline, detail, id,
     read, first_seen.
 
@@ -227,6 +227,10 @@ INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
 LOOP_IDS_PATH = DASHBOARD_DIR / "loop_ids.py"
 """Canonical loop identity module, resolved relative to this file."""
 
+LIVE_REGISTRY_PATH = DASHBOARD_DIR / "live_registry.py"
+"""Owned running-evidence module (heartbeat, native runs), resolved relative
+to this file."""
+
 TRANSCRIPT_INDEX_PATH = DASHBOARD_DIR / "transcript_index.py"
 """Session-id transcript index module, resolved relative to this file."""
 
@@ -287,6 +291,7 @@ _HEALTH_MODULE = None
 _BROKER_HTTP_MODULE = None
 _INBOX_STATE_MODULE = None
 _LOOP_IDS_MODULE = None
+_LIVE_REGISTRY_MODULE = None
 _TRANSCRIPT_INDEX_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
@@ -576,6 +581,25 @@ def load_inbox_state_module():
         if not hasattr(module, fn):
             raise RuntimeError(f"inbox state module missing required function: {fn}")
     _INBOX_STATE_MODULE = module
+    return module
+
+
+def load_live_registry_module():
+    """Load dashboard/live_registry.py by path and cache the module."""
+    global _LIVE_REGISTRY_MODULE
+    if _LIVE_REGISTRY_MODULE is not None:
+        return _LIVE_REGISTRY_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_live_registry", LIVE_REGISTRY_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load live registry module: {LIVE_REGISTRY_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in ("read_heartbeat", "native_run_evidence"):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"live registry module missing required function: {fn}")
+    _LIVE_REGISTRY_MODULE = module
     return module
 
 
@@ -1398,35 +1422,51 @@ def _broker_listing() -> dict:
         return value
 
 
+def _same_path(left, right_text: str) -> bool:
+    """Whether the path ``left`` resolves to the already-resolved text."""
+    if not left:
+        return False
+    try:
+        return str(Path(left).resolve()) == right_text
+    except (OSError, RuntimeError):
+        return False
+
+
 def _broker_sessions_for_mailbox(loop_dir: Path, root: Path | None,
                                  listing: dict) -> list[dict]:
     """Running broker sessions that belong to exactly this mailbox.
 
-    trioctl titles sessions ``trioctl <mailbox-dir-name> <role>:...`` and
-    records the workspace. Both must match, and the mailbox dir name must be
-    unique within the workspace; a title alone never attributes a session.
+    Two rules attribute a session. A session whose ``workspace`` is this
+    mailbox's own directory counts under any title (a driver or session
+    started inside the mailbox). Otherwise trioctl titles sessions
+    ``trioctl <mailbox-dir-name> <role>:...`` and records the workspace: the
+    title prefix and a workspace equal to the repo root must both match, and
+    the mailbox dir name must be unique within the workspace. A title alone
+    or a root workspace alone never attributes a session.
     """
-    if root is None or not listing.get("running"):
+    if not listing.get("running"):
         return []
+    try:
+        mailbox_text = str(loop_dir.resolve())
+    except OSError:
+        return []
+    matches = [s for s in listing["running"]
+               if _same_path(s.get("workspace"), mailbox_text)]
+    if root is None:
+        return matches
     ambiguous = (getattr(_PROC_SNAPSHOT, "ambiguous", None) or {}).get(
         str(root), set())
     if loop_dir.name in ambiguous:
-        return []
+        return matches
     prefix = f"trioctl {loop_dir.name} "
     try:
         root_text = str(root.resolve())
     except OSError:
-        return []
-    matches = []
+        return matches
     for session in listing["running"]:
-        workspace = session.get("workspace")
-        if not workspace or not session["title"].startswith(prefix):
-            continue
-        try:
-            same = str(Path(workspace).resolve()) == root_text
-        except OSError:
-            same = False
-        if same:
+        if (session not in matches
+                and str(session.get("title") or "").startswith(prefix)
+                and _same_path(session.get("workspace"), root_text)):
             matches.append(session)
     return matches
 
@@ -1536,6 +1576,12 @@ def _running_detection(loop_dir: Path, root: Path | None = None) -> dict:
 def _detect_running(loop_dir: Path, root: Path | None = None) -> dict:
     """Return concrete running evidence and any stale session sidecar.
 
+    ``sources`` is owned evidence only: ``driver`` (live ``.driver.json`` or
+    ``.lock`` pid), ``session`` (live ``.session.json`` pid), ``native`` (a
+    live native-runs registry entry), ``broker`` and ``heartbeat`` (a live
+    ``.heartbeat.json``). A process naming the mailbox in its argv is only
+    ``running_hints: ["proc"]``.
+
     ``broker`` reports whether broker liveness was known for this check:
     ``ok`` (listing read), ``disabled`` (no broker URL) or ``unreachable`` /
     ``truncated``; only ``ok`` lets callers treat "no broker session" as a
@@ -1550,8 +1596,8 @@ def _detect_running(loop_dir: Path, root: Path | None = None) -> dict:
     if driver_live or lock_pid is not None:
         sources.append("driver")
 
-    if _proc_matches_mailbox(loop_dir):
-        sources.append("proc")
+    # Argv sniffing is a hint, never evidence of a run (GOAL DoD2).
+    hints = ["proc"] if _proc_matches_mailbox(loop_dir) else []
 
     orphaned_session = None
     session_running = False
@@ -1586,6 +1632,21 @@ def _detect_running(loop_dir: Path, root: Path | None = None) -> dict:
     if matched or _broker_has_running_session(session_ids, listing):
         sources.append("broker")
 
+    try:
+        live_registry = load_live_registry_module()
+        native = live_registry.native_run_evidence(
+            _native_registry(), loop_dir, pid_alive=_pid_is_live)
+        heartbeat = live_registry.read_heartbeat(
+            loop_dir, pid_alive=lambda pid: _record_pid_live(
+                pid, loop_dir / ".heartbeat.json"))
+    except Exception:  # noqa: BLE001 - the board renders without it
+        traceback.print_exc()
+        native, heartbeat = None, None
+    if native is not None:
+        sources.append("native")
+    if heartbeat is not None and heartbeat["live"]:
+        sources.append("heartbeat")
+
     control_pid = None
     if driver_live:
         control_pid = driver_state["pid"]
@@ -1594,6 +1655,8 @@ def _detect_running(loop_dir: Path, root: Path | None = None) -> dict:
 
     return {
         "sources": sources,
+        "running_hints": hints,
+        "heartbeat": heartbeat,
         "orphaned_session": orphaned_session,
         "substate": _open_loop_substate(loop_dir),
         "broker": listing.get("status", "disabled"),
@@ -1758,11 +1821,16 @@ def _loop_controls(loop_dir: Path, root: Path | None, detection: dict,
                         "nothing in it is read or started.")
     elif not (loop_dir / "GOAL.md").is_file():
         start = (False, "GOAL.md is missing.")
+    elif sources:
+        start = (False, "Already running (" + ", ".join(sources) + ").")
+    elif detection.get("running_hints"):
+        # GOAL DoD2: argv is a hint, not running evidence, but it still
+        # blocks Start (a process that names this mailbox may own it).
+        start = (False, "A process names this mailbox in its argv (not "
+                        "counted as running); stop it first.")
     elif not Path(entrypoints[chosen]).is_file():
         start = (False, f"The {chosen} driver is not installed "
                         f"({entrypoints[chosen]}).")
-    elif sources:
-        start = (False, "Already running (" + ", ".join(sources) + ").")
     elif detection.get("broker") in ("unreachable", "truncated"):
         start = (False, "Broker liveness is unknown (the broker "
                         + ("did not answer" if detection.get("broker")
@@ -1818,6 +1886,8 @@ def _live_card_fields(loop_dir: Path, root: Path | None) -> dict:
         "driver": driver,
         "running": bool(sources),
         "running_sources": sources,
+        "running_hints": detection["running_hints"],
+        "heartbeat": detection["heartbeat"],
         "running_substate": detection["substate"],
         "broker": detection["broker"],
         "broker_sessions": detection["broker_sessions"],
@@ -4486,6 +4556,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "last_entry_summary": "refused: the mailbox contains symlinks ("
                     + ", ".join(links[:5]) + "); nothing in it is read",
                     "segments": [], "refused": "mailbox contains symlinks",
+                    # A refused mailbox is never read: nothing counts as running.
+                    "running": False, "running_sources": [], "running_hints": [],
                 })
                 continue
             if _mailbox_nested_git(loop_dir, root) or (
@@ -4497,6 +4569,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "final_verdict": None, "last_activity": None, "verdict_mtime": None,
                     "last_entry_summary": "refused: " + NESTED_GIT_REFUSAL,
                     "segments": [], "refused": "mailbox contains a .git entry",
+                    # A refused mailbox is never read: nothing counts as running.
+                    "running": False, "running_sources": [], "running_hints": [],
                 })
                 continue
             try:
@@ -5766,8 +5840,8 @@ def _worktree_main(worktree: Path) -> Path | None:
     return common.parent
 
 
-_RUNTIME_FILES = {".driver.json", ".session.json", ".lock", ".repairs",
-                  ".driver.json.dashboard-tmp"}
+_RUNTIME_FILES = {".driver.json", ".session.json", ".heartbeat.json", ".lock",
+                  ".repairs", ".driver.json.dashboard-tmp"}
 """Runtime files a running loop writes that are not mailbox content."""
 
 
@@ -6149,9 +6223,14 @@ def _worktree_live_candidates(worktree: Path, mailboxes: list[Path],
         s for s in listing.get("running", [])
         if s.get("workspace") and s.get("title", "").startswith("trioctl ")
     ]
+    workspaces = {str(s["workspace"]) for s in listing.get("running", [])
+                  if s.get("workspace")}
     out = []
     for mailbox in mailboxes:
         text = str(mailbox)
+        if text in workspaces:  # a session started inside the mailbox
+            out.append(mailbox)
+            continue
         if any(p == text or p.startswith(text + os.sep) for p in named):
             out.append(mailbox)
             continue
@@ -6191,7 +6270,8 @@ def _worktree_mailboxes(worktree: Path, listing: dict) -> dict[str, list[str]]:
             continue
         mailbox = Path(key)
         if any((mailbox / n).exists()
-               for n in (".driver.json", ".session.json", ".lock")):
+               for n in (".driver.json", ".session.json",
+                           ".heartbeat.json", ".lock")):
             if _running_detection(mailbox, worktree)["sources"]:
                 reasons[key].append("live")
     return reasons
