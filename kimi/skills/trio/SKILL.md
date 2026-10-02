@@ -75,6 +75,11 @@ product code. Builder performs the substantive implementation in its named
 scope. The post-Builder Lead reviews and may correct the implementation. The
 Evaluator independently runs checks and grades the diff without fixing it.
 
+## Session heartbeat (dashboard liveness)
+You run inside a session with no driver, so the dashboard cannot see this loop unless you write `<mailbox>/.heartbeat.json` (format: `MAILBOX-SCHEMA.md`, "Session heartbeat"). It is the one mailbox file you write besides STATE.md. Right before each synchronous role spawn (Lead, Repair, Evaluator), write it with `ttl_s` 7200 and `phase` `lead`, `evaluator` or `repair`; refresh it (new `updated_at`) after the role returns; and when you apply a stop condition (SHIP, BLOCKED, NEEDS_HUMAN, iteration cap, error) write it once more with `done: true`. Write it atomically (temp file, then `mv`):
+`printf '{"schema":1,"writer":"trio-skill","session_id":"%s","pid":null,"phase":"%s","iteration":%s,"updated_at":"%s","ttl_s":%s,"done":%s}\n' "${CLAUDE_SESSION_ID:-}" <phase> <iteration> "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 7200 <true|false> > <mailbox>/.heartbeat.json.tmp && mv <mailbox>/.heartbeat.json.tmp <mailbox>/.heartbeat.json`
+Add `.heartbeat.json` to `<mailbox>/.gitignore` if it is missing. A heartbeat failure never stops the loop.
+
 <!-- trio-protocol:start -->
 ## Trio protocol essentials
 

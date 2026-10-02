@@ -42,6 +42,11 @@ Then:
 - **SHIP** → end the loop (do not reschedule) and announce the Evaluator's retirement commit sha(s) from `loop/VERDICT.md`'s `commit:` lines.
 - **BLOCKED / NEEDS_HUMAN** → end the loop (do not reschedule) and tell the user why; for NEEDS_HUMAN quote the `## Human check` steps.
 
+## Session heartbeat (dashboard liveness)
+You run inside a session with no driver, so the dashboard cannot see this loop unless you write `<mailbox>/.heartbeat.json` (format: `MAILBOX-SCHEMA.md`, "Session heartbeat"). It is the one mailbox file you write besides STATE.md. Right before each synchronous role spawn (Lead, Repair, Evaluator), write it with `ttl_s` 7200 and `phase` `lead`, `evaluator` or `repair`; refresh it (new `updated_at`) after the role returns; and when you apply a stop condition (SHIP, BLOCKED, NEEDS_HUMAN, iteration cap, error) write it once more with `done: true`. Write it atomically (temp file, then `mv`):
+`printf '{"schema":1,"writer":"trio-skill","session_id":"%s","pid":null,"phase":"%s","iteration":%s,"updated_at":"%s","ttl_s":%s,"done":%s}\n' "${CLAUDE_SESSION_ID:-}" <phase> <iteration> "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 7200 <true|false> > <mailbox>/.heartbeat.json.tmp && mv <mailbox>/.heartbeat.json.tmp <mailbox>/.heartbeat.json`
+Add `.heartbeat.json` to `<mailbox>/.gitignore` if it is missing. A heartbeat failure never stops the loop.
+
 ## Hard rules
 - Never edit the mailbox files yourself except STATE.md bookkeeping — content belongs to the roles.
 - Never fix code yourself, even for a trivial failure; that's the next iteration's job.

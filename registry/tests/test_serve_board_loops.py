@@ -300,7 +300,7 @@ class RealRunningDetectionTests(unittest.TestCase):
         self.assertEqual(loop["running_sources"], [])
         self.assertIn("running", loop["status"])
 
-    def test_proc_mailbox_command_line_marks_loop_running(self):
+    def test_proc_mailbox_command_line_is_a_hint_not_running(self):
         pid = 42001
         command = (
             b"python3\0--mailbox\0"
@@ -309,8 +309,10 @@ class RealRunningDetectionTests(unittest.TestCase):
         )
         self._write_proc_cmdline(pid, command)
         loop = self._loop()
-        self.assertTrue(loop["running"])
-        self.assertIn("proc", loop["running_sources"])
+        # GOAL DoD2: argv alone is a hint, never running evidence.
+        self.assertFalse(loop["running"])
+        self.assertEqual(loop["running_sources"], [])  # GOAL DoD2
+        self.assertEqual(loop["running_hints"], ["proc"])  # GOAL DoD2
 
     def test_session_sidecar_live_then_orphaned(self):
         live_pid = 42002
