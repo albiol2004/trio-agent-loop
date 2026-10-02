@@ -2,8 +2,10 @@
 
 /* Trio Loop Dashboard — frontend.
  * No build step, no external dependencies. Talks to the backend at
- * /api/overview (every workspace's board), /api/loop, /api/transcript (SSE),
- * and loop controls. Loops are keyed by workspace root + mailbox name. */
+ * /api/stream (SSE: a snapshot of every workspace's board, then keyed
+ * deltas), /api/overview (the same board, polled only while the stream is
+ * unavailable), /api/loop, /api/transcript (SSE), and loop controls. Loops
+ * are keyed by workspace root + mailbox name. */
 
 const state = {
   boardTimer: null,
@@ -57,8 +59,33 @@ function withRoot(url) {
 }
 
 const BOARD_POLL_MS = 5000;
+const STREAM_URL = "/api/stream";
+const STREAM_IDLE_MS = 45000;
+const STREAM_RETRY_MS = 30000;
+const STREAM_MAX_RESYNCS = 5;
 const TABS = ["running", "attention", "all", "archived"];
 const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
+
+/* Render guards. Each section computes a string signature of exactly the data
+ * and UI state it renders and skips every DOM write when that signature is the
+ * one it last rendered: a push that did not touch a section leaves its DOM
+ * alone (focus, hover and selection survive, and nothing is rebuilt). */
+const sectionSigs = new Map();
+
+function sectionUnchanged(name, sig) {
+  return sectionSigs.get(name) === sig;
+}
+
+function sectionRendered(name, sig) {
+  sectionSigs.set(name, sig);
+}
+
+/* The drawer's sections are cleared by hand when it opens for another loop. */
+function invalidateDrawerSections() {
+  for (const name of Array.from(sectionSigs.keys())) {
+    if (name.startsWith("d:")) sectionSigs.delete(name);
+  }
+}
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -375,29 +402,368 @@ function ingestOverview(data) {
   state.updatedAt = data.updated_at || null;
 }
 
-async function refreshBoard() {
+/* ------------------------ push stream (client model) ------------------------
+ * /api/stream sends one snapshot (the /api/overview object plus epoch/seq),
+ * then keyed deltas. The client keeps a model of the entities, applies each
+ * delta, rebuilds the overview shape from it and renders; guarded sections
+ * skip the DOM when their inputs did not change. */
+
+function streamLoopId(root, card) {
+  return card.loop_id || "path:" + root + "::" + card.name;
+}
+
+function streamModelFromSnapshot(snapshot) {
+  const meta = {};
+  for (const key of Object.keys(snapshot)) {
+    if (key !== "workspaces") meta[key] = snapshot[key];
+  }
+  const workspaces = new Map();
+  const loops = new Map();
+  const inbox = new Map();
+  const order = [];
+  for (const ws of Array.isArray(snapshot.workspaces) ? snapshot.workspaces : []) {
+    const header = {};
+    for (const key of Object.keys(ws)) {
+      if (key !== "loops" && key !== "inbox") header[key] = ws[key];
+    }
+    workspaces.set(ws.root, header);
+    order.push(ws.root);
+    for (const card of ws.loops || []) loops.set(streamLoopId(ws.root, card), { root: ws.root, card });
+    for (const item of ws.inbox || []) inbox.set(item.id, { root: ws.root, item });
+  }
+  meta.workspace_order = order;
+  return { epoch: snapshot.epoch, seq: snapshot.seq, meta, workspaces, loops, inbox };
+}
+
+/* Apply one delta in place. A delta for another epoch, or one that does not
+ * start at the model's seq (a gap or a replay), is refused and the model is
+ * left untouched: the caller must resync from a snapshot. */
+function applyStreamDelta(model, delta) {
+  const refused = { ok: false, loopIds: new Set(), kinds: new Set() };
+  if (!model || !delta || delta.epoch !== model.epoch || delta.from_seq !== model.seq ||
+      !Array.isArray(delta.changes)) {
+    return refused;
+  }
+  const loopIds = new Set();
+  const kinds = new Set();
+  for (const change of delta.changes) {
+    if (!change) continue;
+    if (change.kind === "meta") {
+      kinds.add("meta");
+      if (change.op === "upsert" && change.data) {
+        const next = Object.assign({}, change.data);
+        if (!Array.isArray(next.workspace_order)) next.workspace_order = model.meta.workspace_order;
+        model.meta = next;
+      }
+      continue;
+    }
+    const table = { workspace: model.workspaces, loop: model.loops, inbox: model.inbox }[change.kind];
+    if (!table) continue;
+    kinds.add(change.kind);
+    if (change.kind === "loop") loopIds.add(change.id);
+    if (change.op === "remove") table.delete(change.id);
+    else if (change.op === "upsert" && change.data) table.set(change.id, change.data);
+  }
+  model.seq = delta.seq;
+  if (delta.updated_at !== undefined) model.meta.updated_at = delta.updated_at;
+  return { ok: true, loopIds, kinds };
+}
+
+/* The model as an /api/overview object: workspaces in meta.workspace_order,
+ * each with its loops and inbox items in model order. ingestOverview mutates
+ * cards and items, so every one handed out is a fresh shallow copy. */
+function overviewFromStreamModel(model) {
+  const overview = {};
+  for (const key of Object.keys(model.meta)) {
+    if (key !== "workspace_order") overview[key] = model.meta[key];
+  }
+  const groups = new Map();
+  for (const root of model.workspaces.keys()) groups.set(root, { loops: [], inbox: [] });
+  for (const entry of model.loops.values()) {
+    const group = groups.get(entry.root);
+    if (group) group.loops.push(Object.assign({}, entry.card));
+  }
+  for (const entry of model.inbox.values()) {
+    const group = groups.get(entry.root);
+    if (group) group.inbox.push(Object.assign({}, entry.item));
+  }
+  const order = Array.isArray(model.meta.workspace_order)
+    ? model.meta.workspace_order : Array.from(model.workspaces.keys());
+  const seen = new Set();
+  overview.workspaces = [];
+  for (const root of order) {
+    const header = model.workspaces.get(root);
+    if (!header || seen.has(root)) continue;
+    seen.add(root);
+    const group = groups.get(root);
+    overview.workspaces.push(Object.assign({}, header, { loops: group.loops, inbox: group.inbox }));
+  }
+  return overview;
+}
+
+/* --------------------------- board feed --------------------------- */
+
+/* "stream": the board arrives over /api/stream and nothing polls.
+ * "poll": the stream is unavailable (no EventSource, it ended closed, or it
+ * went quiet), so /api/overview is polled every 5 s and the stream is retried
+ * every 30 s; the first stream event ends the polling. */
+const push = {
+  mode: "stream",
+  es: null,
+  model: null,
+  idleTimer: null,
+  retryTimer: null,
+  resyncs: 0,
+  detailBusy: false,
+  detailAgain: false,
+};
+
+function streamSupported() {
+  return typeof window.EventSource === "function";
+}
+
+function activeCardSig() {
+  return JSON.stringify(state.byKey.get(state.activeLoop) || null);
+}
+
+/* Show the board from the model; true when a `#loop=` hash opened the drawer. */
+function showStreamModel() {
+  ingestOverview(overviewFromStreamModel(push.model));
+  state.lastOk = Date.now();
+  state.loaded = true;
+  hideBoardError();
+  renderAll();
+  return openPendingHashLoop();
+}
+
+function openPendingHashLoop() {
+  if (!pendingLoopHash) return false;
+  const target = resolveHashLoop(pendingLoopHash);
+  if (!target) return false;
+  pendingLoopHash = null;
+  openDrawer(target.key);
+  return true;
+}
+
+/* Detail refetches coalesce: pushes arriving mid-fetch cost one more fetch. */
+async function requestDetailRefresh() {
+  if (push.detailBusy) {
+    push.detailAgain = true;
+    return;
+  }
+  push.detailBusy = true;
+  try {
+    await refreshDetail({ quiet: true });
+  } finally {
+    push.detailBusy = false;
+    if (push.detailAgain) {
+      push.detailAgain = false;
+      if (state.activeLoop) requestDetailRefresh();
+    }
+  }
+}
+
+/* Did a delta change the loop open in the drawer? Match by the card's
+ * loop_id, or by workspace root + mailbox name. */
+function activeLoopTouched(loopIds, previousCard) {
+  const key = state.activeLoop;
+  if (!key || !loopIds.size) return false;
+  if (loopIds.has("path:" + key)) return true;
+  if (previousCard && previousCard.loop_id && loopIds.has(previousCard.loop_id)) return true;
+  for (const id of loopIds) {
+    const entry = push.model && push.model.loops.get(id);
+    if (entry && entry.card && loopKey(entry.root, entry.card.name) === key) return true;
+  }
+  return false;
+}
+
+function onStreamSnapshot(data) {
+  push.model = streamModelFromSnapshot(data);
+  push.resyncs = 0;
+  const before = activeCardSig();
+  const opened = showStreamModel();
+  if (!opened && state.activeLoop) {
+    requestDetailRefresh();
+    if (activeCardSig() !== before) refreshActions();
+  }
+}
+
+function onStreamDelta(data) {
+  const previous = state.byKey.get(state.activeLoop) || null;
+  const result = push.model ? applyStreamDelta(push.model, data) : null;
+  if (!result || !result.ok) {
+    resyncStream();
+    return;
+  }
+  push.resyncs = 0;
+  const opened = showStreamModel();
+  if (!opened && activeLoopTouched(result.loopIds, previous)) {
+    requestDetailRefresh();
+    refreshActions();
+  }
+}
+
+/* Nothing changed: only the liveness indicator moves. */
+function onStreamTick(data) {
+  if (data.updated_at) {
+    state.updatedAt = data.updated_at;
+    if (push.model && data.epoch === push.model.epoch) push.model.meta.updated_at = data.updated_at;
+  }
+  state.lastOk = Date.now();
+  hideBoardError();
+  renderLive();
+}
+
+const STREAM_HANDLERS = { snapshot: onStreamSnapshot, delta: onStreamDelta, tick: onStreamTick };
+
+function onStreamEvent(es, type, ev) {
+  if (push.es !== es) return;
+  let data;
+  try {
+    data = JSON.parse(ev.data);
+  } catch (err) {
+    return;
+  }
+  if (!data || typeof data !== "object") return;
+  // Any event proves the stream healthy: polling and the retry timer stop.
+  push.mode = "stream";
+  clearTimeout(state.boardTimer);
+  clearTimeout(push.retryTimer);
+  armStreamIdle();
+  STREAM_HANDLERS[type](data);
+}
+
+function onStreamError(es) {
+  if (push.es !== es) return;
+  // CONNECTING: the browser is reconnecting by itself (Last-Event-ID); the
+  // idle watchdog covers it never succeeding. CLOSED: it gave up (503/404).
+  if (es.readyState === 2) startPolling();
+}
+
+function armStreamIdle() {
+  clearTimeout(push.idleTimer);
+  push.idleTimer = setTimeout(startPolling, STREAM_IDLE_MS);
+}
+
+function closeBoardStream() {
+  clearTimeout(push.idleTimer);
+  const es = push.es;
+  push.es = null;
+  if (es) {
+    try {
+      es.close();
+    } catch (err) {
+      /* already closed */
+    }
+  }
+}
+
+/* (Re)open the stream, resuming from the model's position when there is one. */
+function openStream() {
+  closeBoardStream();
+  const model = push.model;
+  const since = model && model.epoch != null && model.seq != null
+    ? "?since=" + encodeURIComponent(model.epoch + ":" + model.seq) : "";
+  let es;
+  try {
+    es = new window.EventSource(STREAM_URL + since);
+  } catch (err) {
+    startPolling();
+    return;
+  }
+  push.es = es;
+  for (const type of Object.keys(STREAM_HANDLERS)) {
+    es.addEventListener(type, (ev) => onStreamEvent(es, type, ev));
+  }
+  es.addEventListener("error", () => onStreamError(es));
+  armStreamIdle();
+}
+
+/* A refused delta: reopen from the model's position (the server answers with
+ * the missed deltas or a fresh snapshot). A stream that keeps being refused
+ * is given up on. */
+function resyncStream() {
+  push.resyncs += 1;
+  if (push.resyncs > STREAM_MAX_RESYNCS) startPolling();
+  else openStream();
+}
+
+function startPolling() {
+  const already = push.mode === "poll";
+  push.mode = "poll";
+  closeBoardStream();
+  clearTimeout(push.retryTimer);
+  if (streamSupported() && !document.hidden) push.retryTimer = setTimeout(retryStream, STREAM_RETRY_MS);
+  if (!already) pollBoard();
+}
+
+function retryStream() {
+  if (document.hidden || push.mode !== "poll" || !streamSupported()) return;
+  openStream();
+}
+
+function startBoardFeed() {
+  if (!streamSupported()) {
+    push.mode = "poll";
+    pollBoard();
+    return;
+  }
+  push.mode = "stream";
+  openStream();
+}
+
+/* The tab hid: the stream (or the poll) is dropped; it resumes when shown. */
+function pauseBoardFeed() {
+  closeBoardStream();
+  clearTimeout(push.retryTimer);
+  clearTimeout(state.boardTimer);
+}
+
+function resumeBoardFeed() {
+  if (push.mode === "poll") {
+    if (streamSupported()) {
+      clearTimeout(push.retryTimer);
+      push.retryTimer = setTimeout(retryStream, STREAM_RETRY_MS);
+    }
+    pollBoard();
+  } else {
+    openStream();
+  }
+}
+
+/* Called after loop actions: while the stream is healthy the server pushes
+ * the result, so only the polling fallback fetches here. */
+function refreshBoard() {
+  if (push.mode === "poll") return pollBoard();
+  if (!push.es && !document.hidden) openStream();
+  return Promise.resolve();
+}
+
+/* "Retry" on the error banner: reconnect the stream, or poll right now. */
+function retryBoard() {
+  if (push.mode === "poll") pollBoard();
+  else openStream();
+}
+
+async function pollBoard() {
   clearTimeout(state.boardTimer);
   try {
     const res = await fetch("/api/overview", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
+    if (push.mode !== "poll") return; // the stream took over while this was in flight
+    const before = activeCardSig();
     ingestOverview(data);
     state.lastOk = Date.now();
     state.loaded = true;
     hideBoardError();
     renderAll();
-    if (pendingLoopHash) {
-      const target = resolveHashLoop(pendingLoopHash);
-      if (target) {
-        pendingLoopHash = null;
-        openDrawer(target.key);
-      }
-    }
-    if (state.activeLoop) {
-      refreshDetail({ quiet: true });
-      refreshActions();
+    if (!openPendingHashLoop() && state.activeLoop) {
+      requestDetailRefresh();
+      if (activeCardSig() !== before) refreshActions();
     }
   } catch (err) {
+    if (push.mode !== "poll") return;
     showBoardError(
       state.loaded
         ? "Lost contact with the dashboard server (" + err.message + "). Showing the last data received; retrying every 5 seconds."
@@ -408,16 +774,17 @@ async function refreshBoard() {
   schedulePoll();
 }
 
-/* Poll every 5 s while visible; hidden tabs stop polling (the server only
- * rebuilds when someone asks). A build older than the server's rebuild
- * interval means a fresh one is on its way, so look again sooner, once. */
+/* Poll every 5 s while visible and in fallback; hidden tabs stop polling (the
+ * server only rebuilds when someone asks). A build older than the server's
+ * rebuild interval means a fresh one is on its way, so look again sooner,
+ * once. */
 function schedulePoll() {
   clearTimeout(state.boardTimer);
-  if (document.hidden) return;
+  if (document.hidden || push.mode !== "poll") return;
   const age = ageMs(state.updatedAt);
   const soon = state.loaded && age != null && age > 18000 && !state.quickRepoll;
   state.quickRepoll = soon;
-  state.boardTimer = setTimeout(refreshBoard, soon ? 1500 : BOARD_POLL_MS);
+  state.boardTimer = setTimeout(pollBoard, soon ? 1500 : BOARD_POLL_MS);
 }
 
 function resolveHashLoop(hash) {
@@ -431,11 +798,14 @@ function showBoardError(msg) {
 }
 
 function hideBoardError() {
-  el("board-error").hidden = true;
+  const banner = el("board-error");
+  if (!banner.hidden) banner.hidden = true;
 }
 
 /* ---------------------------- render ---------------------------- */
 
+/* Every section below is guarded (see sectionUnchanged), so calling this on
+ * unchanged state writes nothing to the DOM except the live indicator. */
 function renderAll() {
   const groups = attentionGroups();
   renderLive();
@@ -470,8 +840,10 @@ function renderLive() {
   }
   live.className = "live " + cls;
   text.textContent = label;
-  live.title = "Polls every " + BOARD_POLL_MS / 1000 + " s. Data built at " +
-    (state.updatedAt ? new Date(state.updatedAt).toLocaleString() : "—");
+  live.title = (push.mode === "stream"
+    ? "Push (SSE)"
+    : "Polling every " + BOARD_POLL_MS / 1000 + " s (stream unavailable)") +
+    " · data built at " + (state.updatedAt ? new Date(state.updatedAt).toLocaleString() : "—");
 }
 
 /* Unread attention grouped per loop, split into "needs you" and notes. */
@@ -503,6 +875,33 @@ function plural(n, word, many) {
   return n + " " + (n === 1 ? word : many || word + "s");
 }
 
+/* Everything a loop's board row, running card, state badge and phase line
+ * show. The relative time is included as rendered ("2d ago"), so it moves the
+ * signature exactly when its text would change. */
+function loopViewSig(loop) {
+  return [
+    loop.key, loop.title || "", loop.mission || "", loop.name, loop.workspace, loop.root,
+    Boolean(loop.worktree), loop.worktree_reasons || null, loop.driver || null,
+    loop.diagnosis || null, loop.status ?? null, loop.final_verdict ?? null,
+    verdictSeq(loop).join(""), Boolean(loop.running), loop.running_sources || [],
+    loop.running_substate ?? null, loop.driver_phase ?? null,
+    loop.loop_state ? [loop.loop_state.state, loop.loop_state.status_raw, loop.loop_state.summary] : null,
+    loop.last_activity ?? null, loop.last_activity ? relTime(loop.last_activity) : "",
+    loop.iteration ?? null, loop.max_iterations ?? null,
+  ];
+}
+
+/* What attentionRow() renders for one group of inbox items. */
+function attentionSig(group) {
+  const loop = group.loop;
+  return [
+    group.key,
+    loop ? [loopTitle(loop), loop.last_activity ? relTime(loop.last_activity) : ""] : null,
+    group.items.map((i) => [i.id, i.root, i.workspace, i.loop, i.severity, i.kind,
+      i.headline || "", i.detail || "", Boolean(i.read)]),
+  ];
+}
+
 /* "2 via driver · 1 process only": distinct phases, else evidence counts. */
 function runningContext(running) {
   const phases = Array.from(new Set(running.map(phaseText).filter(Boolean)));
@@ -532,7 +931,6 @@ function renderSummary(groups) {
   } else {
     verdict = "All clear. No loop is running and nothing needs you.";
   }
-  el("verdict").textContent = verdict;
   const latest = loops.slice().sort((a, b) =>
     String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
   const wtShown = state.workspaces.filter((w) => w.worktree).length;
@@ -540,28 +938,45 @@ function renderSummary(groups) {
     (wtShown ? " and " + plural(wtShown, "worktree") : "") + " with loops (" +
     plural(state.scanned, "workspace") + (state.worktreesScanned ? " and " + plural(state.worktreesScanned, "worktree") : "") +
     " scanned).";
-  el("verdict-sub").textContent = (latest
+  const verdictSub = (latest
     ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + ". "
-    : "Start a loop with /trio-init in a project; it appears here on the next poll. ") + coverage;
-  const brokerNote = el("broker-note");
+    : "Start a loop with /trio-init in a project; it appears here on the next update. ") + coverage;
   const brokerText = {
     disabled: "Broker liveness is not configured, so loops driven only through Omnigent broker sessions cannot show as running.",
     unreachable: "The Omnigent broker did not answer; loops driven only through broker sessions may be running but show as not running.",
     truncated: "The Omnigent broker session list was too long to read in full; some broker-only loops may not show as running.",
   }[state.broker];
-  brokerNote.hidden = !brokerText;
-  brokerNote.textContent = brokerText || "";
-
   const partial = state.workspaces.filter((w) => w.error);
-  el("board-partial").hidden = partial.length === 0;
-  el("board-partial").textContent = partial.length
+  const partialText = partial.length
     ? "Could not read " + partial.map((w) => w.name).join(", ") + ". Other workspaces are shown."
     : "";
+  const unread = groups.needs.reduce((n, g) => n + g.items.filter((i) => !i.read).length, 0);
+  // [label, value, context, tone, target]
+  const tiles = [
+    ["Needs you", needsLoops.length,
+      needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
+      needsLoops.length ? "warning" : "", "#needs"],
+    ["Running now", running.length,
+      running.length ? runningContext(running) : "No live driver, process or session",
+      running.length ? "live" : "", "#running"],
+    ["Shipped, last 7 days", shipped7.length,
+      plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null],
+    ["Loops tracked", loops.length,
+      "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops"],
+  ];
 
+  const sig = JSON.stringify([verdict, verdictSub, brokerText || "", partialText, tiles]);
+  if (sectionUnchanged("b:summary", sig)) return;
+  el("verdict").textContent = verdict;
+  el("verdict-sub").textContent = verdictSub;
+  const brokerNote = el("broker-note");
+  brokerNote.hidden = !brokerText;
+  brokerNote.textContent = brokerText || "";
+  el("board-partial").hidden = partial.length === 0;
+  el("board-partial").textContent = partialText;
   const kpis = el("kpis");
   kpis.textContent = "";
-  const unread = groups.needs.reduce((n, g) => n + g.items.filter((i) => !i.read).length, 0);
-  const tile = (label, value, context, tone, target) => {
+  for (const [label, value, context, tone, target] of tiles) {
     const node = document.createElement(target ? "a" : "div");
     node.className = "kpi" + (tone ? " kpi-" + tone : "");
     if (target) node.href = target;
@@ -569,17 +984,8 @@ function renderSummary(groups) {
     node.appendChild(span("kpi-value", String(value)));
     node.appendChild(span("kpi-context", context));
     kpis.appendChild(node);
-  };
-  tile("Needs you", needsLoops.length,
-    needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
-    needsLoops.length ? "warning" : "", "#needs");
-  tile("Running now", running.length,
-    running.length ? runningContext(running) : "No live driver, process or session",
-    running.length ? "live" : "", "#running");
-  tile("Shipped, last 7 days", shipped7.length,
-    plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null);
-  tile("Loops tracked", loops.length,
-    "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops");
+  }
+  sectionRendered("b:summary", sig);
 }
 
 function inboxMarkButton(item) {
@@ -677,6 +1083,10 @@ function renderNeeds(groups) {
   const list = el("needs-list");
   const toggle = el("inbox-toggle");
   const unreadGroups = groups.needs.filter((g) => g.items.some((i) => !i.read));
+  const sig = JSON.stringify([state.showReadInbox, groups.readCount, unreadGroups.length,
+    groups.needs.map(attentionSig)]);
+  if (sectionUnchanged("b:needs", sig)) return;
+  sectionRendered("b:needs", sig);
   el("needs-count").textContent = unreadGroups.length ? String(unreadGroups.length) : "";
   toggle.hidden = groups.readCount === 0;
   toggle.textContent = (state.showReadInbox ? "Hide read (" : "Show read (") + groups.readCount + ")";
@@ -690,6 +1100,9 @@ function renderNeeds(groups) {
 }
 
 function renderNotes(groups) {
+  const sig = JSON.stringify(groups.notes.map(attentionSig));
+  if (sectionUnchanged("b:notes", sig)) return;
+  sectionRendered("b:notes", sig);
   const details = el("notes");
   details.hidden = groups.notes.length === 0;
   const count = groups.notes.reduce((n, g) => n + g.items.length, 0);
@@ -704,9 +1117,13 @@ function renderRunning() {
   const list = el("running-list");
   const running = state.loops.filter((l) => l.running)
     .sort((a, b) => String(b.last_activity || "").localeCompare(String(a.last_activity || "")));
+  const busy = state.workspaces.filter((w) => w.unattributed_processes > 0);
+  const sig = JSON.stringify([running.map(loopViewSig),
+    busy.map((w) => [w.name, w.unattributed_processes])]);
+  if (sectionUnchanged("b:running", sig)) return;
+  sectionRendered("b:running", sig);
   el("running-count").textContent = running.length ? String(running.length) : "";
   list.textContent = "";
-  const busy = state.workspaces.filter((w) => w.unattributed_processes > 0);
   for (const ws of busy) {
     const note = document.createElement("p");
     note.className = "run-note";
@@ -773,7 +1190,7 @@ function renderWorkspaceFilter() {
     }
   }
   if (state.workspace && !names.some(([root]) => root === state.workspace)) state.workspace = "";
-  select.value = state.workspace;
+  if (select.value !== state.workspace) select.value = state.workspace;
 }
 
 function hasUnreadAttention(loop) {
@@ -792,9 +1209,13 @@ const TAB_LABELS = { running: "Running", attention: "Attention", all: "All", arc
 function renderTabs() {
   const nav = el("tabs");
   const scoped = state.loops.filter(matchesFilters);
+  const counts = TABS.map((tab) => scoped.filter((loop) => matchesTab(tab, loop)).length);
+  const sig = JSON.stringify([state.tab, counts]);
+  if (sectionUnchanged("b:tabs", sig)) return;
+  sectionRendered("b:tabs", sig);
   nav.textContent = "";
   for (const tab of TABS) {
-    const count = scoped.filter((loop) => matchesTab(tab, loop)).length;
+    const count = counts[TABS.indexOf(tab)];
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "seg-btn";
@@ -835,20 +1256,14 @@ function visibleLoops() {
 }
 
 function boardSignature(loops) {
+  const unread = new Map();
+  for (const item of state.inbox) {
+    if (!item.read) unread.set(item.key, (unread.get(item.key) || 0) + 1);
+  }
   return JSON.stringify(
     loops.map((loop) => [
-      loop.key,
-      loop.title || "",
-      loop.status ?? null,
-      loop.final_verdict ?? null,
-      Boolean(loop.running),
-      loop.running_sources || [],
-      loop.last_activity ?? null,
-      loop.iteration,
-      loop.max_iterations,
-      verdictSeq(loop),
-      loop.driver_phase ?? null,
-      hasUnreadAttention(loop),
+      loopViewSig(loop),
+      unread.get(loop.key) || 0,
       state.activeLoop === loop.key,
     ])
   );
@@ -860,14 +1275,15 @@ function renderBoard() {
   const emptyText = !state.loops.length
     ? "No loop mailboxes found. Start one with /trio-init in a project."
     : loops.length ? "" : "No loops match these filters.";
+  const sig = state.tab + "|" + state.sort.key + "|" + state.sort.dir + "|" + emptyText + "|" +
+    boardSignature(loops);
+  if (sig === state.boardSignature) return;
+  state.boardSignature = sig;
   for (const th of document.querySelectorAll(".loop-table th[aria-sort]")) {
     const key = th.querySelector(".th-sort")?.dataset.sort;
     th.setAttribute("aria-sort", key === state.sort.key
       ? (state.sort.dir === "asc" ? "ascending" : "descending") : "none");
   }
-  const sig = state.tab + "|" + emptyText + "|" + boardSignature(loops);
-  if (sig === state.boardSignature) return;
-  state.boardSignature = sig;
 
   if (emptyText) {
     body.textContent = "";
@@ -913,7 +1329,7 @@ function renderBoard() {
  * focus and hover survive the 5 s poll. */
 function patchCard(row, loop) {
   const fresh = cardEl(loop);
-  row.className = fresh.className;
+  if (row.className !== fresh.className) row.className = fresh.className;
   const oldCells = Array.from(row.children);
   const newCells = Array.from(fresh.children);
   newCells.forEach((cell, i) => {
@@ -1037,7 +1453,18 @@ async function setInboxRead(items, read) {
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
     }
+    // Sections keep the rows of the items they were rendered from: mark the
+    // items now in state (and in the stream model) as well as the ones clicked.
+    const marked = new Set(items.map((item) => item.root + "\u0000" + item.id));
     for (const item of items) item.read = read;
+    for (const item of state.inbox) {
+      if (marked.has(item.root + "\u0000" + item.id)) item.read = read;
+    }
+    if (push.model) {
+      for (const entry of push.model.inbox.values()) {
+        if (marked.has(entry.root + "\u0000" + entry.item.id)) entry.item.read = read;
+      }
+    }
     renderAll();
   } catch (err) {
     showBoardError("Could not update the attention list: " + err.message);
@@ -1048,8 +1475,12 @@ function renderDrawerInbox() {
   const section = el("drawer-inbox-section");
   const list = el("drawer-inbox-list");
   if (!section || !list) return;
-  list.textContent = "";
   const items = state.inbox.filter((item) => item.key === state.activeLoop);
+  const sig = JSON.stringify([state.activeLoop, items.map((i) => [i.id, i.root, i.severity,
+    i.headline || "", i.detail || "", Boolean(i.read)])]);
+  if (sectionUnchanged("b:drawer-inbox", sig)) return;
+  sectionRendered("b:drawer-inbox", sig);
+  list.textContent = "";
   section.hidden = items.length === 0;
   for (const item of items) {
     const row = document.createElement("div");
@@ -1113,15 +1544,34 @@ async function controlLoop(action) {
 function renderDrawerControls(loop) {
   const wrap = el("drawer-controls");
   if (!loop) {
-    wrap.hidden = true;
+    sectionSigs.delete("d:controls");
+    if (!wrap.hidden) wrap.hidden = true;
     return;
   }
-  wrap.hidden = false;
   const controls = loop.controls || {
     start: { enabled: false, reason: "Controls unavailable." },
     stop: { enabled: false, reason: "Controls unavailable." },
   };
   const pending = Boolean(state.actionNotes.get(loop.key)?.pending);
+  const status = actionNote(loop);
+  let noteText;
+  let noteClass;
+  let noteRole;
+  if (status) {
+    noteText = status.text;
+    noteClass = "control-note control-" + status.tone;
+    noteRole = status.tone === "error" ? "alert" : "status";
+  } else {
+    noteText = controls.start.enabled ? "" : controls.start.reason;
+    if (!controls.start.enabled && controls.stop.enabled) noteText = controls.stop.reason;
+    noteClass = "control-note caption";
+    noteRole = "status";
+  }
+  const sig = JSON.stringify([loop.key, pending, controls.start, controls.stop,
+    noteText, noteClass, noteRole]);
+  if (sectionUnchanged("d:controls", sig)) return;
+  sectionRendered("d:controls", sig);
+  wrap.hidden = false;
   const start = el("loop-start");
   const stop = el("loop-stop");
   start.disabled = pending || !controls.start.enabled;
@@ -1129,17 +1579,9 @@ function renderDrawerControls(loop) {
   start.title = controls.start.reason;
   stop.title = controls.stop.reason || controls.start.reason;
   const note = el("loop-control-note");
-  const status = actionNote(loop);
-  if (status) {
-    note.textContent = status.text;
-    note.className = "control-note control-" + status.tone;
-    note.setAttribute("role", status.tone === "error" ? "alert" : "status");
-  } else {
-    note.textContent = controls.start.enabled ? "" : controls.start.reason;
-    if (!controls.start.enabled && controls.stop.enabled) note.textContent = controls.stop.reason;
-    note.className = "control-note caption";
-    note.setAttribute("role", "status");
-  }
+  note.textContent = noteText;
+  note.className = noteClass;
+  note.setAttribute("role", noteRole);
 }
 
 /* ---------------------------- unblock panel ----------------------------
@@ -1648,6 +2090,7 @@ async function openDrawer(key) {
   state.activePath = null;
   state.drawerTab = "overview";
   state.graphSel = null;
+  invalidateDrawerSections();
 
   el("drawer-name").textContent = loopTitle(loop);
   el("drawer-where").textContent = loop.workspace + " / " + name;
@@ -1707,6 +2150,7 @@ function closeDrawer() {
   state.pendingLines = [];
   state.drawerTab = "overview";
   state.graphSel = null;
+  invalidateDrawerSections();
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
   setBackgroundInert(false);
@@ -1730,10 +2174,9 @@ async function refreshDetail({ quiet }) {
     if (state.activeLoop !== key) return;
     const detail = await res.json();
     state.detail = detail;
-    const before = sessionSignature(state.sessions);
     state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
     renderDetail(detail);
-    if (!quiet || sessionSignature(state.sessions) !== before) renderSessionList();
+    renderSessionList();
     if (state.drawerTab === "transcripts") openDefaultSession();
   } catch (err) {
     if (!quiet) {
@@ -1808,50 +2251,106 @@ function toggleCompare(n) {
   renderTimelineView();
 }
 
-function renderDetail(detail) {
-  const badge = el("drawer-badge");
-  badge.className = "status-tags";
-  badge.textContent = "";
-  const live = state.byKey.get(state.activeLoop) || {};
-  badge.appendChild(stateBadge(Object.assign({}, detail, {
-    running: live.running ?? detail.running,
-    running_sources: live.running_sources || detail.running_sources,
-  })));
-
-  const missionEl = el("drawer-mission");
-  missionEl.textContent = detail.mission || "No mission recorded.";
-  missionEl.title = detail.mission || "";
-
+/* The small facts under the drawer title. The relative time and the session
+ * count move without a refetch, so the 5 s tick re-runs this too. */
+function renderDetailFacts(detail) {
   const cur = detail.iteration != null ? detail.iteration : "–";
   const max = detail.max_iterations != null ? detail.max_iterations : "–";
-  el("fact-iter").textContent = cur + " of " + max;
-
   const verdict = detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "—";
+  const verdictClass = detail.final_verdict ? "verdict-" + normVerdict(detail.final_verdict) : "";
+  const activity = relTime(detail.last_activity);
+  const sessions = String(state.sessions.length);
+  const sig = JSON.stringify([cur, max, verdict, verdictClass, activity, sessions]);
+  if (sectionUnchanged("d:facts", sig)) return;
+  sectionRendered("d:facts", sig);
+  el("fact-iter").textContent = cur + " of " + max;
   const fv = el("fact-verdict");
   fv.textContent = verdict;
-  fv.className = detail.final_verdict ? "verdict-" + normVerdict(detail.final_verdict) : "";
+  fv.className = verdictClass;
+  el("fact-activity").textContent = activity;
+  el("fact-sessions").textContent = sessions;
+}
 
-  el("fact-activity").textContent = relTime(detail.last_activity);
-  el("fact-sessions").textContent = String(state.sessions.length);
+/* Re-render what shows relative time or session counts, from cached data. */
+function renderDetailTimes() {
+  if (!state.detail) return;
+  renderDetailFacts(state.detail);
+  renderSessionList();
+}
 
-  const strip = el("drawer-strip");
-  strip.textContent = "";
-  const seq = verdictSeq(detail);
-  if (seq.length) {
-    strip.appendChild(historyEl(detail));
-    strip.appendChild(span("caption", " S shipped · I iterate · B blocked · H needs human, oldest first"));
-  } else {
-    strip.appendChild(span("caption", "No evaluator verdicts parsed from LOG.md. Latest recorded verdict: " +
-      (detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "none") + "."));
+function renderDetail(detail) {
+  const live = state.byKey.get(state.activeLoop) || {};
+  const badgeLoop = Object.assign({}, detail, {
+    running: live.running ?? detail.running,
+    running_sources: live.running_sources || detail.running_sources,
+  });
+  const badgeSig = JSON.stringify([Boolean(badgeLoop.running), badgeLoop.running_sources || [],
+    badgeLoop.status ?? null, latestVerdict(badgeLoop),
+    badgeLoop.loop_state
+      ? [badgeLoop.loop_state.state, badgeLoop.loop_state.status_raw, badgeLoop.loop_state.summary]
+      : null]);
+  if (!sectionUnchanged("d:badge", badgeSig)) {
+    sectionRendered("d:badge", badgeSig);
+    const badge = el("drawer-badge");
+    badge.className = "status-tags";
+    badge.textContent = "";
+    badge.appendChild(stateBadge(badgeLoop));
   }
 
+  const mission = detail.mission || "";
+  if (!sectionUnchanged("d:mission", mission)) {
+    sectionRendered("d:mission", mission);
+    const missionEl = el("drawer-mission");
+    missionEl.textContent = mission || "No mission recorded.";
+    missionEl.title = mission;
+  }
+
+  renderDetailFacts(detail);
+
+  const seq = verdictSeq(detail);
+  const stripSig = JSON.stringify([seq, detail.final_verdict ?? null]);
+  if (!sectionUnchanged("d:strip", stripSig)) {
+    sectionRendered("d:strip", stripSig);
+    const strip = el("drawer-strip");
+    strip.textContent = "";
+    if (seq.length) {
+      strip.appendChild(historyEl(detail));
+      strip.appendChild(span("caption", " S shipped · I iterate · B blocked · H needs human, oldest first"));
+    } else {
+      strip.appendChild(span("caption", "No evaluator verdicts parsed from LOG.md. Latest recorded verdict: " +
+        (detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "none") + "."));
+    }
+  }
+
+  renderCommits(detail);
+  renderSlices(detail);
+
+  renderTimeline(detail.timeline || []);
+  renderTimelineView();
+  renderFilesView();
+  renderGraphView();
+
+  if (!state.activePath) {
+    setPaneStatus(
+      "idle",
+      state.sessions.length
+        ? state.sessions.length + (state.sessions.length === 1 ? " session" : " sessions")
+        : "no sessions"
+    );
+  }
+}
+
+function renderCommits(detail) {
   const commits = Array.isArray(detail.commits) ? detail.commits : [];
+  const COMMIT_PREVIEW = 8;
+  const showAll = state.showAllCommits === state.activeLoop;
+  const sig = JSON.stringify([showAll, commits.map((c) => [c.short, c.sha, c.slice, c.subject])]);
+  if (sectionUnchanged("d:commits", sig)) return;
+  sectionRendered("d:commits", sig);
   const csec = el("commits-section");
   const clist = el("commit-list");
   clist.textContent = "";
   csec.hidden = commits.length === 0;
-  const COMMIT_PREVIEW = 8;
-  const showAll = state.showAllCommits === state.activeLoop;
   for (const c of showAll ? commits : commits.slice(0, COMMIT_PREVIEW)) {
     const row = document.createElement("div");
     row.className = "commit-row";
@@ -1875,28 +2374,16 @@ function renderDetail(detail) {
     });
     clist.appendChild(more);
   }
-
-  renderSlices(detail);
-
-  renderTimeline(detail.timeline || []);
-  renderTimelineView();
-  renderFilesView();
-  renderGraphView();
-
-  if (!state.activePath) {
-    setPaneStatus(
-      "idle",
-      state.sessions.length
-        ? state.sessions.length + (state.sessions.length === 1 ? " session" : " sessions")
-        : "no sessions"
-    );
-  }
 }
 
 /* Slices section (Overview): one row per PLAN.md slice, merged with its
  * derived lifecycle keys (see the /api/loop `slices` contract). */
 function renderSlices(detail) {
   const slices = Array.isArray(detail.slices) ? detail.slices : [];
+  const sig = JSON.stringify(slices.map((s) => s && [s.id, s.repo, s.lifecycle, s.retired_sha,
+    s.verdict, s.open_faults]));
+  if (sectionUnchanged("d:slices", sig)) return;
+  sectionRendered("d:slices", sig);
   const ssec = el("slices-section");
   const slist = el("slice-list");
   slist.textContent = "";
@@ -1967,6 +2454,10 @@ function sliceCountSummary(iterNum) {
 
 function renderTimeline(entries) {
   const view = el("drawer-timeline");
+  const d = state.detail;
+  const sig = JSON.stringify([entries, d ? [d.mode, d.iterations, d.slices] : null]);
+  if (sectionUnchanged("d:timeline", sig)) return;
+  sectionRendered("d:timeline", sig);
   view.textContent = "";
   if (!entries.length) {
     const empty = document.createElement("div");
@@ -2174,7 +2665,9 @@ function renderTimelineView() {
   /* The detail poll re-renders every 5 s. Skip when nothing the timeline
    * shows has changed, so focused controls are not replaced; when it has,
    * focus returns to the same control (by data-focus-key) without scrolling. */
-  const signature = JSON.stringify([state.detail, state.compare]);
+  const d = state.detail;
+  const signature = JSON.stringify([d ? [d.timeline, d.slices, d.overlaps, d.mode, d.iterations] : null,
+    state.compare]);
   if (signature === state.tlSignature && view.childElementCount) {
     requestAnimationFrame(() => syncSummaryToggles(view));
     return;
@@ -2310,7 +2803,8 @@ function syncSummaryToggles(view) {
   for (const btn of view.querySelectorAll(".tl-more")) {
     const body = document.getElementById(btn.getAttribute("aria-controls"));
     if (!body || body.classList.contains("is-open")) continue;
-    btn.hidden = body.scrollHeight <= body.clientHeight + 1;
+    const fits = body.scrollHeight <= body.clientHeight + 1;
+    if (btn.hidden !== fits) btn.hidden = fits;
   }
 }
 
@@ -2548,6 +3042,10 @@ function comparePanel() {
 function renderFilesView() {
   const view = el("view-files");
   if (view.hidden) return;
+  const d = state.detail;
+  const sig = JSON.stringify(d ? [d.slices ?? null, d.slice_activity ?? null] : null);
+  if (sectionUnchanged("d:files", sig)) return;
+  sectionRendered("d:files", sig);
   view.textContent = "";
   if (!state.detail) {
     appendEmpty(view, "Loading…");
@@ -2708,6 +3206,12 @@ function normSliceStatus(raw) {
 function renderGraphView() {
   const view = el("view-graph");
   if (view.hidden) return;
+  const d = state.detail;
+  const picked = d && Array.isArray(d.slices) && d.slices.some((s) => String(s.id ?? "") === state.graphSel)
+    ? state.graphSel : null;
+  const sig = JSON.stringify(d ? [d.slices ?? null, picked] : null);
+  if (sectionUnchanged("d:graph", sig)) return;
+  sectionRendered("d:graph", sig);
   view.textContent = "";
   if (!state.detail) {
     appendEmpty(view, "Loading…");
@@ -2916,10 +3420,6 @@ function renderGraphView() {
 
 /* --------------------------- sessions --------------------- */
 
-function sessionSignature(sessions) {
-  return sessions.map((s) => (s.path ?? "") + ":" + (s.size ?? "") + ":" + (s.status ?? "")).join("|");
-}
-
 /* Transcripts tab with nothing selected: open the newest session so the
  * tab never opens onto a blank pane. */
 function openDefaultSession() {
@@ -2943,6 +3443,10 @@ function openDefaultSession() {
 
 function renderSessionList() {
   const list = el("session-list");
+  const sig = JSON.stringify([Boolean(state.detail), state.activePath, state.sessions,
+    state.sessions.map((s) => relTime(s.timestamp))]);
+  if (sectionUnchanged("d:sessions", sig)) return;
+  sectionRendered("d:sessions", sig);
   list.textContent = "";
   /* Mailbox exports are written when a role's session is archived; say so
    * rather than let the list read as a live view of the broker session. */
@@ -3618,6 +4122,8 @@ function hideTranscriptNotice() {
 }
 
 function setPaneStatus(key, text) {
+  if (sectionUnchanged("d:pane", key + "|" + text)) return;
+  sectionRendered("d:pane", key + "|" + text);
   el("pane-status").className = "stream-status status-" + key;
   el("pane-status-text").textContent = text;
 }
@@ -3702,10 +4208,10 @@ function init() {
     else pendingLoopHash = target;
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) clearTimeout(state.boardTimer);
-    else refreshBoard();
+    if (document.hidden) pauseBoardFeed();
+    else resumeBoardFeed();
   });
-  el("board-retry").addEventListener("click", refreshBoard);
+  el("board-retry").addEventListener("click", retryBoard);
   el("loop-start").addEventListener("click", () => controlLoop("start"));
   el("loop-stop").addEventListener("click", () => controlLoop("stop"));
   el("loop-search").addEventListener("input", (ev) => {
@@ -3729,12 +4235,19 @@ function init() {
       renderBoard();
     });
   }
-  /* Relative times ("4m ago") keep moving between polls. */
+  /* Relative times ("4m ago") keep moving between pushes: every section's
+   * signature carries its rendered text, so only a section whose text
+   * actually changed is touched. */
   setInterval(() => {
     if (!state.loaded) return;
-    renderLive();
+    renderAll();
+    renderDetailTimes();
   }, 5000);
-  refreshBoard();
+  if (document.hidden) {
+    pauseBoardFeed();
+  } else {
+    startBoardFeed();
+  }
 }
 
 if (document.readyState === "loading") {
