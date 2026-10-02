@@ -34,6 +34,31 @@ Board:
     Each inbox item includes: loop, kind, severity, headline, detail, id,
     read, first_seen.
 
+Live stream (SSE; GOAL DoD3 "push, not poll"):
+    GET /api/stream[?since=<epoch>:<seq>]
+    Content-Type: text/event-stream; charset=utf-8. A ``Last-Event-ID:
+    <epoch>:<seq>`` header wins over ``since``. First bytes ``retry: 3000``.
+    Events (every one but ``retry`` carries ``id: <epoch>:<seq>``):
+        event: snapshot  data: the overview (as /api/overview) plus "epoch"
+                         and "seq"; sent when the caller has no resumable
+                         position (first connect, foreign epoch, a seq the
+                         bounded delta log no longer reaches).
+        event: delta     data: {"epoch", "seq", "from_seq", "updated_at",
+                         "changes": [{"op": "upsert"|"remove", "kind":
+                         "meta"|"workspace"|"loop"|"inbox", "id", "data"}]}
+                         keyed upserts carry the whole entity; removes carry
+                         data null. A resuming client first gets the missed
+                         deltas.
+        event: tick      data: {"epoch", "seq", "updated_at"}; a scan changed
+                         nothing, or the 15 s keepalive.
+    A background scanner (started by the first stream request, idle with no
+    subscriber) rebuilds the overview every ``TRIO_DASH_SCAN_INTERVAL_S``
+    seconds (default 10, clamped 1..300) and a successful inbox read/unread
+    or loop start/stop rescans at once. ``TRIO_DASH_STREAM=0`` (read per
+    request) answers 503 {"error": "stream disabled"}; more than 16 open
+    streams answer 503 {"error": "too many streams"}. /api/overview stays
+    the polling fallback.
+
 Inbox:
     POST /api/inbox/read    Body: {"ids": ["<id>"], "root": "<absolute-path>"}
     POST /api/inbox/unread  Body: {"ids": ["<id>"], "root": "<absolute-path>"}
@@ -196,7 +221,9 @@ import importlib.util
 import json
 import os
 import re
+import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -268,6 +295,18 @@ PROC_ROOT = Path("/proc")
 BROKER_BASE_URL = os.environ.get("TRIO_BOARD_BROKER_URL", "").strip()
 """Optional broker base URL; an empty value disables broker probing."""
 
+LIVE_MODEL_PATH = DASHBOARD_DIR / "live_model.py"
+"""Overview delta model behind /api/stream, resolved relative to this file."""
+
+STREAM_KEEPALIVE_S = 15
+"""Longest silence on /api/stream before a keepalive ``tick`` is sent."""
+
+STREAM_MAX_CLIENTS = 16
+"""Concurrent /api/stream subscribers; more are refused with 503."""
+
+STREAM_WRITE_TIMEOUT_S = 10.0
+"""A stream client that cannot take a write for this long is dropped."""
+
 REGISTRY_CACHE_SECONDS = 5.0
 """Maximum age for the in-memory registry index."""
 
@@ -292,6 +331,7 @@ _BROKER_HTTP_MODULE = None
 _INBOX_STATE_MODULE = None
 _LOOP_IDS_MODULE = None
 _LIVE_REGISTRY_MODULE = None
+_LIVE_MODEL_MODULE = None
 _TRANSCRIPT_INDEX_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
@@ -601,6 +641,37 @@ def load_live_registry_module():
             raise RuntimeError(f"live registry module missing required function: {fn}")
     _LIVE_REGISTRY_MODULE = module
     return module
+
+
+def load_live_model_module():
+    """Load dashboard/live_model.py by path and cache the module."""
+    global _LIVE_MODEL_MODULE
+    if _LIVE_MODEL_MODULE is not None:
+        return _LIVE_MODEL_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_live_model", LIVE_MODEL_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load live model module: {LIVE_MODEL_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for name in ("LiveModel", "loop_entity_id", "VOLATILE_KEYS"):
+        if not hasattr(module, name):
+            raise RuntimeError(f"live model module missing required name: {name}")
+    _LIVE_MODEL_MODULE = module
+    return module
+
+
+def _scan_interval() -> float:
+    """Seconds between scanner rebuilds: ``TRIO_DASH_SCAN_INTERVAL_S``
+    (default 10), clamped to 1..300."""
+    try:
+        value = float(os.environ.get("TRIO_DASH_SCAN_INTERVAL_S", "10"))
+    except ValueError:
+        return 10.0
+    if value != value:  # NaN
+        return 10.0
+    return max(1.0, min(300.0, value))
 
 
 def load_loop_ids_module():
@@ -4669,6 +4740,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "workspaces": len(server.get_workspace_seeds()),
             "overview_age_seconds": server.overview_age(),
             "broker": (server._overview or {}).get("broker"),
+            "stream_subscribers": server.stream_subscribers(),
+            "stream_seq": server.live.seq,
         })
 
     # -- /api/sessions -----------------------------------------------------
@@ -4884,6 +4957,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if root is None:
             return
         load_inbox_state_module().set_read(root, ids, read, HOME)
+        self.server.live_kick()
         self._send_json(200, {"ok": True, "ids": ids})
 
     # -- /api/loop controls -------------------------------------------------
@@ -5018,6 +5092,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         threading.Thread(
             target=_reap_loop_process, args=(mailbox, process),
             daemon=True).start()
+        self.server.live_kick()
         self._send_json(202, {
             "pid": process.pid,
             "driver": driver,
@@ -5061,6 +5136,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not _pid_is_live(pid):
             _record_action(mailbox, outcome="stopped",
                            message=f"Driver PID {pid} stopped")
+        self.server.live_kick()
         self._send_json(200, {"stopped": True, "pid": pid})
 
     def _handle_loop_status(self, root: Path) -> None:
@@ -5540,6 +5616,119 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
 
+    # -- /api/stream (SSE overview deltas) ---------------------------------
+
+    def _stream_event(self, event: str, data, event_id: str | None) -> None:
+        lines = f"event: {event}\n"
+        if event_id is not None:
+            lines += f"id: {event_id}\n"
+        lines += "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+        self.wfile.write(lines.encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_client_gone(self) -> bool:
+        """True when the peer closed its end (a streaming client sends
+        nothing after its request, so any readable EOF means it left)."""
+        try:
+            readable, _w, _x = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    @staticmethod
+    def _stream_position(value: str | None) -> tuple[str, int] | None:
+        """Parse ``<epoch>:<seq>``; None when absent or malformed."""
+        epoch, _sep, seq = (value or "").strip().rpartition(":")
+        if not epoch or not seq.isdigit():
+            return None
+        return epoch, int(seq)
+
+    def _handle_stream(self, query: dict) -> None:
+        server = self.server
+        if os.environ.get("TRIO_DASH_STREAM", "1").strip() == "0":
+            return self._send_json(503, {"error": "stream disabled"})
+        position = self._stream_position(
+            self.headers.get("Last-Event-ID")
+            or (query.get("since") or [None])[0])
+        if not server.stream_acquire():
+            return self._send_json(503, {"error": "too many streams"})
+        try:
+            self._stream_loop(position)
+        except OSError:
+            pass  # client disconnected or stopped reading
+        except Exception:
+            traceback.print_exc()
+        finally:
+            server.stream_release()
+            self.close_connection = True
+
+    def _stream_loop(self, position: tuple[str, int] | None) -> None:
+        server = self.server
+        live = server.live
+        server.ensure_scanner()
+        if live.snapshot() is None:
+            with server._overview_lock:  # every build holds this lock
+                if live.snapshot() is None:
+                    server._build_overview(server.board_payload)
+            if live.snapshot() is None:
+                return self._send_json(503, {"error": "overview unavailable"})
+        elif (server.overview_age() or 0.0) > server._scan_interval_s:
+            server.live_kick()
+        if not self._sse_start():
+            return
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)
+        self.wfile.write(b"retry: 3000\n\n")
+        self.wfile.flush()
+        batches = live.changes_since(*position) if position else None
+        if batches is None:
+            snapshot = live.snapshot()
+            sent = snapshot["seq"]
+            self._stream_event(
+                "snapshot", snapshot, f"{snapshot['epoch']}:{sent}")
+        else:
+            sent = position[1]
+            for batch in batches:
+                sent = batch["seq"]
+                self._stream_event("delta", batch, f"{batch['epoch']}:{sent}")
+            if not batches:
+                self._send_tick(sent)
+        last_write = time.monotonic()
+        ticks = live.ticks
+        while not live.closed:
+            if self._stream_client_gone():
+                return
+            budget = STREAM_KEEPALIVE_S - (time.monotonic() - last_write)
+            live.wait(sent, max(0.0, min(1.0, budget)))
+            if live.closed:
+                return
+            batches = live.changes_since(live.epoch, sent)
+            if batches is None:
+                snapshot = live.snapshot()
+                sent = snapshot["seq"]
+                self._stream_event(
+                    "snapshot", snapshot, f"{snapshot['epoch']}:{sent}")
+                last_write = time.monotonic()
+            elif batches:
+                for batch in batches:
+                    sent = batch["seq"]
+                    self._stream_event(
+                        "delta", batch, f"{batch['epoch']}:{sent}")
+                last_write = time.monotonic()
+            elif (live.ticks != ticks
+                  or time.monotonic() - last_write >= STREAM_KEEPALIVE_S):
+                self._send_tick(sent)
+                last_write = time.monotonic()
+            ticks = live.ticks
+
+    def _send_tick(self, seq: int) -> None:
+        live = self.server.live
+        self._stream_event("tick", {
+            "epoch": live.epoch, "seq": seq,
+            "updated_at": (live.snapshot() or {}).get("updated_at"),
+        }, f"{live.epoch}:{seq}")
+
     # -- dispatch ----------------------------------------------------------
 
     def do_GET(self) -> None:
@@ -5557,6 +5746,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._api(self._handle_workspaces)
         if path == "/api/overview":
             return self._api(self._handle_overview)
+        if path == "/api/stream":
+            return self._handle_stream(query)
         if path == "/api/registry":
             root = self._request_root(query)
             if root is None:
@@ -5724,6 +5915,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             return self._api(lambda: self._handle_agent_delete(query))
         self._send_json(404, {"error": "not found"})
+
+
+class _HeadlessBoard:
+    """Request-free board builder for the stream scanner.
+
+    ``_board_payload`` / ``_build_board`` / ``_loop_card`` only need the
+    server (for ``metrics``), never the HTTP request, so the very same
+    functions are reused here: board output is unchanged.
+    """
+
+    _board_payload = DashboardHandler._board_payload
+    _build_board = DashboardHandler._build_board
+    _loop_card = DashboardHandler._loop_card
+
+    def __init__(self, server) -> None:
+        self.server = server
 
 
 def _workspace_scan_roots() -> list[Path]:
@@ -6526,8 +6733,84 @@ class DashboardServer(ThreadingHTTPServer):
         self._overview_at = 0.0
         self.started_at = time.monotonic()
         self._version = None
+        self.live = load_live_model_module().LiveModel()
+        self._stream_lock = threading.Lock()
+        self._stream_count = 0
+        self._scan_wake = threading.Event()
+        self._scan_active = threading.Event()
+        self._scan_stop = threading.Event()
+        self._scanner: threading.Thread | None = None
+        self._scan_interval_s = 10.0
+        self._headless = _HeadlessBoard(self)
         self.get_workspace_seeds(force=True)
         super().__init__(address, DashboardHandler)
+
+    # -- live stream: subscribers, scanner, shutdown -------------------------
+
+    def board_payload(self, root, processes=None, broker=None, only=None):
+        """Request-independent ``_board_payload`` (the scanner's callable)."""
+        return self._headless._board_payload(root, processes, broker, only)
+
+    def stream_subscribers(self) -> int:
+        with self._stream_lock:
+            return self._stream_count
+
+    def stream_acquire(self) -> bool:
+        """Register one /api/stream subscriber; False at the cap."""
+        with self._stream_lock:
+            if self._stream_count >= STREAM_MAX_CLIENTS:
+                return False
+            self._stream_count += 1
+            self._scan_active.set()
+            return True
+
+    def stream_release(self) -> None:
+        with self._stream_lock:
+            self._stream_count = max(0, self._stream_count - 1)
+            if self._stream_count == 0:
+                self._scan_active.clear()
+
+    def ensure_scanner(self) -> None:
+        """Start the scanner thread once (first stream request); the
+        interval is read here."""
+        with self._stream_lock:
+            if self._scanner is not None or self._scan_stop.is_set():
+                return
+            self._scan_interval_s = _scan_interval()
+            self._scanner = threading.Thread(
+                target=self._scan_loop, name="trio-dash-scanner", daemon=True)
+            self._scanner.start()
+
+    def live_kick(self) -> None:
+        """Ask the scanner for an immediate rescan (no-op while idle)."""
+        self._scan_wake.set()
+
+    def _scan_loop(self) -> None:
+        while not self._scan_stop.is_set():
+            self._scan_active.wait()
+            if self._scan_stop.is_set():
+                return
+            self._scan_wake.wait(self._scan_interval_s)
+            self._scan_wake.clear()
+            if self._scan_stop.is_set():
+                return
+            if not self._scan_active.is_set():
+                continue
+            try:
+                with self._overview_lock:
+                    self._build_overview(self.board_payload)
+            except Exception:
+                traceback.print_exc()
+
+    def server_close(self) -> None:
+        self._scan_stop.set()
+        self._scan_active.set()
+        self._scan_wake.set()
+        self.live.close()
+        super().server_close()
+        scanner = self._scanner
+        if scanner is not None and scanner is not threading.current_thread():
+            scanner.join(timeout=2.0)
 
     def transcript_index(self):
         """The long-lived session-id transcript index, created lazily from
@@ -6666,6 +6949,10 @@ class DashboardServer(ThreadingHTTPServer):
             "elapsed_ms": int((time.monotonic() - now) * 1000),
         }
         self._overview_at = time.monotonic()
+        try:
+            self.live.apply(self._overview)
+        except Exception:
+            traceback.print_exc()
         return self._overview
 
     @property

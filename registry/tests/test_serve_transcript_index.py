@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -472,6 +473,12 @@ class DeletedRowDomTests(Base):
         # Only a deleted reference: an openable session would auto-open an
         # SSE stream, which keeps headless virtual time from ever finishing.
         self.launch()
+        # GOAL DoD3: the board opens an SSE stream, which never lets headless
+        # virtual time finish; TRIO_DASH_STREAM=0 (read per request) answers
+        # 503 and the client polls instead.
+        patcher = unittest.mock.patch.dict(os.environ, {"TRIO_DASH_STREAM": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         rows = self.sessions()
         self.assertEqual([r["status"] for r in rows], ["deleted"])
         # chromium's singleton socket path must stay under ~108 bytes
