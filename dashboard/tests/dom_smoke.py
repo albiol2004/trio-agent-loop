@@ -206,7 +206,10 @@ def start_server(root: Path, port: int, log_path: Path, live_dir: Path) -> subpr
     env = {**os.environ,
            "TRIO_DASH_INBOX_STATE": str(live_dir / "inbox-state.json"),
            "TRIO_DASH_STATE_DIR": str(live_dir / "trio-dash-state"),
-           "TRIO_NATIVE_RUNS_DIR": str(live_dir / "native-runs")}
+           "TRIO_NATIVE_RUNS_DIR": str(live_dir / "native-runs"),
+           # GOAL DoD3 makes the board open an SSE stream; --dump-dom's
+           # virtual-time budget never ends with a fetch pending, so it polls.
+           "TRIO_DASH_STREAM": "0"}
     proc = subprocess.Popen(
         [sys.executable, str(SERVE_PATH), "--root", str(root), "--port", str(port)],
         stdout=log_file, stderr=subprocess.STDOUT, env=env,
