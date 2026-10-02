@@ -339,6 +339,29 @@ class BoardGuardTests(unittest.TestCase):
         self.assertIn("Gamma", out[-1])
         self.assertEqual(counts.get("workspace-filter", 0), 0)
 
+    def test_moving_verdict_line_does_not_rebuild_unchanged_kpis(self):
+        # The verdict line ("Most recent activity: ..., 3m ago") moves on its own
+        # (live data, clock); the #kpis tiles are a separate section and their
+        # inputs did not change, so they must not be rebuilt.
+        snap = make_snapshot()
+        changed = make_snapshot()
+        changed["workspaces"][1]["loops"][0]["last_activity"] = "2026-05-31T09:00:00+00:00"
+        res, errors = run(board_ops(snap) + [
+            {"op": "call", "fn": "renderAll", "quiet": True},
+            {"op": "text", "id": "verdict-sub"},
+            {"op": "resetCounts"},
+            {"op": "call", "fn": "ingestOverview", "args": [overview_of(changed)], "quiet": True},
+            {"op": "call", "fn": "renderAll", "quiet": True},
+            {"op": "counts"},
+            {"op": "text", "id": "verdict-sub"},
+        ])
+        self.assertEqual(errors, [])
+        out = values(res)
+        before, counts, after = out[-4], out[-2], out[-1]
+        self.assertNotEqual(before, after)  # the verdict line did move
+        self.assertGreater(counts.get("verdict-sub", 0), 0)
+        self.assertEqual(counts.get("kpis", 0), 0)
+
     def test_changed_inbox_items_rewrite_their_lists(self):
         snap = make_snapshot()
         changed = make_snapshot()

@@ -965,15 +965,15 @@ function renderSummary(groups) {
       "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops"],
   ];
 
-  const sig = JSON.stringify([verdict, verdictSub, brokerText || "", partialText, tiles]);
-  if (sectionUnchanged("b:summary", sig)) return;
-  el("verdict").textContent = verdict;
-  el("verdict-sub").textContent = verdictSub;
-  const brokerNote = el("broker-note");
-  brokerNote.hidden = !brokerText;
-  brokerNote.textContent = brokerText || "";
-  el("board-partial").hidden = partial.length === 0;
-  el("board-partial").textContent = partialText;
+  // Two guards: the verdict line carries a relative time ("3m ago") that moves
+  // on its own, and must not rebuild the #kpis tiles when they are unchanged.
+  const headSig = JSON.stringify([verdict, verdictSub, brokerText || "", partialText]);
+  if (!sectionUnchanged("b:summary", headSig)) {
+    renderSummaryHead(verdict, verdictSub, brokerText, partial, partialText);
+    sectionRendered("b:summary", headSig);
+  }
+  const tilesSig = JSON.stringify(tiles);
+  if (sectionUnchanged("b:kpis", tilesSig)) return;
   const kpis = el("kpis");
   kpis.textContent = "";
   for (const [label, value, context, tone, target] of tiles) {
@@ -985,7 +985,17 @@ function renderSummary(groups) {
     node.appendChild(span("kpi-context", context));
     kpis.appendChild(node);
   }
-  sectionRendered("b:summary", sig);
+  sectionRendered("b:kpis", tilesSig);
+}
+
+function renderSummaryHead(verdict, verdictSub, brokerText, partial, partialText) {
+  el("verdict").textContent = verdict;
+  el("verdict-sub").textContent = verdictSub;
+  const brokerNote = el("broker-note");
+  brokerNote.hidden = !brokerText;
+  brokerNote.textContent = brokerText || "";
+  el("board-partial").hidden = partial.length === 0;
+  el("board-partial").textContent = partialText;
 }
 
 function inboxMarkButton(item) {
