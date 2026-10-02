@@ -304,6 +304,18 @@ opencode/                             # native OpenCode agents + commands
   commands/{trio,trio-init}.md
   configure-models.sh             # applies user-supplied strong/light IDs
   opencode.trio.example.jsonc         # optional; no model default
+opencode-driver/                      # standalone trio-opencode CLI driver (no Omnigent)
+  trio-opencode                       # executable: CLI `start`/`resume`/`status`/`abandon`/`land`/`doctor`
+  trio_opencode/                      # driver state machine, runner, open-loop, acceptance
+  config.example.json                 # annotated config template
+  agents/trio-{lead,evaluator,builder,repair,acceptance}.md # r19-hardened overlays
+  README.md PARITY.md                 # comprehensive guide and feature audit
+  tests/                              # pytest suite + fake-opencode end-to-end scenarios
+tbench/                               # Terminal-Bench 4.0 Harbor adapter for trio-opencode
+  trio_tbench_agent.py                # TrioOpenCodeAgent via Harbor
+  goal.py configgen.py                # goal rendering and config generation
+  run_job.sh                          # convenience script
+  README.md                           # agent kwarg docs (open_loop, acceptance)
 omp/                                  # native Oh My Pi agents + commands
   agents/trio-{lead,evaluator,scout,builder}.md
   commands/{trio,trio-init}.md
