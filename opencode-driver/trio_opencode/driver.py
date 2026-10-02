@@ -1081,11 +1081,24 @@ AUTHORED_TEXT_KEYS = frozenset({
 })
 
 
-def audit_tool_input(tool_input: dict) -> dict:
-    """``tool_input`` without the keys that only carry authored text (see
-    :data:`AUTHORED_TEXT_KEYS`) -- the part of an author tool call the
-    isolation audit should judge."""
-    return {k: v for k, v in tool_input.items() if k not in AUTHORED_TEXT_KEYS}
+#: Tools whose ``pattern`` is a regex/literal to FIND inside files, not a path:
+#: the file or directory they search is their ``path`` (judged as usual). A
+#: ``glob`` pattern IS path-like (``../x/*``) and stays audited.
+CONTENT_SEARCH_TOOLS = frozenset({"grep", "search", "ripgrep", "rg"})
+
+
+def audit_tool_input(tool_input: dict, tool: str | None = None) -> dict:
+    """``tool_input`` without the keys that only carry text, never a path the
+    call reads: authored text (see :data:`AUTHORED_TEXT_KEYS`) and the
+    ``pattern`` of a content search (:data:`CONTENT_SEARCH_TOOLS`) -- a no-shell
+    author that grepped its own export's GOAL.md for a goal sentence naming
+    ``/app/src/worker/requirements.txt`` was discarded as having "read inside
+    the loop repository" though nothing outside its export was touched. What is
+    left is the part of an author tool call the isolation audit should judge."""
+    drop = set(AUTHORED_TEXT_KEYS)
+    if str(tool or "").lower() in CONTENT_SEARCH_TOOLS:
+        drop.add("pattern")
+    return {k: v for k, v in tool_input.items() if k not in drop}
 
 
 _PERMISSION_REFUSAL_RE = re.compile(
@@ -1155,7 +1168,7 @@ def _persist_author_tool_calls(ctx: RunContext, result: Any, marker: str) -> Non
                 continue
             tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
             entries.append({"type": "tool_use", "name": part.get("tool"),
-                            "input": audit_tool_input(tool_input)})
+                            "input": audit_tool_input(tool_input, part.get("tool"))})
     out_path = Path(steplib.AUTHOR_TOOLCALLS_DIR) / f"{marker}.jsonl"
     try:
         with open(out_path, "w", encoding="utf-8") as fh:

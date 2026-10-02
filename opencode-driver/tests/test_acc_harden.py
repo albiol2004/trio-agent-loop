@@ -942,6 +942,58 @@ def test_audit_tool_input_drops_authored_text_but_keeps_paths():
                                    "oldString": "/app/a", "newString": "/app/b",
                                    "command": "ls /app"})
     assert row == {"path": "acceptance/AUTHOR.md", "command": "ls /app"}
+    # a content search's pattern is text to find, a glob's pattern is a path
+    assert driver.audit_tool_input({"pattern": "/app/x", "path": "p"}, "grep") == {"path": "p"}
+    assert driver.audit_tool_input({"pattern": "/app/x", "path": "p"}, "glob") == {
+        "pattern": "/app/x", "path": "p"}
+    assert driver.audit_tool_input({"pattern": "/app/x"}) == {"pattern": "/app/x"}
+
+
+def _author_audit_of(tmp_path, monkeypatch, *calls, level="no-shell"):
+    """Run the real isolation audit over opencode tool parts the way the
+    author hook does: log lines -> ``_tool_call_rows`` -> ``audit_transcript``."""
+    from types import SimpleNamespace  # noqa: PLC0415
+    from test_openloop import make_ctx  # noqa: PLC0415
+    root = tmp_path / "accproduct"
+    if not root.exists():
+        _acc_repo(tmp_path)
+    ctx = make_ctx(root)
+    runner = openloop.OpenLoopRunner(ctx, settings=openloop.resolve_settings(ctx.cfg, is_open_loop=True))
+    export = tmp_path / "export"
+    (export / ".acceptance-input").mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "author.jsonl"
+    log.write_text("".join(json.dumps({"type": "tool_use", "part": {"type": "tool", "tool": tool, "state": {
+        "status": "completed", "input": tool_input}}}) + "\n" for tool, tool_input in calls),
+        encoding="utf-8")
+    ctx.author_level = level
+    rows = runner._tool_call_rows(SimpleNamespace(log_paths=[str(log)]), export)
+    acc = TL._load_sibling("trio_acceptance_audit", "trio-acceptance.py")
+    return root, acc.audit_transcript(rows, export, forbidden=[root, root / "loop"])
+
+
+def test_grep_pattern_quoting_a_repo_path_is_not_a_read(tmp_path, monkeypatch):
+    """Seen in the payments smoke: the no-shell author grepped its OWN export's
+    GOAL.md for a sentence of the goal ("Add any extra Python packages to
+    `/app/src/worker/requirements.txt`."). The `pattern` of a content search is
+    text to find, not a path; it read nothing outside the export, yet the audit
+    scanned it as a path and discarded the session ("reads inside the loop
+    repository: /app/src/worker/requirements.txt") -- a whole author turn lost."""
+    root = _acc_repo(tmp_path)            # the repo path the goal text happens to name
+    quoted = f"Add any extra Python packages to `{root}/src/worker/requirements.txt`."
+    _repo, audit = _author_audit_of(
+        tmp_path, monkeypatch,
+        ("grep", {"pattern": quoted, "path": ".acceptance-input/GOAL.md", "literal": True}))
+    assert audit == {"contaminated": False, "hits": []}, audit
+
+
+def test_grep_whose_path_or_a_glob_pattern_reaches_the_repo_is_still_contamination(tmp_path, monkeypatch):
+    root = _acc_repo(tmp_path)
+    _r, audit = _author_audit_of(tmp_path, monkeypatch,
+                                 ("grep", {"pattern": "SECRET", "path": str(root / "src")}))
+    assert audit["contaminated"] and "loop repository" in audit["hits"][0], audit
+    _r, audit = _author_audit_of(tmp_path, monkeypatch,
+                                 ("glob", {"pattern": f"{root}/src/**/*.py"}))
+    assert audit["contaminated"], audit
 
 
 def test_permission_refused_calls_are_not_audited_but_other_errors_are():

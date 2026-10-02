@@ -849,7 +849,7 @@ class OpenLoopRunner:
                     continue
                 tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
                 abs_input: dict[str, Any] = {}
-                for key, value in drv.audit_tool_input(tool_input or {}).items():
+                for key, value in drv.audit_tool_input(tool_input or {}, part.get("tool")).items():
                     if (key in self._PATH_KEYS and isinstance(value, str) and value
                             and not Path(value).is_absolute()):
                         abs_input[key] = str((export / value).resolve())
@@ -1137,6 +1137,7 @@ class OpenLoopRunner:
                 path, dispatch_head, s.get("brief") or "", targeted, mailbox_rel=mailbox_rel,
                 budget=quality.kill_check_budget(ctx.live_mailbox))
         return {"id": slice_id, "branch": branch, "path": path, "ok": ok, "reason": why,
+               "iteration": iteration,
                "report": reported, "targeted": targeted, "kill_check": kill_check,
                "flags": flags, "repo_path": repo_path, "attempt": attempt}
 
@@ -1147,10 +1148,58 @@ class OpenLoopRunner:
         subprocess.run(["git", "-C", str(repo_path), "branch", "-d" if merged else "-D", branch],
                        capture_output=True, text=True)
 
+    def _rebase_onto_freeze(self, repo_path: Path, outcome: dict, mailbox: Path) -> None:
+        """Put a builder branch that was cut BEFORE the acceptance freeze on
+        top of it, so its slice commits descend the freeze commit.
+
+        The acceptance author runs alongside the Lead, so a builder is routinely
+        dispatched -- its worktree branch cut from HEAD -- before the freeze
+        commit exists. Merging that branch afterwards puts a ``slice(<id>):``
+        commit on a line that does not contain the freeze, which the shared
+        commit gate (``trio-shadow --require-commits``) rejects as
+        "acceptance/freeze ordering" for good: the slice could never be graded
+        and the run livelocked. The builder never saw the pack and the freeze
+        commit only adds ``<mailbox>/acceptance/`` (builders may not commit
+        mailbox paths), so replaying the branch's own commits on the freeze is
+        a clean, content-preserving move. Best effort: when it cannot be done
+        the merge proceeds unchanged (the gate then reports the cause).
+        Caller holds the repo's merge lock."""
+        mailbox_rel = drv._mailbox_rel(repo_path, self.ctx.live_mailbox)
+        if mailbox_rel is None:
+            return
+        base_rel = "" if mailbox_rel in ("", ".") else mailbox_rel
+        frozen_rel = "/".join(p for p in (base_rel, "acceptance", "FROZEN") if p)
+        added = TL._git(repo_path, "log", "--first-parent", "--diff-filter=A", "--format=%H",
+                        "HEAD", "--", frozen_rel).stdout.split()
+        if not added:
+            return
+        freeze = added[-1]          # the FIRST commit that adds FROZEN
+        tip = TL._git(repo_path, "rev-parse", "--verify", "-q",
+                      f"refs/heads/{outcome['branch']}").stdout.strip()
+        if not tip or TL._git_is_ancestor(repo_path, freeze, tip):
+            return
+        rebase = TL._git(outcome["path"], "rebase", "--autostash", freeze)
+        iteration = outcome.get("iteration")
+        if rebase.returncode != 0:
+            TL._git(outcome["path"], "rebase", "--abort")
+            TL._append_log(
+                mailbox,
+                f"- iter {iteration} | loop | builder branch {outcome['branch']} predates the "
+                f"acceptance freeze {freeze[:12]} and could not be moved onto it "
+                f"({' '.join((rebase.stderr or rebase.stdout).split())[:200]}); merging as is",
+            )
+            return
+        TL._append_log(
+            mailbox,
+            f"- iter {iteration} | loop | builder branch {outcome['branch']} was cut before the "
+            f"acceptance freeze {freeze[:12]}; rebased onto it so its slice commits follow the freeze",
+        )
+
     def _merge_and_retire(self, repo_path: Path, outcome: dict, mailbox: Path) -> tuple[str, str]:
         lock = self._merge_lock_for(repo_path)
         repo_field = _repo_field_for(self.ctx.lead_record, repo_path)
         with lock:
+            self._rebase_onto_freeze(repo_path, outcome, mailbox)
             # Write-ahead merge-intent record (see `_MERGE_INTENT_FILE`): it
             # is durable BEFORE `git merge` runs, and removed only once the
             # `retired:` entry is on disk, so a SIGKILL anywhere in between
@@ -2219,6 +2268,11 @@ def drive(ctx: "drv.RunContext", *, mode: str, max_iterations: int, settings: di
             slice_eval_concurrency=settings["slice_eval_concurrency"],
             slice_eval_drain_seconds=settings.get("slice_eval_drain_seconds"),
             land=land_hook, acceptance=acceptance_cfg,
+            # The Lead here is a planner (`_validate_plan` refuses to re-build a
+            # retired slice, and a gate failure is not a code fault it can
+            # fix), so a stuck commit gate is not handed back to it: after the
+            # grace period the run stops `status: error` with the gate's reason.
+            max_gate_repair_rounds=0,
         )
     except BaseException as exc:  # noqa: BLE001 - H3: finalize instead of crashing drive()
         caught = exc

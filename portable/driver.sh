@@ -56,6 +56,11 @@ build_prompt() {
       printf '\nQUEUE.md PARSE ERRORS: the integration gate is held until the `faults:` block parses cleanly. Repair these entries in place (keep every fault, fix its shape):'
       while IFS= read -r qerr; do printf '\n- %s' "$qerr"; done <<<"$TRIO_QUEUE_ERRORS"
     fi
+    if [[ -n "${TRIO_GATE_ERRORS:-}" ]]; then
+      # ol-livelock: same note as trioctl _open_loop_gate_errors_note.
+      printf '\nCOMMIT GATE FAILURES: the per-slice commit gate keeps rejecting these retired slices, so none of them was ever graded and the run is stuck. Repair the cause (for example re-commit the slice'\''s work as a fresh `slice(<id>): ...` commit on the current HEAD and append a new `retired:` entry for it) or the run stops with an error:'
+      while IFS= read -r gerr; do printf '\n- %s' "$gerr"; done <<<"$TRIO_GATE_ERRORS"
+    fi
     printf '\n\n'
   elif [[ -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
     # Lockstep: same LOCKSTEP CONTEXT prefix as OmnigentRunner._prompt.

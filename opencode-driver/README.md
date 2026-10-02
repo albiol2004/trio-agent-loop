@@ -752,7 +752,29 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
   repo path in AUTHOR.md or a check read nothing —
   `metrics/trio-acceptance.py` `_AUDIT_AUTHORED_KEYS`, mirrored in
   `driver.audit_tool_input`) and never counts a call the permission rules
-  refused (`driver.refused_by_permission`).
+  refused (`driver.refused_by_permission`); and the `pattern` of a content
+  search (`grep`) is text to find, not a path, so a goal sentence quoted in a
+  grep of the author's own export no longer reads as a repo read
+  (`driver.CONTENT_SEARCH_TOOLS`; a `glob` pattern is still audited).
+- **Builders cut before the freeze are rebased onto it (open-loop).** The
+  author runs alongside the Lead, so a builder branch is routinely cut before
+  the `acceptance: freeze` commit exists. `_merge_and_retire` replays such a
+  branch on the freeze (`OpenLoopRunner._rebase_onto_freeze`) before merging,
+  because the shared commit gate rejects a `slice(<id>):` commit on a line that
+  does not contain the freeze ("acceptance/freeze ordering") — for good, which
+  used to livelock the poll loop. If the rebase cannot be done the merge goes
+  ahead and the gate reports it.
+- **A commit gate that keeps failing stops the run (core, all drivers).**
+  `trio_loop.run_open_loop`: the failure is logged once per distinct reason
+  (with trio-shadow's own text), and once the Lead is done and nothing is in
+  flight the slice is waited on `GATE_GRACE_POLLS`, handed back to the Lead
+  (`gate_errors` in its OPEN-LOOP CONTEXT) up to `MAX_GATE_REPAIR_ROUNDS`, then
+  the run ends `status: error`. This driver passes `max_gate_repair_rounds=0`:
+  its Lead is a planner that cannot repair a gate, so it stops after the grace
+  period. Independently, `NO_PROGRESS_POLLS` consecutive idle polls (Lead
+  finished, no slice-eval in flight, queue/verdict/state/HEAD unchanged) end
+  the run `status: error` with a `no progress` LOG line; it counts zero
+  progress, it is not a time limit.
 - **Author failure degrades (open-loop).** `openloop.DegradableAcceptance`
   subclasses the core's controller. The author wait is unbounded by default
   (`acceptance_wait_seconds`; the turn's own idle watchdog is the only

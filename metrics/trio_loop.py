@@ -3939,6 +3939,7 @@ def _lead_thread_body(
     gate_held_lock: threading.Lock | None = None,
     empty_passes: dict | None = None,
     acceptance=None,
+    gate_feedback: dict | None = None,
 ) -> None:
     """One Lead-thread lifetime: run passes until every PLAN.md slice has a
     retired entry and no fault is open/taken, or the pass budget caps.
@@ -4009,6 +4010,12 @@ def _lead_thread_body(
             queue_errors = _queue_fault_errors(_read_queue(mailbox))
             if queue_errors:
                 context["queue_errors"] = queue_errors
+            if gate_feedback:
+                # A retired slice's commit gate keeps failing: its own text
+                # rides on the first pass of the hand-back (consumed once).
+                gate_errors = gate_feedback.pop("errors", None)
+                if gate_errors:
+                    context["gate_errors"] = [str(e) for e in gate_errors]
             if acceptance is not None:
                 try:
                     acceptance.check_pin(iteration, "before lead")
@@ -4087,9 +4094,38 @@ def _open_loop_acceptance_refused(mailbox: Path, state_path: Path, iteration: in
     )
 
 
+class _GateExit(int):
+    """A trio-shadow exit code that also carries *why* it failed.
+
+    Behaves exactly like the plain ``int`` the per-slice gate always returned
+    (tests and callers compare it to 0/1/2); ``reason`` is the gate's own
+    explanation (its ``commit gate:`` / ``acceptance gate:`` lines), so the
+    LOG line and the Lead can name the cause instead of a bare failure.
+    """
+
+    reason: str = ""
+
+    def __new__(cls, code: int, reason: str = ""):
+        obj = super().__new__(cls, code)
+        obj.reason = reason
+        return obj
+
+
+def _gate_reason(stdout: str, limit: int = 400) -> str:
+    """The failure lines of a trio-shadow ``--require-commits`` run, joined."""
+    lines = [
+        line.strip()
+        for line in (stdout or "").splitlines()
+        if line.startswith(("commit gate:", "acceptance gate:"))
+        and "FAIL \u2014" not in line
+    ]
+    return " | ".join(lines)[:limit]
+
+
 def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
     """v1 open-loop per-slice commit gate; returns the raw trio-shadow exit
-    code (0 pass, 1 missing commits, 2 malformed/unknown-slice/error)."""
+    code (0 pass, 1 missing commits, 2 malformed/unknown-slice/error) as a
+    :class:`_GateExit` (an ``int``) whose ``reason`` names the failure."""
     script = Path(__file__).resolve().with_name("trio-shadow.py")
     target = mailbox if (mailbox / "PLAN.md").is_file() else repo or mailbox
     command = [
@@ -4103,9 +4139,70 @@ def _per_slice_gate(mailbox: Path, repo: Path | None, slice_id: str) -> int:
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True)
-    except OSError:
-        return 2
-    return result.returncode
+    except OSError as exc:
+        return _GateExit(2, f"commit gate could not run: {exc}")
+    reason = ""
+    if result.returncode != 0:
+        reason = _gate_reason(result.stdout) or " ".join(
+            (result.stderr or "").split()
+        )[:400]
+    return _GateExit(result.returncode, reason)
+
+
+#: Open-loop stuck-gate policy. A retired slice whose per-slice commit gate
+#: keeps failing, with the Lead finished and nothing else in flight, is first
+#: waited on (the gate may pass once commits land: GATE_GRACE_POLLS idle polls
+#: with nothing changing), then handed back to the Lead with the gate's own
+#: text (MAX_GATE_REPAIR_ROUNDS passes, each followed by the same grace), and
+#: only then does the run stop `status: error`. ``None`` disables the
+#: hand-back (the no-progress detector below still ends the run).
+MAX_GATE_REPAIR_ROUNDS = 2
+GATE_GRACE_POLLS = 5
+
+#: Open-loop no-progress detector: this many consecutive polls with the Lead
+#: finished, no slice-eval in flight and NOTHING changed (queue, verdict,
+#: state, repo HEAD, the graded/blocked/pending sets) end the run loudly. It
+#: counts zero progress; it is not a time limit. ``None``/0 disables it.
+NO_PROGRESS_POLLS = 30
+
+
+class _NoProgressWatch:
+    """Counts consecutive idle polls whose state fingerprint did not change."""
+
+    def __init__(self) -> None:
+        self._last: object = None
+        self._count = 0
+
+    def reset(self) -> None:
+        self._last = None
+        self._count = 0
+
+    def observe(self, fingerprint: object, idle: bool) -> int:
+        """Record one poll; return how many consecutive idle polls have now
+        seen this exact fingerprint (0 when anything is alive)."""
+        if not idle:
+            self.reset()
+            return 0
+        if self._count and fingerprint == self._last:
+            self._count += 1
+        else:
+            self._last = fingerprint
+            self._count = 1
+        return self._count
+
+
+def _open_loop_fingerprint(mailbox: Path, repo: Path | None, extra: tuple) -> tuple:
+    """Everything whose change means the open loop moved: the queue, verdict
+    and state files, the repo HEAD, plus the caller's in-memory sets."""
+    parts = []
+    for name in ("QUEUE.md", "VERDICT.md", "STATE.md", "PLAN.md"):
+        try:
+            parts.append((mailbox / name).read_bytes())
+        except OSError:
+            parts.append(None)
+    target = mailbox if (mailbox / "PLAN.md").is_file() else repo or mailbox
+    parts.append(_git_head_sha(target))
+    return (tuple(parts), extra)
 
 
 #: Drain budget for in-flight slice-evals when the runner exposes no
@@ -4211,6 +4308,9 @@ def run_open_loop(
     slice_eval_drain_seconds: float | None = None,
     land=None,
     acceptance: dict | None = None,
+    max_gate_repair_rounds: int | None = MAX_GATE_REPAIR_ROUNDS,
+    gate_grace_polls: int = GATE_GRACE_POLLS,
+    no_progress_polls: int | None = NO_PROGRESS_POLLS,
 ) -> int:
     """Run the open-loop Lead+Evaluator state machine against a QUEUE.md
     mailbox: one stdlib Lead thread plus an Evaluator poll loop on the
@@ -4244,6 +4344,17 @@ def run_open_loop(
     starts on a ``needs_land`` (or shipped but not ``landed``) mailbox
     retries the land before anything else and dispatches no Lead (an
     interrupted land -- ``shipped`` in phase ``landing`` -- likewise).
+
+    A retired slice whose commit gate keeps failing never spins silently: its
+    failure (with the gate's reason) is logged once, and once the Lead is
+    finished and nothing else is in flight it is waited on for
+    ``gate_grace_polls`` polls, handed back to the Lead (context
+    ``gate_errors``) up to ``max_gate_repair_rounds`` times, and then the run
+    stops ``status: error`` (exit 3); ``max_gate_repair_rounds=None`` skips
+    the hand-back. Independently, ``no_progress_polls`` consecutive polls
+    with the Lead finished, no slice-eval in flight and nothing changed end
+    the run ``status: error`` too (``None``/0 disables; zero progress, not a
+    time limit).
     """
     if not isinstance(slice_eval_concurrency, int) or slice_eval_concurrency < 1:
         raise ValueError(
@@ -4525,8 +4636,15 @@ def run_open_loop(
         gate_held_lock = threading.Lock()
         lead_empty_passes: dict = {"n": 0}
 
-        def spawn_lead(force_first_pass: bool = False) -> tuple[threading.Thread, dict]:
+        def spawn_lead(
+            force_first_pass: bool = False, gate_errors: list | None = None
+        ) -> tuple[threading.Thread, dict]:
             holder: dict = {}
+            lead_kwargs: dict = {}
+            if acc is not None:
+                lead_kwargs["acceptance"] = acc
+            if gate_errors:
+                lead_kwargs["gate_feedback"] = {"errors": list(gate_errors)}
             thread = threading.Thread(
                 target=_lead_thread_body,
                 args=(
@@ -4544,7 +4662,7 @@ def run_open_loop(
                     gate_held_lock,
                     lead_empty_passes,
                 ),
-                kwargs={"acceptance": acc} if acc is not None else {},
+                kwargs=lead_kwargs,
                 daemon=True,
             )
             thread.start()
@@ -4593,6 +4711,13 @@ def run_open_loop(
         # blocking the integration-eval termination check below even
         # though QUEUE.md already shows it as retired.
         gate_blocked: set[tuple[str, str]] = set()
+        # (slice_id, sha) -> the failing gate's own explanation; and the
+        # (key, reason) pairs already written to LOG.md, so a gate that
+        # keeps failing is logged once per distinct reason, not once per poll.
+        gate_reasons: dict[tuple[str, str], str] = {}
+        gate_logged: set[tuple[tuple[str, str], str]] = set()
+        gate_repair_rounds = [0]
+        progress_watch = _NoProgressWatch()
         # (slice_id, sha) -> number of slice-eval attempts made so far that
         # returned exit 0 but did not (yet) leave a `## slice ... — SHIP|
         # ITERATE` section on disk. A key here (not yet graded, not yet
@@ -4739,13 +4864,21 @@ def run_open_loop(
                 gate_code = _per_slice_gate(mailbox, repo, slice_id)
                 if gate_code == 1:
                     gate_blocked.add(key)
-                    _append_log(
-                        mailbox,
-                        f"- iter {current_iteration()} | loop | commit gate "
-                        f"failed for slice {slice_id}; skipping until re-retired",
+                    reason = " ".join(
+                        str(getattr(gate_code, "reason", "") or "").split()
                     )
+                    gate_reasons[key] = reason
+                    if (key, reason) not in gate_logged:
+                        gate_logged.add((key, reason))
+                        _append_log(
+                            mailbox,
+                            f"- iter {current_iteration()} | loop | commit gate "
+                            f"failed for slice {slice_id}; skipping until "
+                            f"re-retired" + (f" ({reason})" if reason else ""),
+                        )
                     continue
                 gate_blocked.discard(key)
+                gate_reasons.pop(key, None)
                 if gate_code == 2:
                     stop_lead()
                     _update_state(state_path, {"status": "error"})
@@ -4913,6 +5046,84 @@ def run_open_loop(
                     # for the Lead to do, so just wait for the next poll
                     # and re-check then, instead of spinning the Lead
                     # thread up and down.
+                    #
+                    # "Presumably transient" is bounded (the Lead is done and
+                    # nothing is in flight, so only an outside edit could
+                    # clear it): after a grace period the stuck slice goes
+                    # back to the Lead with the gate's text, and after that
+                    # the run stops loudly. A loop that is idle with NOTHING
+                    # changing for `no_progress_polls` polls stops likewise.
+                    idle_polls = progress_watch.observe(
+                        _open_loop_fingerprint(
+                            mailbox,
+                            repo,
+                            (
+                                frozenset(graded),
+                                frozenset(gate_blocked),
+                                frozenset(eval_pending),
+                                tuple(sorted(inflight)),
+                            ),
+                        ),
+                        idle=not inflight,
+                    )
+                    stuck_slices = [
+                        (sid, latest_for_gate[sid]["sha"])
+                        for sid in (slice_ids or [])
+                        if sid in latest_for_gate
+                        and (sid, latest_for_gate[sid]["sha"]) in gate_blocked
+                    ]
+                    if (
+                        stuck_slices
+                        and not any_eval_pending
+                        and max_gate_repair_rounds is not None
+                        and idle_polls >= max(1, gate_grace_polls)
+                    ):
+                        gate_lines = [
+                            f"slice {sid}@{sha}: "
+                            + (gate_reasons.get((sid, sha)) or "commit gate failed")
+                            for sid, sha in stuck_slices
+                        ]
+                        if gate_repair_rounds[0] < max_gate_repair_rounds:
+                            gate_repair_rounds[0] += 1
+                            _append_log(
+                                mailbox,
+                                f"- iter {current_iteration()} | loop | commit "
+                                f"gate still failing after {idle_polls} polls "
+                                f"for {', '.join(sid for sid, _ in stuck_slices)}; "
+                                f"handing back to the Lead (round "
+                                f"{gate_repair_rounds[0]}/{max_gate_repair_rounds})",
+                            )
+                            progress_watch.reset()
+                            wake_event.clear()
+                            lead_thread, lead_result = spawn_lead(
+                                force_first_pass=True, gate_errors=gate_lines
+                            )
+                            write_sidecar("lead", current_iteration(), True, True)
+                            continue
+                        _update_state(state_path, {"status": "error"})
+                        _append_log(
+                            mailbox,
+                            f"- iter {current_iteration()} | loop | open-loop: "
+                            f"commit gate keeps failing for slice "
+                            f"{stuck_slices[0][0]}@{stuck_slices[0][1]} after "
+                            f"{gate_repair_rounds[0]} Lead hand-back(s); "
+                            f"stopping: {gate_lines[0][:300]}",
+                        )
+                        return finish(3)
+                    if no_progress_polls and idle_polls >= no_progress_polls:
+                        _update_state(state_path, {"status": "error"})
+                        what = (
+                            ", ".join(f"{sid}@{sha}" for sid, sha in stuck_slices)
+                            or "pending slice-evals"
+                        )
+                        _append_log(
+                            mailbox,
+                            f"- iter {current_iteration()} | loop | open-loop: "
+                            f"no progress for {idle_polls} polls (Lead finished, "
+                            f"nothing in flight, nothing changed; blocked: "
+                            f"{what}); stopping",
+                        )
+                        return finish(3)
                     wake_event.wait(
                         timeout=poll_seconds if poll_seconds > 0 else 0.01
                     )
@@ -5045,11 +5256,13 @@ def run_open_loop(
                     continue
                 # Fresh open work appeared after the Lead thread stopped
                 # (e.g. a slice-eval fault) -- re-invoke it.
+                progress_watch.reset()
                 wake_event.clear()
                 lead_thread, lead_result = spawn_lead()
                 write_sidecar("lead", current_iteration(), True, True)
                 continue
 
+            progress_watch.reset()  # a live Lead is live work
             wake_event.wait(timeout=poll_seconds if poll_seconds > 0 else 0.01)
             wake_event.clear()
     finally:
@@ -5131,6 +5344,13 @@ class _PortableRunner:
                 )
             else:
                 environment.pop("TRIO_QUEUE_ERRORS", None)
+            gate_errors = context.get("gate_errors") or []
+            if gate_errors:
+                environment["TRIO_GATE_ERRORS"] = "\n".join(
+                    str(e) for e in gate_errors
+                )
+            else:
+                environment.pop("TRIO_GATE_ERRORS", None)
         elif context:
             # Lockstep pin/attempt: same LOCKSTEP CONTEXT as Omnigent.
             attempt = str(context.get("evaluator_attempt") or "")

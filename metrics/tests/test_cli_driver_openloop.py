@@ -605,3 +605,49 @@ def test_lead_pass_queue_errors_render_identically_in_both_runners(
     assert held_py.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n" + note + "\n")
     for err in errors:
         assert f"\n- {err}" in held_sh and f"\n- {err}" in held_py
+
+
+def test_lead_pass_gate_errors_render_identically_in_both_runners(
+    tmp_path: Path,
+) -> None:
+    """ol-livelock: a stuck commit gate's text reaches the Lead in its
+    OPEN-LOOP CONTEXT block -- driver.sh (TRIO_GATE_ERRORS) and trioctl
+    (`gate_errors`) render the same text; absent, the block is unchanged."""
+    mailbox = make_mailbox_with_goal(tmp_path)
+    errors = [
+        "slice dispatch-plan@cc1f95e: acceptance gate: 67a68a9 'slice(dispatch-plan): x': "
+        "slice commit is on a line that does not contain the acceptance freeze",
+    ]
+
+    def driver_block(extra: dict) -> str:
+        result = subprocess.run(
+            [str(DRIVER), "--run-role", "lead"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "LOOP_DIR": str(mailbox),
+                "HARNESS": "generic",
+                "RUN_LEAD": "cat",
+                "TRIO_MODE": "open-loop",
+                "TRIO_KIND": "lead-pass",
+                **extra,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split("\n\n", 1)[0] + "\n\n"
+
+    trioctl = _load_trioctl()
+    ctx = {"mode": "open-loop", "kind": "lead-pass", "slice": None, "sha": None}
+    plain_py = trioctl.OmnigentRunner._open_loop_context_block(ctx)
+    held_py = trioctl.OmnigentRunner._open_loop_context_block({**ctx, "gate_errors": errors})
+    plain_sh = driver_block({})
+    held_sh = driver_block({"TRIO_GATE_ERRORS": "\n".join(errors)})
+
+    assert plain_sh == "OPEN-LOOP CONTEXT: kind=lead-pass\n\n"
+    assert "COMMIT GATE FAILURES" not in plain_py
+    note = trioctl._open_loop_gate_errors_note(errors)
+    assert held_sh == "OPEN-LOOP CONTEXT: kind=lead-pass\n" + note + "\n\n"
+    assert held_py.startswith("OPEN-LOOP CONTEXT: kind=lead-pass\n" + note + "\n")
+    assert f"\n- {errors[0]}" in held_sh and f"\n- {errors[0]}" in held_py

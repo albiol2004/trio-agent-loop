@@ -4513,6 +4513,19 @@ def _run_post_loop_session_prune(
     return deleted
 
 
+def _open_loop_gate_errors_note(errors: list[str]) -> str:
+    """The commit-gate-failures note of a lead-pass OPEN-LOOP CONTEXT block
+    (ol-livelock); byte-identical to portable/driver.sh build_prompt."""
+    return (
+        "COMMIT GATE FAILURES: the per-slice commit gate keeps rejecting "
+        "these retired slices, so none of them was ever graded and the run "
+        "is stuck. Repair the cause (for example re-commit the slice's work "
+        "as a fresh `slice(<id>): ...` commit on the current HEAD and append "
+        "a new `retired:` entry for it) or the run stops with an error:"
+        "\n" + "\n".join(f"- {e}" for e in errors)
+    )
+
+
 def _open_loop_queue_errors_note(errors: list[str]) -> str:
     """The QUEUE.md-parse-errors note of a lead-pass OPEN-LOOP CONTEXT
     block (r11g Q1); byte-identical to portable/driver.sh build_prompt."""
@@ -6175,6 +6188,11 @@ class OmnigentRunner:
             # QUEUE.md `faults:` block has parse errors; the Lead never
             # reads LOG.md, so the error text rides on this block.
             line += "\n" + _open_loop_queue_errors_note(queue_errors)
+        gate_errors = [str(e) for e in context.get("gate_errors") or []]
+        if gate_errors:
+            # ol-livelock: a retired slice's commit gate keeps failing; the
+            # Lead never reads LOG.md, so the gate's text rides on this block.
+            line += "\n" + _open_loop_gate_errors_note(gate_errors)
         if not procedure:
             return line + "\n\n"
         return line + "\n" + procedure + "\n"

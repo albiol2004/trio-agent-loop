@@ -1231,6 +1231,32 @@ def test_portable_runner_passes_queue_errors_to_build_prompt(
     assert "TRIO_QUEUE_ERRORS" not in captured
 
 
+def test_portable_runner_passes_gate_errors_to_build_prompt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """ol-livelock: a stuck commit gate's text rides on the lead-pass context."""
+    captured: dict = {}
+
+    def fake_run(cmd, check, env):
+        captured.update(env)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(trio_loop.subprocess, "run", fake_run)
+    monkeypatch.setenv("TRIO_GATE_ERRORS", "stale from the parent env")
+    runner = trio_loop._PortableRunner()
+    ctx = {"mode": "open-loop", "kind": "lead-pass", "slice": None, "sha": None,
+           "gate_errors": ["slice a@1: acceptance gate: x", "slice b@2: commit gate: y"]}
+    runner.run("lead", 1, tmp_path, ctx)
+    assert captured["TRIO_GATE_ERRORS"] == "slice a@1: acceptance gate: x\nslice b@2: commit gate: y"
+    captured.clear()
+    ctx.pop("gate_errors")
+    runner.run("lead", 1, tmp_path, ctx)
+    assert "TRIO_GATE_ERRORS" not in captured
+
+
 def test_live_faults_counts_unknown_status_as_live() -> None:
     faults = [
         {"id": "f1", "status": "open"}, {"id": "f2", "status": "taken"},
