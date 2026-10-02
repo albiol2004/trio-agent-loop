@@ -212,6 +212,113 @@ class WorktreeOwnershipTests(unittest.TestCase):
 
     # -- ancestry rules ---------------------------------------------------
 
+    def merged_ref_fixture(self) -> tuple[Path, Path]:
+        """A worktree with one branch-only mailbox that merged a ref whose
+        mailbox commits are not on the main checkout's HEAD (the live
+        wt-cogs-treatment case)."""
+        donor = self.worktree("donor")
+        for name in ("loop-inh-1", "loop-inh-2"):
+            write_mailbox(donor / name, "needs_human")
+        (donor / "loop-beta" / "STATE.md").write_text("status: running\n")
+        git(donor, "add", "-A")
+        git(donor, "commit", "-q", "-m", "donor: mailboxes main lacks")
+        wt = self.worktree()
+        write_mailbox(wt / "loop-own", "running", "VERDICT: none\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "branch: own mailbox")
+        git(wt, "merge", "-q", "--no-edit", donor.name)
+        return wt, donor
+
+    def test_mailboxes_inherited_through_a_merge_are_not_branch_owned(self):
+        wt, _donor = self.merged_ref_fixture()
+        self.assertTrue((wt / "loop-inh-1" / "GOAL.md").is_file())
+        self.assertEqual(self.selection(wt), {"loop-own": ["new on branch"]})
+
+    def test_overview_lists_merged_in_mailboxes_once_and_branch_only_once(self):
+        wt, donor = self.merged_ref_fixture()
+        server = serve.DashboardServer(
+            ("127.0.0.1", 0), workspaces=[self.main], auto_discover=True)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        with patch.object(serve, "BROKER_BASE_URL", ""):
+            status, data = _get(
+                f"http://127.0.0.1:{server.server_address[1]}/api/overview")
+        self.assertEqual(status, 200, data)
+        entry = next(w for w in data["workspaces"] if w["root"] == str(wt))
+        self.assertEqual([c["name"] for c in entry["loops"]], ["loop-own"])
+        names = [c["name"] for w in data["workspaces"] if w["root"] == str(wt)
+                 for c in w["loops"]]
+        self.assertEqual(names.count("loop-own"), 1)
+        for w in data["workspaces"]:
+            if w["root"] == str(wt):
+                continue
+            self.assertNotIn("loop-own", [c["name"] for c in w["loops"]])
+
+    def test_overview_shows_a_loop_id_once_with_other_copies(self):
+        wt = self.worktree()
+        self.needs_human(wt)
+        git(wt, "commit", "-q", "-am", "loop: needs human on the branch")
+        server = serve.DashboardServer(
+            ("127.0.0.1", 0), workspaces=[self.main], auto_discover=True)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        with patch.object(serve, "BROKER_BASE_URL", ""):
+            status, data = _get(
+                f"http://127.0.0.1:{server.server_address[1]}/api/overview")
+        self.assertEqual(status, 200, data)
+        cards = [(w, c) for w in data["workspaces"] for c in w["loops"]]
+        ids = [c["loop_id"] for _w, c in cards]
+        self.assertEqual(len(ids), len(set(ids)), "a loop id is listed twice")
+        owner, card = next((w, c) for w, c in cards
+                           if c["name"] == "loop-alpha")
+        self.assertEqual(owner["root"], str(wt))
+        self.assertEqual(card["other_copies"],
+                         [{"root": str(self.main), "worktree": False}])
+        alpha_items = [i for w in data["workspaces"] for i in w["inbox"]
+                       if i["loop"] == "loop-alpha"]
+        self.assertEqual([i["kind"] for i in alpha_items], ["needs_human"])
+        main_entry = next(w for w in data["workspaces"]
+                          if w["root"] == str(self.main))
+        self.assertNotIn("loop-alpha", [c["name"] for c in main_entry["loops"]])
+        self.assertIn("loop-beta", [c["name"] for c in main_entry["loops"]])
+
+    def test_dedupe_precedence_live_then_worktree_then_main(self):
+        def entry(root, worktree, *cards, inbox=()):
+            return {"root": root, "worktree": worktree, "loops": list(cards),
+                    "inbox": list(inbox)}
+
+        def card(name, **extra):
+            return {"name": name, "loop_id": "L", **extra}
+
+        main = entry("/m", False, card("a"), inbox=[
+            {"id": "i1", "loop_id": "L", "loop": "a"}])
+        wt = entry("/w", True, card("a", worktree_reasons=["committed on branch"]),
+                   inbox=[{"id": "i1", "loop_id": "L", "loop": "a"}])
+        serve._dedupe_overview_loops([main, wt])
+        self.assertEqual(main["loops"], [])
+        self.assertEqual(main["inbox"], [])
+        self.assertEqual(wt["loops"][0]["other_copies"],
+                         [{"root": "/m", "worktree": False}])
+        self.assertEqual(len(wt["inbox"]), 1)
+
+        main = entry("/m", False, card("a", running=True))
+        wt = entry("/w", True, card("a", worktree_reasons=["new on branch"]))
+        serve._dedupe_overview_loops([main, wt])
+        self.assertEqual(wt["loops"], [])
+        self.assertEqual(main["loops"][0]["other_copies"],
+                         [{"root": "/w", "worktree": True}])
+
+        main = entry("/m", False, card("a"))
+        wt = entry("/w", True, card("a", worktree_reasons=["modified"]))
+        wt2 = entry("/w2", True, card("a", worktree_reasons=["live"],
+                                      running=True))
+        serve._dedupe_overview_loops([main, wt, wt2])
+        self.assertEqual([len(e["loops"]) for e in (main, wt, wt2)], [0, 0, 1])
+        self.assertEqual({c["root"] for c in wt2["loops"][0]["other_copies"]},
+                         {"/m", "/w"})
+
     def test_committed_deletion_is_shown(self):
         wt = self.worktree()
         git(wt, "rm", "-q", "loop-beta/LOG.md")

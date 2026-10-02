@@ -224,6 +224,9 @@ METRICS_PATH = DASHBOARD_DIR.parent / "metrics" / "trio-metrics.py"
 INBOX_STATE_PATH = DASHBOARD_DIR / "inbox_state.py"
 """Inbox identity and read-state module, resolved relative to this file."""
 
+LOOP_IDS_PATH = DASHBOARD_DIR / "loop_ids.py"
+"""Canonical loop identity module, resolved relative to this file."""
+
 REGISTRY_PATH = DASHBOARD_DIR.parent / "registry" / "scan.py"
 """Skill registry scanner, resolved relative to this file."""
 
@@ -280,6 +283,7 @@ _MODELS_MODULE = None
 _HEALTH_MODULE = None
 _BROKER_HTTP_MODULE = None
 _INBOX_STATE_MODULE = None
+_LOOP_IDS_MODULE = None
 _REGISTRY_CACHE: dict[Path, tuple[dict, float]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 
@@ -568,6 +572,26 @@ def load_inbox_state_module():
         if not hasattr(module, fn):
             raise RuntimeError(f"inbox state module missing required function: {fn}")
     _INBOX_STATE_MODULE = module
+    return module
+
+
+def load_loop_ids_module():
+    """Load dashboard/loop_ids.py by path and cache the module (shared with
+    inbox_state.py through ``sys.modules``)."""
+    global _LOOP_IDS_MODULE
+    if _LOOP_IDS_MODULE is not None:
+        return _LOOP_IDS_MODULE
+    spec = importlib.util.spec_from_file_location(
+        "trio_dashboard_loop_ids", LOOP_IDS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load loop ids module: {LOOP_IDS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    for fn in ("repo_identity", "canonical_loop"):
+        if not hasattr(module, fn):
+            raise RuntimeError(f"loop ids module missing required function: {fn}")
+    _LOOP_IDS_MODULE = module
     return module
 
 
@@ -2309,6 +2333,55 @@ def _state_inbox_items(derived: dict, add, *, opencode: bool = False,
             "dangling:" + ",".join(sorted(dangling)))
 
 
+def _stamp_loop_identity(card: dict, root_mailbox: Path) -> None:
+    """``loop_id``/``loop_key`` of a card, from the ROOT mailbox path (never
+    an r16 live copy), identical from the main checkout and any worktree."""
+    try:
+        canonical = load_loop_ids_module().canonical_loop(root_mailbox)
+    except OSError:
+        return
+    card["loop_id"] = canonical["loop_id"]
+    card["loop_key"] = canonical["loop_key"]
+
+
+def _sidecar_run_id(loop_dir: Path, name: str, *fields: str) -> str | None:
+    try:
+        payload = json.loads(_read_mailbox_text(loop_dir / name))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for field in fields:
+        value = payload.get(field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _interrupted_run_key(loop_dir: Path, card: dict) -> str:
+    """Semantic key of an ``interrupted`` item: the run that stopped.
+
+    ``.session.json`` exec_id, else ``.driver.json`` run/exec id, else the
+    native launch's session id, else the native-runs registry's run_token,
+    else the iteration.  A moving ``last_activity`` is never part of it."""
+    run = (
+        _sidecar_run_id(loop_dir, ".session.json", "exec_id")
+        or _sidecar_run_id(loop_dir, ".driver.json",
+                           "exec_id", "run_id", "run")
+        or _sidecar_run_id(loop_dir, ".native-launch.json", "session_id")
+    )
+    if run is None:
+        entry = _native_registry_entry(loop_dir)
+        token = (entry or {}).get("run_token")
+        if isinstance(token, str) and token.strip():
+            run = token.strip()
+    if run is not None:
+        return f"run:{run}"
+    return f"iter:{card.get('iteration')}"
+
+
 def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """Attention signals for one loop, highest severity first.
 
@@ -2322,7 +2395,9 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
     """
     items = []
 
-    def add(severity, kind, headline, detail, anchor=None):
+    def add(severity, kind, headline, detail, anchor=None, legacy=None):
+        # ``anchor`` is the semantic (v2) key; ``legacy`` the v1 anchor, used
+        # only to carry old read marks onto the new id.
         item = {
             "loop": card["name"],
             "kind": kind,
@@ -2332,8 +2407,11 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         }
         if anchor is not None:
             item["_inbox_anchor"] = anchor
+        if legacy is not None:
+            item["_inbox_legacy_anchor"] = legacy
         items.append(item)
 
+    inbox_state = load_inbox_state_module()
     detection = _running_detection(loop_dir, root)
     orphaned = detection["orphaned_session"]
     if orphaned is not None and not detection["sources"]:
@@ -2366,6 +2444,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         # Without a readable broker, a broker-only loop cannot be ruled out,
         # so the item is a low-severity note instead of a call to act.
         last = card.get("last_activity") or ""
+        run_key = _interrupted_run_key(loop_dir, card)
         when = (f" Last mailbox write {last[:16].replace('T', ' ')} UTC."
                 if last else "")
         broker = detection.get("broker")
@@ -2378,13 +2457,13 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                 f"{'are' if working != 1 else 'is'} running in this "
                 "workspace without naming a mailbox, so this loop may still "
                 "be progressing." + when,
-                f"interrupted:{last}")
+                run_key, f"interrupted:{last}")
         elif broker == "ok":
             add("medium", "interrupted",
                 f"STATE.md says {status}; nothing is live",
                 "No driver, lock, process, session sidecar or broker "
                 "session is live." + when,
-                f"interrupted:{last}")
+                run_key, f"interrupted:{last}")
         else:
             reason = {
                 "disabled": "broker liveness is not configured",
@@ -2395,7 +2474,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                 f"STATE.md says {status}; no local process",
                 "No driver, lock, process or session sidecar is live; "
                 f"{reason}, so a broker-only run cannot be ruled out." + when,
-                f"interrupted:{last}")
+                run_key, f"interrupted:{last}")
 
     _state_inbox_items(derived, add, opencode=_is_opencode_loop(loop_dir),
                        mailbox=str(loop_dir))
@@ -2404,10 +2483,12 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
         pass  # the hold explains STATE's needs_human; an answer was given
     elif verdict == "NEEDS_HUMAN":
         add("high", "needs_human", "Human verification pending",
-            "Agent-verifiable criteria pass; verify: human criteria remain.")
+            "Agent-verifiable criteria pass; verify: human criteria remain.",
+            inbox_state.verdict_key(loop_dir, "needs_human"))
     elif verdict == "BLOCKED":
         add("high", "blocked", "Loop blocked",
-            card.get("last_entry_summary") or "")
+            card.get("last_entry_summary") or "",
+            inbox_state.verdict_key(loop_dir, "blocked"))
     elif status in _HUMAN_STATUS_WORDS:
         # A Lead that stops for a decision records it in STATE.md; the
         # verdict file may still say "none" or the previous ITERATE.
@@ -2416,10 +2497,11 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
             + (f"; verdict file says {verdict}." if verdict else ".")
             + (f" Last log entry: {card.get('last_entry_summary')}."
                if card.get("last_entry_summary") else ""),
-            f"state:{status}")
+            f"state:{status}:{card.get('iteration')}")
     elif status == "blocked":
         add("high", "blocked", "STATE.md says blocked",
-            card.get("last_entry_summary") or "", "state:blocked")
+            card.get("last_entry_summary") or "",
+            f"state:blocked:{card.get('iteration')}")
 
     plan = loop_dir / "PLAN.md"
     try:
@@ -2444,6 +2526,7 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
                     f"{'s' if drift_slices != 1 else ''}: "
                     + ", ".join(sorted_drift_files[:4])
                     + ("…" if len(sorted_drift_files) > 4 else ""),
+                    f"iter:{card.get('iteration')}",
                     ",".join(sorted_drift_files))
 
     is_open_loop = (loop_dir / "QUEUE.md").is_file()
@@ -2528,8 +2611,9 @@ def _inbox_items(loop_dir: Path, card: dict, root: Path) -> list[dict]:
 
     order = {"high": 0, "medium": 1, "low": 2}
     items.sort(key=lambda i: order[i["severity"]])
-    return load_inbox_state_module().decorate_items(
-        items, root, card["name"], loop_dir, HOME
+    return inbox_state.decorate_items(
+        items, root, card["name"], loop_dir, HOME,
+        loop_id=card.get("loop_id"),
     )
 
 
@@ -4414,6 +4498,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if only is not None:
             for root_dir, card in zip(root_dirs, loops):
                 card["worktree_reasons"] = only.get(str(root_dir), [])
+        for root_dir, card in zip(root_dirs, loops):
+            _stamp_loop_identity(card, root_dir)
         inbox = []
         for loop_dir, card in zip(loop_dirs, loops):
             if card.get("refused"):
@@ -4526,6 +4612,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send_json(403, {"error": NESTED_GIT_REFUSAL, "refused": True})
         card = self._loop_card(loop_dir, self.server.metrics, root)
         card["name"] = card["path"] = name  # r16: a live copy keeps the root name
+        pair = self._find_loop_pair(name, root)
+        _stamp_loop_identity(card, pair[0] if pair else loop_dir)
         card["mission"] = _mission_from_goal(loop_dir / "GOAL.md", limit=4000)
         card["timeline"] = _loop_timeline(loop_dir / "LOG.md")
         card["commits"] = _loop_commits(loop_dir, root)
@@ -5769,9 +5857,10 @@ def _worktree_ancestry(worktree: Path, mailboxes: list[Path]) -> dict:
     files cannot move it).
 
     With ``mb = merge-base(HEAD, base tip)``: a mailbox's own files are
-    those added, modified or deleted between ``mb`` and HEAD; they still
-    belong to the branch when the base tip does not already have the same
-    content at that path. ``changed`` maps such mailboxes to
+    those added, modified or deleted between ``mb`` and HEAD by a non-merge
+    commit on HEAD's first-parent chain (changes that arrived through a
+    merge are inherited); they still belong to the branch when the base tip
+    does not already have the same content at that path. ``changed`` maps such mailboxes to
     ``changed``/``deleted``; ``new`` lists those among them absent from
     the ``mb`` tree. Cached on (HEAD, tip) commit ids, so a commit
     elsewhere in the repository does not recompute every worktree.
@@ -5798,10 +5887,19 @@ def _worktree_ancestry(worktree: Path, mailboxes: list[Path]) -> dict:
     if merge_base and rels and merge_base != head:
         own = _git_out(worktree, "diff", "--name-status", "--no-renames",
                        merge_base, head, "--", *rels)
+        # Only a NON-merge commit on HEAD's first-parent chain makes a file
+        # the branch's own: whatever arrived through a merge (main -> branch,
+        # or another ref) is inherited, not branch work.
+        authored = _git_out(worktree, "log", "--first-parent", "--no-merges",
+                            "--name-status", "--no-renames", "--format=",
+                            f"{merge_base}..{head}", "--", *rels)
+        authored_paths = None if authored is None else {
+            line.partition("\t")[2] for line in authored.splitlines()
+            if line.partition("\t")[2]}
         own_files: dict[str, str] = {}
         for line in (own or "").splitlines():
             status, _, path = line.partition("\t")
-            if path:
+            if path and (authored_paths is None or path in authored_paths):
                 own_files[path] = "deleted" if status.startswith("D") else "changed"
         if own_files:
             touched = sorted({
@@ -6075,6 +6173,52 @@ def _dashboard_version() -> str:
     return result.stdout.strip() or "unknown"
 
 
+def _dedupe_overview_loops(entries: list[dict]) -> None:
+    """Show each canonical loop id once across workspace entries.
+
+    The same mailbox can be listed under the main checkout and under linked
+    worktrees.  The kept copy is the one with live running evidence, else a
+    linked-worktree copy with its own branch evidence, else the first
+    (main checkout) copy; the others' cards and inbox items are removed and
+    named in the kept card's ``other_copies``.  Inbox items are also
+    deduplicated by id across the whole overview."""
+    groups: dict[str, list[tuple[dict, dict]]] = {}
+    for entry in entries:
+        for card in entry.get("loops") or []:
+            loop_id = card.get("loop_id")
+            if loop_id:
+                groups.setdefault(loop_id, []).append((entry, card))
+    for loop_id, group in groups.items():
+        if len(group) < 2:
+            continue
+        keep_entry, keep_card = max(group, key=lambda pair: (
+            bool(pair[1].get("running")),
+            bool(pair[0].get("worktree") and pair[1].get("worktree_reasons"))))
+        others = [pair for pair in group if pair[1] is not keep_card]
+        keep_card["other_copies"] = [
+            {"root": other_entry["root"],
+             "worktree": bool(other_entry.get("worktree"))}
+            for other_entry, _card in others]
+        for other_entry, other_card in others:
+            other_entry["loops"] = [
+                c for c in other_entry["loops"] if c is not other_card]
+            if other_entry is not keep_entry:
+                other_entry["inbox"] = [
+                    i for i in other_entry.get("inbox") or []
+                    if i.get("loop_id") != loop_id]
+    seen: set[str] = set()
+    for entry in entries:
+        kept = []
+        for item in entry.get("inbox") or []:
+            identity = item.get("id")
+            if identity is not None:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            kept.append(item)
+        entry["inbox"] = kept
+
+
 class DashboardServer(ThreadingHTTPServer):
     """Threaded server carrying workspace roots and the loaded metrics module."""
 
@@ -6224,6 +6368,7 @@ class DashboardServer(ThreadingHTTPServer):
             worktree_entries = [e for e in worktree_entries
                                 if e["loops"] or e.get("error")]
         entries.extend(worktree_entries)
+        _dedupe_overview_loops(entries)
         # Processes working inside a workspace without naming any mailbox
         # (e.g. builders started with only --config/--workspace): shown as
         # evidence, never attributed to a loop.

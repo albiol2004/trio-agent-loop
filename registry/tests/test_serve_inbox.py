@@ -115,12 +115,29 @@ class InboxStateTests(unittest.TestCase):
         self.assertEqual(first["first_seen"], second["first_seen"])
         self.assertFalse(first["read"])
 
-    def test_verdict_rewrite_creates_new_unread_identity(self):
+    def test_verdict_rewrite_keeps_identity_until_word_or_iteration_changes(self):
+        # Replaces test_verdict_rewrite_creates_new_unread_identity: GOAL
+        # DoD 1 makes the id semantic (loop, kind, verdict word, iteration),
+        # so prose edits to VERDICT.md no longer resurface a read item.
         old = self.inbox_item()
+        status, payload = self.post(
+            "/api/inbox/read", {"ids": [old["id"]], "root": str(self.root)}
+        )
+        self.assertEqual(status, 200, payload)
         self.write_verdict("VERDICT: NEEDS_HUMAN\n\n## Iteration 3\nchanged\n")
-        new = self.inbox_item()
-        self.assertNotEqual(old["id"], new["id"])
-        self.assertFalse(new["read"])
+        same = self.inbox_item()
+        self.assertEqual(old["id"], same["id"])
+        self.assertTrue(same["read"])
+
+        self.write_verdict("VERDICT: NEEDS_HUMAN\n\n## Iteration 4\n")
+        bumped = self.inbox_item()
+        self.assertNotEqual(old["id"], bumped["id"])
+        self.assertFalse(bumped["read"])
+
+        self.write_verdict("VERDICT: BLOCKED\n\n## Iteration 3\n")
+        blocked = self.inbox_item("blocked")
+        self.assertNotIn(blocked["id"], (old["id"], bumped["id"]))
+        self.assertFalse(blocked["read"])
 
     def test_read_state_survives_new_server_and_unread_flips_it_back(self):
         item = self.inbox_item()
