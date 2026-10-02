@@ -4798,7 +4798,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             session.setdefault("identity", None)
             session.setdefault("identity_source", "unavailable")
             session.setdefault("start_dir", None)
-        parents =[s for s in sessions if s["kind"] == "parent"]
+        parents = [s for s in sessions if s["kind"] == "parent"]
         subagents = [s for s in sessions if s["kind"] != "parent"]
         parents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)
         subagents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)
