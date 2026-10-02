@@ -76,6 +76,7 @@ defaults; an explicit `--config` path that does not exist is a hard error. A
 | `max_iterations` | the loop's normal iteration cap |
 | `root_free` | default isolation mode (`true`; `--in-place` overrides per run) |
 | `container_mode` | default `false`; relaxes generated permissions for running inside a disposable Terminal-Bench task container (see "Container / no-time-limit mode") |
+| `acceptance_wait_seconds` | open-loop only; default `null` (= `0` = **no time limit**): how long the Lead pass waits for the frozen-acceptance author. A number bounds it; hitting the bound degrades the run to no pack (see "Author failure degrades") |
 | `acceptance` | default `false`; r19 frozen acceptance (see "Frozen acceptance (r19)"); `--acceptance`/`--no-acceptance` (start only) and `TRIO_ACCEPTANCE=1\|0` override it, precedence CLI > env > config |
 
 **Default models**: lead/evaluator/acceptance = `opencode-go/deepseek-v4.1-flash`;
@@ -692,6 +693,78 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
   validation remain authoritative either way). `acceptance-freeze`
   (dropped/fatal retry, contamination re-run, up to 3 attempts, mirrors
   `authorPhase`) then validates and freezes the pack exactly as native does.
+- **Author isolation: two real levels, chosen by a probe (acc-harden).**
+  Detect-and-discard alone discarded every attempt of a real run (a goal that
+  names absolute repository paths makes a model go and read them), and
+  permission globs over *command text* cannot bound a shell (`cd ..`,
+  symlinks, `python -c "open(...)"`, string building). So the author turn
+  (`RunContext.author_setup`, `trio_opencode/authorbox.py`) is contained one
+  of two ways, picked at run time by *starting* bwrap, not by finding it on
+  `PATH` (`TRIO_OPENCODE_AUTHOR_ISOLATION=no-shell` forces the second):
+  - **`sandbox`** — the whole `opencode` process runs under `bwrap` with a
+    tmpfs root: only the export (read-write), a private scratch dir, the
+    OpenCode config/cache dirs, the validator's directory, the system dirs a
+    process needs and the `PATH`/interpreter/`opencode` directories are
+    mounted. The author's own generated config (`opencode.json`, plus an
+    empty XDG config home beside it, in `author-cfg-<id>/` next to the
+    scratch dir, outside the run dir) is mounted **read-only** by name; the
+    author cannot loosen its own rules. The loop repository and every ancestor of it do not exist for
+    the process, so a shell stays available and safe; the network is **not**
+    unshared (the provider stays reachable); a mount that would expose the
+    repo or an ancestor is skipped. Extra read-only/read-write mounts a site
+    needs: `TRIO_OPENCODE_AUTHOR_SANDBOX_RO` / `_RW` (`os.pathsep` lists). The
+    tool-call text audit is not applied (the repo was not there; `ls <repo>`
+    -> "no such directory" read nothing).
+  - **`no-shell`** — no usable OS sandbox (Docker/Harbor task containers block
+    user namespaces; their security options are not ours to loosen): the
+    author gets **no shell** and only OpenCode's own file tools, confined by
+    the generated per-turn config (`ocgen._acceptance_permission`, written to
+    `author-cfg-<id>/opencode/` beside the export; deny rules only, never
+    `ask`, never `--auto`). **Default-deny**: the block starts with
+    `"*": "deny"` and allows only `read`, `glob`, `grep` and `edit`/`write`
+    (a shell too, at `sandbox`), each confined to the export. OpenCode v2's
+    Code Mode `execute` (`fetch('file://...')`, `session_move`) is thereby
+    denied, and so is every tool a later OpenCode adds. The rules follow how OpenCode v2 actually decides (read out of
+    the shipped binary, modelled in `tests/scenarios/oc_perm.py`): a path is
+    resolved *lexically* (`..` folded, symlinks **not** followed) against the
+    project directory; outside it, `external_directory` is asked with
+    `<dir>/*` and is `deny` for everything but the export, the author's
+    scratch and the validator's directory (also in `container_mode`, whose
+    flat allow no longer applies to this role); `read` also denies the
+    loop's own roots by absolute path and relative `../*`; `glob` refuses
+    climbing, absolute and `~` patterns (OpenCode judges the pattern, not the
+    directory); `bash` is denied; everything else (`execute`, `lsp`, `skill`,
+    `task`, web, todo, MCP, unknown) is denied by the default. Because
+    "inside" is lexical, every symlink that leaves the export (and every
+    multiply-linked file) is removed before the turn
+    (`authorbox.sanitize_export`), and when a git ancestor would otherwise
+    become OpenCode's project root (`grep {path:"../.."}` then searches it)
+    the export gets a minimal `.git` of its own for the turn only
+    (`authorbox.ensure_project_root` / `release_project_root`). The author's
+    prompt says it has no shell; the driver validates the pack at base itself
+    (one retry with the drops).
+  The level is logged loudly once per run (driver log, `LOG.md`, result
+  `acceptance.author_isolation`). `TMPDIR`/`HOME` and OpenCode's
+  `XDG_DATA_HOME`/`XDG_STATE_HOME` (where it saves a truncated
+  tool output the model is told to read back) point at a private directory beside the export,
+  outside the repository. The audit stays as the net at `no-shell`, with two
+  corrections: it never counts text the author *wrote* (a pack that names a
+  repo path in AUTHOR.md or a check read nothing —
+  `metrics/trio-acceptance.py` `_AUDIT_AUTHORED_KEYS`, mirrored in
+  `driver.audit_tool_input`) and never counts a call the permission rules
+  refused (`driver.refused_by_permission`).
+- **Author failure degrades (open-loop).** `openloop.DegradableAcceptance`
+  subclasses the core's controller. The author wait is unbounded by default
+  (`acceptance_wait_seconds`; the turn's own idle watchdog is the only
+  bound). When the pack was never frozen and the author phase fails
+  (contaminated twice, a turn that died, a configured bound hit) every
+  acceptance hook becomes a no-op, a loud `acceptance: DEGRADED to no frozen
+  pack (<reason>)` LOG line says so, the half-written pack is removed, later
+  Lead prompts stop mentioning a pack, the result's `acceptance` summary gains
+  `degraded: <reason>` — and the loop carries on as if acceptance were off.
+  The core (and the Omnigent, native and lockstep paths) end the run `status:
+  error` instead. Tamper of a *frozen* pack, a resume state mismatch
+  (NEEDS_HUMAN) and a cancellation are not degraded.
 - **Author audit on OpenCode.** The reused helper's own
   `_native_author_audit` looks for a Claude Code subagent transcript, which
   never exists for an OpenCode turn — `steplib.py` **overrides** it

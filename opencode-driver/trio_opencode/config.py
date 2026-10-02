@@ -89,6 +89,9 @@ def _default_dict() -> dict[str, Any]:
         "isolate_workers": True,
         "slice_eval_concurrency": 4,
         "kill_check": True,
+        # Open-loop frozen-acceptance author wait: null (or 0) = no time
+        # limit (the author turn's own idle watchdog is the only bound).
+        "acceptance_wait_seconds": None,
     }
 
 
@@ -159,6 +162,10 @@ class Config:
     isolate_workers: bool = True
     slice_eval_concurrency: int = 4
     kill_check: bool = True
+    #: Open-loop only: how long the Lead pass waits for the frozen-acceptance
+    #: author, in seconds. ``None`` (default; ``null``/``0`` in the file) =
+    #: no time limit.
+    acceptance_wait_seconds: float | None = None
     #: Path this config was loaded from, or None for pure defaults.
     source_path: str | None = None
 
@@ -299,6 +306,8 @@ def _validate_types(data: dict[str, Any]) -> None:
         _expect_type(data["slice_eval_concurrency"], int, "slice_eval_concurrency")
     if "kill_check" in data:
         _expect_type(data["kill_check"], bool, "kill_check")
+    if data.get("acceptance_wait_seconds") is not None:
+        _expect_type(data["acceptance_wait_seconds"], (int, float), "acceptance_wait_seconds")
 
 
 def _config_path(path: str | None) -> Path | None:
@@ -348,6 +357,8 @@ def _to_config(data: dict[str, Any], source_path: str | None) -> Config:
         isolate_workers=bool(data.get("isolate_workers", True)),
         slice_eval_concurrency=int(data.get("slice_eval_concurrency", 4)),
         kill_check=bool(data.get("kill_check", True)),
+        acceptance_wait_seconds=(None if data.get("acceptance_wait_seconds") in (None, 0)
+                                 else float(data["acceptance_wait_seconds"])),
         source_path=source_path,
     )
 

@@ -101,6 +101,7 @@ def test_resolve_settings_open_loop_defaults():
         "isolate_workers": True, "slice_eval_concurrency": 4,
         "slice_eval_drain_seconds": None, "kill_check_cli_disabled": False,
         "poll_seconds": 30.0, "notices": [],
+        "acceptance_wait_seconds": None,   # no author time limit by default
     }
 
 
@@ -475,7 +476,8 @@ def test_tool_call_rows_makes_relative_paths_absolute(tmp_path, product_repo):
     assert rows[0]["name"] == "edit"
     assert Path(rows[0]["input"]["path"]).is_absolute()
     assert rows[0]["input"]["path"] == str((export / "sub/file.txt").resolve())
-    assert rows[0]["input"]["content"] == "x"
+    # text the author WROTE is never audited as something it read
+    assert "content" not in rows[0]["input"]
     assert rows[1]["input"]["command"] == "ls"
 
 
@@ -494,7 +496,8 @@ def test_author_builds_prompt_and_absolute_transcript(tmp_path, product_repo, mo
     captured = {}
 
     def fake_call_role(ctx_, *, role, agent, model, prompt, cwd, label, session_id=None,
-                       turn_timeout=None, idle_timeout=None):
+                       turn_timeout=None, idle_timeout=None, env_extra=None,
+                       argv_prefix=()):
         captured["prompt"] = prompt
         captured["cwd"] = cwd
         captured["role"] = role

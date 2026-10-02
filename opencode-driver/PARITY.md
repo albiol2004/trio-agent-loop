@@ -36,6 +36,9 @@ Legend: **present** / **missing** / **partial** / **n/a** (with reason).
 | r19 frozen acceptance: switch (CLI > env `TRIO_ACCEPTANCE` > config, default off) | present | present (`args.acceptance`, `launch.sh --acceptance`) | **missing** (only a `models.acceptance` tier check in config/doctor) | present — see README "Frozen acceptance" |
 | r19 author at Lead/Evaluator tier, refused otherwise | present | present | partial (config/doctor only) | present (config + helper `begin --models`) |
 | r19 freeze (validation at base, retry, contaminated re-run, author isolation audit) | present | present (transcript or limited audit) | missing | present (audit from the OpenCode author turn's tool calls; author cwd = export) |
+| r19 author isolation: prevent reads, not only detect them | prompt + audit (Cursor cwd = export) | prompt + audit (author told to `cd`; no mechanical block) | missing | **beyond both**: `sandbox` (bwrap, only the export visible, shell kept) where a user namespace starts, else `no-shell` (no shell, file tools confined to the export by a per-turn config modelled on OpenCode v2's own path resolution, escaping symlinks removed), also in `container_mode`; audit ignores written text and permission-refused calls |
+| r19 author failure | status `error` | status `error` | missing | open-loop: degrades to no pack with a loud LOG line and runs on (`DegradableAcceptance`); lockstep still stops `error` |
+| r19 author wait | 900s default bound | n/a (synchronous) | missing | open-loop: unbounded by default (`acceptance_wait_seconds`) |
 | r19 coverage gate before builders, one re-plan | present | present | missing | present |
 | r19 pre-run at pin + SHIP gate (`review_verdict`, anti-thrash, amendments) | present | present | missing | present |
 | Lockstep evaluator gets integration rigor | present | present | present | present |

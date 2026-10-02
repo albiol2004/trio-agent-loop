@@ -152,6 +152,7 @@ def make_cfg(key_file: Path, **overrides) -> config_mod.Config:
         isolate_workers=overrides.get("isolate_workers", True),
         slice_eval_concurrency=overrides.get("slice_eval_concurrency", 4),
         kill_check=overrides.get("kill_check", False),
+        container_mode=overrides.get("container_mode", False),
     )
 
 

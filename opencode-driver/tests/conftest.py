@@ -103,6 +103,11 @@ def _isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # task 5 / driver.run()'s new validate-before-anything-else gate) —
     # global, so no individual test call site needs editing for it.
     monkeypatch.setenv("TRIO_OPENCODE_TEST_TIMEOUTS", "1")
+    # The acceptance author runs under bwrap where the host can start a user
+    # namespace; the fake `opencode` and its scenario files live outside that
+    # sandbox, so by default tests take the `no-shell` level on every host.
+    # The sandbox tests opt back in (TRIO_OPENCODE_AUTHOR_ISOLATION=auto).
+    monkeypatch.setenv("TRIO_OPENCODE_AUTHOR_ISOLATION", "no-shell")
 
     yield
 

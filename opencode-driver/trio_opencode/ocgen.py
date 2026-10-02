@@ -20,7 +20,9 @@ agent calling ``task``).
 from __future__ import annotations
 
 import json
+import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -216,6 +218,178 @@ PERMISSIONS: dict[str, dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
+# Acceptance-author isolation (r19). The author must judge the product from
+# its export alone; a goal that names absolute repository paths makes a model
+# naturally go and look there. Detect-and-discard (the audit) can only discard
+# after the fact -- and discarded every attempt of a real run.
+# These rules PREVENT the reads instead: deny rules only, never "ask" and
+# never `--auto`.
+# --------------------------------------------------------------------------
+
+#: The author's two isolation levels (see ``trio_opencode/authorbox.py``):
+#: ``sandbox`` -- the whole OpenCode process runs under bwrap with only its
+#: export (plus what OpenCode itself needs) visible, so a shell is safe;
+#: ``no-shell`` -- no OS sandbox is usable (Docker/Harbor task containers
+#: block user namespaces), so the author gets NO shell and only OpenCode's own
+#: path-checked file tools.
+LEVEL_SANDBOX = "sandbox"
+LEVEL_NO_SHELL = "no-shell"
+
+
+@dataclass(frozen=True)
+class AuthorIsolation:
+    """What the acceptance author may and may not touch for one turn.
+
+    ``export`` is its workspace (also its process cwd, i.e. OpenCode's
+    project directory). ``forbidden`` are the loop's own roots (repository,
+    git dir, mailboxes) whose paths it must never read. ``allow_dirs`` are
+    scratch directories (its ``TMPDIR``, OpenCode's own data dir) it may use
+    even when they sit under a forbidden root. ``tool`` is the validator
+    script it may run (``trio-acceptance.py``). ``level`` says how the turn
+    is contained (:data:`LEVEL_SANDBOX` / :data:`LEVEL_NO_SHELL`)."""
+    export: str
+    forbidden: tuple[str, ...] = ()
+    allow_dirs: tuple[str, ...] = ()
+    tool: str | None = None
+    level: str = LEVEL_NO_SHELL
+
+
+def _spellings(path: "str | Path") -> list[str]:
+    """normpath and realpath spellings of ``path`` (symlinked roots)."""
+    raw = os.path.normpath(str(path))
+    real = os.path.realpath(str(path))
+    return list(dict.fromkeys([raw, real]))
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _usable_forbidden(iso: AuthorIsolation) -> list[str]:
+    """Forbidden roots that can actually be denied: never ``/``, and never a
+    root that contains the export (or an allowed scratch dir) -- denying
+    that would also deny the author's own workspace."""
+    keep: list[str] = []
+    keepers = [sp for p in (iso.export, *iso.allow_dirs) for sp in _spellings(p)]
+    for root in iso.forbidden:
+        for sp in _spellings(root):
+            if sp in ("/", "") or sp in keep:
+                continue
+            if any(_is_under(k, sp) for k in keepers):
+                continue
+            keep.append(sp)
+    return keep
+
+
+def _acceptance_permission(permission: dict[str, Any], repo_root: "Path | None",
+                           iso: "AuthorIsolation | None") -> dict[str, Any]:
+    """The acceptance author's permission block.
+
+    Grounded in how OpenCode v2 itself evaluates a call (read out of the
+    shipped binary): a path is resolved *lexically* against the project
+    directory (``..`` folded, symlinks NOT followed); a path inside it is
+    authorized as the RELATIVE path, one outside it first asks
+    ``external_directory`` with ``<dir>/*`` and is then judged by the tool's
+    own rule on the ABSOLUTE path; the last matching rule wins and an
+    unmatched call is ``ask`` (= refused in a non-interactive run); ``bash``
+    is the ``shell`` action; ``glob`` judges the glob PATTERN, ``grep`` the
+    regex, never the directory (that is ``external_directory``'s job).
+
+    So: ``external_directory`` is NEVER the container-mode flat ``allow`` --
+    the export is the project directory, everything the author legitimately
+    needs is inside it, and anything outside is refused for read, glob,
+    grep and edit alike; ``read`` additionally denies the loop's own
+    roots by absolute path; ``glob`` refuses patterns that climb (``..``) or
+    are absolute (the pattern itself is not path-checked). A symlink that
+    leaves the export is removed before the turn (``authorbox.sanitize_export``),
+    because containment is lexical. At level ``no-shell`` the author gets no
+    shell at all -- command-text patterns cannot bound a shell (``cd ..``,
+    ``python -c open()``, string building); at level ``sandbox`` the OS keeps
+    everything but the export out of reach, so the usual guard-railed shell
+    stays. Every other tool is DENIED BY DEFAULT (``"*": "deny"`` first,
+    :func:`_default_deny`): OpenCode v2's Code Mode ``execute`` can ``fetch``
+    ``file://`` and ``session_move`` out of the export, so a deny list of
+    known tools is not enough. Allows that must beat a deny come after it."""
+    perm = _default_deny(permission, iso)
+    ext: dict[str, str] = {"*": "deny"}
+    if repo_root is not None:
+        base = f"{Path(repo_root).resolve()}/.trio-opencode/worktrees/tmp-"
+        ext[f"{base}*"] = "allow"
+        ext[f"{base}*/**"] = "allow"
+    if iso is None:
+        perm["external_directory"] = ext
+        return perm
+    bad = _usable_forbidden(iso)
+    scratch = [sp for p in (iso.export, *iso.allow_dirs) for sp in _spellings(p)]
+    for sp in scratch:
+        ext[sp] = "allow"
+        ext[f"{sp}/**"] = "allow"
+    tool_sp = _spellings(iso.tool) if iso.tool and os.path.isabs(iso.tool) else []
+    # The validator the author may run (and read): its directory is allowed
+    # unless it sits inside a root the author must not see (the trio repo
+    # hosting itself -- OpenCode's external_directory can only name the
+    # directory, which would be the repo's, so then it is not readable).
+    tool_clean = bool(tool_sp) and not any(_is_under(t, r) for t in tool_sp for r in bad)
+    if tool_clean:
+        for t in tool_sp:
+            ext[f"{os.path.dirname(t)}/*"] = "allow"
+    perm["external_directory"] = ext
+    read: dict[str, str] = {"*": "allow"}
+    for root in bad:
+        read[root] = "deny"
+        read[f"{root}/**"] = "deny"
+    for sp in scratch + tool_sp:
+        read[sp] = "allow"
+        read[f"{sp}/**"] = "allow"
+    # A project root that contains the export (OpenCode treats everything
+    # under it as "inside") authorizes such a path by its RELATIVE form, which
+    # climbs: refuse that form for reads and writes.
+    read["../*"] = "deny"
+    read[".."] = "deny"
+    perm["read"] = read
+    perm["edit"] = {"*": "allow", "../*": "deny"}
+    perm["grep"] = "allow"
+    if iso.level == LEVEL_NO_SHELL:
+        perm["glob"] = {"*": "allow", "*..*": "deny", "/*": "deny", "~*": "deny"}
+    else:
+        perm["glob"] = "allow"
+    return perm
+
+
+#: The only tools the acceptance author may call (OpenCode v2 names ``write``
+#: and ``edit`` under the ``edit`` action); a shell is added at level
+#: ``sandbox`` only. Everything else -- ``execute`` (Code Mode: ``fetch
+#: file://`` and ``session_move`` walk out of the export), ``bash``,
+#: ``webfetch``, session/task/todo tools, MCP, and any tool a later OpenCode
+#: adds -- falls under the leading ``"*": "deny"``.
+_AUTHOR_TOOLS = ("read", "glob", "grep", "edit")
+
+
+_AUTHOR_DENIED = ("bash", "execute", "webfetch", "websearch", "task", "todowrite", "lsp",
+                  "skill", "list", "doom_loop", "question")
+
+
+def _default_deny(permission: dict[str, Any], iso: "AuthorIsolation | None") -> dict[str, Any]:
+    """The author's permission block before the path rules: ``"*": "deny"``
+    first (OpenCode: the last matching rule wins, so every later key is an
+    explicit allow-list entry), then every action the author may use. Deny
+    and allow rules only: never ``ask``, never ``--auto``. ``iso is None``
+    (the run's generic config, a shell-allowed context) keeps its shell."""
+    perm: dict[str, Any] = {"*": "deny"}
+    # Known tools are denied by name as well: the wildcard is what stops a
+    # tool this driver has never heard of, the names are what an OpenCode
+    # that does not honour a top-level ``*`` (v1) still reads.
+    for key in _AUTHOR_DENIED:
+        perm[key] = "deny"
+    for key in _AUTHOR_TOOLS:
+        perm[key] = permission.get(key, "allow")
+    if iso is None or iso.level != LEVEL_NO_SHELL:
+        perm["bash"] = permission["bash"]
+    perm["external_directory"] = permission.get("external_directory", "deny")
+    return perm
+
+
+# --------------------------------------------------------------------------
 # YAML frontmatter rendering (hand-written; no PyYAML dependency).
 # --------------------------------------------------------------------------
 
@@ -359,7 +533,8 @@ def _external_directory_for(role: str, repo_root: "Path | None", *,
 
 
 def _agent_frontmatter(role: str, cfg: Config, description: str,
-                       repo_root: "Path | None" = None) -> dict[str, Any]:
+                       repo_root: "Path | None" = None,
+                       iso: "AuthorIsolation | None" = None) -> dict[str, Any]:
     fm: dict[str, Any] = {"description": description}
     if role == "scout":
         fm["mode"] = "subagent"
@@ -377,13 +552,16 @@ def _agent_frontmatter(role: str, cfg: Config, description: str,
     if container_mode:
         permission["bash"] = _bash_for_role(role, container_mode=True)
     permission["external_directory"] = _external_directory_for(role, repo_root, container_mode=container_mode)
+    if role == "acceptance":
+        permission = _acceptance_permission(permission, repo_root, iso)
     fm["permission"] = permission
     return fm
 
 
-def _render_agent_file(role: str, cfg: Config, repo_root: Path) -> str:
+def _render_agent_file(role: str, cfg: Config, repo_root: Path,
+                       iso: "AuthorIsolation | None" = None) -> str:
     description, body = _load_role_body(repo_root, role)
-    frontmatter = _agent_frontmatter(role, cfg, description, repo_root)
+    frontmatter = _agent_frontmatter(role, cfg, description, repo_root, iso)
     return render_frontmatter(frontmatter) + "\n" + _DRIVER_NOTE + "\n\n" + body + "\n"
 
 
@@ -420,7 +598,8 @@ def _build_opencode_json(cfg: Config) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 def _agent_config_entry(role: str, cfg: Config, description: str, body: str,
-                        repo_root: "Path | None") -> dict[str, Any]:
+                        repo_root: "Path | None",
+                        iso: "AuthorIsolation | None" = None) -> dict[str, Any]:
     entry: dict[str, Any] = {"description": description}
     if role == "scout":
         entry["mode"] = "subagent"
@@ -440,12 +619,15 @@ def _agent_config_entry(role: str, cfg: Config, description: str, body: str,
     if container_mode:
         permission["bash"] = _bash_for_role(role, container_mode=True)
     permission["external_directory"] = _external_directory_for(role, repo_root, container_mode=container_mode)
+    if role == "acceptance":
+        permission = _acceptance_permission(permission, repo_root, iso)
     entry["permission"] = permission
     entry["prompt"] = _DRIVER_NOTE + "\n\n" + body
     return entry
 
 
-def _build_opencode_json_v2(cfg: Config, repo_root: Path) -> dict[str, Any]:
+def _build_opencode_json_v2(cfg: Config, repo_root: Path,
+                            iso: "AuthorIsolation | None" = None) -> dict[str, Any]:
     doc: dict[str, Any] = {
         "$schema": "https://opencode.ai/config.json",
         "autoupdate": False,
@@ -460,10 +642,47 @@ def _build_opencode_json_v2(cfg: Config, repo_root: Path) -> dict[str, Any]:
     }
     for role in ROLES:
         description, body = _load_role_body(repo_root, role)
-        doc["agent"][f"trio-{role}"] = _agent_config_entry(role, cfg, description, body, repo_root)
+        doc["agent"][f"trio-{role}"] = _agent_config_entry(role, cfg, description, body, repo_root, iso)
     if cfg.provider.id not in _BUILTIN_PROVIDERS:
         doc["provider"] = {cfg.provider.id: {}}
     return doc
+
+
+def _write_opencode_dir(oc_dir: Path, cfg: Config, repo_root: Path, *, is_v1: bool,
+                        iso: "AuthorIsolation | None" = None) -> Path:
+    """Write ``<oc_dir>/opencode.json`` (plus, for v1, ``agent/trio-<role>
+    .md``) and return the ``opencode.json`` path."""
+    oc_dir.mkdir(parents=True, exist_ok=True)
+    if is_v1:
+        agent_dir = oc_dir / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        for role in ROLES:
+            content = _render_agent_file(role, cfg, repo_root, iso)
+            (agent_dir / f"trio-{role}.md").write_text(content, encoding="utf-8")
+        doc = _build_opencode_json(cfg)
+    else:
+        doc = _build_opencode_json_v2(cfg, repo_root, iso)
+    path = oc_dir / "opencode.json"
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def generate_author_env(run_dir: Path, cfg: Config, repo_root: Path, *,
+                        isolation: AuthorIsolation, style: str = "v2",
+                        oc_dir: "Path | None" = None) -> dict[str, str]:
+    """Per-turn config for the acceptance author: the same generated config
+    as :func:`generate`, but with the ``trio-acceptance`` agent's permissions
+    narrowed by ``isolation`` (see :class:`AuthorIsolation`). Written to
+    ``oc_dir`` (default ``<run_dir>/opencode-author/``; the driver passes a
+    directory OUTSIDE every forbidden root so the sandbox can mount it) and
+    returned as the two env vars that select it (``OPENCODE_CONFIG`` /
+    ``OPENCODE_CONFIG_DIR``); every other variable (XDG dirs, the key) stays
+    the run's own unless the caller overrides it. Safe to call before every
+    author attempt (overwrites)."""
+    oc_dir = Path(oc_dir) if oc_dir is not None else Path(run_dir) / "opencode-author"
+    path = _write_opencode_dir(oc_dir, cfg, Path(repo_root), is_v1=(style == "v1"),
+                               iso=isolation)
+    return {"OPENCODE_CONFIG": str(path), "OPENCODE_CONFIG_DIR": str(oc_dir)}
 
 
 # --------------------------------------------------------------------------
@@ -507,20 +726,7 @@ def generate(
     is_v1 = style == "v1"
 
     oc_dir = run_dir / "opencode"
-    oc_dir.mkdir(parents=True, exist_ok=True)
-
-    if is_v1:
-        agent_dir = oc_dir / "agent"
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        for role in ROLES:
-            content = _render_agent_file(role, cfg, repo_root)
-            (agent_dir / f"trio-{role}.md").write_text(content, encoding="utf-8")
-        doc = _build_opencode_json(cfg)
-    else:
-        doc = _build_opencode_json_v2(cfg, repo_root)
-
-    opencode_json_path = oc_dir / "opencode.json"
-    opencode_json_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    opencode_json_path = _write_opencode_dir(oc_dir, cfg, repo_root, is_v1=is_v1)
 
     xdg_root = run_dir / "xdg"
     xdg_config = xdg_root / "config"

@@ -23,7 +23,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -176,6 +178,17 @@ def _get_runner():
 def _get_ocgen():
     from trio_opencode import ocgen  # noqa: PLC0415 - lazy, another slice
     return ocgen
+
+
+def _env_paths(name: str) -> list[str]:
+    """Extra author-sandbox mounts a site needs (a toolchain installed in an
+    unusual place), as an ``os.pathsep``-separated env var."""
+    return [p for p in os.environ.get(name, "").split(os.pathsep) if p.startswith("/")]
+
+
+def _get_authorbox():
+    from trio_opencode import authorbox  # noqa: PLC0415 - lazy
+    return authorbox
 
 
 def _get_config_mod():
@@ -378,6 +391,30 @@ def _driver_json_paths(root_mailbox: Path, repo: Path, root_free: bool) -> list[
 
 
 # ------------------------------------------------------------- run context
+@dataclasses.dataclass(frozen=True)
+class AuthorSetup:
+    """One acceptance-author turn's containment (see ``RunContext.author_setup``)."""
+    level: str                      # "sandbox" | "no-shell" | "none" (no isolation context)
+    env: dict[str, str]             # env overrides for the turn
+    argv_prefix: tuple[str, ...]    # e.g. the bwrap wrapper; () when none
+    shell: bool                     # may the author run commands at all
+    note: str
+
+
+def _seed_author_cache(dest: Path, src: "str | None") -> str:
+    """``dest`` (created), filled once from ``src`` when that exists and is
+    small. Best effort: a cold cache only costs OpenCode a refetch."""
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        if src and Path(src).is_dir() and not any(dest.iterdir()):
+            total = sum(f.stat().st_size for f in Path(src).rglob("*") if f.is_file())
+            if total <= 256 * 1024 * 1024:
+                shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
+    except (OSError, shutil.Error):
+        pass
+    return str(dest)
+
+
 class RunContext:
     """Everything one ``run()`` call threads through the pass functions."""
 
@@ -460,6 +497,151 @@ class RunContext:
         #: `on_spawn`/`on_turn_end`) writes in between two sidecar writes.
         #: Always ``{}`` for a lockstep run.
         self.driver_extra: dict[str, Any] = {}
+        #: CLI style ``run()`` detected and the root the agent bodies live
+        #: under -- what ``ocgen.generate_author_env`` needs to write the
+        #: acceptance author's own, narrower per-turn config.
+        self.cli_style: str = "v2"
+        self.agents_root: Path | None = None
+        #: Isolation level of the latest author turn (``author_setup``);
+        #: ``sandbox`` makes the tool-call audit moot (see
+        #: :func:`audit_rows_for_level`).
+        self.author_level: str | None = None
+
+    # -- acceptance author isolation -----------------------------------
+    def author_forbidden_roots(self) -> list[Path]:
+        """Roots whose contents the acceptance author must never read: the
+        loop repository (every declared repo, the root-free Lead worktree),
+        its git dir and main checkout, and the mailboxes -- the same set the
+        post-hoc audit (``AcceptanceController._audit_forbidden``) judges
+        against, plus the run's own dir."""
+        roots: list[Path] = [self.repo, self.live_mailbox, self.root_mailbox, self.run_dir]
+        rec = self.lead_record
+        if rec is not None:
+            roots.append(Path(rec.path))
+            for info in (rec.repos or {}).values():
+                for key in ("path", "main"):
+                    if isinstance(info, dict) and info.get(key):
+                        roots.append(Path(info[key]))
+        for base in list(roots[:1]):
+            try:
+                out = subprocess.run(["git", "-C", str(base), "rev-parse", "--git-common-dir"],
+                                     capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out.returncode == 0 and out.stdout.strip():
+                git_dir = (Path(base) / out.stdout.strip()).resolve()
+                roots.append(git_dir)
+                if git_dir.name == ".git":
+                    roots.append(git_dir.parent)
+        seen: dict[str, Path] = {}
+        for r in roots:
+            seen.setdefault(str(r), Path(r))
+        return list(seen.values())
+
+    def author_setup(self, export: Path, tool: str | None, *,
+                     iteration: Any = "?") -> "AuthorSetup":
+        """How the next acceptance-author turn is contained
+        (``trio_opencode/authorbox.py``): the per-turn permission config
+        (``ocgen.AuthorIsolation``), a private scratch area OUTSIDE the
+        repository (``TMPDIR``, OpenCode's data/state dirs -- where it saves
+        a truncated tool output, a path the model is told to read back; the
+        run's own dirs live under the repo's git dir), and the isolation
+        level: ``sandbox`` (the opencode process runs under bwrap, only the
+        export visible, a shell is safe) when a probe shows bwrap really
+        starts here, else ``no-shell`` (no shell, path-checked file tools).
+        Symlinks leaving the export are removed first. The level is logged
+        loudly once per run. One stable scratch dir per run, so a same-session
+        re-prompt finds its session again. A context built by a test (no
+        ``agents_root``) gets an empty, shell-allowed setup."""
+        if self.agents_root is None:
+            return AuthorSetup(level="none", env={}, argv_prefix=(), shell=True, note="")
+        ocgen, authorbox = _get_ocgen(), _get_authorbox()
+        export = Path(export)
+        removed = authorbox.sanitize_export(export)
+        scratch = export.parent / f"author-{self.exec_id[:8]}"
+        #: The author's own OpenCode config + XDG config home. A sibling of
+        #: the scratch dir, NOT under the run dir (a forbidden root the
+        #: sandbox never mounts: ``Agent not found``) and NOT inside the
+        #: scratch dir (the author may write there; the sandbox mounts this
+        #: one read-only and the permission rules never allow it).
+        cfg_root = export.parent / f"author-cfg-{self.exec_id[:8]}"
+        env: dict[str, str] = {}
+        have_scratch = True
+        try:
+            for name in ("tmp", "xdg-data", "xdg-state", "home"):
+                (scratch / name).mkdir(parents=True, exist_ok=True)
+            for name in ("opencode", "xdg-config"):
+                (cfg_root / name).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            have_scratch = False
+        if have_scratch:
+            env.update({
+                "TMPDIR": str(scratch / "tmp"), "TMP": str(scratch / "tmp"),
+                "TEMP": str(scratch / "tmp"), "HOME": str(scratch / "home"),
+                "XDG_DATA_HOME": str(scratch / "xdg-data"),
+                "XDG_STATE_HOME": str(scratch / "xdg-state"),
+                "XDG_CONFIG_HOME": str(cfg_root / "xdg-config"),
+            })
+        if not have_scratch:
+            usable, detail = False, "no scratch dir"
+        elif os.environ.get("TRIO_OPENCODE_AUTHOR_ISOLATION", "auto").strip().lower() == "no-shell":
+            usable, detail = False, "forced by TRIO_OPENCODE_AUTHOR_ISOLATION=no-shell"
+        else:
+            usable, detail = authorbox.bwrap_usable()
+        level = ocgen.LEVEL_SANDBOX if usable else ocgen.LEVEL_NO_SHELL
+        forbidden = [str(r) for r in self.author_forbidden_roots()]
+        iso = ocgen.AuthorIsolation(
+            export=str(export), forbidden=tuple(forbidden),
+            allow_dirs=(str(scratch),) if have_scratch else (), tool=tool, level=level)
+        env.update(ocgen.generate_author_env(
+            self.run_dir, self.cfg, self.agents_root, isolation=iso, style=self.cli_style,
+            oc_dir=(cfg_root / "opencode") if have_scratch else None))
+        if level == ocgen.LEVEL_NO_SHELL:
+            # a git ancestor of the export would become OpenCode's project
+            # root (grep/glob ``path: ../..`` then counts as inside it); the
+            # caller removes this guard after the turn (``release_author``)
+            authorbox.ensure_project_root(export)
+        prefix: tuple[str, ...] = ()
+        if level == ocgen.LEVEL_SANDBOX:
+            if have_scratch:
+                # The run's own cache lives under the run dir, a forbidden root
+                # (mounting it would make the repo's path exist in the sandbox).
+                # The author gets a cache beside its scratch, seeded once with
+                # the run's (OpenCode's models catalog), and has no need of more.
+                env["XDG_CACHE_HOME"] = _seed_author_cache(
+                    scratch / "xdg-cache", self.turn_env().get("XDG_CACHE_HOME"))
+            turn_env = {**self.turn_env(), **env}
+            prefix = tuple(authorbox.sandbox_prefix(
+                export=export, scratch=scratch,
+                config_dir=cfg_root if have_scratch else env["OPENCODE_CONFIG_DIR"],
+                env=turn_env, opencode_bin=getattr(self.cfg, "opencode_bin", "opencode"),
+                forbidden=forbidden,
+                extra_ro=([os.path.dirname(tool)] if tool and os.path.isabs(tool) else [])
+                + _env_paths("TRIO_OPENCODE_AUTHOR_SANDBOX_RO"),
+                extra_rw=_env_paths("TRIO_OPENCODE_AUTHOR_SANDBOX_RW")))
+        note = (f"author isolation: {level} ({detail})" if usable else
+                f"author isolation: {level} -- no OS sandbox here ({detail}); the author gets "
+                "NO shell and only path-checked file tools confined to its export")
+        if removed:
+            note += f"; removed {len(removed)} symlink(s) leaving the export"
+        if self.acc_log.get("author_isolation") != level:
+            self.acc_log["author_isolation"] = level
+            self.out(f"acceptance: {note}")
+            try:
+                steplib.TL._append_log(self.live_mailbox,
+                                       f"- iter {iteration} | loop | acceptance: {note}")
+            except Exception:  # noqa: BLE001 - the LOG line is best effort
+                pass
+        self.author_level = level
+        return AuthorSetup(level=level, env=env, argv_prefix=prefix,
+                           shell=(level != ocgen.LEVEL_NO_SHELL), note=note)
+
+    def release_author(self, export: Path) -> None:
+        """Undo what ``author_setup`` added to the export for the turn (the
+        project-root guard), so the validator and the freeze see the export
+        as built."""
+        if self.agents_root is not None:
+            _get_authorbox().release_project_root(Path(export))
 
     # -- .driver.json -----------------------------------------------------
     def write_driver_json(self, *, phase: str, iteration: int) -> None:
@@ -526,7 +708,9 @@ class RunContext:
 def _call_role(ctx: RunContext, *, role: str, agent: str, model: str, prompt: str,
                cwd: Path, label: str, session_id: str | None = None,
                turn_timeout: float | None = None, idle_timeout: float | None = None,
-               guard_state_override: bool | None = None) -> Any:
+               guard_state_override: bool | None = None,
+               env_extra: dict[str, str] | None = None,
+               argv_prefix: tuple[str, ...] = ()) -> Any:
     """One role turn, retried once on a null-equivalent (``ok=False`` and
     not a stop kind), matching the native driver's ``runAgentTwice``.
     Raises :class:`DriverStop` on a permission/config_error result or two
@@ -589,7 +773,8 @@ def _call_role(ctx: RunContext, *, role: str, agent: str, model: str, prompt: st
                 runner, role=role, agent=agent, model=model, prompt=prompt,
                 variant=_variant_for(ctx.cfg, role, model),
                 cwd=str(cwd), session_id=session_id, label=this_label,
-                env=ctx.turn_env(), turn_timeout=turn_timeout, idle_timeout=idle_timeout,
+                env={**ctx.turn_env(), **(env_extra or {})}, argv_prefix=tuple(argv_prefix),
+                turn_timeout=turn_timeout, idle_timeout=idle_timeout,
                 opencode_bin=getattr(ctx.cfg, "opencode_bin", "opencode"),
                 key_file=_key_file_for(ctx.cfg), log_dir=str(ctx.log_dir),
                 max_attempts=max_attempts, backoff=backoff,
@@ -639,7 +824,9 @@ def _call_role(ctx: RunContext, *, role: str, agent: str, model: str, prompt: st
 
 def _structured(ctx: RunContext, *, result: Any, required: tuple[str, ...],
                 cwd: Path, role: str, agent: str, model: str, label: str,
-                advisory: bool = False, defaults: dict | None = None) -> dict:
+                advisory: bool = False, defaults: dict | None = None,
+                env_extra: dict[str, str] | None = None,
+                argv_prefix: tuple[str, ...] = ()) -> dict:
     """Parse the fenced ```json block from a turn's text; one re-prompt in
     the same session on a missing/malformed block.
 
@@ -659,7 +846,8 @@ def _structured(ctx: RunContext, *, result: Any, required: tuple[str, ...],
     retry = _call_role(
         ctx, role=role, agent=agent, model=model,
         prompt=prompts.reprompt(problem, schema_hint), cwd=cwd,
-        label=f"{label} (reprompt)", session_id=result.session_id,
+        label=f"{label} (reprompt)", session_id=result.session_id, env_extra=env_extra,
+        argv_prefix=argv_prefix,
     )
     obj2 = extract_json_block(retry.text)
     if obj2 is not None and all(k in obj2 for k in required):
@@ -881,6 +1069,54 @@ def _get_events():
     return events
 
 
+#: Tool-input keys that carry text the author WROTE (a file body, an edit's
+#: old/new strings, a patch) rather than something it asked to read. The
+#: audit judges what the author LOOKED AT; a written pack that merely
+#: *mentions* a repository path (a goal that names absolute paths makes a
+#: check or AUTHOR.md quoting one natural) is not a read and used to discard
+#: the attempt as "reads inside the loop repository".
+AUTHORED_TEXT_KEYS = frozenset({
+    "content", "oldString", "newString", "old_string", "new_string",
+    "patch", "patchText", "patch_text", "newText", "oldText",
+})
+
+
+def audit_tool_input(tool_input: dict) -> dict:
+    """``tool_input`` without the keys that only carry authored text (see
+    :data:`AUTHORED_TEXT_KEYS`) -- the part of an author tool call the
+    isolation audit should judge."""
+    return {k: v for k, v in tool_input.items() if k not in AUTHORED_TEXT_KEYS}
+
+
+_PERMISSION_REFUSAL_RE = re.compile(
+    r"rule which prevents|prevents you from using|rejected permission|permission denied"
+    r"|denied by (?:a )?(?:rule|permission)|not allowed (?:by|in) ", re.IGNORECASE)
+
+
+def refused_by_permission(state: dict) -> bool:
+    """A tool call the permission rules refused before it ran (status
+    ``error`` with a rule-denial message). It read nothing, so the isolation
+    audit must not count the ATTEMPT: with deny rules in place a refused read
+    of the repository is the mechanism working, not contamination. Any other
+    error (file not found, ...) still counts -- the author looked."""
+    if not isinstance(state, dict) or state.get("status") != "error":
+        return False
+    return bool(_PERMISSION_REFUSAL_RE.search(str(state.get("error") or "")))
+
+
+#: The one benign row recorded for a sandboxed author turn.
+SANDBOXED_ROW = {"type": "tool_use", "name": "sandboxed-author", "input": {}}
+
+
+def sandboxed(ctx: RunContext) -> bool:
+    """Was the latest author turn contained by the OS sandbox? Then the
+    isolation is not judged from tool-call text: the repository did not exist
+    for the process, so a command that merely NAMES it (``ls /app`` -> no such
+    directory) read nothing and must not discard the session. The audit is the
+    net where the isolation is weaker (``no-shell``)."""
+    return getattr(ctx, "author_level", None) == "sandbox"
+
+
 def _persist_author_tool_calls(ctx: RunContext, result: Any, marker: str) -> None:
     """req. 4: convert the author turn's own NDJSON event log (one ``.jsonl``
     per attempt, already written and scrubbed by ``runner.py`` — see
@@ -897,6 +1133,9 @@ def _persist_author_tool_calls(ctx: RunContext, result: Any, marker: str) -> Non
     events_mod = _get_events()
     entries: list[dict] = []
     for log_path in getattr(result, "log_paths", []) or []:
+        if sandboxed(ctx):
+            entries = [dict(SANDBOXED_ROW)]
+            break
         if not str(log_path).endswith(".jsonl"):
             continue
         try:
@@ -912,8 +1151,11 @@ def _persist_author_tool_calls(ctx: RunContext, result: Any, marker: str) -> Non
             if not is_tool:
                 continue
             state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            if refused_by_permission(state):
+                continue
             tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
-            entries.append({"type": "tool_use", "name": part.get("tool"), "input": tool_input})
+            entries.append({"type": "tool_use", "name": part.get("tool"),
+                            "input": audit_tool_input(tool_input)})
     out_path = Path(steplib.AUTHOR_TOOLCALLS_DIR) / f"{marker}.jsonl"
     try:
         with open(out_path, "w", encoding="utf-8") as fh:
@@ -1022,18 +1264,25 @@ def _author_phase(ctx: RunContext, *, iteration: int) -> None:
     for attempt in (1, 2, 3):
         ctx.acc_log["author_attempts"] = attempt
         marker = f"{ex['marker']}-a{attempt}"
-        prompt = prompts.author_prompt(str(export), tool, marker, attempt,
-                                       notes=bool(ex.get("notes")), retry=retry)
-        result = _call_role(ctx, role="acceptance", agent=AGENTS["acceptance"], model=model,
-                            prompt=prompt, cwd=export,
-                            label=f"acceptance author it{iteration}#{attempt}")
-        _persist_author_tool_calls(ctx, result, marker)
-        author_out = _structured(
-            ctx, result=result, required=("checks", "summary"), cwd=export, role="acceptance",
-            agent=AGENTS["acceptance"], model=model,
-            label=f"acceptance author it{iteration}#{attempt}", advisory=True,
-            defaults={"checks": None, "summary": "(no structured report)"},
-        )
+        setup = ctx.author_setup(export, tool, iteration=iteration)
+        try:
+            prompt = prompts.author_prompt(str(export), tool, marker, attempt,
+                                           notes=bool(ex.get("notes")), retry=retry,
+                                           shell=setup.shell)
+            result = _call_role(ctx, role="acceptance", agent=AGENTS["acceptance"], model=model,
+                                prompt=prompt, cwd=export,
+                                label=f"acceptance author it{iteration}#{attempt}",
+                                env_extra=setup.env, argv_prefix=setup.argv_prefix)
+            _persist_author_tool_calls(ctx, result, marker)
+            author_out = _structured(
+                ctx, result=result, required=("checks", "summary"), cwd=export, role="acceptance",
+                agent=AGENTS["acceptance"], model=model,
+                label=f"acceptance author it{iteration}#{attempt}", advisory=True,
+                defaults={"checks": None, "summary": "(no structured report)"},
+                env_extra=setup.env, argv_prefix=setup.argv_prefix,
+            )
+        finally:
+            ctx.release_author(export)
         author_summary = {
             "exit": 0,
             "checks": author_out.get("checks") if isinstance(author_out.get("checks"), int) else None,
@@ -1545,6 +1794,8 @@ def run(mailbox: str | Path, cfg: Any, *, mode: str = "start",
                              log_dir=log_dir, env=env, root_free=root_free,
                              lead_record=lead_record, out=out, cancel=cancel,
                              cancel_code=stop_now, acceptance=acceptance)
+            ctx.cli_style = cli_style
+            ctx.agents_root = steplib.REPO_ROOT
             if acceptance:
                 # r19: the directory steplib's `_opencode_author_audit`
                 # override reads the author turn's persisted tool-call JSONL
@@ -1890,6 +2141,8 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
             "ship_refused": ctx.acc_log["ship_refused"],
             "author_attempts": ctx.acc_log["author_attempts"],
         }
+        if ctx.acc_log.get("author_isolation"):
+            final["acceptance"]["author_isolation"] = ctx.acc_log["author_isolation"]
 
     try:
         ctx.driver_json_path.unlink()

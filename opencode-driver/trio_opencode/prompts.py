@@ -240,7 +240,8 @@ def acc_briefed(plan: dict, briefs: dict | None) -> dict:
 
 
 def author_prompt(export: str, tool: str, marker: str, attempt: int, *,
-                  notes: bool = False, retry: dict | None = None) -> str:
+                  notes: bool = False, retry: dict | None = None,
+                  shell: bool = True) -> str:
     """The acceptance author's turn prompt. Unlike native's ``authorPrompt``
     (a Claude Code Workflow ``agent()`` call, which starts in the *loop*
     repository and must be told to ``cd`` into the export for every
@@ -266,9 +267,22 @@ def author_prompt(export: str, tool: str, marker: str, attempt: int, *,
         "directory is the repository's public surface at the loop's base.",
         "Write files only under `acceptance/` (checks, MANIFEST.json, AUTHOR.md); scratch "
         "work goes under `.author-tmp/`.",
-        f"Validate: `python3 {tool} validate --export .` (schema + a run of every check at "
-        "base). Fix what it reports (WOULD DROP, INVALID), run it again, then stop.",
     ]
+    if shell:
+        lines.append(
+            f"Validate: `python3 {tool} validate --export .` (schema + a run of every check at "
+            "base). Fix what it reports (WOULD DROP, INVALID), run it again, then stop.")
+    else:
+        lines += [
+            "This run gives you NO shell: you cannot run commands or the validator. Use your "
+            "read, glob, grep and edit/write tools only, and only inside this directory (a "
+            "path outside it is refused). Write every file with the write tool.",
+            "The driver validates your pack at the base commit itself (schema plus a run of "
+            "every check) right after you finish: write checks you are sure about, as "
+            "plain scripts that drive the product through its public surface from the "
+            "directory they run in, and keep MANIFEST.json exactly to schema. A check that "
+            "is broken or already passes at base is dropped, and you get one retry.",
+        ]
     dropped = retry.get("dropped") or []
     fatal = retry.get("fatal") or []
     if dropped or fatal:

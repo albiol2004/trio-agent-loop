@@ -100,7 +100,8 @@ def resolve_settings(cfg: Any, *, is_open_loop: bool,
                      slice_eval_concurrency: int | None = None,
                      slice_eval_drain_seconds: float | None = None,
                      kill_check: bool | None = None,
-                     poll_seconds: float | None = None) -> dict[str, Any]:
+                     poll_seconds: float | None = None,
+                     acceptance_wait_seconds: float | None = None) -> dict[str, Any]:
     """D12: CLI > config > default, mirroring trioctl ``omnigent loop``.
 
     Raises :class:`SettingsError` for a refused combination (CLI exit 2 /
@@ -157,7 +158,18 @@ def resolve_settings(cfg: Any, *, is_open_loop: bool,
         except ValueError:
             poll = 30.0
 
+    # No author time limit by default: null/0 (config) means wait for as long
+    # as the author turn lives (its idle watchdog is the only bound).
+    wait_cfg = acceptance_wait_seconds
+    if wait_cfg is None:
+        wait_cfg = getattr(cfg, "acceptance_wait_seconds", None)
+    if wait_cfg is not None:
+        if isinstance(wait_cfg, bool) or not isinstance(wait_cfg, (int, float)) or wait_cfg < 0:
+            raise SettingsError("acceptance_wait_seconds must be a number >= 0 (or null)")
+        wait_cfg = float(wait_cfg) or None
+
     return {
+        "acceptance_wait_seconds": wait_cfg,
         "isolate_workers": isolate,
         "slice_eval_concurrency": conc,
         "slice_eval_drain_seconds": drain,
@@ -461,6 +473,192 @@ def _acceptance_pass_notes(ctx: "drv.RunContext") -> list[str]:
     return ["\n".join(lines).strip("\n")]
 
 
+# ====================================== author failure degrades, never kills
+
+
+class DegradableAcceptance(TL.AcceptanceController):
+    """The shared core's ``AcceptanceController`` with two driver-side
+    differences, both for a run that must not die of its *author*:
+
+    * **No author time limit by default.** The core waits for the author
+      ``wait_s`` seconds (default 900; this driver used to pass 180) and then
+      stops the loop with ``acceptance-timeout``. Here ``wait_s=None`` (the
+      default) waits for as long as the author turn lives -- the turn's own
+      idle/hung-connection watchdogs are the only bound. A configured number
+      still bounds it.
+    * **An author failure degrades to NO PACK instead of ending the run.**
+      Whenever the pack was never frozen and the author phase failed
+      (contaminated twice, validation never passed, a crashed or timed-out
+      turn, ...), every acceptance hook becomes a no-op, a loud
+      ``acceptance: DEGRADED`` LOG line says so, and the loop carries on as if
+      acceptance were off: no coverage gate, no pre-runs, no SHIP gate. The
+      Omnigent, native and lockstep paths END the run with ``status: error``
+      here (``_acceptance_stop``); a benchmark run must not. Failures that
+      are NOT the author's -- a frozen pack tampered with, a state mismatch
+      on resume (NEEDS_HUMAN), a cancellation -- still stop the loop exactly
+      as the core decides.
+    """
+
+    def __init__(self, mailbox, repo, runner, config) -> None:  # noqa: ANN001
+        super().__init__(mailbox, repo, runner, config)
+        raw = (config or {}).get("wait_s")
+        self.wait_s = float(raw) if raw else None
+        self.degraded: str | None = None
+        self._degrade_lock = threading.Lock()
+        self._on_degrade = (config or {}).get("on_degrade")
+
+    # -- helpers ------------------------------------------------------------
+
+    def _cancelled(self) -> bool:
+        ctx = getattr(self.runner, "ctx", None)
+        cancel = getattr(ctx, "cancel", None)
+        return bool(cancel is not None and cancel.is_set())
+
+    def _degrade(self, iteration: int, exc: "TL.AcceptanceError") -> None:
+        with self._degrade_lock:
+            if self.degraded:
+                return
+            self.degraded = f"{exc.reason}: {exc.detail}"
+        try:
+            self._drop_unfrozen_pack()
+        except Exception:  # noqa: BLE001 - best effort, never masks the degrade
+            pass
+        TL._append_log(
+            self.mailbox,
+            f"- iter {iteration} | loop | acceptance: DEGRADED to no frozen pack "
+            f"({exc.reason}): {exc.detail[:300]}; the loop continues WITHOUT frozen "
+            "acceptance (no coverage gate, no pre-runs, no SHIP gate)",
+        )
+        self._set_meta("acceptance", {"enabled": True, "status": "degraded",
+                                      "degraded": self.degraded, "pin": None,
+                                      "state_file": str(self.state_path)})
+        callback = self._on_degrade
+        if callable(callback):
+            try:
+                callback(self.degraded)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _drop_unfrozen_pack(self) -> None:
+        """A half-written, never-committed ``acceptance/`` must not stay in
+        the mailbox: a later resume would find a pack with no pin
+        (``acceptance-state-lost``, NEEDS_HUMAN). A tracked pack is left."""
+        if self.frozen() or not self.acc_dir.exists():
+            return
+        tracked = TL._git(self.repo, "ls-files", "--", self.acc_rel)
+        if tracked.returncode == 0 and tracked.stdout.strip():
+            return
+        shutil.rmtree(self.acc_dir, ignore_errors=True)
+
+    # -- author phase ---------------------------------------------------------
+
+    def start(self, iteration: int) -> None:
+        if self.degraded:
+            return
+        if self._resume_error is not None:
+            raise self._resume_error
+        try:
+            super().start(iteration)
+        except TL.AcceptanceNeedsHuman:
+            raise
+        except TL.AcceptanceError as exc:
+            self._degrade(iteration, exc)
+
+    def _call_author(self, export: Path, context: dict) -> dict:
+        if self.degraded:
+            # A timed-out author thread that is still looping (re-run after a
+            # discard / validation retry) must not spawn another turn.
+            raise TL.AcceptanceError("acceptance-abandoned", "the run already degraded to no pack")
+        return super()._call_author(export, context)
+
+    def _freeze(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        if self.degraded:
+            raise TL.AcceptanceError("acceptance-abandoned", "the run already degraded to no pack")
+        return super()._freeze(*args, **kwargs)
+
+    def wait(self, iteration: int, timeout: float | None = None) -> None:
+        if self.degraded:
+            return
+        if self._resume_error is not None:
+            raise self._resume_error
+        try:
+            self._wait_for_author(iteration, timeout)
+        except TL.AcceptanceError as exc:
+            if self.degraded:
+                return
+            if self.frozen() or self._cancelled():
+                raise
+            self._degrade(iteration, exc)
+
+    def _wait_for_author(self, iteration: int, timeout: float | None) -> None:
+        if self._thread is None and not self.frozen():
+            self.start(iteration)
+            if self.degraded:
+                return
+        thread = self._thread
+        if thread is not None:
+            limit = self.wait_s if timeout is None else timeout
+            deadline = None if limit is None else time.monotonic() + limit
+            while thread.is_alive():
+                step = 1.0
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise TL.AcceptanceError(
+                            "acceptance-timeout",
+                            f"the author did not finish within {limit:g}s")
+                    step = min(step, left)
+                thread.join(timeout=step)
+                if thread.is_alive() and self._cancelled():
+                    raise TL.AcceptanceError("acceptance-cancelled", "the run was cancelled")
+        if self._error is not None:
+            raise self._error
+        if not self.frozen():
+            raise TL.AcceptanceError("acceptance-error", "the pack is not frozen")
+
+    # -- every later hook is a no-op once degraded ------------------------------
+
+    def check_pin(self, iteration: int, role: str) -> bool:
+        if self.degraded:
+            return True
+        return super().check_pin(iteration, role)
+
+    def coverage(self) -> list[str]:
+        return [] if self.degraded else super().coverage()
+
+    def lead_gate(self, iteration: int, role: str) -> list[str]:
+        self.wait(iteration)
+        if self.degraded:
+            self.pending_errors = []
+            return []
+        return super().lead_gate(iteration, role)
+
+    def covered_line(self, slice_id: str, sha: str):  # noqa: ANN201
+        return None if self.degraded else super().covered_line(slice_id, sha)
+
+    def integration_context(self, sha: str, iteration: int) -> dict:
+        self.wait(iteration)
+        if self.degraded:
+            return {"text": "", "passed": 0, "total": 0, "failed": [], "unavailable": [],
+                    "amendments_left": 0, "degraded": self.degraded}
+        return super().integration_context(sha, iteration)
+
+    def review_verdict(self, verdict, scope, iteration, evaluated, state_path):  # noqa: ANN001, ANN201
+        if self.degraded:
+            return verdict, scope, None
+        return super().review_verdict(verdict, scope, iteration, evaluated, state_path)
+
+
+def _make_degradable_acceptance(mailbox, repo, runner, config):  # noqa: ANN001, ANN201
+    """Stand-in for ``TL.make_acceptance`` while :func:`drive` runs the core
+    (same shape: ``None`` unless the switch is on)."""
+    if not TL.acceptance_enabled(config):
+        return None
+    controller = DegradableAcceptance(mailbox, repo, runner, config)
+    controller.on_resume()
+    return controller
+
+
 # ============================================================ the runner
 
 
@@ -601,14 +799,25 @@ class OpenLoopRunner:
         tool = _acceptance_tool_path()
         marker = context.get("marker") or uuid.uuid4().hex[:12]
         attempt = context.get("attempt") or 1
+        # The core's author context carries the contaminated-retry `prefix`
+        # and the validation retry's `dropped`/`fatal` at the TOP LEVEL
+        # (`AcceptanceController._author_phase`), never under `retry`; an
+        # explicit `retry` dict (older callers/tests) still wins.
+        retry = context.get("retry") or {
+            k: context[k] for k in ("prefix", "dropped", "fatal") if context.get(k)}
+        notes = context.get("notes")
+        if notes is None and context.get("mailbox"):
+            notes = (Path(context["mailbox"]) / "ACCEPTANCE-NOTES.md").is_file()
+        setup = ctx.author_setup(export, tool, iteration=context.get("iteration") or "?")
         prompt = prompts_mod.author_prompt(
-            str(export), tool, marker, attempt,
-            notes=context.get("notes"), retry=context.get("retry"),
+            str(export), tool, marker, attempt, notes=bool(notes), retry=retry,
+            shell=setup.shell,
         )
         model = drv._model_for(ctx.cfg, "acceptance")
         label = f"acceptance author {marker}-a{attempt}"
         result = drv._call_role(ctx, role="acceptance", agent=drv.AGENTS["acceptance"],
-                                model=model, prompt=prompt, cwd=export, label=label)
+                                model=model, prompt=prompt, cwd=export, label=label,
+                                env_extra=setup.env, argv_prefix=setup.argv_prefix)
         rows = self._tool_call_rows(result, export)
         with self._session_lock:
             self.session_ids["acceptance"] = result.session_id
@@ -616,6 +825,8 @@ class OpenLoopRunner:
                "path": "opencode", "transcript": rows}
 
     def _tool_call_rows(self, result: Any, export: Path) -> list[dict]:
+        if drv.sandboxed(self.ctx):
+            return [dict(drv.SANDBOXED_ROW)]
         events_mod = drv._get_events()
         rows: list[dict] = []
         for log_path in getattr(result, "log_paths", []) or []:
@@ -634,9 +845,11 @@ class OpenLoopRunner:
                 if not is_tool:
                     continue
                 state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                if drv.refused_by_permission(state):
+                    continue
                 tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
                 abs_input: dict[str, Any] = {}
-                for key, value in (tool_input or {}).items():
+                for key, value in drv.audit_tool_input(tool_input or {}).items():
                     if (key in self._PATH_KEYS and isinstance(value, str) and value
                             and not Path(value).is_absolute()):
                         abs_input[key] = str((export / value).resolve())
@@ -754,7 +967,7 @@ class OpenLoopRunner:
                 "PLAN.md's block, not your structured reply, and the run "
                 "stalls after 3 no-op passes without it."
             ]
-        if ctx.acceptance:
+        if ctx.acceptance and not ctx.acc_log.get("degraded"):
             # H10/D13: the same frozen-acceptance lead fragment lockstep's
             # own plan call gets -- carried through on the replan attempt
             # below too (`plan_ctx = dict(plan_ctx, refusals=...)` keeps
@@ -809,7 +1022,7 @@ class OpenLoopRunner:
         if run_review:
             review_ctx = dict(plan_ctx, results=results, pass_slices=pass_slices,
                               takeovers=takeovers)
-            if ctx.acceptance:
+            if ctx.acceptance and not ctx.acc_log.get("degraded"):
                 # H10/D13: the review turn is a LATER Lead call in this same
                 # pass -- lockstep's own last integrate/solo-continuation
                 # call gets `acc_pass_lines`, not another `acc_plan_lines`
@@ -1095,6 +1308,19 @@ class OpenLoopRunner:
         command = (quality.brief_targeted_command(slice_info.get("brief") or "")
                   or (slice_info.get("targeted_check") or "").strip() or None)
         if command is None:
+            if not slice_info and slice_id not in olqueue.latest_retired(mailbox):
+                # Not a plan slice at all: the Lead tagged a deliverable
+                # commit (e.g. `slice(lead-integration): manifests`) with an
+                # id no PLAN.md slice owns. There is nothing to retire and no
+                # command to run, so this is expected, not a failure -- say
+                # so instead of implying a verification gap.
+                TL._append_log(
+                    mailbox,
+                    f"- iter {iteration} | loop | lead commit {sha[:12]} tagged "
+                    f"slice({slice_id}) is not a plan slice; nothing to retire "
+                    "(a non-slice deliverable commit)",
+                )
+                return
             TL._append_log(
                 mailbox,
                 f"- iter {iteration} | loop | lead commit for {slice_id} not retired: "
@@ -1879,6 +2105,10 @@ def _finalize_result(ctx: "drv.RunContext", runner: OpenLoopRunner, code: int | 
         final["reason"] = reason
     if ctx.acceptance:
         final["acceptance"] = {"enabled": True}
+        if ctx.acc_log.get("author_isolation"):
+            final["acceptance"]["author_isolation"] = ctx.acc_log["author_isolation"]
+        if ctx.acc_log.get("degraded"):
+            final["acceptance"]["degraded"] = ctx.acc_log["degraded"]
     if status == "shipped" and str(state.get("landed", "")).strip():
         final["land"] = {"status": "landed", "landed": state.get("landed"),
                          "target_ref": state.get("target_ref")}
@@ -1961,7 +2191,20 @@ def drive(ctx: "drv.RunContext", *, mode: str, max_iterations: int, settings: di
     orig_sidecar = TL._write_open_loop_sidecars
     TL._write_open_loop_sidecars = _make_sidecar_writer(ctx)
     land_hook = make_land_hook(ctx) if ctx.root_free and ctx.lead_record else None
-    acceptance_cfg = {"enabled": True, "wait_s": 180.0} if ctx.acceptance else None
+    # No author time limit by default (`acceptance_wait_seconds` null/0);
+    # an author failure degrades to no pack (`DegradableAcceptance`), and
+    # `on_degrade` tells the prompts to stop mentioning a pack that never was.
+    def _on_acceptance_degrade(reason: str) -> None:
+        ctx.acc_log["degraded"] = reason
+        ctx.out(f"acceptance: DEGRADED to no frozen pack ({reason[:200]}); continuing "
+                "without frozen acceptance")
+
+    acceptance_cfg = ({"enabled": True, "wait_s": settings.get("acceptance_wait_seconds"),
+                       "on_degrade": _on_acceptance_degrade}
+                      if ctx.acceptance else None)
+    orig_make_acceptance = TL.make_acceptance
+    if ctx.acceptance:
+        TL.make_acceptance = _make_degradable_acceptance
 
     # H4: real signal handling for the one window `driver.run()`'s own
     # flag-only handlers miss -- idle between turns, inside
@@ -2015,6 +2258,7 @@ def drive(ctx: "drv.RunContext", *, mode: str, max_iterations: int, settings: di
         _restore_signal_handlers(old_term, old_int)
         guard.uninstall()
         TL._write_open_loop_sidecars = orig_sidecar
+        TL.make_acceptance = orig_make_acceptance
         if tmpdir_path is not None:
             shutil.rmtree(tmpdir_path, ignore_errors=True)
 

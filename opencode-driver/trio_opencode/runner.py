@@ -94,6 +94,10 @@ class TurnSpec:
     log_dir: str | None = None
     opencode_bin: str = "opencode"
     key_file: str | None = None
+    #: Prepended to the ``opencode run ...`` argv at spawn (never to the
+    #: ``--help`` feature probe): a sandbox wrapper such as ``bwrap ... --``
+    #: for the acceptance author (``trio_opencode/authorbox.py``).
+    argv_prefix: tuple[str, ...] = ()
 
 
 @dataclass
@@ -566,7 +570,7 @@ def run_turn(
                 events=0, tokens={}, denials=[], log_paths=all_log_paths,
             )
 
-        argv = _build_argv(spec, caps, current_session_id, current_prompt)
+        argv = [*spec.argv_prefix, *_build_argv(spec, caps, current_session_id, current_prompt)]
         env = _build_env(spec, key_value)
 
         stdout_log_path = log_dir / f"{label_slug}-{attempt}.jsonl"

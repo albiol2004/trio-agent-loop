@@ -761,9 +761,16 @@ def _render_integration_eval(ctx: dict[str, Any]) -> str:
 
     lines.append(body.rstrip("\n"))
 
-    if ctx.get("acceptance"):
+    acc_block = ctx.get("acceptance")
+    if isinstance(acc_block, dict):
+        # `AcceptanceController.integration_context` hands over a dict whose
+        # `text` is the prompt block; printing the dict would show the
+        # evaluator a Python repr (and a degraded run's empty block must
+        # vanish).
+        acc_block = acc_block.get("text")
+    if acc_block:
         lines.append("")
-        lines.append(str(ctx["acceptance"]))
+        lines.append(str(acc_block))
 
     lines.append("")
     lines.append(_output_instruction(

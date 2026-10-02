@@ -1736,6 +1736,17 @@ _AUDIT_ARG_KEYS = frozenset({
     "cwd", "directory", "dir", "filename", "file", "files", "script",
 })
 _AUDIT_TOKEN_RE = re.compile(r"[^\s'\"`;|&<>(){}\[\],=\\]+")
+#: Keys of a tool call that carry text the author WROTE (a file body, an
+#: edit's old/new strings, a patch), never something it asked to read. A
+#: pack that merely *mentions* the loop repository's path in a check or in
+#: AUTHOR.md ("not at <repo>", or a GOAL-named `<repo>/requirements.txt`) read
+#: nothing; scanning that prose discarded honest authors twice in a row when
+#: the goal names absolute repo paths. The `file_path` /
+#: `path` of the same call is still audited.
+_AUDIT_AUTHORED_KEYS = frozenset({
+    "content", "file_text", "old_string", "new_string", "oldString", "newString",
+    "old_str", "new_str", "patch", "patchText", "patch_text",
+})
 
 
 def _audit_inputs(entry: Any) -> list[str]:
@@ -1766,6 +1777,8 @@ def _audit_inputs(entry: Any) -> list[str]:
             call = in_call or bool(_AUDIT_CALL_KIND_RE.search(kind))
             for key, item in value.items():
                 if _AUDIT_OUTPUT_KEY_RE.search(str(key)):
+                    continue
+                if str(key) in _AUDIT_AUTHORED_KEYS and isinstance(item, str):
                     continue
                 walk(item, call or str(key).lower() in _AUDIT_ARG_KEYS)
         elif isinstance(value, list):
