@@ -18,7 +18,23 @@ else
 fi
 install -m 0755 "$dir/checkout/dashboard/service/run" "$dir/run"
 [ -f "$dir/env" ] || install -m 0644 "$dir/checkout/dashboard/service/env.example" "$dir/env"
-echo 9470 > "$dir/port"
+# The port svc shows is the one `run` will listen on: TRIO_DASH_PORT from the
+# environment, else the last assignment in the service env file (svc sources it
+# before `run`), else 9470. Parsed, never sourced.
+port="${TRIO_DASH_PORT:-}"
+if [ -z "$port" ]; then
+  port="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}TRIO_DASH_PORT=//p' "$dir/env" | tail -n 1)"
+  port="${port%%#*}"
+  port="${port//[[:space:]\"\']/}"
+fi
+port="${port:-9470}"
+if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || [ "$((10#$port))" -lt 1 ] || [ "$((10#$port))" -gt 65535 ]; then
+  echo "install-service.sh: invalid TRIO_DASH_PORT '$port' (want an integer 1..65535)" >&2
+  exit 1
+fi
+port="$((10#$port))"
+echo "$port" > "$dir/port.tmp.$$"
+mv -f "$dir/port.tmp.$$" "$dir/port"
 echo 10 > "$dir/stop_timeout"
 [ -f "$dir/pid" ] || touch "$dir/.disabled"
 echo "installed trio-dash at $(git -C "$dir/checkout" rev-parse --short HEAD) in $dir"
