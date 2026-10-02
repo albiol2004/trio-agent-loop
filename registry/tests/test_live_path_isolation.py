@@ -99,7 +99,10 @@ class UnpatchedHomeServerTests(unittest.TestCase):
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
         temp_state = json.loads(Path(os.environ["TRIO_DASH_INBOX_STATE"]).read_text())
-        self.assertEqual(temp_state[str(self.root)]["read"], ids[:1])
+        self.assertEqual(temp_state["schema"], 2)
+        self.assertTrue(temp_state["items"][ids[0]]["read"])
+        self.assertEqual({i for i, r in temp_state["items"].items() if r["read"]},
+                         set(ids[:1]))
         self.assertEqual(_sha(guard.LIVE_INBOX_STATE), live_before)  # None stays None
 
 
