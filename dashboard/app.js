@@ -197,6 +197,9 @@ const LOOP_STATE_BADGES = {
   budget: ["warning", "Budget spent"],
   iteration_cap: ["warning", "Iteration cap"],
   answered: ["warning", "Answered — restart"],
+  finished: ["positive", "Finished"],
+  between_roles: ["neutral", "Between roles"],
+  paused: ["neutral", "Paused"],
 };
 
 function derivedStateOf(loop) {
@@ -266,6 +269,10 @@ function stateBadge(loop) {
     text = "Running";
   } else if (LOOP_STATE_BADGES[derived]) {
     [tone, text] = LOOP_STATE_BADGES[derived];
+  } else if (derived === "unmapped") {
+    // A STATE.md word outside the status map is shown verbatim (textContent).
+    tone = "neutral";
+    text = String(loop.loop_state.status_raw || statusWord(loop));
   } else if (HUMAN_STATUS.has(status)) {
     // STATE.md handing the loop to a person outranks an older verdict file.
     tone = "warning";

@@ -882,8 +882,52 @@ RUNNING_WORDS = {"running", "in_progress", "active", "iterating"}
 STATES = (
     "running", "shipped", "needs_human", "blocked", "error", "needs_retirement",
     "needs_land", "held", "conflict", "budget", "iteration_cap", "interrupted",
-    "answered", "ready", "unknown",
+    "answered", "ready", "unknown", "finished", "between_roles", "paused", "unmapped",
 )
+
+# Free-form STATE.md status words (status_word form) -> derived state. Running
+# words keep derive_state's live/interrupted/iteration_cap/answered logic and
+# terminal words keep their own states; a word in no family maps to None.
+STATUS_MAP: dict[str, str] = {
+    "ship": "shipped", "shipped": "shipped",
+    **dict.fromkeys(("delivered", "done", "complete", "completed", "pushed", "merged",
+                     "landed", "finished", "closed", "retired"), "finished"),
+    **dict.fromkeys(("awaiting_evaluator", "awaiting_eval", "lead_done", "eval_pending",
+                     "evaluator_pending", "awaiting_lead", "between_roles"), "between_roles"),
+    **dict.fromkeys(("ready", "idle", ""), "ready"),
+    **dict.fromkeys(("paused", "stopped", "on_hold"), "paused"),
+    **dict.fromkeys(RUNNING_WORDS, "running"),
+    **dict.fromkeys(("blocked", "needs_human", "error", "needs_retirement", "needs_land"),
+                    "terminal"),
+}
+_STATUS_PREFIXES = (
+    ("delivered", "finished"), ("shipped", "finished"), ("done", "finished"),
+    ("complete", "finished"), ("pushed", "finished"), ("merged", "finished"),
+    ("landed", "finished"),
+    ("awaiting_eval", "between_roles"), ("lead_done", "between_roles"),
+    ("eval_pending", "between_roles"), ("awaiting_lead", "between_roles"),
+    ("between_roles", "between_roles"),
+)
+
+
+def normalize_status(word: str) -> str | None:
+    """Map a status_word() to its derived state (exact key, then prefix
+    family); ``None`` when the word is in no family."""
+    word = word or ""
+    if word in STATUS_MAP:
+        return STATUS_MAP[word]
+    for prefix, state in _STATUS_PREFIXES:
+        if word.startswith(prefix):
+            return state
+    return None
+
+
+# derive_state's state -> status_family (anything else is a terminal outcome).
+_STATE_FAMILY = {
+    "finished": "finished", "shipped": "finished", "between_roles": "between_roles",
+    "ready": "ready", "paused": "paused", "running": "running", "interrupted": "running",
+    "answered": "running", "unmapped": "unmapped", "unknown": "unmapped",
+}
 
 UNBLOCK_TABLE = [
     {"exit": 0, "status": "shipped", "state": "shipped",
@@ -965,12 +1009,26 @@ _NATIVE_STATUS = {
 
 def derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None = None,
                  last_action: dict | None = None, native: dict | None = None) -> dict:
+    """``_derive_state`` plus ``status_raw`` (STATE.md ``status:`` verbatim,
+    80 chars, None when absent) and ``status_family`` on every result."""
+    out = _derive_state(mailbox, running_sources, home=home, last_action=last_action,
+                        native=native)
+    raw = (read_state(Path(mailbox)).get("status") or "").strip()
+    out["status_raw"] = raw[:80] if raw else None
+    out["status_family"] = _STATE_FAMILY.get(out["state"], "terminal")
+    return out
+
+
+def _derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None = None,
+                  last_action: dict | None = None, native: dict | None = None) -> dict:
     """One factual state for a mailbox (the live copy for root-free loops).
 
     Order: live evidence, then a claude-workflow result that describes the
     latest run, then held-dispatch records, then STATE.md's status word,
-    then the iteration cap. Anything unknown stays ``unknown``/``ready``;
-    the function never guesses a cause it cannot read."""
+    then the iteration cap. A STATE.md word in the status map is normalised
+    (finished, between_roles, ready, paused); any other readable word is
+    ``unmapped`` (the caller shows it verbatim). The function never guesses
+    a cause it cannot read."""
     mailbox = Path(mailbox)
     state = read_state(mailbox)
     word = status_word(state)
@@ -1062,8 +1120,13 @@ def derive_state(mailbox: Path, running_sources: list[str], *, home: Path | None
             out.update(state="interrupted", summary=f"STATE.md says {word}; nothing is live"
                        + (f" (driver exit {code})" if code is not None else ""))
         return out
-    out.update(state="ready" if word in ("ready", "idle", "") or phase.lower() == "idle" else "unknown",
-               summary=f"STATE.md status {word or '—'}")
+    mapped = normalize_status(word)
+    if mapped == "ready":
+        out.update(state="ready", summary=f"STATE.md status {word or '—'}")
+    elif mapped in ("finished", "between_roles", "paused"):
+        out.update(state=mapped, summary=f"STATE.md status {word} ({mapped.replace('_', ' ')})")
+    else:
+        out.update(state="unmapped", summary=f"STATE.md status {word} (not in the status map)")
     return out
 
 
