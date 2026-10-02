@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -176,6 +177,53 @@ class MailboxSessionTests(unittest.TestCase):
         self.assertEqual(first["timestamp"], "2026-09-17T13:27:22Z")
         self.assertEqual(first["id"], HEADER["id"])
         self.assertEqual(sessions[2]["label"], "1789600000-bare-abcd1234")
+
+    def test_export_rows_carry_identity_from_the_header_workspace(self):
+        saved = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.root.parent)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("GIT_CEILING_DIRECTORIES", saved)
+            if saved is not None
+            else os.environ.pop("GIT_CEILING_DIRECTORIES", None))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        beta = self.root / "agents" / "beta"
+        beta.mkdir(parents=True)
+
+        def export(name, **header):
+            path = self.loop / ".sessions" / name
+            path.write_text(json.dumps(dict(HEADER, **header)) + "\n",
+                            encoding="utf-8")
+
+        export("1789651700-beta-aaaa1111.jsonl", id="beta1",
+               workspace=str(beta))
+        # a fork inherits its source export's identity, not its own workspace
+        export("1789651800-fork-bbbb2222.jsonl", id="fork1",
+               workspace=str(self.root),
+               labels={"omnigent.fork.source_id": "beta1"})
+        export("1789651900-root-cccc3333.jsonl", id="root1",
+               workspace=str(self.root))
+        status, sessions = _get(self._url("/api/sessions", loop="loop-demo"))
+        self.assertEqual(status, 200)
+        by_id = {s["id"]: s for s in sessions}
+        self.assertEqual((by_id["beta1"]["identity"],
+                          by_id["beta1"]["identity_source"],
+                          by_id["beta1"]["start_dir"]),
+                         ("beta", "omnigent-export-workspace", str(beta)))
+        self.assertEqual((by_id["fork1"]["identity"],
+                          by_id["fork1"]["identity_source"]),
+                         ("beta", "inherited:omnigent-export-workspace"))
+        self.assertEqual(by_id["root1"]["identity"], "coordinator")
+        self.assertNotIn("_fork_source_id", by_id["fork1"])
+        # header without a workspace: unavailable, never an error
+        self.assertEqual((by_id[HEADER["id"]]["identity"],
+                          by_id[HEADER["id"]]["identity_source"]),
+                         (None, "unavailable"))
+        status, detail = _get(self._url("/api/loop", name="loop-demo"))
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            {s["id"]: s["identity"] for s in detail["sessions"]}["beta1"],
+            "beta")
 
     def test_nested_loop_label_drops_its_short_name(self):
         nested = self.root / "loop" / "drafting"

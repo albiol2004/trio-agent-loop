@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -343,6 +344,150 @@ class CacheTests(Fixture):
         self.assertEqual(len(cached), len(first))
         fresh = self.index().sessions_for_mailbox(self.mailbox)
         self.assertIn("agent-new", [r["id"] for r in fresh])
+
+
+def _git_init(path: Path) -> None:
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "init", "-q", str(path)], check=True, env=env,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class IdentityTests(Fixture):
+    """Every descriptor carries identity / identity_source / start_dir."""
+
+    def setUp(self):
+        super().setUp()
+        # Bound git discovery to the fixture: the temp dir may itself sit
+        # inside another checkout.
+        saved = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.tmp)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("GIT_CEILING_DIRECTORIES", saved)
+            if saved is not None
+            else os.environ.pop("GIT_CEILING_DIRECTORIES", None))
+        _git_init(self.repo)
+        self.alpha = self.repo / "agents" / "alpha"
+        self.alpha.mkdir(parents=True)
+        self.wt = self.tmp / "tmp-worktree"
+        self.wt.mkdir()
+
+    def parent_with_agents(self, sid=SID, cwd=None, later="/elsewhere"):
+        parent = _write(self.projects / f"{sid}.jsonl", _jsonl(
+            {"type": "queue-operation", "timestamp": "2026-10-02T08:47:14Z"},
+            {"type": "user", "cwd": str(cwd or self.alpha),
+             "timestamp": "2026-10-02T08:47:15Z"},
+            {"type": "user", "cwd": later}))
+        base = self.projects / sid / "subagents"
+        for sub in (base / "agent-a.jsonl",
+                    base / "workflows" / "wf_x" / "agent-b.jsonl"):
+            _write(sub, _jsonl({"type": "user", "cwd": str(self.wt)}))
+        return parent
+
+    def test_parent_identity_is_first_cwd_and_subagents_inherit(self):
+        self.parent_with_agents()
+        self.launch()
+        rows = self.index().sessions_for_mailbox(self.mailbox)
+        self.assertEqual(len(rows), 3)
+        parent = rows[0]
+        self.assertEqual((parent["identity"], parent["identity_source"]),
+                         ("alpha", "claude-transcript-cwd"))
+        self.assertEqual(parent["start_dir"], str(self.alpha))
+        for sub in rows[1:]:
+            self.assertEqual(sub["kind"], "subagent")
+            self.assertEqual((sub["identity"], sub["identity_source"]),
+                             ("alpha", "inherited:claude-transcript-cwd"))
+            self.assertEqual(sub["start_dir"], str(self.alpha))
+
+    def test_broker_workspace_beats_transcript_cwd(self):
+        self.parent_with_agents()
+        rows = self.index().sessions_for_mailbox(self.mailbox, broker_sessions=[
+            {"id": "b1", "external_session_id": SID, "workspace": str(self.repo),
+             "labels": {"omnigent.wrapper": "claude-code"}}])
+        self.assertEqual(rows[0]["source"], "broker")
+        self.assertEqual((rows[0]["identity"], rows[0]["identity_source"]),
+                         ("coordinator", "broker-workspace"))
+        self.assertEqual(rows[1]["identity_source"],
+                         "inherited:broker-workspace")
+
+    def test_broker_without_workspace_falls_back_to_transcript_cwd(self):
+        self.parent_with_agents()
+        rows = self.index().sessions_for_mailbox(self.mailbox, broker_sessions=[
+            {"id": "b1", "external_session_id": SID, "workspace": "",
+             "labels": {"omnigent.wrapper": "claude-code"}}])
+        self.assertEqual((rows[0]["identity"], rows[0]["identity_source"]),
+                         ("alpha", "claude-transcript-cwd"))
+
+    def test_deleted_rows_use_broker_workspace_else_unavailable(self):
+        self.launch()
+        rows = self.index().sessions_for_mailbox(self.mailbox)
+        self.assertEqual([(r["status"], r["identity"], r["identity_source"],
+                           r["start_dir"]) for r in rows],
+                         [("deleted", None, "unavailable", None)])
+        rows = self.index().sessions_for_mailbox(
+            self.tmp / "other-mailbox", broker_sessions=[
+                {"id": "b1", "external_session_id": SID,
+                 "workspace": str(self.repo),
+                 "labels": {"omnigent.wrapper": "claude-code"}},
+                {"id": "b2", "external_session_id": OTHER, "workspace": "",
+                 "labels": {"omnigent.wrapper": "claude-code"}}])
+        self.assertEqual(
+            [(r["status"], r["identity"], r["identity_source"]) for r in rows],
+            [("deleted", "coordinator", "broker-workspace"),
+             ("deleted", None, "unavailable")])
+
+    def test_fork_inherits_its_source_sessions_identity(self):
+        self.parent_with_agents(cwd=self.repo / "other")
+        broker = [
+            {"id": "src", "external_session_id": OTHER,
+             "workspace": str(self.alpha),
+             "labels": {"omnigent.wrapper": "codex"}},
+            {"id": "fork", "external_session_id": SID,
+             "workspace": str(self.repo),
+             "labels": {"omnigent.wrapper": "claude-code",
+                        "omnigent.fork.source_id": "src"}}]
+        rows = self.index().sessions_for_mailbox(
+            self.mailbox, broker_sessions=broker)
+        fork = [r for r in rows if r["id"] == SID][0]
+        self.assertEqual((fork["identity"], fork["identity_source"]),
+                         ("alpha", "inherited:broker-workspace"))
+        # a source outside the listing is not followed
+        rows = self.index().sessions_for_mailbox(
+            self.mailbox, broker_sessions=broker[1:])
+        self.assertEqual(rows[0]["identity"], "coordinator")
+
+    def test_codex_and_cursor_rows_use_their_recorded_cwd(self):
+        self.codex_rollout(OTHER, self.alpha)
+        chats = self.home / ".cursor" / "chats" / "h1"
+        _write(chats / "33333333-3333-3333-3333-333333333333" / "meta.json",
+               json.dumps({"cwd": str(self.mailbox)}))
+        rows = self.index().sessions_for_mailbox(self.alpha)
+        self.assertEqual([(r["harness"], r["identity"], r["identity_source"])
+                          for r in rows],
+                         [("codex", "alpha", "codex-session-meta")])
+        rows = self.index().sessions_for_mailbox(self.mailbox)
+        self.assertEqual([(r["harness"], r["identity"], r["identity_source"])
+                          for r in rows],
+                         [("cursor", "unassigned", "cursor-cwd")])
+
+    def test_start_dir_read_is_cached_per_path_and_mtime(self):
+        parent = self.parent_with_agents()
+        self.launch()
+        index = self.index()
+        module = ti._identity()
+        calls = []
+        original = module.claude_start_dir
+        module.claude_start_dir = lambda p, **kw: (
+            calls.append(p), original(p, **kw))[1]
+        self.addCleanup(setattr, module, "claude_start_dir", original)
+        index.sessions_for_mailbox(self.mailbox)
+        index.sessions_for_mailbox(self.mailbox)
+        self.assertEqual(len(calls), 1)
+        _write(parent, _jsonl({"type": "user", "cwd": str(self.repo)}))
+        os.utime(parent, ns=(1, 2_000_000_000))
+        rows = index.sessions_for_mailbox(self.mailbox)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(rows[0]["identity"], "coordinator")
 
 
 if __name__ == "__main__":
