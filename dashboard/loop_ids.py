@@ -67,17 +67,35 @@ def _checkout_at(directory: str) -> dict | None:
             "main_worktree": main}
 
 
+def _ceilings() -> frozenset:
+    """Real paths in ``GIT_CEILING_DIRECTORIES``: like git's own discovery,
+    the upward search never steps into one of them (the start directory
+    itself is always examined)."""
+    raw = os.environ.get("GIT_CEILING_DIRECTORIES", "")
+    out = set()
+    for item in raw.split(os.pathsep):
+        if item and os.path.isabs(item):
+            try:
+                out.add(os.path.realpath(item))
+            except (OSError, ValueError):
+                continue
+    return frozenset(out)
+
+
 def repo_identity(path) -> dict | None:
     """``{"common_dir", "toplevel", "main_worktree"}`` for the checkout that
     contains ``path``, or None outside git.  ``main_worktree`` is None for a
-    bare repository or a submodule gitdir."""
+    bare repository or a submodule gitdir.  ``GIT_CEILING_DIRECTORIES`` bounds
+    the upward search as it does for git."""
     try:
         real = os.path.realpath(os.fspath(path))
     except (OSError, TypeError, ValueError):
         return None
+    ceilings = _ceilings()
+    cache_key = real + "\0" + "\0".join(sorted(ceilings))
     now = time.monotonic()
     with _CACHE_LOCK:
-        hit = _CACHE.get(real)
+        hit = _CACHE.get(cache_key)
         if hit and now - hit[0] <= _CACHE_SECONDS:
             return dict(hit[1]) if hit[1] else None
     directory = real if os.path.isdir(real) else os.path.dirname(real)
@@ -87,11 +105,11 @@ def repo_identity(path) -> dict | None:
         if found is not None:
             break
         parent = os.path.dirname(directory)
-        if parent == directory:
+        if parent == directory or parent in ceilings:
             break
         directory = parent
     with _CACHE_LOCK:
-        _CACHE[real] = (now, found)
+        _CACHE[cache_key] = (now, found)
     return dict(found) if found else None
 
 

@@ -106,6 +106,12 @@ class RepoIdentityTests(RepoFixture):
     def test_outside_git_is_none_and_files_resolve_through_their_parent(self):
         outside = self.base / "plain" / "loop"
         outside.mkdir(parents=True)
+        # The fixture base may itself live inside a checkout (TMPDIR under a
+        # repository); bound discovery at it, as git does.
+        ceiling = patch.dict(os.environ,
+                             {"GIT_CEILING_DIRECTORIES": str(self.base)})
+        ceiling.start()
+        self.addCleanup(ceiling.stop)
         self.assertIsNone(loop_ids.repo_identity(outside))
         self.assertEqual(
             loop_ids.repo_identity(self.main / "loop-x" / "STATE.md")["toplevel"],
@@ -157,6 +163,12 @@ class CanonicalLoopTests(RepoFixture):
     def test_outside_git_falls_back_to_the_real_path(self):
         outside = self.base / "plain" / "loop"
         outside.mkdir(parents=True)
+        # The fixture base may itself live inside a checkout (TMPDIR under a
+        # repository); bound discovery at it, as git does.
+        ceiling = patch.dict(os.environ,
+                             {"GIT_CEILING_DIRECTORIES": str(self.base)})
+        ceiling.start()
+        self.addCleanup(ceiling.stop)
         got = loop_ids.canonical_loop(outside)
         self.assertEqual(got["loop_key"], "path::" + str(outside))
         self.assertIsNone(got["common_dir"])
