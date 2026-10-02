@@ -2922,10 +2922,10 @@ function openDefaultSession() {
   }
   if (!state.sessions.length) {
     showTranscriptNotice(
-      "No session transcripts for this loop yet. Sessions appear when " +
-      "archived, usually after a role finishes; active sessions are not " +
-      "listed yet. Omnigent drivers export them to the mailbox's .sessions/ " +
-      "folder and omp runs keep theirs under ~/.omp."
+      "No session transcripts for this loop yet. Sessions are found by id: " +
+      "Claude/Codex sessions as soon as a loop records their id, Omnigent " +
+      "sessions when archived. Omnigent drivers export them to the mailbox's " +
+      ".sessions/ folder and omp runs keep theirs under ~/.omp."
     );
     return;
   }
@@ -3173,6 +3173,9 @@ function appendRecord(view, rec) {
   if (!rec || typeof rec !== "object") return;
   hideTranscriptNotice();
 
+  /* Claude Code and Codex rollout records have their own shapes. */
+  if (appendForeignRecord(view, rec)) return;
+
   /* Omnigent session header: the first line, with no `type`. */
   if (!rec.type && (rec.agent_name || rec.title)) {
     const who = rec.agent_name ? String(rec.agent_name) : "";
@@ -3264,6 +3267,234 @@ function appendRecord(view, rec) {
   }
 
   metaRow(view, rec, String(rec.type || "record"));
+}
+
+/* ---- Claude Code JSONL and Codex rollout records ----
+ * Both are normalised onto the omp block shapes so the builders below render
+ * them. Everything reaches the DOM through textContent. */
+
+/* tool_use id / call_id -> tool name, so a result row can name its call. */
+const transcriptToolNames = new Map();
+
+const CLAUDE_META_TYPES = new Set([
+  "attachment", "system", "summary", "queue-operation", "file-history-snapshot", "progress",
+]);
+const CODEX_TYPES = new Set([
+  "session_meta", "response_item", "event_msg", "turn_context", "compacted",
+]);
+
+function isPlainObject(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/* First non-empty string among `keys` of obj, else "". */
+function firstString(obj, keys) {
+  if (!isPlainObject(obj)) return "";
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.trim()) return v;
+    if (Array.isArray(v) && v.length && v.every((x) => typeof x === "string")) return v.join(" ");
+  }
+  return "";
+}
+
+/* One-line summary of a tool's arguments for the call row. */
+function toolIntent(args) {
+  return oneLine(firstString(args, ["description", "command", "cmd", "file_path", "path", "pattern", "prompt"]), 90);
+}
+
+/* Tool output of either vendor -> omp-style content parts. */
+function resultParts(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === "string" ? { type: "text", text: p } : p));
+  }
+  if (isPlainObject(content)) {
+    if (content.content !== undefined) return resultParts(content.content);
+    if (typeof content.output === "string") return resultParts(content.output);
+    return [{ type: "text", text: JSON.stringify(content) }];
+  }
+  return [];
+}
+
+function toolNameFor(id) {
+  return (id && transcriptToolNames.get(String(id))) || "tool";
+}
+
+function rememberTool(id, name) {
+  if (!id) return;
+  if (transcriptToolNames.size > 5000) transcriptToolNames.clear();
+  transcriptToolNames.set(String(id), String(name || "tool"));
+}
+
+function appendClaudeUser(view, rec) {
+  const msg = isPlainObject(rec.message) ? rec.message : {};
+  const content = msg.content;
+  if (rec.isMeta === true) {
+    const text = typeof content === "string" ? content : textOf(content);
+    metaRow(view, rec, "meta", oneLine(text, 160));
+    return;
+  }
+  if (typeof content === "string") {
+    if (content.trim()) view.appendChild(msgBlock(rec, "user", "user", content.trim()));
+    return;
+  }
+  const texts = [];
+  for (const part of Array.isArray(content) ? content : []) {
+    if (!isPlainObject(part)) continue;
+    if (part.type === "tool_result") {
+      view.appendChild(toolResultBlock(rec, {
+        isError: part.is_error === true,
+        toolName: toolNameFor(part.tool_use_id),
+        content: resultParts(part.content),
+      }));
+    } else if (part.type === "image") {
+      texts.push("[image]");
+    } else if (TEXT_PARTS.has(part.type) && typeof part.text === "string" && part.text.trim()) {
+      texts.push(part.text.trim());
+    }
+  }
+  if (texts.length) view.appendChild(msgBlock(rec, "user", "user", texts.join("\n")));
+}
+
+function appendClaudeAssistant(view, rec) {
+  const content = isPlainObject(rec.message) ? rec.message.content : null;
+  if (typeof content === "string") {
+    if (content.trim()) view.appendChild(msgBlock(rec, "assistant", "assistant", content.trim()));
+    return;
+  }
+  for (const part of Array.isArray(content) ? content : []) {
+    if (!isPlainObject(part)) continue;
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      view.appendChild(msgBlock(rec, "assistant", "assistant", part.text.trim()));
+    } else if (part.type === "thinking" && part.thinking) {
+      view.appendChild(thinkingBlock(rec, String(part.thinking)));
+    } else if (part.type === "redacted_thinking") {
+      metaRow(view, rec, "thinking", "[redacted]");
+    } else if (part.type === "tool_use") {
+      rememberTool(part.id, part.name);
+      const args = isPlainObject(part.input) ? part.input : {};
+      view.appendChild(toolCallBlock(rec, {
+        name: part.name, arguments: args, intent: toolIntent(args),
+      }));
+    }
+  }
+}
+
+/* Short detail for the quiet meta rows of Claude Code record types. */
+function claudeMetaDetail(rec) {
+  switch (rec.type) {
+    case "system":
+      return oneLine(typeof rec.content === "string" ? rec.content : rec.subtype || "", 160);
+    case "summary":
+      return oneLine(rec.summary || "", 160);
+    case "attachment": {
+      const a = isPlainObject(rec.attachment) ? rec.attachment : {};
+      const body = firstString(a, ["content", "stdout", "command", "filename", "path", "prompt", "text"]);
+      return oneLine([a.type, body].filter(Boolean).join(" · "), 160);
+    }
+    case "queue-operation":
+      return oneLine([rec.operation, typeof rec.content === "string" ? rec.content : ""].filter(Boolean).join(" · "), 160);
+    case "progress": {
+      const d = isPlainObject(rec.data) ? rec.data : {};
+      return oneLine(d.type || firstString(d, ["message", "command"]), 160);
+    }
+    default:
+      return "";
+  }
+}
+
+function codexJson(text) {
+  if (typeof text !== "string") return null;
+  const t = text.trim();
+  if (!t || (t[0] !== "{" && t[0] !== "[")) return null;
+  try { return JSON.parse(t); } catch { return null; }
+}
+
+function appendCodexItem(view, rec, item) {
+  switch (item.type) {
+    case "message": {
+      const text = textOf(item.content);
+      if (!text) return;
+      if (item.role === "user") view.appendChild(msgBlock(rec, "user", "user", text));
+      else if (item.role === "assistant") view.appendChild(msgBlock(rec, "assistant", "assistant", text));
+      else metaRow(view, rec, String(item.role || "message"), oneLine(text, 160));
+      return;
+    }
+    case "function_call":
+    case "custom_tool_call": {
+      const raw = item.type === "function_call" ? item.arguments : (item.input ?? item.arguments);
+      let args = isPlainObject(raw) ? raw : codexJson(raw);
+      if (!isPlainObject(args)) args = raw === undefined || raw === "" ? {} : { arguments: raw };
+      rememberTool(item.call_id || item.id, item.name);
+      view.appendChild(toolCallBlock(rec, { name: item.name, arguments: args, intent: toolIntent(args) }));
+      return;
+    }
+    case "function_call_output":
+    case "custom_tool_call_output": {
+      let out = item.output;
+      const parsed = codexJson(out);
+      if (isPlainObject(parsed) && typeof parsed.output === "string") out = parsed.output;
+      view.appendChild(toolResultBlock(rec, {
+        isError: false,
+        toolName: toolNameFor(item.call_id),
+        content: resultParts(out),
+      }));
+      return;
+    }
+    case "reasoning": {
+      const parts = Array.isArray(item.summary) ? item.summary : [];
+      const text = parts
+        .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      if (text) view.appendChild(thinkingBlock(rec, text));
+      else metaRow(view, rec, "thinking", "[no summary]");
+      return;
+    }
+    default: {
+      const action = isPlainObject(item.action) ? firstString(item.action, ["command"]) : "";
+      metaRow(view, rec, String(item.type || "response_item"), oneLine(action, 160));
+    }
+  }
+}
+
+function appendCodexRecord(view, rec) {
+  const payload = isPlainObject(rec.payload) ? rec.payload : {};
+  if (rec.type === "session_meta") {
+    metaRow(view, rec, "session", [payload.cwd, payload.id].filter(Boolean).join(" · "));
+  } else if (rec.type === "response_item") {
+    appendCodexItem(view, rec, payload);
+  } else if (rec.type === "turn_context") {
+    metaRow(view, rec, "turn", oneLine([payload.cwd, payload.model].filter(Boolean).join(" · "), 160));
+  } else if (rec.type === "compacted") {
+    metaRow(view, rec, "compacted", oneLine(firstString(payload, ["message"]), 160));
+  } else {
+    const detail = firstString(payload, ["message", "text", "command", "reason", "last_agent_message"]);
+    metaRow(view, rec, String(payload.type || rec.type), oneLine(detail, 160));
+  }
+}
+
+/* True when rec was a Claude Code / Codex record and has been rendered. */
+function appendForeignRecord(view, rec) {
+  if (rec.type === "user" && isPlainObject(rec.message)) {
+    appendClaudeUser(view, rec);
+    return true;
+  }
+  if (rec.type === "assistant" && isPlainObject(rec.message)) {
+    appendClaudeAssistant(view, rec);
+    return true;
+  }
+  if (CLAUDE_META_TYPES.has(rec.type)) {
+    metaRow(view, rec, String(rec.type), claudeMetaDetail(rec));
+    return true;
+  }
+  if (CODEX_TYPES.has(rec.type) && "payload" in rec) {
+    appendCodexRecord(view, rec);
+    return true;
+  }
+  return false;
 }
 
 /* user / assistant text block */
@@ -3366,6 +3597,7 @@ function metaRow(view, rec, label, text) {
 
 function renderTranscript() {
   el("transcript-view").textContent = "";
+  transcriptToolNames.clear();
 }
 
 function showTranscriptNotice(text) {
