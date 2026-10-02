@@ -2884,6 +2884,21 @@ def _epoch_iso(value) -> str | None:
         return None
 
 
+_AGENT_IDENTITY_MODULE = None
+
+
+def _agent_identity():
+    """dashboard/agent_identity.py, loaded once by file path."""
+    global _AGENT_IDENTITY_MODULE
+    if _AGENT_IDENTITY_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "trio_dashboard_agent_identity", DASHBOARD_DIR / "agent_identity.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _AGENT_IDENTITY_MODULE = module
+    return _AGENT_IDENTITY_MODULE
+
+
 def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
     """Describe one exported Omnigent session from its header line.
 
@@ -2891,6 +2906,10 @@ def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
     list reads ``evaluator:iteration 1``. A missing or malformed header
     falls back to the file name, its leading epoch, then the mtime, so the
     file is never hidden.
+
+    The row also carries the agent identity of the header's ``workspace``
+    (``identity``, ``identity_source``, ``start_dir``) and, for a fork, the
+    private ``_fork_source_id`` that ``_session_list`` resolves and removes.
     """
     stem = path.name[: -len(".jsonl")]
     header: dict = {}
@@ -2914,7 +2933,10 @@ def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
     timestamp = (_epoch_iso(header.get("created_at"))
                  or (_epoch_iso(stem_epoch.group(1)) if stem_epoch else None)
                  or _epoch_iso(stat.st_mtime))
-    return {
+    labels = header.get("labels") if isinstance(header.get("labels"), dict) else {}
+    fork_source = labels.get("omnigent.fork.source_id")
+    workspace = header.get("workspace")
+    row = {
         "id": str(header.get("id") or stem),
         "label": title or stem,
         "timestamp": timestamp,
@@ -2923,7 +2945,12 @@ def _parse_mailbox_session_file(path: Path, loop_name: str) -> dict:
         "source": "mailbox",
         "agent": str(header.get("agent_name") or "") or None,
         "status": str(header.get("status") or "") or None,
+        "_fork_source_id": (
+            fork_source if isinstance(fork_source, str) and fork_source else None),
     }
+    return _agent_identity().stamp(
+        row, workspace if isinstance(workspace, str) else None,
+        "omnigent-export-workspace")
 
 
 def _resolve_registry_path(value) -> Path:
@@ -4735,6 +4762,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             session["parent_id"] = None
             session["parent_path"] = None
             sessions.append(session)
+        # A fork inherits the identity of the exported session it forked from
+        # (when that export is in this listing); chains are followed.
+        exports = {s["id"]: s for s in sessions}
+        origins = {}
+        for session in sessions:
+            source, seen = session.get("_fork_source_id"), {session["id"]}
+            origin = None
+            while source in exports and source not in seen:
+                seen.add(source)
+                origin = exports[source]
+                source = origin.get("_fork_source_id")
+            if origin is not None and origin.get("identity") is not None:
+                origins[session["id"]] = dict(origin)
+        for session in sessions:
+            if session["id"] in origins:
+                _agent_identity().inherit(session, origins[session["id"]])
+        for session in sessions:
+            session.pop("_fork_source_id", None)
         try:
             sessions.extend(self._indexed_sessions(loop_dir, root))
         except Exception:  # noqa: BLE001 - exports and omp sessions still list
@@ -4748,7 +4793,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             session["parent_id"] = desc["parent_id"]
             session["parent_path"] = desc["parent_path"]
             sessions.append(session)
-        parents = [s for s in sessions if s["kind"] == "parent"]
+        for session in sessions:
+            # omp sessions record no start directory the index can trust.
+            session.setdefault("identity", None)
+            session.setdefault("identity_source", "unavailable")
+            session.setdefault("start_dir", None)
+        parents =[s for s in sessions if s["kind"] == "parent"]
         subagents = [s for s in sessions if s["kind"] != "parent"]
         parents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)
         subagents.sort(key=lambda s: (s["timestamp"] or "", s["label"]), reverse=True)

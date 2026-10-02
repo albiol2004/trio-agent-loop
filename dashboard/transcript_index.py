@@ -20,6 +20,7 @@ Layouts (read-only):
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -36,6 +37,21 @@ _RUN_TOKEN_RE = re.compile(r"^ls-([0-9a-fA-F]{6,32})$")
 _UUID_TAIL_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 _FIRST_LINE_CAP = 4 * 1024 * 1024
+_FORK_SOURCE_LABEL = "omnigent.fork.source_id"
+_IDENTITY_MODULE = None
+
+
+def _identity():
+    """dashboard/agent_identity.py, loaded once by file path."""
+    global _IDENTITY_MODULE
+    if _IDENTITY_MODULE is None:
+        path = Path(__file__).resolve().with_name("agent_identity.py")
+        spec = importlib.util.spec_from_file_location(
+            "trio_transcript_index_agent_identity", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _IDENTITY_MODULE = module
+    return _IDENTITY_MODULE
 
 
 # --------------------------------------------------------------------- roots
@@ -100,6 +116,10 @@ def _harness_from_wrapper(wrapper) -> str | None:
     return None
 
 
+def _text(value) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _same_mailbox(candidate, mailbox: str) -> bool:
     if not candidate or not isinstance(candidate, str):
         return False
@@ -110,7 +130,9 @@ def mailbox_session_refs(mailbox, *, native_runs=(), broker_sessions=(),
                          resolve_prefix=None) -> list[dict]:
     """Deduped session references for one mailbox.
 
-    Returns [{"session_id", "harness", "source"}]. `resolve_prefix(hex)` maps
+    Returns [{"session_id", "harness", "source"}] (broker refs also carry the
+    session's `workspace`, its broker `id` and, for forks, `fork_source_id`,
+    which feed agent identity). `resolve_prefix(hex)` maps
     a `ls-<hex>` run token to the Claude session ids whose dashless id starts
     with that hex; a token counts only when it yields exactly one id (without
     a resolver tokens are ignored).
@@ -120,7 +142,7 @@ def mailbox_session_refs(mailbox, *, native_runs=(), broker_sessions=(),
     refs: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(session_id, harness, source):
+    def add(session_id, harness, source, **extra):
         sid = _valid_id(session_id)
         if sid is None:
             return
@@ -128,7 +150,8 @@ def mailbox_session_refs(mailbox, *, native_runs=(), broker_sessions=(),
         if key in seen:
             return
         seen.add(key)
-        refs.append({"session_id": sid, "harness": harness, "source": source})
+        refs.append({"session_id": sid, "harness": harness, "source": source,
+                     **extra})
 
     def from_token(token, source):
         match = _RUN_TOKEN_RE.match(str(token or "").strip())
@@ -182,10 +205,13 @@ def mailbox_session_refs(mailbox, *, native_runs=(), broker_sessions=(),
         labels = sess.get("labels") if isinstance(sess.get("labels"), dict) else {}
         harness = _harness_from_wrapper(labels.get("omnigent.wrapper"))
         external = sess.get("external_session_id")
+        extra = {"workspace": _text(sess.get("workspace")),
+                 "broker_id": _text(sess.get("id")),
+                 "fork_source_id": _text(labels.get(_FORK_SOURCE_LABEL))}
         if harness and external:
-            add(external, harness, "broker")
+            add(external, harness, "broker", **extra)
         else:
-            add(sess.get("id"), "omnigent", "broker")
+            add(sess.get("id"), "omnigent", "broker", **extra)
     return refs
 
 
@@ -215,6 +241,7 @@ class TranscriptIndex:
         self._codex_meta: dict[str, dict | None] = {}
         self._cursor_meta: dict[str, tuple] = {}    # path -> (mtime_ns, dict)
         self._claude_loc: dict[str, tuple[float, str | None]] = {}
+        self._start_dirs: dict[tuple, tuple] = {}   # (kind, path) -> (mtime_ns, dir)
 
     # -- public ----------------------------------------------------------
 
@@ -234,13 +261,15 @@ class TranscriptIndex:
             resolve_prefix=self._claude_ids_with_prefix)
         rows: list[dict] = []
         taken: set[tuple[str, str]] = set()
+        by_id = {s["id"]: s for s in broker_sessions or ()
+                 if isinstance(s, dict) and isinstance(s.get("id"), str)}
 
         for ref in refs:
             key = (ref["harness"], ref["session_id"])
             if key in taken:
                 continue
             taken.add(key)
-            rows.extend(self._rows_for_ref(ref))
+            rows.extend(self._rows_for_ref(ref, by_id))
 
         cwd_targets = {os.path.normpath(str(mb)), real_mb}
         for harness, finder in (("codex", self._codex_by_cwd),
@@ -421,11 +450,65 @@ class TranscriptIndex:
         except OSError:
             return None, None
 
-    def _claude_rows(self, ref: dict) -> list[dict]:
+    # -- agent identity ------------------------------------------------
+
+    def _start_dir_of(self, kind: str, path: str) -> str | None:
+        """Start dir read from a transcript, cached per (path, mtime)."""
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+        key = (kind, path)
+        with self._lock:
+            cached = self._start_dirs.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        ident = _identity()
+        reader = ident.codex_start_dir if kind == "codex" \
+            else ident.claude_start_dir
+        value = reader(path)
+        with self._lock:
+            self._start_dirs[key] = (mtime, value)
+        return value
+
+    @staticmethod
+    def _fork_identity(ref: dict, by_id: dict, seen=()) -> dict | None:
+        """Identity row of the broker session this ref forked from, when that
+        session is in the same listing (workspace-based, followed through
+        chained forks); None otherwise."""
+        source_id = ref.get("fork_source_id")
+        source = by_id.get(source_id) if source_id else None
+        if source is None or source_id in seen:
+            return None
+        ident = _identity()
+        labels = source.get("labels") if isinstance(source.get("labels"), dict) \
+            else {}
+        upstream = {"fork_source_id": _text(labels.get(_FORK_SOURCE_LABEL))}
+        found = TranscriptIndex._fork_identity(
+            upstream, by_id, tuple(seen) + (source_id,))
+        if found is not None:
+            return found
+        row = ident.stamp({}, _text(source.get("workspace")),
+                          "broker-workspace")
+        return row if row["identity"] is not None else None
+
+    def _stamp_parent(self, row: dict, ref: dict, own_dir, own_source: str,
+                      by_id) -> dict:
+        """Identity of a parent row: a fork inherits its source session; else
+        a broker ref's workspace; else the transcript's own first cwd."""
+        ident = _identity()
+        fork = self._fork_identity(ref, by_id or {})
+        if fork is not None:
+            return ident.inherit(row, fork)
+        if ref.get("source") == "broker" and ref.get("workspace"):
+            return ident.stamp(row, ref["workspace"], "broker-workspace")
+        return ident.stamp(row, own_dir, own_source)
+
+    def _claude_rows(self, ref: dict, by_id=None) -> list[dict]:
         sid = ref["session_id"]
         loc = self._claude_location(sid)
         if loc is None:
-            return [self._deleted_row(ref)]
+            return [self._deleted_row(ref, by_id)]
         root, slug_dir, parent_real = loc
         size, mtime = self._stat(parent_real)
         parent_row = {
@@ -436,6 +519,9 @@ class TranscriptIndex:
             "harness": "claude", "source": ref["source"], "status": "ok",
             "agent_type": None, "description": None, "workflow": None,
         }
+        self._stamp_parent(parent_row, ref,
+                           self._start_dir_of("claude", parent_real),
+                           "claude-transcript-cwd", by_id)
         rows = [parent_row]
         sub_root = os.path.join(slug_dir, sid, "subagents")
         real_projects = _real(os.path.join(str(root), "projects"))
@@ -455,7 +541,7 @@ class TranscriptIndex:
             label = stem
             if agent_type or description:
                 label = f"{agent_type or 'agent'}: {description or stem}"
-            rows.append({
+            rows.append(_identity().inherit({
                 "id": stem, "label": label,
                 "timestamp": self._first_timestamp(real, mtime),
                 "path": real, "size": size, "kind": "subagent",
@@ -464,7 +550,7 @@ class TranscriptIndex:
                 "agent_type": agent_type if isinstance(agent_type, str) else None,
                 "description": description if isinstance(description, str) else None,
                 "workflow": workflow,
-            })
+            }, parent_row))
         return rows
 
     # -- Codex -----------------------------------------------------------
@@ -600,7 +686,7 @@ class TranscriptIndex:
             ts = _iso_from_mtime(created / 1000.0)
         return {"harness": "cursor", "id": sid, "path": path, "timestamp": ts,
                 "root": root, "label": meta.get("title") or f"cursor {sid}",
-                "allowed_root": root}
+                "allowed_root": root, "cwd": meta.get("cwd")}
 
     def _cursor_by_cwd(self, targets: set[str]) -> list[dict]:
         out = []
@@ -620,27 +706,38 @@ class TranscriptIndex:
 
     # -- shared ----------------------------------------------------------
 
-    def _row_for_found(self, found: dict, *, source: str) -> dict:
+    def _row_for_found(self, found: dict, *, source: str, ref=None,
+                       by_id=None) -> dict:
         real = _real(found["path"])
         size, mtime = self._stat(real)
+        ref = ref or {"session_id": found["id"], "harness": found["harness"],
+                      "source": source}
         if not _under(real, _real(found["allowed_root"])):
             return self._deleted_row({
                 "session_id": found["id"], "harness": found["harness"],
-                "source": source})
+                "source": source,
+                **{k: ref.get(k) for k in ("workspace", "fork_source_id")}},
+                by_id)
         ts = found.get("timestamp") or (
             _iso_from_mtime(mtime) if mtime is not None else "")
-        return {
+        row = {
             "id": found["id"], "label": found["label"], "timestamp": ts,
             "path": real, "size": size, "kind": "parent",
             "parent_id": None, "parent_path": None,
             "harness": found["harness"], "source": source, "status": "ok",
             "agent_type": None, "description": None, "workflow": None,
         }
+        if found["harness"] == "codex":
+            own_dir = self._start_dir_of("codex", real)
+            own_source = "codex-session-meta"
+        else:
+            own_dir = found.get("cwd")
+            own_source = "cursor-cwd"
+        return self._stamp_parent(row, ref, own_dir, own_source, by_id)
 
-    @staticmethod
-    def _deleted_row(ref: dict) -> dict:
+    def _deleted_row(self, ref: dict, by_id=None) -> dict:
         sid = ref["session_id"]
-        return {
+        row = {
             "id": sid, "label": f"{sid} ({RETENTION_LABEL})",
             "timestamp": "", "path": None, "size": None, "kind": "parent",
             "parent_id": None, "parent_path": None,
@@ -648,11 +745,12 @@ class TranscriptIndex:
             "status": "deleted", "agent_type": None, "description": None,
             "workflow": None,
         }
+        return self._stamp_parent(row, ref, None, "unavailable", by_id)
 
-    def _rows_for_ref(self, ref: dict) -> list[dict]:
+    def _rows_for_ref(self, ref: dict, by_id=None) -> list[dict]:
         harness = ref["harness"]
         if harness == "claude":
-            return self._claude_rows(ref)
+            return self._claude_rows(ref, by_id)
         if harness == "codex":
             found = self._codex_by_id(ref["session_id"])
         elif harness == "cursor":
@@ -662,5 +760,6 @@ class TranscriptIndex:
             # .sessions/ exports are listed by the caller); never "deleted".
             return []
         if found is None:
-            return [self._deleted_row(ref)]
-        return [self._row_for_found(found, source=ref["source"])]
+            return [self._deleted_row(ref, by_id)]
+        return [self._row_for_found(found, source=ref["source"], ref=ref,
+                                    by_id=by_id)]

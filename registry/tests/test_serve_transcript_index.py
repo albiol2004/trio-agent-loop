@@ -369,6 +369,84 @@ class BrokerSessionTests(Base):
         self.assertEqual([r["path"] for r in self.sessions()], [str(parent)])
 
 
+class IdentityApiTests(Base):
+    """GET /api/sessions rows carry identity, identity_source and start_dir."""
+
+    def setUp(self):
+        super().setUp()
+        self.handler = type("H", (_Broker,), {})
+        self.broker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), self.handler)
+        threading.Thread(target=self.broker.serve_forever, daemon=True).start()
+        self.addCleanup(self.broker.server_close)
+        self.addCleanup(self.broker.shutdown)
+        serve.BROKER_BASE_URL = f"http://127.0.0.1:{self.broker.server_address[1]}"
+        serve._BROKER_LISTING.update(at=0.0, value=None)
+        saved = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(self.tmp)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("GIT_CEILING_DIRECTORIES", saved)
+            if saved is not None
+            else os.environ.pop("GIT_CEILING_DIRECTORIES", None))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.alpha = self.root / "agents" / "alpha"
+        self.alpha.mkdir(parents=True)
+
+    def write_parent(self, sid=SID):
+        parent = _write(self.projects / f"{sid}.jsonl", _jsonl(
+            {"type": "queue-operation", "timestamp": "2026-10-02T08:47:14.363Z"},
+            {"type": "user", "cwd": str(self.alpha),
+             "timestamp": "2026-10-02T08:47:15.000Z"},
+            {"type": "user", "cwd": "/elsewhere"}))
+        wt = self.tmp / "tmp-worktree"
+        wt.mkdir(exist_ok=True)
+        subs = []
+        base = self.projects / sid / "subagents"
+        for path in (base / "agent-a.jsonl",
+                     base / "workflows" / "wf_x" / "agent-b.jsonl"):
+            subs.append(_write(path, _jsonl({"type": "user", "cwd": str(wt)})))
+        return parent, subs
+
+    def test_parent_and_subagents_by_start_directory(self):
+        parent, subs = self.write_parent()
+        self.launch()
+        rows = {r["path"]: r for r in self.sessions()}
+        top = rows[str(parent)]
+        self.assertEqual((top["identity"], top["identity_source"]),
+                         ("alpha", "claude-transcript-cwd"))
+        self.assertEqual(top["start_dir"], str(self.alpha))
+        self.assertEqual(len(rows), 3)
+        for sub in subs:
+            row = rows[str(sub)]
+            self.assertEqual(row["kind"], "subagent")
+            self.assertEqual((row["identity"], row["identity_source"]),
+                             ("alpha", "inherited:claude-transcript-cwd"))
+        status, detail = _get(self.url("/api/loop", name="loop-x"))
+        self.assertEqual(status, 200)
+        self.assertEqual({s["identity"] for s in detail["sessions"]}, {"alpha"})
+
+    def test_broker_sourced_session_uses_its_workspace(self):
+        parent, _ = self.write_parent(sid=BROKER_SID)
+        self.handler.sessions = [
+            {"id": "b1", "status": "idle", "title": "trioctl loop-x lead:1",
+             "workspace": str(self.root), "external_session_id": BROKER_SID,
+             "labels": {"omnigent.wrapper": "claude-code"}}]
+        rows = self.sessions()
+        top = [r for r in rows if r["path"] == str(parent)][0]
+        self.assertEqual(top["source"], "broker")
+        self.assertEqual((top["identity"], top["identity_source"]),
+                         ("coordinator", "broker-workspace"))
+
+    def test_deleted_ref_without_a_start_dir_is_unavailable(self):
+        self.launch()
+        rows = self.sessions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["status"], rows[0]["identity"],
+                          rows[0]["identity_source"], rows[0]["start_dir"]),
+                         ("deleted", None, "unavailable", None))
+
+
 def _find_chromium():
     env = os.environ.get("TRIO_DASH_CHROMIUM")
     candidates = [env] if env else []
