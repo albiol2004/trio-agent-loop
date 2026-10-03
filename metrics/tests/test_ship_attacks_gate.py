@@ -11,6 +11,7 @@ import json
 import subprocess
 import threading
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -93,6 +94,114 @@ def test_count_attacks_list_ends_at_first_non_indented_non_bullet_line() -> None
 def test_count_attacks_blocks_sum() -> None:
     text = "attacks:\n- a -> b\n\nother: x\n\nattacks:\n- c -> d\n- e -> f\n"
     assert trio_loop.count_attacks(text) == 3
+
+
+# Canonical template lines, verbatim (prompts/canonical/evaluator.md and the
+# portable/omnigent copies generated from it).
+TEMPLATE_LINES = [
+    "- <command or input beyond the accepts> -> <what happened>",
+    "- <input, boundary, removal or injected fault> -> <what happened>",
+    "- <second attack> -> <what happened>",
+]
+
+
+@pytest.mark.parametrize("line", TEMPLATE_LINES)
+def test_count_attacks_unfilled_template_lines_do_not_count(line: str) -> None:
+    assert trio_loop.count_attacks(f"attacks:\n{line}\n") == 0
+    assert trio_loop.count_attacks("attacks:\n" + "\n".join(TEMPLATE_LINES) + "\n") == 0
+
+
+@pytest.mark.parametrize("bullet", [
+    "- none attempted -> n/a", "- skipped -> n/a", "- not run -> n/a",
+    "- <command> -> rejected with exit 2",          # unfilled probe
+    "- empty input -> <what happened>",             # unfilled result
+    "- `<input>` -> **<result>**",
+    "- empty input -> n/a", "- empty input -> N/A.", "- empty input -> none",
+    "- empty input -> TBD", "- empty input -> skipped", "- empty input -> Not run",
+    "- empty input -> not run.", "- empty input -> untested", "- empty input -> `none`",
+    "- Skipped -> something", "- NOT RUN -> something", "- None attempted -> x",
+])
+def test_count_attacks_placeholder_entries_do_not_count(bullet: str) -> None:
+    assert trio_loop.count_attacks(f"attacks:\n{bullet}\n") == 0
+
+
+@pytest.mark.parametrize("bullet", [
+    "- empty input -> rejected with exit 2",
+    "- `app.py --x` -> exit 2: usage printed",
+    "- delete the cache dir mid-run -> restarted cleanly",
+    "- <b>bold</b> input -> escaped as &lt;b&gt;",       # not entirely one <...> slot
+    "- 3 < 5 and 7 > 2 as input -> parsed",              # angle brackets, not a slot
+    "- empty input -> nothing was written, exit 2",
+    "- huge file → streamed, no OOM",
+    "- re-run twice -> not run twice: second call hit the cache",
+])
+def test_count_attacks_genuine_entries_still_count(bullet: str) -> None:
+    assert trio_loop.count_attacks(f"attacks:\n{bullet}\n") == 1
+
+
+def test_count_attacks_counts_only_the_filled_entries_of_a_mixed_list() -> None:
+    text = ("attacks:\n" + "\n".join(TEMPLATE_LINES) + "\n- skipped -> n/a\n"
+            "- empty input -> rejected with exit 2\n- 0-byte file -> exit 2\n")
+    assert trio_loop.count_attacks(text) == 2
+
+
+@pytest.mark.parametrize("text", [
+    "## Attacks\n- a -> b\n",
+    "## Attacks:\n- a -> b\n",
+    "**Attacks**\n- a -> b\n",
+    "attacks:\n1. a -> b\n",
+    "attacks:\n1) a -> b\n",
+    "attacks:\n+ a -> b\n",
+    "attacks:\n- a => b\n",
+    "attacks:\n  - a \u2192 b\n",
+    "## Attacks\n1. a => b\n2. c -> d\n",
+])
+def test_count_attacks_accepts_the_reasonable_formats(text: str) -> None:
+    assert trio_loop.count_attacks(text) >= 1
+
+
+def test_count_attacks_heading_without_colon_is_not_a_prose_match() -> None:
+    assert trio_loop.count_attacks("The attacks were run -> fine\n- a -> b\n") is None
+    assert trio_loop.count_attacks("## Attacks surface\n- a -> b\n") is None
+
+
+def _load_trioctl():
+    import importlib.machinery
+    import importlib.util
+    path = Path(trio_loop.__file__).resolve().parents[1] / "omnigent" / "trioctl"
+    loader = importlib.machinery.SourceFileLoader("trioctl_attacks_parity", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _load_quality(monkeypatch: pytest.MonkeyPatch):
+    import importlib
+    import sys
+    driver = Path(trio_loop.__file__).resolve().parents[1] / "opencode-driver"
+    monkeypatch.syspath_prepend(str(driver))
+    for name in [n for n in sys.modules if n == "trio_opencode" or n.startswith("trio_opencode.")]:
+        monkeypatch.delitem(sys.modules, name)
+    return importlib.import_module("trio_opencode.quality")
+
+
+PARITY_BODIES = [
+    "attacks:\n" + "\n".join(TEMPLATE_LINES) + "\n",
+    "attacks:\n- none attempted -> n/a\n- skipped -> n/a\n- not run -> n/a\n",
+    "attacks:\n- empty input -> rejected\n- <x> -> y\n- z -> <w>\n- q -> N/A\n",
+    "## Attacks\n1. a => b\n2) c -> d\n+ e \u2192 f\n",
+    "attacks:\n- huge file \u2192 streamed\n",
+    "no header\n- a -> b\n",
+    "attacks:\n- re-ran ACC-01 -> pass\n  continued -> x\nnotes\n- c -> d\n",
+]
+
+
+@pytest.mark.parametrize("body", PARITY_BODIES)
+def test_fallback_copies_count_exactly_like_the_core(monkeypatch, body: str) -> None:
+    want = trio_loop.count_attacks(body)
+    assert _load_trioctl()._local_count_attacks(body) == want
+    assert _load_quality(monkeypatch)._fallback_count_attacks(body) == want
 
 
 # ------------------------------------------- whole_goal / slice scoping
@@ -238,6 +347,25 @@ def test_lockstep_attacks_header_with_only_placeholders_is_refused(tmp_path: Pat
     assert "attacks=0" in (mailbox / "LOG.md").read_text()
 
 
+@pytest.mark.parametrize("body", [
+    "\n".join(TEMPLATE_LINES),
+    "- none attempted -> n/a",
+    "- skipped -> n/a",
+    "- not run -> n/a",
+])
+def test_lockstep_ship_with_unfilled_or_placeholder_attacks_is_refused(tmp_path: Path, body: str) -> None:
+    mailbox = TL.make_mailbox(tmp_path)
+    runner = TL.FakeRunner(
+        [f"VERDICT: SHIP\nattacks:\n{body}\n", SHIP_ATTACKED], inject_attacks=False)
+    assert trio_loop.run_loop(mailbox, 3, runner, mode="lockstep") == 0
+    assert [c for c in runner.calls] == [
+        ("lead", 1), ("evaluator", 1), ("lead", 2), ("evaluator", 2)]
+    log = (mailbox / "LOG.md").read_text()
+    assert "iter 1 | loop | SHIP refused by the attacks gate" in log and "attacks=0" in log
+    lead2 = runner.contexts[2]
+    assert "`- <command or input> -> <what happened>`" in lead2["ship_gate_errors"][0]
+
+
 def test_lockstep_iterate_and_blocked_are_not_gated(tmp_path: Path) -> None:
     mailbox = TL.make_mailbox(tmp_path)
     runner = TL.FakeRunner(["VERDICT: ITERATE", "VERDICT: BLOCKED"])
@@ -297,6 +425,43 @@ def test_lockstep_acceptance_on_attacks_gate_runs_before_the_pack(tmp_path: Path
     assert len([c for c in fake.calls if c[0] == "lead"]) == 2
     assert "status: shipped" in T.state(mb)
     assert ("loop: iteration 1 — attacks gate refused SHIP (ITERATE)") in T.subjects(repo)
+
+
+GOOD_AMEND = (
+    "import subprocess, sys\nout = subprocess.run([sys.executable, 'app.py', 'f1'],"
+    " capture_output=True, text=True).stdout\nsys.exit(0 if 'ok-f1' in out else 1)\n")
+
+
+@pytest.mark.parametrize("mode", ["lockstep", "open-loop"])
+def test_attacks_refusal_still_runs_the_acceptance_review(tmp_path: Path, mode: str) -> None:
+    """One evaluation = a legitimate `acceptance: amend` commit AND a SHIP
+    with no attack. The refusal skips only the frozen-pack run: the
+    amendment is accepted (no tamper restore, no breach on the next Lead)
+    and the review (amendments, anti-thrash, verdict record) saw an ITERATE."""
+    repo, mb = T.make_repo(tmp_path, queue=mode == "open-loop")
+    fake = T.Fake(repo, mb, lead_script=[{}, {}, {}], mode=mode,
+                  eval_script=[{"verdict": "SHIP", "attacks": False,
+                                "amend": [{"k": 1, "body": GOOD_AMEND}]},
+                               {"verdict": "SHIP"}])
+    reviews: list[tuple] = []
+    real = trio_loop.AcceptanceController.review_verdict
+
+    def spy(self, verdict, scope, iteration, evaluated, state_path):
+        reviews.append((verdict, scope))
+        return real(self, verdict, scope, iteration, evaluated, state_path)
+
+    with mock.patch.object(trio_loop.AcceptanceController, "review_verdict", spy):
+        assert T.run(mb, fake, mode=mode) == 0
+    assert reviews[0] == ("ITERATE", None), reviews
+    lg = T.log(mb)
+    assert "SHIP refused by the attacks gate (verdict becomes ITERATE)" in lg
+    assert "amendment of ACC-01 accepted" in lg
+    assert "tamper" not in lg and "restored" not in lg, lg
+    assert "amend ACC-01" in (mb / "acceptance" / "FROZEN").read_text()
+    # The frozen pack ran for the second SHIP only.
+    assert lg.count("SHIP gate:") == 1
+    assert "refused by the acceptance gate" not in lg
+    assert "status: shipped" in T.state(mb)
 
 
 # ----------------------------------------------------------- open-loop

@@ -755,26 +755,51 @@ def _integration_verdict_text(text: str) -> str:
 #: Minimum number of recorded attacks a SHIP's evidence must carry.
 MIN_SHIP_ATTACKS = 1
 
+# The header tolerates leading spaces, a `#` heading / `-` bullet marker,
+# `**`/backticks, any case, and the colon: `## Attacks` alone on its line is a
+# header too (inline text after a colon is allowed).
 _ATTACKS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*:", re.IGNORECASE
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*(?::|$)", re.IGNORECASE
 )
-_ATTACK_BULLET_RE = re.compile(r"^\s*[-*]\s+\S")
-_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*[-*]\s+")
-_ATTACK_PLACEHOLDERS = frozenset({"", "none", "na", "tbd"})
+# Entries are `-`/`*`/`+` bullets or numbered (`1.` / `1)`).
+_ATTACK_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+_ATTACK_ARROW_RE = re.compile(r"->|=>|\u2192")
+#: Left side (the probe), after dropping everything but [0-9a-z]: not an attack.
+_ATTACK_PLACEHOLDERS = frozenset({
+    "", "none", "na", "tbd", "todo", "noneattempted", "notattempted", "skipped",
+    "notrun", "untested", "notapplicable", "noattack", "noattacks"})
+#: Right side (the result), same normalisation: no result was recorded.
+_ATTACK_RESULT_PLACEHOLDERS = frozenset({
+    "", "none", "na", "tbd", "todo", "pending", "skipped", "notrun", "untested",
+    "notattempted", "noneattempted", "notapplicable"})
+#: A side that is nothing but an unfilled `<...>` template slot.
+_ATTACK_TEMPLATE_SLOT_RE = re.compile(r"<[^<>]*>")
+
+
+def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
+    bare = side.strip("*`_ \t")
+    if _ATTACK_TEMPLATE_SLOT_RE.fullmatch(bare):
+        return True
+    return re.sub(r"[^0-9a-z]", "", bare.lower()) in names
 
 
 def _attack_counts(entry: str) -> bool:
     """True when one `attacks:` bullet records an attack AND its result:
-    ``<probe> -> <what happened>`` with text on both sides and a left side
-    that is not a placeholder (none / n/a / tbd / ``-`` / ``...``)."""
+    ``<probe> -> <what happened>`` (also ``=>`` / ``→``) with text on both
+    sides, neither side entirely an unfilled ``<...>`` template slot, the
+    probe not a placeholder (none / n/a / tbd / skipped / not run / ``-`` /
+    ``...``) and the result not one either (n/a, none, tbd, skipped, not
+    run, untested, ...)."""
     body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
-    parts = re.split(r"->|→", body, maxsplit=1)
+    parts = _ATTACK_ARROW_RE.split(body, maxsplit=1)
     if len(parts) != 2:
         return False
     left, right = parts[0].strip(), parts[1].strip()
     if not left or not right.strip("*`_ \t"):
         return False
-    return re.sub(r"[^0-9a-z]", "", left.lower()) not in _ATTACK_PLACEHOLDERS
+    return not (_attack_side_is_placeholder(left, _ATTACK_PLACEHOLDERS)
+                or _attack_side_is_placeholder(right, _ATTACK_RESULT_PLACEHOLDERS))
 
 
 def count_attacks(text: str) -> int | None:
@@ -782,12 +807,14 @@ def count_attacks(text: str) -> int | None:
     ``attacks:`` header line exists at all.
 
     The header is tolerant (leading spaces, ``**``/backticks, any case,
-    inline text after the colon). Bullets (``- x`` / ``* x``) after it are
+    inline text after the colon, or a ``## Attacks`` heading with no
+    colon). Bullets (``- x`` / ``* x`` / ``+ x`` / ``1. x``) after it are
     list entries; an indented non-bullet line continues the previous
     entry; the list ends at the first non-blank, non-indented, non-bullet
     line. An entry COUNTS only when it records the probe and its result
-    (``->`` or ``→`` with text on both sides, left side not a placeholder
-    such as ``none``/``n/a``/``tbd``). Several blocks sum.
+    (``->``, ``=>`` or ``→`` with text on both sides; see ``_attack_counts``
+    for what a placeholder side is: ``<...>`` template slots, none/n/a/tbd,
+    skipped, not run). Several blocks sum.
     """
     total = 0
     found = False
@@ -1027,7 +1054,11 @@ def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
         f"beyond the frozen checks ({reason}). Frozen checks are a floor: the "
         "next evaluation must run and record at least one adversarial probe "
         "(boundary, interaction between requirements, malformed input, "
-        "failure mode, concurrency) with its command and result. Change "
+        "failure mode, concurrency) with its command and result. The "
+        "driver counts only an `attacks:` list (or a `## Attacks` heading) "
+        "of bullets shaped `- <command or input> -> <what happened>` with "
+        "both sides filled in: an unfilled `<...>` slot or a placeholder "
+        "(none, n/a, tbd, skipped, not run) does not count. Change "
         "product code only for a genuine defect."
     )
     try:
@@ -3686,11 +3717,14 @@ def _run_lockstep(
                     _write_driver_state(mailbox, runner, iteration, "error")
                     return 3
                 # Cheap gate first: a SHIP with no beyond-pack attack never
-                # reaches the (expensive) frozen acceptance run.
-                verdict, scope, attack_errors = review_ship_attacks(
+                # reaches the (expensive) frozen pack run. The refusal turns
+                # it into an ITERATE, which the acceptance review still sees:
+                # amendments, anti-thrash and the verdict record are not
+                # SHIP-only.
+                verdict, scope, _attack_errors = review_ship_attacks(
                     mailbox, iteration, verdict, scope, context="lockstep"
                 )
-                if acc is not None and not attack_errors:
+                if acc is not None:
                     verdict, scope, forced = acc.review_verdict(
                         verdict, scope, iteration,
                         _read_state(state_path)["evaluated_sha"], state_path,
@@ -5595,10 +5629,13 @@ def run_open_loop(
                             "integration verdict",
                         )
                         return finish(3)
-                    verdict, scope, attack_errors = review_ship_attacks(
+                    # A refused SHIP becomes ITERATE; the acceptance review
+                    # still runs on it (amendments, anti-thrash, record) and
+                    # only the SHIP-only frozen pack run is skipped.
+                    verdict, scope, _attack_errors = review_ship_attacks(
                         mailbox, iteration_now, verdict, scope, context="open-loop"
                     )
-                    if acc is not None and not attack_errors:
+                    if acc is not None:
                         verdict, scope, forced = acc.review_verdict(
                             verdict, scope, iteration_now, context["pinned_sha"], state_path
                         )

@@ -1512,13 +1512,15 @@ def _apply_body(mailbox: Path, repo: Path | None, a: argparse.Namespace,
     if verdict == "SHIP":
         # Rule 1: the cheap attacks gate first. A SHIP with no counted
         # attack beyond the frozen checks becomes ITERATE and never reaches
-        # the (expensive) frozen-pack run. Not idempotent (logs, commits):
-        # only a first apply gets here; replays return the sealed result.
+        # the (expensive) frozen-pack run; the acceptance review below still
+        # sees that ITERATE (amendments, anti-thrash, verdict record).
+        # Not idempotent (logs, commits): only a first apply gets here;
+        # replays return the sealed result.
         verdict, scope, attack_errors = TL.review_ship_attacks(
             mailbox, a.iteration, verdict, scope, context="lockstep")
         if attack_errors:
             attacks_gate = {"refused": True, "errors": list(attack_errors)}
-    if _acc_on(a) and verdict is not None and attacks_gate is None:
+    if _acc_on(a) and verdict is not None:
         verdict, scope, forced, acc_record = _acc_review(
             mailbox, repo, a, verdict, scope, state["evaluated_sha"].strip())
     if verdict is None:

@@ -878,17 +878,33 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
 
 
 _ATTACKS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*:", re.IGNORECASE)
-_ATTACK_BULLET_RE = re.compile(r"^\s*[-*]\s+\S")
-_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*[-*]\s+")
-_ATTACK_PLACEHOLDERS = frozenset({"", "none", "na", "tbd"})
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*(?::|$)", re.IGNORECASE
+)
+_ATTACK_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
+_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+_ATTACK_ARROW_RE = re.compile(r"->|=>|\u2192")
+_ATTACK_PLACEHOLDERS = frozenset({
+    "", "none", "na", "tbd", "todo", "noneattempted", "notattempted", "skipped",
+    "notrun", "untested", "notapplicable", "noattack", "noattacks"})
+_ATTACK_RESULT_PLACEHOLDERS = frozenset({
+    "", "none", "na", "tbd", "todo", "pending", "skipped", "notrun", "untested",
+    "notattempted", "noneattempted", "notapplicable"})
+_ATTACK_TEMPLATE_SLOT_RE = re.compile(r"<[^<>]*>")
+
+
+def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
+    bare = side.strip("*`_ \t")
+    if _ATTACK_TEMPLATE_SLOT_RE.fullmatch(bare):
+        return True
+    return re.sub(r"[^0-9a-z]", "", bare.lower()) in names
 
 
 def _fallback_count_attacks(text: str) -> int | None:
     """Faithful copy of the core's ``trio_loop.count_attacks`` (used only
     when the loaded core predates it): bullets after an ``attacks:`` header
     count when they record ``<probe> -> <result>`` with text on both sides
-    and a non-placeholder probe; ``None`` without any header."""
+    and a non-placeholder probe and result (no unfilled ``<...>`` slot);
+    ``None`` without any header."""
     total = 0
     found = False
     in_list = False
@@ -896,13 +912,14 @@ def _fallback_count_attacks(text: str) -> int | None:
 
     def counts(entry: str) -> bool:
         body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
-        parts = re.split(r"->|\u2192", body, maxsplit=1)
+        parts = _ATTACK_ARROW_RE.split(body, maxsplit=1)
         if len(parts) != 2:
             return False
         left, right = parts[0].strip(), parts[1].strip()
         if not left or not right.strip("*`_ \t"):
             return False
-        return re.sub(r"[^0-9a-z]", "", left.lower()) not in _ATTACK_PLACEHOLDERS
+        return not (_attack_side_is_placeholder(left, _ATTACK_PLACEHOLDERS)
+                    or _attack_side_is_placeholder(right, _ATTACK_RESULT_PLACEHOLDERS))
 
     def flush() -> None:
         nonlocal total, current

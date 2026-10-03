@@ -84,6 +84,16 @@ def test_off_ship_without_attacks_is_refused_and_iterates(repo: Path) -> None:
     ("attacks:\n- n/a -> nothing\n- tbd -> later\n", False),
     ("attacks:\n- empty input\n", False),  # no `->`: not counted
     ("attacks:\n- reran ACC-01 -> still passes\n- n/a -> nothing\n", True),
+    # the prompts' unfilled template lines, verbatim, and placeholder entries
+    ("attacks:\n- <input, boundary, removal or injected fault> -> <what happened>\n"
+     "- <second attack> -> <what happened>\n", False),
+    ("attacks:\n- <command or input beyond the accepts> -> <what happened>\n", False),
+    ("attacks:\n- none attempted -> n/a\n", False),
+    ("attacks:\n- skipped -> n/a\n", False),
+    ("attacks:\n- not run -> n/a\n", False),
+    ("attacks:\n- empty input -> n/a\n", False),
+    ("attacks:\n- <second attack> -> <what happened>\n- empty input -> exit 2\n", True),
+    ("## Attacks\n1. empty input => exit 2\n", True),
 ])
 def test_off_only_counted_attacks_let_a_ship_through(repo: Path, attacks: str, ships: bool) -> None:
     step(repo, "begin")
@@ -183,8 +193,10 @@ def test_on_ship_without_attacks_is_refused_and_the_pack_is_not_run(repo: Path) 
     assert ap["ok"], ap
     assert ap["verdict"] == "ITERATE" and not ap["stop"], ap
     assert ap["attacks_gate"]["refused"] is True and ap["ship_refused"] is True
-    # the frozen gate did not run: no acceptance verdict record, no pack LOG line
-    assert "acceptance" not in ap
+    # the review ran on the converted ITERATE, but the frozen pack did not:
+    # no pack-gate record, no pack LOG line
+    assert ap["acceptance"]["verdict_in"] == "ITERATE"
+    assert ap["acceptance"]["ship_refused"] is False and ap["acceptance"]["ship_gate"] is None
     log = log_text(repo)
     assert log.count(REFUSED) == 1
     assert "acceptance gate" not in log and "SHIP gate:" not in log
@@ -227,6 +239,33 @@ def test_on_refused_ship_then_a_ship_with_attacks_runs_the_pack_and_ships(repo: 
     assert "attacks_gate" not in ap2
     assert ap2["acceptance"]["ship_gate"]["passed"] == 5  # the frozen gate ran
     assert "SHIP gate: 5/5 PASS" in log_text(repo)
+
+
+def test_on_attacks_refusal_still_processes_an_amendment(repo: Path) -> None:
+    """One evaluation = a legitimate `acceptance: amend` commit AND a SHIP
+    with no attack: the amendment is accepted (pin chain extended, no
+    tamper) and only the frozen-pack run is skipped."""
+    run = Run(repo)
+    p, _ar = to_prerun(run, repo, upto=3)
+    pin = run.digest["pin"]
+    R19._amend(repo, R19.CHECK.format(k=5) + "# clearer failure text\n")
+    (mbox(repo) / "VERDICT.md").write_text(
+        f"VERDICT: SHIP\n# Verdict — iteration 1\nattempt: {p['evaluator_attempt']}\n"
+        f"evaluated: {p['sha']}\ncommit: {p['sha']}\n", encoding="utf-8")
+    ap = run("apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert ap["ok"], ap
+    assert ap["verdict"] == "ITERATE" and not ap["stop"], ap
+    assert ap["attacks_gate"]["refused"] is True and ap["ship_refused"] is True
+    assert ap["acceptance"]["amendments"] == 1 and ap["acceptance"]["pin"] != pin, ap
+    assert ap["acceptance"]["verdict_in"] == "ITERATE"
+    log = log_text(repo)
+    assert "amendment of ACC-05 accepted" in log
+    assert log.count(REFUSED) == 1
+    assert "SHIP gate:" not in log and "acceptance gate" not in log  # pack not run
+    assert "pin[1]:" in (mbox(repo) / "acceptance" / "FROZEN").read_text()
+    n = run("next", max_iterations=4)
+    assert n["action"] == "lead" and n["ship_gate_errors"] == ap["attacks_gate"]["errors"], n
+    assert "tamper" not in log_text(repo)
 
 
 # ------------------------------------------- Rule 2, requirement map gate
