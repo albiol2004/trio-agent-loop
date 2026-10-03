@@ -57,6 +57,15 @@ def _n_checks() -> int:
     return int(os.environ.get("FAKE_OC_ACC_CHECKS", "5"))
 
 
+def _requirements(n: int) -> list[dict]:
+    """The requirement map (rule 2): R1 quotes the GOAL, ACC-01 is its
+    normal check, ACC-02 its hard (boundary) check -- so the pack freezes
+    cleanly on the first try."""
+    hard = [{"check": "ACC-02", "type": "boundary"}] if n >= 2 else []
+    return [{"id": "R1", "goal_ref": "GOAL.md:2", "goal_quote": QUOTE,
+             "normal": ["ACC-01"], "hard": hard}]
+
+
 def write_pack(export: Path, n: int, *, passing: tuple = ()) -> None:
     """Mirrors ``native/tests/test_r19_acceptance.py``'s ``write_pack``: a
     minimal but schema-valid pack whose non-``passing`` checks genuinely
@@ -78,7 +87,7 @@ def write_pack(export: Path, n: int, *, passing: tuple = ()) -> None:
                        "expect": {"exit": 0}, "timeout_s": 30})
     (acc / "MANIFEST.json").write_text(json.dumps({
         "acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-        "checks": checks}, indent=2), encoding="utf-8")
+        "checks": checks, "requirements": _requirements(n)}, indent=2), encoding="utf-8")
     (acc / "AUTHOR.md").write_text("# inventory\n- testable-black-box: hello N\n",
                                    encoding="utf-8")
 
@@ -188,7 +197,7 @@ def _handle_evaluator(ctx) -> None:
     attempt, sha = common.pin_attempt_and_sha(ctx)
     common.write(mbox / "VERDICT.md",
                 f"VERDICT: SHIP\n# Verdict — iteration {iteration}\n"
-                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n")
+                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n" + common.ATTACKS)
     common.commit(ctx.dir, f"loop: iteration {iteration} — SHIP", ["loop/VERDICT.md"])
     ctx.text(f"SHIP. The frozen acceptance pack and PLAN.md both check out. "
             f"attempt: {attempt} evaluated: {sha}")

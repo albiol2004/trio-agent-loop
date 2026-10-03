@@ -76,7 +76,7 @@ def _handle_evaluator(ctx) -> None:
         return
     common.write(mbox / "VERDICT.md",
                 f"VERDICT: SHIP\n# Verdict — iteration {iteration}\n"
-                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n")
+                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n" + common.ATTACKS)
     common.commit(ctx.dir, f"loop: iteration {iteration} — SHIP", ["loop/VERDICT.md"])
     ctx.text(f"SHIP. x.py now parses and prints. attempt: {attempt} evaluated: {sha}")
 

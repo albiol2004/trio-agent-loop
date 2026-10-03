@@ -38,6 +38,15 @@ sys.exit(1)
 _ALL_IDS = [f"ACC-{k:02d}" for k in range(1, N_CHECKS + 1)]
 
 
+def _requirements(n: int) -> list[dict]:
+    """The requirement map (rule 2): R1 quotes the GOAL, ACC-01 is its
+    normal check, ACC-02 its hard (boundary) check -- so the pack freezes
+    cleanly on the first try."""
+    hard = [{"check": "ACC-02", "type": "boundary"}] if n >= 2 else []
+    return [{"id": "R1", "goal_ref": "GOAL.md:2", "goal_quote": "prints hello N",
+             "normal": ["ACC-01"], "hard": hard}]
+
+
 def _write_pack(export: Path) -> None:
     """Mirrors ``tests/scenarios/acceptance.py``'s ``write_pack``: a
     minimal but schema-valid pack whose checks genuinely FAIL at the base
@@ -55,7 +64,7 @@ def _write_pack(export: Path) -> None:
                        "expect": {"exit": 0}, "timeout_s": 30})
     (acc / "MANIFEST.json").write_text(json.dumps({
         "acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-        "checks": checks}, indent=2), encoding="utf-8")
+        "checks": checks, "requirements": _requirements(N_CHECKS)}, indent=2), encoding="utf-8")
     (acc / "AUTHOR.md").write_text("# inventory\n- testable-black-box: hello N\n",
                                    encoding="utf-8")
 
@@ -113,6 +122,7 @@ def _handle_slice_eval(ctx, slice_id: str, sha: str) -> None:
     with open(mbox / "VERDICT.md", "a", encoding="utf-8") as fh:
         fh.write(f"## slice {slice_id} @{sha} — SHIP\n")
         fh.write("evidence: re-run=1 implementer-test=0 receipt=0 unverified=0\n")
+        fh.write(common.ATTACKS)
     ctx.text(f"SHIP. slice {slice_id}@{sha[:12]} verified (app.py present).")
 
 

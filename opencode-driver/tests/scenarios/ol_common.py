@@ -200,7 +200,7 @@ def handle_integration_eval_ship(ctx) -> None:
     verdict_path = mbox / "VERDICT.md"
     existing = verdict_path.read_text(encoding="utf-8") if verdict_path.is_file() else ""
     header = (f"VERDICT: SHIP\n# Verdict — iteration {iteration}\n"
-             f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n\n")
+             f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n" + common.ATTACKS + "\n")
     verdict_path.write_text(header + existing, encoding="utf-8")
     mailbox_rel = str(mbox.relative_to(lead_wt))
     common.commit(lead_wt, f"loop: iteration {iteration} — SHIP", [mailbox_rel])

@@ -100,6 +100,7 @@ def _handle_slice_eval(ctx, slice_id, sha):
     with open(mbox / "VERDICT.md", "a", encoding="utf-8") as fh:
         fh.write(f"## slice {slice_id} @{sha} — SHIP\n")
         fh.write("evidence: re-run=1 implementer-test=0 receipt=0 unverified=0\n")
+        fh.write(common.ATTACKS)
     ctx.text(f"SHIP. slice {slice_id}@{sha[:12]} verified (a.py/b.py/c.py present).")
 
 
@@ -116,7 +117,7 @@ def _handle_integration_eval(ctx):
     verdict_path = mbox / "VERDICT.md"
     existing = verdict_path.read_text(encoding="utf-8") if verdict_path.is_file() else ""
     header = (f"VERDICT: SHIP\n# Verdict — iteration {iteration}\n"
-             f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n\n")
+             f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n" + common.ATTACKS + "\n")
     verdict_path.write_text(header + existing, encoding="utf-8")
     mailbox_rel = str(mbox.relative_to(lead_wt))
     common.commit(lead_wt, f"loop: iteration {iteration} — SHIP", [mailbox_rel])

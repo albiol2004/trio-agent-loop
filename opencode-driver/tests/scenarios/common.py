@@ -33,6 +33,12 @@ def _git_env() -> dict[str, str]:
     return env
 
 
+#: The `attacks:` list every fake evaluator's SHIP verdict carries (rule 1:
+#: a SHIP needs at least one counted adversarial probe beyond the frozen
+#: checks, ``- <probe> -> <what happened>``).
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
+
+
 def git(cwd: "str | Path", *args: str) -> str:
     r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
                        env=_git_env())

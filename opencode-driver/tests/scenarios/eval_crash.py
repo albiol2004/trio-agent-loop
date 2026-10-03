@@ -84,7 +84,7 @@ def _handle_evaluator(ctx) -> None:
     attempt, sha = common.pin_attempt_and_sha(ctx)
     common.write(mbox / "VERDICT.md",
                 f"VERDICT: SHIP\n# Verdict — iteration {iteration}\n"
-                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n")
+                f"attempt: {attempt}\nevaluated: {sha}\ncommit: {sha}\n" + common.ATTACKS)
     common.commit(ctx.dir, f"loop: iteration {iteration} — SHIP", ["loop/VERDICT.md"])
     ctx.text(f"SHIP. a.py exists and is committed as slice(a). "
             f"attempt: {attempt} evaluated: {sha}")

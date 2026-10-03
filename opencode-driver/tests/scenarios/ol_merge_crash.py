@@ -83,6 +83,7 @@ def _handle_evaluator(ctx) -> None:
         with open(mbox / "VERDICT.md", "a", encoding="utf-8") as fh:
             fh.write(f"## slice {slice_id} @{sha} — SHIP\n")
             fh.write("evidence: re-run=1 implementer-test=0 receipt=0 unverified=0\n")
+            fh.write(common.ATTACKS)
         ctx.text(f"SHIP. slice {slice_id}@{sha[:12]} verified (a.py present).")
         return
     if kind == "integration-eval":

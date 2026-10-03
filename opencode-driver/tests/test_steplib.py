@@ -117,7 +117,8 @@ def test_full_round_trip_gate_pin_apply_ship(git_repo: Path) -> None:
     (mbox(git_repo) / "VERDICT.md").write_text(
         f"VERDICT: SHIP\n# Verdict — iteration 1\n"
         f"attempt: {p['evaluator_attempt']}\nevaluated: {p['sha']}\n"
-        f"commit: {p['sha']}\n",
+        f"commit: {p['sha']}\n"
+        "attacks:\n- empty input -> rejected with exit 2\n",
         encoding="utf-8",
     )
     _git(git_repo, "add", "loop/VERDICT.md")
