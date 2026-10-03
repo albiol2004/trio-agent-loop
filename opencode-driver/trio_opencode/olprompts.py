@@ -112,13 +112,24 @@ def _not_router(ctx: dict[str, Any]) -> str:
     return _NOT_ROUTER.format(driver=ctx.get("driver") or "opencode")
 
 
+def _scratch_note(ctx: dict[str, Any]) -> list[str]:
+    tmpdir = ctx.get("tmpdir")
+    if not tmpdir:
+        return []
+    return [
+        f"Scratch space: put every probe, scratch or output file under `{tmpdir}` (write the "
+        "path exactly as given; it is also your `TMPDIR`), never in the product tree or "
+        "directly in `.trio-opencode/`."
+    ]
+
+
 def _role_intro(role_label: str, ctx: dict[str, Any], extra: str = "") -> list[str]:
     return [
         f"You are the trio-{role_label} for iteration {ctx['iteration']} of an open-loop "
         f"Trio loop driven by the trio-{ctx.get('driver') or 'opencode'} driver{extra}.",
         f"Mailbox (absolute): {ctx['mailbox']}. Product repo: {ctx['repo']}.",
         _not_router(ctx),
-    ]
+    ] + _scratch_note(ctx)
 
 
 def _output_instruction(ctx: dict[str, Any], fields_desc: str) -> str:

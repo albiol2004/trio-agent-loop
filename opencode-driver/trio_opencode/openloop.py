@@ -1763,6 +1763,11 @@ def _git_worktree_add(repo_path: Path, path: Path, start: str,
     reports ``could not create directory of '.git/worktrees/...': No such file
     or directory``). The branch is created before the worktree, so the retry
     checks the already-created branch out instead of creating it again."""
+    # every worktree the driver creates lives under ``<repo>/.trio-opencode/``:
+    # make sure THIS repo's common git dir excludes it (a declared repo that
+    # joined after start included) before an agent can write there
+    drv._exclude_driver_scratch(repo_path)
+
     def _run(first: bool) -> "subprocess.CompletedProcess[str]":
         if branch is None:
             args = ["--detach", str(path), start]

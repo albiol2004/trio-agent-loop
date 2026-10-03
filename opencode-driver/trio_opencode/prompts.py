@@ -86,7 +86,9 @@ def tmp_note(tmpdir: str | None) -> list[str]:
         f"Temporary files: use `{tmpdir}` (e.g. `export TMPDIR={tmpdir}`) instead of /tmp or "
         "a new directory; do not create other directories under "
         "`.trio-opencode/worktrees/` — the driver removes only the directories it created "
-        "itself, at the end of the run."
+        "itself, at the end of the run. Never leave probe, scratch or output files in the "
+        "product tree or directly in `.trio-opencode/`; keep them under that temporary "
+        "directory (write its path exactly as given)."
     ]
 
 

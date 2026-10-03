@@ -55,6 +55,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -113,8 +114,19 @@ NS.RECORDS = ".opencode.json"
 NS.RESULT = ".opencode-result.json"
 NS.LEDGER_DIR = "trio-opencode"
 NS.WORKTREES_DIR = ".trio-opencode/worktrees"
-NS.EXCLUDE_LINE = ".trio-opencode/worktrees/"
-NS.EXCLUDE_HEADER = "# trio-opencode: loop worktrees and build artefacts"
+#: The WHOLE ``.trio-opencode/`` dir, not just ``worktrees/``: it is the
+#: driver's own namespace inside the product repo (builder/eval worktrees, role
+#: TMPDIRs, and the probe/scratch files agents drop there because a prompt names
+#: it), so nothing in it may ever show as an untracked product path at SHIP
+#: retirement or be swept into a commit by ``git add -A``. ROOT-ANCHORED (leading
+#: ``/``): the driver only ever creates the dir at the top of a repo or worktree,
+#: and an unanchored pattern would also hide a real product file under any
+#: nested ``sub/.trio-opencode/``. ``info/exclude`` is read from the common git
+#: dir, so the anchor is relative to each worktree's own root (main checkout,
+#: builder worktree nested under ``/.trio-opencode/worktrees/``, external Lead
+#: worktree alike).
+NS.EXCLUDE_LINE = "/.trio-opencode/"
+NS.EXCLUDE_HEADER = "# trio-opencode: driver scratch, loop worktrees and build artefacts"
 NS.MAILBOX_RUNTIME_IGNORES = tuple(dict.fromkeys(
     _BASE_RUNTIME_IGNORES + (".driver.json", NS.RECORDS, NS.RESULT, ".opencode-runs/")
 ))
@@ -585,8 +597,14 @@ def ledger_path(mailbox: str | Path, repo: str | Path | None) -> Path | None:
     return NS._ledger_path(Path(mailbox), Path(repo) if repo else None)
 
 
+_EXCLUDE_LOCK = threading.Lock()
+
+
 def ensure_exclude(repo: str | Path | None) -> str | None:
-    return NS._ensure_exclude(Path(repo) if repo else None)
+    # the native writer is a non-atomic read-modify-write; open-loop creates
+    # worktrees (and so calls this) from concurrent builder threads
+    with _EXCLUDE_LOCK:
+        return NS._ensure_exclude(Path(repo) if repo else None)
 
 
 # --------------------------------------------------------------- guardian

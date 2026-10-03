@@ -1709,6 +1709,14 @@ def run(mailbox: str | Path, cfg: Any, *, mode: str = "start",
         lock_fh.write(str(os.getpid()))
         lock_fh.flush()
 
+        # The driver's own scratch (``.trio-opencode/``) lives inside the
+        # product repo; exclude it once, idempotently, in the common git dir
+        # (every worktree shares it) before any role can write there -- both
+        # modes (lockstep ``begin`` also calls this; open-loop never does).
+        # Every declared repo has its own common dir, so each gets it too.
+        _exclude_driver_scratch(repo0, *(
+            _declared_repo_paths(openloop, root_mailbox) if is_open_loop else ()))
+
         if mode == "resume":
             # REVIEW-driver.md item 7: kill EVERY dead run's orphan opencode
             # turn (recorded in either possible `.driver.json` location) —
@@ -1765,6 +1773,11 @@ def run(mailbox: str | Path, cfg: Any, *, mode: str = "start",
                 declared = (openloop.declared_repos_for_prepare(root_mailbox)
                            if is_open_loop else [])
                 lead_record = rootfree.prepare(root_mailbox, declared=declared)
+                # repos that joined on resume are attached by `prepare`; the
+                # aggregates (and their main checkouts) exist only now
+                _exclude_driver_scratch(*(
+                    p for info in (lead_record.repos or {}).values()
+                    for p in (info.get("main"), info.get("path"))))
                 # `lead_record.repo` is the *root* checkout's identity path
                 # (fine for rootfree.py's own ref-name-based git calls, and
                 # for git-common-dir identity); every native step op below
@@ -1836,6 +1849,27 @@ def run(mailbox: str | Path, cfg: Any, *, mode: str = "start",
         except OSError:
             pass
         lock_fh.close()
+
+
+def _declared_repo_paths(openloop: Any, root_mailbox: Path) -> list[str]:
+    """PLAN.md ``repos:`` checkouts of *root_mailbox* (best effort: a plan
+    that is missing or does not parse yet simply declares none)."""
+    try:
+        return [d["path"] for d in openloop.declared_repos_for_prepare(root_mailbox)]
+    except Exception:  # noqa: BLE001 - never let the exclude step stop a run
+        return []
+
+
+def _exclude_driver_scratch(*repos: "str | Path | None") -> None:
+    """Best-effort :func:`steplib.ensure_exclude` for each repo (``None`` and
+    non-repos skipped): the driver's ``.trio-opencode/`` scratch must never
+    show as an untracked product path at SHIP retirement, in ANY repo the
+    run's builders, evals or agents write into, not just repo0."""
+    for repo in dict.fromkeys(str(r) for r in repos if r):
+        try:
+            steplib.ensure_exclude(repo)
+        except OSError:
+            pass
 
 
 def _pid_alive(pid: int) -> bool:
