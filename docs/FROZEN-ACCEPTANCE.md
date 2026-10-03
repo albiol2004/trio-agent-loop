@@ -113,6 +113,53 @@ exception is the C1 slice-eval trim, which applies whatever the switch says
   a product traceback the check echoes does not count). The author gets
   one retry, with the drop list, when more than 30% were dropped, fewer
   than 5 checks remain, or any check was dropped for a pack import.
+- **Requirement map.** MANIFEST.json carries a top-level `requirements`
+  list, one entry per GOAL requirement or constraint:
+  `{"id": "R1", "goal_ref": "GOAL.md:12", "goal_quote": "<verbatim
+  substring of GOAL.md or the notes>", "normal": ["ACC-01"], "hard":
+  [{"check": "ACC-02", "type": "boundary"}]}`. `normal` lists check ids
+  for the stated behaviour. A `hard` item names a check and one of five
+  types: `boundary`, `interaction` (also names another requirement id in
+  `with`; `with` is not allowed on other types), `failure-mode`,
+  `malformed-input`, `concurrency`. Every requirement needs at least one
+  normal and one hard check. A check may serve several requirements, but
+  within one requirement it is normal or hard, never both. Any check kind
+  may be referenced; the kind rules above still hold. A requirement no
+  check can test at all (`testable-only-live`, `not-testable`) stays out of
+  the map and lives only in AUTHOR.md, where the integration Evaluator
+  finds it for its own attacks.
+- **Coverage rule (freeze filter).** `freeze_filter` checks the map against
+  the checks that survive the freeze. Each gap is one `requirements: ...`
+  line, returned as `requirement_gaps` and also appended to `fatal` with
+  `retry` set, so the author's one retry carries them as
+  `- pack: requirements: <gap>` (the same retry that handles drops).
+  Gap lines: `requirements: missing — list every GOAL requirement and
+  constraint with >=1 normal and >=1 hard check` (no map or an empty one:
+  a fresh pack without the map is a gap); `R1 has no normal check`; `R1
+  has no hard check`; plus schema lines (`R2 is duplicated`, `R1
+  goal_quote is not a verbatim substring of GOAL.md or the notes`, `R1
+  hard check ACC-02 type 'x' is not one of ...`, `... is an interaction
+  and needs `with` = the id of another requirement`, `... unknown`). A
+  reference to a check dropped at freeze (or listed as both normal and
+  hard) is a gap only when nothing else covers that role; the line then
+  says why (`R1 has no hard check (ACC-02 was dropped at freeze (...))`).
+  After the one retry the survivors freeze anyway: FROZEN gets a
+  `requirement_gaps: <gap>; <gap>` line and LOG gets `acceptance: WARNING
+  frozen with requirement-map gaps after the retry: <n> (...)`. The
+  integration Evaluator attacks those gaps first. `trio-acceptance.py
+  validate` prints each as `REQUIREMENT GAP: <gap>` (not `INVALID pack`)
+  and exits 1, so the author fixes them before it stops.
+- **Legacy packs.** A pack frozen before the requirement-map rule has no
+  `requirements` key. It loads, runs and verifies unchanged; hard-check
+  coverage is not enforced for it. The driver logs once per loop
+  `acceptance: WARNING legacy frozen pack: no requirements map (frozen
+  before the requirement-map rule); hard-check coverage is not enforced for
+  this pack` (deduped on the LOG line; a pack frozen under the rule with
+  gaps has its own warning instead), `trio-acceptance.py run` prints it on
+  stderr and `trio-check` reports it as a WARN (so it does for a pack
+  frozen with `requirement_gaps:`). An amendment cannot add the map:
+  top-level keys are frozen and only a check's `run`, `expect`,
+  `timeout_s`, `binds`, `needs` may change.
 - Tier: the author runs on the Lead/Evaluator model. Without
   `[roles.acceptance]` it inherits `[roles.evaluator]`. With the switch on,
   the doctor FAILs unless lead, evaluator and acceptance resolve to one
@@ -369,6 +416,40 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
   - may amend;
   - aims its independent probe at the GOAL sentences no check covers;
   - writes `## Frozen acceptance` in VERDICT.md.
+- **Frozen checks are a floor (every SHIP, acceptance on or off).** Passing
+  the frozen pack, a slice's `accepts:` or PLAN's criteria is necessary, not
+  sufficient: every SHIP (per-slice, integration, lockstep) needs at least
+  one counted attack beyond them (`MIN_SHIP_ATTACKS = 1`; the whole-goal
+  Evaluator prompt still asks for two). The Evaluator lists them in an
+  `attacks:` list, one `- <command or input> -> <what happened>` bullet
+  each. `count_attacks` counts a bullet only with `->` or `→`, text on both
+  sides, and a left side that is not a placeholder (`none`, `n/a`, `tbd`,
+  `-`, `...`); the header is tolerant (case, `**`, backticks, `## attacks:`)
+  and several lists sum. A whole-goal verdict is counted without its
+  `## slice` sections; a slice section is counted alone, and the newest
+  section for the slice wins. Re-running a frozen check or an accept's own
+  test is not an attack. With acceptance off the rule is the same and
+  "beyond" means beyond the accepts, PLAN's criteria and the existing tests.
+  The driver refuses a SHIP without it:
+  - **Whole-goal SHIP** (lockstep, open-loop integration): the verdict
+    becomes ITERATE with scope none (a full Lead pass). LOG gets
+    `SHIP refused by the attacks gate (verdict becomes ITERATE): no attack
+    beyond the frozen checks (attacks=n/a)` (`attacks=0` when the list had
+    no counted bullet). When LOG.md is tracked, the driver commits it as
+    `loop: iteration N — attacks gate refused SHIP (ITERATE)`. The next Lead
+    gets the reason as `SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was
+    refused):`; it is stored in `.driver.json` `ship_gate` and cleared once
+    that Lead pass ran.
+  - **Per-slice SHIP** (open-loop): the newest `## slice <id> @<sha> — SHIP`
+    section with no counted attack is not accepted. It is handled like a
+    missing section: the slice-eval is re-dispatched with `SLICE-EVAL ERRORS
+    FROM THE DRIVER:`, LOG gets `open-loop: slice <id> @<sha12> SHIP not
+    accepted (<reason>); re-dispatching slice-eval (attempt n)`, and the
+    third failed attempt sets `status: error` (exit 3). An ITERATE section
+    needs no attacks.
+  - **Order.** The attacks gate runs before the frozen-pack SHIP gate: a SHIP
+    it refused never reaches the (expensive) pack run; a SHIP it passed
+    still meets the acceptance gate.
 - **After the verdict, amendments.** Amend commits since the pin are
   validated on git objects (the pinned pack at the driver's pin commit,
   the amended pack at HEAD):
@@ -504,16 +585,21 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
 
 ## C1: slice-evals back to fast (independent of the switch)
 
-The r18a slice-eval pack is removed: per-accept table, `attacks:`,
-per-slice independent probe, and the re-execution duties. What remains is
-the rules plus one `evidence:` summary line. The evaluator rigor is split:
+The r18a slice-eval pack is removed: per-accept table, per-slice
+independent probe, and the re-execution duties. What remains is the rules,
+an `attacks:` list and one `evidence:` summary line (the attacks floor,
+see Evaluation, applies to slice SHIP sections too). The evaluator rigor is
+split:
 
 - `RIGOR_CORE` stays in the registered evaluator config and the per-dispatch
   prompt;
 - `RIGOR_INTEGRATION` is generated into `integration-rigor.md`, which trioctl
   appends only to integration-eval and lockstep evaluator prompts.
 
-Slice sections without `attacks:` log `attacks=n/a`.
+A slice section's `attacks:` items are still counted in the evidence LOG
+line (`attacks=<n|n/a>`, format unchanged), but a SHIP section with none is
+no longer accepted, so `attacks=n/a` marks an ITERATE section or a SHIP the
+driver refuses.
 
 ## Commands
 

@@ -5,14 +5,17 @@ check reported "passed". Design: the lab's `r18/DESIGN.md` (levers L0-L9).
 > **r19 (C1):** the slice-eval part of this pack is trimmed regardless of
 > the acceptance switch: slice sections keep receipt-never-PASS, the
 > tautology list, the kill check, the lints and one `evidence:` line; the
-> per-accept table, attacks (L9), the per-slice probe (L3) and the
-> re-execution duties (L5, L8) are whole-goal only (integration-eval,
-> lockstep) via the generated `integration-rigor.md`. See
+> per-accept table, the per-slice probe (L3) and the re-execution duties
+> (L5, L8) are whole-goal only (integration-eval, lockstep) via the
+> generated `integration-rigor.md`. Attacks (L9) are enforced by the driver
+> for every SHIP, slice sections included: at least one counted `attacks:`
+> bullet beyond the floor, acceptance on or off. See
 > docs/FROZEN-ACCEPTANCE.md.
 
 This release carries the prompt pack plus the mechanical checks that cost no
 model tokens, all advisory or shadow; nothing here changes a retire or SHIP
-decision, and METRICS_API is unchanged (6).
+decision (except L9, which the driver now enforces), and METRICS_API is
+unchanged (6).
 
 ## Prompt pack
 
@@ -25,7 +28,7 @@ decision, and METRICS_API is unchanged (6).
 | L4 | Lead | `goal_acceptance:` and `goal_probe:` under `## Verification standard`; the Lead declares the probe, never implements it |
 | L5 | both | `test-first` needs red-before-green evidence, `implement-then-smoke` needs the Evaluator to re-execute the smoke; a `full_check:` of `--verify-only`/receipt readers is not a whole-tree check; a mode switch needs `DECISION:` |
 | L8 | Evaluator | `AUTHORED-BY: lead` (take-over) or tests over Lead receipts: value accepts need `re-run`/`probe`, one re-execution per receipt family |
-| L9 | Evaluator | no SHIP (slice or whole-goal) without at least two concrete attacks listed |
+| L9 | Evaluator, driver | no SHIP (slice or whole-goal) without a counted `attacks:` list beyond the frozen checks: the driver enforces at least one (whole-goal prompts still ask for two); a whole-goal SHIP without it becomes ITERATE, a slice SHIP section without it is not accepted and the slice-eval is re-dispatched |
 | builder | Builder | maps each accept to its test: `ACCEPT_TEST: <accept> -> <file>::<test>` |
 
 Re-registration: the Lead and Evaluator Omnigent role configs changed
@@ -72,7 +75,7 @@ the loop driver through `.driver.json`). Budget: 120 s, PLAN.md
 ## Evidence telemetry and pre-gate flags (L1, L7)
 
 After each slice-eval the driver parses the section's `evidence:` line (or
-the per-accept table) and `attacks:` items and logs
+the per-accept table) and `attacks:` items (L9 is enforced, see above; the line is telemetry) and logs
 `slice <id> @<sha12> SHIP evidence: re-run=.. probe=.. implementer-test=..
 receipt=.. unverified=.. attacks=.. (shadow)`; after each integration-eval
 it logs `probe: PASS|FAIL|UNAVAILABLE|missing (shadow)`. Both land in

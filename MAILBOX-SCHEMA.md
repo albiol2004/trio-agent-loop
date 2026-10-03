@@ -762,10 +762,12 @@ their evidence kind and command, and ends with ONE summary line:
 evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
 
-The per-accept table, the `attacks:` list, the independent probe and the
-re-execution duties (implement-then-smoke, `AUTHORED-BY: lead` receipt
-families, data-work re-run) are whole-goal duties: the lockstep verdict
-and the open-loop integration verdict carry them (the Omnigent driver
+A SHIP section also carries an `attacks:` list (at least one `- <command or
+input> -> <what happened>` bullet beyond the slice's accepts and the frozen
+checks; see "Attacks gate" below). The per-accept table, the independent
+probe and the re-execution duties (implement-then-smoke, `AUTHORED-BY: lead`
+receipt families, data-work re-run) are whole-goal duties: the lockstep
+verdict and the open-loop integration verdict carry them (the Omnigent driver
 appends the generated `integration-rigor.md` to those prompts only).
 Tests on the canonical evaluator's tautology list (string presence on
 files the slice or Lead wrote, one- or two-character `in` checks,
@@ -779,9 +781,23 @@ The Omnigent driver parses each slice section after the slice-eval returns
 items) and logs `- iter N | loop | slice <id> @<sha12> SHIP|ITERATE
 evidence: re-run=<n> probe=<n> implementer-test=<n> receipt=<n>
 unverified=<n> attacks=<n|n/a> (shadow)` (`evidence: missing` when neither
-is present; `attacks=n/a` when the section lists none, the r19 norm),
-records it under `quality` in `.driver.json`, and trio-shadow prints it.
-Telemetry only.
+is present; `attacks=n/a` when the section lists none), records it under
+`quality` in `.driver.json`, and trio-shadow prints it. The line itself is
+telemetry and its format is unchanged, but attacks are no longer
+shadow-only for SHIP: the loop core counts the section's `attacks:` list
+(`count_attacks`: a bullet counts only as `<probe> -> <result>`, not a
+placeholder such as `none -> n/a`) and does not accept a slice SHIP section
+with no counted attack; it re-dispatches the slice-eval with the reason
+(cap 3, then `status: error`). An ITERATE section needs no attacks.
+
+**Attacks gate (every SHIP, acceptance on or off).** Frozen checks, a
+slice's accepts and PLAN's criteria are a floor. Besides the slice rule
+above, a whole-goal SHIP (lockstep verdict, open-loop integration verdict;
+`## slice` sections excluded) whose VERDICT.md has no counted `attacks:`
+bullet becomes ITERATE with scope none (`MIN_SHIP_ATTACKS = 1`; the
+whole-goal Evaluator prompt still asks for two). The gate runs before the
+frozen-pack SHIP gate. See LOG lines and `ship_gate` under "Frozen
+acceptance" and docs/FROZEN-ACCEPTANCE.md "Evaluation".
 
 **Pre-gate flags (r18a L7, advisory).** Before integrating an isolated
 builder, trioctl runs a deterministic AST/regex lint (no model call) over
@@ -968,12 +984,13 @@ validates them at base, freezes them, and the PLAN must map every one.
 <mailbox>/acceptance/
   MANIFEST.json      # acceptance_version: 1 (JSON)
   AUTHOR.md          # GOAL sentence inventory: testable-black-box /
-                     # testable-only-live / not-testable, drops + reasons
+                     # testable-only-live / not-testable, requirement list,
+                     # drops + reasons (untestable requirements live only here)
   checks/acc_NN_<slug>.{py,sh,mjs}
   checks/ACC-NN/...  # optional per-check files (only that check sees them)
   fakes/...          # fake CLIs / loopback servers / fixtures (shared)
   lib/...            # optional shared helpers (PYTHONPATH / NODE_PATH)
-  FROZEN             # written by the DRIVER: pin chain
+  FROZEN             # written by the DRIVER: pin chain (+ requirement_gaps:)
   AMENDMENTS.md      # created empty at freeze; append-only
 ```
 
@@ -983,10 +1000,24 @@ validates them at base, freezes them, and the PLAN must map every one.
 {default, goal_quote}}` and `checks: [{id: ACC-NN, goal_ref, goal_quote,
 kind, surface, run: [argv], expect: {exit: 0, stdout?|stderr?|output?: [regex]},
 timeout_s (<= 120), needs: [tool | setup:<id>], binds: [NAME], network:
-loopback}]`. `goal_quote` is a verbatim substring of GOAL.md (or
+loopback}]` and `requirements: [{id: R1, goal_ref, goal_quote, normal:
+[ACC-NN], hard: [{check: ACC-NN, type: boundary|interaction|failure-mode|
+malformed-input|concurrency, with?: <other requirement id, interaction
+only>}]}]`. `goal_quote` is a verbatim substring of GOAL.md (or
 `ACCEPTANCE-NOTES.md`). `kind`: `behaviour` (must FAIL at base, needs
 coverage), `doc` (help text/README obligation; must FAIL at base, needs
 coverage), `guard` (may PASS at base; at most 3; no coverage).
+
+`requirements` (one entry per testable GOAL requirement or constraint)
+needs at least one `normal` and one `hard` check per entry; a check is
+normal or hard within one requirement, never both, and a requirement no
+check can test stays out of the map (AUTHOR.md only). The freeze filter
+reports each gap as a `requirements: ...` line (also in `fatal`, so the
+author's single retry carries it); after the retry the survivors freeze
+and FROZEN records the gaps. A pack frozen before the rule (no
+`requirements` key) is a legacy pack: it loads and runs unchanged, with a
+once-per-loop LOG warning. Amendments cannot add the map (top-level keys are
+frozen). `validate` prints each gap as `REQUIREMENT GAP: <gap>`.
 
 Runner (`metrics/trio-acceptance.py run|validate|hash|verify`): exit 0
 PASS, 1 FAIL, 77 or an unmet `needs` UNAVAILABLE, a timeout is FAIL
@@ -1019,7 +1050,10 @@ start), no symlinks in the pack, env scrubbed of `*_TOKEN`/`*_KEY`/`*_SECRET`/
 `ACC_ID`, `ACC_BIND_<NAME>`.
 
 `FROZEN` lines: `manifest_sha256`, `base`, `frozen_utc`, `author`,
-`dropped: <id> <reason>; ...`, then the pin chain `pin[0]: <sha256>
+`dropped: <id> <reason>; ...`, an optional `unavailable_at_base:
+<ids>`, an optional `requirement_gaps: <gap>; <gap>` (the map gaps the
+author did not fix in its one retry; absent when the map is complete or the
+pack is legacy), then the pin chain `pin[0]: <sha256>
 freeze`, `pin[k]: <sha256> amend ACC-NN` / `restore`. `manifest_sha256` is
 the sha256 over the sorted `(relpath NUL bytes NUL)` of every pack file
 except `FROZEN` (`__pycache__`/`*.pyc` ignored).
@@ -1121,8 +1155,11 @@ for the drivers.
   `TRIO_ACCEPTANCE_STATE`).
 - **LOG lines** (`- iter N | loop | ...`): `acceptance: frozen <n>
   check(s) @<sha12> pin <sha12> (dropped <k>; author <model>)`,
-  `acceptance: author retry: ...`, `acceptance: author session
-  contaminated (...)`, `acceptance tamper restored (<role>)`, `lead pass
+  `acceptance: author retry: ...`, `acceptance: WARNING frozen with
+  requirement-map gaps after the retry: <n> (...)`, `acceptance: WARNING
+  legacy frozen pack: no requirements map (frozen before the requirement-map
+  rule); hard-check coverage is not enforced for this pack` (once per loop),
+  `acceptance: author session contaminated (...)`, `acceptance tamper restored (<role>)`, `lead pass
   refused: acceptance coverage`, `gate breach after lead: acceptance ...`,
   `acceptance: integration pre-run @<sha12>: p/t PASS ... · unavailable=<n>`,
   `acceptance: amendment of ACC-NN accepted|rejected: ...`, `acceptance:
@@ -1139,6 +1176,25 @@ for the drivers.
   missing)`, `acceptance: pack commits after the last driver pin <sha12>
   are not adopted and are restored as tamper ...`, `acceptance: forced
   NEEDS_HUMAN (acceptance-state-mismatch|acceptance-state-lost): ...`.
+  The attacks gate (acceptance on or off) adds: `SHIP refused by the
+  attacks gate (verdict becomes ITERATE): no attack beyond the frozen checks
+  (attacks=n/a|0)` (whole-goal SHIP; the driver also commits LOG.md as
+  `loop: iteration N — attacks gate refused SHIP (ITERATE)` when it is
+  tracked) and, open-loop per slice, `open-loop: slice <id> @<sha12> SHIP
+  not accepted (<reason>); re-dispatching slice-eval (attempt n)` (after
+  three attempts `open-loop: slice-eval for <id>@<sha> failed to write a
+  verdict section the driver accepts (<reason>) after 3 attempts` and
+  `status: error`).
+- **Attacks gate state.** A refused whole-goal SHIP leaves
+  `.driver.json` `ship_gate: {"iteration": K, "errors": [..]}`, K being the
+  iteration of the next Lead pass (refused iteration + 1). The driver hands
+  `errors` to that Lead (runner context `ship_gate_errors`, rendered as
+  `SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):`) and
+  clears the key once the pass ran; an entry for any other iteration is
+  stale and ignored. Every writer of `.driver.json` that rewrites the file
+  must preserve `ship_gate`. The unaccepted slice SHIP section's reason
+  goes to the re-dispatched slice-eval as context `slice_eval_errors`
+  (`SLICE-EVAL ERRORS FROM THE DRIVER:`); it is not persisted.
 - **Author audit.** Contamination is evidence of a *read* of the loop:
   a tool-call argument, never a tool's output or chat text, that names a
   path inside the loop repository (its checkout, git dir or mailbox;
@@ -1872,9 +1928,10 @@ under `quality` in `--json`.
   otherwise; builder exit 10; registry profile
   `cursor-grok-4.6-medium+glm-5.2-max-v4-acc` with the optional
   `trio-omnigent-acceptance` anchor. Independently of the switch (C1):
-  slice-eval sections carry one `evidence:` line (no table, attacks or
-  probe; `attacks=n/a` in the LOG line); the whole-goal rigor rides only on
-  integration-eval and lockstep prompts. See docs/FROZEN-ACCEPTANCE.md.
+  slice-eval sections carry one `evidence:` line plus an `attacks:` list (no
+  table or probe; a SHIP section needs at least one counted attack, see the
+  attacks gate); the whole-goal rigor rides only on integration-eval and
+  lockstep prompts. See docs/FROZEN-ACCEPTANCE.md.
 
 - **r16b** (no METRICS_API bump: no loop-core change): lockstep runs
   root-free (Lead, repair and Evaluator in the Lead worktree; the land is
