@@ -174,6 +174,16 @@ def test_ls_stale_ship_gate_errors_of_another_iteration_are_not_rendered(
     assert not any("SHIP GATE ERRORS" in p for p in _lead_plans(env))
 
 
+def test_ls_ship_gate_errors_merge_the_core_read_with_the_native_next_result(tmp_path):
+    TL._persist_ship_gate_errors(tmp_path, 4, ["core says no attack", "shared"])
+    ctx = SimpleNamespace(live_mailbox=tmp_path, next_ship_gate_errors=["native says it", "shared"])
+    assert driver._ship_gate_errors(ctx, 4) == ["core says no attack", "shared", "native says it"]
+    # another iteration's stored gate is stale; the native list alone still renders
+    assert driver._ship_gate_errors(ctx, 5) == ["native says it", "shared"]
+    ctx.next_ship_gate_errors = []
+    assert driver._ship_gate_errors(ctx, 5) == []
+
+
 class _Ctx:
     """Just enough of a RunContext for `_apply`'s attacks-gate notice."""
 

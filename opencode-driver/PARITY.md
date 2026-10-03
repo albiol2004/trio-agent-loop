@@ -42,6 +42,8 @@ Legend: **present** / **missing** / **partial** / **n/a** (with reason).
 | r19 coverage gate before builders, one re-plan | present | present | missing | present |
 | r19 pre-run at pin + SHIP gate (`review_verdict`, anti-thrash, amendments) | present | present | missing | present |
 | Lockstep evaluator gets integration rigor | present | present | present | present |
+| **Rule 1** SHIP attacks gate: every SHIP lists >=1 counted `attacks:` probe beyond the frozen checks, acceptance on or off | present (shared core `review_ship_attacks`) | present (native `op_apply`/`next`, `ship_gate_errors`) | n/a (new rule) | present: open-loop runs the core's gates (slice SHIP without an attack is re-dispatched with `SLICE-EVAL ERRORS FROM THE DRIVER`, integration SHIP is refused with `SHIP GATE ERRORS FROM THE DRIVER` in the next Lead plan, also when acceptance degraded to no pack); lockstep reads `TL.ship_gate_errors` into the Lead plan prompt and reports `ship_gate_refused`; every `.driver.json` rewrite preserves `ship_gate`; `quality.slice_evidence` counts attacks with the core's rule |
+| **Rule 2** requirement map: author maps each GOAL requirement to a normal and a hard check; gaps = one retry then loud freeze; legacy packs warn once | present (shared core `freeze_filter`/`_warn_legacy`) | present (same helper) | n/a (new rule) | present: gaps reach the author as `- pack: requirements: ...` through the existing retry feedback (author prompt adds one sentence: fix them with a hard check); legacy-pack WARNING comes from the inherited controller |
 
 ## Open-loop (QUEUE.md) mode
 
