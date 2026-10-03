@@ -94,8 +94,13 @@ def make_repo(tmp_path, *, queue=False) -> tuple[Path, Path]:
     return repo, mb
 
 
+DEFAULT_REQUIREMENTS = [{
+    "id": "R1", "goal_ref": "GOAL.md:3", "goal_quote": "feature f1 works",
+    "normal": ["ACC-01"], "hard": [{"check": "ACC-02", "type": "boundary"}]}]
+
+
 def author_pack(export: Path, *, n=N_CHECKS, passing_at_base=(), unavailable=(),
-                bad_quote=()) -> None:
+                bad_quote=(), requirements="default") -> None:
     acc = export / "acceptance"
     (acc / "checks").mkdir(parents=True, exist_ok=True)
     checks = []
@@ -117,9 +122,15 @@ def author_pack(export: Path, *, n=N_CHECKS, passing_at_base=(), unavailable=(),
                        "run": ["python3", f"acceptance/checks/acc_{k:02d}.py"],
                        "expect": {"exit": 0}, "timeout_s": 30, "needs": [], "binds": [],
                        "network": "loopback"})
-    (acc / "MANIFEST.json").write_text(json.dumps(
-        {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-         "checks": checks}, indent=2))
+    manifest = {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
+                "checks": checks}
+    # The requirement map (every GOAL requirement with a normal and a hard
+    # check): "default" is one requirement over ACC-01/ACC-02; None omits it.
+    if requirements == "default":
+        manifest["requirements"] = DEFAULT_REQUIREMENTS
+    elif requirements is not None:
+        manifest["requirements"] = requirements
+    (acc / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
     (acc / "AUTHOR.md").write_text("# inventory\n")
 
 

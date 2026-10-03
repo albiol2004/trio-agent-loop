@@ -255,8 +255,12 @@ def test_f3_one_import_drop_forces_the_retry(tmp_path):
     (acc / "checks").mkdir(parents=True)
     (acc / "checks" / "a.py").write_text("pass\n")
     checks = [_chk(f"ACC-{n:02d}", ["python3", "acceptance/checks/a.py"]) for n in range(1, 11)]
+    # The requirement map (ACC-01 normal, ACC-02 hard) keeps the clean pack
+    # from needing a retry for a missing map.
+    reqs = [{"id": "R1", "goal_ref": "GOAL.md:1", "goal_quote": "x", "normal": ["ACC-01"],
+             "hard": [{"check": "ACC-02", "type": "boundary"}]}]
     man = {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-           "checks": checks}
+           "checks": checks, "requirements": reqs}
     tb = ('Traceback (most recent call last):\n  File "acceptance/checks/a.py", line 1, '
           "in <module>\nModuleNotFoundError: No module named 'yaml'\n")
     base = {"results": [{"id": c["id"], "outcome": "FAIL", "reason": "x", "excerpt": ""}

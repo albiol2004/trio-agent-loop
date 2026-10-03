@@ -2424,6 +2424,38 @@ class AcceptanceController:
     def _log(self, iteration: int, text: str) -> None:
         _append_log(self.mailbox, f"- iter {iteration} | loop | acceptance: {text}")
 
+    def _warn_legacy(self, iteration: int) -> None:
+        """Log once per loop that the frozen pack predates the requirement
+        map. Stateless callers (a controller per helper op) dedupe on the
+        LOG line itself; the pack is never rewritten."""
+        if not self.frozen() or getattr(self, "_legacy_checked", False):
+            return
+        self._legacy_checked = True
+        manifest = None
+        try:
+            shown = _git(self.repo, "show", f"{self.state.get('pin_commit')}:"
+                         f"{self.acc_rel}/{self.ta.MANIFEST}")
+            if shown.returncode == 0:
+                manifest = json.loads(shown.stdout or "{}")
+        except (json.JSONDecodeError, OSError):
+            manifest = None
+        if not isinstance(manifest, dict):
+            try:
+                manifest = self.ta.load_manifest(self.acc_dir)
+            except self.ta.ManifestError:
+                return
+        warning = self.ta.legacy_pack_warning(manifest)
+        if not warning or self.ta.read_frozen(self.acc_dir).get("requirement_gaps"):
+            # (A pack frozen with the rule in force but gap-ridden has its own warning.)
+            return
+        line = f"acceptance: WARNING {warning}"
+        try:
+            if line in (self.mailbox / "LOG.md").read_text(encoding="utf-8", errors="replace"):
+                return
+        except OSError:
+            pass
+        self._log(iteration, f"WARNING {warning}")
+
     # ------------------------------------------------------ author phase
 
     def start(self, iteration: int) -> None:
@@ -2435,6 +2467,7 @@ class AcceptanceController:
             return
         if self.frozen():
             # A missing or edited working-tree pack is check_pin's to restore.
+            self._warn_legacy(iteration)
             self._publish()
             return
         if self._has_pack():
@@ -2569,9 +2602,12 @@ class AcceptanceController:
                             "retry": True, "fatal": ["no manifest"]}
             if filtered["retry"] and not retried:
                 retried = True
+                gaps = filtered.get("requirement_gaps") or []
                 self._log(iteration, "author retry: "
                           + (f"{len(filtered['dropped'])} dropped" if filtered["dropped"]
-                             else "; ".join(filtered["fatal"][:2]) or "too few checks"))
+                             else "; ".join(filtered["fatal"][:2]) or "too few checks")
+                          + (f"; {len(gaps)} requirement gap(s)" if gaps and filtered["dropped"]
+                             else ""))
                 continue
             break
         self._freeze(iteration, export, filtered, author, info, goal, notes)
@@ -2602,6 +2638,10 @@ class AcceptanceController:
         extra = {}
         if filtered.get("unavailable_at_base"):
             extra["unavailable_at_base"] = ", ".join(filtered["unavailable_at_base"])
+        gaps = [str(g) for g in filtered.get("requirement_gaps") or []]
+        if gaps:
+            extra["requirement_gaps"] = "; ".join(g.replace(";", ",").replace("\n", " ")
+                                                  for g in gaps)
         (self.acc_dir / ta.FROZEN).write_text(ta.frozen_text(
             pin, info["base"], f"{model} {author.get('session') or '-'}", dropped,
             [(pin, "freeze")], extra=extra), encoding="utf-8")
@@ -2628,6 +2668,9 @@ class AcceptanceController:
             self._log(iteration, "empty (0 checks survived validation; coverage is vacuous)")
         self._log(iteration, f"frozen {n} check(s) @{sha[:12]} pin {pin[:12]} "
                              f"(dropped {len(dropped)}; author {model})")
+        if gaps:
+            self._log(iteration, "WARNING frozen with requirement-map gaps after the retry: "
+                                 f"{len(gaps)} ({'; '.join(g[:120] for g in gaps[:3])})")
 
     def freeze_from_export(self, export: Path, author: dict, iteration: int = 0) -> int:
         """`trioctl omnigent acceptance freeze`: validate an authored export
@@ -2910,6 +2953,7 @@ class AcceptanceController:
                                    f"{self.acc_rel}/{ta.MANIFEST}").stdout or "{}").get("goal_sha256")
         except (json.JSONDecodeError, AttributeError):
             want = None
+        self._warn_legacy(iteration)
         goal = self.mailbox / "GOAL.md"
         if want and goal.is_file() and ta.file_sha256(goal) != want:
             self._resume_error = AcceptanceNeedsHuman(

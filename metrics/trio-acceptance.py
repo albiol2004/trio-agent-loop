@@ -119,6 +119,12 @@ CHECK_KEYS = {
 }
 #: The only per-check fields an Evaluator amendment may change (§3.4).
 AMENDABLE_KEYS = ("run", "expect", "timeout_s", "binds", "needs")
+# The requirement map (top-level `requirements`): every GOAL requirement and
+# constraint with >=1 normal and >=1 HARD check; hard-check types below.
+HARD_TYPES = ("boundary", "interaction", "failure-mode", "malformed-input", "concurrency")
+REQUIREMENT_KEYS = frozenset({"id", "goal_ref", "goal_quote", "normal", "hard"})
+HARD_KEYS = frozenset({"check", "type", "with"})
+REQUIREMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 IMMUTABLE_KEYS = ("id", "goal_quote", "kind")
 SKIP_DIRS = frozenset({
     ".git", "node_modules", "__pycache__", ".pytest_cache", ".venv", "venv",
@@ -407,6 +413,139 @@ def manifest_errors(manifest: dict[str, Any], goal_text: str | None = None,
     if dup:
         errs.append(f"duplicate check id(s): {', '.join(dup)}")
     return errs
+
+
+def has_requirements_map(manifest: dict[str, Any]) -> bool:
+    """True when the manifest carries the requirement map (key present, a
+    list). A pack frozen before the requirement-map rule lacks the key."""
+    return isinstance(manifest.get("requirements"), list)
+
+
+LEGACY_PACK_WARNING = (
+    "legacy frozen pack: no requirements map (frozen before the requirement-map rule); "
+    "hard-check coverage is not enforced for this pack")
+
+
+def legacy_pack_warning(manifest: dict[str, Any]) -> str | None:
+    """The loud warning for a frozen pack without the requirement map."""
+    return None if has_requirements_map(manifest) else LEGACY_PACK_WARNING
+
+
+MISSING_MAP_GAP = ("requirements: missing \u2014 list every GOAL requirement and constraint "
+                   "with >=1 normal and >=1 hard check")
+
+
+def _drop_note(dropped: dict[str, str], cid: str) -> str:
+    reason = (dropped.get(cid) or "").strip().splitlines()[0:1]
+    return f"was dropped at freeze ({reason[0][:100]})" if reason else "unknown"
+
+
+def requirements_problems(manifest: dict[str, Any], kept_ids: Iterable[str],
+                          goal_text: str | None, notes_text: str | None = None,
+                          dropped: Iterable[tuple[str, str]] | None = None) -> list[str]:
+    """Gaps of the manifest's requirement map against the checks that
+    survive the freeze ([] = every requirement has >=1 normal and >=1 hard
+    check). Each problem is one line prefixed ``requirements: ``; the order
+    is deterministic (missing map, then entries in list order)."""
+    reqs = manifest.get("requirements")
+    if not isinstance(reqs, list) or not reqs:
+        return [MISSING_MAP_GAP]
+    kept = set(kept_ids)
+    why = {str(i): str(r) for i, r in dropped or ()}
+    entries = [e for e in reqs if isinstance(e, dict)]
+    req_ids = {e["id"] for e in entries
+               if isinstance(e.get("id"), str) and REQUIREMENT_ID_RE.match(e["id"])}
+    probs: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str) -> None:
+        line = f"requirements: {text}"
+        if line not in probs:
+            probs.append(line)
+
+    for n, entry in enumerate(reqs, 1):
+        if not isinstance(entry, dict):
+            add(f"entry #{n} is not an object")
+            continue
+        rid = entry.get("id")
+        if not isinstance(rid, str) or not REQUIREMENT_ID_RE.match(rid):
+            add(f"entry #{n} id {rid!r} is not a short identifier (e.g. R1)")
+            label = f"entry #{n}"
+        else:
+            label = rid
+            if rid in seen:
+                add(f"{rid} is duplicated")
+            seen.add(rid)
+        unknown = sorted(set(entry) - REQUIREMENT_KEYS)
+        if unknown:
+            add(f"{label} has unknown key(s) {', '.join(unknown)}")
+        ref = entry.get("goal_ref")
+        if ref is not None and not (isinstance(ref, str) and ref.strip()):
+            add(f"{label} goal_ref must be a string such as GOAL.md:12")
+        quote = entry.get("goal_quote")
+        if not isinstance(quote, str) or not quote.strip():
+            add(f"{label} goal_quote is empty")
+        elif goal_text is not None and not any(
+                quote in text for text in _goal_texts(goal_text, notes_text)):
+            add(f"{label} goal_quote is not a verbatim substring of GOAL.md or the notes")
+        normal = entry.get("normal")
+        normal_ok: set[str] = set()
+        if not isinstance(normal, list) or not normal:
+            add(f"{label} has no normal check")
+        else:
+            for cid in normal:
+                if not isinstance(cid, str):
+                    add(f"{label} normal check {cid!r} is not a check id")
+                elif cid in kept:
+                    normal_ok.add(cid)
+                else:
+                    add(f"{label} normal check {cid} {_drop_note(why, cid)}")
+            if not normal_ok:
+                add(f"{label} has no normal check")
+        hard = entry.get("hard")
+        hard_ok = 0
+        if not isinstance(hard, list) or not hard:
+            add(f"{label} has no hard check")
+        else:
+            for item in hard:
+                if not isinstance(item, dict):
+                    add(f"{label} hard item {item!r} is not an object "
+                        "{check, type[, with]}")
+                    continue
+                cid = item.get("check")
+                tag = f"{label} hard check {cid}"
+                good = True
+                bad_keys = sorted(set(item) - HARD_KEYS)
+                if bad_keys:
+                    add(f"{tag} has unknown key(s) {', '.join(bad_keys)}")
+                    good = False
+                if not isinstance(cid, str):
+                    add(f"{label} hard item names no check id")
+                    continue
+                if cid not in kept:
+                    add(f"{tag} {_drop_note(why, cid)}")
+                    good = False
+                elif isinstance(normal, list) and cid in normal:
+                    add(f"{tag} is also listed as normal (a check is normal or hard for "
+                        "one requirement, not both)")
+                    good = False
+                typ = item.get("type")
+                if typ not in HARD_TYPES:
+                    add(f"{tag} type {typ!r} is not one of {', '.join(HARD_TYPES)}")
+                    good = False
+                other = item.get("with")
+                if typ == "interaction":
+                    if not isinstance(other, str) or other not in req_ids or other == rid:
+                        add(f"{tag} is an interaction and needs `with` = the id of "
+                            "another requirement")
+                        good = False
+                elif "with" in item:
+                    add(f"{tag}: `with` is only allowed for type interaction")
+                    good = False
+                hard_ok += good
+            if not hard_ok:
+                add(f"{label} has no hard check")
+    return probs
 
 
 def covered_ids(manifest: dict[str, Any]) -> list[str]:
@@ -1585,7 +1724,8 @@ def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
     """Apply §2.6 to an authored manifest and its run at base.
 
     Returns ``{"manifest": kept manifest, "dropped": [(id, reason)],
-    "unavailable_at_base": [ids], "retry": bool, "fatal": [pack errors]}``.
+    "unavailable_at_base": [ids], "retry": bool, "fatal": [pack errors],
+    "requirement_gaps": [requirement-map gaps, also appended to fatal]}``.
     """
     fatal = manifest_errors(manifest, goal_text, notes_text)
     if acc_root is not None:
@@ -1651,11 +1791,17 @@ def freeze_filter(manifest: dict[str, Any], base_result: dict[str, Any] | None,
         kept = kept[:MAX_CHECKS]
     new = dict(manifest)
     new["checks"] = kept
+    gaps = requirements_problems(manifest, [c["id"] for c in kept], goal_text, notes_text,
+                                 dropped)
+    # The gaps ride in `fatal` too: every driver's retry feedback forwards
+    # `fatal` as `- pack: ...` lines, and nothing downstream refuses to
+    # freeze on it (after the one retry the survivors freeze anyway).
+    fatal.extend(gaps)
     total = len(checks) or 1
     retry = bool(fatal) or (len(dropped) / total > RETRY_DROP_FRACTION) or len(kept) < MIN_CHECKS \
         or any(reason.startswith(PACK_IMPORT_DROP) for _, reason in dropped)
     return {"manifest": new, "dropped": dropped, "unavailable_at_base": unavailable,
-            "retry": retry, "fatal": fatal}
+            "retry": retry, "fatal": fatal, "requirement_gaps": gaps}
 
 
 # ------------------------------------------------------------ the export
@@ -2997,6 +3143,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except (ManifestError, RuntimeError) as exc:
         print(f"trio-acceptance: {exc}", file=sys.stderr)
         return 2
+    try:
+        legacy = legacy_pack_warning(load_manifest(acc))
+    except ManifestError:
+        legacy = None
+    if legacy:
+        print(f"trio-acceptance: WARNING {legacy}", file=sys.stderr)
     text = json.dumps(result, indent=2)
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
@@ -3025,8 +3177,12 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         print(f"INVALID: {exc}")
         return 1
     filtered = freeze_filter(manifest, result, goal, notes, acc)
+    gaps = filtered.get("requirement_gaps") or []
     for err in filtered["fatal"]:
-        print(f"INVALID pack: {err}")
+        if err not in gaps:
+            print(f"INVALID pack: {err}")
+    for gap in gaps:
+        print(f"REQUIREMENT GAP: {gap}")
     for cid, reason in filtered["dropped"]:
         print(f"WOULD DROP {cid}: {reason}")
     for cid in filtered["unavailable_at_base"]:

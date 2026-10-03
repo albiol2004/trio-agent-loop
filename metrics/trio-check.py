@@ -1430,6 +1430,14 @@ def acceptance_findings(loop_dir: Path, tm) -> list[tuple[str, str]]:
                 out.append(("VIOLATION", f"acceptance pack hash {now[:12]} != pinned "
                                          f"{pin[:12]} in FROZEN (edited outside the "
                                          "freeze/amend protocol)"))
+    if ta is not None and (acc / "FROZEN").is_file() and st["manifest"] is not None:
+        gaps = ta.read_frozen(acc).get("requirement_gaps")
+        legacy = ta.legacy_pack_warning(st["manifest"])
+        if gaps:
+            out.append(("WARN", "acceptance pack was frozen with requirement-map gaps after "
+                                f"the author's retry: {_clip(gaps, 300)}"))
+        elif legacy:
+            out.append(("WARN", legacy))
     covered = st["covered"]
     if covered and st["manifest"] is not None:
         only_lead = [c for c in covered if c in st["lead"] and c not in st["covers"]]
