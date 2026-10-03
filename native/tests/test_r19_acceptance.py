@@ -123,8 +123,21 @@ class Run:
         return out
 
 
+def requirements_map(n: int, passing: tuple = (), gap: bool = False) -> list:
+    """The pack's requirement map (Rule 2): R1 quotes the GOAL, its normal
+    check is the first check that survives the freeze (one that passes at
+    base is dropped) and its hard check the second. ``gap`` leaves R1 with
+    no hard check (a map the freeze flags)."""
+    kept = [f"ACC-{k:02d}" for k in range(1, n + 1) if k not in passing]
+    entry: dict = {"id": "R1", "goal_ref": "GOAL.md:2", "goal_quote": QUOTE,
+                   "normal": kept[:1], "hard": []}
+    if len(kept) > 1 and not gap:
+        entry["hard"] = [{"check": kept[1], "type": "boundary"}]
+    return [entry]
+
+
 def write_pack(export: Path, n: int = 5, *, passing: tuple = (), unavailable: tuple = (),
-               quote: str = QUOTE) -> None:
+               quote: str = QUOTE, requirements: bool | list = True) -> None:
     acc = export / "acceptance"
     (acc / "checks").mkdir(parents=True, exist_ok=True)
     checks = []
@@ -141,9 +154,13 @@ def write_pack(export: Path, n: int = 5, *, passing: tuple = (), unavailable: tu
                        "kind": "behaviour", "surface": "cli",
                        "run": ["python3", f"acceptance/checks/{name}"],
                        "expect": {"exit": 0}, "timeout_s": 30})
-    (acc / "MANIFEST.json").write_text(json.dumps({
-        "acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-        "checks": checks}, indent=2), encoding="utf-8")
+    manifest = {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
+                "checks": checks}
+    if requirements is True:
+        manifest["requirements"] = requirements_map(n, passing)
+    elif requirements:
+        manifest["requirements"] = requirements
+    (acc / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     (acc / "AUTHOR.md").write_text("# inventory\n- testable-black-box: hello N\n",
                                    encoding="utf-8")
 
