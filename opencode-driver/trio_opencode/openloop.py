@@ -298,7 +298,8 @@ def _make_sidecar_writer(ctx: "drv.RunContext") -> Callable[..., None]:
             "lead_alive": lead_alive, "eval_alive": eval_alive, "started_at": started_at,
         }
         with ctx.driver_json_lock:
-            drv._atomic_write_json(mailbox / ".driver.json", payload)
+            drv._atomic_write_json(mailbox / ".driver.json",
+                                   drv._preserve_ship_gate(mailbox / ".driver.json", payload))
             drv._atomic_write_json(mailbox / ".session.json", session_payload)
             # Keep driver.py's own (non-open-loop-aware) write_driver_json
             # from dropping these keys when a role turn's on_spawn/
@@ -491,7 +492,8 @@ class DegradableAcceptance(TL.AcceptanceController):
       (contaminated twice, validation never passed, a crashed or timed-out
       turn, ...), every acceptance hook becomes a no-op, a loud
       ``acceptance: DEGRADED`` LOG line says so, and the loop carries on as if
-      acceptance were off: no coverage gate, no pre-runs, no SHIP gate. The
+      acceptance were off: no coverage gate, no pre-runs, no frozen-acceptance SHIP
+      gate (the attacks gate is not part of acceptance and still applies). The
       Omnigent, native and lockstep paths END the run with ``status: error``
       here (``_acceptance_stop``); a benchmark run must not. Failures that
       are NOT the author's -- a frozen pack tampered with, a state mismatch
@@ -527,7 +529,8 @@ class DegradableAcceptance(TL.AcceptanceController):
             self.mailbox,
             f"- iter {iteration} | loop | acceptance: DEGRADED to no frozen pack "
             f"({exc.reason}): {exc.detail[:300]}; the loop continues WITHOUT frozen "
-            "acceptance (no coverage gate, no pre-runs, no SHIP gate)",
+            "acceptance (no coverage gate, no pre-runs, no frozen-acceptance SHIP gate; "
+            "the attacks gate still applies)",
         )
         self._set_meta("acceptance", {"enabled": True, "status": "degraded",
                                       "degraded": self.degraded, "pin": None,
@@ -942,6 +945,7 @@ class OpenLoopRunner:
             "tmpdir": ctx.tmpdir,
             "queue_errors": context.get("queue_errors") or [],
             "acceptance_errors": context.get("acceptance_errors") or [],
+            "ship_gate_errors": context.get("ship_gate_errors") or [],
             "open_faults": open_faults, "retired": retired, "refusals": [], "repos": repos_decl,
         }
         if TL._read_plan_slice_ids(mailbox) is None:
@@ -1478,6 +1482,7 @@ class OpenLoopRunner:
                 "tmpdir": ctx.tmpdir, "slice": slice_id, "sha": sha, "eval_worktree": str(cwd),
                 "repo_name": repo_name or "home", "shadow": shadow, "lead_worktree": str(ctx.repo),
                 "acceptance_covered": context.get("acceptance_covered"),
+                "slice_eval_errors": context.get("slice_eval_errors") or [],
             }
             if note:
                 eval_ctx["quality_note"] = note
@@ -2329,10 +2334,7 @@ def drive(ctx: "drv.RunContext", *, mode: str, max_iterations: int, settings: di
     # exactly as it would for a `code` it got back normally.
     final = _finalize_result(ctx, runner, code, settings, exc=caught)
     _remove_leftover_eval_worktrees(ctx)
-    try:
-        ctx.driver_json_path.unlink()
-    except OSError:
-        pass
+    drv._retire_driver_json(ctx.driver_json_path)
     drv._atomic_write_json(live_mailbox / drv.RESULT_FILE, final)
     if final.get("land") and final["land"].get("status") == "landed" and ctx.lead_record:
         final["teardown"] = rootfree.teardown(ctx.lead_record)

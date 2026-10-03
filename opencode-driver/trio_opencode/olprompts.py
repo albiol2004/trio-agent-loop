@@ -55,7 +55,8 @@ _COMMON_KEYS = (
 )
 
 # ctx keys REQUIRED for one kind (frozen; see the S4b/ol-prompts briefs).
-# `quality_note` (slice-eval) and `rigor` (integration-eval) are optional
+# `quality_note` (slice-eval), `slice_eval_errors` (slice-eval),
+# `ship_gate_errors` (lead-plan) and `rigor` (integration-eval) are optional
 # and deliberately left out of this map.
 _KIND_KEYS: dict[str, tuple[str, ...]] = {
     "lead-plan": (
@@ -267,6 +268,12 @@ def _render_lead_plan(ctx: dict[str, Any]) -> str:
             "acceptance gate):"
         )
         lines += [f"- {e}" for e in acceptance_errors]
+
+    ship_gate_errors = ctx.get("ship_gate_errors") or []
+    if ship_gate_errors:
+        lines.append("")
+        lines.append("SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):")
+        lines += [f"- {e}" for e in ship_gate_errors]
 
     refusals = ctx.get("refusals") or []
     if refusals:
@@ -591,6 +598,12 @@ def _render_slice_eval(ctx: dict[str, Any]) -> str:
         body += str(ctx["quality_note"])
 
     lines.append(body.rstrip("\n"))
+
+    slice_eval_errors = ctx.get("slice_eval_errors") or []
+    if slice_eval_errors:
+        lines.append("")
+        lines.append("SLICE-EVAL ERRORS FROM THE DRIVER:")
+        lines += [f"- {e}" for e in slice_eval_errors]
 
     if ctx.get("acceptance_covered"):
         lines.append("")

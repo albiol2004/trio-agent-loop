@@ -147,6 +147,54 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+def _preserve_ship_gate(path: Path, payload: dict) -> dict:
+    """Carry the core's pending ``ship_gate`` (the attacks gate's refusal of
+    the last SHIP, persisted in `.driver.json` by ``TL.review_ship_attacks``)
+    from the file currently on disk into a whole-file ``payload`` about to
+    replace it. Read fresh from disk on every write (never cached): a gate
+    the core cleared in between is not resurrected, one it just persisted is
+    not dropped. Best effort: an unreadable file preserves nothing."""
+    gate = _read_json(path).get("ship_gate")
+    if isinstance(gate, dict):
+        payload["ship_gate"] = gate
+    else:
+        payload.pop("ship_gate", None)
+    return payload
+
+
+def _retire_driver_json(path: Path) -> None:
+    """End-of-run removal of `.driver.json` (the run is over, nothing to
+    resume). A still-pending ``ship_gate`` (a refused SHIP the loop stopped
+    before any Lead pass could read) survives as a file carrying only that
+    key, so a later resume's Lead still gets the refusal."""
+    gate = _read_json(path).get("ship_gate")
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if isinstance(gate, dict):
+        try:
+            _atomic_write_json(path, {"ship_gate": gate})
+        except OSError:
+            pass
+
+
+def _ship_gate_errors(ctx: "RunContext", iteration: int) -> list[str]:
+    """The attacks-gate errors the Lead plan call for ``iteration`` must
+    show: the core's own read-only ``TL.ship_gate_errors`` (works whether or
+    not the native helper reports them) merged with any the native ``next``
+    result carried (``ctx.next_ship_gate_errors``), deduped, in order."""
+    merged: list[str] = []
+    try:
+        merged += [str(e) for e in (steplib.TL.ship_gate_errors(ctx.live_mailbox, iteration) or [])]
+    except Exception:  # noqa: BLE001 - never block a Lead pass on this
+        pass
+    for e in ctx.next_ship_gate_errors or []:
+        if str(e) not in merged:
+            merged.append(str(e))
+    return merged
+
+
 def extract_json_block(text: str) -> dict | None:
     """The last fenced ```json/```jsonc/bare ``` block in ``text`` that
     parses as a JSON object; ``None`` when there is none."""
@@ -477,6 +525,12 @@ class RunContext:
         self.state_snapshot: dict[str, str] | None = None
         self._last_phase = "begin"
         self._last_iteration = 0
+        #: Attacks-gate (rule 1) bookkeeping, acceptance on or off: the
+        #: `ship_gate_errors` a native `next` result carried (merged with the
+        #: core's own read in `_ship_gate_errors`), and every SHIP the gate
+        #: refused this run (`[{"iteration": N, "became": "ITERATE"}]`).
+        self.next_ship_gate_errors: list[str] = []
+        self.ship_gate_refused: list[dict[str, Any]] = []
         # r19 frozen acceptance (docs/FROZEN-ACCEPTANCE.md): `acceptance` is
         # the resolved switch for this run (fixed at `run()`'s call);
         # `acc` is the script's held digest (native's `ACC` global, mirrored
@@ -670,7 +724,8 @@ class RunContext:
             for key, value in self.driver_extra.items():
                 payload.setdefault(key, value)
         with self.driver_json_lock:
-            _atomic_write_json(self.driver_json_path, payload)
+            _atomic_write_json(self.driver_json_path,
+                               _preserve_ship_gate(self.driver_json_path, payload))
 
     def on_spawn(self, pid: int, pgid: int, *, label: str, session_id: str | None) -> None:
         with self._turns_lock:
@@ -1235,7 +1290,8 @@ def _coverage_gate(ctx: RunContext, *, iteration: int, rec: dict, plan: dict,
         prompt = prompts.lead_plan_prompt(
             iteration, str(ctx.live_mailbox), str(ctx.repo), ctx.tmpdir,
             human_answer=human_answer, reclaimed=reclaimed, begin_iteration=begin_iteration,
-            acc_lines=acc_lines, plan_schema_hint=prompts.PLAN_SCHEMA_HINT_ACC)
+            acc_lines=acc_lines, plan_schema_hint=prompts.PLAN_SCHEMA_HINT_ACC,
+            ship_gate_errors=_ship_gate_errors(ctx, iteration))
         result = _call_role(ctx, role="lead", agent=AGENTS["lead"], model=lead_model,
                             prompt=prompt, cwd=ctx.repo, label=f"lead plan it{iteration} (re-plan)")
         session_id = result.session_id
@@ -1366,7 +1422,8 @@ def _run_lead_pass(ctx: RunContext, *, iteration: int, rec: dict,
         iteration, str(ctx.live_mailbox), str(ctx.repo), ctx.tmpdir,
         human_answer=human_answer, reclaimed=reclaimed, begin_iteration=begin_iteration,
         acc_lines=acc_lines,
-        plan_schema_hint=prompts.PLAN_SCHEMA_HINT_ACC if ctx.acceptance else prompts.PLAN_SCHEMA_HINT)
+        plan_schema_hint=prompts.PLAN_SCHEMA_HINT_ACC if ctx.acceptance else prompts.PLAN_SCHEMA_HINT,
+        ship_gate_errors=_ship_gate_errors(ctx, iteration))
     plan_result = _call_role(ctx, role="lead", agent=AGENTS["lead"], model=lead_model,
                              prompt=plan_prompt, cwd=cwd, label=f"lead plan it{iteration}")
     plan = _structured(ctx, result=plan_result, required=("slices",), cwd=cwd, role="lead",
@@ -1605,7 +1662,36 @@ def _apply(ctx: RunContext, *, iteration: int, pin: dict, rec: dict) -> dict:
             ctx.acc_log["ship_refused"].append({"iteration": iteration, "became": a.get("verdict")})
             ctx.out(f"iteration {iteration}: the frozen-acceptance gate refused the SHIP "
                    f"(verdict becomes {a.get('verdict')})")
+    _note_attacks_gate(ctx, iteration, a)
     return a
+
+
+def _attacks_gate_refused(ctx: RunContext, iteration: int, a: dict) -> bool:
+    """Did the attacks gate (rule 1) refuse this iteration's SHIP? The
+    native op-result key ``attacks_gate: {"refused": true, ...}`` when the
+    helper reports it, else the core's LOG refusal line for the iteration
+    (only consulted when the verdict is no longer SHIP)."""
+    gate = a.get("attacks_gate")
+    if isinstance(gate, dict):
+        return bool(gate.get("refused"))
+    if str(a.get("verdict") or "").upper() == "SHIP":
+        return False
+    try:
+        log = (ctx.live_mailbox / "LOG.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    marker = f"- iter {iteration} | loop | SHIP refused by the attacks gate"
+    return any(line.startswith(marker) for line in log.splitlines())
+
+
+def _note_attacks_gate(ctx: RunContext, iteration: int, a: dict) -> None:
+    if not _attacks_gate_refused(ctx, iteration, a):
+        return
+    if not any(r.get("iteration") == iteration for r in ctx.ship_gate_refused):
+        ctx.ship_gate_refused.append({"iteration": iteration,
+                                      "became": a.get("verdict") or "ITERATE"})
+    ctx.out(f"iteration {iteration}: the attacks gate refused the SHIP "
+           f"(verdict becomes {a.get('verdict') or 'ITERATE'})")
 
 
 # --------------------------------------------------------------- registry
@@ -2085,6 +2171,9 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
                     break
                 ctx.acc = steplib.acc_take(ctx.acc, n, "next")
             iteration = n["iteration"]
+            ctx.next_ship_gate_errors = [
+                str(e) for e in (n.get("ship_gate_errors") or []) if e
+            ] if isinstance(n.get("ship_gate_errors"), list) else []
             ctx.write_driver_json(phase=f"{action}-running", iteration=iteration)
             # Native pushes one `iterations[]` record per next() action, even
             # "evaluate" (role: null) — REVIEW-driver.md item 11.
@@ -2110,6 +2199,14 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
                     human_answer=n.get("human_answer"), reclaimed=reclaimed,
                     begin_iteration=begin_iteration,
                 )
+                if _ship_gate_errors(ctx, iteration):
+                    # The Lead pass got the refused SHIP's errors; spend them
+                    # (mirrors TL._run_role's clear after the runner ran).
+                    try:
+                        steplib.TL.clear_ship_gate_errors(ctx.live_mailbox)
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                    ctx.next_ship_gate_errors = []
             else:
                 raise DriverStop("error", 3, f"next: unknown action {action!r}")
             pin = _pin_and_evaluate(ctx, iteration=iteration)
@@ -2141,6 +2238,7 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
     final["lead_worktree"] = str(ctx.lead_record.path) if ctx.lead_record else None
     final["branch"] = ctx.lead_record.branch if ctx.lead_record else None
     final["land"] = None
+    final["ship_gate_refused"] = list(ctx.ship_gate_refused)
 
     # REVIEW-driver.md item 8: land (while still holding the mailbox lock)
     # -> end (release it) -> write the result to the live mailbox -> only
@@ -2191,10 +2289,7 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
         if ctx.acc_log.get("author_isolation"):
             final["acceptance"]["author_isolation"] = ctx.acc_log["author_isolation"]
 
-    try:
-        ctx.driver_json_path.unlink()
-    except OSError:
-        pass
+    _retire_driver_json(ctx.driver_json_path)
     _atomic_write_json(ctx.live_mailbox / RESULT_FILE, final)
 
     if land_result is not None and land_result.get("status") == "landed":

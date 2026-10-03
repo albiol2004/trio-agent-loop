@@ -214,6 +214,17 @@ def acc_plan_lines(mailbox: str, tool: str, acc: dict | None, *,
     return lines
 
 
+def ship_gate_lines(errors: list[str] | None) -> list[str]:
+    """The attacks gate's refusal of the last SHIP (whole-goal rule 1:
+    every SHIP needs at least one counted adversarial probe beyond the
+    frozen checks), rendered for the next Lead plan call -- with acceptance
+    on or off. Same block shape as the portable runner's."""
+    if not errors:
+        return []
+    return ["", "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):"] + [
+        f"- {e}" for e in errors]
+
+
 def acc_pass_lines(role: str, mailbox: str, tool: str) -> list[str]:
     """``accPassLines()`` (native): the short reminder every other Lead/
     repair call gets (fresh agents, no plan-call context)."""
@@ -292,6 +303,11 @@ def author_prompt(export: str, tool: str, marker: str, attempt: int, *,
                  "or replace these and stay within the rules:"]
         lines += [f"- {d[0]}: {d[1]}" for d in dropped]
         lines += [f"- pack: {f}" for f in fatal]
+        if any(str(f).startswith("requirements:") for f in fatal):
+            lines.append("A `requirements:` line is a requirement-map gap: fix it by "
+                         "adding a hard check (boundary, interaction, failure-mode, "
+                         "malformed-input or concurrency) for that requirement, and map "
+                         "it in MANIFEST.json `requirements`.")
     lines += ["", "Return through the structured output: `checks` (the number of checks in "
              "MANIFEST.json) and `summary` (one line).",
              "", json_block_instruction(ACCEPTANCE_AUTHOR_SCHEMA_HINT)]
@@ -303,7 +319,8 @@ def lead_plan_prompt(iteration: int, mailbox: str, repo: str | None, tmpdir: str
                      reclaimed: dict | None = None,
                      begin_iteration: int | None = None,
                      acc_lines: list[str] | None = None,
-                     plan_schema_hint: str = PLAN_SCHEMA_HINT) -> str:
+                     plan_schema_hint: str = PLAN_SCHEMA_HINT,
+                     ship_gate_errors: list[str] | None = None) -> str:
     lines = header("lead", iteration, mailbox, repo, tmpdir) + [
         "",
         "PLAN CALL (driver-owned builders). You have no useful Agent/task tool for this in "
@@ -351,7 +368,7 @@ def lead_plan_prompt(iteration: int, mailbox: str, repo: str | None, tmpdir: str
     # both arguments here would always show it, on every later iteration too.
     return "\n".join(
         lines + reclaimed_block(reclaimed, iteration, begin_iteration) + (acc_lines or [])
-        + human_block(human_answer)
+        + ship_gate_lines(ship_gate_errors) + human_block(human_answer)
     )
 
 

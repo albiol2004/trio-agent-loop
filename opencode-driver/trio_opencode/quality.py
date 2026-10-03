@@ -877,6 +877,70 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
     return found
 
 
+_ATTACKS_HEADER_RE = re.compile(
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*:", re.IGNORECASE)
+_ATTACK_BULLET_RE = re.compile(r"^\s*[-*]\s+\S")
+_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*[-*]\s+")
+_ATTACK_PLACEHOLDERS = frozenset({"", "none", "na", "tbd"})
+
+
+def _fallback_count_attacks(text: str) -> int | None:
+    """Faithful copy of the core's ``trio_loop.count_attacks`` (used only
+    when the loaded core predates it): bullets after an ``attacks:`` header
+    count when they record ``<probe> -> <result>`` with text on both sides
+    and a non-placeholder probe; ``None`` without any header."""
+    total = 0
+    found = False
+    in_list = False
+    current: str | None = None
+
+    def counts(entry: str) -> bool:
+        body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
+        parts = re.split(r"->|\u2192", body, maxsplit=1)
+        if len(parts) != 2:
+            return False
+        left, right = parts[0].strip(), parts[1].strip()
+        if not left or not right.strip("*`_ \t"):
+            return False
+        return re.sub(r"[^0-9a-z]", "", left.lower()) not in _ATTACK_PLACEHOLDERS
+
+    def flush() -> None:
+        nonlocal total, current
+        if current is not None and counts(current):
+            total += 1
+        current = None
+
+    for raw in (text or "").splitlines():
+        if _ATTACKS_HEADER_RE.match(raw):
+            flush()
+            found = True
+            in_list = True
+            continue
+        if not in_list:
+            continue
+        if not raw.strip():
+            continue
+        if _ATTACK_BULLET_RE.match(raw):
+            flush()
+            current = raw
+        elif raw[:1] in (" ", "\t"):
+            if current is not None:
+                current += " " + raw.strip()
+        else:
+            flush()
+            in_list = False
+    flush()
+    return total if found else None
+
+
+def count_attacks(text: str) -> int | None:
+    """The attacks counted in *text*: exactly the core's rule
+    (``steplib.TL.count_attacks``) so the LOG's ``attacks=N`` is the number
+    the gates act on. ``None`` = no ``attacks:`` header."""
+    fn = getattr(steplib.TL, "count_attacks", None)
+    return fn(text) if callable(fn) else _fallback_count_attacks(text)
+
+
 def slice_evidence(text: str, slice_id: str, sha: str) -> dict[str, Any] | None:
     """Evidence kinds and attack count of one slice section (r18a L1).
 
@@ -885,8 +949,9 @@ def slice_evidence(text: str, slice_id: str, sha: str) -> dict[str, Any] | None:
     The ``evidence: re-run=<n> ...`` summary line wins; otherwise the kinds
     named in the per-accept table rows are counted. ``None`` when the
     section is absent. A section without ``attacks:`` reports
-    ``attacks: "n/a"`` (slice-evals do not list attacks; that is a
-    whole-goal duty).
+    ``attacks: "n/a"``. A slice section lists attacks too (rule 1: a slice
+    SHIP needs at least one counted ``<probe> -> <result>`` bullet); they are
+    counted with the core's own rule (``count_attacks``), not every bullet.
     """
     found = _slice_section(text, slice_id, sha)
     if found is None:
@@ -917,21 +982,8 @@ def slice_evidence(text: str, slice_id: str, sha: str) -> dict[str, Any] | None:
             if any(c == "unverified" for c in cells):
                 counts["unverified"] = counts.get("unverified", 0) + 1
         source = "table" if counts else "missing"
-    attacks: int | str = 0
-    inside = False
-    seen_attacks = False
-    for ln in body.splitlines():
-        if re.match(r"^\s*`?attacks\s*:", ln, re.IGNORECASE):
-            inside = True
-            seen_attacks = True
-            continue
-        if inside:
-            if re.match(r"^\s*[-*]\s+\S", ln):
-                attacks += 1
-            elif ln.strip():
-                inside = False
-    if not seen_attacks:
-        attacks = "n/a"
+    found_attacks = count_attacks(body)
+    attacks: int | str = "n/a" if found_attacks is None else found_attacks
     ordered = {k: counts.get(k, 0) for k in EVIDENCE_KINDS} if counts else {}
     return {"verdict": verdict, "evidence": ordered, "evidence_source": source,
             "attacks": attacks}
