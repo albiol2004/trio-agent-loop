@@ -30,6 +30,7 @@ from test_r19_acceptance_e2e import (
 
 SHIP_BLOCK = "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):\n- "
 SLICE_BLOCK = "SLICE-EVAL ERRORS FROM THE DRIVER:\n- "
+EVAL_BLOCK = "SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):\n- "
 REFUSED = "SHIP refused by the attacks gate"
 
 
@@ -89,6 +90,31 @@ def test_lockstep_ship_without_attacks_is_refused_and_the_lead_is_told(world, tm
     # The shipped verdict carries the counted attack.
     verdict = (_live_box(world, home, spec) / "VERDICT.md").read_text()
     assert "attacks:\n- empty input -> rejected with exit 2" in verdict
+
+
+def test_lockstep_refusal_reaches_the_next_evaluator_prompt(world, tmp_path):
+    home = _plain_home(tmp_path)
+    spec = world.add_loop(home, "loop/le", [{"id": "le-a", "write": "src/le_a.py"}], lockstep=True)
+    calls = {"n": 0}
+
+    def evaluator(w, sp, runner, ctx, workspace, box, prompt, iteration):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            w.lockstep_eval(sp, ctx, workspace, box, iteration, attacks=False)
+            return True
+        return False
+
+    world.hooks["evaluator"] = evaluator
+    assert world.run_loop(spec) == 0
+    evaluators = _evals(world, "evaluator")
+    assert len(evaluators) == 2
+    assert "SHIP REFUSED BY THE DRIVER" not in evaluators[0]["prompt"]
+    assert EVAL_BLOCK + "The driver refused your previous SHIP" in evaluators[1]["prompt"]
+    assert "attacks=n/a" in evaluators[1]["prompt"]
+    assert "SHIP GATE ERRORS" not in evaluators[1]["prompt"], "that block is the Lead's"
+    # The Lead's own block is unchanged, and spent once the second Evaluator ran.
+    assert SHIP_BLOCK in _evals(world, "lead")[1]["prompt"]
+    assert "eval_gate" not in json.loads((_live_box(world, home, spec) / ".driver.json").read_text())
 
 
 def test_lockstep_ship_with_attacks_ships_first_try_without_the_block(world, tmp_path):
@@ -160,6 +186,28 @@ def test_open_loop_slice_ship_without_attacks_redispatches_the_slice_eval(world,
     assert "attacks=1 (shadow)" in log  # telemetry of the accepted section
 
 
+def test_open_loop_integration_refusal_reaches_the_next_integration_eval_prompt(world, tmp_path):
+    home = _plain_home(tmp_path)
+    spec = world.add_loop(home, "loop/oe", [{"id": "oe-a", "write": "src/oe_a.py"}])
+    seen = {"n": 0}
+
+    def integration(w, sp, runner, ctx, workspace, box, prompt, iteration):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            w.integration(sp, runner, ctx, workspace, box, attacks=False)
+            return True
+        return False
+
+    world.hooks["integration-eval"] = integration
+    assert world.run_loop(spec) == 0
+    evals = _evals(world, "integration-eval")
+    assert len(evals) == 2
+    assert "SHIP REFUSED BY THE DRIVER" not in evals[0]["prompt"]
+    assert EVAL_BLOCK + "The driver refused your previous SHIP" in evals[1]["prompt"]
+    for e in _evals(world, "slice-eval"):
+        assert "SHIP REFUSED BY THE DRIVER" not in e["prompt"]
+
+
 def test_open_loop_integration_ship_without_attacks_wakes_the_lead(world, tmp_path):
     home = _plain_home(tmp_path)
     spec = world.add_loop(home, "loop/oi", [{"id": "oi-a", "write": "src/oi_a.py"}])
@@ -228,6 +276,29 @@ def test_slice_eval_prompt_renders_slice_eval_errors_only(tmp_path, acceptance):
     clean = runner._prompt("evaluator", 2, mailbox, {k: v for k, v in ctx.items()
                                                       if not k.endswith("_errors")})
     assert "SLICE-EVAL ERRORS" not in clean
+
+
+@pytest.mark.parametrize("acceptance", [None, {"enabled": True}], ids=["acceptance-off", "acceptance-on"])
+def test_whole_goal_evaluator_prompts_render_eval_gate_errors(tmp_path, acceptance):
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    _, runner = _runner(tmp_path, acceptance=acceptance)
+    errors = ["list an attack", "second"]
+    for ctx in ({"evaluator_attempt": "att1", "pinned_sha": "a" * 40, "eval_gate_errors": errors},
+                {"mode": "open-loop", "kind": "integration-eval", "slice": None, "sha": "a" * 40,
+                 "eval_gate_errors": errors}):
+        text = runner._prompt("evaluator", 2, mailbox, dict(ctx))
+        assert (EVAL_BLOCK + "list an attack\n- second\n") in text
+        assert "SHIP GATE ERRORS" not in text and "SLICE-EVAL ERRORS" not in text
+        plain = runner._prompt("evaluator", 2, mailbox,
+                               {k: v for k, v in ctx.items() if k != "eval_gate_errors"})
+        assert "SHIP REFUSED BY THE DRIVER" not in plain
+    # Never on a slice-eval or the Lead (their blocks are their own).
+    slice_ctx = {"mode": "open-loop", "kind": "slice-eval", "slice": "s1", "sha": "a" * 40,
+                 "slice_eval_errors": ["x"]}
+    assert "SHIP REFUSED BY THE DRIVER" not in runner._prompt("evaluator", 2, mailbox, slice_ctx)
+    assert "SHIP REFUSED BY THE DRIVER" not in runner._prompt(
+        "lead", 2, mailbox, {"ship_gate_errors": ["x"]})
 
 
 # ----------------------------------------------- telemetry counting parity
@@ -316,6 +387,23 @@ def test_driver_json_writers_preserve_the_ship_gate(tmp_path):
     stopped = json.loads((mailbox / ".driver.json").read_text())
     assert stopped["ship_gate"] == gate and stopped["lead_alive"] is False
     assert core.ship_gate_errors(mailbox, 3) == gate["errors"]
+
+
+def test_driver_json_writers_preserve_the_eval_gate(tmp_path):
+    t, runner = _runner(tmp_path)
+    core = t._load_trio_loop(REPO_ROOT)
+    mailbox = tmp_path / "mb"
+    mailbox.mkdir()
+    gate = {"iteration": 3, "errors": ["The driver refused your previous SHIP: no attack"]}
+    (mailbox / ".driver.json").write_text(json.dumps({"pid": 1, "iteration": 2, "eval_gate": gate}))
+    runner._record_quality("s1@aaaaaaaaaaaa", {"slice": "s1", "attacks": 0})
+    core._write_driver_state(mailbox, runner, 2, "lead")
+    assert json.loads((mailbox / ".driver.json").read_text())["eval_gate"] == gate
+    (mailbox / "STATE.md").write_text("schema: 1\niteration: 2\nmax_iterations: 5\nstatus: running\n")
+    (mailbox / "LOG.md").write_text("# Trio loop log\n")
+    t._apply_driver_stop(core, mailbox, {"status": "error", "phase": "x", "reason": "r", "exit": 3})
+    assert json.loads((mailbox / ".driver.json").read_text())["eval_gate"] == gate
+    assert core.eval_gate_errors(mailbox) == gate["errors"]
 
 
 def test_refused_ship_gate_survives_the_run_in_driver_json(world, tmp_path):

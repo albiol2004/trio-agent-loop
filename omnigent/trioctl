@@ -2849,9 +2849,10 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
         got = m.group(2).lower()
         if want and not (got == want or want.startswith(got) or got.startswith(want)):
             continue
-        # Ends at the next `# `/`## ` heading, like the core's slice sections.
+        # Ends at the next `# `/`## ` heading, like the core's slice sections
+        # (a `## Attacks` heading is the slice's own list and stays inside).
         end = next((j for j in range(i + 1, len(lines))
-                    if lines[j].startswith(("# ", "## "))), len(lines))
+                    if _ends_slice_section(lines[j])), len(lines))
         found = (m.group(3), "\n".join(lines[i + 1:end]))
     return found
 
@@ -2859,32 +2860,39 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
 # The SHIP attacks gate's counting rule (loop core `count_attacks`), kept
 # here as a faithful fallback for a pinned core that predates the gate.
 _ATTACKS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*(?::|$)", re.IGNORECASE
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks(?:\s+(?:tried|attempted))?[*`_]*\s*(?::|$)",
+    re.IGNORECASE,
 )
 _ATTACK_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
 _ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
 _ATTACK_ARROW_RE = re.compile(r"->|=>|\u2192")
 _ATTACK_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "noneattempted", "notattempted", "skipped",
-    "notrun", "untested", "notapplicable", "noattack", "noattacks"})
+    "notrun", "untested", "notapplicable", "noattack", "noattacks",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun"})
 _ATTACK_RESULT_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "pending", "skipped", "notrun", "untested",
-    "notattempted", "noneattempted", "notapplicable"})
+    "notattempted", "noneattempted", "notapplicable",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun", "nothing"})
 _ATTACK_TEMPLATE_SLOT_RE = re.compile(r"<[^<>]*>")
 
 
 def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
-    bare = side.strip("*`_ \t")
-    if _ATTACK_TEMPLATE_SLOT_RE.fullmatch(bare):
+    """A side records nothing when no alphanumeric is left once its `<...>`
+    slots are removed, or when what is left is, as a whole, one of `names`."""
+    bare = _ATTACK_TEMPLATE_SLOT_RE.sub("", side)
+    if not any(ch.isalnum() for ch in bare):
         return True
     return re.sub(r"[^0-9a-z]", "", bare.lower()) in names
 
 
 def _attack_entry_counts(entry: str) -> bool:
     """One `attacks:` bullet records a probe AND its result (`<probe> ->
-    <result>`, also `=>` / arrow; text both sides, neither side entirely an
-    unfilled `<...>` slot, neither a placeholder such as none / n/a / tbd /
-    skipped / not run)."""
+    <result>`, also `=>` / arrow; text both sides, neither side empty of
+    alphanumerics once its `<...>` slots are removed, neither a placeholder
+    word such as none / n/a / tbd / skipped / not run / not tested)."""
     body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
     parts = _ATTACK_ARROW_RE.split(body, maxsplit=1)
     if len(parts) != 2:
@@ -3569,6 +3577,14 @@ def _verdict_line_ready(text: str) -> bool:
 _SLICE_SECTION_HEADING_RE = re.compile(r"^##\s+slice\s+\S+\s+@[0-9a-fA-F]{7,40}\b")
 
 
+def _ends_slice_section(line: str) -> bool:
+    """A `# `/`## ` heading ends a slice section, except an attacks heading
+    (`## Attacks`, `## Attacks tried`): the slice's own list."""
+    if not (line.startswith("# ") or line.startswith("## ")):
+        return False
+    return not _ATTACKS_HEADER_RE.match(line)
+
+
 def _integration_verdict_text(text: str) -> str:
     """VERDICT.md with every open-loop ``## slice <id> @<sha>`` section removed.
 
@@ -3585,7 +3601,7 @@ def _integration_verdict_text(text: str) -> str:
         if _SLICE_SECTION_HEADING_RE.match(line):
             skipping = True
             continue
-        if skipping and (line.startswith("# ") or line.startswith("## ")):
+        if skipping and _ends_slice_section(line):
             skipping = False
         if not skipping:
             kept.append(line)
@@ -4596,20 +4612,25 @@ def _attacks_gate_block(role: str, context: dict[str, Any] | None) -> str:
     """The SHIP-attacks-gate feedback block of one dispatch ('' when none).
 
     Lead/repair prompts carry ``ship_gate_errors`` (the last SHIP was
-    refused for lacking a counted attack); slice-eval prompts carry
-    ``slice_eval_errors`` (the slice's SHIP section was not accepted).
+    refused for lacking a counted attack); a whole-goal Evaluator carries
+    ``eval_gate_errors`` (the same refusal, worded for the Evaluator whose
+    SHIP it was); slice-eval prompts carry ``slice_eval_errors`` (the
+    slice's SHIP section was not accepted).
     Same wording as portable/driver.sh ship_gate_note."""
     ctx = context or {}
     if role in ("lead", "repair"):
-        key, head = "ship_gate_errors", "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):"
+        keys = [("ship_gate_errors", "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):")]
     elif role == "evaluator":
-        key, head = "slice_eval_errors", "SLICE-EVAL ERRORS FROM THE DRIVER:"
+        keys = [("eval_gate_errors", "SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):"),
+                ("slice_eval_errors", "SLICE-EVAL ERRORS FROM THE DRIVER:")]
     else:
         return ""
-    errors = [str(e) for e in ctx.get(key) or [] if str(e).strip()]
-    if not errors:
-        return ""
-    return head + "\n" + "\n".join(f"- {e}" for e in errors) + "\n"
+    out = ""
+    for key, head in keys:
+        errors = [str(e) for e in ctx.get(key) or [] if str(e).strip()]
+        if errors:
+            out += head + "\n" + "\n".join(f"- {e}" for e in errors) + "\n"
+    return out
 
 
 def _open_loop_gate_errors_note(errors: list[str]) -> str:

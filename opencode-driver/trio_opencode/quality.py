@@ -871,30 +871,38 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
         got = m.group(2).lower()
         if want and not (got == want or want.startswith(got) or got.startswith(want)):
             continue
+        # An attacks heading (`## Attacks`, `## Attacks tried`) is the
+        # slice's own list and stays inside the section.
         end = next((j for j in range(i + 1, len(lines))
-                    if lines[j].startswith("## ")), len(lines))
+                    if lines[j].startswith("## ")
+                    and not _ATTACKS_HEADER_RE.match(lines[j])), len(lines))
         found = (m.group(3), "\n".join(lines[i + 1:end]))
     return found
 
 
 _ATTACKS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*(?::|$)", re.IGNORECASE
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks(?:\s+(?:tried|attempted))?[*`_]*\s*(?::|$)",
+    re.IGNORECASE,
 )
 _ATTACK_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
 _ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
 _ATTACK_ARROW_RE = re.compile(r"->|=>|\u2192")
 _ATTACK_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "noneattempted", "notattempted", "skipped",
-    "notrun", "untested", "notapplicable", "noattack", "noattacks"})
+    "notrun", "untested", "notapplicable", "noattack", "noattacks",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun"})
 _ATTACK_RESULT_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "pending", "skipped", "notrun", "untested",
-    "notattempted", "noneattempted", "notapplicable"})
+    "notattempted", "noneattempted", "notapplicable",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun", "nothing"})
 _ATTACK_TEMPLATE_SLOT_RE = re.compile(r"<[^<>]*>")
 
 
 def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
-    bare = side.strip("*`_ \t")
-    if _ATTACK_TEMPLATE_SLOT_RE.fullmatch(bare):
+    bare = _ATTACK_TEMPLATE_SLOT_RE.sub("", side)
+    if not any(ch.isalnum() for ch in bare):
         return True
     return re.sub(r"[^0-9a-z]", "", bare.lower()) in names
 

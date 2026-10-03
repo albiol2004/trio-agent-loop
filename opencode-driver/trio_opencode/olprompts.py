@@ -56,7 +56,8 @@ _COMMON_KEYS = (
 
 # ctx keys REQUIRED for one kind (frozen; see the S4b/ol-prompts briefs).
 # `quality_note` (slice-eval), `slice_eval_errors` (slice-eval),
-# `ship_gate_errors` (lead-plan) and `rigor` (integration-eval) are optional
+# `ship_gate_errors` (lead-plan) and `rigor` / `eval_gate_errors`
+# (integration-eval) are optional
 # and deliberately left out of this map.
 _KIND_KEYS: dict[str, tuple[str, ...]] = {
     "lead-plan": (
@@ -792,6 +793,14 @@ def _render_integration_eval(ctx: dict[str, Any]) -> str:
         body += str(ctx["rigor"])
 
     lines.append(body.rstrip("\n"))
+
+    eval_gate_errors = ctx.get("eval_gate_errors") or []
+    if eval_gate_errors:
+        # The attacks gate refused this Evaluator's previous SHIP (same
+        # wording as trioctl's `_attacks_gate_block`).
+        lines.append("")
+        lines.append("SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):")
+        lines += [f"- {e}" for e in eval_gate_errors]
 
     acc_block = ctx.get("acceptance")
     if isinstance(acc_block, dict):

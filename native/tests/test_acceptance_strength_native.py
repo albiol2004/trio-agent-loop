@@ -94,6 +94,11 @@ def test_off_ship_without_attacks_is_refused_and_iterates(repo: Path) -> None:
     ("attacks:\n- empty input -> n/a\n", False),
     ("attacks:\n- <second attack> -> <what happened>\n- empty input -> exit 2\n", True),
     ("## Attacks\n1. empty input => exit 2\n", True),
+    ("Attacks tried:\n- empty input -> exit 2\n", True),
+    ("Attacks attempted:\n- empty input -> exit 2\n", True),
+    ("attacks:\n- empty input -> not tested\n", False),
+    ("attacks:\n- empty input -> nothing\n- x -> <a>, <b>\n- y -> ...\n", False),
+    ("attacks:\n- re-run twice -> not run twice: cache hit\n", True),
 ])
 def test_off_only_counted_attacks_let_a_ship_through(repo: Path, attacks: str, ships: bool) -> None:
     step(repo, "begin")
@@ -177,6 +182,79 @@ def test_off_refused_ship_then_a_fixed_pass_ships(repo: Path) -> None:
     git(repo, "commit", "-q", "-m", "loop: iteration 2 — SHIP")
     a = step(repo, "apply", iteration=2, attempt=p2["evaluator_attempt"])
     assert a["verdict"] == "SHIP" and a["status"] == "shipped", a
+
+
+EVAL_HEAD = "SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):"
+
+
+def test_off_pin_after_a_refusal_hands_the_evaluator_its_copy_until_apply(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    assert "eval_gate_errors" not in p and EVAL_HEAD not in p["context_block"]
+    verdict_without_attacks(repo, 1, p)
+    a = step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert a["verdict"] == "ITERATE" and "eval_gate" in driver_json(repo)
+    n = step(repo, "next", max_iterations=4)
+    lead_errors = n["ship_gate_errors"]
+    plain_lead_pass(repo, 2)
+    assert step(repo, "gate", role="lead", iteration=2, attempt=1)["pass"]
+    # the Lead's copy is spent; the Evaluator's own key is untouched
+    assert "ship_gate" not in driver_json(repo) and "eval_gate" in driver_json(repo)
+    p2 = step(repo, "pin", iteration=2)
+    errs = p2["eval_gate_errors"]
+    assert len(errs) == 1 and "refused your previous SHIP" in errs[0] and errs != lead_errors
+    assert "no attack beyond the frozen checks" in errs[0] and "<what happened>" in errs[0]
+    assert EVAL_HEAD + "\n- " + errs[0] in p2["context_block"]
+    assert p2["context_block"].startswith("LOCKSTEP CONTEXT: attempt=")
+    # `pin` is read-only: a resumed workflow gets the same text
+    again = step(repo, "pin", iteration=2)
+    assert again["eval_gate_errors"] == errs and EVAL_HEAD in again["context_block"]
+    assert "eval_gate" in driver_json(repo)
+    # apply = the Evaluator ran: spent; a SHIP with an attack finishes the loop
+    write_verdict(repo, "VERDICT: SHIP", 2, p2, f"commit: {p2['sha']}\n")
+    git(repo, "add", "loop/VERDICT.md")
+    git(repo, "commit", "-q", "-m", "loop: iteration 2 — SHIP")
+    ap = step(repo, "apply", iteration=2, attempt=p2["evaluator_attempt"])
+    assert ap["verdict"] == "SHIP" and ap["status"] == "shipped", ap
+    assert "eval_gate" not in driver_json(repo)
+
+
+def test_off_a_second_refusal_replaces_the_evaluators_copy(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    verdict_without_attacks(repo, 1, p)
+    step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    step(repo, "next", max_iterations=4)
+    plain_lead_pass(repo, 2)
+    assert step(repo, "gate", role="lead", iteration=2, attempt=1)["pass"]
+    p2 = step(repo, "pin", iteration=2)
+    assert p2["eval_gate_errors"]
+    verdict_without_attacks(repo, 2, p2)
+    a2 = step(repo, "apply", iteration=2, attempt=p2["evaluator_attempt"])
+    assert a2["verdict"] == "ITERATE" and a2["attacks_gate"]["refused"], a2
+    # spent by the apply of iteration 2, then re-persisted for iteration 3's Evaluator
+    assert driver_json(repo)["eval_gate"]["iteration"] == 3
+    step(repo, "next", max_iterations=4)
+    fixing_pass(repo, 3)
+    assert step(repo, "gate", role="lead", iteration=3, attempt=1)["pass"]
+    p3 = step(repo, "pin", iteration=3)
+    assert len(p3["eval_gate_errors"]) == 1 and EVAL_HEAD in p3["context_block"]
+
+
+def test_off_an_iterate_verdict_spends_the_evaluators_copy(repo: Path) -> None:
+    step(repo, "begin")
+    p = to_lead_done(repo)
+    verdict_without_attacks(repo, 1, p)
+    step(repo, "apply", iteration=1, attempt=p["evaluator_attempt"])
+    step(repo, "next", max_iterations=4)
+    plain_lead_pass(repo, 2)
+    assert step(repo, "gate", role="lead", iteration=2, attempt=1)["pass"]
+    p2 = step(repo, "pin", iteration=2)
+    assert p2["eval_gate_errors"]
+    write_verdict(repo, "VERDICT: ITERATE scope=design", 2, p2, "")
+    ap = step(repo, "apply", iteration=2, attempt=p2["evaluator_attempt"])
+    assert ap["verdict"] == "ITERATE", ap
+    assert "eval_gate" not in driver_json(repo)
 
 
 # ------------------------------------------------ Rule 1, acceptance on
@@ -266,6 +344,27 @@ def test_on_attacks_refusal_still_processes_an_amendment(repo: Path) -> None:
     n = run("next", max_iterations=4)
     assert n["action"] == "lead" and n["ship_gate_errors"] == ap["attacks_gate"]["errors"], n
     assert "tamper" not in log_text(repo)
+
+
+def test_on_refusal_reaches_the_next_evaluator_through_pin_and_is_spent_by_apply(repo: Path) -> None:
+    run = Run(repo)
+    p, _ = to_prerun(run, repo, upto=5)
+    (mbox(repo) / "VERDICT.md").write_text(
+        f"VERDICT: SHIP\n# Verdict — iteration 1\nattempt: {p['evaluator_attempt']}\n"
+        f"evaluated: {p['sha']}\ncommit: {p['sha']}\n", encoding="utf-8")
+    ap = run("apply", iteration=1, attempt=p["evaluator_attempt"])
+    assert ap["attacks_gate"]["refused"], ap
+    run("next", max_iterations=4)
+    fixing_pass(repo, 2)
+    assert run("gate", role="lead", iteration=2, attempt=1)["pass"]
+    assert "ship_gate" not in driver_json(repo) and "eval_gate" in driver_json(repo)
+    p2 = run("pin", acceptance=False, iteration=2)
+    assert len(p2["eval_gate_errors"]) == 1 and EVAL_HEAD in p2["context_block"]
+    run("acceptance-run", iteration=2, sha=p2["sha"])
+    ship_verdict(repo, 2, p2)
+    ap2 = run("apply", iteration=2, attempt=p2["evaluator_attempt"])
+    assert ap2["verdict"] == "SHIP" and ap2["status"] == "shipped", ap2
+    assert "eval_gate" not in driver_json(repo)
 
 
 # ------------------------------------------- Rule 2, requirement map gate
@@ -425,6 +524,19 @@ def test_workflow_ship_refused_by_the_attacks_gate_reaches_the_second_plan(accep
         # the attacks refusal is not the frozen gate's: acceptance keeps its meaning
         assert r["acceptance"]["ship_refused"] == []
         assert "ACCEPTANCE ERRORS FROM THE DRIVER" not in plans[1]
+
+
+@needs_node
+@pytest.mark.parametrize("acceptance", [False, True])
+def test_workflow_ship_refusal_reaches_the_second_evaluator_prompt(acceptance: bool) -> None:
+    args = dict(ACC) if acceptance else {"mailbox": ACC["mailbox"]}
+    out = wf_run({"verdicts": ["SHIP", "SHIP"], "args": args,
+                  "attacks": {"refuse": [0], "errors": ["The driver refused the SHIP"]}})
+    evaluators = [c["prompt"] for c in out["calls"] if c["agentType"] == "trio-evaluator"]
+    assert len(evaluators) == 2
+    assert EVAL_HEAD not in evaluators[0]
+    assert EVAL_HEAD + "\n- evaluator copy of the refusal" in evaluators[1]
+    assert evaluators[1].index(EVAL_HEAD) < evaluators[1].index("You are the trio-evaluator")
 
 
 @needs_node

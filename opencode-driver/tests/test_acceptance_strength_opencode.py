@@ -30,6 +30,7 @@ from test_openloop_e2e import (  # noqa: E402 - sibling test module's helpers
 )
 
 TL = steplib.TL
+EVAL_HEAD = "SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):"
 ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
 
 
@@ -96,6 +97,22 @@ def test_ol_integration_ship_without_attacks_is_refused_then_ships(
     assert TL.ship_gate_errors(ol_repo_one_slice / "loop") == []
 
 
+def test_ol_integration_refusal_reaches_the_next_integration_evaluator(
+        ol_repo_one_slice, tmp_path, monkeypatch):
+    env, result = _run_ol(tmp_path, monkeypatch, ol_repo_one_slice, "integration")
+    assert result["status"] == "shipped", (result, _log(ol_repo_one_slice))
+    evaluators = _prompts_of(env, "trio-evaluator", "integration-eval")
+    assert len(evaluators) == 2
+    assert EVAL_HEAD not in evaluators[0]
+    assert EVAL_HEAD + "\n- The driver refused your previous SHIP" in evaluators[1]
+    for slice_eval in _prompts_of(env, "trio-evaluator", "slice-eval"):
+        assert EVAL_HEAD not in slice_eval
+    # the Lead's block is its own text, and the Evaluator's copy is spent
+    leads = _prompts_of(env, "trio-lead", "lead-plan")
+    assert all(EVAL_HEAD not in l for l in leads)
+    assert TL.eval_gate_errors(ol_repo_one_slice / "loop") == []
+
+
 def test_ol_degraded_acceptance_still_applies_the_attacks_gate(
         ol_repo_one_slice, tmp_path, monkeypatch):
     """The author dies, acceptance degrades to no pack ("as if acceptance
@@ -141,6 +158,17 @@ def test_ls_ship_without_attacks_is_refused_then_ships(git_repo, tmp_path, monke
     assert len(plans) == 2, [p[:80] for p in plans]
     assert "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):" not in plans[0]
     assert "SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):" in plans[1]
+
+
+def test_ls_ship_refusal_reaches_the_second_evaluator_prompt(git_repo, tmp_path, monkeypatch):
+    env, result = _run_ls(tmp_path, monkeypatch, git_repo, "first_no_attacks")
+    assert result["status"] == "shipped" and result["iteration"] == 2, result
+    evaluators = [c["prompt"] for c in ls_e2e.read_calls(env) if c["agent"] == "trio-evaluator"]
+    assert len(evaluators) == 2, [p[:80] for p in evaluators]
+    assert EVAL_HEAD not in evaluators[0]
+    assert EVAL_HEAD + "\n- The driver refused your previous SHIP" in evaluators[1]
+    assert "SHIP GATE ERRORS" not in evaluators[1]
+    assert TL.eval_gate_errors(git_repo / "loop") == []
 
 
 def test_ls_default_run_reports_no_ship_gate_refusal(git_repo, tmp_path, monkeypatch):
@@ -260,6 +288,19 @@ def test_olprompts_render_ship_gate_and_slice_eval_error_blocks():
     assert "SLICE-EVAL ERRORS" not in olprompts.render("slice-eval", _ol_ctx("slice-eval"))
 
 
+def test_olprompts_render_the_integration_evaluators_refusal_block():
+    ctx = _ol_ctx("slice-eval")
+    ctx = {k: v for k, v in ctx.items() if k not in ("slice", "repo_name", "shadow", "acceptance_covered")}
+    ctx.update(attempt="att1", pins={"home": "1" * 40}, repo_worktrees={"home": "/w"},
+               acceptance=None, retire_paths={})
+    plain = olprompts.render("integration-eval", dict(ctx))
+    assert "SHIP REFUSED BY THE DRIVER" not in plain
+    shown = olprompts.render("integration-eval", dict(ctx, eval_gate_errors=["E1", "E2"]))
+    assert (EVAL_HEAD + "\n- E1\n- E2") in shown
+    assert "SHIP REFUSED BY THE DRIVER" not in olprompts.render(
+        "slice-eval", _ol_ctx("slice-eval", slice_eval_errors=["S1"]))
+
+
 # ------------------------------------------------------------------- rule 2
 def test_author_retry_prompt_carries_requirement_gaps_from_fatal():
     out = prompts.author_prompt("/export", "/tool", "marker", 2,
@@ -362,6 +403,41 @@ def test_driver_json_rewrites_preserve_a_pending_ship_gate_and_never_resurrect_a
     assert TL.ship_gate_errors(ctx.live_mailbox) == []
 
 
+@pytest.mark.parametrize("writer", ["lockstep", "open-loop"])
+def test_driver_json_rewrites_preserve_a_pending_eval_gate_and_never_resurrect_a_cleared_one(
+        git_repo, writer):
+    ctx = _ctx_for(git_repo)
+    write = (lambda: ctx.write_driver_json(phase="lead-running", iteration=2)) \
+        if writer == "lockstep" else (lambda: _sidecar(ctx))
+    write()
+    TL._persist_eval_gate_errors(ctx.live_mailbox, 2, ["refused"])
+    for _ in range(2):
+        write()
+        assert json.loads(ctx.driver_json_path.read_text())["eval_gate"] == {
+            "iteration": 2, "errors": ["refused"]}
+    TL.clear_ship_gate_errors(ctx.live_mailbox)           # the Lead's clear leaves it alone
+    write()
+    assert TL.eval_gate_errors(ctx.live_mailbox) == ["refused"]
+    TL.clear_eval_gate_errors(ctx.live_mailbox)           # an Evaluator got it
+    write()
+    assert "eval_gate" not in json.loads(ctx.driver_json_path.read_text()), "a cleared gate came back"
+
+
+def test_retiring_driver_json_keeps_an_unread_evaluator_refusal(git_repo):
+    ctx = _ctx_for(git_repo)
+    ctx.write_driver_json(phase="evaluate-running", iteration=1)
+    TL._persist_ship_gate_errors(ctx.live_mailbox, 2, ["lead copy"])
+    TL._persist_eval_gate_errors(ctx.live_mailbox, 2, ["eval copy"])
+    driver._retire_driver_json(ctx.driver_json_path, shipped=True)
+    assert not ctx.driver_json_path.exists()
+    ctx.write_driver_json(phase="evaluate-running", iteration=1)
+    TL._persist_eval_gate_errors(ctx.live_mailbox, 2, ["eval copy"])
+    driver._retire_driver_json(ctx.driver_json_path)
+    assert json.loads(ctx.driver_json_path.read_text()) == {
+        "eval_gate": {"iteration": 2, "errors": ["eval copy"]}}
+    assert TL.eval_gate_errors(ctx.live_mailbox) == ["eval copy"]
+
+
 def test_crash_rollback_snapshot_neither_drops_a_pending_nor_resurrects_a_cleared_gate(git_repo):
     box = git_repo / "loop"
     (box / "STATE.md").write_text("iteration: 2\nstatus: running\nphase: lead-running\n",
@@ -424,6 +500,11 @@ _SECTIONS = {
     "two blocks sum": "attacks:\n- a -> b\n\nnotes\n\nattacks:\n- c -> d\n",
     "list ends at prose": "attacks:\n- a -> b\nprose line\n- c -> d\n",
     "star bullets": "attacks:\n* a -> b\n* c -> d\n",
+    "tried header": "Attacks tried:\n- a -> b\n",
+    "attempted heading": "## Attacks attempted\n1. a -> b\n",
+    "prose with attacks": "Attacks were tried\n- a -> b\n",
+    "placeholder words": "attacks:\n- a -> not tested\n- b -> nothing\n- c -> not run twice: x\n",
+    "slots and punctuation": "attacks:\n- a -> <x>, <y>\n- b -> ...\n- <p>, <q> -> r\n- ok -> fine\n",
 }
 
 
@@ -437,6 +518,15 @@ def test_slice_evidence_attacks_match_the_core_count_attacks(name):
     assert quality.slice_evidence(text, "a", sha)["attacks"] == want
     # the fallback (a core without count_attacks) is the same rule
     assert quality._fallback_count_attacks(body) == TL.count_attacks(body)
+
+
+def test_slice_evidence_keeps_an_attacks_heading_inside_the_slice_section():
+    sha = "ef" * 20
+    text = (f"## slice a @{sha} \u2014 SHIP\nevidence: re-run=1\n## Attacks\n- a -> b\n"
+            f"## slice b @{'01' * 20} \u2014 SHIP\n## Attacks tried\n- c -> d\n- e -> f\n## Notes\nx\n")
+    assert quality.slice_evidence(text, "a", sha)["attacks"] == 1
+    assert quality.slice_evidence(text, "b", "01" * 20)["attacks"] == 2
+    assert TL.slice_attacks(text, "a", sha) == 1
 
 
 def test_slice_evidence_counts_only_attacks_that_record_a_result():

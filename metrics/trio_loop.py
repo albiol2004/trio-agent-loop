@@ -722,6 +722,15 @@ def _verdict_commit_shas(text: str, repo: str | None = None) -> list[str]:
 _SLICE_SECTION_HEADING_RE = re.compile(r"^##\s+slice\s+\S+\s+@[0-9a-fA-F]{7,40}\b")
 
 
+def _ends_slice_section(line: str) -> bool:
+    """True when ``line`` (an open-loop slice section's body line) ends the
+    section: a ``# ``/``## `` heading, except an attacks heading (``##
+    Attacks``, ``## Attacks tried``), which is the slice's own list."""
+    if not (line.startswith("# ") or line.startswith("## ")):
+        return False
+    return not _ATTACKS_HEADER_RE.match(line)
+
+
 def _integration_verdict_text(text: str) -> str:
     """VERDICT.md with every open-loop ``## slice <id> @<sha>`` section removed.
 
@@ -729,8 +738,10 @@ def _integration_verdict_text(text: str) -> str:
     ``iteration:``/``evaluated:``/``attempt:`` lines) to the same file as
     the integration verdict. A section runs from its heading up to (not
     including) the next ``# ``/``## `` heading that is not itself a slice
-    heading, or EOF. Everything else is kept in order, so integration
-    field checks see only the integration verdict's own block.
+    heading, or EOF; a ``## Attacks`` heading is part of the section (it
+    is the slice-eval's own attacks list). Everything else is kept in
+    order, so integration field checks see only the integration verdict's
+    own block.
     """
     kept: list[str] = []
     skipping = False
@@ -738,7 +749,7 @@ def _integration_verdict_text(text: str) -> str:
         if _SLICE_SECTION_HEADING_RE.match(line):
             skipping = True
             continue
-        if skipping and (line.startswith("# ") or line.startswith("## ")):
+        if skipping and _ends_slice_section(line):
             skipping = False
         if not skipping:
             kept.append(line)
@@ -757,29 +768,40 @@ MIN_SHIP_ATTACKS = 1
 
 # The header tolerates leading spaces, a `#` heading / `-` bullet marker,
 # `**`/backticks, any case, and the colon: `## Attacks` alone on its line is a
-# header too (inline text after a colon is allowed).
+# header too (inline text after a colon is allowed). `Attacks tried` and
+# `Attacks attempted` are the same header (the prompts say "list the attacks
+# you tried"); any other word after `attacks` is prose.
 _ATTACKS_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*(?::|$)", re.IGNORECASE
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks(?:\s+(?:tried|attempted))?[*`_]*\s*(?::|$)",
+    re.IGNORECASE,
 )
 # Entries are `-`/`*`/`+` bullets or numbered (`1.` / `1)`).
 _ATTACK_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+\S")
 _ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
 _ATTACK_ARROW_RE = re.compile(r"->|=>|\u2192")
-#: Left side (the probe), after dropping everything but [0-9a-z]: not an attack.
+#: Left side (the probe), after dropping everything but [0-9a-z]: not an
+#: attack. Whole-value matches only (``not run twice: ...`` still counts).
 _ATTACK_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "noneattempted", "notattempted", "skipped",
-    "notrun", "untested", "notapplicable", "noattack", "noattacks"})
+    "notrun", "untested", "notapplicable", "noattack", "noattacks",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun"})
 #: Right side (the result), same normalisation: no result was recorded.
 _ATTACK_RESULT_PLACEHOLDERS = frozenset({
     "", "none", "na", "tbd", "todo", "pending", "skipped", "notrun", "untested",
-    "notattempted", "noneattempted", "notapplicable"})
-#: A side that is nothing but an unfilled `<...>` template slot.
+    "notattempted", "noneattempted", "notapplicable",
+    "nottested", "notexecuted", "unverified", "notverified", "didnotrun",
+    "didntrun", "nothing"})
+#: An unfilled `<...>` template slot.
 _ATTACK_TEMPLATE_SLOT_RE = re.compile(r"<[^<>]*>")
 
 
 def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
-    bare = side.strip("*`_ \t")
-    if _ATTACK_TEMPLATE_SLOT_RE.fullmatch(bare):
+    """A side records nothing when no alphanumeric character is left once its
+    ``<...>`` slots are removed (punctuation, quotes and brackets carry no
+    content), or when what is left is, as a whole, one of ``names``."""
+    bare = _ATTACK_TEMPLATE_SLOT_RE.sub("", side)
+    if not any(ch.isalnum() for ch in bare):
         return True
     return re.sub(r"[^0-9a-z]", "", bare.lower()) in names
 
@@ -787,10 +809,12 @@ def _attack_side_is_placeholder(side: str, names: frozenset) -> bool:
 def _attack_counts(entry: str) -> bool:
     """True when one `attacks:` bullet records an attack AND its result:
     ``<probe> -> <what happened>`` (also ``=>`` / ``→``) with text on both
-    sides, neither side entirely an unfilled ``<...>`` template slot, the
-    probe not a placeholder (none / n/a / tbd / skipped / not run / ``-`` /
-    ``...``) and the result not one either (n/a, none, tbd, skipped, not
-    run, untested, ...)."""
+    sides, neither side empty of alphanumerics once its ``<...>`` slots are
+    removed (``-``, ``...``, ``<a>, <b>``), the probe not a placeholder
+    word (none / n/a / tbd / skipped / not run / not tested / ...) and the
+    result not one either (also nothing, unverified, did not run, ...);
+    placeholder words match the whole side, so ``not run twice: ...``
+    counts."""
     body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
     parts = _ATTACK_ARROW_RE.split(body, maxsplit=1)
     if len(parts) != 2:
@@ -859,7 +883,8 @@ def whole_goal_attacks(verdict_text: str) -> int | None:
 
 def _slice_sections(text: str) -> list[dict]:
     """Every ``## slice <id> @<sha> — SHIP|ITERATE`` section: heading through
-    the line before the next ``# ``/``## `` heading (or EOF)."""
+    the line before the next ``# ``/``## `` heading (or EOF); a ``## Attacks``
+    heading stays inside the section."""
     sections: list[dict] = []
     current: dict | None = None
     for raw in (text or "").splitlines(keepends=True):
@@ -869,7 +894,7 @@ def _slice_sections(text: str) -> list[dict]:
                        "verdict": match.group(3), "text": raw}
             sections.append(current)
             continue
-        if raw.startswith("# ") or raw.startswith("## "):
+        if _ends_slice_section(raw):
             current = None
         elif current is not None:
             current["text"] += raw
@@ -947,10 +972,12 @@ def _read_driver_json(mailbox: Path) -> dict:
 
 
 def _preserved_ship_gate(mailbox: Path) -> dict:
-    """``{"ship_gate": ...}`` from the current `.driver.json`, so the
-    loop's own whole-file rewrites never drop a pending refusal."""
-    gate = _read_driver_json(mailbox).get("ship_gate")
-    return {"ship_gate": gate} if isinstance(gate, dict) else {}
+    """``{"ship_gate": ..., "eval_gate": ...}`` (whichever exist) from the
+    current `.driver.json`, so the loop's own whole-file rewrites never drop
+    a pending refusal (the Lead's, or the next Evaluator's copy)."""
+    data = _read_driver_json(mailbox)
+    return {key: data[key] for key in ("ship_gate", "eval_gate")
+            if isinstance(data.get(key), dict)}
 
 
 #: Serialises every in-process read-modify-write of `.driver.json` (the
@@ -1016,6 +1043,78 @@ def _persist_ship_gate_errors(mailbox: Path, iteration: int, errors: list[str]) 
         _store_driver_json(mailbox, data)
 
 
+def eval_gate_errors(mailbox) -> list[str]:
+    """Pending attacks-gate refusal for the next whole-goal Evaluator
+    (read-only, idempotent).
+
+    The same refusal as ``ship_gate_errors``, addressed to the Evaluator
+    that wrote the refused SHIP, stored under its own key so the Lead's
+    ``clear_ship_gate_errors`` never removes it: `.driver.json`
+    ``eval_gate`` = ``{"iteration": K, "errors": [...]}`` (K, the iteration
+    of the Lead pass that follows the refusal, is informational). It is NOT
+    keyed to an iteration on read: the next whole-goal Evaluator may run at
+    any iteration (an open-loop integration-eval can follow a Lead pass that
+    made no change, so the state iteration has not moved). It lives until an
+    Evaluator has been given it (``clear_eval_gate_errors``) or a SHIP is
+    accepted; a newer refusal replaces it. A missing or malformed file or
+    key yields [].
+    """
+    gate = _read_driver_json(Path(mailbox)).get("eval_gate")
+    if not isinstance(gate, dict):
+        return []
+    errors = gate.get("errors")
+    if not isinstance(errors, list):
+        return []
+    return [str(e) for e in errors if str(e).strip()]
+
+
+def clear_eval_gate_errors(mailbox) -> None:
+    """Forget the pending Evaluator-side refusal (after an Evaluator got it)."""
+    with _DRIVER_JSON_LOCK:
+        data = _read_driver_json(Path(mailbox))
+        if "eval_gate" not in data:
+            return
+        data.pop("eval_gate", None)
+        try:
+            _store_driver_json(Path(mailbox), data)
+        except OSError:
+            pass
+
+
+def _persist_eval_gate_errors(mailbox: Path, iteration: int, errors: list[str]) -> None:
+    with _DRIVER_JSON_LOCK:
+        data = _read_driver_json(mailbox)
+        data["eval_gate"] = {"iteration": iteration, "errors": list(errors)}
+        _store_driver_json(mailbox, data)
+
+
+def _with_eval_gate(context: dict, mailbox) -> dict:
+    """Add ``eval_gate_errors`` to a whole-goal Evaluator context when a
+    refusal is pending (the key is absent otherwise)."""
+    errors = eval_gate_errors(mailbox)
+    if errors:
+        context["eval_gate_errors"] = errors
+    return context
+
+
+def _spend_eval_gate(mailbox, context: dict | None) -> None:
+    """The Evaluator the context was built for has run: forget the refusal
+    it carried, so a refusal persisted afterwards is never lost."""
+    if (context or {}).get("eval_gate_errors"):
+        clear_eval_gate_errors(mailbox)
+
+
+#: What the driver counts as an attack (shared by the Lead's and the
+#: Evaluator's refusal text).
+_ATTACKS_FORMAT_NOTE = (
+    "The driver counts only an `attacks:` list (or a `## Attacks` heading, "
+    "or `Attacks tried:`) of bullets shaped `- <command or input> -> <what "
+    "happened>` with both sides filled in: an unfilled `<...>` slot, "
+    "punctuation alone, or a placeholder (none, n/a, tbd, skipped, not run, "
+    "not tested, unverified, nothing) does not count."
+)
+
+
 def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
                         context: str = "lockstep") -> tuple[str, object, list[str]]:
     """The whole-goal attacks gate: a SHIP whose VERDICT.md lists no
@@ -1026,7 +1125,9 @@ def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
     ``- iter N | loop | SHIP refused by the attacks gate (verdict becomes
     ITERATE): <reason>`` to LOG.md, commits LOG.md as ``loop: iteration N —
     attacks gate refused SHIP (ITERATE)`` when it is tracked, and persists
-    the error for the next Lead pass (see ``ship_gate_errors``).
+    the error for the next Lead pass (see ``ship_gate_errors``) and, under
+    a separate key the Lead's clear leaves alone, a copy worded for the next
+    whole-goal Evaluator (see ``eval_gate_errors``).
     ``context`` ("lockstep" | "open-loop") only names the caller; both key
     the next Lead pass as ``iteration + 1``.
     """
@@ -1040,6 +1141,7 @@ def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
         text = ""
     reason = ship_attacks_problem(whole_goal_attacks(text))
     if reason is None:
+        clear_eval_gate_errors(mailbox)   # an accepted SHIP: nothing left to tell
         return verdict, scope, []
     _append_log(
         mailbox,
@@ -1054,15 +1156,21 @@ def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
         f"beyond the frozen checks ({reason}). Frozen checks are a floor: the "
         "next evaluation must run and record at least one adversarial probe "
         "(boundary, interaction between requirements, malformed input, "
-        "failure mode, concurrency) with its command and result. The "
-        "driver counts only an `attacks:` list (or a `## Attacks` heading) "
-        "of bullets shaped `- <command or input> -> <what happened>` with "
-        "both sides filled in: an unfilled `<...>` slot or a placeholder "
-        "(none, n/a, tbd, skipped, not run) does not count. Change "
-        "product code only for a genuine defect."
+        "failure mode, concurrency) with its command and result. "
+        + _ATTACKS_FORMAT_NOTE + " Change product code only for a genuine "
+        "defect."
+    )
+    eval_error = (
+        f"The driver refused your previous SHIP{where}: it listed no counted "
+        f"attack beyond the frozen checks ({reason}). Frozen checks are a "
+        "floor: this evaluation must run and record at least one adversarial "
+        "probe (boundary, interaction between requirements, malformed input, "
+        "failure mode, concurrency) with its command and result. "
+        + _ATTACKS_FORMAT_NOTE + " Re-running a frozen check is not an attack."
     )
     try:
         _persist_ship_gate_errors(mailbox, iteration + 1, [error])
+        _persist_eval_gate_errors(mailbox, iteration + 1, [eval_error])
     except OSError as exc:
         _append_log(mailbox, f"- iter {iteration} | loop | could not persist the "
                              f"attacks gate error ({exc})")
@@ -2169,7 +2277,6 @@ def _lockstep_eval_context(
     still matches the same evidence. A new Lead pass must mint a new
     attempt after this helper is called with empty state keys.
     """
-    del iteration
     attempt = state.get("evaluator_attempt", "").strip()
     pinned = state.get("evaluated_sha", "").strip()
     git_root = _git_root(repo)
@@ -2209,7 +2316,7 @@ def _lockstep_eval_context(
     }
     if declared:
         context["pins"] = {"home": pinned, **repo_pins}
-    return context
+    return _with_eval_gate(context, mailbox)
 
 
 def _open_loop_integration_context(
@@ -2275,7 +2382,7 @@ def _open_loop_integration_context(
             "home": pinned,
             **{name: repo_pins.get(name, "") for name, _path in declared},
         }
-    return context
+    return _with_eval_gate(context, mailbox)
 
 
 # --- r19 frozen acceptance (behind the `acceptance` switch) -----------------
@@ -3705,6 +3812,9 @@ def _run_lockstep(
                         raise RuntimeError(
                             f"evaluator runner failed with exit {result}"
                         )
+                # The Evaluator was given the last refusal (or already had it
+                # before a crash): spent, before a new refusal can persist.
+                _spend_eval_gate(mailbox, context)
                 verdict, scope = _first_verdict(mailbox / "VERDICT.md")
                 if verdict is None:
                     _update_state(
@@ -5583,6 +5693,7 @@ def run_open_loop(
                             raise RuntimeError(
                                 f"evaluator runner failed with exit {result}"
                             )
+                        _spend_eval_gate(mailbox, context)
                         restored_sections = _restore_clobbered_verdict_sections(
                             mailbox, verdict_path, verdict_snapshot,
                             "integration-eval", iteration_now,
@@ -5788,8 +5899,10 @@ class _PortableRunner:
                 environment["TRIO_ATTEMPT"] = attempt
                 environment["TRIO_PINNED_SHA"] = sha
         # Attacks-gate feedback (any mode): the refused SHIP's error for the
-        # Lead, the unaccepted slice SHIP section's error for a slice-eval.
+        # Lead, the same refusal for the next whole-goal Evaluator, the
+        # unaccepted slice SHIP section's error for a slice-eval.
         for key, var in (("ship_gate_errors", "TRIO_SHIP_GATE_ERRORS"),
+                         ("eval_gate_errors", "TRIO_EVAL_GATE_ERRORS"),
                          ("slice_eval_errors", "TRIO_SLICE_EVAL_ERRORS")):
             errors = (context or {}).get(key) or []
             if errors:

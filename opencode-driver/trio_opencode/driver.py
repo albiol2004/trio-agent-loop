@@ -147,35 +147,46 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+#: The core's pending attacks-gate refusal keys in `.driver.json`: the Lead's
+#: copy and the next whole-goal Evaluator's copy (a separate key, so the
+#: Lead's clear never removes it).
+_GATE_KEYS = ("ship_gate", "eval_gate")
+
+
 def _preserve_ship_gate(path: Path, payload: dict) -> dict:
-    """Carry the core's pending ``ship_gate`` (the attacks gate's refusal of
-    the last SHIP, persisted in `.driver.json` by ``TL.review_ship_attacks``)
+    """Carry the core's pending ``ship_gate`` and ``eval_gate`` (the attacks
+    gate's refusal of the last SHIP, persisted in `.driver.json` by
+    ``TL.review_ship_attacks``: the Lead's copy and the next Evaluator's)
     from the file currently on disk into a whole-file ``payload`` about to
     replace it. Read fresh from disk on every write (never cached): a gate
     the core cleared in between is not resurrected, one it just persisted is
     not dropped. Best effort: an unreadable file preserves nothing."""
-    gate = _read_json(path).get("ship_gate")
-    if isinstance(gate, dict):
-        payload["ship_gate"] = gate
-    else:
-        payload.pop("ship_gate", None)
+    on_disk = _read_json(path)
+    for key in _GATE_KEYS:
+        gate = on_disk.get(key)
+        if isinstance(gate, dict):
+            payload[key] = gate
+        else:
+            payload.pop(key, None)
     return payload
 
 
 def _retire_driver_json(path: Path, *, shipped: bool = False) -> None:
     """End-of-run removal of `.driver.json` (the run is over, nothing to
-    resume). A still-pending ``ship_gate`` (a refused SHIP the loop stopped
-    before any Lead pass could read) survives as a file carrying only that
-    key, so a later resume's Lead still gets the refusal -- unless the run
-    SHIPPED (a stale refusal no later Lead pass will ever need)."""
-    gate = None if shipped else _read_json(path).get("ship_gate")
+    resume). A still-pending ``ship_gate`` / ``eval_gate`` (a refused SHIP
+    the loop stopped before any Lead pass or Evaluator could read) survives
+    as a file carrying only those keys, so a later resume's Lead and
+    Evaluator still get the refusal -- unless the run SHIPPED (a stale
+    refusal no later pass will ever need)."""
+    on_disk = {} if shipped else _read_json(path)
+    kept = {key: on_disk[key] for key in _GATE_KEYS if isinstance(on_disk.get(key), dict)}
     try:
         path.unlink()
     except OSError:
         pass
-    if isinstance(gate, dict):
+    if kept:
         try:
-            _atomic_write_json(path, {"ship_gate": gate})
+            _atomic_write_json(path, kept)
         except OSError:
             pass
 

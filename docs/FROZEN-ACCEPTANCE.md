@@ -422,10 +422,14 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
   one counted attack beyond them (`MIN_SHIP_ATTACKS = 1`; the whole-goal
   Evaluator prompt still asks for two). The Evaluator lists them in an
   `attacks:` list, one `- <command or input> -> <what happened>` bullet
-  each. `count_attacks` counts a bullet only with `->` or `→`, text on both
-  sides, and a left side that is not a placeholder (`none`, `n/a`, `tbd`,
-  `-`, `...`); the header is tolerant (case, `**`, backticks, `## attacks:`)
-  and several lists sum. A whole-goal verdict is counted without its
+  each. `count_attacks` counts a bullet only with `->`, `=>` or `→` and
+  text on both sides. A side is a placeholder when nothing alphanumeric is
+  left once its `<...>` slots are removed (`-`, `...`, `<a>, <b>`), or when
+  the whole side is `none`, `n/a`, `tbd`, `skipped`, `not run`, `not
+  tested`, `not executed`, `unverified`, `not verified`, `did not run` (the
+  result side also `nothing`); `not run twice: ...` is not one. The header
+  is tolerant (case, `**`, backticks, `## attacks:`, `Attacks tried:`,
+  `Attacks attempted:`) and several lists sum. A whole-goal verdict is counted without its
   `## slice` sections; a slice section is counted alone, and the newest
   section for the slice wins. Re-running a frozen check or an accept's own
   test is not an attack. With acceptance off the rule is the same and
@@ -439,7 +443,10 @@ refusal text (`acceptance_errors`). A second refusal sets `status: error`
     `loop: iteration N — attacks gate refused SHIP (ITERATE)`. The next Lead
     gets the reason as `SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was
     refused):`; it is stored in `.driver.json` `ship_gate` and cleared once
-    that Lead pass ran.
+    that Lead pass ran. The next whole-goal Evaluator gets the same refusal
+    as `SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):` (stored
+    under `eval_gate`, cleared once an Evaluator ran). A `## Attacks` heading
+    inside an open-loop slice section belongs to that section.
   - **Per-slice SHIP** (open-loop): the newest `## slice <id> @<sha> — SHIP`
     section with no counted attack is not accepted. It is handled like a
     missing section: the slice-eval is re-dispatched with `SLICE-EVAL ERRORS

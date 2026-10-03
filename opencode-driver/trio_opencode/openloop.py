@@ -1567,6 +1567,7 @@ class OpenLoopRunner:
                                  for name in pins if name != "home"},
                 "acceptance": context.get("acceptance"),
                 "rigor": integration_rigor(),
+                "eval_gate_errors": context.get("eval_gate_errors") or [],
             }
             prompt = olprompts.render("integration-eval", eval_ctx)
             label = f"integration-eval it{iteration}a{attempt[:8]}"

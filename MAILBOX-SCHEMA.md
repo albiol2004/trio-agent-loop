@@ -1191,8 +1191,16 @@ for the drivers.
   `errors` to that Lead (runner context `ship_gate_errors`, rendered as
   `SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):`) and
   clears the key once the pass ran; an entry for any other iteration is
-  stale and ignored. Every writer of `.driver.json` that rewrites the file
-  must preserve `ship_gate`. The unaccepted slice SHIP section's reason
+  stale and ignored. The same refusal, worded for the Evaluator that wrote
+  the SHIP, is stored under its own key `eval_gate: {"iteration": K,
+  "errors": [..]}` (the Lead's clear does not remove it). It is handed to
+  the next whole-goal Evaluator (lockstep, open-loop integration-eval; runner
+  context `eval_gate_errors`, rendered as `SHIP REFUSED BY THE DRIVER (your
+  previous SHIP was refused):`, native: in `pin`'s `context_block`) and
+  cleared once that Evaluator ran (native: by its `apply`) or when a SHIP
+  is accepted; it is not matched to an iteration. Every writer of
+  `.driver.json` that rewrites the file must preserve `ship_gate` and
+  `eval_gate`. The unaccepted slice SHIP section's reason
   goes to the re-dispatched slice-eval as context `slice_eval_errors`
   (`SLICE-EVAL ERRORS FROM THE DRIVER:`); it is not persisted.
 - **Author audit.** Contamination is evidence of a *read* of the loop:

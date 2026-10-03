@@ -694,3 +694,267 @@ def test_ship_gate_survives_concurrent_driver_json_rewrites(tmp_path: Path) -> N
         for thread in threads:
             thread.join()
     assert torn == []
+
+
+# ------------------------------------------------------------ attacks-polish
+# Item 2: `Attacks tried:` / `Attacks attempted:` headers.
+
+
+@pytest.mark.parametrize("text", [
+    "Attacks tried:\n- a -> b\n",
+    "attacks attempted:\n- a -> b\n",
+    "## Attacks tried\n- a -> b\n",
+    "**Attacks tried**\n- a -> b\n",
+    "**Attacks attempted:**\n- a -> b\n",
+    "- Attacks tried:\n  - a -> b\n",
+    "Attacks tried: first idea\n- a -> b\n",
+])
+def test_count_attacks_accepts_attacks_tried_and_attempted_headers(text: str) -> None:
+    assert trio_loop.count_attacks(text) == 1
+
+
+@pytest.mark.parametrize("text", [
+    "We considered several attacks:\n- a -> b\n",
+    "Attacks were tried but none helped\n- a -> b\n",
+    "Attacks tried so far looked fine\n- a -> b\n",
+    "Attacks surface:\n- a -> b\n",
+    "Attacks tried by someone else -> fine\n- a -> b\n",
+])
+def test_count_attacks_bare_prose_still_opens_no_list(text: str) -> None:
+    assert trio_loop.count_attacks(text) is None
+
+
+# Item 3: placeholder = nothing alphanumeric once `<...>` slots and
+# punctuation are gone; more placeholder words; whole-value matches only.
+
+
+@pytest.mark.parametrize("bullet", [
+    "- empty input -> not tested", "- empty input -> Not executed.",
+    "- empty input -> unverified", "- empty input -> not verified",
+    "- empty input -> did not run", "- empty input -> didn't run",
+    "- empty input -> Didn’t run.", "- empty input -> nothing",
+    "- not tested -> rejected", "- did not run -> rejected",
+    "- empty input -> -", "- empty input -> ...", "- empty input -> ?",
+    "- empty input -> —", "- empty input -> (-)", "- empty input -> \"\"",
+    "- empty input -> <what happened>.", "- empty input -> \"<what happened>\"",
+    "- empty input -> (<result>)", "- empty input -> <a>, <b>",
+    "- empty input -> [<a>] / <b>", "- <input>, <boundary> -> rejected",
+    "- (<input>) -> rejected", "- \"<input>\" -> \"<what happened>\"",
+    "- <a> <b> -> <c> <d>",
+])
+def test_count_attacks_tighter_placeholder_rule(bullet: str) -> None:
+    assert trio_loop.count_attacks(f"attacks:\n{bullet}\n") == 0
+
+
+@pytest.mark.parametrize("bullet", [
+    "- not run twice: second call hit the cache -> fine",
+    "- empty input -> not run twice: second call hit the cache",
+    "- empty input -> not tested by the suite: found a crash",
+    "- empty input -> nothing was written, exit 2",
+    "- unverified input -> rejected",
+    "- empty input -> did not run the second hook: exit 2",
+    "- <input> with empty string -> rejected",
+    "- empty input -> <what happened> and then exit 2",
+])
+def test_count_attacks_placeholder_words_match_whole_values_only(bullet: str) -> None:
+    assert trio_loop.count_attacks(f"attacks:\n{bullet}\n") == 1
+
+
+PARITY_BODIES_POLISH = [
+    "Attacks tried:\n- a -> b\n- not tested -> x\n- y -> nothing\n",
+    "## Attacks attempted\n1. a -> unverified\n2. b -> did not run\n3. c -> didn't run\n",
+    "attacks:\n- x -> <a>, <b>\n- y -> \"<c>\"\n- z -> ...\n- w -> (-)\n",
+    "attacks:\n- not run twice: x -> y\n- q -> not tested yet\n",
+    "We considered several attacks:\n- a -> b\n",
+    "Attacks were tried\n- a -> b\n",
+    "attacks:\n- <a> -> b\n- <input>, <boundary> -> rejected\n- ok -> fine\n",
+]
+
+
+@pytest.mark.parametrize("body", PARITY_BODIES_POLISH)
+def test_fallback_copies_match_the_core_on_the_polished_rules(monkeypatch, body: str) -> None:
+    want = trio_loop.count_attacks(body)
+    assert _load_trioctl()._local_count_attacks(body) == want
+    assert _load_quality(monkeypatch)._fallback_count_attacks(body) == want
+
+
+def test_fallback_copies_match_the_core_on_random_compositions(monkeypatch) -> None:
+    import random
+    rng = random.Random(20261003)
+    headers = ["attacks:", "Attacks tried:", "attacks attempted:", "## Attacks", "## Attacks tried",
+               "**Attacks**", "- Attacks:", "Attacks were tried", "attacks tried so far", "attacks"]
+    sides = ["empty input", "not run", "not run twice: x", "not tested", "Not executed.",
+             "unverified", "not verified", "did not run", "didn't run", "nothing",
+             "nothing was written", "<x>", "<x>, <y>", "\"<x>\"", "(-)", "...", "?", "—",
+             "n/a", "none attempted", "`<a>`", "3 < 5 and 7 > 2", "<b>bold</b>", "ok", "",
+             "TBD", "skipped", "pending", "untested"]
+    arrows = ["->", "=>", "→", " -> ", ""]
+    bullets = ["- ", "* ", "+ ", "1. ", "2) ", "  - ", ""]
+    trioctl, quality = _load_trioctl(), _load_quality(monkeypatch)
+    for _ in range(3000):
+        lines = []
+        for _line in range(rng.randint(1, 6)):
+            if rng.random() < 0.25:
+                lines.append(rng.choice(headers))
+            else:
+                lines.append(rng.choice(bullets) + rng.choice(sides) + rng.choice(arrows)
+                             + rng.choice(sides))
+        body = "\n".join(lines) + "\n"
+        want = trio_loop.count_attacks(body)
+        assert trioctl._local_count_attacks(body) == want, body
+        assert quality._fallback_count_attacks(body) == want, body
+
+
+# Item 4: a `## Attacks` heading inside an open-loop slice section stays in it.
+
+SECTION_WITH_HEADING = (
+    "VERDICT: SHIP\niteration: 1\n"
+    "## slice alpha @abcdef1234567 — SHIP\nevidence: x\n"
+    "## Attacks\n- slice probe -> held\n"
+    "## slice beta @1234567abcdef — SHIP\nevidence: y\n"
+    "## Attacks tried\n- other probe -> held\n"
+    "## Notes\nnot part of any slice\n"
+)
+
+
+def test_integration_text_keeps_attacks_headings_inside_their_slice_section() -> None:
+    scoped = trio_loop._integration_verdict_text(SECTION_WITH_HEADING)
+    assert "slice probe" not in scoped and "other probe" not in scoped
+    assert "## Attacks" not in scoped
+    assert "## Notes" in scoped and "not part of any slice" in scoped
+    assert trio_loop.whole_goal_attacks(SECTION_WITH_HEADING) is None
+
+
+def test_slice_sections_include_the_attacks_heading_and_its_bullets() -> None:
+    sections = trio_loop._slice_sections(SECTION_WITH_HEADING)
+    assert [s["slice"] for s in sections] == ["alpha", "beta"]
+    assert "slice probe -> held" in sections[0]["text"]
+    assert "## Notes" not in sections[1]["text"]
+    assert trio_loop.slice_attacks(SECTION_WITH_HEADING, "alpha", "abcdef1234567") == 1
+    assert trio_loop.slice_attacks(SECTION_WITH_HEADING, "beta", "1234567abcdef") == 1
+
+
+def test_trioctl_and_quality_slice_scoping_match_the_core(monkeypatch) -> None:
+    want = trio_loop._integration_verdict_text(SECTION_WITH_HEADING)
+    assert _load_trioctl()._integration_verdict_text(SECTION_WITH_HEADING) == want
+    for module in (_load_trioctl(), _load_quality(monkeypatch)):
+        got = module._slice_section(SECTION_WITH_HEADING, "alpha", "abcdef1234567")
+        assert got is not None and "slice probe -> held" in got[1], module
+
+
+def test_open_loop_slice_attacks_under_an_attacks_heading_neither_refuse_the_slice_nor_vouch_for_the_goal(
+        tmp_path: Path) -> None:
+    lock = threading.Lock()
+    mailbox = OL.make_open_loop_mailbox(tmp_path, OL.PLAN_ONE_SLICE)
+    queue = OL.QueueModel(mailbox, lock)
+    sha1, sha2 = OL.fake_sha("solo-1"), OL.fake_sha("solo-2")
+    section = lambda sha: (f"## slice solo @{sha} — SHIP\nevidence: re-run=1\n"
+                           "## Attacks\n- empty input -> rejected with exit 2\n")
+    lead = RecordingLead([lambda mb: queue.retire("solo", sha1),
+                          lambda mb: queue.retire("solo", sha2)])
+    evaluator = RecordingEval(
+        {("solo", sha1): [lambda mb: _append(mb, section(sha1))],
+         ("solo", sha2): [lambda mb: _append(mb, section(sha2))]},
+        [lambda mb: _integration(mb, SHIP), lambda mb: _integration(mb, SHIP_ATTACKED)],
+    )
+    assert trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01) == 0
+    log = (mailbox / "LOG.md").read_text()
+    # The slice SHIPs were accepted (their `## Attacks` stayed in the section),
+    # the first integration SHIP was refused (those bullets are not the goal's).
+    assert log.count("SHIP refused by the attacks gate") == 1
+    assert sum(1 for c in evaluator.calls if c["context"]["kind"] == "slice-eval") == 2
+
+
+# Item 1: the refusal reason reaches the next whole-goal Evaluator.
+
+
+def test_eval_gate_is_a_separate_key_the_leads_clear_does_not_remove(tmp_path: Path) -> None:
+    mailbox = TL.make_mailbox(tmp_path)
+    (mailbox / "VERDICT.md").write_text(SHIP, encoding="utf-8")
+    _verdict, _scope, errors = trio_loop.review_ship_attacks(mailbox, 3, "SHIP", None)
+    data = json.loads((mailbox / ".driver.json").read_text())
+    assert set(data) >= {"ship_gate", "eval_gate"} and data["ship_gate"] != data["eval_gate"]
+    seen = trio_loop.eval_gate_errors(mailbox)
+    assert len(seen) == 1 and seen[0] != errors[0]
+    assert "your previous SHIP" in seen[0] and NO_ATTACK_REASON in seen[0]
+    assert "attacks:" in seen[0] and "<command or input> -> <what happened>" in seen[0]
+    assert trio_loop.eval_gate_errors(mailbox) == seen, "read-only"
+    assert data["eval_gate"]["iteration"] == 4
+    trio_loop.clear_ship_gate_errors(mailbox)                     # the Lead got its copy
+    assert trio_loop.ship_gate_errors(mailbox) == []
+    assert trio_loop.eval_gate_errors(mailbox) == seen
+    trio_loop._write_driver_state(mailbox, TL.FakeRunner([]), 3, "idle")
+    assert trio_loop.eval_gate_errors(mailbox) == seen, "a whole-file rewrite keeps it"
+    trio_loop.clear_eval_gate_errors(mailbox)
+    assert trio_loop.eval_gate_errors(mailbox) == []
+    assert "eval_gate" not in json.loads((mailbox / ".driver.json").read_text())
+
+
+def test_an_accepted_ship_forgets_a_stale_eval_gate(tmp_path: Path) -> None:
+    mailbox = TL.make_mailbox(tmp_path)
+    trio_loop._persist_eval_gate_errors(mailbox, 2, ["old"])
+    (mailbox / "VERDICT.md").write_text(SHIP_ATTACKED, encoding="utf-8")
+    assert trio_loop.review_ship_attacks(mailbox, 2, "SHIP", None) == ("SHIP", None, [])
+    assert trio_loop.eval_gate_errors(mailbox) == []
+
+
+def test_lockstep_refusal_reaches_the_next_evaluator_once(tmp_path: Path) -> None:
+    mailbox = TL.make_mailbox(tmp_path)
+    seen: dict = {}
+
+    class Runner(TL.FakeRunner):
+        def run(self, role, iteration, mb, context=None):
+            if role == "evaluator":
+                seen[iteration] = list((context or {}).get("eval_gate_errors") or [])
+            return super().run(role, iteration, mb, context)
+
+    runner = Runner(["VERDICT: SHIP", "VERDICT: SHIP", "VERDICT: ITERATE\nscope: design",
+                     SHIP_ATTACKED], inject_attacks=False)
+    assert trio_loop.run_loop(mailbox, 6, runner, mode="lockstep") == 0
+    assert seen[1] == []
+    assert len(seen[2]) == 1 and "your previous SHIP" in seen[2][0]
+    assert len(seen[3]) == 1, "the second refusal replaced the first and was delivered"
+    assert seen[4] == [], "an evaluator that has seen it is not told again"
+    lead2 = runner.contexts[2]
+    assert "ship_gate_errors" in lead2 and "eval_gate_errors" not in lead2
+    assert trio_loop.eval_gate_errors(mailbox) == []
+
+
+def test_open_loop_integration_refusal_reaches_the_next_integration_evaluator(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    mailbox = OL.make_open_loop_mailbox(tmp_path, OL.PLAN_ONE_SLICE)
+    queue = OL.QueueModel(mailbox, lock)
+    sha1, sha2 = OL.fake_sha("solo-1"), OL.fake_sha("solo-2")
+    lead = RecordingLead([lambda mb: queue.retire("solo", sha1),
+                          lambda mb: queue.retire("solo", sha2)])
+    evaluator = RecordingEval(
+        {("solo", sha1): [lambda mb: _append(mb, _slice_section("solo", sha1))],
+         ("solo", sha2): [lambda mb: _append(mb, _slice_section("solo", sha2))]},
+        [lambda mb: _integration(mb, SHIP), lambda mb: _integration(mb, SHIP_ATTACKED)],
+    )
+    assert trio_loop.run_open_loop(mailbox, 5, lead, evaluator, poll_seconds=0.01) == 0
+    integrations = [c["context"] for c in evaluator.calls if c["context"]["kind"] == "integration-eval"]
+    slices = [c["context"] for c in evaluator.calls if c["context"]["kind"] == "slice-eval"]
+    assert len(integrations) == 2
+    assert "eval_gate_errors" not in integrations[0]
+    assert "your previous SHIP" in integrations[1]["eval_gate_errors"][0]
+    assert all("eval_gate_errors" not in c for c in slices), "slice-evals never get it"
+    assert trio_loop.eval_gate_errors(mailbox) == []
+
+
+def test_portable_whole_goal_evaluator_prompt_renders_the_refusal(monkeypatch, capfd, tmp_path) -> None:
+    out = _render(monkeypatch, capfd, tmp_path, "evaluator",
+                  {"evaluator_attempt": "att1", "pinned_sha": "abc1234",
+                   "eval_gate_errors": ["list an attack", "second"]})
+    assert out.startswith("LOCKSTEP CONTEXT: attempt=att1 sha=abc1234\n\n")
+    assert ("SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):\n"
+            "- list an attack\n- second\n") in out
+    ol = _render(monkeypatch, capfd, tmp_path, "evaluator",
+                 {"mode": "open-loop", "kind": "integration-eval", "slice": None, "sha": "abc1234",
+                  "eval_gate_errors": ["list an attack"]})
+    assert "SHIP REFUSED BY THE DRIVER (your previous SHIP was refused):\n- list an attack\n" in ol
+    plain = _render(monkeypatch, capfd, tmp_path, "evaluator",
+                    {"evaluator_attempt": "att1", "pinned_sha": "abc1234"})
+    assert "SHIP REFUSED" not in plain
+    lead = _render(monkeypatch, capfd, tmp_path, "lead", {"ship_gate_errors": ["x"]})
+    assert "SHIP REFUSED BY THE DRIVER" not in lead

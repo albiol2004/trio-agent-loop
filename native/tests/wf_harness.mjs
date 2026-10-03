@@ -216,7 +216,10 @@ function baseStepResult(op, base, flag) {
         detail: pass ? [] : ["commit gate: slice 'app' ... no slice(app): commit"], status: final ? 'error' : 'running' }
     }
     case 'pin': return { ...base, iteration, evaluator_attempt: `att${iteration}`, sha: `sha${iteration}`,
-      skip_evaluator: false, context_block: `LOCKSTEP CONTEXT: attempt=att${iteration} sha=sha${iteration}\n`,
+      // The helper renders the pending attacks-gate refusal into the Evaluator's context_block.
+      skip_evaluator: false, context_block: `LOCKSTEP CONTEXT: attempt=att${iteration} sha=sha${iteration}\n` +
+        (attacksRefusedIteration !== null && iteration === attacksRefusedIteration + 1
+          ? `\nSHIP REFUSED BY THE DRIVER (your previous SHIP was refused):\n- evaluator copy of the refusal\n` : ''),
       ...(sc.eval_places ? { eval_worktree: `/repo/.claude/worktrees/eval-EXEC-${iteration}-att${iteration}`,
         eval_scratch: `/repo/.claude/worktrees/eval-EXEC-${iteration}-att${iteration}-scratch`, tmpdir: sc.tmpdir || null } : {}),
       ...(sc.human ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}) }

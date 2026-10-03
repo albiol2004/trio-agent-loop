@@ -41,15 +41,20 @@ fi
 [[ -f "$LOOP_DIR/GOAL.md" ]] || { echo "$LOOP_DIR/GOAL.md missing — copy portable/GOAL.template.md to $LOOP_DIR/GOAL.md and edit it." >&2; exit 1; }
 
 # ship_gate_note — the driver's attacks-gate feedback (trio_loop.py
-# ship_gate_errors / slice_eval_errors, passed as TRIO_SHIP_GATE_ERRORS /
-# TRIO_SLICE_EVAL_ERRORS): the Lead is told its last SHIP was refused, a
-# slice-eval is told its SHIP section was not accepted. Prints a leading
-# newline per block and nothing when neither variable is set.
+# ship_gate_errors / eval_gate_errors / slice_eval_errors, passed as
+# TRIO_SHIP_GATE_ERRORS / TRIO_EVAL_GATE_ERRORS / TRIO_SLICE_EVAL_ERRORS): the
+# Lead is told its last SHIP was refused, the next whole-goal Evaluator is told
+# its previous SHIP was, a slice-eval is told its SHIP section was not
+# accepted. Prints a leading newline per block and nothing when none is set.
 ship_gate_note() {
   local line
   if [[ -n "${TRIO_SHIP_GATE_ERRORS:-}" ]]; then
     printf '\nSHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):'
     while IFS= read -r line; do printf '\n- %s' "$line"; done <<<"$TRIO_SHIP_GATE_ERRORS"
+  fi
+  if [[ -n "${TRIO_EVAL_GATE_ERRORS:-}" ]]; then
+    printf '\nSHIP REFUSED BY THE DRIVER (your previous SHIP was refused):'
+    while IFS= read -r line; do printf '\n- %s' "$line"; done <<<"$TRIO_EVAL_GATE_ERRORS"
   fi
   if [[ -n "${TRIO_SLICE_EVAL_ERRORS:-}" ]]; then
     printf '\nSLICE-EVAL ERRORS FROM THE DRIVER:'
@@ -85,7 +90,8 @@ build_prompt() {
     printf 'LOCKSTEP CONTEXT: attempt=%s sha=%s\n\n' \
       "${TRIO_ATTEMPT:-}" "${TRIO_PINNED_SHA:-}"
   fi
-  if [[ "${TRIO_MODE:-}" != "open-loop" && -n "${TRIO_SHIP_GATE_ERRORS:-}" ]]; then
+  if [[ "${TRIO_MODE:-}" != "open-loop" \
+        && ( -n "${TRIO_SHIP_GATE_ERRORS:-}" || -n "${TRIO_EVAL_GATE_ERRORS:-}" ) ]]; then
     local note
     note="$(ship_gate_note)"
     printf '%s\n\n' "${note#$'\n'}"
@@ -139,7 +145,8 @@ run_role() {
              if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" \
                    || -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" \
                    || -n "${TRIO_HUMAN_ANSWER:-}" \
-                   || -n "${TRIO_SHIP_GATE_ERRORS:-}" || -n "${TRIO_SLICE_EVAL_ERRORS:-}" ]]; then
+                   || -n "${TRIO_SHIP_GATE_ERRORS:-}" || -n "${TRIO_EVAL_GATE_ERRORS:-}" \
+                   || -n "${TRIO_SLICE_EVAL_ERRORS:-}" ]]; then
                pf="$(mktemp)"
                build_prompt "$prompt_file" > "$pf"
              fi

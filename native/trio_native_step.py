@@ -1079,7 +1079,8 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     attacks gate's refusal of the last SHIP, keyed to the iteration this
     pass runs as; the key is absent when there is none, so a switch-off
     run's answers stay byte-identical), acceptance on or off. Read-only, so
-    a re-run of ``next`` answers the same until the pass's gate passes.
+    a re-run of ``next`` answers the same until the pass's gate passes. The
+    next ``pin`` carries the same refusal worded for the Evaluator.
     """
     body = _op_next_body(mailbox, repo, a)
     if body.get("action") in ("lead", "repair"):
@@ -1334,11 +1335,18 @@ def _context_block(mailbox: Path, ctx: dict) -> str:
     pins = ctx.get("pins") or {}
     extra = (" pins=" + ",".join(f"{n}@{v}" for n, v in pins.items())
              if pins else "")
+    refused = [str(e)[:1200] for e in (ctx.get("eval_gate_errors") or [])][:10]
+    refusal = (
+        "\nSHIP REFUSED BY THE DRIVER (your previous SHIP was refused):\n"
+        + "".join(f"- {e}\n" for e in refused)
+        if refused else ""
+    )
     return (
         f"LOCKSTEP CONTEXT: attempt={attempt} sha={sha}{extra}\n\n"
         f"MAILBOX OVERRIDE: this run uses `{mailbox}/` as the loop mailbox "
         f"— every `loop/` path in the instructions below resolves to "
         f"`{mailbox}/`.\n"
+        + refusal
     )
 
 
@@ -1388,7 +1396,7 @@ def op_pin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         mailbox, repo, a.iteration, state, mailbox / "STATE.md"
     )
     _write_session(mailbox, a.token, "evaluator-running", done=False)
-    return {
+    body = {
         **_eval_places(mailbox, repo, a.iteration,
                        str(ctx["evaluator_attempt"] or ""),
                        str(ctx["pinned_sha"] or "")),
@@ -1401,8 +1409,16 @@ def op_pin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         "skip_evaluator": TL._fresh_evaluator_artifact(
             mailbox, a.iteration, ctx
         ),
+        # Carries the attacks gate's refusal of the last SHIP when there is
+        # one (read-only here: `apply` spends it once the Evaluator ran).
         "context_block": _context_block(mailbox, ctx),
     }
+    if ctx.get("eval_gate_errors"):
+        # Additive (absent when none, so a switch-off run's answers stay
+        # byte-identical): the refusal the context_block already renders.
+        body["eval_gate_errors"] = [
+            str(e)[:1200] for e in ctx["eval_gate_errors"]][:10]
+    return body
 
 
 def _section(text: str, heading: str, limit: int = 1500) -> str | None:
@@ -1509,6 +1525,11 @@ def _apply_body(mailbox: Path, repo: Path | None, a: argparse.Namespace,
     acc_record = None
     attacks_gate = None
     _fence()
+    # The Evaluator that just ran was given the last refusal (`pin` renders
+    # it into its context_block): spent now, before a refusal of THIS
+    # verdict can persist a new one. Not idempotent, like the gate below:
+    # replays return the sealed result.
+    TL.clear_eval_gate_errors(mailbox)
     if verdict == "SHIP":
         # Rule 1: the cheap attacks gate first. A SHIP with no counted
         # attack beyond the frozen checks becomes ITERATE and never reaches
