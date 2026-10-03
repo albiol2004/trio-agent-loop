@@ -440,6 +440,14 @@ def _drop_note(dropped: dict[str, str], cid: str) -> str:
     return f"was dropped at freeze ({reason[0][:100]})" if reason else "unknown"
 
 
+def _gap(label: str, role: str, notes: list[str]) -> str:
+    """``R1 has no hard check`` plus why the listed checks did not count
+    (dropped at freeze, also listed as normal) -- a reference that did not
+    count is only a gap when nothing else covers that role."""
+    text = f"{label} has no {role} check"
+    return f"{text} ({'; '.join(notes)})" if notes else text
+
+
 def requirements_problems(manifest: dict[str, Any], kept_ids: Iterable[str],
                           goal_text: str | None, notes_text: str | None = None,
                           dropped: Iterable[tuple[str, str]] | None = None) -> list[str]:
@@ -493,17 +501,21 @@ def requirements_problems(manifest: dict[str, Any], kept_ids: Iterable[str],
         if not isinstance(normal, list) or not normal:
             add(f"{label} has no normal check")
         else:
+            normal_notes: list[str] = []
             for cid in normal:
                 if not isinstance(cid, str):
                     add(f"{label} normal check {cid!r} is not a check id")
                 elif cid in kept:
                     normal_ok.add(cid)
+                elif cid in why:
+                    normal_notes.append(f"{cid} {_drop_note(why, cid)}")
                 else:
-                    add(f"{label} normal check {cid} {_drop_note(why, cid)}")
+                    add(f"{label} normal check {cid} unknown")
             if not normal_ok:
-                add(f"{label} has no normal check")
+                add(_gap(label, "normal", normal_notes))
         hard = entry.get("hard")
         hard_ok = 0
+        hard_notes: list[str] = []
         if not isinstance(hard, list) or not hard:
             add(f"{label} has no hard check")
         else:
@@ -523,11 +535,14 @@ def requirements_problems(manifest: dict[str, Any], kept_ids: Iterable[str],
                     add(f"{label} hard item names no check id")
                     continue
                 if cid not in kept:
-                    add(f"{tag} {_drop_note(why, cid)}")
+                    if cid in why:
+                        hard_notes.append(f"{cid} {_drop_note(why, cid)}")
+                    else:
+                        add(f"{tag} unknown")
                     good = False
                 elif isinstance(normal, list) and cid in normal:
-                    add(f"{tag} is also listed as normal (a check is normal or hard for "
-                        "one requirement, not both)")
+                    hard_notes.append(f"{cid} is also listed as normal (a check is normal "
+                                      "or hard for one requirement, not both)")
                     good = False
                 typ = item.get("type")
                 if typ not in HARD_TYPES:
@@ -544,7 +559,7 @@ def requirements_problems(manifest: dict[str, Any], kept_ids: Iterable[str],
                     good = False
                 hard_ok += good
             if not hard_ok:
-                add(f"{label} has no hard check")
+                add(_gap(label, "hard", hard_notes))
     return probs
 
 

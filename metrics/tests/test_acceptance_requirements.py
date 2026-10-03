@@ -109,8 +109,16 @@ def test_no_hard_check_and_empty_normal():
 def test_hard_check_dropped_at_freeze_names_the_reason():
     kept = [c for c in ids() if c != "ACC-02"]
     got = problems([req()], kept=kept, dropped=[("ACC-02", "passes-at-base")])
-    assert got == ["requirements: R1 hard check ACC-02 was dropped at freeze (passes-at-base)",
-                   "requirements: R1 has no hard check"]
+    assert got == ["requirements: R1 has no hard check "
+                   "(ACC-02 was dropped at freeze (passes-at-base))"]
+
+
+def test_dropped_reference_is_no_gap_while_another_hard_check_survives():
+    kept = [c for c in ids() if c != "ACC-02"]
+    entry = req("R1", hard=(("ACC-02", "boundary"), ("ACC-03", "failure-mode")))
+    assert problems([entry], kept=kept, dropped=[("ACC-02", "passes-at-base")]) == []
+    entry = req("R1", normal=("ACC-02", "ACC-01"), hard=(("ACC-03", "boundary"),))
+    assert problems([entry], kept=kept, dropped=[("ACC-02", "passes-at-base")]) == []
 
 
 def test_unknown_check_ids():
@@ -160,8 +168,8 @@ def test_interaction_needs_a_valid_other_requirement():
 
 def test_check_both_normal_and_hard_does_not_count_as_hard():
     got = problems([req("R1", normal=("ACC-01", "ACC-02"), hard=(("ACC-02", "boundary"),))])
-    assert any("ACC-02 is also listed as normal" in g for g in got)
-    assert got[-1] == "requirements: R1 has no hard check"
+    assert len(got) == 1 and got[0].startswith("requirements: R1 has no hard check (")
+    assert "ACC-02 is also listed as normal" in got[0]
     # The same check may be hard for one requirement and normal for another.
     assert problems([req("R1"), req("R2", normal=("ACC-02",), hard=(("ACC-03", "boundary"),))]) == []
 
@@ -219,8 +227,7 @@ def test_freeze_filter_hard_check_dropped_at_base():
     assert ("ACC-02", "passes-at-base") in out["dropped"]
     assert out["retry"] is True
     assert out["requirement_gaps"] == [
-        "requirements: R1 hard check ACC-02 was dropped at freeze (passes-at-base)",
-        "requirements: R1 has no hard check"]
+        "requirements: R1 has no hard check (ACC-02 was dropped at freeze (passes-at-base))"]
     assert "ACC-02" not in [c["id"] for c in out["manifest"]["checks"]]
 
 
@@ -431,12 +438,12 @@ def test_loop_hard_check_dropped_at_base_both_times_freezes_with_gaps(tmp_path):
     authors = authors_of(fake)
     assert len(authors) == 2
     assert {d[0] for d in authors[1]["dropped"]} == {"ACC-02"}
-    assert any("R1 hard check ACC-02 was dropped at freeze (passes-at-base)" in f
+    assert any("R1 has no hard check (ACC-02 was dropped at freeze (passes-at-base))" in f
                for f in authors[1]["fatal"])
     frozen = (mb / "acceptance" / "FROZEN").read_text()
-    assert "ACC-02 passes-at-base" in frozen and "requirement_gaps: requirements: R1 hard" in frozen
-    assert "WARNING frozen with requirement-map gaps after the retry: 2 (" in T.log(mb)
-    assert "author retry: 1 dropped; 2 requirement gap(s)" in T.log(mb)
+    assert "ACC-02 passes-at-base" in frozen and "requirement_gaps: requirements: R1 has no hard" in frozen
+    assert "WARNING frozen with requirement-map gaps after the retry: 1 (" in T.log(mb)
+    assert "author retry: 1 dropped; 1 requirement gap(s)" in T.log(mb)
 
 
 def freeze_legacy_pack(mb: Path, repo: Path) -> None:
