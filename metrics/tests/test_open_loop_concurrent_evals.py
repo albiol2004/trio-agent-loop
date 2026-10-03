@@ -15,6 +15,7 @@ import pytest
 
 from metrics import trio_loop
 from metrics.tests.test_open_loop_driver import (
+    ATTACKS,
     QueueModel,
     ScriptedEvalRunner,
     ScriptedLeadRunner,
@@ -442,7 +443,9 @@ def test_concurrent_eval_clobbering_a_section_written_mid_flight_is_restored(
     def eval_beta_clobbers(mb):
         assert alpha_done.wait(10)
         time.sleep(0.2)  # the driver harvests alpha and sees its section
-        (mb / "VERDICT.md").write_text(f"## slice beta @{sha_b} -- SHIP\n", encoding="utf-8")
+        (mb / "VERDICT.md").write_text(
+            f"## slice beta @{sha_b} -- SHIP\n{ATTACKS}", encoding="utf-8"
+        )
 
     evaluator = TrackingEvalRunner(
         slice_actions={("alpha", sha_a): eval_alpha, ("beta", sha_b): eval_beta_clobbers},

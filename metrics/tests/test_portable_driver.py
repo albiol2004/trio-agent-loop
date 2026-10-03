@@ -119,7 +119,7 @@ def successful_harnesses(tmp_path: Path) -> tuple[Path, Path]:
             '"$LOOP_DIR/STATE.md")"\n'
             'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
             '>> "$LOOP_DIR/LOG.md"\n'
-            'printf "%s\\n" "VERDICT: SHIP" > "$LOOP_DIR/VERDICT.md"\n'
+            'printf "%s\\n" "VERDICT: SHIP" "attacks:" "- empty input -> rejected with exit 2" > "$LOOP_DIR/VERDICT.md"\n'
         ),
     )
     return lead, evaluator

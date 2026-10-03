@@ -277,7 +277,7 @@ def test_lockstep_cli_end_to_end_missing_retirement_exits_six(
             '"$LOOP_DIR/STATE.md")"\n'
             'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
             '>> "$LOOP_DIR/LOG.md"\n'
-            'printf "%s\\n" "VERDICT: SHIP" > "$LOOP_DIR/VERDICT.md"\n'
+            'printf "%s\\n" "VERDICT: SHIP" "attacks:" "- empty input -> rejected with exit 2" > "$LOOP_DIR/VERDICT.md"\n'
         ),
     )
     result = run_lockstep_cli(
@@ -343,7 +343,7 @@ def test_lockstep_cli_end_to_end_genuine_retirement_ships(
             'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
             '>> "$LOOP_DIR/LOG.md"\n'
             "{\n"
-            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "VERDICT: SHIP" "attacks:" "- empty input -> rejected with exit 2"\n'
             '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
             '  printf "%s\\n" "attempt: ${attempt}"\n'
             '  printf "%s\\n" "evaluated: ${pin}"\n'
@@ -473,7 +473,7 @@ def test_portable_dispatch_ships_when_prompt_fields_copied(
             'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
             '>> "$LOOP_DIR/LOG.md"\n'
             "{\n"
-            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "VERDICT: SHIP" "attacks:" "- empty input -> rejected with exit 2"\n'
             '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
             '  printf "%s\\n" "attempt: ${attempt}"\n'
             '  printf "%s\\n" "evaluated: ${sha}"\n'
@@ -528,7 +528,7 @@ def test_portable_dispatch_without_fields_does_not_ship(
             'printf "%s\\n" "- iter ${iteration} | evaluator | checked" '
             '>> "$LOOP_DIR/LOG.md"\n'
             "{\n"
-            '  printf "%s\\n" "VERDICT: SHIP"\n'
+            '  printf "%s\\n" "VERDICT: SHIP" "attacks:" "- empty input -> rejected with exit 2"\n'
             '  printf "%s\\n" "# Verdict — iteration ${iteration}"\n'
             '  printf "%s\\n" "commit: ${pin}"\n'
             '} > "$LOOP_DIR/VERDICT.md"\n'

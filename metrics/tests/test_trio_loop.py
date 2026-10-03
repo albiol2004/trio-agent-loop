@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import pytest
 
 from metrics import trio_loop
 
+
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
 
 PLAN = """\
 ```yaml
@@ -50,7 +53,9 @@ class FakeRunner:
         expected_roles: list[str] | None = None,
         add_log: bool = True,
         inject_lockstep: bool = True,
+        inject_attacks: bool = True,
     ) -> None:
+        self.inject_attacks = inject_attacks
         self.verdicts = list(verdicts)
         self.expected_roles = expected_roles
         self.add_log = add_log
@@ -78,6 +83,15 @@ class FakeRunner:
             assert self.verdicts
             text = self.verdicts.pop(0)
             extras: list[str] = []
+            # A SHIP must record a probe beyond the frozen checks (the
+            # driver's attacks gate); fake SHIP verdicts carry one unless
+            # the test is about the gate itself (inject_attacks=False).
+            if (
+                self.inject_attacks
+                and re.match(r"\s*#?\s*verdict:\s*ship\b", text, re.IGNORECASE)
+                and "attacks:" not in text.lower()
+            ):
+                extras.append(ATTACKS.rstrip("\n"))
             if context and self.inject_lockstep:
                 attempt = str(context.get("evaluator_attempt") or "")
                 if attempt and "attempt:" not in text.lower():
@@ -600,7 +614,7 @@ def test_matching_attempt_skips_evaluator_redispatch(
     )
     (mailbox / "VERDICT.md").write_text(
         "VERDICT: SHIP\n# Verdict — iteration 1\n"
-        f"attempt: {attempt}\n",
+        f"attempt: {attempt}\n" + ATTACKS,
         encoding="utf-8",
     )
     with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:
@@ -839,7 +853,7 @@ def test_resume_does_not_rerun_bound_evaluator(tmp_path: Path) -> None:
         "VERDICT: SHIP\n# Verdict — iteration 1\n"
         f"attempt: {attempt}\n"
         f"evaluated: {product}\n"
-        f"commit: {product}\n",
+        f"commit: {product}\n" + ATTACKS,
         encoding="utf-8",
     )
     with (mailbox / "LOG.md").open("a", encoding="utf-8") as log:

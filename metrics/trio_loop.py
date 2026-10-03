@@ -258,6 +258,7 @@ def _write_driver_state(
     }
     for key, value in _driver_meta(runner).items():
         payload.setdefault(key, value)
+    payload.update(_preserved_ship_gate(mailbox))
     (mailbox / ".driver.json").write_text(
         json.dumps(payload) + "\n",
         encoding="utf-8",
@@ -510,6 +511,9 @@ def _run_role(mailbox, iteration, role, runner, repo, state_path,
     role once with ``acceptance_errors`` in its context.
     """
     context: dict = {}
+    # The attacks gate's refusal of the last SHIP reaches the Lead whether
+    # or not acceptance is on; cleared once a runner got it.
+    ship_errors = ship_gate_errors(mailbox, iteration) if role in ("lead", "repair") else []
     for _attempt in range(2):
         if acceptance is not None:
             try:
@@ -525,9 +529,13 @@ def _run_role(mailbox, iteration, role, runner, repo, state_path,
             if acceptance.pending_errors:
                 context = {"acceptance_errors": list(acceptance.pending_errors)}
                 acceptance.pending_errors = []
+        if ship_errors:
+            context = {**context, "ship_gate_errors": list(ship_errors)}
         result = _invoke_runner(runner, role, iteration, mailbox, context)
         if result != 0:
             raise RuntimeError(f"{role} runner failed with exit {result}")
+        if ship_errors:
+            clear_ship_gate_errors(mailbox)
         checks = (
             _commit_gate(mailbox, repo),
             _log_gate(mailbox, iteration, role),
@@ -737,6 +745,300 @@ def _integration_verdict_text(text: str) -> str:
         if not skipping:
             kept.append(line)
     return "".join(kept)
+
+
+# --- ship attacks gate ------------------------------------------------------
+# Frozen acceptance checks (when on) and the Evaluator's own pass are a floor:
+# before ANY SHIP (lockstep, open-loop integration, open-loop per-slice) the
+# Evaluator must have listed at least one adversarial probe beyond the frozen
+# pack in an `attacks:` list. The DRIVER enforces it, whether or not
+# acceptance is on.
+
+#: Minimum number of recorded attacks a SHIP's evidence must carry.
+MIN_SHIP_ATTACKS = 1
+
+_ATTACKS_HEADER_RE = re.compile(
+    r"^\s*(?:#{1,6}\s+|[-*]\s+)?[*`_]*attacks[*`_]*\s*:", re.IGNORECASE
+)
+_ATTACK_BULLET_RE = re.compile(r"^\s*[-*]\s+\S")
+_ATTACK_BULLET_STRIP_RE = re.compile(r"^\s*[-*]\s+")
+_ATTACK_PLACEHOLDERS = frozenset({"", "none", "na", "tbd"})
+
+
+def _attack_counts(entry: str) -> bool:
+    """True when one `attacks:` bullet records an attack AND its result:
+    ``<probe> -> <what happened>`` with text on both sides and a left side
+    that is not a placeholder (none / n/a / tbd / ``-`` / ``...``)."""
+    body = _ATTACK_BULLET_STRIP_RE.sub("", entry, count=1)
+    parts = re.split(r"->|→", body, maxsplit=1)
+    if len(parts) != 2:
+        return False
+    left, right = parts[0].strip(), parts[1].strip()
+    if not left or not right.strip("*`_ \t"):
+        return False
+    return re.sub(r"[^0-9a-z]", "", left.lower()) not in _ATTACK_PLACEHOLDERS
+
+
+def count_attacks(text: str) -> int | None:
+    """Recorded attacks in ``text``'s ``attacks:`` list(s); None when no
+    ``attacks:`` header line exists at all.
+
+    The header is tolerant (leading spaces, ``**``/backticks, any case,
+    inline text after the colon). Bullets (``- x`` / ``* x``) after it are
+    list entries; an indented non-bullet line continues the previous
+    entry; the list ends at the first non-blank, non-indented, non-bullet
+    line. An entry COUNTS only when it records the probe and its result
+    (``->`` or ``→`` with text on both sides, left side not a placeholder
+    such as ``none``/``n/a``/``tbd``). Several blocks sum.
+    """
+    total = 0
+    found = False
+    in_list = False
+    current: str | None = None
+
+    def flush() -> None:
+        nonlocal total, current
+        if current is not None and _attack_counts(current):
+            total += 1
+        current = None
+
+    for raw in (text or "").splitlines():
+        if _ATTACKS_HEADER_RE.match(raw):
+            flush()
+            found = True
+            in_list = True
+            continue
+        if not in_list:
+            continue
+        if not raw.strip():
+            continue
+        if _ATTACK_BULLET_RE.match(raw):
+            flush()
+            current = raw
+        elif raw[:1] in (" ", "\t"):
+            if current is not None:
+                current += " " + raw.strip()
+        else:
+            flush()
+            in_list = False
+    flush()
+    return total if found else None
+
+
+def whole_goal_attacks(verdict_text: str) -> int | None:
+    """``count_attacks`` over the whole-goal verdict only (every open-loop
+    ``## slice`` section is ignored: a slice's probes do not vouch for the
+    integrated goal)."""
+    return count_attacks(_integration_verdict_text(verdict_text))
+
+
+def _slice_sections(text: str) -> list[dict]:
+    """Every ``## slice <id> @<sha> — SHIP|ITERATE`` section: heading through
+    the line before the next ``# ``/``## `` heading (or EOF)."""
+    sections: list[dict] = []
+    current: dict | None = None
+    for raw in (text or "").splitlines(keepends=True):
+        match = _METRICS.SLICE_VERDICT_RE.match(raw.strip())
+        if match:
+            current = {"slice": match.group(1), "sha": match.group(2),
+                       "verdict": match.group(3), "text": raw}
+            sections.append(current)
+            continue
+        if raw.startswith("# ") or raw.startswith("## "):
+            current = None
+        elif current is not None:
+            current["text"] += raw
+    return sections
+
+
+def _last_slice_section(text: str, slice_id: str, sha: str) -> dict | None:
+    """The LAST section for the slice whose heading sha is a prefix of
+    ``sha`` or the other way round (same tolerance as slice grading)."""
+    found = None
+    for section in _slice_sections(text):
+        if section["slice"] != slice_id:
+            continue
+        if sha.startswith(section["sha"]) or section["sha"].startswith(sha):
+            found = section
+    return found
+
+
+def slice_attacks(verdict_text: str, slice_id: str, sha: str) -> int | None:
+    """``count_attacks`` of the last ``## slice <id> @<sha>`` section (the
+    last section wins, so a re-dispatched slice-eval's new section
+    replaces the refused one); None without a section or a header."""
+    section = _last_slice_section(verdict_text, slice_id, sha)
+    return None if section is None else count_attacks(section["text"])
+
+
+def ship_attacks_problem(attacks: int | None) -> str | None:
+    """None when ``attacks`` meets ``MIN_SHIP_ATTACKS``, else a one-line
+    reason (``attacks=n/a`` = no list at all)."""
+    if attacks is not None and attacks >= MIN_SHIP_ATTACKS:
+        return None
+    return ("no attack beyond the frozen checks "
+            f"(attacks={'n/a' if attacks is None else attacks})")
+
+
+def _slice_ship_problem(verdict_text: str, slice_id: str, sha: str) -> str | None:
+    """Reason the newest section for this slice is a SHIP the driver does
+    not accept (a SHIP with no beyond-pack attack); None for an ITERATE
+    section, a missing section, or an accepted SHIP."""
+    section = _last_slice_section(verdict_text, slice_id, sha)
+    if section is None or section["verdict"] != "SHIP":
+        return None
+    return ship_attacks_problem(count_attacks(section["text"]))
+
+
+def _slice_eval_error_text(slice_id: str, sha: str, reason: str) -> str:
+    return (
+        f"The driver did not accept your SHIP section for slice {slice_id} "
+        f"@{sha[:12]}: {reason}. Append a new `## slice {slice_id} @{sha} — "
+        "SHIP|ITERATE` section whose body carries an `attacks:` list with at "
+        "least one probe beyond the slice accepts and the frozen checks, each "
+        "`- <command or input> -> <what happened>`."
+    )
+
+
+def _commit_ship_refusal(top: Path, log_rel: str, ta, subject: str, why: str) -> str | None:
+    """Commit LOG.md as the record of a refused SHIP, only when LOG.md is
+    tracked (the Evaluator may already have made its SHIP retirement
+    commit). Returns an error text when the commit failed, else None."""
+    if _git(top, "ls-files", "--error-unmatch", "--", log_rel).returncode != 0:
+        return None
+    try:
+        ta.commit_paths(top, [log_rel], f"{subject}\n\n{' '.join(str(why).split())[:600]}\n")
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def _read_driver_json(mailbox: Path) -> dict:
+    try:
+        data = json.loads((Path(mailbox) / ".driver.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _preserved_ship_gate(mailbox: Path) -> dict:
+    """``{"ship_gate": ...}`` from the current `.driver.json`, so the
+    loop's own whole-file rewrites never drop a pending refusal."""
+    gate = _read_driver_json(mailbox).get("ship_gate")
+    return {"ship_gate": gate} if isinstance(gate, dict) else {}
+
+
+def _store_driver_json(mailbox: Path, data: dict) -> None:
+    path = Path(mailbox) / ".driver.json"
+    tmp = path.with_name(f".driver.json.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def ship_gate_errors(mailbox, iteration: int | None = None) -> list[str]:
+    """Pending attacks-gate errors for the next Lead pass (read-only,
+    idempotent).
+
+    They live in the mailbox's `.driver.json` under ``ship_gate`` =
+    ``{"iteration": K, "errors": [...]}``. K is the iteration the Lead pass
+    that follows the refused SHIP runs as: the refused verdict was graded at
+    iteration N (lockstep: the iteration of the evaluated Lead pass;
+    open-loop: STATE.md ``iteration`` when the integration-eval ran), and
+    both state machines open the next Lead pass as N+1 (an ITERATE with
+    scope None resets the repair counter, so that pass is a full Lead; a
+    repair pass also runs as N+1). A stateless caller (native ``next``)
+    asks with the iteration it is about to dispatch; entries of any other
+    iteration are stale and ignored. ``iteration=None`` returns whatever is
+    stored. A missing/malformed file or key yields [].
+    """
+    gate = _read_driver_json(Path(mailbox)).get("ship_gate")
+    if not isinstance(gate, dict):
+        return []
+    if iteration is not None and gate.get("iteration") != iteration:
+        return []
+    errors = gate.get("errors")
+    if not isinstance(errors, list):
+        return []
+    return [str(e) for e in errors if str(e).strip()]
+
+
+def clear_ship_gate_errors(mailbox) -> None:
+    """Forget the pending attacks-gate errors (after the Lead got them)."""
+    data = _read_driver_json(Path(mailbox))
+    if "ship_gate" not in data:
+        return
+    data.pop("ship_gate", None)
+    try:
+        _store_driver_json(Path(mailbox), data)
+    except OSError:
+        pass
+
+
+def _persist_ship_gate_errors(mailbox: Path, iteration: int, errors: list[str]) -> None:
+    data = _read_driver_json(mailbox)
+    data["ship_gate"] = {"iteration": iteration, "errors": list(errors)}
+    _store_driver_json(mailbox, data)
+
+
+def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
+                        context: str = "lockstep") -> tuple[str, object, list[str]]:
+    """The whole-goal attacks gate: a SHIP whose VERDICT.md lists no
+    beyond-pack attack becomes ITERATE (scope None, a full Lead pass).
+
+    Returns ``(verdict, scope, errors)``; anything but SHIP, and a SHIP with
+    enough attacks, comes back unchanged with ``[]``. A refusal appends
+    ``- iter N | loop | SHIP refused by the attacks gate (verdict becomes
+    ITERATE): <reason>`` to LOG.md, commits LOG.md as ``loop: iteration N —
+    attacks gate refused SHIP (ITERATE)`` when it is tracked, and persists
+    the error for the next Lead pass (see ``ship_gate_errors``).
+    ``context`` ("lockstep" | "open-loop") only names the caller; both key
+    the next Lead pass as ``iteration + 1``.
+    """
+    del context
+    if verdict != "SHIP":
+        return verdict, scope, []
+    mailbox = Path(mailbox)
+    try:
+        text = (mailbox / "VERDICT.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    reason = ship_attacks_problem(whole_goal_attacks(text))
+    if reason is None:
+        return verdict, scope, []
+    _append_log(
+        mailbox,
+        f"- iter {iteration} | loop | SHIP refused by the attacks gate "
+        f"(verdict becomes ITERATE): {reason}",
+    )
+    state = _read_state(mailbox / "STATE.md") if (mailbox / "STATE.md").is_file() else {}
+    evaluated = (state.get("evaluated_sha") or "").strip()
+    where = f" at {evaluated[:12]}" if evaluated else ""
+    error = (
+        f"The driver refused the SHIP{where}: the Evaluator listed no attack "
+        f"beyond the frozen checks ({reason}). Frozen checks are a floor: the "
+        "next evaluation must run and record at least one adversarial probe "
+        "(boundary, interaction between requirements, malformed input, "
+        "failure mode, concurrency) with its command and result. Change "
+        "product code only for a genuine defect."
+    )
+    try:
+        _persist_ship_gate_errors(mailbox, iteration + 1, [error])
+    except OSError as exc:
+        _append_log(mailbox, f"- iter {iteration} | loop | could not persist the "
+                             f"attacks gate error ({exc})")
+    top_proc = _git(mailbox, "rev-parse", "--show-toplevel")
+    top = Path(top_proc.stdout.strip()) if top_proc.returncode == 0 and top_proc.stdout.strip() else None
+    ta = _load_sibling("trio_acceptance", "trio-acceptance.py") if top else None
+    if top is not None and ta is not None:
+        rel = _mailbox_rel(top, mailbox)
+        if rel is not None:
+            failed = _commit_ship_refusal(
+                top, f"{rel}/LOG.md", ta,
+                f"loop: iteration {iteration} — attacks gate refused SHIP (ITERATE)", error)
+            if failed:
+                _append_log(mailbox, f"- iter {iteration} | loop | could not commit "
+                                     f"the SHIP refusal record ({failed})")
+    return "ITERATE", None, [error]
 
 
 def _verdict_mentions_iteration(text: str, iteration: int) -> bool:
@@ -3117,17 +3419,11 @@ class AcceptanceController:
         `loop: iteration N — SHIP` retirement; say so in history too."""
         why = (self.pending_errors[0] if self.pending_errors else "") or became
         self._log(iteration, f"SHIP refused by the acceptance gate (verdict becomes {became})")
-        log_rel = f"{self.mailbox_rel}/LOG.md"
-        tracked = _git(self.repo, "ls-files", "--error-unmatch", "--", log_rel)
-        if tracked.returncode != 0:
-            return
-        try:
-            self.ta.commit_paths(
-                self.repo, [log_rel],
-                f"loop: iteration {iteration} — acceptance gate refused SHIP ({became})\n\n"
-                f"{' '.join(str(why).split())[:600]}\n")
-        except RuntimeError as exc:
-            self._log(iteration, f"could not commit the SHIP refusal record ({exc})")
+        failed = _commit_ship_refusal(
+            self.repo, f"{self.mailbox_rel}/LOG.md", self.ta,
+            f"loop: iteration {iteration} — acceptance gate refused SHIP ({became})", why)
+        if failed:
+            self._log(iteration, f"could not commit the SHIP refusal record ({failed})")
 
     def _review_verdict(self, verdict: str, scope, iteration: int, evaluated: str,
                         state_path: Path) -> tuple[str, object, int | None]:
@@ -3336,7 +3632,12 @@ def _run_lockstep(
                     )
                     _write_driver_state(mailbox, runner, iteration, "error")
                     return 3
-                if acc is not None:
+                # Cheap gate first: a SHIP with no beyond-pack attack never
+                # reaches the (expensive) frozen acceptance run.
+                verdict, scope, attack_errors = review_ship_attacks(
+                    mailbox, iteration, verdict, scope, context="lockstep"
+                )
+                if acc is not None and not attack_errors:
                     verdict, scope, forced = acc.review_verdict(
                         verdict, scope, iteration,
                         _read_state(state_path)["evaluated_sha"], state_path,
@@ -3532,6 +3833,7 @@ def _write_open_loop_sidecars(
         driver_payload["evaluator_sessions"] = dict(evaluator_sessions)
     for key, value in _driver_meta(lead_runner, eval_runner).items():
         driver_payload.setdefault(key, value)
+    driver_payload.update(_preserved_ship_gate(mailbox))
     (mailbox / ".driver.json").write_text(
         json.dumps(driver_payload) + "\n", encoding="utf-8"
     )
@@ -4026,6 +4328,9 @@ def _lead_thread_body(
                 if acceptance.pending_errors:
                     context["acceptance_errors"] = list(acceptance.pending_errors)
                     acceptance.pending_errors = []
+            ship_errors = ship_gate_errors(mailbox, iteration)
+            if ship_errors:
+                context["ship_gate_errors"] = ship_errors
             snapshot_before = _lead_pass_snapshot(mailbox, repo)
             result = _invoke_runner(lead_runner, "lead", iteration, mailbox, context)
             if result != 0:
@@ -4049,6 +4354,10 @@ def _lead_thread_body(
                     return
                 continue
             counter["n"] = 0
+            if ship_errors:
+                # Delivered to a pass that did work; an empty pass retries
+                # with the same errors.
+                clear_ship_gate_errors(mailbox)
             _update_state(
                 state_path, {"iteration": str(iteration), "status": "running"}
             )
@@ -4814,7 +5123,14 @@ def run_open_loop(
                     v["slice"] == slice_id and sha.startswith(v["sha"])
                     for v in _METRICS.parse_slice_verdicts(verdict_text_after)
                 )
-                if wrote_section:
+                # The attacks gate: a newest SHIP section with no beyond-pack
+                # attack is not a verdict the driver accepts (an ITERATE
+                # section is unaffected).
+                rejected = (
+                    _slice_ship_problem(verdict_text_after, slice_id, sha)
+                    if wrote_section else None
+                )
+                if wrote_section and rejected is None:
                     graded.add(key)
                     gate_blocked.discard(key)
                     eval_pending.discard(key)
@@ -4822,12 +5138,21 @@ def run_open_loop(
                     return None
                 attempts = slice_eval_attempts.get(key, 0) + 1
                 slice_eval_attempts[key] = attempts
-                _append_log(
-                    mailbox,
-                    f"- iter {current_iteration()} | loop | open-loop: "
-                    f"slice-eval for {slice_id}@{sha} wrote no verdict "
-                    f"section (attempt {attempts})",
-                )
+                if rejected is not None:
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | open-loop: "
+                        f"slice {slice_id} @{sha[:12]} SHIP not accepted "
+                        f"({rejected}); re-dispatching slice-eval "
+                        f"(attempt {attempts})",
+                    )
+                else:
+                    _append_log(
+                        mailbox,
+                        f"- iter {current_iteration()} | loop | open-loop: "
+                        f"slice-eval for {slice_id}@{sha} wrote no verdict "
+                        f"section (attempt {attempts})",
+                    )
                 if attempts >= 3:
                     stop_lead()
                     _update_state(state_path, {"status": "error"})
@@ -4835,7 +5160,9 @@ def run_open_loop(
                         mailbox,
                         f"- iter {current_iteration()} | loop | open-loop: "
                         f"slice-eval for {slice_id}@{sha} failed to write a "
-                        f"verdict section after {attempts} attempts",
+                        + ("verdict section" if rejected is None else
+                           f"verdict section the driver accepts ({rejected})")
+                        + f" after {attempts} attempts",
                     )
                     return 3
                 eval_pending.add(key)
@@ -4849,7 +5176,7 @@ def run_open_loop(
                 if any(
                     v["slice"] == slice_id and sha.startswith(v["sha"])
                     for v in verdict_sections
-                ):
+                ) and _slice_ship_problem(verdict_text, slice_id, sha) is None:
                     graded.add(key)
                     if concurrent_evals:
                         # A section that shows up after a harvest judged
@@ -4910,6 +5237,12 @@ def run_open_loop(
                 if entry_repo and entry_repo != "home":
                     # r15: the sha is a commit of this declared repo.
                     context["repo"] = entry_repo
+                refused = _slice_ship_problem(verdict_text, slice_id, sha)
+                if refused is not None:
+                    # A re-dispatch after an unaccepted SHIP section: say why.
+                    context["slice_eval_errors"] = [
+                        _slice_eval_error_text(slice_id, sha, refused)
+                    ]
                 verdict_snapshot = (
                     verdict_path.read_text(encoding="utf-8", errors="replace")
                     if verdict_path.is_file()
@@ -5210,7 +5543,10 @@ def run_open_loop(
                             "integration verdict",
                         )
                         return finish(3)
-                    if acc is not None:
+                    verdict, scope, attack_errors = review_ship_attacks(
+                        mailbox, iteration_now, verdict, scope, context="open-loop"
+                    )
+                    if acc is not None and not attack_errors:
                         verdict, scope, forced = acc.review_verdict(
                             verdict, scope, iteration_now, context["pinned_sha"], state_path
                         )
@@ -5362,6 +5698,15 @@ class _PortableRunner:
             if attempt or sha:
                 environment["TRIO_ATTEMPT"] = attempt
                 environment["TRIO_PINNED_SHA"] = sha
+        # Attacks-gate feedback (any mode): the refused SHIP's error for the
+        # Lead, the unaccepted slice SHIP section's error for a slice-eval.
+        for key, var in (("ship_gate_errors", "TRIO_SHIP_GATE_ERRORS"),
+                         ("slice_eval_errors", "TRIO_SLICE_EVAL_ERRORS")):
+            errors = (context or {}).get(key) or []
+            if errors:
+                environment[var] = "\n".join(str(e) for e in errors)
+            else:
+                environment.pop(var, None)
         # A driver-verified human answer (only when HUMAN.md exists and its
         # newest ledger answer is current); never HUMAN.md text itself.
         block = human_answer_block(Path(mailbox), iteration, role,

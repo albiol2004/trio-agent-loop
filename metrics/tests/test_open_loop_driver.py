@@ -49,6 +49,8 @@ slices:
 ```
 """
 
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
+
 EMPTY_QUEUE = "```yaml\nretired:\n```\n\n```yaml\nfaults:\n```\n"
 
 
@@ -187,12 +189,18 @@ class VerdictModel:
             if text and not text.endswith("\n"):
                 text += "\n"
             text += f"## slice {slice_id} @{sha} -- {verdict}\n"
+            if verdict == "SHIP":
+                # The driver's attacks gate: a SHIP section records at
+                # least one probe beyond the slice accepts.
+                text += ATTACKS
             path.write_text(text, encoding="utf-8")
 
     def set_integration_verdict(self, line: str) -> None:
         with self.lock:
             path = self.mailbox / "VERDICT.md"
             existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if line.strip().upper().startswith("VERDICT: SHIP"):
+                line += "\n" + ATTACKS.rstrip("\n")
             path.write_text(line + "\n" + existing, encoding="utf-8")
 
 
@@ -1311,12 +1319,14 @@ def test_open_loop_restores_verdict_sections_clobbered_by_evaluator_rewrite(
         # Rewrites the whole file with only its own new section, dropping
         # alpha's section that was already there -- the observed bug.
         (mailbox / "VERDICT.md").write_text(
-            f"## slice beta @{sha_b} -- SHIP\n", encoding="utf-8"
+            f"## slice beta @{sha_b} -- SHIP\n{ATTACKS}", encoding="utf-8"
         )
 
     def integration_clobbers(mb):
         # Rewrites the whole file again, dropping every per-slice section.
-        (mailbox / "VERDICT.md").write_text("VERDICT: SHIP\n", encoding="utf-8")
+        (mailbox / "VERDICT.md").write_text(
+            "VERDICT: SHIP\n" + ATTACKS, encoding="utf-8"
+        )
 
     evaluator = ScriptedEvalRunner(
         slice_actions={
@@ -1377,7 +1387,9 @@ def test_open_loop_leaves_verdict_untouched_when_evaluator_appends_correctly(
 
     assert code == 0
     verdict_text = (mailbox / "VERDICT.md").read_text(encoding="utf-8")
-    assert verdict_text == f"VERDICT: SHIP\n## slice solo @{sha1} -- SHIP\n"
+    assert verdict_text == (
+        f"VERDICT: SHIP\n{ATTACKS}## slice solo @{sha1} -- SHIP\n{ATTACKS}"
+    )
     log_text = (mailbox / "LOG.md").read_text(encoding="utf-8")
     assert "restored" not in log_text
 
@@ -1934,7 +1946,7 @@ class LegacyThreeArgRunner:
                 log.write(f"- iter {iteration} | {role} | completed\n")
         if role == "evaluator":
             (mailbox / "VERDICT.md").write_text(
-                "VERDICT: SHIP\n", encoding="utf-8"
+                "VERDICT: SHIP\n" + ATTACKS, encoding="utf-8"
             )
         return 0
 

@@ -151,6 +151,7 @@ class Scenario:
             f"evaluated: {state['evaluated_sha']}\n"
             f"attempt: {state['evaluator_attempt']}\n"
             "integrated pin passes every check\n"
+            "attacks:\n- empty input -> rejected with exit 2\n"
         )
 
     def commit_retirement(self) -> None:

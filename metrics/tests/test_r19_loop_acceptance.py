@@ -62,6 +62,10 @@ def git_retry(repo, *args):
     raise AssertionError("index.lock never released")
 
 
+# A SHIP must record at least one adversarial probe beyond the frozen pack
+# (the driver's attacks gate); fake SHIP verdicts carry one by default.
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
+
 APP = """import sys
 FEATURES = {features!r}
 arg = sys.argv[1] if len(sys.argv) > 1 else ''
@@ -202,7 +206,8 @@ class Fake:
         if context.get("kind") == "slice-eval":
             with (self.mb / "VERDICT.md").open("a") as fh:
                 fh.write(f"\n## slice {context['slice']} @{context['sha']} — SHIP\n"
-                         "evidence: re-run=1 implementer-test=0 receipt=0 unverified=0\n")
+                         "evidence: re-run=1 implementer-test=0 receipt=0 unverified=0\n"
+                         + ATTACKS)
             return 0
         step = self.eval_script.pop(0) if self.eval_script else {"verdict": "SHIP"}
         sha = context.get("pinned_sha") or ""
@@ -219,8 +224,10 @@ class Fake:
             git_retry(self.repo, "commit", "-qm",
                       f"acceptance: amend ACC-{amend['k']:02d} (evaluator, iter {iteration}): x")
         verdict = step["verdict"]
+        attacks = ATTACKS if verdict == "SHIP" and step.get("attacks", True) else ""
         body = (f"VERDICT: {verdict}\niteration: {iteration}\n"
                 f"attempt: {context.get('evaluator_attempt')}\nevaluated: {sha}\n"
+                + attacks +
                 "## Frozen acceptance\nacceptance: see driver run\ndisputes: none\n"
                 "amendments: none\n")
         old = (self.mb / "VERDICT.md").read_text()
@@ -529,12 +536,12 @@ class Plain:
             return 0
         if context.get("kind") == "slice-eval":
             with (self.mb / "VERDICT.md").open("a") as fh:
-                fh.write(f"\n## slice cli @{context['sha']} — SHIP\n")
+                fh.write(f"\n## slice cli @{context['sha']} — SHIP\n" + ATTACKS)
             return 0
         sha = context.get("pinned_sha") or ""
         (self.mb / "VERDICT.md").write_text(
             f"VERDICT: SHIP\niteration: {iteration}\nattempt: {context.get('evaluator_attempt')}\n"
-            f"evaluated: {sha}\n")
+            f"evaluated: {sha}\n" + ATTACKS)
         with (self.mb / "LOG.md").open("a") as fh:
             fh.write(f"- iter {iteration} | evaluator | VERDICT: SHIP — ok\n")
         git(self.repo, "add", "-A", "--", "loop")

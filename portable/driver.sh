@@ -40,6 +40,23 @@ fi
 
 [[ -f "$LOOP_DIR/GOAL.md" ]] || { echo "$LOOP_DIR/GOAL.md missing — copy portable/GOAL.template.md to $LOOP_DIR/GOAL.md and edit it." >&2; exit 1; }
 
+# ship_gate_note — the driver's attacks-gate feedback (trio_loop.py
+# ship_gate_errors / slice_eval_errors, passed as TRIO_SHIP_GATE_ERRORS /
+# TRIO_SLICE_EVAL_ERRORS): the Lead is told its last SHIP was refused, a
+# slice-eval is told its SHIP section was not accepted. Prints a leading
+# newline per block and nothing when neither variable is set.
+ship_gate_note() {
+  local line
+  if [[ -n "${TRIO_SHIP_GATE_ERRORS:-}" ]]; then
+    printf '\nSHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):'
+    while IFS= read -r line; do printf '\n- %s' "$line"; done <<<"$TRIO_SHIP_GATE_ERRORS"
+  fi
+  if [[ -n "${TRIO_SLICE_EVAL_ERRORS:-}" ]]; then
+    printf '\nSLICE-EVAL ERRORS FROM THE DRIVER:'
+    while IFS= read -r line; do printf '\n- %s' "$line"; done <<<"$TRIO_SLICE_EVAL_ERRORS"
+  fi
+}
+
 # build_prompt <file> — role prompts say `loop/`; when LOOP_DIR overrides it,
 # prepend a mailbox-override note so fresh-context roles resolve paths right.
 # api:OpenLoopPromptEnv: when TRIO_MODE=open-loop (set per-role by
@@ -61,11 +78,17 @@ build_prompt() {
       printf '\nCOMMIT GATE FAILURES: the per-slice commit gate keeps rejecting these retired slices, so none of them was ever graded and the run is stuck. Repair the cause (for example re-commit the slice'\''s work as a fresh `slice(<id>): ...` commit on the current HEAD and append a new `retired:` entry for it) or the run stops with an error:'
       while IFS= read -r gerr; do printf '\n- %s' "$gerr"; done <<<"$TRIO_GATE_ERRORS"
     fi
+    ship_gate_note
     printf '\n\n'
   elif [[ -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" ]]; then
     # Lockstep: same LOCKSTEP CONTEXT prefix as OmnigentRunner._prompt.
     printf 'LOCKSTEP CONTEXT: attempt=%s sha=%s\n\n' \
       "${TRIO_ATTEMPT:-}" "${TRIO_PINNED_SHA:-}"
+  fi
+  if [[ "${TRIO_MODE:-}" != "open-loop" && -n "${TRIO_SHIP_GATE_ERRORS:-}" ]]; then
+    local note
+    note="$(ship_gate_note)"
+    printf '%s\n\n' "${note#$'\n'}"
   fi
   if [[ "$LOOP_DIR" != "loop" ]]; then
     # A path outside [A-Za-z0-9._/+@-] (spaces, non-ASCII, punctuation) is
@@ -115,7 +138,8 @@ run_role() {
              local pf="$prompt_file"
              if [[ "$LOOP_DIR" != "loop" || "${TRIO_MODE:-}" == "open-loop" \
                    || -n "${TRIO_ATTEMPT:-}" || -n "${TRIO_PINNED_SHA:-}" \
-                   || -n "${TRIO_HUMAN_ANSWER:-}" ]]; then
+                   || -n "${TRIO_HUMAN_ANSWER:-}" \
+                   || -n "${TRIO_SHIP_GATE_ERRORS:-}" || -n "${TRIO_SLICE_EVAL_ERRORS:-}" ]]; then
                pf="$(mktemp)"
                build_prompt "$prompt_file" > "$pf"
              fi

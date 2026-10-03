@@ -103,18 +103,25 @@ def _write_retired_queue(mailbox: Path, slice_id: str, sha: str, at: str) -> Non
     )
 
 
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
+
+
 def _append_slice_verdict(mailbox: Path, slice_id: str, sha: str, verdict: str) -> None:
     path = mailbox / "VERDICT.md"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     if text and not text.endswith("\n"):
         text += "\n"
     text += f"## slice {slice_id} @{sha} — {verdict}\n"
+    if verdict == "SHIP":
+        text += ATTACKS  # the driver's attacks gate: a probe beyond the accepts
     path.write_text(text, encoding="utf-8")
 
 
 def _prepend_integration_verdict(mailbox: Path, line: str) -> None:
     path = mailbox / "VERDICT.md"
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if line.startswith("VERDICT: SHIP"):
+        line += "\n" + ATTACKS.rstrip("\n")
     path.write_text(line + "\n" + existing, encoding="utf-8")
 
 
@@ -298,7 +305,7 @@ def test_auto_selection_without_queue_takes_lockstep_path(tmp_path: Path) -> Non
                     log.write(f"- iter {iteration} | lead | completed\n")
             elif role == "evaluator":
                 (mailbox / "VERDICT.md").write_text(
-                    "VERDICT: SHIP\n", encoding="utf-8"
+                    "VERDICT: SHIP\n" + ATTACKS, encoding="utf-8"
                 )
             return 0
 
