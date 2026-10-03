@@ -819,6 +819,9 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
   `acceptance_errors`. `acceptance-freeze`/`acceptance-run`/`apply` run as
   detached helper jobs; `steplib.step_long` polls `pending` the same way
   native's `stepLong` does (bounded poll count, injectable sleep for tests).
+  The attacks gate (on or off acceptance) checks that every SHIP has at least
+  one recorded attack beyond frozen checks; a SHIP without attacks is refused
+  (whole-goal becomes ITERATE; per-slice re-dispatches up to 3 times).
 - **Records.** `.opencode-result.json`, the run registry and `.driver.json`
   all gain additive keys only: `acceptance_enabled` (the resolved switch,
   from `begin` on) and, once the run ends, a full `acceptance` summary

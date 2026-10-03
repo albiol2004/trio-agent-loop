@@ -177,6 +177,30 @@ actor-critic literature (Reflexion, self-preference-bias papers):
   Budget roughly like two senior code reviews per iteration. `max_iterations`
   is your circuit breaker — keep it low until you trust a given GOAL.md.
 
+## Verification rules
+
+**Attacks gate (all harnesses, with or without acceptance).** Frozen checks
+form a floor, not a ceiling: every SHIP verdict — per-slice or whole-goal —
+requires at least one recorded attack beyond the frozen checks, in the form
+`- <probe> -> <result>` under an `attacks:` / `## Attacks` header in VERDICT.md.
+Placeholders (unfilled `<...>` slots, `n/a`, `skipped`, `not run`) do not count.
+A SHIP without a counted attack is refused: a whole-goal SHIP becomes ITERATE
+with the refusal reason logged and committed; a per-slice SHIP is re-dispatched
+for slice-eval, up to 3 attempts.
+
+**Requirement map (frozen acceptance, r19+).** The acceptance author lists
+every GOAL requirement in the frozen pack's MANIFEST.json `requirements` array,
+each with a normal-check list and hard-check list (`boundary`, `interaction`,
+`failure-mode`, `malformed-input`, `concurrency` types). At freeze, every
+requirement must have at least one normal and one hard check; gaps cause a
+freeze refusal with one retry allowed. If gaps remain after the retry, they
+are recorded in FROZEN and the integration Evaluator attacks them. Legacy packs
+frozen before the requirement-map rule still work with a warning.
+
+**Compatibility.** Loops pinned to an installed core that predates these rules (r21 and earlier) do not
+enforce the attacks gate until they upgrade the core; the requirement map is
+not available on older cores.
+
 ## Native bundles and other harnesses
 The role prompts and mailbox protocol are harness-agnostic; `portable/`
 carries them as standalone files plus a Ralph-style bash driver:
