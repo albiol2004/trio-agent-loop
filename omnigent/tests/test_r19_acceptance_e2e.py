@@ -51,8 +51,17 @@ def fake_author(runner, export, context):
                        "kind": "behaviour", "surface": "cli",
                        "run": ["python3", f"acceptance/checks/{name}"], "expect": {"exit": 0},
                        "timeout_s": 30, "needs": [], "binds": [], "network": "loopback"})
+    # acceptance-strength rule 2: one requirement per slice, first check
+    # normal, the rest hard boundary checks.
+    requirements = []
+    for n, (sid, toks) in enumerate(TOKENS.items(), 1):
+        ids = [cid for cid, s_id, _tok in _checks() if s_id == sid]
+        requirements.append({
+            "id": f"R{n}", "goal_ref": "GOAL.md", "goal_quote": f"`{FILES[sid]}` mentions {toks[0]}",
+            "normal": ids[:1], "hard": [{"check": cid, "type": "boundary"} for cid in ids[1:]]})
     (acc / "MANIFEST.json").write_text(json.dumps(
-        {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {}, "checks": checks}))
+        {"acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {}, "checks": checks,
+         "requirements": requirements}))
     (acc / "AUTHOR.md").write_text("# inventory\n")
     return {"exit": 0, "session": "author-1", "model": "m", "effort": "medium",
             "path": "fake", "transcript": [f"ls {export}"]}

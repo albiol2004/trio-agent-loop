@@ -2849,8 +2849,9 @@ def _slice_section(text: str, slice_id: str, sha: str) -> tuple[str, str] | None
         got = m.group(2).lower()
         if want and not (got == want or want.startswith(got) or got.startswith(want)):
             continue
+        # Ends at the next `# `/`## ` heading, like the core's slice sections.
         end = next((j for j in range(i + 1, len(lines))
-                    if lines[j].startswith("## ")), len(lines))
+                    if lines[j].startswith(("# ", "## "))), len(lines))
         found = (m.group(3), "\n".join(lines[i + 1:end]))
     return found
 

@@ -36,6 +36,9 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "trio@example.invalid",
 }
 CHECK_LINE = "1 passed in 0.01s"
+#: A counted adversarial probe: every fake SHIP carries one (the core refuses
+#: a SHIP without an `attacks:` list).
+ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
 METRICS_FILES = ("trio_loop.py", "trio-metrics.py", "trio-shadow.py", "trio-check.py")
 
 
@@ -327,7 +330,7 @@ class World:
         git(workspace, "commit", "-q", "--allow-empty", "-m", f"loop: iteration {iteration}")
 
     def lockstep_eval(self, spec: dict, ctx: dict, workspace: Path, box: Path,
-                      iteration: int, verdict: str = "SHIP") -> None:
+                      iteration: int, verdict: str = "SHIP", attacks: bool = True) -> None:
         """r16b lockstep Evaluator in the Lead worktree: a bound verdict and
         the SHIP retirement commit(s) in its own workspace (and aggregates)."""
         it = ctx.get("iteration", iteration)
@@ -348,7 +351,8 @@ class World:
         old = (box / "VERDICT.md").read_text()
         (box / "VERDICT.md").write_text(
             f"VERDICT: {verdict}\n\niteration: {it}\nattempt: {ctx['evaluator_attempt']}\n"
-            f"evaluated: {evaluated}\ncommit: {pin}\n{commits}\n" + old
+            f"evaluated: {evaluated}\ncommit: {pin}\n{commits}"
+            + (ATTACKS if attacks else "") + "\n" + old
         )
         with (box / "LOG.md").open("a") as fh:
             fh.write(f"- iter {it} | evaluator | VERDICT: {verdict} — r16b\n")
@@ -359,13 +363,14 @@ class World:
         git(workspace, "add", "-u", "--", rel)
         git(workspace, "commit", "-q", "-m", f"loop: iteration {it} — SHIP", "--", rel)
 
-    def slice_eval(self, ctx: dict, box: Path) -> None:
+    def slice_eval(self, ctx: dict, box: Path, attacks: bool = True) -> None:
         with self.lock:
             with (box / "VERDICT.md").open("a") as fh:
-                fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n")
+                fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n"
+                         + (ATTACKS if attacks else ""))
 
     def integration(self, spec: dict, runner, ctx: dict, workspace: Path, box: Path,
-                    verdict: str = "SHIP") -> None:
+                    verdict: str = "SHIP", attacks: bool = True) -> None:
         lead = Path(runner._root_free["lead"])
         assert git(workspace, "rev-parse", "HEAD") == ctx["pinned_sha"]
         pins = dict(ctx.get("pins") or {})
@@ -385,7 +390,8 @@ class World:
         text = (box / "VERDICT.md").read_text()
         (box / "VERDICT.md").write_text(
             f"VERDICT: {verdict}\n\niteration: {ctx['iteration']}\n"
-            f"attempt: {ctx['evaluator_attempt']}\nevaluated: {evaluated}\n{commits}\n" + text
+            f"attempt: {ctx['evaluator_attempt']}\nevaluated: {evaluated}\n{commits}"
+            + (ATTACKS if attacks else "") + "\n" + text
         )
         with (box / "LOG.md").open("a") as fh:
             fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: {verdict} — r16\n")

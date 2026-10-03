@@ -114,7 +114,8 @@ def main() -> int:
     def slice_eval(mailbox: Path, ctx: dict) -> None:
         time.sleep(float(cfg.get("eval_sleep", 0.2)))
         with (mailbox / "VERDICT.md").open("a") as fh:
-            fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n")
+            fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n"
+                     "attacks:\n- empty input -> rejected with exit 2\n")
 
     def integration(lead_workspace: Path, mailbox: Path, ctx: dict) -> None:
         """The retirement commit always lands in *lead_workspace* -- the
@@ -128,7 +129,8 @@ def main() -> int:
         (mailbox / "VERDICT.md").write_text(
             "VERDICT: SHIP\n\n"
             f"iteration: {ctx['iteration']}\nattempt: {ctx['evaluator_attempt']}\n"
-            f"evaluated: {ctx['pinned_sha']}\n\n" + text
+            f"evaluated: {ctx['pinned_sha']}\n"
+            "attacks:\n- empty input -> rejected with exit 2\n\n" + text
         )
         with (mailbox / "LOG.md").open("a") as fh:
             fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP\n")
