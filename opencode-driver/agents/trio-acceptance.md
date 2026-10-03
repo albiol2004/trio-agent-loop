@@ -80,9 +80,10 @@ at modules that do not exist yet.
    whole pack runs in <= 5 minutes at base. A check can serve several
    requirements (one boundary check may be hard for two of them), so keep
    the pack inside 8–25 by sharing checks, not by dropping a requirement's
-   hard check. A requirement the GOAL states but no check can test
-   (`testable-only-live`, `not-testable`) still gets its entry, with the
-   reason in `AUTHOR.md`.
+   hard check. A requirement no check can test at all
+   (`testable-only-live`, `not-testable`) stays out of `requirements`:
+   list it in `AUTHOR.md` with the reason, for the integration
+   Evaluator's attacks. Every requirement a check can reach goes in.
 
 ## Output — `acceptance/` in your workspace
 ```
