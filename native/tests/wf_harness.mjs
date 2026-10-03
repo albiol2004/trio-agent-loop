@@ -33,6 +33,13 @@ let lastConflictBranches = []
 const builderRuns = {}
 const verifyRuns = {}
 
+// Rule 1 (SHIP attacks gate; acceptance on or off): sc.attacks =
+// {refuse: [verdict indexes the gate refuses], errors: [..]}: that `apply`
+// answers ITERATE with attacks_gate.refused, and the next Lead `next`
+// carries ship_gate_errors (present only when there are any, as the helper).
+const ATT = sc.attacks || {}
+let attacksRefusedIteration = null
+
 // r19 frozen acceptance (only when the script passes --acceptance):
 // sc.acc = {tier_refuse, begin_stop, begin_frozen, freeze: [actions],
 // coverage: [bool per call], stop_on_refusal_2, errors: [..] (next),
@@ -59,8 +66,12 @@ function accStepResult(op, base, flag) {
       if (action === 'stop') return { ...base, action: 'stop', acceptance: { stop: { status: 'error', code: 3,
         reason: 'acceptance-contaminated', detail: 'the re-run author session was contaminated too' } } }
       if (action === 'frozen') accFrozen = true
+      // Rule 2: ACC.retry_fatal = the retry's `fatal` (requirement-map gaps ride in it),
+      // ACC.freeze_gaps = the gaps the pack froze with after its one retry.
       return { ...base, action, checks: 6, dropped: action === 'retry' ? [['ACC-02', 'passes-at-base']] : [],
-        fatal: [], prefix: action === 'reauthor' ? 'YOUR PREVIOUS ATTEMPT WAS DISCARDED' : undefined,
+        fatal: action === 'retry' ? (ACC.retry_fatal || []) : [],
+        requirement_gaps: action === 'frozen' ? (ACC.freeze_gaps || []) : (ACC.retry_fatal || []),
+        prefix: action === 'reauthor' ? 'YOUR PREVIOUS ATTEMPT WAS DISCARDED' : undefined,
         hits: action === 'reauthor' ? ['reads inside the loop repository: /repo/loop/PLAN.md'] : undefined,
         audit: { limited: true }, acceptance: accDigest() }
     }
@@ -112,6 +123,7 @@ function stepResult(op, nonce, prompt) {
       return out
     case 'gate': return { ...out, acceptance: accDigest() }
     case 'apply': {
+      if (out.attacks_gate) return out  // the attacks gate ran first; the pack never did
       if ((ACC.refuse_ship || []).includes(verdictIdx - 1)) {
         lastVerdict = 'ITERATE'
         return { ...out, verdict: 'ITERATE', scope: null, stop: false, status: 'running', code: null, commit_shas: [],
@@ -191,8 +203,10 @@ function baseStepResult(op, base, flag) {
       // sc.human = {answer, notes}: the helper's verified-answer keys (only
       // present when the mailbox has HUMAN.md).
       const human = (sc.human && !scoped) ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}
+      const shipErrors = attacksRefusedIteration !== null && iteration === attacksRefusedIteration + 1 && !scoped
+        ? { ship_gate_errors: ATT.errors || ['The driver refused the SHIP: no attack beyond the frozen checks'] } : {}
       return { ...base, action: scoped ? 'repair' : 'lead', iteration, attempt: 1, scope: scoped ? 'local:app.py' : null,
-        ...human }
+        ...human, ...shipErrors }
     }
     case 'gate': {
       const pass = (sc.gates || [])[gateIdx++] ?? true
@@ -207,7 +221,15 @@ function baseStepResult(op, base, flag) {
         eval_scratch: `/repo/.claude/worktrees/eval-EXEC-${iteration}-att${iteration}-scratch`, tmpdir: sc.tmpdir || null } : {}),
       ...(sc.human ? { human_answer: sc.human.answer, human_notes: sc.human.notes || [] } : {}) }
     case 'apply': {
-      const v = sc.verdicts[verdictIdx++]
+      const idx = verdictIdx++
+      const v = sc.verdicts[idx]
+      if (v.split(' ')[0] === 'SHIP' && (ATT.refuse || []).includes(idx)) {
+        lastVerdict = 'ITERATE'
+        attacksRefusedIteration = iteration
+        return { ...base, verdict: 'ITERATE', scope: null, stop: false, status: 'running', code: null, commit_shas: [],
+          human_check: null, bound: true, ship_refused: true,
+          attacks_gate: { refused: true, errors: ATT.errors || ['The driver refused the SHIP: no attack beyond the frozen checks'] } }
+      }
       lastVerdict = v
       const word = v.split(' ')[0]
       const stop = word !== 'ITERATE'

@@ -1077,14 +1077,16 @@ def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     Mirrors the head of ``trio_loop._run_lockstep``'s loop body. A Lead or
     repair pass also carries ``ship_gate_errors`` (additive, list[str]; the
     attacks gate's refusal of the last SHIP, keyed to the iteration this
-    pass runs as; ``[]`` when none), acceptance on or off. Read-only, so a
-    re-run of ``next`` answers the same until the pass's gate passes.
+    pass runs as; the key is absent when there is none, so a switch-off
+    run's answers stay byte-identical), acceptance on or off. Read-only, so
+    a re-run of ``next`` answers the same until the pass's gate passes.
     """
     body = _op_next_body(mailbox, repo, a)
     if body.get("action") in ("lead", "repair"):
-        body["ship_gate_errors"] = [
-            e[:1200] for e in TL.ship_gate_errors(mailbox, int(body.get("iteration") or 0))
-        ][:10]
+        errors = [e[:1200] for e in
+                  TL.ship_gate_errors(mailbox, int(body.get("iteration") or 0))][:10]
+        if errors:
+            body["ship_gate_errors"] = errors
     return body
 
 
