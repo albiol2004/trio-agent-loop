@@ -6,7 +6,7 @@
     "VERDICT: ITERATE scope=local:a.py",
     "VERDICT: ITERATE scope=local:b.py",
     "VERDICT: ITERATE scope=local:c.py",
-    "VERDICT: SHIP"
+    "VERDICT: SHIP\nattacks:\n- empty input -> rejected with exit 2"
   ],
   "max_iterations": 4,
   "expected_exit_code": 0,
