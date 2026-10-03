@@ -462,6 +462,15 @@ function reclaimedBlock(n) {
     '. Review that work on HEAD and plan only what is still missing or wrong; do not re-slice work that is already there.']
 }
 
+// Rule 1 (acceptance on or off): the attacks gate refused the last SHIP (the
+// Evaluator listed no attack beyond the frozen checks). `next` hands the
+// refusal to the Lead plan call as `ship_gate_errors`.
+function shipGateLines(n) {
+  const errs = n && Array.isArray(n.ship_gate_errors) ? n.ship_gate_errors.filter(e => typeof e === 'string' && e) : []
+  if (!errs.length) return []
+  return ['', 'SHIP GATE ERRORS FROM THE DRIVER (the last SHIP was refused):', ...errs.map(e => `- ${e}`)]
+}
+
 // r19: the plan call's frozen-acceptance block (acceptance on only).
 function accPlanLines(n, refusals) {
   if (!ACCEPTANCE) return []
@@ -523,7 +532,7 @@ function leadPlanPrompt(n, acc) {
     MAILBOX_WRITES,
     '',
     'Final output: the structured plan.',
-  ]).concat(reclaimedBlock(n), acc || [], humanBlock(n)).join('\n')
+  ]).concat(reclaimedBlock(n), shipGateLines(n), acc || [], humanBlock(n)).join('\n')
 }
 
 function builderPrompt(n, s, head) {
@@ -965,7 +974,8 @@ async function authorPhase(n) {
     if (fr.action === 'frozen') {
       log(`acceptance: frozen ${fr.checks} check(s), pin ${String(ACC && ACC.pin).slice(0, 12)} @` +
         `${String(ACC && ACC.pin_commit).slice(0, 12)}` + ((fr.dropped || []).length ? `; dropped ${fr.dropped.length}` : '') +
-        (audit.limited ? '; author audit limited (no author transcript found)' : ''))
+        (audit.limited ? '; author audit limited (no author transcript found)' : '') +
+        ((fr.requirement_gaps || []).length ? `; requirement gaps ${fr.requirement_gaps.length}` : ''))
       return null
     }
     if (fr.action === 'reauthor') {
@@ -1347,6 +1357,11 @@ try {
         ? await stepLong('apply', Object.assign({ iteration: n.iteration, attempt: p.evaluator_attempt }, accFlags()))
         : await step('apply', { iteration: n.iteration, attempt: p.evaluator_attempt })
       if (!ap.ok) { outcome = stepFail('apply', ap); break }
+      if (ap.attacks_gate && ap.attacks_gate.refused) {
+        // Rule 1 (acceptance on or off): a SHIP with no attack beyond the frozen checks.
+        rec.attacks_gate = { refused: true, errors: (ap.attacks_gate.errors || []).slice(0, 3) }
+        log(`iteration ${n.iteration}: the attacks gate refused the SHIP (verdict becomes ${ap.verdict})`)
+      }
       if (ACCEPTANCE && ap.acceptance) {
         accTake(ap, 'apply')
         const r = ap.acceptance

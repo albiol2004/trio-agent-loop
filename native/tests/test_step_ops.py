@@ -119,12 +119,19 @@ def lead_pass(repo: Path, iteration: int, *, role: str = "lead",
             f"# Report — iteration {iteration}{body}\n", encoding="utf-8")
 
 
+#: Rule 1 (SHIP attacks gate): every fake SHIP lists a counted adversarial
+#: probe beyond the frozen checks, ahead of its trailing `commit:` lines.
+SHIP_ATTACKS = "attacks:\n- empty input -> rejected with exit 2\n"
+
+
 def write_verdict(repo: Path, first: str, iteration: int, pin: dict,
-                  extra: str = "") -> None:
+                  extra: str = "", attacks: bool = True) -> None:
+    ship = first.split()[:2] == ["VERDICT:", "SHIP"] and attacks \
+        and "attacks:" not in extra
     (mbox(repo) / "VERDICT.md").write_text(
         f"{first}\n# Verdict — iteration {iteration}\n"
         f"attempt: {pin['evaluator_attempt']}\nevaluated: {pin['sha']}\n"
-        + extra,
+        + (SHIP_ATTACKS if ship else "") + extra,
         encoding="utf-8",
     )
 

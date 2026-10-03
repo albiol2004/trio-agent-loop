@@ -1074,8 +1074,21 @@ def op_begin(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
 def op_next(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     """What the driver runs next: lead | repair | evaluate | stop.
 
-    Mirrors the head of ``trio_loop._run_lockstep``'s loop body.
+    Mirrors the head of ``trio_loop._run_lockstep``'s loop body. A Lead or
+    repair pass also carries ``ship_gate_errors`` (additive, list[str]; the
+    attacks gate's refusal of the last SHIP, keyed to the iteration this
+    pass runs as; ``[]`` when none), acceptance on or off. Read-only, so a
+    re-run of ``next`` answers the same until the pass's gate passes.
     """
+    body = _op_next_body(mailbox, repo, a)
+    if body.get("action") in ("lead", "repair"):
+        body["ship_gate_errors"] = [
+            e[:1200] for e in TL.ship_gate_errors(mailbox, int(body.get("iteration") or 0))
+        ][:10]
+    return body
+
+
+def _op_next_body(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
     _require_lock(mailbox, a.token)
     state_path = mailbox / "STATE.md"
     state = _state(mailbox)
@@ -1276,6 +1289,10 @@ def op_gate(mailbox: Path, repo: Path | None, a: argparse.Namespace) -> dict:
         TL._update_state(mailbox / "STATE.md",
                          {"status": "running", "phase": "lead-done"})
         result.update(final=False, status="running", phase="lead-done")
+        # The pass the attacks gate's refusal was for is done: forget it
+        # (idempotent; `next` keeps answering it until here).
+        if TL.ship_gate_errors(mailbox, iteration):
+            TL.clear_ship_gate_errors(mailbox)
     else:
         result["detail"] = _shadow_detail(mailbox, repo)
         if attempt >= 2:
@@ -1488,8 +1505,18 @@ def _apply_body(mailbox: Path, repo: Path | None, a: argparse.Namespace,
         )
     forced = None
     acc_record = None
+    attacks_gate = None
     _fence()
-    if _acc_on(a) and verdict is not None:
+    if verdict == "SHIP":
+        # Rule 1: the cheap attacks gate first. A SHIP with no counted
+        # attack beyond the frozen checks becomes ITERATE and never reaches
+        # the (expensive) frozen-pack run. Not idempotent (logs, commits):
+        # only a first apply gets here; replays return the sealed result.
+        verdict, scope, attack_errors = TL.review_ship_attacks(
+            mailbox, a.iteration, verdict, scope, context="lockstep")
+        if attack_errors:
+            attacks_gate = {"refused": True, "errors": list(attack_errors)}
+    if _acc_on(a) and verdict is not None and attacks_gate is None:
         verdict, scope, forced, acc_record = _acc_review(
             mailbox, repo, a, verdict, scope, state["evaluated_sha"].strip())
     if verdict is None:
@@ -1526,6 +1553,11 @@ def _apply_body(mailbox: Path, repo: Path | None, a: argparse.Namespace,
     }
     if acc_record is not None:
         result["acceptance"] = acc_record
+    if attacks_gate is not None:
+        # Additive. `ship_refused` is the attacks gate's here; the frozen
+        # gate's own `acceptance.ship_refused` keeps meaning the pack.
+        result["attacks_gate"] = attacks_gate
+        result["ship_refused"] = True
     if _acc_on(a):
         # The tree this answer was judged and applied on (after the
         # retirement fold): a replay must find it unchanged.
@@ -3885,8 +3917,14 @@ def op_acceptance_freeze(mailbox: Path, repo: Path | None, a: argparse.Namespace
             if ctl.frozen():
                 ctl._log(iteration, f"freeze replayed (this execution's freeze "
                                     f"{str(ctl.state.get('freeze_commit'))[:12]})")
+                try:
+                    stored = str(ta.read_frozen(ctl.acc_dir).get("requirement_gaps") or "")
+                except Exception:  # noqa: BLE001 - a report only
+                    stored = ""
                 return {"action": "frozen", "checks": ctl.state.get("checks"),
                         "dropped": [list(d) for d in ctl.state.get("dropped") or []][:40],
+                        "requirement_gaps": [g.strip()[:300] for g in stored.split("; ")
+                                             if g.strip()][:20],
                         "replayed": True, "acceptance": _acc_digest(ctl)}
             export = _acc_work(ctl, "export")
             base = str(ctl.state.get("base") or "")
@@ -3953,7 +3991,12 @@ def op_acceptance_freeze(mailbox: Path, repo: Path | None, a: argparse.Namespace
                             else "; ".join(filtered["fatal"][:2]) or "too few checks"))
                 return {"action": "retry",
                         "dropped": [list(d) for d in filtered["dropped"]][:40],
-                        "fatal": list(filtered["fatal"])[:20], "audit": summary,
+                        # `fatal` already carries the requirement-map gaps
+                        # (`requirements: ...`); `requirement_gaps` names them.
+                        "fatal": list(filtered["fatal"])[:20],
+                        "requirement_gaps": [str(g)[:300] for g in
+                                             filtered.get("requirement_gaps") or []][:20],
+                        "audit": summary,
                         "acceptance": _acc_digest(ctl)}
             _fence()
             if ctl._has_pack():
@@ -3977,6 +4020,10 @@ def op_acceptance_freeze(mailbox: Path, repo: Path | None, a: argparse.Namespace
             return {"action": "frozen", "checks": ctl.state.get("checks"),
                     "dropped": [list(d) for d in ctl.state.get("dropped") or []][:40],
                     "unavailable_at_base": list(filtered.get("unavailable_at_base") or []),
+                    # Rule 2 (additive): requirement-map gaps the pack froze
+                    # with after its one retry ([] = a complete map).
+                    "requirement_gaps": [str(g)[:300] for g in
+                                         filtered.get("requirement_gaps") or []][:20],
                     "audit": summary, "acceptance": _acc_digest(ctl)}
         except TL.AcceptanceError as exc:
             return {"action": "stop", "acceptance": {"stop": _acc_stop(mailbox, iteration, exc)}}

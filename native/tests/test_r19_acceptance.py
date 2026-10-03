@@ -208,6 +208,7 @@ def ship_verdict(repo: Path, iteration: int, pin: dict, word: str = "SHIP") -> N
     (box / "VERDICT.md").write_text(
         f"VERDICT: {word}\n# Verdict — iteration {iteration}\n"
         f"attempt: {pin['evaluator_attempt']}\nevaluated: {pin['sha']}\n"
+        + ("attacks:\n- empty input -> rejected with exit 2\n" if word == "SHIP" else "")
         + (f"commit: {pin['sha']}\n" if word == "SHIP" else ""), encoding="utf-8")
     if word == "SHIP":
         git(repo, "add", "loop/VERDICT.md")
