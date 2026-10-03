@@ -2334,7 +2334,7 @@ def drive(ctx: "drv.RunContext", *, mode: str, max_iterations: int, settings: di
     # exactly as it would for a `code` it got back normally.
     final = _finalize_result(ctx, runner, code, settings, exc=caught)
     _remove_leftover_eval_worktrees(ctx)
-    drv._retire_driver_json(ctx.driver_json_path)
+    drv._retire_driver_json(ctx.driver_json_path, shipped=final.get("status") == "shipped")
     drv._atomic_write_json(live_mailbox / drv.RESULT_FILE, final)
     if final.get("land") and final["land"].get("status") == "landed" and ctx.lead_record:
         final["teardown"] = rootfree.teardown(ctx.lead_record)

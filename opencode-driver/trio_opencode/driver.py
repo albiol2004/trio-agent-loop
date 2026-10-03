@@ -162,12 +162,13 @@ def _preserve_ship_gate(path: Path, payload: dict) -> dict:
     return payload
 
 
-def _retire_driver_json(path: Path) -> None:
+def _retire_driver_json(path: Path, *, shipped: bool = False) -> None:
     """End-of-run removal of `.driver.json` (the run is over, nothing to
     resume). A still-pending ``ship_gate`` (a refused SHIP the loop stopped
     before any Lead pass could read) survives as a file carrying only that
-    key, so a later resume's Lead still gets the refusal."""
-    gate = _read_json(path).get("ship_gate")
+    key, so a later resume's Lead still gets the refusal -- unless the run
+    SHIPPED (a stale refusal no later Lead pass will ever need)."""
+    gate = None if shipped else _read_json(path).get("ship_gate")
     try:
         path.unlink()
     except OSError:
@@ -2289,7 +2290,7 @@ def _drive(ctx: RunContext, *, mode: str, max_iterations: int, stop_now: dict) -
         if ctx.acc_log.get("author_isolation"):
             final["acceptance"]["author_isolation"] = ctx.acc_log["author_isolation"]
 
-    _retire_driver_json(ctx.driver_json_path)
+    _retire_driver_json(ctx.driver_json_path, shipped=final.get("status") == "shipped")
     _atomic_write_json(ctx.live_mailbox / RESULT_FILE, final)
 
     if land_result is not None and land_result.get("status") == "landed":

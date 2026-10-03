@@ -20,6 +20,8 @@ Selected by ``$FAKE_OC_ACC_MODE`` (default ``"ship"``):
   product repo (``$FAKE_OC_ACC_REPO``); the driver discards it and
   re-authors once, honestly, from a prompt carrying the contamination
   notice.
+- ``nohard_retry``: attempt 1's requirement map has no hard check for R1 (a
+  requirement-map gap, one retry); attempt 2 maps ACC-02 as R1's hard check.
 - ``retry``: the author's first pack has one check that already passes at
   the base commit; the helper asks for one validation retry, which the
   second attempt's clean (smaller) pack satisfies.
@@ -57,16 +59,16 @@ def _n_checks() -> int:
     return int(os.environ.get("FAKE_OC_ACC_CHECKS", "5"))
 
 
-def _requirements(n: int) -> list[dict]:
+def _requirements(n: int, *, hard_ok: bool = True) -> list[dict]:
     """The requirement map (rule 2): R1 quotes the GOAL, ACC-01 is its
     normal check, ACC-02 its hard (boundary) check -- so the pack freezes
     cleanly on the first try."""
-    hard = [{"check": "ACC-02", "type": "boundary"}] if n >= 2 else []
+    hard = [{"check": "ACC-02", "type": "boundary"}] if n >= 2 and hard_ok else []
     return [{"id": "R1", "goal_ref": "GOAL.md:2", "goal_quote": QUOTE,
              "normal": ["ACC-01"], "hard": hard}]
 
 
-def write_pack(export: Path, n: int, *, passing: tuple = ()) -> None:
+def write_pack(export: Path, n: int, *, passing: tuple = (), hard_ok: bool = True) -> None:
     """Mirrors ``native/tests/test_r19_acceptance.py``'s ``write_pack``: a
     minimal but schema-valid pack whose non-``passing`` checks genuinely
     FAIL at the base commit (``app.py`` does not exist yet there) and PASS
@@ -87,7 +89,7 @@ def write_pack(export: Path, n: int, *, passing: tuple = ()) -> None:
                        "expect": {"exit": 0}, "timeout_s": 30})
     (acc / "MANIFEST.json").write_text(json.dumps({
         "acceptance_version": 1, "budget_s": 300, "setup": [], "bindings": {},
-        "checks": checks, "requirements": _requirements(n)}, indent=2), encoding="utf-8")
+        "checks": checks, "requirements": _requirements(n, hard_ok=hard_ok)}, indent=2), encoding="utf-8")
     (acc / "AUTHOR.md").write_text("# inventory\n- testable-black-box: hello N\n",
                                    encoding="utf-8")
 
@@ -127,6 +129,13 @@ def _handle_acceptance(ctx) -> None:
         # root" = ctl.repo/ctl.mailbox).
         ctx.tool("bash", input={"command": f"cat {repo}/loop/PLAN.md"})
         write_pack(export, _n_checks())
+        common.reply(ctx, {"checks": _n_checks(), "summary": "wrote the pack"})
+        return
+    if MODE == "nohard_retry":
+        # rule 2: attempt 1 maps R1 to no hard check -> the core's freeze gate
+        # answers `requirements: R1 has no hard check` and the driver forwards
+        # it to attempt 2, which maps one.
+        write_pack(export, _n_checks(), hard_ok=attempt > 1)
         common.reply(ctx, {"checks": _n_checks(), "summary": "wrote the pack"})
         return
     if MODE == "retry" and attempt == 1:
