@@ -171,6 +171,8 @@ class FakeBrokerClient:
                     if sha:
                         body += f"evaluated: {sha}\n"
                         body += f"commit: {sha}\n"
+                    # A counted probe: the core refuses a SHIP without one.
+                    body += "attacks:\n- empty input -> rejected with exit 2\n"
                     verdict.write_text(body, encoding="utf-8")
         return {"items": [{"role": "assistant", "content": role}]}
 

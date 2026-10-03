@@ -146,7 +146,8 @@ def _runner(trioctl, repo, monkeypatch, client, *, isolate=None,
             return 0
         if ctx.get("kind") == "slice-eval":
             with open(mailbox / "VERDICT.md", "a") as fh:
-                fh.write(f"## slice demo @{ctx['sha']} — SHIP\n")
+                fh.write(f"## slice demo @{ctx['sha']} — SHIP\n\n"
+                         "attacks:\n- empty input -> rejected with exit 2\n")
             return 0
         for rel in evaluator_drops:
             (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +155,8 @@ def _runner(trioctl, repo, monkeypatch, client, *, isolate=None,
         it = ctx.get("iteration", iteration)
         body = ["VERDICT: SHIP", "", f"iteration: {it}",
                 f"attempt: {ctx['evaluator_attempt']}", f"evaluated: {ctx['pinned_sha']}",
-                f"commit: {ctx['pinned_sha']}"]
+                f"commit: {ctx['pinned_sha']}",
+                "attacks:", "- empty input -> rejected with exit 2"]
         old = (mailbox / "VERDICT.md").read_text()
         (mailbox / "VERDICT.md").write_text("\n".join(body) + "\n\n" + old)
         with open(mailbox / "LOG.md", "a") as fh:

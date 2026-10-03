@@ -225,7 +225,7 @@ def write_artifact_for(mailbox: Path, role: str):
     else:
         (mailbox / "VERDICT.md").write_text(
             f"VERDICT: SHIP\n\niteration: 1\nattempt: {ATTEMPT}\n"
-            f"evaluated: {PIN}\n", "utf-8")
+            f"evaluated: {PIN}\nattacks:\n- empty input -> rejected with exit 2\n", "utf-8")
 
 
 def tree_hash(root: Path) -> str:
@@ -1370,7 +1370,8 @@ class FakeLoopRunner:
             (Path(mailbox) / "VERDICT.md").write_text(
                 f"VERDICT: SHIP\n\niteration: {iteration}\n"
                 f"attempt: {context['evaluator_attempt']}\n"
-                f"evaluated: {context['pinned_sha']}\n", "utf-8")
+                f"evaluated: {context['pinned_sha']}\n"
+                "attacks:\n- empty input -> rejected with exit 2\n", "utf-8")
         return 0
 
 

@@ -406,7 +406,8 @@ class _OpenLoopRunner:
         self.contexts.append(dict(context or {}))
         if context["kind"] == "slice-eval":
             with open(mailbox / "VERDICT.md", "a") as fh:
-                fh.write(f"## slice demo @{context['sha']} — SHIP\n")
+                fh.write(f"## slice demo @{context['sha']} — SHIP\n\n"
+                         "attacks:\n- empty input -> rejected with exit 2\n")
             return 0
         verdict = self.integration.pop(0)
         if self.late:
@@ -417,6 +418,7 @@ class _OpenLoopRunner:
             body += [f"attempt: {context['evaluator_attempt']}",
                      f"evaluated: {context['pinned_sha']}"]
         body.append(f"commit: {context.get('pinned_sha') or git(self.repo, 'rev-parse', 'HEAD')}")
+        body += ["attacks:", "- empty input -> rejected with exit 2"]
         old = (mailbox / "VERDICT.md").read_text()
         (mailbox / "VERDICT.md").write_text("\n".join(body) + "\n\n" + old)
         if verdict == "SHIP":

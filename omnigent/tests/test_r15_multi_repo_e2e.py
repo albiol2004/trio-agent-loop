@@ -287,7 +287,8 @@ class Scenario:
             time.sleep(0.4)
         with self.lock:
             with (self.l["box"] / "VERDICT.md").open("a") as fh:
-                fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n")
+                fh.write(f"\n## slice {ctx['slice']} @{ctx['sha']} — SHIP\n\naccepts: PASS\n"
+                         "attacks:\n- empty input -> rejected with exit 2\n")
             self.evals.append({"slice": ctx["slice"], "start": start, "end": time.monotonic()})
 
     def integration(self, ctx, prompt):
@@ -316,7 +317,8 @@ class Scenario:
         (box / "VERDICT.md").write_text(
             "VERDICT: SHIP\n\n"
             f"iteration: {ctx['iteration']}\nattempt: {ctx['evaluator_attempt']}\n"
-            f"evaluated: {evaluated}\n" + "".join(commits) + "\n" + text
+            f"evaluated: {evaluated}\n" + "".join(commits)
+            + "attacks:\n- empty input -> rejected with exit 2\n\n" + text
         )
         with (box / "LOG.md").open("a") as fh:
             fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP — multi-repo\n")

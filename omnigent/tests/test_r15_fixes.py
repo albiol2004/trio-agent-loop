@@ -65,7 +65,8 @@ def _ship(scenario, ctx, evaluated_names, retire_names):
     (box / "VERDICT.md").write_text(
         "VERDICT: SHIP\n\n"
         f"iteration: {ctx['iteration']}\nattempt: {ctx['evaluator_attempt']}\n"
-        f"evaluated: {evaluated}\n" + "".join(commits) + "\n" + text
+        f"evaluated: {evaluated}\n" + "".join(commits)
+        + "attacks:\n- empty input -> rejected with exit 2\n\n" + text
     )
     with (box / "LOG.md").open("a") as fh:
         fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP\n")
@@ -471,6 +472,7 @@ class LiteralLockstep(E.Scenario):
             f"VERDICT: SHIP\n\niteration: {ctx['iteration']}\n"
             f"attempt: {ctx['evaluator_attempt']}\n{evaluated}\n"
             f"commit: {ctx['pinned_sha']}\n" + "".join(commits)
+            + "attacks:\n- empty input -> rejected with exit 2\n"
         )
         with (box / "LOG.md").open("a") as fh:
             fh.write(f"- iter {ctx['iteration']} | evaluator | VERDICT: SHIP — lockstep\n")

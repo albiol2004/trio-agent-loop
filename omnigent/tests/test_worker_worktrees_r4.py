@@ -237,11 +237,13 @@ def _e2e_runner(trioctl, repo, root, monkeypatch, client, *, end_sessions=True):
             return 0
         if ctx["kind"] == "slice-eval":
             with open(mailbox / "VERDICT.md", "a") as fh:
-                fh.write(f"## slice demo @{ctx['sha']} — SHIP\n")
+                fh.write(f"## slice demo @{ctx['sha']} — SHIP\n\n"
+                         "attacks:\n- empty input -> rejected with exit 2\n")
             return 0
         body = ["VERDICT: SHIP", "", f"iteration: {ctx.get('iteration')}",
                 f"attempt: {ctx['evaluator_attempt']}", f"evaluated: {ctx['pinned_sha']}",
-                f"commit: {ctx['pinned_sha']}"]
+                f"commit: {ctx['pinned_sha']}",
+                "attacks:", "- empty input -> rejected with exit 2"]
         old = (mailbox / "VERDICT.md").read_text()
         (mailbox / "VERDICT.md").write_text("\n".join(body) + "\n\n" + old)
         with open(mailbox / "LOG.md", "a") as fh:
