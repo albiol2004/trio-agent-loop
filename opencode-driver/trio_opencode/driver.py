@@ -516,8 +516,12 @@ class RunContext:
         #: two concurrent writers racing `_atomic_write_json` and whichever
         #: finishes last silently dropping the other's fields. Always
         #: uncontended for a lockstep run (only `write_driver_json` itself
-        #: ever writes this file there).
-        self.driver_json_lock = threading.Lock()
+        #: ever writes this file there). It IS the loop core's own
+        #: ``_DRIVER_JSON_LOCK`` when the core has one, so the core's
+        #: ``ship_gate`` persist/clear (the attacks gate) serializes with
+        #: these writers too instead of losing an update between them.
+        self.driver_json_lock = (getattr(steplib.TL, "_DRIVER_JSON_LOCK", None)
+                                 or threading.RLock())
         #: `_call_role`'s pre-turn :data:`OWNED_STATE_KEYS` snapshot for the
         #: guarded turn currently in flight (``None`` otherwise), persisted
         #: into ``.driver.json`` so a crash mid-turn leaves `resume` a record

@@ -485,3 +485,47 @@ def test_portable_open_loop_prompts_render_both_blocks(monkeypatch, capfd, tmp_p
     clean = _render(monkeypatch, capfd, tmp_path, "evaluator",
                     {"mode": "open-loop", "kind": "slice-eval", "slice": "solo", "sha": "abc1234"})
     assert "SLICE-EVAL ERRORS" not in clean
+
+
+def test_ship_gate_survives_concurrent_driver_json_rewrites(tmp_path: Path) -> None:
+    """The open-loop threads rewrite `.driver.json` while the attacks gate
+    persists `ship_gate` and the Lead reads it: no rewrite may drop a pending
+    refusal (lost update) and no reader may see a torn file (it would read
+    as "no errors" and the refusal would never reach the Lead)."""
+    mailbox = tmp_path / "loop"
+    mailbox.mkdir()
+
+    class Runner:
+        session_ids: dict = {}
+
+    stop = threading.Event()
+    torn: list[str] = []
+
+    def writer() -> None:
+        while not stop.is_set():
+            trio_loop._write_driver_state(mailbox, Runner(), 1, "lead")
+
+    def reader() -> None:
+        while not stop.is_set():
+            path = mailbox / ".driver.json"
+            if path.exists():
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (ValueError, OSError) as exc:
+                    torn.append(repr(exc))
+
+    threads = [threading.Thread(target=writer) for _ in range(3)]
+    threads.append(threading.Thread(target=reader))
+    for thread in threads:
+        thread.start()
+    try:
+        for n in range(200):
+            trio_loop._persist_ship_gate_errors(mailbox, n, [f"refusal {n}"])
+            assert trio_loop.ship_gate_errors(mailbox, n) == [f"refusal {n}"], n
+            trio_loop.clear_ship_gate_errors(mailbox)
+            assert trio_loop.ship_gate_errors(mailbox) == [], n
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
+    assert torn == []

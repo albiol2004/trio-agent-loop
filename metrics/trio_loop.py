@@ -258,11 +258,9 @@ def _write_driver_state(
     }
     for key, value in _driver_meta(runner).items():
         payload.setdefault(key, value)
-    payload.update(_preserved_ship_gate(mailbox))
-    (mailbox / ".driver.json").write_text(
-        json.dumps(payload) + "\n",
-        encoding="utf-8",
-    )
+    with _DRIVER_JSON_LOCK:
+        payload.update(_preserved_ship_gate(mailbox))
+        _store_driver_json(mailbox, payload)
 
 def _append_log(mailbox: Path, line: str) -> None:
     path = mailbox / "LOG.md"
@@ -928,9 +926,18 @@ def _preserved_ship_gate(mailbox: Path) -> dict:
     return {"ship_gate": gate} if isinstance(gate, dict) else {}
 
 
+#: Serialises every in-process read-modify-write of `.driver.json` (the
+#: open-loop lead/eval/monitor threads write it concurrently): without it a
+#: sidecar rewrite could drop a `ship_gate` persisted between its read and
+#: its write. Re-entrant; drivers sharing the process may take it too.
+_DRIVER_JSON_LOCK = threading.RLock()
+
+
 def _store_driver_json(mailbox: Path, data: dict) -> None:
+    """Atomic whole-file write (temp file + rename), so a concurrent reader
+    such as ``ship_gate_errors`` never sees a truncated file."""
     path = Path(mailbox) / ".driver.json"
-    tmp = path.with_name(f".driver.json.{os.getpid()}.tmp")
+    tmp = path.with_name(f".driver.json.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -964,20 +971,22 @@ def ship_gate_errors(mailbox, iteration: int | None = None) -> list[str]:
 
 def clear_ship_gate_errors(mailbox) -> None:
     """Forget the pending attacks-gate errors (after the Lead got them)."""
-    data = _read_driver_json(Path(mailbox))
-    if "ship_gate" not in data:
-        return
-    data.pop("ship_gate", None)
-    try:
-        _store_driver_json(Path(mailbox), data)
-    except OSError:
-        pass
+    with _DRIVER_JSON_LOCK:
+        data = _read_driver_json(Path(mailbox))
+        if "ship_gate" not in data:
+            return
+        data.pop("ship_gate", None)
+        try:
+            _store_driver_json(Path(mailbox), data)
+        except OSError:
+            pass
 
 
 def _persist_ship_gate_errors(mailbox: Path, iteration: int, errors: list[str]) -> None:
-    data = _read_driver_json(mailbox)
-    data["ship_gate"] = {"iteration": iteration, "errors": list(errors)}
-    _store_driver_json(mailbox, data)
+    with _DRIVER_JSON_LOCK:
+        data = _read_driver_json(mailbox)
+        data["ship_gate"] = {"iteration": iteration, "errors": list(errors)}
+        _store_driver_json(mailbox, data)
 
 
 def review_ship_attacks(mailbox, iteration: int, verdict: str, scope, *,
@@ -3877,10 +3886,9 @@ def _write_open_loop_sidecars(
         driver_payload["evaluator_sessions"] = dict(evaluator_sessions)
     for key, value in _driver_meta(lead_runner, eval_runner).items():
         driver_payload.setdefault(key, value)
-    driver_payload.update(_preserved_ship_gate(mailbox))
-    (mailbox / ".driver.json").write_text(
-        json.dumps(driver_payload) + "\n", encoding="utf-8"
-    )
+    with _DRIVER_JSON_LOCK:
+        driver_payload.update(_preserved_ship_gate(mailbox))
+        _store_driver_json(mailbox, driver_payload)
     session_payload = {
         "pid": os.getpid(),
         "iteration": iteration,
