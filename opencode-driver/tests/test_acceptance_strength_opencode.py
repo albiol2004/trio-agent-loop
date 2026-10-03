@@ -127,7 +127,6 @@ def _lead_plans(env) -> list[str]:
             if c["agent"] == "trio-lead" and "PLAN CALL" in c["prompt"]]
 
 
-@pytest.mark.xfail(strict=True, reason="needs drv-native")
 def test_ls_ship_without_attacks_is_refused_then_ships(git_repo, tmp_path, monkeypatch):
     """End to end through the native helper's `apply`: the attacks gate turns
     the attack-less SHIP into ITERATE, the next Lead plan shows why, the
