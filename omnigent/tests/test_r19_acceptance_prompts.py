@@ -66,11 +66,13 @@ def test_switch_on_adds_the_acceptance_blocks(tmp_path, name):
     if role == "lead":
         assert "trioctl omnigent acceptance wait --mailbox" in text and "covers:" in text
         assert "ACCEPTANCE-DISPUTE:" in text
+        assert "`requirements` map" in text and "attacks beyond the pack" in text
     elif ctx.get("kind") == "slice-eval":
         assert "ACCEPTANCE (covered): ACC-01 FAIL" in text and "sole-cover" in text
         assert "trioctl omnigent acceptance run" not in text
     else:
         assert "FROZEN ACCEPTANCE @" in text and "## Frozen acceptance" in text
+        assert "requirement_gaps:" in text and "floor, not the finish line" in text
         assert "acceptance: amend ACC-NN (evaluator, iter N)" in text
     assert not re.search(r"`git [^`]*`", text[len(base):]), "no backticked git in acceptance blocks"
 
@@ -92,6 +94,10 @@ def test_generated_acceptance_sources():
     assert f"  model: {model}\n" in cfg and "name: trio-omnigent-acceptance" in cfg
     assert "spawn: false" in cfg and "{export}" not in cfg
     assert "{export}" in (PROMPTS / "acceptance.md").read_text()
+    # acceptance strength: the author maps every requirement to a hard check
+    for text in (cfg, (PROMPTS / "acceptance.md").read_text()):
+        assert '"requirements": [' in text
+        assert "HARD check" in text and "REQUIREMENT GAP:" in text
 
 
 def test_install_templates_the_author_model_and_ships_the_runner():

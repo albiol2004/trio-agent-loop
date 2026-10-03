@@ -329,6 +329,8 @@ def test_acc_evaluator_fragment_substitutes_mailbox_and_tool():
     text = prompts.acc_evaluator_fragment("/abs/loop", "metrics/trio-acceptance.py")
     assert "{mailbox}" not in text and "{tool}" not in text
     assert "metrics/trio-acceptance.py run" in text
+    # acceptance strength: frozen checks are a floor, attacks go beyond them
+    assert "requirement_gaps:" in text and "floor, not the finish line" in text
 
 
 def test_acc_plan_lines_empty_without_acc_digest():
@@ -444,6 +446,9 @@ def test_acceptance_agent_body_loads_from_opencode_driver_agents(tmp_path: Path)
     description, body = ocgen._load_role_body(repo_root, "acceptance")
     assert "# Role: Acceptance Author" in body
     assert description
+    # acceptance strength: the requirements map with a hard check per requirement
+    assert '"requirements": [' in body and "HARD check" in body
+    assert "REQUIREMENT GAP:" in body and "{export}" not in body
 
 
 def test_acceptance_agent_uses_lead_variant_not_its_own(tmp_path: Path):

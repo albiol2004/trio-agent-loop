@@ -62,6 +62,8 @@ def test_generated_native_roles_carry_obligations() -> None:
     assert "task-specific checklist" in lead
     assert "unavailable environment" in evaluator
     assert "whole-goal SHIP" in evaluator
+    assert "Frozen checks are a floor, not the finish line (every SHIP)" in evaluator
+    assert "the driver refuses a SHIP with no counted attack" in " ".join(evaluator.split())
 
 
 def test_omnigent_dispatch_prompt_carries_shared_essentials(

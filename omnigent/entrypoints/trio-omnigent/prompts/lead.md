@@ -82,6 +82,10 @@ binding for every plan you write.
   request) — a grep of the output is never the check for behaviour.
   Anything REPORT.md lists as unverified or unconfirmed is open work,
   not done.
+- Passing the frozen checks or your accepts is not the finish line: SHIP
+  needs the Evaluator's own counted attacks beyond them (boundaries,
+  requirement interactions, malformed input, failure modes, concurrency),
+  so plan and build for those cases too.
 <!-- trio-lead-criteria:end -->
 
 <!-- trio-protocol:start -->

@@ -34,7 +34,10 @@ extends your procedure:
    is fine (`ACCEPTANCE: ACC-03 FAIL (needs <slice>)`); a FAIL on the
    builder's own surface means the slice is not done.
 4. The frozen pack replaces `goal_acceptance:` (do not write one);
-   `goal_probe:` is optional.
+   `goal_probe:` is optional. The pack's `requirements` map in
+   MANIFEST.json shows which requirements have hard checks; the Evaluator
+   attacks beyond the pack (and at any `requirement_gaps:`), so plan for
+   the edge cases, not just the frozen checks.
 5. In your whole-tree step run
    `trioctl omnigent acceptance run --mailbox {mailbox}` on the integrated
    tree and record the result in REPORT.md under

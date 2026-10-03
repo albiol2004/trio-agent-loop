@@ -1,9 +1,12 @@
 """r19 C1: slice-evals back to fast; rigor split core/integration.
 
 Rendered through the real ``OmnigentRunner._prompt`` (root-bound and
-root-free): the slice-eval render carries no attacks, no independent
-probe and no per-accept table; the integration-eval and lockstep renders
-carry all three; receipt-never-PASS is in every evaluator render.
+root-free): the slice-eval render carries no independent probe, no
+per-accept table and no "at least two attacks" duty, but a SHIP section
+needs an `attacks:` list with one counted probe beyond the accepts (the
+acceptance-strength floor rule); the integration-eval and lockstep renders
+carry all three whole-goal duties; receipt-never-PASS is in every
+evaluator render.
 """
 from __future__ import annotations
 
@@ -34,6 +37,14 @@ INTEGRATION = {"mode": "open-loop", "kind": "integration-eval", "slice": None, "
 LOCKSTEP = {"evaluator_attempt": "a1", "pinned_sha": "c" * 40}
 
 WHOLE_GOAL_MARKERS = ("attacks:", "Independent probe", "| # | criterion |")
+#: What a slice-eval render carries instead of the whole-goal attack duty.
+SLICE_ATTACK_MARKERS = (
+    "Frozen checks are a floor, not the finish line",
+    "an `attacks:` list",
+    "needs at least one counted attack beyond the slice's accepts",
+    "The driver refuses a SHIP section with no counted attack",
+    "the slice-eval is re-dispatched",
+)
 RECEIPT = "A receipt alone is never PASS"
 
 
@@ -52,8 +63,10 @@ def _flat(text: str) -> str:
 @pytest.mark.parametrize("root_free", [False, True], ids=["root-bound", "root-free"])
 def test_slice_eval_render_is_fast(tmp_path, root_free):
     text = _flat(_render(tmp_path, SLICE, root_free))
-    for marker in WHOLE_GOAL_MARKERS + ("| # | accept |", "at least two"):
+    for marker in ("Independent probe", "| # | criterion |", "| # | accept |", "at least two"):
         assert marker not in text, marker
+    for marker in ("attacks:",) + SLICE_ATTACK_MARKERS:
+        assert marker in text, marker
     assert RECEIPT in text
     assert "`evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>`" in text
 
@@ -90,6 +103,10 @@ def test_generator_splits_core_and_integration():
     core = " ".join(gen.rigor_content().split())
     integ = " ".join(gen.integration_rigor_content().split())
     assert RECEIPT in core and RECEIPT not in integ
+    # the floor rule and the slice SHIP `attacks:` requirement ride the core
+    # (every evaluator dispatch); the "at least two" duty stays whole-goal.
+    assert "Frozen checks are a floor, not the finish line" in core
+    assert "carries an `attacks:` list" in core and "at least two" not in core
     for marker in ("### Independent probe", "at least two concrete attacks",
                    "### Data-work profile", "per receipt family"):
         assert marker in integ and marker not in core, marker

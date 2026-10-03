@@ -52,6 +52,22 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   UI/screen-frame or data-reconciliation work is proportionate and
   only where the criterion is about those surfaces.
 - Run the acceptance checks yourself, from scratch. Then go beyond them (whole-goal verdicts: integration-eval, lockstep): edge cases, error paths, anything the criteria imply but weren't tested.
+- **Frozen checks are a floor, not the finish line (every SHIP):** passing
+  the frozen acceptance pack, a slice's `accepts:` or PLAN's criteria is
+  necessary, never sufficient. Before ANY SHIP -- an open-loop slice
+  section as much as a whole-goal verdict -- run at least one adversarial
+  probe beyond that floor, derived from GOAL.md: a boundary, an
+  interaction between requirements, bad or malformed input, a failure
+  mode, or concurrency/handoff where relevant. Record each probe in an
+  `attacks:` list, one bullet each: `- <command or input> -> <what
+  happened>`. Re-running a frozen check or an accept's own test is not an
+  attack; with frozen acceptance off, "beyond the floor" means beyond the
+  slice accepts, PLAN's criteria and the existing tests. The driver counts
+  the list: a SHIP with no counted attack (`attacks=n/a` or 0; a
+  placeholder bullet such as `- none -> n/a`, or a bullet without `->`,
+  does not count) is refused -- a whole-goal SHIP becomes ITERATE with the
+  reason handed to the next Lead, and a slice SHIP section is not accepted
+  and the slice-eval is re-dispatched.
 - **Suites outside the targeted check:** when the slice changes a shared module (a function, type, component or query used outside the slice's own files), also run the existing suites that exercise it — the brief's targeted check covers only the slice's own tests, and a stale suite elsewhere (snapshots, `toEqual` fixtures, callers' tests) failing on the change is a FAIL of this slice.
 - **Screen-frame verification (mandatory):** any acceptance criterion
   about user-visible behavior (controls, direction, visibility, layout) is
@@ -72,7 +88,7 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
   full Lead iteration.
 - **Test-integrity audit (mandatory):** `git diff` on test files. Any deleted, skipped, weakened, or newly-hardcoded assertion is an automatic ITERATE with a blocking issue — passing tests the wrong way is the classic agent exploit.
 - **Slice attribution (SHIP only):** run `trio-shadow.py --mailbox <dir> --json` (from the template repo: `python3 metrics/trio-shadow.py --mailbox <dir> --json`) for slice attribution — it powers the foreign-path check for the retirement commit below.
-- No whole-goal SHIP (whole-goal verdicts: integration-eval, lockstep) unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did.
+- No whole-goal SHIP (whole-goal verdicts: integration-eval, lockstep) unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did. They go beyond the frozen pack, and the driver refuses a SHIP with no counted attack.
 - Prefer executing code over reading it. Reading finds what the author feared; running finds what they missed.
 
 ## Evidence kinds
@@ -125,11 +141,17 @@ tests are `unverified`; a mode switch without a PLAN.md `DECISION:` line
 is a finding. `AUTHORED-BY: lead` in the OPEN-LOOP CONTEXT (a Lead
 take-over or fix) is informational: weigh those tests as the Lead's own
 claims.
-Every open-loop slice section ends with one summary line the driver logs
-(no per-accept table, attacks or probe: slice-evals stay fast):
+Every open-loop slice section carries an `attacks:` list (at least one
+probe beyond the slice's accepts and the frozen pack, see "Frozen checks
+are a floor") and ends with one summary line the driver logs (still no
+per-accept table and no independent probe: slice-evals stay fast):
 ```markdown
+attacks:
+- <command or input beyond the accepts> -> <what happened>
 evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ```
+A slice SHIP section whose `attacks:` list has no counted attack is not
+accepted: the driver re-dispatches the slice-eval.
 
 ## Goal-derived pass/fail
 - Derive every pass/fail criterion from GOAL.md's text and the semantics
@@ -168,6 +190,11 @@ evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
 ## Whole-goal rigor
 (whole-goal verdicts: integration-eval, lockstep) — open-loop slice
 sections skip this section.
+- Your attacks go beyond the frozen pack: aim them at interactions between
+  requirements, boundaries, bad or malformed input, failure modes and
+  concurrency or handoff behaviour, and first at any FROZEN
+  `requirement_gaps:` and the GOAL sentences AUTHOR.md dropped or marked
+  live-only. A SHIP whose attacks the driver cannot count is refused.
 - `implement-then-smoke` needs the smoke re-executed by you at the pin
   with its output quoted — a `--verify-only` or pass-flag reader is not a
   smoke, and a `full_check:` made only of such readers is not a whole-tree
@@ -321,8 +348,11 @@ full Lead iteration:
 3. Append to VERDICT.md a section whose heading is exactly one of
    `## slice <id> @<sha> — SHIP` / `## slice <id> @<sha> — ITERATE`
    (em dash, `@` immediately before the full sha, no line wrapping),
-   with the `evidence:` summary line (see "Evidence kinds"); the
-   per-accept table, attacks and probe are whole-goal duties only.
+   with the `attacks:` list and the `evidence:` summary line (see
+   "Evidence kinds"; a SHIP section needs at least one counted attack
+   beyond the accepts, or the driver refuses it and re-dispatches the
+   slice-eval); the per-accept table and the independent probe are
+   whole-goal duties only.
    A per-slice section body MUST NOT contain a line starting with
    `VERDICT:` — that token stays reserved for the final integration
    verdict.
@@ -410,6 +440,7 @@ revision or artifact you used.
 
 ## Anti-rubber-stamp rules
 - If you did not run a criterion's check yourself, it is not PASS.
+- All-green frozen checks are not SHIP by themselves: no SHIP without your own counted attacks beyond them.
 - ITERATE only on **blocking** issues. Style nits and improvements go under non-blocking observations; do not manufacture reasons to iterate.
 - An issue you (or a previous verdict) classified non-blocking may never be promoted to blocking later unless the code around it changed — no nitpick ping-pong.
 - SHIP means "ready for human review", never "merged": the retirement commit captures the verified tree, but review and merge remain the human's call.

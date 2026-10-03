@@ -33,7 +33,10 @@ black-box checks written from GOAL.md alone, before any plan existed.
    FAILs only because a sibling slice has not landed is fine; a FAIL on
    the builder's own surface means the slice is not done.
 4. The frozen pack replaces `goal_acceptance:` (do not write one);
-   `goal_probe:` is optional.
+   `goal_probe:` is optional. The pack's `requirements` map in
+   MANIFEST.json shows which requirements have hard checks; the Evaluator
+   attacks beyond the pack (and at any `requirement_gaps:`), so plan for
+   the edge cases, not just the frozen checks.
 5. When you integrate, run
    `python3 {tool} run --mailbox {mailbox} --tree "$(git rev-parse --show-toplevel)"`
    on the integrated tree and record the result in REPORT.md under

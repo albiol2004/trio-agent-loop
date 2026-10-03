@@ -24,8 +24,23 @@ at modules that do not exist yet.
 1. Split the GOAL into sentences. Mark each one `testable-black-box`,
    `testable-only-live` (the environment it needs is absent: live
    service, credentials, device) or `not-testable` (process or wording).
-   Write this inventory to `acceptance/AUTHOR.md`.
-2. For each testable sentence write 1–3 checks. Each check drives the
+   Write this inventory to `acceptance/AUTHOR.md`. Then list every
+   requirement and constraint the GOAL states or implies (a sentence may
+   hold several; a constraint such as "remain compatible" or a limit is a
+   requirement too) as `R1`, `R2`, ... with its `GOAL.md:<line>` and a
+   verbatim quote; this list becomes `requirements` in the manifest.
+2. For each testable sentence write 1–3 checks. For EVERY requirement
+   write at least one normal check (the stated behaviour) AND at least one
+   HARD check, derived from the GOAL text from first principles, not from
+   a guess at the future implementation. Hard means one of: `boundary`
+   (an edge or limit of the stated range or format), `interaction` (two
+   requirements together; name the other one in `with`), `failure-mode`
+   (what must happen when something it depends on fails or is absent),
+   `malformed-input` (bad, empty, oversized or hostile input), or
+   `concurrency` (parallel use, ordering, handoff between actors) -- pick
+   what the GOAL implies for that requirement. A check may serve several
+   requirements, but within one requirement the normal and the hard check
+   are different checks. Each check drives the
    product through its **public surface**, the way its users run it: a
    CLI subprocess; an HTTP request to a server the check starts itself; or
    a public function or entry point named in the GOAL or existing at base,
@@ -55,13 +70,18 @@ at modules that do not exist yet.
    GOAL does not state) is dropped; record it in `AUTHOR.md` as "for the
    integration Evaluator's probe".
 7. Size and budget: 8–25 checks; each `timeout_s` <= 120 (default 60); the
-   whole pack runs in <= 5 minutes at base.
+   whole pack runs in <= 5 minutes at base. A check can serve several
+   requirements (one boundary check may be hard for two of them), so keep
+   the pack inside 8–25 by sharing checks, not by dropping a requirement's
+   hard check. A requirement the GOAL states but no check can test
+   (`testable-only-live`, `not-testable`) still gets its entry, with the
+   reason in `AUTHOR.md`.
 
 ## Output — `acceptance/` in your workspace
 ```
 acceptance/
   MANIFEST.json        # acceptance_version: 1 (schema below)
-  AUTHOR.md            # the GOAL sentence inventory, drops + reasons
+  AUTHOR.md            # the GOAL sentence inventory, requirement list, drops + reasons
   checks/acc_NN_<slug>.{py,sh,mjs}
   fakes/...            # fake CLIs / servers / fixtures the checks use
 ```
@@ -82,6 +102,13 @@ acceptance/
      "expect": {"exit": 0}, "timeout_s": 60,
      "needs": ["node", "setup:api-deps"], "binds": ["STATS_ROUTE"],
      "network": "loopback"}
+  ],
+  "requirements": [
+    {"id": "R1", "goal_ref": "GOAL.md:12",
+     "goal_quote": "<verbatim substring of GOAL.md or the notes>",
+     "normal": ["ACC-01"],
+     "hard": [{"check": "ACC-02", "type": "boundary"},
+              {"check": "ACC-05", "type": "interaction", "with": "R3"}]}
   ]
 }
 ```
@@ -89,6 +116,22 @@ acceptance/
   anything else is dropped at freeze.
 - `kind`: `behaviour` (must FAIL at base), `doc` (a README or `--help`
   obligation; must FAIL at base), `guard` (may PASS at base; at most 3).
+- `requirements` (top level, required): one entry per requirement of the
+  GOAL, `id` (`R1`, ...), `goal_ref`, `goal_quote` (a verbatim substring
+  of GOAL.md or the notes file), `normal` (check ids) and `hard` (a list
+  of `{"check": <id>, "type": <type>}`). `type` is one of `boundary`,
+  `interaction`, `failure-mode`, `malformed-input`, `concurrency`; an
+  `interaction` also names another requirement id in `with`. Any check
+  kind may be referenced and every kind rule above still holds
+  (`behaviour`/`doc` must FAIL at base, at most 3 guards). A check may
+  serve several requirements, but within one requirement it is either
+  normal or hard, never both. The driver rejects at base a pack where a
+  requirement has no surviving hard check (a dropped or invalid check does
+  not count) or where the map is missing, and gives you ONE retry with the
+  gaps listed (`requirements: R2 has no hard check`); a gap left after
+  the retry is frozen anyway, recorded as `requirement_gaps:`, and the
+  integration Evaluator attacks it. The checks stay frozen before any
+  building and you still see only the GOAL.
 - A check exits 0 on PASS and 1 on FAIL, printing a one-line reason on
   failure; it exits 77 when an environment it needs is missing (that is
   UNAVAILABLE and goes to a human, never to the builders). A hang is a
@@ -129,7 +172,8 @@ acceptance/
 
 End by running `trioctl omnigent acceptance validate --export .` from
 `{export}` (schema + a run of every check at base). Fix anything it
-reports (`WOULD DROP`, `INVALID`), run it again, then stop.
+reports (`WOULD DROP`, `INVALID`, `REQUIREMENT GAP: ...`), run it again,
+then stop.
 
 ## Never
 Run the Lead's or the Evaluator's procedures, write outside

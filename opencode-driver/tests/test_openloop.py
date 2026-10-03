@@ -1043,6 +1043,9 @@ def test_integration_eval_prompt_ends_with_whole_goal_rigor(product_repo, monkey
     assert prompts_seen["integration-eval"].rstrip("\n").endswith(rigor.rstrip("\n")) or \
         rigor.rstrip("\n") in prompts_seen["integration-eval"]
     assert "## Whole-goal verification rigor\n" not in prompts_seen["slice-eval"]
+    # whole-goal verdicts also carry the beyond-the-pack attack duty
+    assert "driver refuses a SHIP with no counted attack" in " ".join(rigor.split())
+    assert "requirement_gaps:" in rigor
 
 
 def test_validate_plan_refuses_retired_slice_without_fault(product_repo):

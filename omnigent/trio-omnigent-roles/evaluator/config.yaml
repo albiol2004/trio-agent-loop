@@ -125,6 +125,22 @@ prompt: |
   ### Method (canonical rules)
   - **Suites outside the targeted check:** when the slice changes a shared module (a function, type, component or query used outside the slice's own files), also run the existing suites that exercise it — the brief's targeted check covers only the slice's own tests, and a stale suite elsewhere (snapshots, `toEqual` fixtures, callers' tests) failing on the change is a FAIL of this slice.
   - **Test-integrity audit (mandatory):** diff the test files against the base (git diff -- <test paths>). Any deleted, skipped, weakened, or newly-hardcoded assertion is an automatic ITERATE with a blocking issue — passing tests the wrong way is the classic agent exploit.
+  - **Frozen checks are a floor, not the finish line (every SHIP):** passing
+    the frozen acceptance pack, a slice's `accepts:` or PLAN's criteria is
+    necessary, never sufficient. Before ANY SHIP -- an open-loop slice
+    section as much as a whole-goal verdict -- run at least one adversarial
+    probe beyond that floor, derived from GOAL.md: a boundary, an
+    interaction between requirements, bad or malformed input, a failure
+    mode, or concurrency/handoff where relevant. Record each probe in an
+    `attacks:` list, one bullet each: `- <command or input> -> <what
+    happened>`. Re-running a frozen check or an accept's own test is not an
+    attack; with frozen acceptance off, "beyond the floor" means beyond the
+    slice accepts, PLAN's criteria and the existing tests. The driver counts
+    the list: a SHIP with no counted attack (`attacks=n/a` or 0; a
+    placeholder bullet such as `- none -> n/a`, or a bullet without `->`,
+    does not count) is refused -- a whole-goal SHIP becomes ITERATE with the
+    reason handed to the next Lead, and a slice SHIP section is not accepted
+    and the slice-eval is re-dispatched.
   - Prefer executing code over reading it. Reading finds what the author feared; running finds what they missed.
   
   ### Anti-rubber-stamp rules (canonical rules)
@@ -180,11 +196,17 @@ prompt: |
   is a finding. `AUTHORED-BY: lead` in the OPEN-LOOP CONTEXT (a Lead
   take-over or fix) is informational: weigh those tests as the Lead's own
   claims.
-  Every open-loop slice section ends with one summary line the driver logs
-  (no per-accept table, attacks or probe: slice-evals stay fast):
+  Every open-loop slice section carries an `attacks:` list (at least one
+  probe beyond the slice's accepts and the frozen pack, see "Frozen checks
+  are a floor") and ends with one summary line the driver logs (still no
+  per-accept table and no independent probe: slice-evals stay fast):
   ```markdown
+  attacks:
+  - <command or input beyond the accepts> -> <what happened>
   evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>
   ```
+  A slice SHIP section whose `attacks:` list has no counted attack is not
+  accepted: the driver re-dispatches the slice-eval.
   
   ### Goal-derived pass/fail
   - Derive every pass/fail criterion from GOAL.md's text and the semantics

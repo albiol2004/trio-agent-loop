@@ -398,6 +398,10 @@ extension"), run this loop instead of waiting for a verdict:
   request) — a grep of the output is never the check for behaviour.
   Anything REPORT.md lists as unverified or unconfirmed is open work,
   not done.
+- Passing the frozen checks or your accepts is not the finish line: SHIP
+  needs the Evaluator's own counted attacks beyond them (boundaries,
+  requirement interactions, malformed input, failure modes, concurrency),
+  so plan and build for those cases too.
 
 ## Quality bar
 - Lockstep: Run the project's build/tests/linters before reporting; "done" with failing checks is the cardinal sin. (Open-loop with isolated builders: Open-loop step 6's one whole-tree gate replaces this bullet.)

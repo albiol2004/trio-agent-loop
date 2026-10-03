@@ -36,6 +36,14 @@ code existed. In order:
    sentences AUTHOR.md lists as not covered by a frozen check (drops,
    live-only) and at any running surface (start the server or board and
    probe it over HTTP).
+   The frozen pack is a floor, not the finish line: your `attacks:` go
+   beyond it (re-running a frozen check is not an attack). Aim them first
+   at the `requirement_gaps:` lines in `acceptance/FROZEN` (requirements
+   the author could not give a hard check), then at the pack's hard
+   requirements (`requirements` in MANIFEST.json: boundaries, interactions
+   between requirements, malformed input, failure modes, concurrency), then
+   at AUTHOR.md's dropped and live-only sentences. A SHIP with no counted
+   attack is refused by the driver.
 6. UNAVAILABLE frozen checks (exit 77 or unmet needs) are never an
    ITERATE: with every other check passing the verdict is NEEDS_HUMAN,
    listing them with exact commands under `## Human check`. With FAILs too,

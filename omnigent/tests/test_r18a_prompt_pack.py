@@ -43,7 +43,10 @@ INTEGRATION = {"mode": "open-loop", "kind": "integration-eval", "slice": None, "
 GRAMMAR = "`<input/action> -> <observable> | oracle: <kind>`"
 LEAD_NEEDLES = (GRAMMAR, "`## Accepts`", "`ACCEPT_TEST:` lines", "AUTHORED-BY: lead")
 SLICE_NEEDLES = (
-    # r19 C1: slice-evals back to fast -- one summary line, no table/attacks.
+    # r19 C1: slice-evals stay fast -- no per-accept table, no probe; one
+    # summary line. Floor rule: a SHIP section also carries an `attacks:` list.
+    "then an `attacks:` list (one bullet per probe,",
+    "a SHIP section needs at least one counted attack beyond the slice's accepts",
     "evidence kind (`re-run`|`implementer-test`|`receipt`)",
     "`evidence: re-run=<n> implementer-test=<n> receipt=<n> unverified=<n>`",
     "a receipt alone is never PASS",
@@ -64,6 +67,8 @@ RIGOR_NEEDLES = (
     "string-presence checks on files the slice or the Lead wrote",
     "`test-first` needs red-before-green evidence",
     "`AUTHORED-BY: lead`",
+    "Frozen checks are a floor, not the finish line (every SHIP)",
+    "Every open-loop slice section carries an `attacks:` list",
 )
 # r19 C1: whole-goal only (integration-eval, lockstep; never a slice-eval).
 WHOLE_GOAL_NEEDLES = (

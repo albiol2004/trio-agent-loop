@@ -55,6 +55,8 @@ def test_lead_section_present_in_native_and_driver_agents():
     for path in LEAD_SITES:
         text = path.read_text(encoding="utf-8")
         assert LEAD_SECTION in text, path
+        # the frozen pack / accepts are not the finish line (SHIP needs beyond-pack attacks)
+        assert "is not the finish line" in text, path
 
 
 def test_evaluator_sections_present_inside_omnigent_rigor_block():
@@ -72,3 +74,4 @@ def test_lead_section_present_inside_omnigent_lead_criteria_block():
         text = path.read_text(encoding="utf-8")
         block = _block(text, "trio-lead-criteria")
         assert LEAD_HEADING in block, path
+        assert "is not the finish line" in block, path

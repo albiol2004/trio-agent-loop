@@ -249,6 +249,12 @@ def test_slice_eval_drift_matches_trioctl_after_substitutions():
     tail = formatted[formatted.index("3. Append"):]  # steps 3-5, untouched by the port
     text = ol.render("slice-eval", _slice_eval_ctx(slice=slice_id, sha=sha))
     assert tail in text
+    # acceptance strength: a SHIP section needs a counted attack, else it is refused
+    flat = " ".join(text.split())
+    assert "then an `attacks:` list" in flat
+    assert "The driver refuses a SHIP section with no counted attack" in flat
+    assert "the slice-eval is re-dispatched" in flat
+    assert "Independent probe" not in text and "at least two" not in text
     # The intro line (minus the literal "<mailbox>" placeholder step 1 drops) survives too.
     intro = formatted[:formatted.index("1. Run")]
     assert intro.strip() in text

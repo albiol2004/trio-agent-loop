@@ -108,6 +108,7 @@ RIGOR_SITES = [
 RIGOR_CORE = [
     ("bullet", "Method", "**Suites outside the targeted check:**"),
     ("bullet", "Method", "**Test-integrity audit (mandatory):**"),
+    ("bullet", "Method", "**Frozen checks are a floor, not the finish line (every SHIP):**"),
     ("bullet", "Method", "Prefer executing code over reading it"),
     ("bullet", "Anti-rubber-stamp rules", "If you did not run a criterion's check yourself"),
     ("section", "Evidence kinds", None),

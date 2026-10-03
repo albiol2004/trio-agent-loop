@@ -28,6 +28,8 @@ RIGOR = (
     "Prefer executing code over reading it",
     "If you did not run a criterion's check yourself, it is not PASS",
     "A receipt alone is never PASS",
+    "Frozen checks are a floor, not the finish line (every SHIP)",
+    "Every open-loop slice section carries an `attacks:` list",
 )
 # ... and whole-goal (integration-eval + lockstep prompts only).
 WHOLE_GOAL = (

@@ -16,11 +16,16 @@ Cite actual query/command output for each. A pipeline whose output "looks plausi
 
 ### Method (canonical rules)
 - Run the acceptance checks yourself, from scratch. Then go beyond them (whole-goal verdicts: integration-eval, lockstep): edge cases, error paths, anything the criteria imply but weren't tested.
-- No whole-goal SHIP (whole-goal verdicts: integration-eval, lockstep) unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did.
+- No whole-goal SHIP (whole-goal verdicts: integration-eval, lockstep) unless your verdict lists what you actively tried to break and couldn't: at least two concrete attacks (an input, a boundary, a removal or injected fault) and what each did. They go beyond the frozen pack, and the driver refuses a SHIP with no counted attack.
 
 ### Whole-goal rigor
 (whole-goal verdicts: integration-eval, lockstep) — open-loop slice
 sections skip this section.
+- Your attacks go beyond the frozen pack: aim them at interactions between
+  requirements, boundaries, bad or malformed input, failure modes and
+  concurrency or handoff behaviour, and first at any FROZEN
+  `requirement_gaps:` and the GOAL sentences AUTHOR.md dropped or marked
+  live-only. A SHIP whose attacks the driver cannot count is refused.
 - `implement-then-smoke` needs the smoke re-executed by you at the pin
   with its output quoted — a `--verify-only` or pass-flag reader is not a
   smoke, and a `full_check:` made only of such readers is not a whole-tree

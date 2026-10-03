@@ -236,6 +236,9 @@ def test_generated_author_agent_is_on_the_evaluator_tier() -> None:
     assert model in agent.splitlines()[:8]
     assert "name: trio-acceptance" in agent and "disallowedTools: Agent, WebFetch, WebSearch" in agent
     assert "trioctl" not in agent and "{export}" not in agent
+    # acceptance strength: the author maps every requirement to normal + hard checks
+    assert '"requirements": [' in agent and '"hard": [{"check": "ACC-02", "type": "boundary"}' in agent
+    assert "HARD check" in agent and "REQUIREMENT GAP:" in agent
     proc = subprocess.run([sys.executable, str(root / "prompts" / "generate.py"), "--check"],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
