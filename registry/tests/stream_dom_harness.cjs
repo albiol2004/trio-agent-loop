@@ -49,25 +49,37 @@ const INIT_SCRIPT = `(() => {
   window.EventSource = Counting;
 })();`;
 
-/* Installs observers on the listed element ids; records per id. */
+/* Installs observers on the listed element ids; records per id.
+ * Relative times ("4m ago") are signal-bound text nodes inside
+ * <time data-reltime>: a clock tick may change their data (characterData) and
+ * nothing else. `records` counts every other record (childList, attributes,
+ * characterData outside [data-reltime]) and must stay 0 while idle; the
+ * allowed ones are only tallied in `reltime`. */
 function installObservers(ids) {
   window.__mo = window.__mo || {};
+  const describe = (rec) => rec.type + ":" + (rec.attributeName || "") + ":" +
+    String((rec.target && (rec.target.textContent || rec.target.nodeValue)) || "").slice(0, 80);
+  const allowed = (rec) => {
+    if (rec.type !== "characterData") return false;
+    const owner = rec.target && rec.target.parentElement;
+    return Boolean(owner && owner.closest("[data-reltime]"));
+  };
   for (const id of ids) {
     const node = document.getElementById(id);
-    if (!node) { window.__mo[id] = { missing: true, records: 0, sample: [] }; continue; }
-    const entry = { missing: false, records: 0, sample: [] };
+    if (!node) { window.__mo[id] = { missing: true, records: 0, reltime: 0, sample: [] }; continue; }
+    const entry = { missing: false, records: 0, reltime: 0, sample: [] };
     window.__mo[id] = entry;
-    const observer = new MutationObserver((records) => {
+    const take = (records) => {
       for (const rec of records) {
+        if (allowed(rec)) { entry.reltime += 1; continue; }
         entry.records += 1;
-        if (entry.sample.length < 4) {
-          entry.sample.push(rec.type + ":" + (rec.attributeName || "") + ":" +
-            String((rec.target && (rec.target.textContent || rec.target.nodeValue)) || "").slice(0, 80));
-        }
+        if (entry.sample.length < 4) entry.sample.push(describe(rec));
       }
-    });
+    };
+    const observer = new MutationObserver(take);
     observer.observe(node, { childList: true, subtree: true, characterData: true, attributes: true });
     entry.observer = observer;
+    entry.take = take;
   }
 }
 
@@ -77,14 +89,10 @@ function readObservers(ids) {
     const entry = window.__mo[id];
     if (!entry) { out[id] = null; continue; }
     // takeRecords() flushes anything still queued so late writes count too.
-    if (entry.observer) {
-      for (const rec of entry.observer.takeRecords()) {
-        entry.records += 1;
-        if (entry.sample.length < 4) entry.sample.push(rec.type + ":" + (rec.attributeName || ""));
-      }
-    }
+    if (entry.observer) entry.take(entry.observer.takeRecords());
     const node = document.getElementById(id);
-    out[id] = { missing: entry.missing, records: entry.records, sample: entry.sample,
+    out[id] = { missing: entry.missing, records: entry.records, reltime: entry.reltime,
+      sample: entry.sample,
       text_len: node ? (node.textContent || "").trim().length : 0,
       children: node ? node.children.length : 0 };
   }
@@ -94,7 +102,7 @@ function readObservers(ids) {
 function resetObservers(ids) {
   for (const id of ids) {
     const entry = window.__mo[id];
-    if (entry) { entry.records = 0; entry.sample = []; }
+    if (entry) { entry.records = 0; entry.reltime = 0; entry.sample = []; }
   }
 }
 

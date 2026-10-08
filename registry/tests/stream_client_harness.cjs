@@ -1,7 +1,9 @@
 "use strict";
-/* Loads the real dashboard/app.js into a vm context with a fake DOM that
- * counts writes, a scriptable fetch / EventSource and a manual clock, then
- * runs a list of ops (JSON on stdin: {"ops": [...]}) against it.
+/* Loads the real dashboard/app.js (the legacy drawer islands: timeline tab,
+ * files, graph, sessions/transcripts, unblock section) into a vm context with
+ * a fake DOM that counts writes, a scriptable fetch / EventSource and a manual
+ * clock, then runs a list of ops (JSON on stdin: {"ops": [...]}) against it.
+ * The board and the stream are not in app.js any more (dashboard/ui/*.js).
  *
  * Output (JSON on stdout): {"results": [one entry per op], "errors": [...]}.
  *
@@ -181,6 +183,8 @@ class FakeNode {
       contains(c) { return list().includes(c); },
     };
   }
+  get data() { return this._text; }
+  set data(value) { this._text = String(value); }
   get textContent() {
     if (this._tag === "#TEXT") return this._text;
     return this._nodes.map((n) => n.textContent).join("");
@@ -205,6 +209,7 @@ class FakeNode {
   get children() { return this._nodes.filter((n) => n._tag !== "#TEXT"); }
   get childNodes() { return this._nodes.slice(); }
   get childElementCount() { return this.children.length; }
+  get firstChild() { return this._nodes[0] || null; }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
   get parentNode() { return this._parent; }
@@ -437,6 +442,7 @@ FakeEventSource.prototype.CLOSED = 2;
 
 const errors = [];
 function boot(opts) {
+  document.readyState = opts.readyState || "loading";
   const windowObj = {
     addEventListener() {},
     confirm: () => true,
@@ -520,6 +526,11 @@ async function runOp(op) {
   switch (op.op) {
     case "boot":
       boot(op);
+      return null;
+    case "domReady":
+      document.readyState = "interactive";
+      for (const fn of document._listeners.DOMContentLoaded || []) fn({ type: "DOMContentLoaded" });
+      await flush();
       return null;
     case "call": {
       const fn = vm.runInContext(op.fn, ctx);

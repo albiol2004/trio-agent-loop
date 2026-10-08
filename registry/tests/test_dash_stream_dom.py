@@ -1,10 +1,18 @@
-"""Real-browser proof of the dashboard's push stream (GOAL DoD3).
+"""Real-browser proof of the dashboard's push stream (GOAL DoD3) on the
+Preact + signals page (GOAL DoD6).
 
 Starts a lab ``dashboard/serve.py`` (ephemeral loopback port, fixture workspace
-with three mailboxes, a 1 s scanner) and drives headless chromium through
+with four mailboxes, a 1 s scanner) and drives headless chromium through
 playwright-core (``stream_dom_harness.cjs``). The harness counts
 MutationObserver records per section, SSE events by type, requests per path
 and CDP ``Network.dataReceived`` bytes.
+
+The fixtures are written just before the page opens and are NOT back-dated
+(the iteration-3 narrowing to back-dated data is withdrawn): their relative
+times ("12s ago") move while the test runs, so an idle section may only see
+characterData inside ``<time data-reltime>``; any childList, attribute or
+other text record is a rebuild and fails the test. test_ui_e2e.py is the long
+version (across a minute boundary) of the same property.
 
 The whole class SKIPS, with the reason, when node, playwright-core or chromium
 is missing: it never passes vacuously.
@@ -107,11 +115,6 @@ def _iso(delta_s: float) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _backdate(path: Path, seconds: float) -> None:
-    stamp = time.time() - seconds
-    os.utime(path, (stamp, stamp))
-
-
 def _write_mailbox(root: Path, name: str, goal: str, state: str,
                    log: str, verdict: str = "", plan: str = "") -> Path:
     mailbox = root / name
@@ -128,12 +131,7 @@ def _write_mailbox(root: Path, name: str, goal: str, state: str,
 
 def build_workspace(root: Path) -> None:
     """A git repo with four mailboxes (live / needs-human / shipped /
-    stale-running).
-
-    Every file is back-dated by ~2.5 h so relative times render as "2h ago":
-    the text cannot change inside a test run (the hour boundary is 30 min
-    away) and a re-render of it would be a real product bug.
-    """
+    stale-running), written now: nothing is back-dated."""
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.email", "t@t"],
                    check=True)
@@ -156,7 +154,7 @@ def build_workspace(root: Path) -> None:
         "schema": 1, "writer": "trio-skill", "session_id": "", "pid": None,
         "phase": "lead", "iteration": 2, "updated_at": _iso(1800),
         "ttl_s": 14400, "done": False}) + "\n", encoding="utf-8")
-    b = _write_mailbox(
+    _write_mailbox(
         root, "loop-b",
         "# Mission: decide the schema\n\nmission: schema\n",
         "iteration: 3\nstatus: needs_human\nmax_iterations: 5\n",
@@ -165,7 +163,7 @@ def build_workspace(root: Path) -> None:
         "# PLAN\n\n```yaml\nslices:\n  - id: schema-pick\n"
         "    writes: [b.py]\n    reads: []\n    status: in_progress\n"
         "    iteration: 3\n```\n")
-    c = _write_mailbox(
+    _write_mailbox(
         root, "loop-c",
         "# Mission: ship the parser\n\nmission: parser\n",
         "iteration: 1\nstatus: shipped\nmax_iterations: 5\n",
@@ -173,7 +171,7 @@ def build_workspace(root: Path) -> None:
         "VERDICT: SHIP\n\n## Iteration 1\nall green\n",
         "# PLAN\n\n## Slice three\nwrites: c.py\n")
     # loop-d claims "running" with nothing live: a low-severity review note.
-    d = _write_mailbox(
+    _write_mailbox(
         root, "loop-d",
         "# Mission: tidy the docs\n\nmission: docs\n",
         "iteration: 1\nstatus: running\nmax_iterations: 5\n",
@@ -183,20 +181,19 @@ def build_workspace(root: Path) -> None:
     subprocess.run(["git", "-C", str(root), "add", "b.py"], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-q", "-m",
                     "slice(schema-pick): add the schema stub"], check=True)
-    for mailbox in (a, b, c, d):
-        for entry in mailbox.iterdir():
-            if entry.is_file() and entry.name != ".heartbeat.json":
-                _backdate(entry, 9000)
-        _backdate(mailbox, 9000)
 
 
 class LabServer:
     """``python3 dashboard/serve.py`` on an ephemeral loopback port."""
 
-    def __init__(self, tmp: Path, workspace: Path, *, stream: bool):
+    def __init__(self, tmp: Path, workspace, *, stream: bool,
+                 scan_interval: str = "1"):
         self.tmp = tmp
-        self.workspace = workspace
+        # one workspace root, or a list of them (test_ui_e2e uses two)
+        self.workspaces = [workspace] if isinstance(workspace, Path) else list(workspace)
+        self.workspace = self.workspaces[0]
         self.stream = stream
+        self.scan_interval = scan_interval
         self.port = _free_port()
         self.proc: subprocess.Popen | None = None
         self.log = tmp / "serve.log"
@@ -215,16 +212,19 @@ class LabServer:
             "TRIO_DASH_STATE_DIR": str(self.tmp / "dash-state"),
             "TRIO_NATIVE_RUNS_DIR": str(self.tmp / "native-runs"),
             "XDG_STATE_HOME": str(self.tmp / "xdg-state"),
-            "TRIO_DASH_SCAN_INTERVAL_S": "1",
+            "TRIO_DASH_SCAN_INTERVAL_S": self.scan_interval,
             "TRIO_BOARD_BROKER_URL": "",
             "TRIO_DASH_NATIVE_RUNS": "0",
             "TRIO_DASH_STREAM": "1" if self.stream else "0",
             "TRIO_DASH_SCAN_ROOTS": str(self.tmp / "no-scan-roots"),
         })
+        args = [sys.executable, str(SERVE_PATH), "--host", "127.0.0.1",
+                "--port", str(self.port)]
+        for workspace in self.workspaces:
+            args += ["--workspace", str(workspace)]
         with open(self.log, "wb") as log:
             self.proc = subprocess.Popen(
-                [sys.executable, str(SERVE_PATH), "--host", "127.0.0.1",
-                 "--port", str(self.port), "--workspace", str(self.workspace)],
+                args,
                 env=env, stdout=log, stderr=subprocess.STDOUT,
                 cwd=str(self.tmp))
         deadline = time.monotonic() + 20
@@ -332,6 +332,10 @@ class StreamDomTests(unittest.TestCase):
                          for s in BOARD_SECTIONS}
         self.assertEqual(board_records, {s: 0 for s in BOARD_SECTIONS},
                          json.dumps(result["board"], indent=1))
+        # Control: the store clock ran inside the window and moved a relative
+        # time ("12s ago") as characterData, the only record a tick may cause.
+        self.assertGreater(
+            sum(result["board"][s]["reltime"] for s in BOARD_SECTIONS), 0, ctx)
         # ... and none of them is idle only because it is empty.
         self.assertEqual(
             [s for s in BOARD_SECTIONS if not result["board"][s]["text_len"]],

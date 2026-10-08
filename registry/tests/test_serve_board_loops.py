@@ -1,4 +1,4 @@
-"""Nested-mailbox discovery over HTTP and the in-place board renderer.
+"""Nested-mailbox discovery over HTTP and the board facts the page renders.
 
 Loads dashboard/serve.py by path (like test_serve_pages.py) and runs it
 against a temp workspace with a ``loop/`` mailbox plus a nested
@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import re
 import sys
 import tempfile
 import threading
@@ -124,35 +123,21 @@ class NestedMailboxBoardTests(unittest.TestCase):
                 self.assertEqual(status, 400)
 
 
-class BoardJsInPlacePatchTests(unittest.TestCase):
-    """renderBoard must patch rows in place instead of wiping the table.
-
-    Rows are keyed by workspace root + mailbox name (``loop.key``) because
-    the board shows every workspace at once.
-    """
-
-    def test_board_uses_fact_only_tabs_and_has_no_loop_state(self):
-        source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
-        self.assertNotIn("function loopState", source)
-        self.assertNotIn("loopState(", source)
-        match = re.search(r"const TABS = \[(.*?)\];", source, re.S)
-        self.assertIsNotNone(match)
-        self.assertEqual(
-            re.findall(r'"([^"]+)"', match.group(1)),
-            ["running", "attention", "all", "archived"],
-        )
-
-    def test_render_board_has_no_grid_wipe(self):
-        source = (REPO_ROOT / "dashboard" / "app.js").read_text(encoding="utf-8")
-        match = re.search(r"function renderBoard\(\) \{(.*?)\n\}\n", source, re.S)
-        self.assertIsNotNone(match)
-        body = match.group(1)
-        self.assertNotIn('grid.textContent = "";\n  if (!state.loops.length)', body)
-        for marker in ("boardSignature", "patchCard", "existing.get(loop.key)",
-                       "insertBefore"):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, body)
-        self.assertIn("state.boardSignature", source)
+# GOAL DoD7: replaced by equivalents. BoardJsInPlacePatchTests asserted on the
+# source text of app.js's renderBoard (patchCard / boardSignature markers, the
+# TABS list, no loopState); that renderer is gone, the board is a keyed Preact
+# component over the signals store (dashboard/ui/board.js). The same properties
+# are now checked by running the page:
+#   test_board_uses_fact_only_tabs_and_has_no_loop_state
+#     -> test_ui_board.py::test_tabs_workspace_filter_sort_and_empty_state (the
+#        four fact-only tabs running/attention/all/archived, their counts and
+#        filtering by facts) and ::test_four_loop_snapshot_renders_rows_and_sections
+#   test_render_board_has_no_grid_wipe
+#     -> test_ui_board.py::test_delta_re_renders_only_the_changed_loops_dom and
+#        ::test_added_and_removed_loops_touch_their_row_and_the_counts (rows are
+#        keyed and patched in place, a delta touches only its own row), and
+#        test_ui_e2e.py::test_idle_across_a_minute_boundary_rebuilds_nothing
+#        (0 childList/attributes on #loop-rows for 66 s on a real server)
 
 
 class FactOnlyBoardHttpTests(unittest.TestCase):
