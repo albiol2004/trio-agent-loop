@@ -341,14 +341,21 @@ class VendorContentTests(unittest.TestCase):
 
     def test_every_bare_import_of_the_vendored_and_ui_modules_resolves(self):
         known = set(importmap())
-        pattern = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*)(["'])([^"']+)\1""")
+        # import/export statements (at a line start or after ; or } in minified
+        # code) and dynamic import(); a bare "from" inside a string literal such
+        # as "Stale · data from " is not an import
+        static = re.compile(
+            r"""(?:^|[;}])\s*(?:import|export)\b(?:[^;"'`]*?\bfrom)?\s*(["'])([^"']+)\1""",
+            re.M)
+        dynamic = re.compile(r"""\bimport\s*\(\s*(["'])([^"']+)\1""")
         sources = [VENDOR / rel for pkg in manifest()["packages"].values()
                    for rel in pkg["files"] if rel.endswith((".js", ".mjs"))]
         sources += sorted((DASHBOARD / "ui").glob("*.js"))
         self.assertGreaterEqual(len(sources), 5 + len(UI_MODULES))
         bare_seen = set()
         for path in sources:
-            for _quote, spec in pattern.findall(path.read_text(encoding="utf-8")):
+            text = path.read_text(encoding="utf-8")
+            for _quote, spec in static.findall(text) + dynamic.findall(text):
                 with self.subTest(file=path.name, spec=spec):
                     self.assertNotRegex(spec, r"^(?:https?:)?//", "remote import")
                     if spec.startswith((".", "/")):
