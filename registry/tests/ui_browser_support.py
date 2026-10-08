@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -84,11 +85,16 @@ def run_cases(case_rel: str, timeout: float = 120) -> dict:
     reason = skip_reason()
     if reason:
         raise RuntimeError(reason)
+    env = dict(os.environ, TRIO_DASH_PW_CORE=PLAYWRIGHT_CORE,
+               TRIO_DASH_CHROMIUM=CHROMIUM, TZ="UTC")
+    # Chromium keeps its profile (and SingletonSocket) under TMPDIR; a unix
+    # socket path must stay under ~108 bytes, so a long TMPDIR makes every
+    # launch fail. Fall back to /tmp then (same rule as test_ui_e2e).
+    if len(tempfile.gettempdir()) > 40 and os.path.isdir("/tmp"):
+        env["TMPDIR"] = "/tmp"
     proc = subprocess.run(
         [NODE, str(HARNESS), case_rel], capture_output=True, text=True,
-        timeout=timeout, cwd=str(REPO_ROOT),
-        env=dict(os.environ, TRIO_DASH_PW_CORE=PLAYWRIGHT_CORE,
-                 TRIO_DASH_CHROMIUM=CHROMIUM, TZ="UTC"))
+        timeout=timeout, cwd=str(REPO_ROOT), env=env)
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
     if not lines:
         raise AssertionError(
