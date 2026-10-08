@@ -193,6 +193,11 @@ class UiEndToEndTests(unittest.TestCase):
             cls.push = push.result()
             cls.poll = poll.result()
         cls.steps = cls.push["steps"]
+        dump = os.environ.get("TRIO_UI_E2E_OUT")
+        if dump:
+            Path(dump).write_text(json.dumps(cls.push, indent=1), encoding="utf-8")
+            Path(dump + "-poll.json").write_text(
+                json.dumps(cls.poll, indent=1), encoding="utf-8")
 
     def ctx(self, run=None) -> str:
         run = run or self.push
