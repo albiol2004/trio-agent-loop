@@ -294,6 +294,9 @@ class UiEndToEndTests(unittest.TestCase):
         # control: the observer saw the rewrite
         obs = mutate["observer"]["loop-rows"]
         self.assertGreater(obs["childList"] + obs["charOther"] + obs["attributes"], 0, ctx)
+        # ... and every #loop-rows record of it is inside the rewritten loop's
+        # row (or moves that row as a whole): no other row was rebuilt
+        self.assertEqual(obs["outsideRow"], 0, obs)
 
     # ---- accept: every script is same-origin, nothing errors, no polling ----
 

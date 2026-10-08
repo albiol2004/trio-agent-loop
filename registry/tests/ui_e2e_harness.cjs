@@ -58,7 +58,19 @@ const INIT_SCRIPT = `(() => {
  * rebuilds; characterData is allowed only on text under [data-reltime] (a
  * clock tick), everything else of it is `charOther`. */
 function installObservers(args) {
-  const { ids, key } = args;
+  const { ids, key, row } = args;
+  /* With `row` (a loop name): a record counts as inside that loop's row when
+   * its target is in the row, or when it only adds/removes the row itself (a
+   * keyed move); every other non-reltime record is counted in `outsideRow`. */
+  const isRow = (n) => Boolean(n && n.nodeType === 1 && n.matches("tr.loop-row") &&
+    String(n.getAttribute("data-key") || "").endsWith("::" + row));
+  const inRow = (rec) => {
+    const t = rec.target && (rec.target.nodeType === 1 ? rec.target : rec.target.parentElement);
+    if (t && isRow(t.closest("tr.loop-row"))) return true;
+    if (rec.type !== "childList") return false;
+    const moved = Array.from(rec.addedNodes).concat(Array.from(rec.removedNodes));
+    return moved.length > 0 && moved.every(isRow);
+  };
   window.__mo = window.__mo || {};
   const bag = (window.__mo[key] = {});
   const describe = (rec) => rec.type + ":" + (rec.attributeName || "") + ":" +
@@ -66,10 +78,16 @@ function installObservers(args) {
       rec.target.nodeName)) || "").slice(0, 60);
   for (const id of ids) {
     const node = document.getElementById(id);
-    if (!node) { bag[id] = { missing: true, childList: 0, attributes: 0, charReltime: 0, charOther: 0, samples: [] }; continue; }
-    const entry = { missing: false, childList: 0, attributes: 0, charReltime: 0, charOther: 0, samples: [] };
+    if (!node) { bag[id] = { missing: true, childList: 0, attributes: 0, charReltime: 0, charOther: 0, outsideRow: 0, samples: [], outsideSamples: [] }; continue; }
+    const entry = { missing: false, childList: 0, attributes: 0, charReltime: 0, charOther: 0, outsideRow: 0, samples: [], outsideSamples: [] };
     const take = (records) => {
       for (const rec of records) {
+        const reltime = rec.type === "characterData" && rec.target && rec.target.parentElement &&
+          rec.target.parentElement.closest("[data-reltime]");
+        if (row && !reltime && !inRow(rec)) {
+          entry.outsideRow += 1;
+          if (entry.outsideSamples.length < 5) entry.outsideSamples.push(describe(rec));
+        }
         if (rec.type === "childList") entry.childList += 1;
         else if (rec.type === "attributes") entry.attributes += 1;
         else {
@@ -99,6 +117,7 @@ function readObservers(args) {
     out[id] = {
       missing: entry.missing, childList: entry.childList, attributes: entry.attributes,
       charReltime: entry.charReltime, charOther: entry.charOther, samples: entry.samples,
+      outsideRow: entry.outsideRow, outsideSamples: entry.outsideSamples,
       textLen: node ? (node.textContent || "").trim().length : 0,
     };
   }
@@ -334,7 +353,7 @@ async function pushScenario(page) {
   await page.evaluate(stopObservers, "idleApp");
 
   // -- another loop's STATE.md rewritten: the row follows, the UI state stays --
-  await page.evaluate(installObservers, { ids: ["loop-rows"], key: "mutate" });
+  await page.evaluate(installObservers, { ids: ["loop-rows"], key: "mutate", row: cfg.shipLoop });
   const shipBefore = await page.evaluate(rowTextOf, cfg.shipLoop);
   const sse1 = await page.evaluate(() => window.__sse.events.length);
   const clock1 = await page.evaluate(() => window.__trioStore.now.value);
