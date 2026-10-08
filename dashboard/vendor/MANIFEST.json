@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "packages": {
+    "preact": {
+      "version": "10.29.8",
+      "tarball": "https://registry.npmjs.org/preact/-/preact-10.29.8.tgz",
+      "integrity": "sha512-ej2aVZ+vZ8WO7tvlQWRM9N63A0KzF9q4mWJfDUHgYaIofWY9hu74QdnQrjoPMmZi2/nZ5gN0bJCQF49xQqx09Q==",
+      "files": {
+        "preact/preact.module.js": {
+          "from": "package/dist/preact.module.js",
+          "sha256": "c30e721ebfdc6e2ad4c18c14d2dfb82667829c8aec27de1207774e3fc16858a8"
+        },
+        "preact/hooks.module.js": {
+          "from": "package/hooks/dist/hooks.module.js",
+          "sha256": "a6ee626f2d01570592dd569a792e3f050154aa02890eead8c223fa3ed5aa3d5a"
+        },
+        "preact/LICENSE": {
+          "from": "package/LICENSE",
+          "sha256": "1fe6958409c8c257a70c587a18b6f7f412b179b456630790d30b2ec9a8e4b7d4"
+        }
+      }
+    },
+    "@preact/signals-core": {
+      "version": "1.14.4",
+      "tarball": "https://registry.npmjs.org/@preact/signals-core/-/signals-core-1.14.4.tgz",
+      "integrity": "sha512-HNB6HYeYKhQbJ1aKl+YRjrS4+QWHLKX6qKoUsfS/m0vqzsVaEBiZiaKbG/e+NKk2ch5ALQr/ihWaMHxiCuuWHA==",
+      "files": {
+        "signals-core/signals-core.mjs": {
+          "from": "package/dist/signals-core.mjs",
+          "sha256": "0676238240715faeb4eb8b0a329837dc06ef7f37e7103601e13af3ed309c042c"
+        },
+        "signals-core/LICENSE": {
+          "from": "package/LICENSE",
+          "sha256": "a11fc89e4c6b118854c7a667734a0b2e6bf2af5e45c6686de31adbccc8f3ae8d"
+        }
+      }
+    },
+    "@preact/signals": {
+      "version": "2.11.3",
+      "tarball": "https://registry.npmjs.org/@preact/signals/-/signals-2.11.3.tgz",
+      "integrity": "sha512-mttwFM98G/JiriTgMwU+UWygL6sfVmYEiNcPSKkUnv4PxPpZhmP2ugGC4qi360+ZIHyQ8NY05bfJT3b4RUIGlw==",
+      "files": {
+        "signals/signals.module.js": {
+          "from": "package/dist/signals.module.js",
+          "sha256": "baa602be76dbecd6f4b3d1a4ff5b5ec694bc22a93f7a1a801bdbdca636d211ed"
+        },
+        "signals/LICENSE": {
+          "from": "package/LICENSE",
+          "sha256": "a11fc89e4c6b118854c7a667734a0b2e6bf2af5e45c6686de31adbccc8f3ae8d"
+        }
+      }
+    },
+    "htm": {
+      "version": "3.1.1",
+      "tarball": "https://registry.npmjs.org/htm/-/htm-3.1.1.tgz",
+      "integrity": "sha512-983Vyg8NwUE7JkZ6NmOqpCZ+sh1bKv2iYTlUkzlWmA5JD2acKoxd4KVxbMmxX/85mtfdnDmTFoNKcg5DGAvxNQ==",
+      "files": {
+        "htm/htm.module.js": {
+          "from": "package/dist/htm.module.js",
+          "sha256": "ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4"
+        },
+        "htm/LICENSE": {
+          "from": "package/LICENSE",
+          "sha256": "740725f7252e750af735d0028cc534970772f513331e9f68150fede8fb3ce00f"
+        }
+      }
+    }
+  }
+}

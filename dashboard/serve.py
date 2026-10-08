@@ -21,6 +21,12 @@ Static files:
     GET /            -> dashboard/index.html
     GET /app.css     -> dashboard/app.css
     GET /app.js      -> dashboard/app.js
+    GET /vendor/<relpath>  -> dashboard/vendor/<relpath>, only a file listed in
+                      dashboard/vendor/MANIFEST.json, its sha256 re-checked on
+                      every request (text/javascript; text/plain for LICENSE);
+                      a mismatch answers 500 {"error": "vendor checksum
+                      mismatch"} with no file body, anything else 404.
+    GET /ui/<name>.js  -> dashboard/ui/<name>.js, <name> = [a-z][a-z0-9_-]*
 
 Board:
     GET /api/board
@@ -216,6 +222,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import copy
+import hashlib
 import ipaddress
 import importlib.util
 import json
@@ -457,6 +464,9 @@ STATIC_ROUTES = {
     "/health.html": ("health.html", "text/html; charset=utf-8"),
     "/health.js": ("health.js", "text/javascript; charset=utf-8"),
 }
+
+UI_MODULE_RE = re.compile(r"[a-z][a-z0-9_-]*\.js")
+"""``GET /ui/<name>.js``: lower-case module names directly under dashboard/ui/."""
 
 SESSION_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\dTZ:\-]+_[0-9a-fA-F\-]+\.jsonl$")
 """Filename shape of top-level omp session transcripts: <ISO-TS>_<id>.jsonl."""
@@ -3573,6 +3583,45 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_vendor(self, relpath: str) -> None:
+        """``/vendor/<relpath>``: manifest-listed files only, sha256 verified
+        on every request. The path is matched literally (never decoded or
+        joined before the manifest lookup), so ``..``, encoded traversal and
+        absolute paths simply are not keys."""
+        vendor_dir = DASHBOARD_DIR / "vendor"
+        try:
+            manifest = json.loads(
+                (vendor_dir / "MANIFEST.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return self._send_text(404, "vendor manifest not found")
+        entry = None
+        for package in (manifest.get("packages") or {}).values():
+            entry = (package.get("files") or {}).get(relpath)
+            if entry is not None:
+                break
+        if entry is None:
+            return self._send_text(404, "not found")
+        try:
+            body = (vendor_dir / relpath).read_bytes()
+        except OSError:
+            return self._send_text(404, "not found")
+        if hashlib.sha256(body).hexdigest() != entry.get("sha256"):
+            return self._send_json(500, {"error": "vendor checksum mismatch"})
+        ctype = ("text/plain; charset=utf-8" if relpath.endswith("LICENSE")
+                 else "text/javascript; charset=utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_ui(self, name: str) -> None:
+        """``/ui/<name>.js``: a module of the Preact frontend."""
+        if not UI_MODULE_RE.fullmatch(name):
+            return self._send_text(404, "not found")
+        self._serve_static("ui/" + name, "text/javascript; charset=utf-8")
+
     # -- /api/workspaces ----------------------------------------------------
 
     def _handle_workspaces(self) -> None:
@@ -5740,6 +5789,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path in STATIC_ROUTES:
             name, ctype = STATIC_ROUTES[path]
             return self._serve_static(name, ctype)
+        if path.startswith("/vendor/"):
+            return self._serve_vendor(path[len("/vendor/"):])
+        if path.startswith("/ui/"):
+            return self._serve_ui(path[len("/ui/"):])
         if path == "/healthz":
             return self._api(self._handle_healthz)
         if path == "/api/workspaces":
