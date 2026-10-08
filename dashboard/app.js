@@ -1,39 +1,30 @@
 "use strict";
 
-/* Trio Loop Dashboard — frontend.
- * No build step, no external dependencies. Talks to the backend at
- * /api/stream (SSE: a snapshot of every workspace's board, then keyed
- * deltas), /api/overview (the same board, polled only while the stream is
- * unavailable), /api/loop, /api/transcript (SSE), and loop controls. Loops
- * are keyed by workspace root + mailbox name. */
+/* Trio Loop Dashboard — frontend, legacy views.
+ *
+ * The board and the loop drawer's frame and overview are Preact components
+ * over a signals store (dashboard/ui/main.js, GOAL DoD6); the store owns the
+ * data feed (/api/stream, /api/overview fallback), the open loop, the URL and
+ * the clock. This classic script keeps the drawer's heavy views as imperative
+ * islands (DECISION D4-3): the Timeline tab, Files, Graph, the sessions list
+ * and transcript pane (/api/transcript SSE) and the Unblock/actions section.
+ * They are driven only through the bridge at the bottom (window.trioLegacy:
+ * onOpen / onClose / onDetail / onTab / onTick, called by main.js when the open
+ * loop, its fetched detail, the active tab or the store clock change) and
+ * never by a timer of their own. */
 
 const state = {
-  boardTimer: null,
-  loops: [],
-  inbox: [],
-  workspaces: [],
-  scanned: 0,
-  byKey: new Map(),
-  showReadInbox: false,
-  updatedAt: null,
-  lastOk: null,
-  loaded: false,
-  tab: "all",
-  workspace: "",
-  query: "",
-  sort: { key: "activity", dir: "desc" },
-  actionNotes: new Map(),
-  broker: "disabled",
-
-  /* drawer */
+  /* the loop open in the drawer (a store Loop), its key and its /api/loop JSON */
+  loop: null,
   activeLoop: null,
-  boardSignature: null,
   detail: null,
   drawerTab: "overview",
   graphSel: null,
   compare: [],
   tlOpen: new Set(),
   tlSignature: null,
+  actions: null,
+  fixSignature: null,
 
   /* transcript stream (inside the drawer's sessions section) */
   sessions: [],
@@ -47,24 +38,18 @@ const state = {
   rafPending: false,
 };
 
-/* Loop to auto-open via `#loop=<name>` or `#root=<path>&loop=<name>` once
- * board data confirms it exists (set in init(), consumed by refreshBoard()). */
-let pendingLoopHash = null;
-
-/* Workspace of the loop open in the drawer; detail requests carry it. */
+/* Workspace of the loop open in the drawer; transcript requests carry it. */
 let currentRoot = "";
 function withRoot(url) {
   if (!currentRoot) return url;
   return url + (url.includes("?") ? "&" : "?") + "root=" + encodeURIComponent(currentRoot);
 }
 
-const BOARD_POLL_MS = 5000;
-const STREAM_URL = "/api/stream";
-const STREAM_IDLE_MS = 45000;
-const STREAM_RETRY_MS = 30000;
-const STREAM_MAX_RESYNCS = 5;
-const TABS = ["running", "attention", "all", "archived"];
-const DRAWER_TABS = ["overview", "timeline", "files", "graph", "transcripts"];
+/* The signals store main.js creates; absent in the vm harnesses that load
+ * this file alone. */
+function uiStore() {
+  return typeof window === "object" && window ? window.__trioStore || null : null;
+}
 
 /* Render guards. Each section computes a string signature of exactly the data
  * and UI state it renders and skips every DOM write when that signature is the
@@ -91,10 +76,6 @@ function invalidateDrawerSections() {
 
 function el(id) {
   return document.getElementById(id);
-}
-
-function cssClass(value) {
-  return String(value).replace(/[^a-z0-9]+/gi, "-").toLowerCase();
 }
 
 function span(cls, text) {
@@ -169,1430 +150,6 @@ function normVerdict(raw) {
   return "none";
 }
 
-/* Verdict sequence from segments, e.g. ["iterate", "ship"]. */
-function verdictSeq(loop) {
-  const seq = (loop.segments || [])
-    .map((s) => s.verdict_sequence || "")
-    .join("");
-  const out = [];
-  for (const ch of seq) {
-    if (ch === "S") out.push("ship");
-    else if (ch === "I") out.push("iterate");
-    else if (ch === "B") out.push("blocked");
-    else if (ch === "H") out.push("needs_human");
-  }
-  return out;
-}
-
-function isArchived(loop) {
-  return String(loop.name || "").split("/")[0].startsWith("loop-archive");
-}
-
-/* Keep the STATE.md word factual; "unknown" is the API's missing-value marker. */
-function statusWord(loop) {
-  const raw = loop.status == null ? "" : String(loop.status);
-  const value = raw.trim();
-  return !value || value === "unknown" ? "—" : raw;
-}
-
-/* Prefer the persisted verdict, then the last parsed segment verdict. */
-function latestVerdict(loop) {
-  const final = String(loop.final_verdict || "").trim();
-  if (final) return final.toUpperCase();
-  const seq = verdictSeq(loop);
-  return seq.length ? String(seq[seq.length - 1]).toUpperCase() : null;
-}
-
-/* ------------------------------ board ------------------------------ */
-
-/* Attention kinds that ask for a decision now; everything else on a
- * finished loop is a review note (still listed, just not at the top). */
-const NEEDS_KINDS = new Set([
-  "needs_human", "blocked", "interrupted", "orphaned", "queue_fault",
-  "error", "needs_retirement", "needs_land", "held", "conflict", "budget",
-  "iteration_cap",
-]);
-
-/* Derived loop states (server: loop_actions.derive_state) shown as their
- * own badge instead of the raw STATE.md word. */
-const LOOP_STATE_BADGES = {
-  error: ["negative", "Error"],
-  needs_retirement: ["warning", "Needs retirement"],
-  needs_land: ["warning", "Needs land"],
-  held: ["warning", "Held"],
-  conflict: ["negative", "Conflict"],
-  budget: ["warning", "Budget spent"],
-  iteration_cap: ["warning", "Iteration cap"],
-  answered: ["warning", "Answered — restart"],
-  finished: ["positive", "Finished"],
-  between_roles: ["neutral", "Between roles"],
-  paused: ["neutral", "Paused"],
-};
-
-function derivedStateOf(loop) {
-  return loop && loop.loop_state ? loop.loop_state.state : null;
-}
-const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
-const STORE_KEY = "trio.board.v2";
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const STALE_AFTER_MS = 30 * 1000;
-
-function loopKey(root, name) {
-  return root + "::" + name;
-}
-
-function isNeedsItem(item, loop) {
-  // A low-severity "interrupted" means liveness was not fully checked
-  // (broker unknown), so it is a note, not a call to act.
-  if (item.severity === "low" && item.kind === "interrupted") return false;
-  if (NEEDS_KINDS.has(item.kind) || item.severity === "high") return true;
-  return Boolean(loop && loop.running);
-}
-
-function loadPrefs() {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return;
-    const saved = JSON.parse(raw);
-    if (TABS.includes(saved.tab)) state.tab = saved.tab;
-    if (typeof saved.workspace === "string") state.workspace = saved.workspace;
-    if (saved.sort && typeof saved.sort.key === "string") state.sort = saved.sort;
-  } catch (err) {
-    /* private window or blocked storage: defaults are fine */
-  }
-}
-
-function savePrefs() {
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({
-      tab: state.tab, workspace: state.workspace, sort: state.sort,
-    }));
-  } catch (err) {
-    /* ignore */
-  }
-}
-
-/* GOAL.md heading, else the mission's first clause, else the mailbox name. */
-function loopTitle(loop) {
-  if (loop.title) return loop.title;
-  const mission = String(loop.mission || "").split(/(?<=[.;:])\s/)[0].trim();
-  return mission ? oneLine(mission, 90) : loop.name;
-}
-
-const HUMAN_STATUS = new Set(["needs_human", "awaiting_human", "awaiting_user"]);
-
-/* One state word per loop, from facts only: live evidence first, then a
- * STATE.md hand-off to a person (or blocked), then the latest verdict, then
- * the STATE.md status word. */
-function stateBadge(loop) {
-  const badge = document.createElement("span");
-  let tone = "neutral";
-  let text = statusWord(loop);
-  const verdict = normVerdict(latestVerdict(loop));
-  const status = String(loop.status || "").trim().toLowerCase().replace(/-/g, "_");
-  const derived = derivedStateOf(loop);
-  if (loop.running) {
-    tone = "live";
-    text = "Running";
-  } else if (LOOP_STATE_BADGES[derived]) {
-    [tone, text] = LOOP_STATE_BADGES[derived];
-  } else if (derived === "unmapped") {
-    // A STATE.md word outside the status map is shown verbatim (textContent).
-    tone = "neutral";
-    text = String(loop.loop_state.status_raw || statusWord(loop));
-  } else if (HUMAN_STATUS.has(status)) {
-    // STATE.md handing the loop to a person outranks an older verdict file.
-    tone = "warning";
-    text = "Needs human";
-  } else if (status === "blocked") {
-    tone = "negative";
-    text = "Blocked";
-  } else if (verdict === "ship") {
-    tone = "positive";
-    text = "Shipped";
-  } else if (verdict === "needs_human") {
-    tone = "warning";
-    text = "Needs human";
-  } else if (verdict === "blocked") {
-    tone = "negative";
-    text = "Blocked";
-  } else if (verdict === "iterate") {
-    text = "Iterating";
-  }
-  badge.className = "badge badge-" + tone;
-  badge.appendChild(span("badge-icon", { live: "●", positive: "✓", warning: "!", negative: "✕", neutral: "○" }[tone]));
-  badge.appendChild(document.createTextNode(text));
-  const facts = ["STATE.md: " + statusWord(loop)];
-  if (latestVerdict(loop)) facts.push("verdict: " + latestVerdict(loop));
-  if (loop.running) facts.push("live via " + (loop.running_sources || []).join(", "));
-  if (loop.loop_state && loop.loop_state.summary) facts.push(derived + ": " + loop.loop_state.summary);
-  badge.title = facts.join(" · ");
-  return badge;
-}
-
-function iterationText(loop) {
-  if (loop.iteration == null) return "—";
-  return loop.max_iterations != null
-    ? loop.iteration + " of " + loop.max_iterations
-    : String(loop.iteration);
-}
-
-/* The driver phase is only current while the loop is live; a stale
- * sidecar's phase ("lead done", "blocked") would contradict the badge. */
-function phaseText(loop) {
-  if (!loop.running) return "";
-  const phase = String(loop.driver_phase || "").trim();
-  const sub = loop.running_substate;
-  const parts = [];
-  if (phase && phase.toLowerCase() !== "idle") parts.push(phase.replace(/[-_]/g, " "));
-  if (sub) parts.push(sub === "both" ? "lead and evaluator active" : sub + " active");
-  return parts.join(" · ");
-}
-
-function historyEl(loop) {
-  const seq = verdictSeq(loop);
-  const wrap = document.createElement("span");
-  wrap.className = "hist";
-  if (!seq.length) {
-    wrap.appendChild(span("hist-none", "—"));
-    wrap.title = "No evaluator verdicts parsed from LOG.md";
-    return wrap;
-  }
-  const letter = { ship: "S", iterate: "I", blocked: "B", needs_human: "H" };
-  const shown = seq.slice(-12);
-  for (const v of shown) wrap.appendChild(span("hist-cell hist-" + v, letter[v] || "?"));
-  wrap.title = "Verdicts, oldest to newest: " + seq.map((v) => letter[v]).join(" ");
-  wrap.setAttribute("aria-label", wrap.title);
-  return wrap;
-}
-
-function ageMs(iso) {
-  const t = Date.parse(iso || "");
-  return Number.isNaN(t) ? null : Date.now() - t;
-}
-
-/* ---------------------------- data ---------------------------- */
-
-function ingestOverview(data) {
-  const loops = [];
-  const inbox = [];
-  const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
-  for (const ws of workspaces) {
-    for (const loop of ws.loops || []) {
-      loop.root = ws.root;
-      loop.workspace = ws.name;
-      loop.worktree = Boolean(ws.worktree);
-      loop.key = loopKey(ws.root, loop.name);
-      loops.push(loop);
-    }
-    for (const item of ws.inbox || []) {
-      item.root = ws.root;
-      item.workspace = ws.name;
-      item.key = loopKey(ws.root, item.loop);
-      inbox.push(item);
-    }
-  }
-  state.workspaces = workspaces;
-  state.scanned = data.scanned || workspaces.length;
-  state.broker = data.broker || "disabled";
-  state.worktreesScanned = data.worktrees_scanned || 0;
-  state.loops = loops;
-  state.inbox = inbox;
-  state.byKey = new Map(loops.map((loop) => [loop.key, loop]));
-  state.updatedAt = data.updated_at || null;
-}
-
-/* ------------------------ push stream (client model) ------------------------
- * /api/stream sends one snapshot (the /api/overview object plus epoch/seq),
- * then keyed deltas. The client keeps a model of the entities, applies each
- * delta, rebuilds the overview shape from it and renders; guarded sections
- * skip the DOM when their inputs did not change. */
-
-function streamLoopId(root, card) {
-  return card.loop_id || "path:" + root + "::" + card.name;
-}
-
-function streamModelFromSnapshot(snapshot) {
-  const meta = {};
-  for (const key of Object.keys(snapshot)) {
-    if (key !== "workspaces") meta[key] = snapshot[key];
-  }
-  const workspaces = new Map();
-  const loops = new Map();
-  const inbox = new Map();
-  const order = [];
-  for (const ws of Array.isArray(snapshot.workspaces) ? snapshot.workspaces : []) {
-    const header = {};
-    for (const key of Object.keys(ws)) {
-      if (key !== "loops" && key !== "inbox") header[key] = ws[key];
-    }
-    workspaces.set(ws.root, header);
-    order.push(ws.root);
-    for (const card of ws.loops || []) loops.set(streamLoopId(ws.root, card), { root: ws.root, card });
-    for (const item of ws.inbox || []) inbox.set(item.id, { root: ws.root, item });
-  }
-  meta.workspace_order = order;
-  return { epoch: snapshot.epoch, seq: snapshot.seq, meta, workspaces, loops, inbox };
-}
-
-/* Apply one delta in place. A delta for another epoch, or one that does not
- * start at the model's seq (a gap or a replay), is refused and the model is
- * left untouched: the caller must resync from a snapshot. */
-function applyStreamDelta(model, delta) {
-  const refused = { ok: false, loopIds: new Set(), kinds: new Set() };
-  if (!model || !delta || delta.epoch !== model.epoch || delta.from_seq !== model.seq ||
-      !Array.isArray(delta.changes)) {
-    return refused;
-  }
-  const loopIds = new Set();
-  const kinds = new Set();
-  for (const change of delta.changes) {
-    if (!change) continue;
-    if (change.kind === "meta") {
-      kinds.add("meta");
-      if (change.op === "upsert" && change.data) {
-        const next = Object.assign({}, change.data);
-        if (!Array.isArray(next.workspace_order)) next.workspace_order = model.meta.workspace_order;
-        model.meta = next;
-      }
-      continue;
-    }
-    const table = { workspace: model.workspaces, loop: model.loops, inbox: model.inbox }[change.kind];
-    if (!table) continue;
-    kinds.add(change.kind);
-    if (change.kind === "loop") loopIds.add(change.id);
-    if (change.op === "remove") table.delete(change.id);
-    else if (change.op === "upsert" && change.data) table.set(change.id, change.data);
-  }
-  model.seq = delta.seq;
-  if (delta.updated_at !== undefined) model.meta.updated_at = delta.updated_at;
-  return { ok: true, loopIds, kinds };
-}
-
-/* The model as an /api/overview object: workspaces in meta.workspace_order,
- * each with its loops and inbox items in model order. ingestOverview mutates
- * cards and items, so every one handed out is a fresh shallow copy. */
-function overviewFromStreamModel(model) {
-  const overview = {};
-  for (const key of Object.keys(model.meta)) {
-    if (key !== "workspace_order") overview[key] = model.meta[key];
-  }
-  const groups = new Map();
-  for (const root of model.workspaces.keys()) groups.set(root, { loops: [], inbox: [] });
-  for (const entry of model.loops.values()) {
-    const group = groups.get(entry.root);
-    if (group) group.loops.push(Object.assign({}, entry.card));
-  }
-  for (const entry of model.inbox.values()) {
-    const group = groups.get(entry.root);
-    if (group) group.inbox.push(Object.assign({}, entry.item));
-  }
-  const order = Array.isArray(model.meta.workspace_order)
-    ? model.meta.workspace_order : Array.from(model.workspaces.keys());
-  const seen = new Set();
-  overview.workspaces = [];
-  for (const root of order) {
-    const header = model.workspaces.get(root);
-    if (!header || seen.has(root)) continue;
-    seen.add(root);
-    const group = groups.get(root);
-    overview.workspaces.push(Object.assign({}, header, { loops: group.loops, inbox: group.inbox }));
-  }
-  return overview;
-}
-
-/* --------------------------- board feed --------------------------- */
-
-/* "stream": the board arrives over /api/stream and nothing polls.
- * "poll": the stream is unavailable (no EventSource, it ended closed, or it
- * went quiet), so /api/overview is polled every 5 s and the stream is retried
- * every 30 s; the first stream event ends the polling. */
-const push = {
-  mode: "stream",
-  es: null,
-  model: null,
-  idleTimer: null,
-  retryTimer: null,
-  resyncs: 0,
-  detailBusy: false,
-  detailAgain: false,
-};
-
-function streamSupported() {
-  return typeof window.EventSource === "function";
-}
-
-function activeCardSig() {
-  return JSON.stringify(state.byKey.get(state.activeLoop) || null);
-}
-
-/* Show the board from the model; true when a `#loop=` hash opened the drawer. */
-function showStreamModel() {
-  ingestOverview(overviewFromStreamModel(push.model));
-  state.lastOk = Date.now();
-  state.loaded = true;
-  hideBoardError();
-  renderAll();
-  return openPendingHashLoop();
-}
-
-function openPendingHashLoop() {
-  if (!pendingLoopHash) return false;
-  const target = resolveHashLoop(pendingLoopHash);
-  if (!target) return false;
-  pendingLoopHash = null;
-  openDrawer(target.key);
-  return true;
-}
-
-/* Detail refetches coalesce: pushes arriving mid-fetch cost one more fetch. */
-async function requestDetailRefresh() {
-  if (push.detailBusy) {
-    push.detailAgain = true;
-    return;
-  }
-  push.detailBusy = true;
-  try {
-    await refreshDetail({ quiet: true });
-  } finally {
-    push.detailBusy = false;
-    if (push.detailAgain) {
-      push.detailAgain = false;
-      if (state.activeLoop) requestDetailRefresh();
-    }
-  }
-}
-
-/* Did a delta change the loop open in the drawer? Match by the card's
- * loop_id, or by workspace root + mailbox name. */
-function activeLoopTouched(loopIds, previousCard) {
-  const key = state.activeLoop;
-  if (!key || !loopIds.size) return false;
-  if (loopIds.has("path:" + key)) return true;
-  if (previousCard && previousCard.loop_id && loopIds.has(previousCard.loop_id)) return true;
-  for (const id of loopIds) {
-    const entry = push.model && push.model.loops.get(id);
-    if (entry && entry.card && loopKey(entry.root, entry.card.name) === key) return true;
-  }
-  return false;
-}
-
-function onStreamSnapshot(data) {
-  push.model = streamModelFromSnapshot(data);
-  push.resyncs = 0;
-  const before = activeCardSig();
-  const opened = showStreamModel();
-  if (!opened && state.activeLoop) {
-    requestDetailRefresh();
-    if (activeCardSig() !== before) refreshActions();
-  }
-}
-
-function onStreamDelta(data) {
-  const previous = state.byKey.get(state.activeLoop) || null;
-  const result = push.model ? applyStreamDelta(push.model, data) : null;
-  if (!result || !result.ok) {
-    resyncStream();
-    return;
-  }
-  push.resyncs = 0;
-  const opened = showStreamModel();
-  if (!opened && activeLoopTouched(result.loopIds, previous)) {
-    requestDetailRefresh();
-    refreshActions();
-  }
-}
-
-/* Nothing changed: only the liveness indicator moves. */
-function onStreamTick(data) {
-  if (data.updated_at) {
-    state.updatedAt = data.updated_at;
-    if (push.model && data.epoch === push.model.epoch) push.model.meta.updated_at = data.updated_at;
-  }
-  state.lastOk = Date.now();
-  hideBoardError();
-  renderLive();
-}
-
-const STREAM_HANDLERS = { snapshot: onStreamSnapshot, delta: onStreamDelta, tick: onStreamTick };
-
-function onStreamEvent(es, type, ev) {
-  if (push.es !== es) return;
-  let data;
-  try {
-    data = JSON.parse(ev.data);
-  } catch (err) {
-    return;
-  }
-  if (!data || typeof data !== "object") return;
-  // Any event proves the stream healthy: polling and the retry timer stop.
-  push.mode = "stream";
-  clearTimeout(state.boardTimer);
-  clearTimeout(push.retryTimer);
-  armStreamIdle();
-  STREAM_HANDLERS[type](data);
-}
-
-function onStreamError(es) {
-  if (push.es !== es) return;
-  // CONNECTING: the browser is reconnecting by itself (Last-Event-ID); the
-  // idle watchdog covers it never succeeding. CLOSED: it gave up (503/404).
-  if (es.readyState === 2) startPolling();
-}
-
-function armStreamIdle() {
-  clearTimeout(push.idleTimer);
-  push.idleTimer = setTimeout(startPolling, STREAM_IDLE_MS);
-}
-
-function closeBoardStream() {
-  clearTimeout(push.idleTimer);
-  const es = push.es;
-  push.es = null;
-  if (es) {
-    try {
-      es.close();
-    } catch (err) {
-      /* already closed */
-    }
-  }
-}
-
-/* (Re)open the stream, resuming from the model's position when there is one. */
-function openStream() {
-  closeBoardStream();
-  const model = push.model;
-  const since = model && model.epoch != null && model.seq != null
-    ? "?since=" + encodeURIComponent(model.epoch + ":" + model.seq) : "";
-  let es;
-  try {
-    es = new window.EventSource(STREAM_URL + since);
-  } catch (err) {
-    startPolling();
-    return;
-  }
-  push.es = es;
-  for (const type of Object.keys(STREAM_HANDLERS)) {
-    es.addEventListener(type, (ev) => onStreamEvent(es, type, ev));
-  }
-  es.addEventListener("error", () => onStreamError(es));
-  armStreamIdle();
-}
-
-/* A refused delta: reopen from the model's position (the server answers with
- * the missed deltas or a fresh snapshot). A stream that keeps being refused
- * is given up on. */
-function resyncStream() {
-  push.resyncs += 1;
-  if (push.resyncs > STREAM_MAX_RESYNCS) startPolling();
-  else openStream();
-}
-
-function startPolling() {
-  const already = push.mode === "poll";
-  push.mode = "poll";
-  closeBoardStream();
-  clearTimeout(push.retryTimer);
-  if (streamSupported() && !document.hidden) push.retryTimer = setTimeout(retryStream, STREAM_RETRY_MS);
-  if (!already) pollBoard();
-}
-
-function retryStream() {
-  if (document.hidden || push.mode !== "poll" || !streamSupported()) return;
-  openStream();
-}
-
-function startBoardFeed() {
-  if (!streamSupported()) {
-    push.mode = "poll";
-    pollBoard();
-    return;
-  }
-  push.mode = "stream";
-  openStream();
-}
-
-/* The tab hid: the stream (or the poll) is dropped; it resumes when shown. */
-function pauseBoardFeed() {
-  closeBoardStream();
-  clearTimeout(push.retryTimer);
-  clearTimeout(state.boardTimer);
-}
-
-function resumeBoardFeed() {
-  if (push.mode === "poll") {
-    if (streamSupported()) {
-      clearTimeout(push.retryTimer);
-      push.retryTimer = setTimeout(retryStream, STREAM_RETRY_MS);
-    }
-    pollBoard();
-  } else {
-    openStream();
-  }
-}
-
-/* Called after loop actions: while the stream is healthy the server pushes
- * the result, so only the polling fallback fetches here. */
-function refreshBoard() {
-  if (push.mode === "poll") return pollBoard();
-  if (!push.es && !document.hidden) openStream();
-  return Promise.resolve();
-}
-
-/* "Retry" on the error banner: reconnect the stream, or poll right now. */
-function retryBoard() {
-  if (push.mode === "poll") pollBoard();
-  else openStream();
-}
-
-async function pollBoard() {
-  clearTimeout(state.boardTimer);
-  try {
-    const res = await fetch("/api/overview", { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    if (push.mode !== "poll") return; // the stream took over while this was in flight
-    const before = activeCardSig();
-    ingestOverview(data);
-    state.lastOk = Date.now();
-    state.loaded = true;
-    hideBoardError();
-    renderAll();
-    if (!openPendingHashLoop() && state.activeLoop) {
-      requestDetailRefresh();
-      if (activeCardSig() !== before) refreshActions();
-    }
-  } catch (err) {
-    if (push.mode !== "poll") return;
-    showBoardError(
-      state.loaded
-        ? "Lost contact with the dashboard server (" + err.message + "). Showing the last data received; retrying every 5 seconds."
-        : "Cannot reach the dashboard server (" + err.message + "). Retrying every 5 seconds."
-    );
-    renderLive();
-  }
-  schedulePoll();
-}
-
-/* Poll every 5 s while visible and in fallback; hidden tabs stop polling (the
- * server only rebuilds when someone asks). A build older than the server's
- * rebuild interval means a fresh one is on its way, so look again sooner,
- * once. */
-function schedulePoll() {
-  clearTimeout(state.boardTimer);
-  if (document.hidden || push.mode !== "poll") return;
-  const age = ageMs(state.updatedAt);
-  const soon = state.loaded && age != null && age > 18000 && !state.quickRepoll;
-  state.quickRepoll = soon;
-  state.boardTimer = setTimeout(pollBoard, soon ? 1500 : BOARD_POLL_MS);
-}
-
-function resolveHashLoop(hash) {
-  if (hash.root) return state.byKey.get(loopKey(hash.root, hash.name)) || null;
-  return state.loops.find((loop) => loop.name === hash.name) || null;
-}
-
-function showBoardError(msg) {
-  el("board-error").hidden = false;
-  el("board-error-text").textContent = msg;
-}
-
-function hideBoardError() {
-  const banner = el("board-error");
-  if (!banner.hidden) banner.hidden = true;
-}
-
-/* ---------------------------- render ---------------------------- */
-
-/* Every section below is guarded (see sectionUnchanged), so calling this on
- * unchanged state writes nothing to the DOM except the live indicator. */
-function renderAll() {
-  const groups = attentionGroups();
-  renderLive();
-  renderSummary(groups);
-  renderNeeds(groups);
-  renderRunning();
-  renderWorkspaceFilter();
-  renderTabs();
-  renderBoard();
-  renderNotes(groups);
-  renderDrawerInbox();
-}
-
-function renderLive() {
-  const live = el("live");
-  const text = el("live-text");
-  const buildAge = ageMs(state.updatedAt);
-  const sinceOk = state.lastOk ? Date.now() - state.lastOk : null;
-  let cls = "live-ok";
-  let label;
-  if (!state.lastOk) {
-    cls = el("board-error").hidden ? "live-connecting" : "live-offline";
-    label = el("board-error").hidden ? "Connecting" : "Offline";
-  } else if (!el("board-error").hidden) {
-    cls = "live-offline";
-    label = "Offline · data from " + fmtClock(state.updatedAt);
-  } else if ((buildAge != null && buildAge > STALE_AFTER_MS) || sinceOk > STALE_AFTER_MS) {
-    cls = "live-stale";
-    label = "Stale · data from " + fmtClock(state.updatedAt);
-  } else {
-    label = "Live · " + fmtClock(state.updatedAt);
-  }
-  live.className = "live " + cls;
-  text.textContent = label;
-  live.title = (push.mode === "stream"
-    ? "Push (SSE)"
-    : "Polling every " + BOARD_POLL_MS / 1000 + " s (stream unavailable)") +
-    " · data built at " + (state.updatedAt ? new Date(state.updatedAt).toLocaleString() : "—");
-}
-
-/* Unread attention grouped per loop, split into "needs you" and notes. */
-function attentionGroups() {
-  const needs = new Map();
-  const notes = new Map();
-  let readCount = 0;
-  for (const item of state.inbox) {
-    if (item.read) {
-      readCount += 1;
-      if (!state.showReadInbox) continue;
-    }
-    const loop = state.byKey.get(item.key);
-    const target = isNeedsItem(item, loop) ? needs : notes;
-    if (!target.has(item.key)) target.set(item.key, { key: item.key, loop, items: [] });
-    target.get(item.key).items.push(item);
-  }
-  const order = (g) => Math.min(...g.items.map((i) => SEVERITY_RANK[i.severity] ?? 3));
-  const sortGroups = (map) => Array.from(map.values()).sort((a, b) =>
-    order(a) - order(b) ||
-    String(b.loop?.last_activity || "").localeCompare(String(a.loop?.last_activity || "")));
-  for (const g of [...needs.values(), ...notes.values()]) {
-    g.items.sort((a, b) => (SEVERITY_RANK[a.severity] ?? 3) - (SEVERITY_RANK[b.severity] ?? 3));
-  }
-  return { needs: sortGroups(needs), notes: sortGroups(notes), readCount };
-}
-
-function plural(n, word, many) {
-  return n + " " + (n === 1 ? word : many || word + "s");
-}
-
-/* Everything a loop's board row, running card, state badge and phase line
- * show. The relative time is included as rendered ("2d ago"), so it moves the
- * signature exactly when its text would change. */
-function loopViewSig(loop) {
-  return [
-    loop.key, loop.title || "", loop.mission || "", loop.name, loop.workspace, loop.root,
-    Boolean(loop.worktree), loop.worktree_reasons || null, loop.driver || null,
-    loop.diagnosis || null, loop.status ?? null, loop.final_verdict ?? null,
-    verdictSeq(loop).join(""), Boolean(loop.running), loop.running_sources || [],
-    loop.running_substate ?? null, loop.driver_phase ?? null,
-    loop.loop_state ? [loop.loop_state.state, loop.loop_state.status_raw, loop.loop_state.summary] : null,
-    loop.last_activity ?? null, loop.last_activity ? relTime(loop.last_activity) : "",
-    loop.iteration ?? null, loop.max_iterations ?? null,
-  ];
-}
-
-/* What attentionRow() renders for one group of inbox items. */
-function attentionSig(group) {
-  const loop = group.loop;
-  return [
-    group.key,
-    loop ? [loopTitle(loop), loop.last_activity ? relTime(loop.last_activity) : ""] : null,
-    group.items.map((i) => [i.id, i.root, i.workspace, i.loop, i.severity, i.kind,
-      i.headline || "", i.detail || "", Boolean(i.read)]),
-  ];
-}
-
-/* "2 via driver · 1 process only": distinct phases, else evidence counts. */
-function runningContext(running) {
-  const phases = Array.from(new Set(running.map(phaseText).filter(Boolean)));
-  if (phases.length) return phases.slice(0, 2).join(", ") + (phases.length > 2 ? "…" : "");
-  const byDriver = running.filter((l) => (l.running_sources || []).includes("driver")).length;
-  const other = running.length - byDriver;
-  return [byDriver ? byDriver + " via driver" : "", other ? other + " via process or session" : ""]
-    .filter(Boolean).join(" · ");
-}
-
-function renderSummary(groups) {
-  const loops = state.loops;
-  const running = loops.filter((l) => l.running);
-  const needsLoops = groups.needs.filter((g) => g.items.some((i) => !i.read));
-  const shipped7 = loops.filter((l) => normVerdict(latestVerdict(l)) === "ship" &&
-    (ageMs(l.verdict_mtime) ?? Infinity) <= WEEK_MS);
-  const wsCount = state.workspaces.length;
-
-  let verdict;
-  if (!loops.length) {
-    verdict = "No loop mailboxes found yet.";
-  } else if (needsLoops.length) {
-    verdict = plural(needsLoops.length, "loop") + (needsLoops.length === 1 ? " needs" : " need") + " you" +
-      (running.length ? "; " + plural(running.length, "loop") + " running." : "; none running.");
-  } else if (running.length) {
-    verdict = "All clear: " + plural(running.length, "loop") + " running, nothing needs you.";
-  } else {
-    verdict = "All clear. No loop is running and nothing needs you.";
-  }
-  const latest = loops.slice().sort((a, b) =>
-    String(b.last_activity || "").localeCompare(String(a.last_activity || "")))[0];
-  const wtShown = state.workspaces.filter((w) => w.worktree).length;
-  const coverage = "Covers " + plural(wsCount - wtShown, "workspace") +
-    (wtShown ? " and " + plural(wtShown, "worktree") : "") + " with loops (" +
-    plural(state.scanned, "workspace") + (state.worktreesScanned ? " and " + plural(state.worktreesScanned, "worktree") : "") +
-    " scanned).";
-  const verdictSub = (latest
-    ? "Most recent activity: " + loopTitle(latest) + " (" + latest.workspace + "), " + relTime(latest.last_activity) + ". "
-    : "Start a loop with /trio-init in a project; it appears here on the next update. ") + coverage;
-  const brokerText = {
-    disabled: "Broker liveness is not configured, so loops driven only through Omnigent broker sessions cannot show as running.",
-    unreachable: "The Omnigent broker did not answer; loops driven only through broker sessions may be running but show as not running.",
-    truncated: "The Omnigent broker session list was too long to read in full; some broker-only loops may not show as running.",
-  }[state.broker];
-  const partial = state.workspaces.filter((w) => w.error);
-  const partialText = partial.length
-    ? "Could not read " + partial.map((w) => w.name).join(", ") + ". Other workspaces are shown."
-    : "";
-  const unread = groups.needs.reduce((n, g) => n + g.items.filter((i) => !i.read).length, 0);
-  // [label, value, context, tone, target]
-  const tiles = [
-    ["Needs you", needsLoops.length,
-      needsLoops.length ? plural(unread, "unread item") : "Nothing waiting",
-      needsLoops.length ? "warning" : "", "#needs"],
-    ["Running now", running.length,
-      running.length ? runningContext(running) : "No live driver, process or session",
-      running.length ? "live" : "", "#running"],
-    ["Shipped, last 7 days", shipped7.length,
-      plural(loops.filter((l) => normVerdict(latestVerdict(l)) === "ship").length, "shipped loop") + " in total", "", null],
-    ["Loops tracked", loops.length,
-      "in " + plural(wsCount - wtShown, "workspace") + (wtShown ? " + " + plural(wtShown, "worktree") : ""), "", "#loops"],
-  ];
-
-  // Two guards: the verdict line carries a relative time ("3m ago") that moves
-  // on its own, and must not rebuild the #kpis tiles when they are unchanged.
-  const headSig = JSON.stringify([verdict, verdictSub, brokerText || "", partialText]);
-  if (!sectionUnchanged("b:summary", headSig)) {
-    renderSummaryHead(verdict, verdictSub, brokerText, partial, partialText);
-    sectionRendered("b:summary", headSig);
-  }
-  const tilesSig = JSON.stringify(tiles);
-  if (sectionUnchanged("b:kpis", tilesSig)) return;
-  const kpis = el("kpis");
-  kpis.textContent = "";
-  for (const [label, value, context, tone, target] of tiles) {
-    const node = document.createElement(target ? "a" : "div");
-    node.className = "kpi" + (tone ? " kpi-" + tone : "");
-    if (target) node.href = target;
-    node.appendChild(span("eyebrow", label));
-    node.appendChild(span("kpi-value", String(value)));
-    node.appendChild(span("kpi-context", context));
-    kpis.appendChild(node);
-  }
-  sectionRendered("b:kpis", tilesSig);
-}
-
-function renderSummaryHead(verdict, verdictSub, brokerText, partial, partialText) {
-  el("verdict").textContent = verdict;
-  el("verdict-sub").textContent = verdictSub;
-  const brokerNote = el("broker-note");
-  brokerNote.hidden = !brokerText;
-  brokerNote.textContent = brokerText || "";
-  el("board-partial").hidden = partial.length === 0;
-  el("board-partial").textContent = partialText;
-}
-
-function inboxMarkButton(item) {
-  const mark = document.createElement("button");
-  mark.type = "button";
-  mark.className = "btn btn-ghost btn-small";
-  mark.textContent = item.read ? "Mark unread" : "Mark read";
-  mark.setAttribute(
-    "aria-label",
-    (item.read ? "Mark unread: " : "Mark read: ") + (item.headline || "item")
-  );
-  mark.addEventListener("click", (event) => {
-    event.stopPropagation();
-    setInboxRead([item], !item.read);
-  });
-  return mark;
-}
-
-function severityBadge(item) {
-  const sev = item.severity || "low";
-  const label = { high: "Action", medium: "Check", low: "Note" }[sev] || sev;
-  const tone = { high: "negative", medium: "warning", low: "neutral" }[sev] || "neutral";
-  const badge = span("badge badge-" + tone, "");
-  badge.appendChild(span("badge-icon", { high: "!", medium: "▲", low: "•" }[sev] || "•"));
-  badge.appendChild(document.createTextNode(label));
-  return badge;
-}
-
-/* One row per loop: the most severe item leads, the rest are counted. */
-function attentionRow(group) {
-  const lead = group.items[0];
-  const loop = group.loop;
-  const row = document.createElement("div");
-  row.className = "attn-row";
-  if (group.items.every((i) => i.read)) row.classList.add("is-read");
-  row.dataset.key = group.key;
-
-  row.appendChild(severityBadge(lead));
-
-  const main = document.createElement("div");
-  main.className = "attn-main";
-  const open = document.createElement("button");
-  open.type = "button";
-  open.className = "attn-open";
-  open.textContent = loop ? loopTitle(loop) : lead.loop;
-  open.setAttribute("aria-label", "Open " + (loop ? loopTitle(loop) : lead.loop) + ": " + lead.headline);
-  open.addEventListener("click", () => openDrawer(group.key));
-  main.appendChild(open);
-  main.appendChild(span("attn-where mono", lead.workspace + " / " + lead.loop));
-  const reason = document.createElement("p");
-  reason.className = "attn-reason";
-  reason.textContent = lead.headline || "";
-  if (group.items.length > 1) {
-    reason.appendChild(span("attn-more", " + " + plural(group.items.length - 1, "more item")));
-  }
-  main.appendChild(reason);
-  if (lead.detail) {
-    const detail = span("attn-detail", oneLine(lead.detail, 220));
-    detail.title = lead.detail;
-    main.appendChild(detail);
-  }
-  row.appendChild(main);
-
-  const side = document.createElement("div");
-  side.className = "attn-side";
-  side.appendChild(span("caption", loop && loop.last_activity ? relTime(loop.last_activity) : ""));
-  const mark = document.createElement("button");
-  mark.type = "button";
-  mark.className = "btn btn-ghost btn-small";
-  const allRead = group.items.every((i) => i.read);
-  mark.textContent = allRead ? "Mark unread" : (group.items.length > 1 ? "Mark all read" : "Mark read");
-  mark.setAttribute("aria-label", mark.textContent + ": " + (loop ? loopTitle(loop) : lead.loop));
-  mark.addEventListener("click", (event) => {
-    event.stopPropagation();
-    setInboxRead(group.items, !allRead);
-  });
-  side.appendChild(mark);
-  row.appendChild(side);
-  row.addEventListener("click", (event) => {
-    if (event.target.closest("button")) return;
-    openDrawer(group.key);
-  });
-  return row;
-}
-
-function emptyState(icon, text) {
-  const node = document.createElement("div");
-  node.className = "empty";
-  node.appendChild(span("empty-icon", icon));
-  node.appendChild(span("", text));
-  return node;
-}
-
-function renderNeeds(groups) {
-  const list = el("needs-list");
-  const toggle = el("inbox-toggle");
-  const unreadGroups = groups.needs.filter((g) => g.items.some((i) => !i.read));
-  const sig = JSON.stringify([state.showReadInbox, groups.readCount, unreadGroups.length,
-    groups.needs.map(attentionSig)]);
-  if (sectionUnchanged("b:needs", sig)) return;
-  sectionRendered("b:needs", sig);
-  el("needs-count").textContent = unreadGroups.length ? String(unreadGroups.length) : "";
-  toggle.hidden = groups.readCount === 0;
-  toggle.textContent = (state.showReadInbox ? "Hide read (" : "Show read (") + groups.readCount + ")";
-  toggle.setAttribute("aria-expanded", String(state.showReadInbox));
-  list.textContent = "";
-  if (!groups.needs.length) {
-    list.appendChild(emptyState("✓", "Nothing needs you. Loops that block, ask for human verification or stop mid-loop appear here."));
-    return;
-  }
-  for (const group of groups.needs) list.appendChild(attentionRow(group));
-}
-
-function renderNotes(groups) {
-  const sig = JSON.stringify(groups.notes.map(attentionSig));
-  if (sectionUnchanged("b:notes", sig)) return;
-  sectionRendered("b:notes", sig);
-  const details = el("notes");
-  details.hidden = groups.notes.length === 0;
-  const count = groups.notes.reduce((n, g) => n + g.items.length, 0);
-  el("notes-count").textContent = String(count);
-  el("notes-sub").textContent = "Drift, overlap, repair and unconfirmed-stop notes on " + plural(groups.notes.length, "loop") + " that are not running";
-  const list = el("notes-list");
-  list.textContent = "";
-  for (const group of groups.notes) list.appendChild(attentionRow(group));
-}
-
-function renderRunning() {
-  const list = el("running-list");
-  const running = state.loops.filter((l) => l.running)
-    .sort((a, b) => String(b.last_activity || "").localeCompare(String(a.last_activity || "")));
-  const busy = state.workspaces.filter((w) => w.unattributed_processes > 0);
-  const sig = JSON.stringify([running.map(loopViewSig),
-    busy.map((w) => [w.name, w.unattributed_processes])]);
-  if (sectionUnchanged("b:running", sig)) return;
-  sectionRendered("b:running", sig);
-  el("running-count").textContent = running.length ? String(running.length) : "";
-  list.textContent = "";
-  for (const ws of busy) {
-    const note = document.createElement("p");
-    note.className = "run-note";
-    note.textContent = plural(ws.unattributed_processes, "process", "processes") +
-      " working in " + ws.name + " name no mailbox, so no loop there is marked running.";
-    list.appendChild(note);
-  }
-  if (!running.length) {
-    list.appendChild(emptyState("○", "No loop is running. A loop shows here while its driver, lock, process or session is live."));
-    return;
-  }
-  for (const loop of running) {
-    const card = document.createElement("button");
-    card.type = "button";
-    card.className = "run-card";
-    card.dataset.key = loop.key;
-    card.addEventListener("click", () => openDrawer(loop.key));
-    const top = document.createElement("span");
-    top.className = "run-top";
-    top.appendChild(stateBadge(loop));
-    top.appendChild(span("caption", "last write " + relTime(loop.last_activity)));
-    card.appendChild(top);
-    card.appendChild(span("run-title", loopTitle(loop)));
-    card.appendChild(span("attn-where mono", loop.workspace + " / " + loop.name));
-    const meta = document.createElement("span");
-    meta.className = "run-meta";
-    meta.appendChild(span("", "Iteration " + iterationText(loop)));
-    const phase = phaseText(loop);
-    if (phase) meta.appendChild(span("", phase));
-    card.appendChild(meta);
-    if (loop.iteration != null && loop.max_iterations) {
-      const bar = document.createElement("span");
-      bar.className = "meter";
-      bar.setAttribute("role", "img");
-      bar.setAttribute("aria-label", "Iteration " + loop.iteration + " of " + loop.max_iterations);
-      const fill = document.createElement("span");
-      fill.className = "meter-fill";
-      fill.style.width = Math.min(100, (loop.iteration / loop.max_iterations) * 100) + "%";
-      bar.appendChild(fill);
-      card.appendChild(bar);
-    }
-    card.appendChild(span("caption", "Live via " + (loop.running_sources || []).join(", ")));
-    list.appendChild(card);
-  }
-}
-
-function renderWorkspaceFilter() {
-  const select = el("workspace-filter");
-  const names = state.workspaces.map((w) => [w.root, w.name, (w.loops || []).length]);
-  const sig = JSON.stringify(names);
-  if (select.dataset.sig !== sig) {
-    select.dataset.sig = sig;
-    select.textContent = "";
-    const all = document.createElement("option");
-    all.value = "";
-    all.textContent = "All workspaces";
-    select.appendChild(all);
-    for (const [root, name, count] of names) {
-      const option = document.createElement("option");
-      option.value = root;
-      option.textContent = name + " (" + count + ")";
-      option.title = root;
-      select.appendChild(option);
-    }
-  }
-  if (state.workspace && !names.some(([root]) => root === state.workspace)) state.workspace = "";
-  if (select.value !== state.workspace) select.value = state.workspace;
-}
-
-function hasUnreadAttention(loop) {
-  return state.inbox.some((item) => item.key === loop.key && !item.read);
-}
-
-function matchesTab(tab, loop) {
-  if (tab === "running") return Boolean(loop.running);
-  if (tab === "attention") return hasUnreadAttention(loop);
-  if (tab === "archived") return isArchived(loop);
-  return true;
-}
-
-const TAB_LABELS = { running: "Running", attention: "Attention", all: "All", archived: "Archived" };
-
-function renderTabs() {
-  const nav = el("tabs");
-  const scoped = state.loops.filter(matchesFilters);
-  const counts = TABS.map((tab) => scoped.filter((loop) => matchesTab(tab, loop)).length);
-  const sig = JSON.stringify([state.tab, counts]);
-  if (sectionUnchanged("b:tabs", sig)) return;
-  sectionRendered("b:tabs", sig);
-  nav.textContent = "";
-  for (const tab of TABS) {
-    const count = counts[TABS.indexOf(tab)];
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "seg-btn";
-    btn.textContent = TAB_LABELS[tab];
-    btn.appendChild(span("seg-count", String(count)));
-    btn.setAttribute("aria-pressed", String(state.tab === tab));
-    btn.addEventListener("click", () => {
-      state.tab = tab;
-      savePrefs();
-      renderTabs();
-      renderBoard();
-    });
-    nav.appendChild(btn);
-  }
-}
-
-function matchesFilters(loop) {
-  if (state.workspace && loop.root !== state.workspace) return false;
-  const q = state.query.trim().toLowerCase();
-  if (!q) return true;
-  return [loop.title, loop.name, loop.workspace, loop.mission, loop.status]
-    .some((v) => String(v || "").toLowerCase().includes(q));
-}
-
-function visibleLoops() {
-  const { key, dir } = state.sort;
-  const sign = dir === "asc" ? 1 : -1;
-  const value = (loop) => key === "loop" ? loopTitle(loop).toLowerCase()
-    : key === "workspace" ? (loop.workspace + "/" + loop.name).toLowerCase()
-    : String(loop.last_activity || "");
-  return state.loops
-    .filter((l) => matchesFilters(l) && matchesTab(state.tab, l))
-    .sort((a, b) => {
-      const running = Number(Boolean(b.running)) - Number(Boolean(a.running));
-      if (key === "activity" && running !== 0) return running;
-      return sign * value(a).localeCompare(value(b));
-    });
-}
-
-function boardSignature(loops) {
-  const unread = new Map();
-  for (const item of state.inbox) {
-    if (!item.read) unread.set(item.key, (unread.get(item.key) || 0) + 1);
-  }
-  return JSON.stringify(
-    loops.map((loop) => [
-      loopViewSig(loop),
-      unread.get(loop.key) || 0,
-      state.activeLoop === loop.key,
-    ])
-  );
-}
-
-function renderBoard() {
-  const body = el("loop-rows");
-  const loops = state.loops.length ? visibleLoops() : [];
-  const emptyText = !state.loops.length
-    ? "No loop mailboxes found. Start one with /trio-init in a project."
-    : loops.length ? "" : "No loops match these filters.";
-  const sig = state.tab + "|" + state.sort.key + "|" + state.sort.dir + "|" + emptyText + "|" +
-    boardSignature(loops);
-  if (sig === state.boardSignature) return;
-  state.boardSignature = sig;
-  for (const th of document.querySelectorAll(".loop-table th[aria-sort]")) {
-    const key = th.querySelector(".th-sort")?.dataset.sort;
-    th.setAttribute("aria-sort", key === state.sort.key
-      ? (state.sort.dir === "asc" ? "ascending" : "descending") : "none");
-  }
-
-  if (emptyText) {
-    body.textContent = "";
-    const tr = document.createElement("tr");
-    tr.className = "row-empty";
-    const td = document.createElement("td");
-    td.colSpan = 6;
-    td.appendChild(emptyState("○", emptyText));
-    tr.appendChild(td);
-    body.appendChild(tr);
-    return;
-  }
-  for (const stale of Array.from(body.querySelectorAll(".row-empty, .row-loading"))) stale.remove();
-
-  const existing = new Map();
-  for (const row of body.querySelectorAll(".loop-row")) existing.set(row.dataset.key, row);
-  const wanted = new Set(loops.map((loop) => loop.key));
-  for (const [key, row] of existing) {
-    if (!wanted.has(key)) {
-      row.remove();
-      existing.delete(key);
-    }
-  }
-  const ordered = loops.map((loop) => {
-    const old = existing.get(loop.key);
-    if (old) {
-      patchCard(old, loop);
-      return old;
-    }
-    return cardEl(loop);
-  });
-  let cursor = body.firstElementChild;
-  for (const row of ordered) {
-    if (row === cursor) {
-      cursor = cursor.nextElementSibling;
-      continue;
-    }
-    body.insertBefore(row, cursor);
-  }
-}
-
-/* Rows patch in place: only cells whose content changed are replaced, so
- * focus and hover survive the 5 s poll. */
-function patchCard(row, loop) {
-  const fresh = cardEl(loop);
-  if (row.className !== fresh.className) row.className = fresh.className;
-  const oldCells = Array.from(row.children);
-  const newCells = Array.from(fresh.children);
-  newCells.forEach((cell, i) => {
-    if (!oldCells[i]) row.appendChild(cell);
-    else if (!oldCells[i].isEqualNode(cell)) oldCells[i].replaceWith(cell);
-  });
-}
-
-function cardEl(loop) {
-  const row = document.createElement("tr");
-  row.className = "loop-row" + (state.activeLoop === loop.key ? " active" : "") +
-    (isArchived(loop) ? " is-archived" : "");
-  row.dataset.key = loop.key;
-
-  const nameCell = document.createElement("th");
-  nameCell.scope = "row";
-  const open = document.createElement("button");
-  open.type = "button";
-  open.className = "row-open";
-  open.textContent = loopTitle(loop);
-  open.title = loop.mission || loopTitle(loop);
-  open.addEventListener("click", () => openDrawer(loop.key));
-  nameCell.appendChild(open);
-  const sub = document.createElement("span");
-  sub.className = "row-sub mono";
-  sub.textContent = loop.name;
-  nameCell.appendChild(sub);
-  if (hasUnreadAttention(loop)) {
-    const n = state.inbox.filter((i) => i.key === loop.key && !i.read).length;
-    nameCell.appendChild(span("row-flag", plural(n, "unread item")));
-  }
-  if (isArchived(loop)) nameCell.appendChild(span("row-flag row-flag-muted", "Archived"));
-  if (loop.driver === "claude-workflow") {
-    const tag = span("row-flag row-flag-muted", "Native (claude-workflow)");
-    tag.title = "Claude-native Trio loop driven by the trio-native Workflow";
-    nameCell.appendChild(tag);
-  }
-  const diag = diagnosisFlag(loop.diagnosis);
-  if (diag) nameCell.appendChild(diag);
-  if (loop.worktree && (loop.worktree_reasons || []).length) {
-    const tag = span("row-flag row-flag-muted", "Worktree: " + loop.worktree_reasons.join(", "));
-    tag.title = "Shown because this linked worktree's copy is " + loop.worktree_reasons.join(", ") +
-      "; untouched committed copies of the main checkout's mailboxes are hidden.";
-    nameCell.appendChild(tag);
-  }
-  row.appendChild(nameCell);
-
-  const ws = document.createElement("td");
-  ws.className = "col-ws";
-  ws.textContent = loop.workspace;
-  ws.title = loop.root;
-  row.appendChild(ws);
-
-  const st = document.createElement("td");
-  st.appendChild(stateBadge(loop));
-  const phase = phaseText(loop);
-  if (phase) st.appendChild(span("row-sub", phase));
-  row.appendChild(st);
-
-  const it = document.createElement("td");
-  it.className = "num col-iter";
-  it.textContent = iterationText(loop);
-  row.appendChild(it);
-
-  const hist = document.createElement("td");
-  hist.className = "col-hist";
-  hist.appendChild(historyEl(loop));
-  row.appendChild(hist);
-
-  const act = document.createElement("td");
-  act.className = "num";
-  const time = document.createElement("time");
-  time.dateTime = loop.last_activity || "";
-  time.textContent = loop.last_activity ? relTime(loop.last_activity) : "—";
-  time.title = loop.last_activity ? new Date(loop.last_activity).toLocaleString() : "No activity recorded";
-  act.appendChild(time);
-  row.appendChild(act);
-
-  row.addEventListener("click", (event) => {
-    if (event.target.closest("button, a")) return;
-    openDrawer(loop.key);
-  });
-  return row;
-}
-
-/* One-line diagnosis status for a card (full result lives in the drawer). */
-function diagnosisFlag(d) {
-  if (!d || !d.status) return null;
-  let text;
-  let cls = "row-flag row-flag-muted";
-  if (d.status === "running") {
-    text = "Diagnosing (" + (d.harness || "?") + ")… " + (d.last_event || "");
-    cls = "row-flag";
-  } else if (d.status === "done") {
-    text = "Diagnosis: " + (d.state || "?") + (d.proposed_fix && d.proposed_fix !== "none"
-      ? " → " + d.proposed_fix + (d.proposed_fix_rejected ? " (rejected)" : "") : "")
-      + (d.needs_human_input ? " · needs your input" : "");
-    if (d.needs_human_input) cls = "row-flag";
-  } else {
-    text = "Diagnosis failed";
-  }
-  const flag = span(cls, oneLine(text, 90));
-  flag.title = (d.harness || "") + " " + (d.model || "") + (d.finished_at ? " · " + d.finished_at : "")
-    + (d.error ? " · " + d.error : "");
-  return flag;
-}
-
-async function setInboxRead(items, read) {
-  const byRoot = new Map();
-  for (const item of items) {
-    if (!byRoot.has(item.root)) byRoot.set(item.root, []);
-    byRoot.get(item.root).push(item.id);
-  }
-  try {
-    for (const [root, ids] of byRoot) {
-      const response = await fetch("/api/inbox/" + (read ? "read" : "unread"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids, root }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
-    }
-    // Sections keep the rows of the items they were rendered from: mark the
-    // items now in state (and in the stream model) as well as the ones clicked.
-    const marked = new Set(items.map((item) => item.root + "\u0000" + item.id));
-    for (const item of items) item.read = read;
-    for (const item of state.inbox) {
-      if (marked.has(item.root + "\u0000" + item.id)) item.read = read;
-    }
-    if (push.model) {
-      for (const entry of push.model.inbox.values()) {
-        if (marked.has(entry.root + "\u0000" + entry.item.id)) entry.item.read = read;
-      }
-    }
-    renderAll();
-  } catch (err) {
-    showBoardError("Could not update the attention list: " + err.message);
-  }
-}
-
-function renderDrawerInbox() {
-  const section = el("drawer-inbox-section");
-  const list = el("drawer-inbox-list");
-  if (!section || !list) return;
-  const items = state.inbox.filter((item) => item.key === state.activeLoop);
-  const sig = JSON.stringify([state.activeLoop, items.map((i) => [i.id, i.root, i.severity,
-    i.headline || "", i.detail || "", Boolean(i.read)])]);
-  if (sectionUnchanged("b:drawer-inbox", sig)) return;
-  sectionRendered("b:drawer-inbox", sig);
-  list.textContent = "";
-  section.hidden = items.length === 0;
-  for (const item of items) {
-    const row = document.createElement("div");
-    row.className = "attn-row attn-row-compact" + (item.read ? " is-read" : "");
-    row.appendChild(severityBadge(item));
-    const main = document.createElement("div");
-    main.className = "attn-main";
-    main.appendChild(span("attn-reason", item.headline || ""));
-    if (item.detail) main.appendChild(span("attn-detail", item.detail));
-    row.appendChild(main);
-    row.appendChild(inboxMarkButton(item));
-    list.appendChild(row);
-  }
-}
-
-/* Action feedback survives polls: a local note (in flight, or refused
- * before the server recorded anything) wins until the server's own record
- * for the mailbox is newer. */
-function actionNote(loop) {
-  const local = state.actionNotes.get(loop.key);
-  const server = loop.last_action;
-  if (local && (!server || !server.updated_at ||
-      Date.parse(server.updated_at) < local.at || local.pending)) {
-    return local;
-  }
-  if (!server) return null;
-  const tone = { failed: "error", exited: "error", running: "ok", finished: "ok", stopped: "ok", stopping: "pending" }[server.outcome] || "ok";
-  const when = server.updated_at ? " · " + relTime(server.updated_at) : "";
-  return { text: (server.message || server.outcome) + when, tone };
-}
-
-async function controlLoop(action) {
-  const loop = state.byKey.get(state.activeLoop);
-  if (!loop) return;
-  const controls = loop.controls || {};
-  const driver = controls.driver || "portable";
-  if (!(controls[action] && controls[action].enabled)) return;
-  if (action === "stop" && !window.confirm("Stop " + loopTitle(loop) + "? " + controls.stop.reason)) return;
-  const key = loop.key;
-  state.actionNotes.set(key, { text: action === "start" ? "Starting the " + driver + " driver…" : "Stopping…", tone: "pending", pending: true, at: Date.now() });
-  renderDrawerControls(loop);
-  let note;
-  try {
-    const res = await fetch("/api/loop/" + action, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root: loop.root, driver }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
-    note = { text: action === "start" ? "Started (PID " + data.pid + ")." : "Stop requested for PID " + data.pid + ".", tone: "ok", at: Date.now() };
-  } catch (err) {
-    note = { text: "Loop " + action + " failed: " + err.message, tone: "error", at: Date.now() };
-  }
-  state.actionNotes.set(key, note);
-  renderDrawerControls(state.byKey.get(key) || loop);
-  await refreshBoard();
-}
-
-/* Capabilities come from the server (`controls`), which also enforces them. */
-function renderDrawerControls(loop) {
-  const wrap = el("drawer-controls");
-  if (!loop) {
-    sectionSigs.delete("d:controls");
-    if (!wrap.hidden) wrap.hidden = true;
-    return;
-  }
-  const controls = loop.controls || {
-    start: { enabled: false, reason: "Controls unavailable." },
-    stop: { enabled: false, reason: "Controls unavailable." },
-  };
-  const pending = Boolean(state.actionNotes.get(loop.key)?.pending);
-  const status = actionNote(loop);
-  let noteText;
-  let noteClass;
-  let noteRole;
-  if (status) {
-    noteText = status.text;
-    noteClass = "control-note control-" + status.tone;
-    noteRole = status.tone === "error" ? "alert" : "status";
-  } else {
-    noteText = controls.start.enabled ? "" : controls.start.reason;
-    if (!controls.start.enabled && controls.stop.enabled) noteText = controls.stop.reason;
-    noteClass = "control-note caption";
-    noteRole = "status";
-  }
-  const sig = JSON.stringify([loop.key, pending, controls.start, controls.stop,
-    noteText, noteClass, noteRole]);
-  if (sectionUnchanged("d:controls", sig)) return;
-  sectionRendered("d:controls", sig);
-  wrap.hidden = false;
-  const start = el("loop-start");
-  const stop = el("loop-stop");
-  start.disabled = pending || !controls.start.enabled;
-  stop.disabled = pending || !controls.stop.enabled;
-  start.title = controls.start.reason;
-  stop.title = controls.stop.reason || controls.start.reason;
-  const note = el("loop-control-note");
-  note.textContent = noteText;
-  note.className = noteClass;
-  note.setAttribute("role", noteRole);
-}
 
 /* ---------------------------- unblock panel ----------------------------
  * /api/loop/actions: derived state, the server's fix allowlist with each
@@ -1612,7 +169,7 @@ function actionsUrl(loop) {
 
 async function refreshActions() {
   const key = state.activeLoop;
-  const loop = state.byKey.get(key);
+  const loop = state.loop;
   if (!loop) return;
   clearTimeout(actionsTimer);
   try {
@@ -1634,7 +191,7 @@ async function refreshActions() {
 }
 
 async function postLoopAction(path, body) {
-  const loop = state.byKey.get(state.activeLoop);
+  const loop = state.loop;
   if (!loop) return { status: 0, data: { error: "no loop open" } };
   const res = await fetch(path, {
     method: "POST",
@@ -1908,7 +465,7 @@ async function applyFix(fix, args, btn, note) {
   } finally {
     btn.disabled = false;
     refreshActions();
-    refreshBoard();
+    refreshAfterAction();
   }
 }
 
@@ -2062,140 +619,7 @@ async function submitAnswer(ev) {
     setNote("answer-note", "Request failed: " + err.message, "error");
   }
   refreshActions();
-  refreshBoard();
-}
-
-function markActiveCard() {
-  for (const row of document.querySelectorAll(".loop-row")) {
-    row.classList.toggle("active", row.dataset.key === state.activeLoop);
-  }
-}
-
-/* ------------------------------ drawer ------------------------------ */
-
-/* The drawer is modal: the board behind it leaves the tab order and the
- * accessibility tree while it is open. */
-function setBackgroundInert(on) {
-  for (const node of document.querySelectorAll(".appbar, #main, .skip-link")) {
-    node.inert = on;
-  }
-}
-
-async function openDrawer(key) {
-  const loop = state.byKey.get(key);
-  if (!loop) return;
-  if (!el("drawer").hidden && state.activeLoop === key) return;
-  closeStream();
-  state.activeLoop = key;
-  state.returnFocus = document.activeElement;
-  currentRoot = loop.root;
-  const name = loop.name;
-  history.replaceState(null, "", "#root=" + encodeURIComponent(loop.root) +
-    "&loop=" + encodeURIComponent(name));
-  state.detail = null;
-  state.compare = [];
-  state.tlOpen.clear();
-  state.tlSignature = null;
-  state.sessions = [];
-  state.activePath = null;
-  state.drawerTab = "overview";
-  state.graphSel = null;
-  invalidateDrawerSections();
-
-  el("drawer-name").textContent = loopTitle(loop);
-  el("drawer-where").textContent = loop.workspace + " / " + name;
-  el("drawer-where").title = loop.root + "/" + name;
-  el("loop-control-note").textContent = "";
-  renderDrawerControls(loop);
-  el("drawer-badge").className = "status-tags";
-  el("drawer-badge").textContent = "LOADING";
-  el("drawer-mission").textContent = "";
-  el("fact-iter").textContent = "—";
-  el("fact-verdict").textContent = "—";
-  el("fact-verdict").className = "";
-  el("fact-activity").textContent = "—";
-  el("fact-sessions").textContent = "—";
-  el("drawer-strip").textContent = "";
-  el("drawer-timeline").textContent = "";
-  el("drawer-timeline").appendChild(span("timeline-empty", "Loading…"));
-  el("session-list").textContent = "";
-  setPaneStatus("idle", "loading…");
-  state.offset = 0;
-  state.size = null;
-  state.records = 0;
-  setOffsetHint();
-  renderTranscript();
-
-  el("drawer").hidden = false;
-  el("drawer-scrim").hidden = false;
-  setBackgroundInert(true);
-  el("drawer-close").focus();
-  markActiveCard();
-  renderDrawerTabs();
-  showDrawerTab();
-  renderDrawerInbox();
-  state.actions = null;
-  state.fixSignature = null;
-  setNote("fix-result", "");
-  el("actions-section").hidden = true;
-  el("diagnose-harness").textContent = "";
-  setNote("diagnose-note", "");
-  setNote("answer-note", "");
-  el("answer-restart").hidden = true;
-  refreshActions();
-  await refreshDetail({ quiet: false });
-}
-
-function closeDrawer() {
-  closeStream();
-  clearTimeout(actionsTimer);
-  state.actions = null;
-  state.activeLoop = null;
-  state.detail = null;
-  state.compare = [];
-  state.tlOpen.clear();
-  state.tlSignature = null;
-  state.sessions = [];
-  state.activePath = null;
-  state.pendingLines = [];
-  state.drawerTab = "overview";
-  state.graphSel = null;
-  invalidateDrawerSections();
-  el("drawer").hidden = true;
-  el("drawer-scrim").hidden = true;
-  setBackgroundInert(false);
-  history.replaceState(null, "", location.pathname);
-  markActiveCard();
-  const back = state.returnFocus;
-  state.returnFocus = null;
-  if (back && document.contains(back)) back.focus();
-}
-
-async function refreshDetail({ quiet }) {
-  const key = state.activeLoop;
-  const loop = state.byKey.get(key);
-  if (!loop) return;
-  renderDrawerControls(loop);
-  try {
-    const res = await fetch(withRoot("/api/loop?name=" + encodeURIComponent(loop.name)), {
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    if (state.activeLoop !== key) return;
-    const detail = await res.json();
-    state.detail = detail;
-    state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
-    renderDetail(detail);
-    renderSessionList();
-    if (state.drawerTab === "transcripts") openDefaultSession();
-  } catch (err) {
-    if (!quiet) {
-      el("drawer-timeline").textContent = "";
-      el("drawer-timeline").appendChild(
-        span("timeline-empty", "Failed to load detail: " + err.message)
-      );
-    }
-  }
+  refreshAfterAction();
 }
 
 /* --------------------- iteration lifecycle + compare --------------------- */
@@ -2261,314 +685,7 @@ function toggleCompare(n) {
   renderTimelineView();
 }
 
-/* The small facts under the drawer title. The relative time and the session
- * count move without a refetch, so the 5 s tick re-runs this too. */
-function renderDetailFacts(detail) {
-  const cur = detail.iteration != null ? detail.iteration : "–";
-  const max = detail.max_iterations != null ? detail.max_iterations : "–";
-  const verdict = detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "—";
-  const verdictClass = detail.final_verdict ? "verdict-" + normVerdict(detail.final_verdict) : "";
-  const activity = relTime(detail.last_activity);
-  const sessions = String(state.sessions.length);
-  const sig = JSON.stringify([cur, max, verdict, verdictClass, activity, sessions]);
-  if (sectionUnchanged("d:facts", sig)) return;
-  sectionRendered("d:facts", sig);
-  el("fact-iter").textContent = cur + " of " + max;
-  const fv = el("fact-verdict");
-  fv.textContent = verdict;
-  fv.className = verdictClass;
-  el("fact-activity").textContent = activity;
-  el("fact-sessions").textContent = sessions;
-}
-
-/* Re-render what shows relative time or session counts, from cached data. */
-function renderDetailTimes() {
-  if (!state.detail) return;
-  renderDetailFacts(state.detail);
-  renderSessionList();
-}
-
-function renderDetail(detail) {
-  const live = state.byKey.get(state.activeLoop) || {};
-  const badgeLoop = Object.assign({}, detail, {
-    running: live.running ?? detail.running,
-    running_sources: live.running_sources || detail.running_sources,
-  });
-  const badgeSig = JSON.stringify([Boolean(badgeLoop.running), badgeLoop.running_sources || [],
-    badgeLoop.status ?? null, latestVerdict(badgeLoop),
-    badgeLoop.loop_state
-      ? [badgeLoop.loop_state.state, badgeLoop.loop_state.status_raw, badgeLoop.loop_state.summary]
-      : null]);
-  if (!sectionUnchanged("d:badge", badgeSig)) {
-    sectionRendered("d:badge", badgeSig);
-    const badge = el("drawer-badge");
-    badge.className = "status-tags";
-    badge.textContent = "";
-    badge.appendChild(stateBadge(badgeLoop));
-  }
-
-  const mission = detail.mission || "";
-  if (!sectionUnchanged("d:mission", mission)) {
-    sectionRendered("d:mission", mission);
-    const missionEl = el("drawer-mission");
-    missionEl.textContent = mission || "No mission recorded.";
-    missionEl.title = mission;
-  }
-
-  renderDetailFacts(detail);
-
-  const seq = verdictSeq(detail);
-  const stripSig = JSON.stringify([seq, detail.final_verdict ?? null]);
-  if (!sectionUnchanged("d:strip", stripSig)) {
-    sectionRendered("d:strip", stripSig);
-    const strip = el("drawer-strip");
-    strip.textContent = "";
-    if (seq.length) {
-      strip.appendChild(historyEl(detail));
-      strip.appendChild(span("caption", " S shipped · I iterate · B blocked · H needs human, oldest first"));
-    } else {
-      strip.appendChild(span("caption", "No evaluator verdicts parsed from LOG.md. Latest recorded verdict: " +
-        (detail.final_verdict ? String(detail.final_verdict).toUpperCase() : "none") + "."));
-    }
-  }
-
-  renderCommits(detail);
-  renderSlices(detail);
-
-  renderTimeline(detail.timeline || []);
-  renderTimelineView();
-  renderFilesView();
-  renderGraphView();
-
-  if (!state.activePath) {
-    setPaneStatus(
-      "idle",
-      state.sessions.length
-        ? state.sessions.length + (state.sessions.length === 1 ? " session" : " sessions")
-        : "no sessions"
-    );
-  }
-}
-
-function renderCommits(detail) {
-  const commits = Array.isArray(detail.commits) ? detail.commits : [];
-  const COMMIT_PREVIEW = 8;
-  const showAll = state.showAllCommits === state.activeLoop;
-  const sig = JSON.stringify([showAll, commits.map((c) => [c.short, c.sha, c.slice, c.subject])]);
-  if (sectionUnchanged("d:commits", sig)) return;
-  sectionRendered("d:commits", sig);
-  const csec = el("commits-section");
-  const clist = el("commit-list");
-  clist.textContent = "";
-  csec.hidden = commits.length === 0;
-  for (const c of showAll ? commits : commits.slice(0, COMMIT_PREVIEW)) {
-    const row = document.createElement("div");
-    row.className = "commit-row";
-    const sha = span("commit-sha", c.short || (c.sha || "").slice(0, 7));
-    sha.title = c.sha || "";
-    row.appendChild(sha);
-    if (c.slice) row.appendChild(span("meta-chip slice-chip", c.slice));
-    const subj = span("commit-subject", c.subject || "");
-    subj.title = c.subject || "";
-    row.appendChild(subj);
-    clist.appendChild(row);
-  }
-  if (commits.length > COMMIT_PREVIEW) {
-    const more = document.createElement("button");
-    more.type = "button";
-    more.className = "btn btn-ghost btn-small";
-    more.textContent = showAll ? "Show fewer commits" : "Show all " + commits.length + " commits";
-    more.addEventListener("click", () => {
-      state.showAllCommits = showAll ? null : state.activeLoop;
-      renderDetail(state.detail);
-    });
-    clist.appendChild(more);
-  }
-}
-
-/* Slices section (Overview): one row per PLAN.md slice, merged with its
- * derived lifecycle keys (see the /api/loop `slices` contract). */
-function renderSlices(detail) {
-  const slices = Array.isArray(detail.slices) ? detail.slices : [];
-  const sig = JSON.stringify(slices.map((s) => s && [s.id, s.repo, s.lifecycle, s.retired_sha,
-    s.verdict, s.open_faults]));
-  if (sectionUnchanged("d:slices", sig)) return;
-  sectionRendered("d:slices", sig);
-  const ssec = el("slices-section");
-  const slist = el("slice-list");
-  slist.textContent = "";
-  ssec.hidden = slices.length === 0;
-  for (const s of slices) {
-    if (!s) continue;
-    const row = document.createElement("div");
-    row.className = "slice-row";
-    row.appendChild(span("slice-id mono", String(s.id ?? "")));
-    // r15: the declared repo a slice belongs to (absent/"."/"home" = the
-    // mailbox repo, shown as nothing, as before).
-    const repo = typeof s.repo === "string" ? s.repo.trim() : "";
-    if (repo && repo !== "." && repo !== "home") {
-      const chip = span("meta-chip slice-repo mono", repo);
-      chip.title = "repo: " + repo;
-      row.appendChild(chip);
-    }
-    row.appendChild(lifecycleChipFor(s.lifecycle));
-    if (s.retired_sha) {
-      const sha = span("slice-sha mono", String(s.retired_sha).slice(0, 7));
-      sha.title = String(s.retired_sha);
-      row.appendChild(sha);
-    }
-    if (s.verdict) {
-      row.appendChild(
-        span(
-          "verdict-word verdict-" + normVerdict(s.verdict),
-          String(s.verdict).toUpperCase()
-        )
-      );
-    }
-    if (Array.isArray(s.open_faults)) {
-      for (const fid of s.open_faults) {
-        row.appendChild(span("meta-chip fault-chip", String(fid)));
-      }
-    }
-    slist.appendChild(row);
-  }
-}
-
-/* Canonical display order for the Timeline slice-count summary — also the
- * order the accept regex `[0-9]+ (shipped|building|retired|faulted|
- * repairing|planned)` lists them in. */
-const SLICE_LIFECYCLE_ORDER = ["shipped", "building", "retired", "faulted", "repairing", "planned"];
-
-/* "3 shipped · 1 faulted" for the slices of one iteration, open-loop only.
- * Reads state.detail directly (same pattern as renderTimelineView etc.)
- * since renderTimeline(entries) is only ever called with detail.timeline. */
-function sliceCountSummary(iterNum) {
-  const slices =
-    state.detail && Array.isArray(state.detail.slices) ? state.detail.slices : [];
-  const counts = new Map();
-  for (const s of slices) {
-    if (!s || s.iteration == null || Number(s.iteration) !== Number(iterNum)) continue;
-    const st = String(s.lifecycle || "");
-    counts.set(st, (counts.get(st) || 0) + 1);
-  }
-  const parts = [];
-  for (const st of SLICE_LIFECYCLE_ORDER) {
-    const n = counts.get(st);
-    if (n) parts.push(n + " " + st);
-  }
-  for (const [st, n] of counts) {
-    if (!SLICE_LIFECYCLE_ORDER.includes(st)) parts.push(n + " " + st);
-  }
-  return parts.join(" · ");
-}
-
-function renderTimeline(entries) {
-  const view = el("drawer-timeline");
-  const d = state.detail;
-  const sig = JSON.stringify([entries, d ? [d.mode, d.iterations, d.slices] : null]);
-  if (sectionUnchanged("d:timeline", sig)) return;
-  sectionRendered("d:timeline", sig);
-  view.textContent = "";
-  if (!entries.length) {
-    const empty = document.createElement("div");
-    empty.className = "timeline-empty";
-    empty.textContent = "No log entries yet.";
-    view.appendChild(empty);
-    return;
-  }
-  /* Every entry is shown, grouped under per-iteration headers — the loop's
-   * full narrative, not a per-(iteration, role) digest. Parallel
-   * iterations interleave in file order, so group strictly by iteration
-   * (file order preserved within each group). */
-  const groups = new Map();
-  for (const entry of entries) {
-    const key = entry.iteration ?? null;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(entry);
-  }
-  const order = [...groups.keys()].sort(
-    (x, y) => (x == null ? 1e9 : x) - (y == null ? 1e9 : y)
-  );
-  for (const iter of order) {
-    const hdr = document.createElement("div");
-    hdr.className = "iter-header";
-    hdr.appendChild(
-      span("iter-header-label", iter == null ? "unattributed" : "Iteration " + iter)
-    );
-    if (iter != null) {
-      hdr.appendChild(lifecycleChip(iter));
-      if (state.detail && state.detail.mode === "open-loop") {
-        const summary = sliceCountSummary(iter);
-        if (summary) hdr.appendChild(span("iter-slice-summary", summary));
-      }
-    }
-    view.appendChild(hdr);
-    for (const entry of groups.get(iter)) {
-    const row = document.createElement("div");
-    row.className = "timeline-row";
-    row.appendChild(span("role-chip role-" + cssClass(entry.role), entry.role || "?"));
-    row.appendChild(span("timeline-dur", fmtDuration(entry.duration_sec)));
-    const text = document.createElement("div");
-    text.className = "timeline-text";
-    let summary = entry.summary || "";
-    if (entry.verdict) {
-      text.appendChild(
-        span("verdict-word verdict-" + entry.verdict.toLowerCase(), entry.verdict)
-      );
-      text.appendChild(document.createTextNode(" "));
-      summary = summary.replace(
-        /^VERDICT:\s*(SHIP|ITERATE|BLOCKED|NEEDS_HUMAN)\s*[—–-]\s*/i,
-        ""
-      );
-    }
-    if (entry.scope) {
-      text.appendChild(span("meta-chip scope-chip", String(entry.scope)));
-      text.appendChild(document.createTextNode(" "));
-    }
-    if (entry.slice) {
-      text.appendChild(span("meta-chip slice-chip", String(entry.slice)));
-      text.appendChild(document.createTextNode(" "));
-    }
-    text.appendChild(document.createTextNode(summary));
-    text.title = summary;
-    row.appendChild(text);
-    view.appendChild(row);
-    }
-  }
-}
-
 /* ------------------------------ drawer views ------------------------------ */
-
-function renderDrawerTabs() {
-  const nav = el("drawer-tabs");
-  nav.textContent = "";
-  for (const tab of DRAWER_TABS) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "drawer-tab" + (state.drawerTab === tab ? " active" : "");
-    btn.textContent = tab.charAt(0).toUpperCase() + tab.slice(1);
-    btn.setAttribute("aria-pressed", String(state.drawerTab === tab));
-    btn.addEventListener("click", () => {
-      state.drawerTab = tab;
-      renderDrawerTabs();
-      showDrawerTab();
-    });
-    nav.appendChild(btn);
-  }
-}
-
-/* Toggle the active view without refetching: content is re-rendered from
- * the cached state.detail (renders are cheap, and data arrival re-renders
- * the visible view via renderDetail). */
-function showDrawerTab() {
-  for (const tab of DRAWER_TABS) {
-    el("view-" + tab).hidden = state.drawerTab !== tab;
-  }
-  renderTimelineView();
-  renderFilesView();
-  renderGraphView();
-  if (state.drawerTab === "transcripts") openDefaultSession();
-}
 
 function appendEmpty(view, msg) {
   const empty = document.createElement("div");
@@ -2671,7 +788,7 @@ function tlRoleClass(role) {
 
 function renderTimelineView() {
   const view = el("view-timeline");
-  if (view.hidden) return;
+  if (state.drawerTab !== "timeline") return;
   /* The detail poll re-renders every 5 s. Skip when nothing the timeline
    * shows has changed, so focused controls are not replaced; when it has,
    * focus returns to the same control (by data-focus-key) without scrolling. */
@@ -2912,9 +1029,7 @@ function timelineIteration(row) {
         " · open in graph";
       chip.addEventListener("click", () => {
         state.graphSel = id;
-        state.drawerTab = "graph";
-        renderDrawerTabs();
-        showDrawerTab();
+        setDrawerTab("graph");
       });
       chips.appendChild(chip);
     }
@@ -3051,7 +1166,7 @@ function comparePanel() {
 
 function renderFilesView() {
   const view = el("view-files");
-  if (view.hidden) return;
+  if (state.drawerTab !== "files") return;
   const d = state.detail;
   const sig = JSON.stringify(d ? [d.slices ?? null, d.slice_activity ?? null] : null);
   if (sectionUnchanged("d:files", sig)) return;
@@ -3215,7 +1330,7 @@ function normSliceStatus(raw) {
 
 function renderGraphView() {
   const view = el("view-graph");
-  if (view.hidden) return;
+  if (state.drawerTab !== "graph") return;
   const d = state.detail;
   const picked = d && Array.isArray(d.slices) && d.slices.some((s) => String(s.id ?? "") === state.graphSel)
     ? state.graphSel : null;
@@ -3453,8 +1568,7 @@ function openDefaultSession() {
 
 function renderSessionList() {
   const list = el("session-list");
-  const sig = JSON.stringify([Boolean(state.detail), state.activePath, state.sessions,
-    state.sessions.map((s) => relTime(s.timestamp))]);
+  const sig = JSON.stringify([Boolean(state.detail), state.activePath, state.sessions]);
   if (sectionUnchanged("d:sessions", sig)) return;
   sectionRendered("d:sessions", sig);
   list.textContent = "";
@@ -3537,18 +1651,26 @@ function sessionItem(s, depth = 0, subCount = 0) {
   }
 
   const label = s.label ? String(s.label).replace(/\.jsonl$/, "") : s.id;
-  const meta = [relTime(s.timestamp), fmtSize(s.size)];
-  if (s.agent) meta.unshift(String(s.agent).replace(/^trio-omnigent-/, ""));
+  const after = [fmtSize(s.size)];
   if (isSub) {
-    meta.push("sub");
+    after.push("sub");
   } else if (subCount > 0) {
-    meta.push(subCount + " sub" + (subCount === 1 ? "" : "s"));
+    after.push(subCount + " sub" + (subCount === 1 ? "" : "s"));
   }
+  /* The age is a <time data-reltime>: tickLegacyTimes() moves its text with
+   * the store clock (characterData only), the list is never re-rendered. */
+  const meta = span("session-meta", s.agent ? String(s.agent).replace(/^trio-omnigent-/, "") + " · " : "");
+  const age = document.createElement("time");
+  age.setAttribute("data-reltime", "");
+  age.setAttribute("datetime", s.timestamp || "");
+  age.appendChild(document.createTextNode(relTime(s.timestamp)));
+  meta.appendChild(age);
+  meta.appendChild(document.createTextNode(" · " + after.join(" · ")));
 
   const labelEl = span("session-label", label);
   labelEl.title = s.label ?? "";
   item.appendChild(labelEl);
-  item.appendChild(span("session-meta", meta.join(" · ")));
+  item.appendChild(meta);
   item.addEventListener("click", () => openSession(s.path));
   return item;
 }
@@ -4161,107 +2283,145 @@ function setOffsetHint() {
   el("offset-hint").textContent = parts.join(" · ");
 }
 
-/* ------------------------------- boot ------------------------------- */
+/* ------------------------- bridge to the store ------------------------- *
+ * dashboard/ui/main.js passes these to the drawer (mountDrawer's `legacy`
+ * hooks); each is called once per change of its input, never on a timer. */
 
-function parseHash() {
-  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
-  const name = params.get("loop");
-  return name ? { root: params.get("root") || "", name } : null;
+function setDrawerTab(tab) {
+  const store = uiStore();
+  if (store) store.drawerTab.value = tab;
+  else onTab(tab);
 }
 
-function trapDrawerFocus(ev) {
-  if (ev.key !== "Tab" || el("drawer").hidden) return;
-  const focusable = Array.from(el("drawer").querySelectorAll(
-    'button:not([disabled]), [href], input, select, [tabindex]:not([tabindex="-1"])'
-  )).filter((node) => node.offsetParent !== null);
-  if (!focusable.length) return;
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (ev.shiftKey && document.activeElement === first) {
-    ev.preventDefault();
-    last.focus();
-  } else if (!ev.shiftKey && document.activeElement === last) {
-    ev.preventDefault();
-    first.focus();
+/* After a confirmed action: the stream pushes the result; the polling
+ * fallback and the open loop's detail are refetched now. */
+function refreshAfterAction() {
+  const store = uiStore();
+  if (!store) return;
+  if (typeof store.refreshBoard === "function") store.refreshBoard();
+  store.refreshDetail();
+}
+
+/* A loop was opened (or another loop replaced it): reset every legacy view. */
+function onOpen(loop) {
+  closeStream();
+  clearTimeout(actionsTimer);
+  state.loop = loop;
+  state.activeLoop = loop.key;
+  currentRoot = loop.root;
+  state.detail = null;
+  state.compare = [];
+  state.tlOpen.clear();
+  state.tlSignature = null;
+  state.sessions = [];
+  state.activePath = null;
+  state.pendingLines = [];
+  state.drawerTab = "overview";
+  state.graphSel = null;
+  invalidateDrawerSections();
+
+  el("session-list").textContent = "";
+  setPaneStatus("idle", "loading…");
+  state.offset = 0;
+  state.size = null;
+  state.records = 0;
+  setOffsetHint();
+  renderTranscript();
+
+  state.actions = null;
+  state.fixSignature = null;
+  setNote("fix-result", "");
+  el("actions-section").hidden = true;
+  el("diagnose-harness").textContent = "";
+  setNote("diagnose-note", "");
+  setNote("answer-note", "");
+  el("answer-restart").hidden = true;
+  refreshActions();
+}
+
+function onClose() {
+  closeStream();
+  clearTimeout(actionsTimer);
+  state.loop = null;
+  state.activeLoop = null;
+  state.actions = null;
+  state.detail = null;
+  state.compare = [];
+  state.tlOpen.clear();
+  state.tlSignature = null;
+  state.sessions = [];
+  state.activePath = null;
+  state.pendingLines = [];
+  state.drawerTab = "overview";
+  state.graphSel = null;
+  invalidateDrawerSections();
+}
+
+/* The open loop's card changed (the stream pushed it): its unblock options
+ * may have changed with it. */
+function onLoop(loop) {
+  if (state.activeLoop !== loop.key) return; // onOpen has not run for it yet
+  state.loop = loop;
+  refreshActions();
+}
+
+/* A new /api/loop answer for the open loop. */
+function onDetail(detail, loop) {
+  if (loop) state.loop = loop;
+  state.detail = detail;
+  state.sessions = Array.isArray(detail.sessions) ? detail.sessions : [];
+  renderTimelineView();
+  renderFilesView();
+  renderGraphView();
+  renderSessionList();
+  if (!state.activePath) {
+    setPaneStatus(
+      "idle",
+      state.sessions.length
+        ? state.sessions.length + (state.sessions.length === 1 ? " session" : " sessions")
+        : "no sessions"
+    );
+  }
+  if (state.drawerTab === "transcripts") openDefaultSession();
+}
+
+/* The drawer switched views: render what the newly shown one needs from the
+ * cached detail (no refetch). */
+function onTab(tab) {
+  state.drawerTab = tab;
+  renderTimelineView();
+  renderFilesView();
+  renderGraphView();
+  if (tab === "transcripts") openDefaultSession();
+}
+
+/* The store clock ticked: only the text of legacy relative times moves. */
+function onTick() {
+  for (const node of document.querySelectorAll("#session-list time[data-reltime]")) {
+    const text = relTime(node.getAttribute("datetime"));
+    const child = node.firstChild;
+    if (child && child.data !== text) child.data = text;
   }
 }
 
-function init() {
-  loadPrefs();
-  pendingLoopHash = parseHash();
-
-  el("drawer-close").addEventListener("click", closeDrawer);
-  el("drawer-scrim").addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", (ev) => {
-    if (el("confirm-dialog").open) return;  // the dialog handles its own keys
-    if (ev.key === "Escape" && !el("drawer").hidden) closeDrawer();
-    trapDrawerFocus(ev);
-  });
-  el("diagnose-btn").addEventListener("click", startDiagnosis);
-  el("answer-box").addEventListener("submit", submitAnswer);
-  el("inbox-toggle").addEventListener("click", () => {
-    state.showReadInbox = !state.showReadInbox;
-    renderAll();
-  });
-  el("follow-btn").addEventListener("click", () => {
+function initLegacy() {
+  const on = (id, type, fn) => {
+    const node = el(id);
+    if (node) node.addEventListener(type, fn);
+  };
+  on("diagnose-btn", "click", startDiagnosis);
+  on("answer-box", "submit", submitAnswer);
+  on("follow-btn", "click", () => {
     state.follow = !state.follow;
     updateFollowBtn();
   });
-  window.addEventListener("hashchange", () => {
-    const target = parseHash();
-    if (!target) {
-      if (!el("drawer").hidden) closeDrawer();
-      return;
-    }
-    const loop = state.loaded ? resolveHashLoop(target) : null;
-    if (loop) openDrawer(loop.key);
-    else pendingLoopHash = target;
-  });
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) pauseBoardFeed();
-    else resumeBoardFeed();
-  });
-  el("board-retry").addEventListener("click", retryBoard);
-  el("loop-start").addEventListener("click", () => controlLoop("start"));
-  el("loop-stop").addEventListener("click", () => controlLoop("stop"));
-  el("loop-search").addEventListener("input", (ev) => {
-    state.query = ev.target.value;
-    renderTabs();
-    renderBoard();
-  });
-  el("workspace-filter").addEventListener("change", (ev) => {
-    state.workspace = ev.target.value;
-    savePrefs();
-    renderTabs();
-    renderBoard();
-  });
-  for (const btn of document.querySelectorAll(".th-sort")) {
-    btn.addEventListener("click", () => {
-      const key = btn.dataset.sort;
-      state.sort = state.sort.key === key
-        ? { key, dir: state.sort.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: key === "activity" ? "desc" : "asc" };
-      savePrefs();
-      renderBoard();
-    });
-  }
-  /* Relative times ("4m ago") keep moving between pushes: every section's
-   * signature carries its rendered text, so only a section whose text
-   * actually changed is touched. */
-  setInterval(() => {
-    if (!state.loaded) return;
-    renderAll();
-    renderDetailTimes();
-  }, 5000);
-  if (document.hidden) {
-    pauseBoardFeed();
-  } else {
-    startBoardFeed();
-  }
 }
 
+window.trioLegacy = { onOpen, onClose, onLoop, onDetail, onTab, onTick };
+
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", init);
+  document.addEventListener("DOMContentLoaded", initLegacy);
 } else {
-  init();
+  initLegacy();
 }
+
