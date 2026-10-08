@@ -1,0 +1,1 @@
+{"imports": {"preact": "/vendor/preact/preact.module.js", "preact/hooks": "/vendor/preact/hooks.module.js", "@preact/signals-core": "/vendor/signals-core/signals-core.mjs", "@preact/signals": "/vendor/signals/signals.module.js", "htm": "/vendor/htm/htm.module.js"}}
