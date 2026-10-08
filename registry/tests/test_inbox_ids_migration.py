@@ -330,6 +330,37 @@ class V1MigrationTests(IdsFixture):
             self.assertTrue(
                 self.item(self.main, "interrupted", "loop-run")["read"])
 
+    def test_v1_root_entries_inside_a_schema_2_document_are_folded_into_legacy(self):
+        # A v1 service kept writing root-keyed records into a document an
+        # earlier v2 run had already migrated (v2 -> v1 rollback -> v2).
+        vanished = self.base / "gone-checkout"
+        anchor = self.verdict_anchor(self.main / "loop-x")
+        read_in_main = self.v1_id(self.main, "loop-x", "needs_human", anchor)
+        kept = "a" * 64
+        self.write_v1({
+            "schema": 2,
+            "items": {},
+            "legacy": {str(self.main): {"read": [kept]}},
+            "migrated_at": "2026-10-03T10:15:07Z",
+            str(self.main): {"read": [read_in_main],
+                             "first_seen": {read_in_main: "2026-10-04T00:00:00Z"}},
+            str(vanished): {
+                "read": [self.v1_id(vanished, "loop-x", "needs_human", anchor)],
+                "first_seen": {}},
+            str(self.wt): {"read": [], "first_seen": {"x": "2026-10-04T00:00:00Z"}},
+        })
+        self.start(self.main)
+        self.assertTrue(self.item(self.main, "needs_human")["read"],
+                        "a v1 read mark in a schema-2 document must be carried")
+        doc = self.document()
+        for root in (self.main, self.wt, vanished):
+            self.assertNotIn(str(root), doc, "top-level v1 root keys are folded")
+        self.assertEqual(doc["legacy"][str(self.main)],
+                         {"read": sorted([kept, read_in_main])})
+        self.assertNotIn(str(vanished), doc["legacy"])
+        self.assertNotIn(str(self.wt), doc["legacy"])
+        self.assertEqual(doc["migrated_at"], "2026-10-03T10:15:07Z")
+
     def test_garbage_and_missing_state_files_start_a_fresh_v2_document(self):
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text("not json", "utf-8")

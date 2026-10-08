@@ -35,6 +35,7 @@ from threading import RLock
 
 
 _STATE_LOCK = RLock()
+_V2_FIELDS = frozenset(("schema", "items", "legacy", "migrated_at"))
 _ITERATION_HEADING_RE = re.compile(
     r"^#{1,6}\s+.*?\biter(?:ation)?\s*[:#-]?\s*(\d+)\b",
     re.IGNORECASE,
@@ -190,6 +191,19 @@ def _load(path: Path) -> tuple[dict, bool]:
         for root, value in raw_legacy.items():
             if isinstance(root, str) and _exists(root):
                 document["legacy"][root] = _normal_legacy(value)
+        # A v1 service run after the document was migrated keeps writing
+        # root-keyed ``{read, first_seen}`` records next to the v2 fields:
+        # fold them into ``legacy`` (union, roots gone from disk dropped).
+        for root, value in raw.items():
+            if (not isinstance(root, str) or root in _V2_FIELDS
+                    or not os.path.isabs(root) or not isinstance(value, dict)
+                    or not _exists(root)):
+                continue
+            folded = _normal_legacy(value)["read"]
+            if not folded:
+                continue
+            known = document["legacy"].get(root, {}).get("read", [])
+            document["legacy"][root] = {"read": sorted({*known, *folded})}
         return document, document != raw
     return _migrate_v1(raw), True
 
