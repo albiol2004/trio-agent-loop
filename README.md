@@ -79,7 +79,10 @@ Scout/Builder; see [SETUP-BY-KIMI.md](SETUP-BY-KIMI.md).
 ./install.sh --kimi              # Kimi Code skills + sequential role runner
 ./install.sh --opencode \
   --strong-model provider/strong --light-model provider/light
-                                # OpenCode native roles + user-selected models
+                                # OpenCode native roles + trio-opencode driver
+./install.sh --opencode-driver \
+  --strong-model provider/strong --light-model provider/light
+                                # standalone trio-opencode driver only
 ./install.sh --omp \
   --strong-model provider/strong --light-model provider/light
                                 # Omp native agents + optional model overrides
@@ -248,12 +251,17 @@ agents and has a dedicated isolated-session fallback, ZCode uses native custom
 subagents and Goal Mode, and Pi uses in-process SDK AgentSessions.
 Kimi Code uses its documented print mode through a sequential role runner; see
 `SETUP-BY-KIMI.md` for installation and the K3/Kimi-for-Coding mapping.
-OpenCode's native bundle is primary; `portable/driver.sh` is the explicit
-fallback when a release lacks the documented named `Task` surface. See
-[SETUP-BY-OPENCODE.md](SETUP-BY-OPENCODE.md) for installation, model
-parameters/inheritance, permissions, and headless command routing. OpenCode
-maps the user-selected strong model to Orchestrator/Lead/Evaluator and the
-light model to Scout/Builder; no provider is chosen by the repository.
+OpenCode's native bundle is the interactive `/trio` surface; the standalone
+`trio-opencode` driver is the automated loop path, with open-loop `QUEUE.md`,
+root-free worktrees, and frozen acceptance. `./install.sh --opencode` installs
+both; `--opencode-driver` installs only the driver. `portable/driver.sh`
+remains the explicit fallback when a release lacks the documented named `Task`
+surface. See [SETUP-BY-OPENCODE.md](SETUP-BY-OPENCODE.md) for installation,
+model configuration, permissions, and headless command routing. For the native
+bundle, OpenCode maps the user-selected strong model to
+Orchestrator/Lead/Evaluator and the light model to Scout/Builder; the driver
+has its own config (and built-in defaults) because it generates its own role
+agents. No provider is chosen by the repository for the native bundle.
 Omp ships native agents and slash commands with a bundled default model
 contract: judgment-tier Lead/Evaluator and worker-tier Scout/Builder pins are
 set in frontmatter, with `--strong-model`/`--light-model` or the global
@@ -408,7 +416,7 @@ its harness — it installs the template and explains usage:
 - Pi: `SETUP-BY-PI.md` (native in-process AgentSession extension)
 - Athen: `SETUP-BY-ATHEN.md` (portable driver + env-based model config)
 - Kimi Code: `SETUP-BY-KIMI.md` (skills + sequential K3/Kimi-for-Coding runner)
-- OpenCode: `SETUP-BY-OPENCODE.md` (parameterized native roles + portable fallback)
+- OpenCode: `SETUP-BY-OPENCODE.md` (native `/trio` + `trio-opencode` driver + portable fallback)
 - Omp: `SETUP-BY-OMP.md` (native agents + `/trio` commands)
 - Omnigent: `SETUP-BY-OMNIGENT.md` (mixed-provider native CLI child sessions)
 Any other agent with shell access can follow `SETUP-BY-CODEX.md`'s shape using

@@ -53,6 +53,20 @@ under `omnigent/` is ever in `sys.modules` after a full run.
 via runtime feature detection of `opencode run --help`. Python >= 3.10,
 git >= 2.30 (`doctor.py`'s version floors).
 
+**Install** (from the repository clone):
+```bash
+./install.sh --opencode          # native /trio bundle + this driver
+./install.sh --opencode-driver   # this driver only
+```
+The driver is copied to
+`${TRIO_OPENCODE_HOME:-${XDG_DATA_HOME:-~/.local/share}/trio-agent-loop/opencode-driver}`
+with a `trio-opencode` command in
+`${TRIO_OPENCODE_BIN_DIR:-~/.local/bin}`. Its config is
+`${TRIO_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-~/.config}/trio-opencode/config.json}`;
+an existing config is preserved. `--strong-model`/`--light-model` seed a new
+config (lead/evaluator/acceptance = strong; builder/scout/repair = light) but
+never overwrite one.
+
 **Config path & precedence** (`config.load_config`): an explicit `path`,
 then `TRIO_OPENCODE_CONFIG`, then
 `${XDG_CONFIG_HOME:-~/.config}/trio-opencode/config.json`, else built-in

@@ -9,7 +9,9 @@
 #   ./install.sh --zcode           -> native ZCode skills
 #   ./install.sh --pi              -> native Pi AgentSession extension
 #   ./install.sh --opencode [--strong-model provider/model --light-model provider/model]
-#                                      -> native OpenCode agents + commands
+#                                      -> native OpenCode agents + commands + trio-opencode driver
+#   ./install.sh --opencode-driver [--strong-model provider/model --light-model provider/model]
+#                                      -> standalone trio-opencode loop driver only
 #   ./install.sh --omp [--strong-model provider/model --light-model provider/model]
 #                                      -> native Oh My Pi agents + commands
 #   ./install.sh --bridge              -> install the trio-bridge suggestion skill for Claude, Codex, and Omp
@@ -125,6 +127,80 @@ inject_orchestration() {
     mv "$tmpfile" "$target"
   fi
   echo "Injected orchestration policy into $target"
+}
+
+# install_opencode_driver [strong-model] [light-model] — install the
+# standalone trio-opencode loop driver. The driver reuses the repository's
+# native/metrics/prompts Python core, so install that small tree beside the
+# driver package rather than assuming the clone stays where it is.
+install_opencode_driver() {
+  local strong="${1:-}" light="${2:-}"
+  local share="${TRIO_OPENCODE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/trio-agent-loop/opencode-driver}"
+  local bin_dir="${TRIO_OPENCODE_BIN_DIR:-$HOME/.local/bin}"
+  local config="${TRIO_OPENCODE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/trio-opencode/config.json}"
+  local models_json=''
+
+  case "$share" in
+    ""|"/"|"$HOME"|"$HOME/"|"$ROOT"|"$ROOT/")
+      echo "refusing unsafe TRIO_OPENCODE_HOME: $share" >&2
+      return 2 ;;
+  esac
+
+  if [[ -n "$strong" || -n "$light" ]]; then
+    [[ -n "$strong" && -n "$light" ]] || {
+      echo "Specify both --strong-model and --light-model, or neither; the driver has built-in defaults." >&2
+      return 2
+    }
+    models_json=1
+  fi
+
+  rm -rf "$share"
+  mkdir -p "$share" "$bin_dir" "$(dirname "$config")"
+  # Runtime trees the driver loads relative to steplib.REPO_ROOT:
+  #   opencode-driver/trio_opencode, native/trio_native_step.py,
+  #   metrics/{trio_loop,trio-acceptance,trio-check,trio-shadow,...}.py,
+  #   prompts/canonical/acceptance-native-*.md, opencode/agents/trio-scout.md
+  cp -R "$ROOT/opencode-driver" "$share/"
+  cp -R "$ROOT/native" "$share/"
+  cp -R "$ROOT/metrics" "$share/"
+  cp -R "$ROOT/prompts" "$share/"
+  cp -R "$ROOT/opencode" "$share/"
+  rm -rf "$share/opencode-driver/tests" "$share/native/tests" "$share/metrics/tests"
+  find "$share" -type d -name __pycache__ -prune -exec rm -rf {} +
+  chmod +x "$share/opencode-driver/trio-opencode"
+
+  if [[ -e "$config" ]]; then
+    echo "Preserving existing $config"
+  elif [[ -n "$models_json" ]]; then
+    python3 - "$ROOT/opencode-driver/config.example.json" "$config" "$strong" "$light" <<'PY'
+import json
+import sys
+
+src, dst, strong, light = sys.argv[1:5]
+with open(src, encoding="utf-8") as fh:
+    data = json.load(fh)
+models = data.setdefault("models", {})
+for role in ("lead", "evaluator", "acceptance"):
+    models[role] = strong
+for role in ("builder", "scout", "repair"):
+    models[role] = light
+with open(dst, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PY
+  else
+    cp -v "$ROOT/opencode-driver/config.example.json" "$config"
+  fi
+
+  ln -sfn "$share/opencode-driver/trio-opencode" "$bin_dir/trio-opencode"
+  echo "Installed trio-opencode driver under $share."
+  echo "Installed command: $bin_dir/trio-opencode"
+  echo "Config: $config"
+  case ":$PATH:" in
+    *":$bin_dir:"*) ;;
+    *) echo "Add $bin_dir to PATH before running trio-opencode." ;;
+  esac
+  echo "Next: trio-opencode doctor; then trio-opencode start --mailbox <project>/loop --max-iterations 4"
 }
 
 case "${1:-}" in
@@ -343,13 +419,35 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
         --light-model "$OPENCODE_LIGHT_MODEL"
     fi
     inject_orchestration "$OPENCODE_DEST/AGENTS.md"
-    echo "Installed native OpenCode Trio agents, commands, and an optional model example."
+    install_opencode_driver "$OPENCODE_STRONG_MODEL" "$OPENCODE_LIGHT_MODEL"
+    echo "Installed native OpenCode Trio agents, commands, an optional model example, and the standalone trio-opencode driver."
     if [[ -n "$OPENCODE_STRONG_MODEL" ]]; then
       echo "Applied the user-selected strong/light model mapping."
     else
       echo "No models selected; Trio agents use OpenCode's documented inheritance."
     fi
     echo "Next: follow SETUP-BY-OPENCODE.md and validate the installed role mappings."
+    exit 0 ;;
+  --opencode-driver)
+    shift
+    OPENCODE_STRONG_MODEL=""
+    OPENCODE_LIGHT_MODEL=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --strong-model)
+          [[ $# -gt 1 ]] || { echo "--strong-model requires provider/model" >&2; exit 2; }
+          OPENCODE_STRONG_MODEL="$2"
+          shift 2 ;;
+        --light-model)
+          [[ $# -gt 1 ]] || { echo "--light-model requires provider/model" >&2; exit 2; }
+          OPENCODE_LIGHT_MODEL="$2"
+          shift 2 ;;
+        *) echo "unknown --opencode-driver option: $1" >&2; exit 2 ;;
+      esac
+    done
+    install_opencode_driver "$OPENCODE_STRONG_MODEL" "$OPENCODE_LIGHT_MODEL"
+    echo "Installed the standalone trio-opencode loop driver."
+    echo "Next: follow SETUP-BY-OPENCODE.md, run trio-opencode doctor, and start a goal mailbox."
     exit 0 ;;
   --omp)
     shift
@@ -502,7 +600,7 @@ raise SystemExit(0 if callable(_resolve_agent_spec) else 1)
     echo "  HARNESS=cursor $DEST/portable/driver.sh 10   # or athen|gemini|... "
     echo "Per-harness setup docs: $DEST/portable/SETUP-<harness>.md"
     exit 0 ;;
-  "") echo "usage: $0 --global | --productionize | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | --dashboard | /path/to/project | --portable [dir]" >&2; exit 1 ;;
+  "") echo "usage: $0 --global | --productionize | --codex | --omnigent | --kimi | --zcode | --pi | --opencode [--strong-model provider/model --light-model provider/model] | --opencode-driver [--strong-model provider/model --light-model provider/model] | --omp [--strong-model provider/model --light-model provider/model] | --bridge | --dashboard | /path/to/project | --portable [dir]" >&2; exit 1 ;;
   *)  DEST="$1/.claude" ;;
 esac
 
