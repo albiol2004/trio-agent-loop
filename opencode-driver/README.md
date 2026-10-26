@@ -851,11 +851,13 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
 
 ## 12. Known gaps / needs live validation
 
-- **No live provider runs from this branch.** Model ids and the v2 CLI
-  surface (`--standalone`, no `--dir`, `-m provider/model#variant`, dotted
-  `error.type`) were live-verified by the coordinator; this branch's own
-  testing is entirely against `tests/fake_opencode.py`. A full loop has not
-  yet run against the real provider from here.
+- **Live provider smoke only.** On 2026-10-26 a lockstep loop and an
+  open-loop + frozen-acceptance loop (12 checks; ITERATE/fault repair then
+  SHIP) both reached SHIP on OpenCode 2.1.4 with the default flash models.
+  Both used small synthetic repos, not a broad production qualification;
+  model ids and the v2 CLI surface (`--standalone`, no `--dir`,
+  `-m provider/model#variant`, dotted `error.type`) are otherwise still
+  exercised mainly by `tests/fake_opencode.py`.
 - **v2 permission precedence is unverified.** The binary's precedence for
   its per-action permission maps (first vs. last match wins) was not
   confirmed live; `ocgen.py` writes `"*"` first, specific denies after
@@ -869,12 +871,13 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
   in `driver.py`: `declared_repos_for_prepare` is only ever computed when
   `is_open_loop` is true). **Open-loop (`QUEUE.md`) mode is supported**,
   including multi-repo (`PLAN.md` `repos:`) — see "Open-loop mode" above.
-- **Open-loop has not yet run against a live provider.** Like the rest of
-  this driver (see the top of this section), open-loop's own testing
-  (`tests/test_olprompts.py`, `test_quality.py`, `test_olqueue.py`,
-  `test_openloop.py`, `test_openloop_e2e.py`) is entirely against
-  `tests/fake_opencode.py`; no full open-loop run has exercised a real
-  `opencode` binary from this branch.
+- **Open-loop live coverage is one smoke.** The 2026-10-26 open-loop +
+  acceptance smoke exercised the real `opencode` binary through slice
+  retirement, a slice-eval fault, a repair, integration evaluation and
+  SHIP. The broader matrix (`tests/test_olprompts.py`, `test_quality.py`,
+  `test_olqueue.py`, `test_openloop.py`, `test_openloop_e2e.py`) is still
+  fake-opencode; multi-slice waves, multi-repo and resume have not had a
+  live round-trip.
 - **Concurrent builders share one OpenCode data dir per loop**:
   `ocgen.generate` runs once per `run()`, so every builder in a wave shares
   the same `XDG_DATA_HOME`/`OPENCODE_CONFIG_DIR`/session store, not fully
@@ -894,7 +897,8 @@ chain, detached-job polling, tamper/mismatch detection). `driver.py` and
   a real, schema-valid frozen pack to SHIP, a SHIP the frozen gate refuses,
   coverage-refusal re-plan/stop, author contamination and the validation
   retry are covered by `tests/test_e2e.py` against the `acceptance` scenario
-  — see "Frozen acceptance (r19)" above. Not covered: a live provider run
-  (fake-opencode only, same as the rest of this port) and the amendment/
-  tamper paths (already covered at the op level by native's own
-  `test_r19_acceptance.py`, which this port's helper calls reuse unchanged).
+  — see "Frozen acceptance (r19)" above. The 2026-10-26 live open-loop smoke
+  froze and re-ran a real 12-check pack to SHIP (author audit sandboxed);
+  the amendment/tamper paths are still not live-exercised (they are covered
+  at the op level by native's own `test_r19_acceptance.py`, which this
+  port's helper calls reuse unchanged).

@@ -289,8 +289,10 @@ Selected automatically — same trigger Omnigent/native use (a mailbox with
   the "Open-loop (QUEUE.md) mode" table. Unit tests
   (`tests/test_olprompts.py`, `test_quality.py`, `test_olqueue.py`,
   `test_rootfree.py`, `test_openloop.py`) and a growing end-to-end suite
-  (`tests/test_openloop_e2e.py`) exist; no live-provider open-loop run yet
-  (same caveat as the rest of this driver — see README §11).
+  (`tests/test_openloop_e2e.py`) exist. A 2026-10-26 live open-loop +
+  frozen-acceptance smoke (OpenCode 2.1.4, 12 checks, ITERATE/fault repair
+  then SHIP) now passes; broader live coverage is still one synthetic repo,
+  not a production qualification.
 - **ol-repair** (this pass): crash-consistent merge/retire
   (`openloop._reconcile_merge_retirement`), the exit drain actually
   cancelling an abandoned slice-eval instead of letting the process linger
