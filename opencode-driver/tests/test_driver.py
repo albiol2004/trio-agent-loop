@@ -623,3 +623,42 @@ def test_variant_for_reaches_turn_spec_and_v2_argv():
     spec = driver._make_turn_spec(runner, role="lead", agent="trio-lead", model="p/deep",
                                   prompt="x", cwd=".", variant=driver._variant_for(cfg, "lead", "p/deep"))
     assert spec.variant == "max"
+
+
+# --------------------------------------------------------------------------
+# Structured-output parsing: a JSON *string value* may itself contain a code
+# fence (a Lead plan's `brief`, typically). Matching a block by its closing
+# fence stops at the inner ```python and truncates the outer object, which
+# made every open-loop plan fail with "no usable structured result" (live
+# incident: both attempts emitted exactly this shape).
+# --------------------------------------------------------------------------
+
+
+def _fenced(obj: dict, lang: str = "json") -> str:
+    return f"```{lang}\n{json.dumps(obj)}\n```\n"
+
+
+def test_extract_json_block_tolerates_code_fence_inside_string_value():
+    brief = "Add subtract.\n```python\ndef subtract(a, b):\n    return a - b\n```\nThen test it."
+    text = "Here is the plan:\n" + _fenced({"slices": [{"id": "s1", "brief": brief}]})
+    assert driver.extract_json_block(text) == {"slices": [{"id": "s1", "brief": brief}]}
+
+
+def test_extract_json_block_last_valid_block_wins_with_inner_fences():
+    first = {"n": 1, "brief": "```python\nprint(1)\n```"}
+    second = {"n": 2, "brief": "```python\nprint(2)\n```"}
+    text = (_fenced(first) + "between blocks\n"
+            + _fenced(second, "JSON") + "```json\n{oops}\n```\n")
+    assert driver.extract_json_block(text) == second
+
+
+def test_extract_json_block_accepts_bare_and_jsonc_fences():
+    assert driver.extract_json_block(_fenced({"a": 1}, "")) == {"a": 1}
+    assert driver.extract_json_block(_fenced({"a": 2}, "jsonc")) == {"a": 2}
+
+
+def test_extract_json_block_malformed_json_returns_none():
+    assert driver.extract_json_block("```json\n{not json}\n```") is None
+    assert driver.extract_json_block('```json\n{"a": 1\n```') is None
+    assert driver.extract_json_block("```json\n[1, 2]\n```") is None
+    assert driver.extract_json_block("no fences here") is None

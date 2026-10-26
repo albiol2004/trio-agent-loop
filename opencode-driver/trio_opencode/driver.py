@@ -55,8 +55,6 @@ STOP_KINDS = {"permission", "config_error"}
 _CODE_STATUS = {0: "shipped", 2: "blocked", 3: "error", 4: "max_iterations",
                5: "needs_human", 6: "needs_retirement", 8: "needs_land"}
 
-_JSON_FENCE_RE = re.compile(r"```(?:json|JSON|jsonc)?\s*\n(.*?)```", re.DOTALL)
-
 #: STATE.md keys the driver's own helper (``next``/``dispatch``'s
 #: ``_lead_running`` gate) owns the cursor for — a lead/repair/evaluator turn
 #: that writes one of these (mistaking it for a role-writable line such as
@@ -209,16 +207,13 @@ def _ship_gate_errors(ctx: "RunContext", iteration: int) -> list[str]:
 
 def extract_json_block(text: str) -> dict | None:
     """The last fenced ```json/```jsonc/bare ``` block in ``text`` that
-    parses as a JSON object; ``None`` when there is none."""
-    blocks = _JSON_FENCE_RE.findall(text or "")
-    for block in reversed(blocks):
-        try:
-            obj = json.loads(block.strip())
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
+    parses as a JSON object; ``None`` when there is none.
+
+    Delegates to :func:`trio_opencode.events.find_fenced_json` so the driver
+    and the event helpers share one fence parser: a JSON string value may
+    itself contain a ```python code fence (a Lead plan's ``brief``), which a
+    closing-fence match would mistake for the end of the outer object."""
+    return _get_events().find_fenced_json(text)
 
 
 def collect_denials(text: str, denials: list[str] | None = None) -> list[str]:

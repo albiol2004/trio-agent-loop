@@ -694,6 +694,22 @@ def test_find_fenced_json_last_wins_and_required_keys():
     assert events.find_fenced_json("```json\nnot json\n```") is None
 
 
+def test_find_fenced_json_tolerates_code_fence_inside_string_value():
+    brief = "Add subtract.\n```python\ndef subtract(a, b):\n    return a - b\n```\nThen test it."
+    text = f"Plan:\n```json\n{json.dumps({'brief': brief})}\n```\n"
+    assert events.find_fenced_json(text) == {"brief": brief}
+    assert events.find_fenced_json(text, required_keys=("brief",)) == {"brief": brief}
+
+
+def test_find_fenced_json_last_valid_block_wins_with_inner_fences():
+    first = {"n": 1, "brief": "```python\nprint(1)\n```"}
+    second = {"n": 2, "brief": "```python\nprint(2)\n```"}
+    text = (f"```json\n{json.dumps(first)}\n```\n"
+            f"```JSON\n{json.dumps(second)}\n```\n"
+            "```json\n{oops}\n```\n")
+    assert events.find_fenced_json(text) == second
+
+
 def test_denied_lines():
     text = "ok\nDENIED: tried to write x\nfine\nDENIED: outside slice\n"
     assert events.denied_lines(text) == ["DENIED: tried to write x", "DENIED: outside slice"]

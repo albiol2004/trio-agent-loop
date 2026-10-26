@@ -512,19 +512,35 @@ def classify(acc: TurnAccumulator, exit_code: int | None, stderr_text: str) -> t
 # Structured-output helpers
 # ---------------------------------------------------------------------------
 
-_FENCE_RE = re.compile(r"```(?:json|JSON)?[ \t]*\r?\n(.*?)```", re.DOTALL)
+#: A line that OPENS a structured-output fence: ``` or ```json/```JSON/
+#: ```jsonc (any case), optionally indented, with an optional CR. Anchored to
+#: a line start so a fence marker inside a JSON string value is never mistaken
+#: for a block boundary; the decoder in :func:`find_fenced_json` is handed
+#: everything after the header and finds the object's real end itself.
+_JSON_FENCE_START_RE = re.compile(r"^[ \t]*```(?:jsonc?)?[ \t]*\r?\n",
+                                  re.IGNORECASE | re.MULTILINE)
 
 
 def find_fenced_json(text: str, required_keys: tuple[str, ...] = ()) -> dict | None:
-    """Return the last fenced ```json / ``` / ```JSON block in ``text`` that
-    parses to a JSON object containing every key in ``required_keys``, or
-    ``None`` if there is no such block."""
+    """Return the last fenced ```json / ``` / ```jsonc block in ``text`` whose
+    body decodes to a JSON object containing every key in ``required_keys``,
+    or ``None`` if there is no such block.
+
+    The body is decoded with :meth:`json.JSONDecoder.raw_decode` from the text
+    after the opening fence line instead of by matching a closing fence: a
+    normal code fence inside a JSON *string value* (a Lead plan's ``brief``,
+    typically) must not truncate the outer object at the inner ```python. The
+    decoder stops at the object's own end; the block's closing fence and any
+    prose after it are ignored. A malformed object fails to decode and is
+    skipped, so the last *parseable* block still wins."""
     if not text:
         return None
+    decoder = json.JSONDecoder()
     found: dict | None = None
-    for block in _FENCE_RE.findall(text):
+    for match in _JSON_FENCE_START_RE.finditer(text):
+        body = text[match.end():]
         try:
-            obj = json.loads(block)
+            obj, _end = decoder.raw_decode(body.lstrip())
         except (ValueError, TypeError):
             continue
         if not isinstance(obj, dict):
